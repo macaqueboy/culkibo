@@ -175,7 +175,13 @@ function corsOptions() {
       callback(null, false);
     },
     credentials: false,
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Culkibo-Token', 'X-Hub-Signature-256', 'X-GitHub-Event']
+    // Las tres últimas son obligatorias en el transporte Streamable HTTP de MCP
+    // 2026-07-28: sin declararlas aquí, el preflight del navegador tumba
+    // cualquier cliente MCP que viva en una página.
+    allowedHeaders: [
+      'Content-Type', 'Authorization', 'X-Culkibo-Token', 'X-Hub-Signature-256', 'X-GitHub-Event',
+      'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name'
+    ]
   };
 }
 

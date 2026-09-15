@@ -147,10 +147,10 @@ export const McpInspector: React.FC = () => {
           <div className="space-y-2 pt-3 border-t border-slate-100">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-slate-800">
-                Cursor / Windsurf (Endpoint SSE)
+                Cursor / Windsurf (Streamable HTTP · MCP {mcpConfig?.protocol?.current || '2026-07-28'})
               </span>
               <button
-                onClick={() => copyToClipboard(`${window.location.protocol}//${window.location.host}/api/mcp/sse`, 'cursor')}
+                onClick={() => copyToClipboard(`${window.location.protocol}//${window.location.host}/api/mcp`, 'cursor')}
                 className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-700 border border-slate-200 cursor-pointer transition-colors"
               >
                 {copiedType === 'cursor' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-slate-500" />}
@@ -158,8 +158,13 @@ export const McpInspector: React.FC = () => {
               </button>
             </div>
             <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-blue-700 font-semibold select-all">
-              {`${window.location.protocol}//${window.location.host}/api/mcp/sse`}
+              {`${window.location.protocol}//${window.location.host}/api/mcp`}
             </div>
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              El endpoint antiguo <code className="font-mono">/api/mcp/sse</code> (revisión 2024-11-05) sigue
+              funcionando para los clientes ya configurados, pero está deprecado: migra en cuanto tu editor
+              hable Streamable HTTP.
+            </p>
           </div>
         </div>
 
