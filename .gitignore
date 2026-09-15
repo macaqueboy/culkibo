@@ -35,6 +35,14 @@ data/github.json
 data/cloudflare-config.json
 # Tokens de bot de Telegram y webhooks de Discord / Slack
 data/notifications.json
+# Bases de datos gestionadas: contraseñas cifradas, endpoint y clave de acceso
+# de S3/R2. El cifrado protege de una fuga accidental, no es permiso para
+# versionarlo.
+data/databases.json
+data/databases.json.*.tmp
+# Clave AES con la que se cifra lo anterior. `*.key` ya la cubre, pero esta es
+# la que de verdad no puede salir de la máquina.
+data/.databases.key
 
 # ---------------------------------------------------------------------------
 # Estado en tiempo de ejecución del daemon
@@ -45,6 +53,9 @@ data/projects.json.bak
 data/projects.json.*.tmp
 data/domains.json
 data/backups/
+# Ficheros efímeros de --env-file y de configuración de mongodump. Se borran
+# solos, pero un proceso muerto a mitad puede dejar alguno.
+data/.tmp/
 
 # Código de terceros clonado por el runner local
 projects/

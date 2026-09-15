@@ -3,6 +3,7 @@ import { Settings, Activity, Globe, Variable, Play, Square, Moon, Trash2, Shield
 import { api, type Project } from '../lib/api';
 import { LiveLogs } from './LiveLogs';
 import { DomainManager } from './DomainManager';
+import { DatabasesPanel } from './DatabasesPanel';
 
 interface ProjectDetailProps {
   projectId: string;
@@ -14,7 +15,7 @@ interface ProjectDetailProps {
 
 export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack, onNotify, onProjectUpdate, incomingLog }) => {
   const [project, setProject] = useState<Project | null>(null);
-  const [activeTab, setActiveTab] = useState<'general' | 'logs' | 'domains' | 'storage' | 'vars' | 'config'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config'>('general');
   const [loading, setLoading] = useState(false);
   const [simulatingWebhook, setSimulatingWebhook] = useState(false);
 
@@ -267,7 +268,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
     { id: 'general', label: 'General', icon: Activity },
     { id: 'logs', label: 'Logs', icon: Activity },
     { id: 'domains', label: 'Dominios', icon: Globe },
-    { id: 'storage', label: 'Almacenamiento', icon: Database },
+    { id: 'databases', label: 'Bases de datos', icon: Database },
+    { id: 'storage', label: 'Almacenamiento', icon: Box },
     { id: 'vars', label: 'Variables', icon: Variable },
     { id: 'config', label: 'Configuración', icon: Settings }
   ];
@@ -687,6 +689,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
               fetchProject();
             }}
           />
+        )}
+
+        {activeTab === 'databases' && (
+          <DatabasesPanel projectId={project.id} onNotify={onNotify} />
         )}
 
         {activeTab === 'vars' && (

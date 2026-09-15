@@ -10,6 +10,7 @@ const projectManager = require('../services/projectManager');
 const coolifyMigrator = require('../services/coolifyMigrator');
 const dockerManager = require('../services/dockerManager');
 const dbBackupManager = require('../services/dbBackupManager');
+const databaseManager = require('../services/databaseManager');
 const crypto = require('crypto');
 const githubService = require('../services/githubService');
 const localRunner = require('../services/localRunner');
@@ -41,6 +42,7 @@ function rateLimiter(req, res, next) {
 
 router.use('/projects', rateLimiter);
 router.use('/import/coolify', rateLimiter);
+router.use('/databases', rateLimiter);
 
 // --- PROJECTS ---
 router.get('/projects', (req, res) => {
@@ -802,6 +804,203 @@ router.post('/backup/dump-command', async (req, res) => {
     const { dbType, options } = req.body;
     const cmd = await dbBackupManager.generateDbDumpCommand(dbType, options);
     res.json({ command: cmd });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- BASES DE DATOS GESTIONADAS ---
+//
+// Orden importante: las rutas literales (/engines, /status, /storage) van antes
+// que /:id, porque Express resuelve por orden de registro y `:id` capturaría
+// "engines" como identificador.
+
+router.get('/databases/engines', (req, res) => {
+  try {
+    res.json({ engines: databaseManager.listEngines() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/databases/status', async (req, res) => {
+  try {
+    res.json(await databaseManager.dockerStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/databases/storage', (req, res) => {
+  try {
+    res.json(databaseManager.getS3Config());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/databases/storage', (req, res) => {
+  try {
+    res.json(databaseManager.setS3Config(req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/databases/storage/test', async (req, res) => {
+  try {
+    res.json(await databaseManager.testS3());
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/databases', (req, res) => {
+  try {
+    res.json({ databases: databaseManager.list({ projectId: req.query.projectId }) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Aprovisionamiento. Devuelve la cadena de conexión UNA sola vez: a partir de
+// aquí hay que pedirla en /credentials.
+router.post('/databases', async (req, res) => {
+  try {
+    res.status(201).json(await databaseManager.provision(req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/databases/:id', (req, res) => {
+  try {
+    res.json(databaseManager.get(req.params.id));
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.delete('/databases/:id', async (req, res) => {
+  try {
+    // Borrar el volumen es destructivo e irreversible: nunca por defecto.
+    const result = await databaseManager.remove(req.params.id, {
+      deleteVolume: req.query.deleteVolume === 'true',
+      deleteBackups: req.query.deleteBackups === 'true'
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+/**
+ * Único endpoint que devuelve la contraseña en claro. Deliberadamente aparte
+ * del listado y del detalle: así una captura de pantalla del panel, un log de
+ * proxy o un `curl /api/databases` no filtran nada.
+ */
+router.get('/databases/:id/credentials', (req, res) => {
+  try {
+    res.json(databaseManager.getCredentials(req.params.id));
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.get('/databases/:id/health', async (req, res) => {
+  try {
+    res.json(await databaseManager.refreshHealth(req.params.id));
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/start', async (req, res) => {
+  try {
+    res.json(await databaseManager.start(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/stop', async (req, res) => {
+  try {
+    res.json(await databaseManager.stop(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/restart', async (req, res) => {
+  try {
+    res.json(await databaseManager.restart(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * Publicar el puerto en el host. Sin `acknowledgeRisk: true` el servicio se
+ * niega a enlazar en 0.0.0.0, y la respuesta trae el aviso que la interfaz debe
+ * mostrar tal cual.
+ */
+router.post('/databases/:id/exposure', async (req, res) => {
+  try {
+    res.json(await databaseManager.setExposure(req.params.id, req.body || {}));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/databases/:id/backups', (req, res) => {
+  try {
+    res.json({ backups: databaseManager.listBackups(req.params.id) });
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/backups', async (req, res) => {
+  try {
+    res.json(await databaseManager.runBackup(req.params.id, { trigger: 'manual' }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/restore', async (req, res) => {
+  try {
+    const { backupId, remoteKey } = req.body || {};
+    if (!backupId && !remoteKey) {
+      return res.status(400).json({ error: 'Indique backupId o remoteKey' });
+    }
+    res.json(await databaseManager.restore(req.params.id, { backupId, remoteKey }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.put('/databases/:id/schedule', (req, res) => {
+  try {
+    const { enabled, cron } = req.body || {};
+    res.json(databaseManager.setSchedule(req.params.id, { enabled, cron }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.put('/databases/:id/retention', (req, res) => {
+  try {
+    const { daily, weekly } = req.body || {};
+    res.json(databaseManager.setRetention(req.params.id, { daily, weekly }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/retention/apply', async (req, res) => {
+  try {
+    res.json(await databaseManager.applyRetention(req.params.id));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

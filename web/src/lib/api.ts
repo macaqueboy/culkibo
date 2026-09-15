@@ -1,5 +1,104 @@
 const API_BASE = '/api';
 
+/**
+ * El backend devuelve `{ error }` con el motivo en español en cada fallo. Sin
+ * esto, un 400 se convertía en un objeto raro asignado al estado y la interfaz
+ * mostraba "undefined" en lugar de "Publicar en 0.0.0.0 expone la base de
+ * datos...". Los avisos de seguridad sólo sirven si llegan a verse.
+ */
+async function jsonOrThrow(res: Response, fallback: string) {
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error((body && body.error) || fallback);
+  return body;
+}
+
+// --- Bases de datos gestionadas ---
+
+export interface DbEngine {
+  engine: string;
+  label: string;
+  image: string;
+  port: number;
+  licence: string;
+  requiresDatabaseName: boolean;
+}
+
+export interface DbExposure {
+  enabled: boolean;
+  bindAddress: string;
+  hostPort: number | null;
+}
+
+export interface ManagedDatabase {
+  id: string;
+  projectId: string;
+  engine: string;
+  engineLabel: string;
+  name: string;
+  image: string;
+  username: string;
+  dbName: string | null;
+  port: number;
+  containerName: string;
+  volumeName: string;
+  networkName: string;
+  memoryMb: number;
+  cpus: number;
+  exposure: DbExposure;
+  status: string;
+  health: 'healthy' | 'unhealthy' | 'starting' | 'unknown';
+  createdAt: string;
+  updatedAt: string;
+  schedule: {
+    enabled: boolean;
+    cron: string;
+    nextRunAt: string | null;
+    lastRunAt: string | null;
+    lastStatus: string | null;
+  };
+  retention: { daily: number; weekly: number };
+  backupsCount: number;
+  /** Cadena de conexión con la contraseña sustituida por asteriscos. */
+  connectionTemplate: string;
+  hasPassword: boolean;
+}
+
+export interface DbCredentials {
+  id: string;
+  username: string;
+  password: string;
+  dbName: string | null;
+  host: string;
+  port: number;
+  internalConnectionString: string;
+  hostConnectionString: string | null;
+}
+
+export interface DbBackup {
+  id: string;
+  fileName: string;
+  sizeBytes: number;
+  sha256: string;
+  createdAt: string;
+  trigger: string;
+  durationMs: number;
+  remote: { key: string; uploadedAt: string } | null;
+  localAvailable: boolean;
+  remoteAvailable: boolean;
+}
+
+export interface DbStorageConfig {
+  configured: boolean;
+  endpoint?: string;
+  region?: string;
+  bucket?: string;
+  prefix?: string;
+  pathStyle?: boolean;
+  /** Siempre enmascarado por el backend. */
+  accessKeyId?: string;
+  secretAccessKey?: string;
+}
+
 export interface PodInfo {
   id: string;
   name: string;
@@ -582,5 +681,125 @@ export const api = {
       throw new Error(err.error || 'Error al analizar repositorio');
     }
     return res.json();
+  },
+
+  // --- BASES DE DATOS GESTIONADAS ---
+
+  async getDbEngines(): Promise<{ engines: DbEngine[] }> {
+    return jsonOrThrow(await fetch(`${API_BASE}/databases/engines`), 'Error al leer el catálogo de motores');
+  },
+
+  async getDbDockerStatus(): Promise<{ available: boolean; reason: string | null }> {
+    return jsonOrThrow(await fetch(`${API_BASE}/databases/status`), 'Error al consultar Docker');
+  },
+
+  async getDatabases(projectId?: string): Promise<{ databases: ManagedDatabase[] }> {
+    const q = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+    return jsonOrThrow(await fetch(`${API_BASE}/databases${q}`), 'Error al listar bases de datos');
+  },
+
+  async createDatabase(data: Record<string, unknown>): Promise<ManagedDatabase & { connectionString: string }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+      }),
+      'Error al aprovisionar la base de datos'
+    );
+  },
+
+  async deleteDatabase(id: string, opts: { deleteVolume?: boolean; deleteBackups?: boolean } = {}): Promise<any> {
+    const q = new URLSearchParams();
+    if (opts.deleteVolume) q.set('deleteVolume', 'true');
+    if (opts.deleteBackups) q.set('deleteBackups', 'true');
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/${id}?${q.toString()}`, { method: 'DELETE' }),
+      'Error al eliminar la base de datos'
+    );
+  },
+
+  /** Devuelve la contraseña en claro. Sólo a petición explícita del usuario. */
+  async getDatabaseCredentials(id: string): Promise<DbCredentials> {
+    return jsonOrThrow(await fetch(`${API_BASE}/databases/${id}/credentials`), 'Error al leer las credenciales');
+  },
+
+  async refreshDatabaseHealth(id: string): Promise<ManagedDatabase> {
+    return jsonOrThrow(await fetch(`${API_BASE}/databases/${id}/health`), 'Error al comprobar el estado');
+  },
+
+  async controlDatabase(id: string, action: 'start' | 'stop' | 'restart'): Promise<ManagedDatabase> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/${id}/${action}`, { method: 'POST' }),
+      'Error al cambiar el estado de la base de datos'
+    );
+  },
+
+  async setDatabaseExposure(
+    id: string,
+    body: { enabled: boolean; hostPort?: number; bindAddress?: string; acknowledgeRisk?: boolean }
+  ): Promise<ManagedDatabase & { warning: string | null }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/${id}/exposure`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }),
+      'Error al cambiar la exposición'
+    );
+  },
+
+  async getDatabaseBackups(id: string): Promise<{ backups: DbBackup[] }> {
+    return jsonOrThrow(await fetch(`${API_BASE}/databases/${id}/backups`), 'Error al listar las copias');
+  },
+
+  async runDatabaseBackup(id: string): Promise<{ success: boolean; backup: DbBackup }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/${id}/backups`, { method: 'POST' }),
+      'Error al ejecutar la copia'
+    );
+  },
+
+  async restoreDatabase(id: string, body: { backupId?: string; remoteKey?: string }): Promise<any> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/${id}/restore`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }),
+      'Error al restaurar'
+    );
+  },
+
+  async setDatabaseSchedule(id: string, body: { enabled: boolean; cron?: string }): Promise<ManagedDatabase> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/${id}/schedule`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }),
+      'Error al guardar la programación'
+    );
+  },
+
+  async setDatabaseRetention(id: string, body: { daily: number; weekly: number }): Promise<ManagedDatabase> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/${id}/retention`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }),
+      'Error al guardar la retención'
+    );
+  },
+
+  async getDbStorage(): Promise<DbStorageConfig> {
+    return jsonOrThrow(await fetch(`${API_BASE}/databases/storage`), 'Error al leer el almacenamiento remoto');
+  },
+
+  async setDbStorage(body: Record<string, unknown> | null): Promise<DbStorageConfig> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/storage`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }),
+      'Error al guardar el almacenamiento remoto'
+    );
+  },
+
+  async testDbStorage(): Promise<{ success: boolean; endpoint: string; bucket: string }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/databases/storage/test`, { method: 'POST' }),
+      'Error al probar el almacenamiento remoto'
+    );
   }
 };
