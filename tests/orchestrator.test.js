@@ -8,9 +8,26 @@ async function testOrchestrator() {
   const podsData = containerOrchestrator.getPods();
   assert.ok(podsData.pods.forge, 'The Forge pod must exist');
   assert.ok(podsData.pods.citadel, 'The Citadel pod must exist');
-  assert.strictEqual(podsData.pods.forge.status, 'running');
-  assert.strictEqual(podsData.pods.citadel.status, 'running');
-  console.log('  ✓ Pods state check passed');
+  // Ningún pod está aprovisionado todavía, y el estado debe decirlo. Antes se
+  // afirmaba 'running' para dos objetos sin contenedor detrás.
+  assert.strictEqual(podsData.pods.forge.provisioned, false);
+  assert.strictEqual(podsData.pods.citadel.provisioned, false);
+  assert.strictEqual(podsData.pods.citadel.status, 'not_provisioned');
+
+  // Las métricas que no se pueden medir son null, nunca un número inventado.
+  assert.strictEqual(podsData.pods.citadel.cpuPercent, null, 'Sin contenedor no hay CPU que medir');
+  assert.strictEqual(podsData.pods.citadel.memoryMb, null, 'Sin contenedor no hay memoria que medir');
+
+  // Las del daemon sí se miden, porque el daemon sí existe.
+  assert.ok(podsData.daemon, 'Deben publicarse las métricas del daemon');
+  assert.strictEqual(podsData.daemon.measured, true);
+  assert.ok(podsData.daemon.memoryMb > 0, 'La memoria residente del daemon es medible');
+  assert.ok(podsData.daemon.uptimeSeconds >= 0);
+
+  // Los contadores arrancan a cero en vez de fingir 1.248.920 peticiones.
+  assert.strictEqual(typeof podsData.totalRequestsServed, 'number');
+  assert.ok(podsData.totalRequestsServed < 1000, 'El contador es real, no una constante de escaparate');
+  console.log(`  ✓ Pods sin aprovisionar declarados como tales; daemon medido (${podsData.daemon.memoryMb} MB RSS)`);
 
   // 2. Detección y clasificación del cambio.
   //

@@ -19,64 +19,79 @@ class ContainerOrchestrator extends EventEmitter {
     this.debounceTimer = null;
     this.metricsTimer = null;
 
+    // Contadores reales, no constantes de escaparate.
+    this.requestsServed = 0;
+    this.connectionCounter = () => 0;
+    this.lastCpuSample = null;
+
+    // Ningún pod está aprovisionado todavía: no hay contenedores detrás de
+    // estos objetos. Los campos medibles se rellenan en tiempo de ejecución;
+    // los que no, quedan a null en lugar de mostrar un número inventado.
+    // `provisioned` es la bandera que el panel debe mirar antes de dibujar
+    // cualquier métrica.
     this.pods = {
       forge: {
         id: 'pod_forge',
         name: 'The Forge',
         role: 'development_hot_pod',
-        status: 'running',
-        health: 'healthy',
+        provisioned: false,
+        status: 'idle',
+        health: 'unknown',
         port: 3001,
-        latencyMs: 24,
-        cpuPercent: 1.8,
-        memoryMb: 142,
-        memoryLimitMb: 1024,
-        uptimeSeconds: 3820,
-        hotReloadsCount: 47,
-        lastHotReloadMs: 28,
+        latencyMs: null,
+        cpuPercent: null,
+        memoryMb: null,
+        memoryLimitMb: null,
+        uptimeSeconds: null,
+        hotReloadsCount: 0,
+        lastHotReloadMs: null,
         fileWatchersActive: 0,
-        version: 'v1.0.0-dev.48',
+        localProcesses: 0,
+        localPorts: [],
         environment: 'development',
-        gitCommit: 'a8f9b1c (feat: stream mcp responses)',
-        createdAt: new Date(Date.now() - 86400000 * 2).toISOString()
+        note: 'Sin contenedor aprovisionado. Refleja los procesos locales que gestiona el daemon.'
       },
       citadel: {
         id: 'pod_citadel',
         name: 'The Citadel',
         role: 'production_hardened_pod',
-        status: 'running',
-        health: 'healthy',
+        provisioned: false,
+        status: 'not_provisioned',
+        health: 'unknown',
         port: 8080,
-        latencyMs: 14,
-        cpuPercent: 0.9,
-        memoryMb: 218,
-        memoryLimitMb: 2048,
-        uptimeSeconds: 84200,
+        latencyMs: null,
+        cpuPercent: null,
+        memoryMb: null,
+        memoryLimitMb: null,
+        uptimeSeconds: null,
         hotReloadsCount: 0,
-        lastHotReloadMs: 0,
+        lastHotReloadMs: null,
         fileWatchersActive: 0,
-        version: 'v1.0.0',
         environment: 'production',
-        gitCommit: 'f2d1e0a (release: v1.0.0 stable)',
-        createdAt: new Date(Date.now() - 86400000 * 5).toISOString()
+        note: 'Sin contenedor aprovisionado. El pod de producción es trabajo pendiente.'
       }
     };
 
     this.initSampleLogs();
-    this.startMetricsSimulation();
+    this.startMetricsCollection();
   }
 
   initSampleLogs() {
+    // Estas líneas eran un decorado: anunciaban un servidor HTTP/2 en el 8080,
+    // un certificado wildcard montado en el proxy, 184 descriptores vigilados y
+    // un hot-reload compilado en 28 ms. Nada de eso ocurría, pero salía en el
+    // visor de logs como si sí. Ahora el arranque cuenta lo que de verdad pasa
+    // y nombra explícitamente lo que falta.
+    const nodeVersion = process.version;
     const initialLogs = [
-      { level: 'INFO', pod: 'citadel', message: '[Citadel:Core] Initializing immutable production container pod...' },
-      { level: 'INFO', pod: 'citadel', message: '[Citadel:TLS] Mounting Let\'s Encrypt Wildcard cert (*.culkibo.dev) into edge proxy.' },
-      { level: 'INFO', pod: 'citadel', message: '[Citadel:Server] Production HTTP/2 server listening on 0.0.0.0:8080.' },
-      { level: 'SUCCESS', pod: 'citadel', message: '[Citadel:Health] Readiness probe passed. Citadel pod is HEALTHY.' },
-      { level: 'INFO', pod: 'forge', message: '[Forge:Daemon] Starting The Forge hot-reloading dev container pod...' },
-      { level: 'INFO', pod: 'forge', message: '[Forge:Watcher] Chokidar active on /workspace (184 file descriptors watched).' },
-      { level: 'INFO', pod: 'forge', message: '[Forge:Server] Hot development server listening on 0.0.0.0:3001.' },
-      { level: 'INFO', pod: 'forge', message: '[Forge:MCP] Native MCP Server transport initialized on stdio & /mcp.' },
-      { level: 'HOT_SYNC', pod: 'forge', message: '[Forge:Sync] Hot-reload triggered: file modified src/routes/predict.py -> compiled in 28ms.' }
+      { level: 'INFO', pod: 'edge', message: `[Culkibo] Daemon iniciado sobre Node ${nodeVersion} en ${process.platform}.` },
+      { level: 'INFO', pod: 'edge', message: '[Culkibo] Plano de control listo: API REST, WebSocket y servidor MCP.' },
+      { level: 'INFO', pod: 'forge', message: '[Forge] Sin contenedor aprovisionado. Los proyectos se ejecutan como procesos locales.' },
+      { level: 'INFO', pod: 'forge', message: '[Forge:Watcher] Vigilancia de ficheros en espera. Se activa al arrancar un proyecto.' },
+      { level: 'WARN', pod: 'citadel', message: '[Citadel] Sin contenedor aprovisionado. El pod de producción todavía no está implementado.' },
+      { level: 'WARN', pod: 'edge', message: '[Edge:Router] El enrutador de ingress no reenvía tráfico todavía: describe el destino, no hace proxy.' },
+      { level: 'WARN', pod: 'edge', message: '[Edge:TLS] Sin terminación TLS. El daemon solo atiende HTTP.' },
+      { level: 'INFO', pod: 'edge', message: '[Culkibo] Estado real y trabajo pendiente: docs/superpowers/specs/' }
     ];
 
     initialLogs.forEach(l => {
@@ -103,12 +118,31 @@ class ContainerOrchestrator extends EventEmitter {
     return logEntry;
   }
 
+  /** Cuenta una petición servida. Lo llama el daemon por cada petición real. */
+  recordRequest() {
+    this.requestsServed++;
+  }
+
+  /**
+   * El daemon inyecta aquí cómo contar los clientes WebSocket vivos, para no
+   * crear una dependencia circular con server/index.js.
+   */
+  setConnectionCounter(fn) {
+    if (typeof fn === 'function') this.connectionCounter = fn;
+  }
+
   getPods() {
+    // `totalRequestsServed: 1248920` y `activeConnections: 142` eran constantes
+    // escritas a mano que el panel mostraba como telemetría. Ahora son
+    // contadores de verdad, y empiezan en cero en cada arranque porque eso es
+    // lo que son.
     return {
       pods: this.pods,
       trafficAllocation: this.trafficAllocation,
-      totalRequestsServed: 1248920,
-      activeConnections: 142
+      totalRequestsServed: this.requestsServed,
+      activeConnections: this.connectionCounter(),
+      daemon: this.getDaemonMetrics(),
+      localProcesses: this.getLocalProcessStats()
     };
   }
 
@@ -400,23 +434,78 @@ class ContainerOrchestrator extends EventEmitter {
     };
   }
 
-  startMetricsSimulation() {
+  /**
+   * Métricas reales del proceso del daemon.
+   *
+   * Esto sí se puede medir, así que se mide. El uso de CPU se calcula como
+   * porcentaje sobre el intervalo transcurrido, no acumulado desde el arranque,
+   * que es lo que la gente espera ver.
+   */
+  getDaemonMetrics() {
+    const now = Date.now();
+    const cpu = process.cpuUsage();
+    const mem = process.memoryUsage();
+
+    let cpuPercent = null;
+    if (this.lastCpuSample) {
+      const elapsedMs = now - this.lastCpuSample.at;
+      const usedMicros = (cpu.user - this.lastCpuSample.user) + (cpu.system - this.lastCpuSample.system);
+      if (elapsedMs > 0) {
+        cpuPercent = +((usedMicros / 1000 / elapsedMs) * 100).toFixed(1);
+      }
+    }
+    this.lastCpuSample = { at: now, user: cpu.user, system: cpu.system };
+
+    return {
+      cpuPercent,
+      memoryMb: Math.round(mem.rss / 1024 / 1024),
+      heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+      uptimeSeconds: Math.round(process.uptime()),
+      measured: true
+    };
+  }
+
+  /** Procesos que el runner local tiene realmente en marcha. */
+  getLocalProcessStats() {
+    try {
+      // require diferido: localRunner ya nos importa a nosotros.
+      const localRunner = require('./localRunner');
+      const runners = Array.from(localRunner.activeRunners.values());
+      return {
+        count: runners.length,
+        ports: runners.map(r => r.port).filter(Boolean),
+        types: runners.reduce((acc, r) => { acc[r.type] = (acc[r.type] || 0) + 1; return acc; }, {})
+      };
+    } catch (e) {
+      return { count: 0, ports: [], types: {} };
+    }
+  }
+
+  /**
+   * Antes esto era `startMetricsSimulation()` y rellenaba CPU, memoria y
+   * latencia de ambos pods con `Math.random()` cada 3 segundos. Un panel que
+   * inventa sus propias métricas es peor que uno vacío: parece que funciona.
+   *
+   * Ahora solo se publica lo que se puede medir. The Forge y The Citadel no
+   * existen todavía como contenedores, así que sus métricas son null y
+   * `provisioned` dice la verdad.
+   */
+  startMetricsCollection() {
     if (this.metricsTimer) clearInterval(this.metricsTimer);
     this.metricsTimer = setInterval(() => {
-      // Small realistic fluctuations in metrics
-      this.pods.forge.cpuPercent = +(1.2 + Math.random() * 2.1).toFixed(1);
-      this.pods.forge.memoryMb = Math.round(140 + Math.sin(Date.now() / 10000) * 8);
-      this.pods.forge.latencyMs = Math.round(20 + Math.random() * 8);
-      this.pods.forge.uptimeSeconds += 3;
+      const local = this.getLocalProcessStats();
 
-      this.pods.citadel.cpuPercent = +(0.8 + Math.random() * 1.0).toFixed(1);
-      this.pods.citadel.memoryMb = Math.round(215 + Math.cos(Date.now() / 12000) * 6);
-      this.pods.citadel.latencyMs = Math.round(12 + Math.random() * 4);
-      this.pods.citadel.uptimeSeconds += 3;
+      // The Forge refleja lo que el daemon gestiona de verdad hoy: los procesos
+      // locales en marcha y los watchers activos.
+      this.pods.forge.localProcesses = local.count;
+      this.pods.forge.localPorts = local.ports;
+      this.pods.forge.status = local.count > 0 ? 'running' : 'idle';
 
       this.emit('metrics', {
         forge: this.pods.forge,
         citadel: this.pods.citadel,
+        daemon: this.getDaemonMetrics(),
+        localProcesses: local,
         trafficAllocation: this.trafficAllocation
       });
     }, 3000);

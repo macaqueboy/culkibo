@@ -53,6 +53,13 @@ const { authMiddleware, corsOptions, resolveToken, authStatus } = require('./mid
 // explícita y el resto del control de acceso vive en authMiddleware.
 app.use(cors(corsOptions()));
 app.set('trust proxy', 'loopback');
+
+// El panel mostraba «1.248.920 peticiones servidas» y «142 conexiones activas»:
+// dos constantes escritas a mano. Ahora se cuentan de verdad.
+app.use((req, res, next) => {
+  containerOrchestrator.recordRequest();
+  next();
+});
 app.use(express.json({
   limit: '10mb',
   verify: (req, res, buf) => {
@@ -221,6 +228,9 @@ app.use((err, req, res, next) => {
 // WebSocket server for ultra-fast telemetry & log streaming
 const wss = new WebSocketServer({ server, path: '/ws' });
 const clients = new Set();
+
+// Conexiones activas reales, para que getPods() deje de inventarlas.
+containerOrchestrator.setConnectionCounter(() => clients.size);
 
 wss.on('connection', (ws) => {
   clients.add(ws);

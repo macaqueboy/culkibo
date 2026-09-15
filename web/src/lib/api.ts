@@ -4,20 +4,35 @@ export interface PodInfo {
   id: string;
   name: string;
   role: string;
-  status: 'running' | 'hot_syncing' | 'deploying' | 'stopped';
-  health: 'healthy' | 'degraded' | 'unhealthy';
+  status: 'running' | 'idle' | 'hot_syncing' | 'deploying' | 'stopped' | 'not_provisioned';
+  health: 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
   port: number;
-  latencyMs: number;
-  cpuPercent: number;
-  memoryMb: number;
-  memoryLimitMb: number;
-  uptimeSeconds: number;
+  /** `provisioned: false` significa que no hay contenedor detrás del pod: las
+   *  métricas de abajo llegan a null y hay que dibujar «—», no un número. */
+  provisioned: boolean;
+  note?: string;
+  latencyMs: number | null;
+  cpuPercent: number | null;
+  memoryMb: number | null;
+  memoryLimitMb: number | null;
+  uptimeSeconds: number | null;
   hotReloadsCount: number;
-  lastHotReloadMs: number;
+  lastHotReloadMs: number | null;
   fileWatchersActive: number;
-  version: string;
+  localProcesses?: number;
+  localPorts?: number[];
+  version?: string;
   environment: string;
-  gitCommit: string;
+  gitCommit?: string;
+}
+
+/** Métricas del proceso del daemon. Estas sí se miden de verdad. */
+export interface DaemonMetrics {
+  cpuPercent: number | null;
+  memoryMb: number;
+  heapUsedMb: number;
+  uptimeSeconds: number;
+  measured: true;
 }
 
 export interface PodsData {

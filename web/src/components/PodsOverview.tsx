@@ -212,12 +212,16 @@ export const PodsOverview: React.FC<PodsOverviewProps> = ({
                 </span>
               </div>
               <div className="flex justify-between text-gray-600">
-                <span>Recargas en caliente aplicadas:</span>
-                <span className="font-medium text-gray-800">{forge.hotReloadsCount} cambios</span>
+                <span>Cambios detectados:</span>
+                <span className="font-medium text-gray-800">{forge.hotReloadsCount}</span>
               </div>
               <div className="flex justify-between text-gray-600">
                 <span>Consumo de RAM:</span>
-                <span className="font-medium text-gray-800">{forge.memoryMb} MB</span>
+                <span className="font-medium text-gray-800">
+                  {/* null cuando no hay contenedor que medir. Una raya dice la
+                      verdad; un número inventado, no. */}
+                  {forge.memoryMb == null ? '—' : `${forge.memoryMb} MB`}
+                </span>
               </div>
             </div>
           </div>
@@ -261,7 +265,9 @@ export const PodsOverview: React.FC<PodsOverviewProps> = ({
               <div className="flex justify-between text-gray-600">
                 <span>Tiempo activo:</span>
                 <span className="font-medium text-gray-800">
-                  {Math.floor(citadel.uptimeSeconds / 3600)}h {Math.floor((citadel.uptimeSeconds % 3600) / 60)}m
+                  {citadel.uptimeSeconds == null
+                    ? '—'
+                    : `${Math.floor(citadel.uptimeSeconds / 3600)}h ${Math.floor((citadel.uptimeSeconds % 3600) / 60)}m`}
                 </span>
               </div>
               <div className="flex justify-between text-gray-600">
