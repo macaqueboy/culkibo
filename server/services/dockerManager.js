@@ -64,7 +64,7 @@ class DockerManager {
         clientVersion: this.dockerVersion || 'No detectado',
         serverVersion: null,
         error: err.message,
-        message: 'Daemon de Docker no detectado en este host. Operando en modo sandbox de procesos ultrarrápido (<35ms hot-sync).'
+        message: 'Daemon de Docker no detectado en este host. Operando en modo sandbox de procesos.'
       };
     }
 

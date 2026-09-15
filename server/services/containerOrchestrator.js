@@ -130,7 +130,7 @@ class ContainerOrchestrator extends EventEmitter {
     return filtered.slice(0, limit);
   }
 
-  // Hot Sync trigger (<35ms file modification push)
+  // Detección de un cambio de fichero. Todavía no lo transporta ni lo aplica.
   async triggerHotSync({ changedFile = 'src/app.ts', diffSize = '4 lines modified' } = {}) {
     const startTime = performance.now();
     this.pods.forge.status = 'hot_syncing';

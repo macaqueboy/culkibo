@@ -354,7 +354,7 @@ router.get('/system/status', (req, res) => {
       uptimeSeconds: Math.floor(process.uptime()),
       memoryUsageMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       features: {
-        hotReloadSub35ms: true,
+        hotReloadImplemented: false, // la detección funciona; el transporte y la aplicación son trabajo pendiente
         acmeDns01Wildcard: true,
         cloudflareTunnels: true,
         nativeMcp: true,

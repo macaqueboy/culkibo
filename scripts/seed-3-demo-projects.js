@@ -89,7 +89,7 @@ const demoProjects = [
   {
     id: 'proj_ai_voice_bot',
     name: 'AI Voice Bot',
-    description: 'Agente conversacional en streaming con WebSockets sub-35ms y síntesis de voz',
+    description: 'Agente conversacional en streaming con WebSockets y síntesis de voz',
     icon: '🤖',
     status: 'active',
     forgePort: 3004,

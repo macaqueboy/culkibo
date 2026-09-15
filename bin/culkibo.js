@@ -19,7 +19,7 @@ const program = new Command();
 
 program
   .name('culkibo')
-  .description('Culkibo v1.0.0 — El Orquestador Cloud de la Era de IA (<35ms Hot-Sync, Cloudflare Wildcard SSL, Native MCP)')
+  .description('Culkibo — Orquestador cloud autohospedado para desarrollar con agentes de IA')
   .version('1.0.0');
 
 // Comando start
@@ -27,7 +27,7 @@ program
   .command('start')
   .description('Inicia el demonio de Culkibo Orchestrator y el panel de control web')
   .option('-p, --port <port>', 'Puerto del servidor', '3030')
-  .option('-w, --watch [dir]', 'Activar sincronización en vivo (<35ms) para el entorno de Desarrollo')
+  .option('-w, --watch [dir]', 'Activar la vigilancia de ficheros para el entorno de Desarrollo')
   .action(async (options) => {
     process.env.PORT = options.port;
     if (options.watch) {
@@ -88,7 +88,7 @@ program
     if (dockerStatus.available) {
       console.log(`\x1b[32m  ✓ Motor Docker:\x1b[0m Activo (${dockerStatus.serverVersion}) — Modo Nativo`);
     } else {
-      console.log(`\x1b[33m  ⚠️ Motor Docker:\x1b[0m Inactivo o no detectado. Modo Sandbox de Procesos activado (<35ms hot-sync)`);
+      console.log(`\x1b[33m  ⚠️ Motor Docker:\x1b[0m Inactivo o no detectado. Modo Sandbox de Procesos activado`);
     }
 
     // 3. Permisos de disco
@@ -131,12 +131,12 @@ program
 // Comando watch
 program
   .command('watch [directorio]')
-  .description('Inicia la sincronización en vivo ultrarrápida (<35ms) hacia el entorno de Desarrollo')
+  .description('Vigila un directorio y notifica los cambios al entorno de Desarrollo')
   .action((directorio = process.cwd()) => {
     try {
       const res = containerOrchestrator.watchDirectory(directorio);
       console.log(`\n⚡ [Desarrollo] Monitoreando ${res.directory} (${res.fileWatchersActive} rutas vigiladas)`);
-      console.log(`   Sincronización sub-35ms activa. Cualquier cambio guardado disparará el hot-reload.\n`);
+      console.log(`   Vigilancia activa. Los cambios se detectan y registran; el transporte al pod remoto aún no está implementado.\n`);
 
       containerOrchestrator.on('pod_change', (pod) => {
         if (pod.lastHotReloadMs) {
@@ -187,7 +187,7 @@ podCmd
 
 podCmd
   .command('sync')
-  .description('Dispara una sincronización manual en caliente (<35ms)')
+  .description('Dispara manualmente la detección de un cambio')
   .option('-f, --file <file>', 'Archivo modificado', 'src/app.ts')
   .action(async (options) => {
     console.log(`[Culkibo CLI] Disparando sincronización en caliente para ${options.file}...`);

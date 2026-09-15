@@ -1,6 +1,6 @@
 # Guía Definitiva de Migración: Coolify v4 → Culkibo (Zero Downtime)
 
-> **Culkibo v1.0.0** es el orquestador de aplicaciones y contenedores para la era de la IA. Diseñado para ofrecer sincronización en caliente sub-35ms (frente a los 2-4 minutos de builds tradicionales en Coolify), soporte nativo de agentes IA mediante MCP (Model Context Protocol) y gestión unificada de certificados Wildcard y túneles Cloudflare.
+> **Culkibo v1.0.0** es el orquestador de aplicaciones y contenedores para la era de la IA. Diseñado para desarrollar con agentes de IA: control nativo mediante MCP (Model Context Protocol), gestión de dominios y túneles Cloudflare, y ejecución local de proyectos sin reconstruir contenedores.
 
 ---
 

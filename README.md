@@ -1,196 +1,239 @@
-# ⚡ CULKIBO v1.0.0 — The AI-Era Cloud Orchestrator
+# Culkibo
 
-> Plataforma open-source alternativa de última generación a **Coolify**, **Dokploy** y **Vercel**, diseñada específicamente para la era de la IA, con despliegues en caliente sub-35ms, control nativo por MCP (Model Context Protocol) y orquestación integral de dominios con Cloudflare & Wildcard SSL (DNS-01 ACME).
+Orquestador cloud autohospedado, open-source, pensado para desarrollar con agentes de
+IA. Alternativa a Coolify y Dokploy, con control nativo por MCP.
 
----
-
-## 🌟 Características Principales
-
-### 1. Gestión de Dominios y Certificados Wildcard SSL
-- **Integración Nativa con Cloudflare API**:
-  - Desafíos **ACME DNS-01** automáticos para certificados wildcard (`*.tudominio.com` y dominio raíz).
-  - Inyección y limpieza automática de registros TXT `_acme-challenge.<dominio>` sin intervención manual.
-  - Gestión integral de registros DNS (A, CNAME, TXT, AAAA) con modo **Cloudflare Proxy (Nube Naranja ☁️)** o **DNS Only (Nube Gris ☁️)**.
-  - Integración con **Cloudflare Zero Trust Tunnels (`cloudflared`)** para exponer pods sin abrir puertos ni IP pública.
-- **Soporte Zero-Config `sslip.io` / `nip.io`**:
-  - Generación instantánea de comodines TLS bajo demanda (e.g. `*.127-0-0-1.sslip.io`) para entornos locales y previsualizaciones sin necesidad de comprar un dominio.
-- **Bóveda de Certificados y Verificación DNS**:
-  - Comprobador en vivo de propagación y resolución DNS con detección automática de Cloudflare Edge.
-  - Almacenamiento seguro en disco (`./data/certs/`), seguimiento de fechas de expiración y loop de renovación automática (&lt;30 días).
+**Apache-2.0 · ~7.700 líneas de servidor · 10 suites de pruebas en verde**
 
 ---
 
-### 2. Arquitectura de Pods: The Forge vs The Citadel
-- **The Forge (Development Hot Pod)**:
-  - Sincronización en caliente y re-compilación instantánea en **&lt;35ms** (media de 18-25ms).
-  - Monitorización de archivos en tiempo real mediante `chokidar`.
-  - Cero cold-starts para iteración ultra-rápida asistida por IA.
-- **The Citadel (Production Hardened Pod)**:
-  - Despliegues inmutables con probes de lectura y salud.
-  - Actualizaciones atómicas y switches de tráfico **zero-downtime**.
-- **Director de Tráfico en Tiempo Real**:
-  - Enrutamiento dinámico a nivel de proxy (100% Citadel, Canary 10% Dev / 90% Prod, o 100% Forge) con conmutación en microsegundos.
+## Antes de nada: qué funciona y qué no
+
+Culkibo está en construcción y este README no va a fingir lo contrario. Si vas a
+instalarlo, esto es lo que te vas a encontrar:
+
+### Funciona de verdad
+
+| | |
+|---|---|
+| **Ejecución local de proyectos** | Clona de GitHub, detecta monorepos (`/backend`, `/web`, `/src`…), instala dependencias, lanza el proceso y asigna puertos. Node, Vite, Next.js y sitios estáticos |
+| **Ciclo de vida** | Arrancar, parar, hibernar y activar, matando de verdad el árbol de procesos y liberando el puerto en Windows y en Linux |
+| **Servidor MCP** | 26 herramientas, registro de auditoría, transporte stdio y SSE |
+| **Webhooks de GitHub** | Firma HMAC verificada, despliegue automático al hacer push |
+| **Migrador de Coolify** | Extracción real desde la API v4: aplicaciones, bases de datos, volúmenes, variables |
+| **API de Cloudflare** | Zonas, registros DNS y túneles reales. Sin token entra en modo simulado y lo dice (`isMock: true`) |
+| **Docker** | Estado, contenedores, métricas y logs. Si no hay Docker, degrada a procesos |
+| **Notificaciones** | Telegram, Discord, Slack y webhook genérico cuando un servicio cae o falla un build |
+| **Panel web** | React 19 + Tailwind v4, telemetría por WebSocket, importador de Coolify, gestor de dominios |
+
+### Todavía no funciona
+
+| | Estado real |
+|---|---|
+| **Proxy inverso** | El router de ingress **no reenvía tráfico**. Devuelve una página describiendo a dónde enrutaría |
+| **HTTPS / TLS** | No hay terminación TLS. El daemon solo habla HTTP |
+| **Certificados wildcard** | El flujo DNS-01 escribe el registro TXT real en Cloudflare, pero **no ejecuta el protocolo ACME**: el certificado que guarda es un PEM de relleno |
+| **Métricas de los pods** | La CPU, memoria y latencia de The Forge y The Citadel son valores simulados |
+| **Reparto de tráfico** | `switchTraffic` cambia un objeto en memoria; no mueve tráfico |
+| **Recarga en caliente** | Se detecta y clasifica el cambio, pero **no se transporta ni se aplica** |
+| **Multi-servidor** | Solo la máquina local |
+| **Backups programados** | Exporta a JSON bajo demanda. Sin cron y sin subida a S3/R2 |
+
+Esa segunda tabla es el plan de trabajo, y está detallado en
+[`docs/superpowers/specs/`](docs/superpowers/specs/).
+
+> Una versión anterior de este README anunciaba «despliegues en caliente sub-35 ms» y
+> certificados wildcard emitidos por ACME. Ninguna de las dos cosas era cierta: el
+> número venía de un `setTimeout(8)` en el código. Se han eliminado ambos, del producto
+> y de aquí.
 
 ---
 
-### 3. Servidor MCP (Model Context Protocol) Nativo
-- Servidor MCP integrado cumpliendo con la especificación JSON-RPC 2.0 (`2024-11-05`).
-- Conexión vía **stdio** o **SSE (Server-Sent Events)** en `/api/mcp/sse`.
-- Herramientas expuestas para agentes como Cursor, Windsurf y Claude Desktop:
-  1. `culkibo_list_pods`: Inspecciona métricas, telemetría y estado de los pods.
-  2. `culkibo_hot_sync`: Aplica modificaciones de código al vuelo en &lt;35ms.
-  3. `culkibo_switch_traffic`: Re-enruta tráfico de forma dinámica.
-  4. `culkibo_manage_domain`: Añade o elimina dominios y activa proxy Cloudflare.
-  5. `culkibo_issue_wildcard_ssl`: Dispara el desafío DNS-01 ACME en Cloudflare.
-  6. `culkibo_create_sslip_domain`: Crea un comodín local con TLS en un clic.
-  7. `culkibo_get_logs`: Transmite logs en streaming filtrados por pod o severidad.
-- Consola de Auditoría en Tiempo Real de todas las acciones ejecutadas por agentes de IA.
+## Hacia dónde va
 
----
+El objetivo no es ser otro Coolify. Es cerrar el bucle que hoy rompe el desarrollo con
+agentes de IA:
 
-### 4. Dashboard Web de Calidad Studio (Cero "AI Slop")
-- Desarrollado en React 19 + TypeScript + Tailwind CSS v4 + Vite + Lucide Icons.
-- Estética industrial refinada: tema oscuro obsidiana/carbón, acentos cálidos ámbar/forja, tipografía Plus Jakarta Sans & JetBrains Mono, micro-interacciones sutiles y consola de terminal ANSI en streaming.
-- Telemetría en tiempo real por **WebSocket nativo** (`ws://localhost:3030/ws`).
+```
+Hoy:      crear repo → push → vincular → build → esperar
+          → cambio → commit → push → webhook → build → esperar → ver
 
----
-
-## 🚀 Inicio Rápido
-
-### Opción A: Script PowerShell de 1 Clic (Windows)
-```powershell
-.\start.ps1
+Objetivo: guardar fichero → ver en tu URL pública
 ```
 
-### Opción B: Inicio con Node / npm
+Dos entornos sobre la misma URL. **The Forge** es tu proceso corriendo en tu máquina,
+visible en internet. **The Citadel** es la build inmutable en tu VPS, que responde
+cuando cierras el portátil. Promocionas lo que has visto funcionar, no una rama de Git
+que puede diferir, y revertir es instantáneo.
+
+Todo el diseño, con presupuesto de latencia medido salto a salto y las contrapartidas
+reconocidas, está en la especificación enlazada arriba.
+
+---
+
+## Seguridad
+
+Culkibo orquesta procesos y contenedores. Eso lo convierte en un objetivo, así que hay
+dos compromisos que se pueden verificar con un `grep` y no con una promesa:
+
+**Nunca se construyen comandos de shell.** Los procesos se lanzan con `spawn()` y un
+array de argumentos; nunca concatenando cadenas. Los secretos viajan por el entorno,
+nunca en `argv` (donde los ve cualquiera con `ps`) ni dentro de una URL. Para clonar
+repositorios privados, el token va por `GIT_ASKPASS` y no acaba en el `.git/config` del
+repo clonado.
+
+Esto no es cosmético: es la clase de fallo que ha producido **21 avisos críticos en
+Coolify y 34 en Dokploy**, y dos de esos parches están catalogados como *«incomplete
+fix»* de un aviso anterior. No se puede parchear caso a caso; hay que eliminarla por
+construcción.
+
+**El plano de control exige autenticación.** Dos capas:
+
+- *Origen*: las peticiones de navegador con un `Origin` fuera de la lista reciben 403.
+  Esto cubre el caso que la gente no espera — cualquier web que visites podría, si no,
+  pedirle cosas a tu `localhost:3030` desde tu propio navegador.
+- *Token*: para lo que no es navegador (CI, agentes MCP, `curl`), comparado en tiempo
+  constante.
+
+Desde loopback y sin navegador se sigue pasando sin token, para que probar en local sea
+inmediato. Si expones el daemon, pon `CULKIBO_REQUIRE_TOKEN=1`.
+
+**Y el argumento que no se compra:** son ~7.700 líneas de servidor. Puedes leerlas
+enteras en una tarde antes de confiarle tu producción. Coolify tiene del orden de
+300.000. Cada funcionalidad que añadamos compite contra el coste de dejar de ser
+auditable.
+
+Si encuentras un fallo de seguridad, abre un issue sin detalles de explotación y lo
+coordinamos.
+
+---
+
+## Instalación
+
+Requiere Node.js 20 o superior. Docker es opcional: sin él, Culkibo ejecuta los
+proyectos como procesos.
+
 ```bash
-# 1. Instalar dependencias raíz
 npm install
-
-# 2. Compilar assets del dashboard web
-npm run build
-
-# 3. Iniciar el Daemon de Culkibo
-npm start
+npm run build        # compila el panel web
+npm start            # arranca el daemon
 ```
 
-Abre tu navegador en:
-👉 **`http://localhost:3030`**
+Panel en `http://localhost:3030`.
+
+En el primer arranque se genera un token de acceso en `data/auth.json` y la consola te
+dice dónde está. Copia `.env.example` a `.env` si prefieres configurarlo tú.
+
+En Windows, `./start.ps1` hace los tres pasos.
 
 ---
 
-## 💻 CLI de Culkibo (`culkibo`)
-
-La CLI permite controlar toda la plataforma por terminal:
+## CLI
 
 ```bash
-# Ver versión
-node bin/culkibo.js --version
+node bin/culkibo.js start                      # arranca el daemon y el panel
+node bin/culkibo.js status                     # estado operativo
+node bin/culkibo.js doctor                     # diagnóstico del entorno
 
-# Listar estado y métricas de los pods
-node bin/culkibo.js pod list
+node bin/culkibo.js pod list                   # estado de The Forge y The Citadel
+node bin/culkibo.js domain list                # dominios y certificados
+node bin/culkibo.js docker                     # inspección de contenedores
+node bin/culkibo.js ingress app.midominio.com  # a qué pod resolvería un Host
 
-# Disparar sincronización en caliente (<35ms)
-node bin/culkibo.js pod sync --file src/app.ts
+node bin/culkibo.js backup <projectId>         # exportar un proyecto
+node bin/culkibo.js restore <archivo.json>     # restaurar desde un backup
 
-# Conmutar tráfico entre Forge y Citadel
-node bin/culkibo.js pod switch forge      # 100% Forge
-node bin/culkibo.js pod switch citadel    # 100% Citadel
-node bin/culkibo.js pod switch 20/80      # 20% Forge / 80% Citadel
-
-# Listar dominios y certificados SSL
-node bin/culkibo.js domain list
-
-# Añadir dominio o comodín
-node bin/culkibo.js domain add "*.midominio.com" --pod forge --proxy
-
-# Emitir certificado Wildcard SSL vía Cloudflare DNS-01 ACME
-node bin/culkibo.js domain issue-wildcard "*.midominio.com" --provider lets_encrypt
-
-# Generar comodín sslip.io con TLS On-Demand
-node bin/culkibo.js domain sslip 127.0.0.1
-
-# Iniciar servidor MCP por stdio (Claude Desktop / Cursor)
-node bin/culkibo.js mcp
+node bin/culkibo.js mcp                        # servidor MCP por stdio
 ```
+
+El ciclo de vida de los proyectos (arrancar, parar, hibernar) se hace hoy desde el panel
+o por la API REST; todavía no tiene comandos propios en la CLI.
 
 ---
 
-## 🤖 Conectar con Agentes de IA (Cursor / Claude Desktop)
+## Conectar un agente de IA
 
-### Claude Desktop (`claude_desktop_config.json`)
+**Claude Desktop** — en `claude_desktop_config.json`:
+
 ```json
 {
   "mcpServers": {
     "culkibo": {
       "command": "node",
-      "args": ["C:\\Users\\pablo\\Desktop\\Culkibo\\bin\\culkibo.js", "mcp"],
-      "env": {
-        "CULKIBO_API_URL": "http://localhost:3030"
-      }
+      "args": ["/ruta/a/Culkibo/bin/culkibo.js", "mcp"],
+      "env": { "CULKIBO_API_URL": "http://localhost:3030" }
     }
   }
 }
 ```
 
-### Cursor / Windsurf
-Añade como SSE Server:
+**Cursor, Windsurf y compatibles** — añade el endpoint SSE:
+
 ```
 http://localhost:3030/api/mcp/sse
 ```
 
+> El servidor MCP declara la revisión `2024-11-05` sobre transporte HTTP+SSE, que está
+> deprecado desde marzo de 2025. La migración a Streamable HTTP está en la
+> especificación. Funciona hoy con los clientes actuales, pero no es la versión vigente
+> del protocolo.
+
 ---
 
-## 🧪 Ejecutar la Suite de Pruebas
-Culkibo incluye tests automáticos para todos sus subsistemas:
+## Pruebas
+
 ```bash
 npm test
 ```
-Pruebas incluidas:
-- `cloudflare.test.js`: Validación de tokens, zonas, registros DNS, inyección ACME TXT y túneles.
-- `ssl.test.js`: Pipeline completo DNS-01 Let's Encrypt, TLS bajo demanda `sslip.io` y cálculo de expiración.
-- `domain.test.js`: Resolución de rutas exactas y comodines, prevención de duplicados y resolución DNS.
-- `orchestrator.test.js`: Latencia sub-35ms de The Forge, conmutación de tráfico y despliegue a The Citadel.
-- `mcp.test.js`: Especificación JSON-RPC 2.0, catálogo de herramientas, ejecución y auditoría.
-- `live-server.test.js`: Servidor HTTP/WebSocket y entrega de assets estáticos de producción.
+
+Levanta su propio daemon si no encuentra uno, así que funciona en frío y en CI.
+
+| Suite | Qué cubre |
+|---|---|
+| `cloudflare.test.js` | Tokens, zonas, DNS, TXT de ACME, túneles |
+| `ssl.test.js` | Registro de certificados, TLS bajo demanda, caducidades |
+| `domain.test.js` | Rutas exactas y comodín, incluida la frontera de etiqueta |
+| `orchestrator.test.js` | Detección de cambios, reparto de tráfico, watchers |
+| `mcp.test.js` | JSON-RPC 2.0, catálogo de herramientas, auditoría |
+| `backup.test.js` | Exportación, restauración y volcados sin shell |
+| `github.test.js` | HMAC de webhooks y despliegue automático |
+| `coolifyMigrator.test.js` | Extracción y agrupación desde la API de Coolify |
+| `localRunner.test.js` | Puertos, estáticos, traversal, manejo de secretos |
+| `stop-lifecycle.test.js` | Parada real de procesos y liberación de puertos |
+
+Más `live-server.test.js` (ingress y control de acceso), `websocket-stress.test.js`
+(30 clientes concurrentes) y `stress.test.js` (100 peticiones simultáneas).
 
 ---
 
-## 📁 Estructura del Proyecto
+## Estructura
 
 ```
-c:\Users\pablo\Desktop\Culkibo\
-├── bin/
-│   └── culkibo.js                 # CLI ejecutable de Culkibo
-├── server/
-│   ├── index.js                   # Daemon principal HTTP + WebSocket + MCP
-│   ├── routes/
-│   │   └── api.js                 # API REST completa
-│   └── services/
-│       ├── cloudflareService.js   # Cliente Cloudflare (Zonas, DNS, Túneles, ACME)
-│       ├── sslManager.js          # Orquestador ACME DNS-01, Wildcard & On-Demand TLS
-│       ├── domainManager.js       # Registro de dominios y tabla de enrutamiento
-│       ├── containerOrchestrator.js # Gestor The Forge (<35ms) vs The Citadel
-│       └── mcpServer.js           # Servidor nativo Model Context Protocol
-├── web/                           # Dashboard UI (React 19 + TypeScript + Tailwind v4)
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── Header.tsx         # Barra superior con WS live status y hot sync
-│   │   │   ├── PodsOverview.tsx   # Visualizador The Forge vs Citadel & Traffic Slider
-│   │   │   ├── DomainManager.tsx  # Orquestador de Dominios, Wildcard ACME & sslip.io
-│   │   │   ├── CloudflareTunnelCard.tsx # Gestión de credenciales CF, Tunnels y DNS
-│   │   │   ├── LiveLogs.tsx       # Terminal de streaming en tiempo real
-│   │   │   ├── McpInspector.tsx   # Sala de control MCP y playground de herramientas AI
-│   │   │   ├── DeployModal.tsx    # Modal de despliegue atómico a producción
-│   │   │   └── SettingsView.tsx   # Matriz de capacidades del sistema
-│   │   ├── lib/api.ts             # Cliente tipado de API y WebSocket
-│   │   └── App.tsx
-│   └── dist/                      # Bundle de producción listo para servir
-├── tests/                         # Suite de verificación integral
-├── start.ps1                      # Lanzador rápido para PowerShell
-└── package.json                   # Configuración del paquete raíz
+bin/culkibo.js              CLI
+server/
+  index.js                  daemon HTTP + WebSocket + ingress
+  middleware/auth.js        control de acceso del plano de control
+  routes/api.js             API REST
+  services/
+    localRunner.js          ejecución de proyectos, clonado, puertos
+    projectManager.js       persistencia atómica y ciclo de vida
+    containerOrchestrator.js  watchers y estado de los pods
+    cloudflareService.js    API de Cloudflare (real + modo simulado)
+    sslManager.js           registro de certificados  ⚠ ACME simulado
+    domainManager.js        dominios y tabla de enrutado
+    mcpServer.js            servidor MCP (26 herramientas)
+    githubService.js        OAuth, repos y webhooks
+    coolifyMigrator.js      importación desde Coolify v4
+    notificationService.js  Telegram, Discord, Slack, webhook
+    dockerManager.js        contenedores
+    dbBackupManager.js      exportar y restaurar
+web/src/                    panel (React 19 + Tailwind v4, modo claro)
+tests/                      suites de verificación
+docs/superpowers/specs/     diseño y decisiones
 ```
 
 ---
 
-Diseñado y construido con precisión para Pablo.
+## Licencia
+
+Apache-2.0.

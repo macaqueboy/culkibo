@@ -194,7 +194,7 @@ export function App() {
             <span>Tu nube y servidor en tiempo real con IA</span>
           </div>
           <div className="flex items-center gap-4 text-slate-500">
-            <span>Sincronización &lt;35ms</span>
+            <span>Control por agentes de IA</span>
             <span>Cloudflare Wildcard SSL</span>
             <span>Control nativo por MCP</span>
           </div>

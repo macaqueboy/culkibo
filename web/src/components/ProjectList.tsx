@@ -395,7 +395,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
             </span>
           </div>
           <p className="text-sm text-slate-500 mt-1">
-            Orquestador en tiempo real con recarga en caliente <span className="font-semibold text-slate-700">&lt;35ms</span>, SSL Wildcard y control nativo por agentes IA.
+            Orquestador autohospedado con control nativo por agentes de IA, gestión de dominios y ejecución local de proyectos.
           </p>
         </div>
 
@@ -1212,7 +1212,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
               <div>
                 <h3 className="text-lg font-bold text-slate-900">Comienza con tu primer proyecto</h3>
                 <p className="text-sm text-slate-500 mt-1 max-w-md mx-auto">
-                  Culkibo te permite orquestar microservicios con recarga en caliente en menos de 35ms, SSL Wildcard automático y control nativo por agentes IA.
+                  Culkibo te permite orquestar tus proyectos y microservicios con control nativo por agentes de IA y gestión unificada de dominios.
                 </p>
               </div>
 

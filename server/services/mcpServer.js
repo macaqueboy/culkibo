@@ -96,7 +96,7 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_hot_sync',
-        description: 'Trigger an ultra-fast (<35ms) hot-code sync to The Forge without container restart.',
+        description: 'Register a code change against The Forge. NOTE: detection and classification only — the change is not yet transported to or applied on the pod. Returns applied:false.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -146,7 +146,7 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_manage_watcher',
-        description: 'Start, stop, or inspect status of the Chokidar directory watcher for sub-35ms hot-sync to The Forge.',
+        description: 'Start, stop, or inspect the directory watcher that detects code changes for The Forge.',
         inputSchema: {
           type: 'object',
           properties: {

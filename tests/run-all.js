@@ -32,7 +32,7 @@ async function runAll() {
     { name: 'Cloudflare Integration', fn: testCloudflare },
     { name: 'SSL Wildcard & On-Demand TLS', fn: testSsl },
     { name: 'Domain Manager & Routing', fn: testDomain },
-    { name: 'Pod Orchestrator (<35ms Forge & Citadel)', fn: testOrchestrator },
+    { name: 'Pod Orchestrator (Forge & Citadel)', fn: testOrchestrator },
     { name: 'Model Context Protocol (MCP) Server', fn: testMcp },
     { name: 'Database & Project Backup / Restore', fn: testBackup },
     { name: 'GitHub Integration & Auto-Deploy Webhooks', fn: testGithub },

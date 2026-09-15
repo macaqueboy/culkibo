@@ -265,7 +265,7 @@ export const SettingsView: React.FC = () => {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
           <div className="p-4 bg-slate-50 rounded-xl border border-slate-200/80 flex items-center justify-between">
             <div>
-              <div className="text-slate-900 font-semibold text-sm">Sincronización Sub-35ms</div>
+              <div className="text-slate-900 font-semibold text-sm">Detección de cambios en caliente</div>
               <div className="text-slate-500 text-xs mt-0.5">Inyección en caliente de archivos con Chokidar</div>
             </div>
             <span className="text-emerald-700 font-semibold flex items-center gap-1 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full text-[11px]">

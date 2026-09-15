@@ -3,7 +3,7 @@ $Host.UI.RawUI.WindowTitle = "Culkibo v1.0.0 Orchestrator"
 Write-Host "========================================================" -ForegroundColor Amber
 Write-Host "  ⚡ CULKIBO ORCHESTRATOR v1.0.0 — AI-ERA CLOUD PLATFORM  " -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Amber
-Write-Host "  The Forge (<35ms Hot Sync) & The Citadel (Prod Pod)   " -ForegroundColor Gray
+Write-Host "  The Forge (desarrollo) y The Citadel (produccion)      " -ForegroundColor Gray
 Write-Host "  Cloudflare DNS-01 Wildcard SSL & Native MCP Server    " -ForegroundColor Gray
 Write-Host "--------------------------------------------------------" -ForegroundColor DarkGray
 
