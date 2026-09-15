@@ -1,0 +1,34 @@
+{
+  // Comprobación de tipos del servidor SIN migrar a .ts.
+  //
+  // `checkJs` hace que TypeScript analice el JavaScript existente y aplique
+  // inferencia y anotaciones JSDoc. Se gana hoy la red de seguridad sobre las
+  // ~7.700 líneas que ya funcionan, sin renombrar un fichero, sin paso de
+  // compilación y sin riesgo de romper nada en la traducción.
+  //
+  // `noEmit` es deliberado: esto no compila, solo verifica. Node sigue
+  // ejecutando el mismo JavaScript de siempre.
+  //
+  // Los ficheros nuevos pueden escribirse directamente en .ts y conviven.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+
+    "strict": false,
+    "noImplicitAny": false,
+    "strictNullChecks": true,
+
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["server/**/*.js", "bin/**/*.js"],
+  "exclude": ["node_modules", "web", "projects", "data", "tests"]
+}

@@ -95,7 +95,7 @@ class DomainManager {
         certInfo: cert ? {
           issuer: cert.issuer,
           expiresAt: cert.expiresAt,
-          daysRemaining: Math.max(0, Math.floor((new Date(cert.expiresAt) - new Date()) / (86400000))),
+          daysRemaining: Math.max(0, Math.floor((new Date(cert.expiresAt).getTime() - Date.now()) / 86400000)),
           isWildcard: cert.type === 'wildcard_dns01'
         } : null
       };

@@ -24,6 +24,13 @@ class ContainerOrchestrator extends EventEmitter {
     this.connectionCounter = () => 0;
     this.lastCpuSample = null;
 
+    // Se creaban perezosamente con `if (!this.x) this.x = new Map()` repartido
+    // por varios métodos, así que había caminos que los tocaban sin inicializar.
+    // El comprobador de tipos lo señaló en tres sitios.
+    this.watchers = new Map();
+    this.debounceTimers = new Map();
+    this.contentHashes = new Map();
+
     // Ningún pod está aprovisionado todavía: no hay contenedores detrás de
     // estos objetos. Los campos medibles se rellenan en tiempo de ejecución;
     // los que no, quedan a null en lugar de mostrar un número inventado.

@@ -14,7 +14,8 @@
     "build": "npm --prefix web run build",
     "test": "node tests/run-all.js && node tests/live-server.test.js && node tests/websocket-stress.test.js && node tests/stress.test.js",
     "test:stress": "node tests/stress.test.js",
-    "cli": "node bin/culkibo.js"
+    "cli": "node bin/culkibo.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [
     "culkibo",
@@ -39,6 +40,8 @@
     "ws": "^8.18.1"
   },
   "devDependencies": {
-    "playwright": "^1.63.0"
+    "@types/node": "^26.5.1",
+    "playwright": "^1.63.0",
+    "typescript": "^7.0.2"
   }
 }

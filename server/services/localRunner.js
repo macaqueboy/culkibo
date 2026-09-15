@@ -687,7 +687,7 @@ class LocalRunner {
     const rootDir = path.resolve(publicDir);
 
     const server = http.createServer((req, res) => {
-      let reqPath = req.url.split('?')[0].split('#')[0];
+      let reqPath = (req.url || '/').split('?')[0].split('#')[0];
       try {
         reqPath = decodeURIComponent(reqPath);
       } catch (e) {

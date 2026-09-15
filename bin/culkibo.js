@@ -268,7 +268,7 @@ domainCmd
       }
     });
     if (res.success) {
-      console.log(`✨ Certificado Wildcard generado y guardado en: ${res.cert.certPath}`);
+      console.log(`✨ Certificado Wildcard generado y guardado en: ${res.cert?.certPath}`);
     } else {
       console.error(`❌ Error en la emisión: ${res.error}`);
     }

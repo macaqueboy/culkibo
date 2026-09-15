@@ -75,7 +75,7 @@ class SslManager {
     return this.registry.map(cert => {
       const expires = new Date(cert.expiresAt);
       const now = new Date();
-      const diffMs = expires - now;
+      const diffMs = expires.getTime() - now.getTime();
       const daysRemaining = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
       return {
         ...cert,

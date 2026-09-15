@@ -200,7 +200,7 @@ class ProjectManager extends EventEmitter {
       // that prints a name into markup escapes it as well.
       data.name = Array.from(String(data.name))
         .filter((ch) => {
-          const code = ch.codePointAt(0);
+          const code = ch.codePointAt(0) ?? 0;
           return code > 31 && code !== 127 && ch !== String.fromCharCode(60) && ch !== String.fromCharCode(62);
         })
         .join('')

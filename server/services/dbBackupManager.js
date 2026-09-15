@@ -210,7 +210,7 @@ class DbBackupManager {
       }
     }
 
-    return backups.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    return backups.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 }
 
