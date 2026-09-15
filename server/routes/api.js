@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const githubService = require('../services/githubService');
 const localRunner = require('../services/localRunner');
 const notificationService = require('../services/notificationService');
+const caddyManager = require('../services/caddyManager');
 
 // In-memory rate limiting for sensitive endpoints (O(1) Fixed Window)
 const rateLimitMap = new Map();
@@ -803,6 +804,58 @@ router.post('/backup/dump-command', async (req, res) => {
     res.json({ command: cmd });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// --- INGRESS: autorización de certificados bajo demanda ---
+//
+// Caddy llama aquí en el primer handshake TLS de un dominio que no conoce,
+// antes de pedir el certificado. Contrato verificado en el código de Caddy
+// (modules/caddytls/ondemand.go): hace GET con el parámetro `domain`, un 2xx
+// autoriza, cualquier otro código deniega, no sigue redirecciones y abandona a
+// los 10 segundos.
+//
+// Es el punto que impide que alguien apunte su dominio a este servidor y nos
+// haga emitir certificados a su costa, agotando la cuota de Let's Encrypt. Por
+// eso Caddy considera obligatorio configurarlo.
+//
+// Sin autenticación a propósito: quien llama es Caddy, que no tiene token. Solo
+// revela si un dominio está configurado, que es información que cualquiera
+// puede deducir resolviendo el DNS.
+router.get('/ingress/ask', (req, res) => {
+  const domain = String(req.query.domain || '').trim().toLowerCase();
+
+  if (!domain) {
+    return res.status(400).type('text/plain').send('falta el parámetro domain');
+  }
+
+  const route = domainManager.resolveRoute(domain);
+  if (!route) {
+    // 403, no 404: es una denegación deliberada, no un despiste.
+    return res.status(403).type('text/plain').send(`dominio no configurado en Culkibo: ${domain}`);
+  }
+  if (route.status === 'disabled') {
+    return res.status(403).type('text/plain').send(`dominio deshabilitado: ${domain}`);
+  }
+
+  containerOrchestrator.addLog('INFO', 'edge', `[Edge:TLS] Certificado autorizado para ${domain} (regla: ${route.hostname})`);
+  return res.status(200).type('text/plain').send('ok');
+});
+
+router.get('/ingress/status', async (req, res) => {
+  try {
+    const detection = await caddyManager.detect({ force: req.query.force === '1' });
+    let routes = [];
+    if (detection.available) {
+      try { routes = await caddyManager.listRoutes(); } catch (e) { /* configuración aún sin cargar */ }
+    }
+    res.json({
+      ...detection,
+      routesManaged: routes.length,
+      routes: routes.map(r => ({ id: r['@id'], hosts: r.match?.[0]?.host || [] }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

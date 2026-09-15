@@ -117,7 +117,11 @@ function isLoopback(req) {
 const PUBLIC_PATHS = [
   /^\/health$/,
   /^\/api\/health$/,
-  /^\/api\/webhooks\/github$/
+  /^\/api\/webhooks\/github$/,
+  // Caddy consulta este endpoint en el primer handshake TLS de un dominio
+  // desconocido y no tiene forma de presentar un token. Solo revela si un
+  // dominio está configurado aquí, que es deducible resolviendo el DNS.
+  /^\/api\/ingress\/ask$/
 ];
 
 function isPublicPath(reqPath) {

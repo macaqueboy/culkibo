@@ -8,6 +8,7 @@ const testGithub = require('./github.test');
 const testCoolifyMigrator = require('./coolifyMigrator.test');
 const testLocalRunner = require('./localRunner.test');
 const testStopLifecycle = require('./stop-lifecycle.test');
+const testCaddy = require('./caddy.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -38,7 +39,8 @@ async function runAll() {
     { name: 'GitHub Integration & Auto-Deploy Webhooks', fn: testGithub },
     { name: 'Coolify Deep Migrator & Resources', fn: testCoolifyMigrator },
     { name: 'Local Execution Runner & Dev Server', fn: testLocalRunner },
-    { name: 'Project Stop & Hibernate Lifecycle', fn: testStopLifecycle }
+    { name: 'Project Stop & Hibernate Lifecycle', fn: testStopLifecycle },
+    { name: 'Ingress Data Plane (Caddy)', fn: testCaddy }
   ];
 
   for (const suite of suites) {
