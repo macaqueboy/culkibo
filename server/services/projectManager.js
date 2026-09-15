@@ -106,18 +106,40 @@ class ProjectManager extends EventEmitter {
     }
   }
 
-  async flushToDisk() {
+  /**
+   * Persiste el estado actual y devuelve una promesa que resuelve cuando ese
+   * estado ya está en disco.
+   *
+   * Antes, si había un flush en vuelo, esto marcaba `pendingFlush` y RETORNABA
+   * DE INMEDIATO. Consecuencia: `await flushToDisk()` no garantizaba nada, y un
+   * `POST /projects/:id/stop` podía responder 200 antes de que la parada
+   * estuviera escrita. Si el daemon moría justo después, el proyecto volvía a
+   * arrancar como si nunca se hubiera parado — y eso contradice la sanidad de
+   * arranque de `loadProjects()`.
+   *
+   * Ahora las escrituras se encadenan: cada llamada espera a la anterior y
+   * escribe el estado vigente en su turno, así que quien haga `await` puede
+   * fiarse del disco.
+   */
+  flushToDisk() {
     if (this.saveDebounceTimer) {
       clearTimeout(this.saveDebounceTimer);
       this.saveDebounceTimer = null;
     }
 
-    if (this.isFlushing) {
-      this.pendingFlush = true;
-      return;
-    }
-    this.isFlushing = true;
+    this.flushChain = (this.flushChain || Promise.resolve())
+      .then(() => this.writeSnapshot())
+      .catch((err) => {
+        // Un fallo de escritura no puede romper la cadena: si la promesa
+        // quedase rechazada, todos los flushes posteriores fallarían también.
+        console.error('Error flushing projects to disk:', err);
+      });
 
+    return this.flushChain;
+  }
+
+  /** Escritura atómica de una instantánea. La llama solo `flushToDisk()`. */
+  async writeSnapshot() {
     let tempPath = null;
     try {
       const data = Array.from(this.projects.values());
@@ -169,12 +191,6 @@ class ProjectManager extends EventEmitter {
       console.error('Error flushing projects to disk:', err);
       if (tempPath) {
         try { await fs.promises.unlink(tempPath); } catch (e) {}
-      }
-    } finally {
-      this.isFlushing = false;
-      if (this.pendingFlush) {
-        this.pendingFlush = false;
-        await this.flushToDisk();
       }
     }
   }

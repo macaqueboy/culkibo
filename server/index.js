@@ -12,10 +12,14 @@ const domainManager = require('./services/domainManager');
 const sslManager = require('./services/sslManager');
 const mcpServer = require('./services/mcpServer');
 const projectManager = require('./services/projectManager');
+const deployManager = require('./services/deployManager');
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3030;
+// Número, no `string | number`: se pasa a `server.listen()` y a comparaciones
+// numéricas. Un PORT no numérico en el entorno cae al valor por defecto en
+// lugar de propagarse como cadena hasta el listen.
+const PORT = Number(process.env.PORT) || 3030;
 
 // ---------------------------------------------------------------------------
 // Global crash barrier.
@@ -315,8 +319,23 @@ projectManager.on('project_update', (data) => broadcast('project_update', data))
 projectManager.on('project_created', (data) => broadcast('project_created', data));
 projectManager.on('project_deleted', (data) => broadcast('project_deleted', data));
 mcpServer.on('mcp_call', (data) => broadcast('mcp_call', data));
+// El progreso de un despliegue viaja por dos canales: las líneas de build van
+// al flujo de logs normal (deployManager las mete por containerOrchestrator, ya
+// etiquetadas con el projectId) y el cambio de fase va por aquí, estructurado,
+// para que el panel pinte la barra de progreso sin tener que parsear texto.
+deployManager.on('deploy_event', (data) => broadcast('deploy_event', data));
 
-function startServer(port = PORT, host = '0.0.0.0') {
+/**
+ * @param {number} port
+ * @param {string} host
+ * @param {{ reconcileIngress?: boolean }} [options]
+ *   `reconcileIngress: false` arranca el daemon sin reponer las rutas de los
+ *   despliegues en Caddy. Lo usan las pruebas: comparten un único Caddy y
+ *   `tests/caddy.test.js` cuenta rutas absolutas, así que un daemon que añade
+ *   las suyas al arrancar haría fallar esa suite en cuanto la máquina tuviera
+ *   un despliegue real. En producción se reponen siempre.
+ */
+function startServer(port = PORT, host = '0.0.0.0', { reconcileIngress = true } = {}) {
   return new Promise((resolve, reject) => {
     server.listen(port, host, () => {
       console.log(`\n========================================================`);
@@ -335,6 +354,22 @@ function startServer(port = PORT, host = '0.0.0.0') {
         console.log(`      exige token siempre con CULKIBO_REQUIRE_TOKEN=1`);
       }
       console.log(`========================================================\n`);
+
+      // Repone en Caddy las rutas de los despliegues que Culkibo cree activos.
+      // Si Caddy se reinició y perdió su configuración, el tráfico vuelve solo
+      // sin que nadie tenga que redesplegar. Es aditiva (nunca borra rutas
+      // ajenas) y no hace nada si no hay despliegues, así que no puede
+      // entorpecer el arranque.
+      if (reconcileIngress) {
+        deployManager.reconcileRoutes()
+          .then((result) => {
+            if (result.applied && result.applied.length > 0) {
+              console.log(`[Culkibo] Rutas de ingress repuestas: ${result.applied.join(', ')}`);
+            }
+          })
+          .catch(() => {});
+      }
+
       resolve(server);
     }).on('error', (err) => {
       console.error(`❌ Failed to start server on port ${port}:`, err.message);
