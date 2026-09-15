@@ -1,0 +1,44 @@
+{
+  "name": "culkibo",
+  "version": "1.0.0",
+  "description": "Orquestador cloud autohospedado para la era de los agentes de IA: recarga en caliente, SSL wildcard por Cloudflare y control nativo por MCP",
+  "main": "server/index.js",
+  "bin": {
+    "culkibo": "./bin/culkibo.js"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build",
+    "build": "npm --prefix web run build",
+    "test": "node tests/run-all.js && node tests/live-server.test.js && node tests/websocket-stress.test.js && node tests/stress.test.js",
+    "test:stress": "node tests/stress.test.js",
+    "cli": "node bin/culkibo.js"
+  },
+  "keywords": [
+    "culkibo",
+    "cloud",
+    "orchestrator",
+    "cloudflare",
+    "wildcard-ssl",
+    "mcp",
+    "hot-sync",
+    "docker",
+    "coolify-alternative"
+  ],
+  "author": "Pablo",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "chokidar": "^4.0.3",
+    "commander": "^13.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# Dependencias y artefactos de compilación
+# ---------------------------------------------------------------------------
+node_modules/
+web/node_modules/
+web/dist/
+*.log
+*.tsbuildinfo
+
+# ---------------------------------------------------------------------------
+# Secretos — NUNCA versionar
+#
+# Si algo de aquí acaba en un commit, no basta con borrarlo después: queda en
+# el historial para siempre. Ante la duda, no lo añadas.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# Claves privadas TLS emitidas por el gestor de certificados
+data/certs/
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Credenciales de servicios.
+# OJO: en .gitignore los comentarios NO pueden ir al final de una línea de
+# patrón — git se traga el comentario como parte del patrón y la regla deja de
+# funcionar en silencio. Cada comentario, en su propia línea.
+#
+# Personal Access Token de GitHub
+data/github.json
+# Token de API de Cloudflare
+data/cloudflare-config.json
+# Tokens de bot de Telegram y webhooks de Discord / Slack
+data/notifications.json
+
+# ---------------------------------------------------------------------------
+# Estado en tiempo de ejecución del daemon
+# Es de cada instalación: no pertenece al repositorio.
+# ---------------------------------------------------------------------------
+data/projects.json
+data/projects.json.bak
+data/projects.json.*.tmp
+data/domains.json
+data/backups/
+
+# Código de terceros clonado por el runner local
+projects/
+
+# ---------------------------------------------------------------------------
+# Ruido de desarrollo
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+screenshot*.png
+capture_*.js
+capture_*.mjs
+take_screenshot*.js
+take_screenshot*.mjs
