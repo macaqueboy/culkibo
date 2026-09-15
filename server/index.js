@@ -46,7 +46,13 @@ function escapeHtml(value) {
 }
 
 // Middleware
-app.use(cors({ origin: '*' }));
+const { authMiddleware, corsOptions, resolveToken, authStatus } = require('./middleware/auth');
+
+// `cors({ origin: '*' })` dejaba que cualquier web que el usuario visitase
+// pilotara el daemon desde su propio navegador. Ahora la lista de orígenes es
+// explícita y el resto del control de acceso vive en authMiddleware.
+app.use(cors(corsOptions()));
+app.set('trust proxy', 'loopback');
 app.use(express.json({
   limit: '10mb',
   verify: (req, res, buf) => {
@@ -58,6 +64,13 @@ app.use(express.urlencoded({ extended: true }));
 // REST API routes
 app.get('/health', (req, res) => res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() }));
 app.get('/api/health', (req, res) => res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() }));
+// Todo lo que cuelga de /api pasa por el control de acceso — incluido el
+// endpoint SSE del MCP, que se declara más abajo. Queda fuera a propósito el
+// router de ingress: esas peticiones vienen de internet contra un dominio
+// enrutado y no llevan credencial, que es justo lo que se espera.
+// /health y el webhook de GitHub están exentos dentro del propio middleware.
+app.use('/api', authMiddleware);
+
 app.use('/api', apiRouter);
 
 // Model Context Protocol SSE Endpoint for AI Agents (Cursor, Windsurf, Claude Desktop)
@@ -301,6 +314,16 @@ function startServer(port = PORT, host = '0.0.0.0') {
       console.log(`📡 REST API & MCP:    http://localhost:${port}/api`);
       console.log(`⚡ WebSocket Stream:  ws://localhost:${port}/ws`);
       console.log(`✨ Dashboard:         http://localhost:${port}`);
+
+      const auth = authStatus();
+      resolveToken(); // fuerza la creación del token en el primer arranque
+      console.log(`--------------------------------------------------------`);
+      console.log(`🔐 Acceso: token en ${auth.tokenSource}`);
+      console.log(`   Orígenes permitidos: ${auth.allowedOrigins.join(', ')}`);
+      if (host !== '127.0.0.1' && host !== 'localhost' && !auth.requireTokenAlways) {
+        console.log(`   ⚠  Escuchando en ${host}. Si el puerto es alcanzable desde fuera,`);
+        console.log(`      exige token siempre con CULKIBO_REQUIRE_TOKEN=1`);
+      }
       console.log(`========================================================\n`);
       resolve(server);
     }).on('error', (err) => {

@@ -104,6 +104,51 @@ async function testLiveServer() {
     assert.strictEqual(ghDetectData.framework, 'React (Vite)');
     console.log('  ✓ API /api/github/auto-detect responding with detected stack');
 
+    // ----------------------------------------------------------------------
+    // Control de acceso del plano de control.
+    //
+    // El daemon servía toda su API con cors('*') y sin credencial. El peligro
+    // no era solo un VPS expuesto: cualquier web que el usuario visitase podía
+    // pedirle cosas a localhost:3030 desde su propio navegador. Estas
+    // aserciones fijan las dos capas —origen y token— para que no se pierdan.
+    // ----------------------------------------------------------------------
+    const { resolveToken } = require('../server/middleware/auth');
+    const validToken = resolveToken();
+
+    const evilRes = await fetch('http://localhost:3031/api/projects', {
+      headers: { Origin: 'https://evil.example' }
+    });
+    assert.strictEqual(evilRes.status, 403, 'Un origen no autorizado debe recibir 403');
+
+    const ownOriginRes = await fetch('http://localhost:3031/api/projects', {
+      headers: { Origin: 'http://localhost:3030' }
+    });
+    assert.strictEqual(ownOriginRes.status, 200, 'El dashboard propio debe pasar');
+
+    const badTokenRes = await fetch('http://localhost:3031/api/projects', {
+      headers: { Authorization: 'Bearer token-que-no-vale' }
+    });
+    assert.strictEqual(badTokenRes.status, 401, 'Un token inválido debe recibir 401');
+
+    const goodTokenRes = await fetch('http://localhost:3031/api/projects', {
+      headers: { Authorization: `Bearer ${validToken}` }
+    });
+    assert.strictEqual(goodTokenRes.status, 200, 'Un token válido debe pasar (caso agente/CI)');
+
+    const localRes = await fetch('http://localhost:3031/api/projects');
+    assert.strictEqual(localRes.status, 200, 'El acceso local sin navegador sigue funcionando');
+
+    const healthRes = await fetch('http://localhost:3031/health', {
+      headers: { Origin: 'https://evil.example' }
+    });
+    assert.strictEqual(healthRes.status, 200, '/health queda abierto para monitorización');
+
+    // El token no puede filtrarse por ninguna respuesta.
+    const authStatusRes = await fetch('http://localhost:3031/api/system/status');
+    const statusBody = await authStatusRes.text();
+    assert.ok(!statusBody.includes(validToken), 'El token nunca debe aparecer en una respuesta');
+    console.log('  ✓ Control de acceso: origen ajeno 403, token inválido 401, local y agente 200');
+
     console.log('✅ Live Server, Ingress Router, Static Dashboard & GitHub APIs verified successfully!\n');
   } finally {
     await containerOrchestrator.stop();

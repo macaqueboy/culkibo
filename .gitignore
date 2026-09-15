@@ -63,3 +63,4 @@ capture_*.js
 capture_*.mjs
 take_screenshot*.js
 take_screenshot*.mjs
+data/auth.json
