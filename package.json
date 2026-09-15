@@ -15,7 +15,8 @@
     "test": "node tests/run-all.js && node tests/live-server.test.js && node tests/websocket-stress.test.js && node tests/stress.test.js",
     "test:stress": "node tests/stress.test.js",
     "cli": "node bin/culkibo.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "bench": "node bench/route-swap.bench.js"
   },
   "keywords": [
     "culkibo",

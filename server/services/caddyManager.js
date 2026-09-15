@@ -193,7 +193,7 @@ class CaddyManager {
    * Consecuencia de diseño: el certificado deja de ser un campo en nuestro
    * JSON. Eso es lo que hace imposible volver a falsearlo.
    */
-  buildBaseConfig({ askEndpoint, httpPort = 80, httpsPort = 443 }) {
+  buildBaseConfig({ askEndpoint, httpPort = 80, httpsPort = 443, automaticHttps = true }) {
     return {
       admin: { listen: this.adminUrl.replace(/^https?:\/\//, '') },
       apps: {
@@ -201,7 +201,12 @@ class CaddyManager {
           servers: {
             culkibo: {
               listen: [`:${httpPort}`, `:${httpsPort}`],
-              routes: []
+              routes: [],
+              // Caddy redirige HTTP→HTTPS por su cuenta en cuanto una ruta casa
+              // por nombre de dominio. Es lo correcto en producción, pero al
+              // medir el conmutador convierte cada respuesta en un 308 y
+              // falsea la medición. Solo el banco de pruebas lo desactiva.
+              ...(automaticHttps ? {} : { automatic_https: { disable: true } })
             }
           }
         },
