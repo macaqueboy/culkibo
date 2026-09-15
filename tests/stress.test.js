@@ -53,6 +53,29 @@ async function runStressTest() {
   const { ensureDaemon } = require('./helpers/daemon');
   await ensureDaemon({ quiet: true });
 
+  // Barrido PREVIO, no solo posterior.
+  //
+  // Esta prueba crea 25 proyectos y los borra al terminar, pero la latencia se
+  // mide antes de ese borrado, así que cualquier residuo de una ejecución que
+  // muriera a medias contamina la medición siguiente. Y se acumula: se llegaron
+  // a juntar 81 proyectos de prueba, y la latencia media subió de 55 ms a 137 ms
+  // sin que cambiara una línea de código. Un banco de pruebas que se degrada
+  // solo no mide nada.
+  const sweep = async () => {
+    const res = await fetchWithTiming(`${BASE_URL}/api/projects`);
+    let all = [];
+    try { all = JSON.parse(res.data); } catch (e) { return 0; }
+    if (!Array.isArray(all)) return 0;
+    const leftovers = all.filter(p => typeof p.name === 'string' && p.name.startsWith('stress-test'));
+    for (const p of leftovers) {
+      try { await fetchWithTiming(`${BASE_URL}/api/projects/${p.id}`, 'DELETE'); } catch (e) {}
+    }
+    return leftovers.length;
+  };
+
+  const swept = await sweep();
+  if (swept > 0) console.log(`Limpiados ${swept} proyectos residuales de ejecuciones anteriores`);
+
   console.log('Warming up connections...');
   await Promise.all([
     fetchWithTiming(`${BASE_URL}/api/system/status`),
