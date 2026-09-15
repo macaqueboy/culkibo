@@ -13,6 +13,7 @@ const sslManager = require('./services/sslManager');
 const mcpServer = require('./services/mcpServer');
 const mcpStreamableHttp = require('./services/mcpStreamableHttp');
 const projectManager = require('./services/projectManager');
+const databaseManager = require('./services/databaseManager');
 
 const app = express();
 const server = http.createServer(app);
@@ -324,6 +325,11 @@ projectManager.on('project_created', (data) => broadcast('project_created', data
 projectManager.on('project_deleted', (data) => broadcast('project_deleted', data));
 mcpServer.on('mcp_call', (data) => broadcast('mcp_call', data));
 
+databaseManager.on('backup_completed', (data) => broadcast('backup_completed', data));
+databaseManager.on('backup_failed', (data) => broadcast('backup_failed', data));
+databaseManager.on('database_created', (data) => broadcast('database_created', data));
+databaseManager.on('database_deleted', (data) => broadcast('database_deleted', data));
+
 function startServer(port = PORT, host = '0.0.0.0') {
   return new Promise((resolve, reject) => {
     server.listen(port, host, () => {
@@ -345,6 +351,16 @@ function startServer(port = PORT, host = '0.0.0.0') {
         console.log(`      exige token siempre con CULKIBO_REQUIRE_TOKEN=1`);
       }
       console.log(`========================================================\n`);
+
+      // El planificador de copias arranca con el daemon y sólo con el daemon.
+      // Su temporizador va con unref(), así que jamás impide que el proceso
+      // termine (importante en las pruebas y en `culkibo` de un solo comando).
+      try {
+        databaseManager.startScheduler();
+      } catch (e) {
+        console.warn('[Databases] No se pudo arrancar el planificador de copias:', e.message);
+      }
+
       resolve(server);
     }).on('error', (err) => {
       console.error(`❌ Failed to start server on port ${port}:`, err.message);
