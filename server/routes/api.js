@@ -97,9 +97,12 @@ router.delete('/projects/:id', (req, res) => {
   }
 });
 
-router.post('/projects/:id/activate', (req, res) => {
+router.post('/projects/:id/activate', async (req, res) => {
   try {
     const project = projectManager.activate(req.params.id);
+    // No se responde hasta que el cambio está en disco: si no, un cliente que
+    // lea inmediatamente después puede ver todavía el estado anterior.
+    await projectManager.flushToDisk();
     res.json(project);
   } catch (err) {
     res.status(404).json({ error: err.message });
@@ -134,6 +137,7 @@ router.post('/projects/:id/hibernate', async (req, res) => {
     } catch(e) {}
 
     const updated = projectManager.hibernate(req.params.id);
+    await projectManager.flushToDisk();
     res.json(updated);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -212,6 +216,7 @@ const handleStopProject = async (req, res) => {
     } catch(e) {}
 
     const updated = projectManager.stop(req.params.id);
+    await projectManager.flushToDisk();
     res.json(updated);
   } catch (err) {
     res.status(500).json({ error: err.message });

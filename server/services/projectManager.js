@@ -106,18 +106,38 @@ class ProjectManager extends EventEmitter {
     }
   }
 
-  async flushToDisk() {
+  /**
+   * Garantiza que el estado actual llega a disco, y devuelve una promesa que
+   * resuelve cuando lo ha hecho.
+   *
+   * La versión anterior hacía `if (this.isFlushing) { this.pendingFlush = true;
+   * return; }`: si ya había una escritura en vuelo, la segunda llamada volvía
+   * inmediatamente sin haber escrito nada. El llamante creía que el estado
+   * estaba persistido cuando aún no lo estaba, y como `stop()` lanza el flush
+   * sin esperarlo, una lectura inmediata de projects.json podía devolver el
+   * estado anterior. Se manifestaba como un test intermitente, que es la peor
+   * forma de manifestarse: parece mala suerte, no un fallo.
+   *
+   * Ahora las escrituras se encadenan. Cada llamada obtiene la promesa de una
+   * escritura que ocurre DESPUÉS de ella, así que esperarla siempre significa
+   * "mi cambio está en disco".
+   */
+  flushToDisk() {
     if (this.saveDebounceTimer) {
       clearTimeout(this.saveDebounceTimer);
       this.saveDebounceTimer = null;
     }
 
-    if (this.isFlushing) {
-      this.pendingFlush = true;
-      return;
-    }
-    this.isFlushing = true;
+    this.flushChain = (this.flushChain || Promise.resolve())
+      // Un fallo de escritura ya se registra dentro; no debe romper la cadena
+      // ni impedir que los cambios siguientes se intenten guardar.
+      .catch(() => {})
+      .then(() => this.writeSnapshot());
 
+    return this.flushChain;
+  }
+
+  async writeSnapshot() {
     let tempPath = null;
     try {
       const data = Array.from(this.projects.values());
@@ -170,13 +190,10 @@ class ProjectManager extends EventEmitter {
       if (tempPath) {
         try { await fs.promises.unlink(tempPath); } catch (e) {}
       }
-    } finally {
-      this.isFlushing = false;
-      if (this.pendingFlush) {
-        this.pendingFlush = false;
-        await this.flushToDisk();
-      }
     }
+    // Sin `finally` con reentrada: la serialización la garantiza la cadena de
+    // flushToDisk(). Volver a llamarse a sí misma desde aquí era lo que hacía
+    // imposible saber cuándo había terminado de verdad una escritura.
   }
 
   getAll() {
