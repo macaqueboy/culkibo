@@ -371,11 +371,11 @@ async function testGithub() {
 
     // 8. Model Context Protocol (MCP) GitHub AI Agent Tools
     const mcpStatusRes = await mcpServer.executeTool('culkibo_github_status', {});
-    assert.strictEqual(mcpStatusRes.isError, undefined);
+    assert.notStrictEqual(mcpStatusRes.isError, true);
     assert.ok(mcpStatusRes.content[0].text.includes('pablo-developer'));
 
     const mcpListRes = await mcpServer.executeTool('culkibo_github_list_repos', { search: 'voice' });
-    assert.strictEqual(mcpListRes.isError, undefined);
+    assert.notStrictEqual(mcpListRes.isError, true);
     assert.ok(mcpListRes.content[0].text.includes('ai-voice-agent'));
 
     const mcpDetectRes = await mcpServer.executeTool('culkibo_github_auto_detect', {
@@ -383,7 +383,7 @@ async function testGithub() {
       repo: 'culkibo-frontend',
       branch: 'main'
     });
-    assert.strictEqual(mcpDetectRes.isError, undefined);
+    assert.notStrictEqual(mcpDetectRes.isError, true);
     assert.ok(mcpDetectRes.content[0].text.includes('React (Vite)'));
 
     const mcpCreateRes = await mcpServer.executeTool('culkibo_create_project_from_github', {
@@ -392,7 +392,7 @@ async function testGithub() {
       branch: 'main',
       name: 'AI Voice Assistant Pod'
     });
-    assert.strictEqual(mcpCreateRes.isError, undefined);
+    assert.notStrictEqual(mcpCreateRes.isError, true);
     const createdMcpData = JSON.parse(mcpCreateRes.content[0].text);
     assert.strictEqual(createdMcpData.project.name, 'AI Voice Assistant Pod');
     assert.strictEqual(createdMcpData.project.source, 'github');

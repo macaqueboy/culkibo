@@ -8,6 +8,173 @@ const dockerManager = require('./dockerManager');
 const dbBackupManager = require('./dbBackupManager');
 const githubService = require('./githubService');
 
+// ---------------------------------------------------------------------------
+// Revisiones del protocolo.
+//
+// 2026-07-28 eliminó el handshake `initialize`: ya no hay negociación por
+// conexión, cada petición declara su propia versión en
+// `_meta["io.modelcontextprotocol/protocolVersion"]` y, sobre HTTP, también en
+// la cabecera `MCP-Protocol-Version`. Por eso el servidor valida por petición
+// y no guarda estado de sesión.
+//
+// `LEGACY_PROTOCOL_VERSION` es la era anterior (handshake `initialize`), que
+// seguimos sirviendo en /api/mcp/message y /api/mcp/sse para no romper las
+// configuraciones de Cursor y Claude Desktop ya instaladas. Está deprecada.
+// ---------------------------------------------------------------------------
+const PROTOCOL_VERSION = '2026-07-28';
+const SUPPORTED_PROTOCOL_VERSIONS = [PROTOCOL_VERSION];
+const LEGACY_PROTOCOL_VERSION = '2024-11-05';
+
+const META_PROTOCOL_VERSION = 'io.modelcontextprotocol/protocolVersion';
+const META_CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
+const META_CLIENT_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
+const META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
+
+// Prefijo propio para metadatos que no define la especificación. La segunda
+// etiqueta no puede ser `mcp` ni `modelcontextprotocol`: esas están reservadas.
+const META_CULKIBO_ERROR = 'dev.culkibo/error';
+
+const SERVER_INFO = { name: 'culkibo-mcp-orchestrator', version: '1.0.0' };
+
+// -32020..-32099 es el rango que la especificación se reserva. Solo se emiten
+// los códigos que ella define, y solo con su significado.
+const ERROR_CODES = {
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  INTERNAL_ERROR: -32603,
+  HEADER_MISMATCH: -32020,
+  MISSING_REQUIRED_CLIENT_CAPABILITY: -32021,
+  UNSUPPORTED_PROTOCOL_VERSION: -32022
+};
+
+// Métodos que sirve el transporte moderno. Cualquier otro es 404 + -32601.
+const MODERN_METHODS = ['server/discover', 'tools/list', 'tools/call'];
+
+// Métodos que obligan a enviar la cabecera `Mcp-Name`.
+const NAME_BEARING_METHODS = ['tools/call', 'resources/read', 'prompts/get'];
+
+/**
+ * Error de ejecución de herramienta con forma accionable.
+ *
+ * El cliente primario de Culkibo es un agente, no una persona leyendo un log.
+ * Un `Error` pelado le obliga a adivinar del texto si puede reintentar o si
+ * debe cambiar de argumentos; este lleva el código estable, si es reintentable
+ * y qué hacer a continuación.
+ */
+class McpToolError extends Error {
+  constructor(code, message, { retryable = false, remediation = null, details = {} } = {}) {
+    super(message);
+    this.name = 'McpToolError';
+    this.code = code;
+    this.retryable = retryable;
+    this.remediation = remediation;
+    this.details = details;
+  }
+}
+
+function jsonType(value) {
+  if (Array.isArray(value)) return 'array';
+  if (value === null) return 'null';
+  if (Number.isInteger(value)) return 'integer';
+  return typeof value;
+}
+
+function matchesSchemaType(value, expected) {
+  switch (expected) {
+    case 'string': return typeof value === 'string';
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'integer': return Number.isInteger(value);
+    case 'boolean': return typeof value === 'boolean';
+    case 'array': return Array.isArray(value);
+    case 'object': return value !== null && typeof value === 'object' && !Array.isArray(value);
+    default: return true;
+  }
+}
+
+/**
+ * Validación de argumentos contra el `inputSchema` declarado.
+ *
+ * Se hace aquí y no en cada `case` porque el fallo de un agente casi siempre es
+ * el mismo —falta un campo obligatorio o mete un valor fuera del enum— y ese
+ * fallo se corrige solo si la respuesta dice exactamente qué falta. Antes se
+ * colaba hasta el servicio y volvía como un `TypeError` ilegible.
+ */
+function validateToolArguments(tool, args) {
+  const schema = tool.inputSchema || {};
+  const properties = schema.properties || {};
+  const required = Array.isArray(schema.required) ? schema.required : [];
+
+  const missing = required.filter((key) => args[key] === undefined || args[key] === null);
+  if (missing.length > 0) {
+    throw new McpToolError(
+      'MISSING_ARGUMENT',
+      `Faltan argumentos obligatorios en ${tool.name}: ${missing.join(', ')}.`,
+      {
+        retryable: true,
+        remediation: `Repite la llamada incluyendo ${missing.join(', ')}.`,
+        details: { missing, required, received: Object.keys(args) }
+      }
+    );
+  }
+
+  for (const [key, value] of Object.entries(args)) {
+    const spec = properties[key];
+    if (!spec || value === undefined || value === null) continue;
+
+    if (Array.isArray(spec.enum) && !spec.enum.includes(value)) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${key}' de ${tool.name} no admite el valor ${JSON.stringify(value)}.`,
+        {
+          retryable: true,
+          remediation: `Usa uno de estos valores para '${key}': ${spec.enum.join(', ')}.`,
+          details: { argument: key, received: value, allowed: spec.enum }
+        }
+      );
+    }
+
+    if (spec.type && !matchesSchemaType(value, spec.type)) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${key}' de ${tool.name} debe ser de tipo ${spec.type}.`,
+        {
+          retryable: true,
+          remediation: `Convierte '${key}' a ${spec.type} y vuelve a llamar.`,
+          details: { argument: key, expectedType: spec.type, receivedType: jsonType(value) }
+        }
+      );
+    }
+  }
+}
+
+// Fallos de «no existe». Un agente los resuelve solo si la respuesta le dice
+// con qué herramienta obtener el identificador bueno, así que siempre lo dice.
+function projectNotFoundError(projectId) {
+  return new McpToolError('PROJECT_NOT_FOUND', `No existe ningún proyecto con el identificador '${projectId}'.`, {
+    retryable: false,
+    remediation: 'Llama a culkibo_list_projects y usa el campo id de uno de los proyectos devueltos.',
+    details: { projectId: projectId ?? null }
+  });
+}
+
+function resourceNotFoundError(projectId, resourceId) {
+  return new McpToolError('RESOURCE_NOT_FOUND', `El proyecto '${projectId}' no tiene ningún recurso llamado '${resourceId}'.`, {
+    retryable: false,
+    remediation: 'Llama a culkibo_get_project y usa el id o el name de uno de los recursos listados.',
+    details: { projectId: projectId ?? null, resourceId: resourceId ?? null }
+  });
+}
+
+function domainNotFoundError({ hostname, id }) {
+  return new McpToolError('DOMAIN_NOT_FOUND', `No hay ningún dominio configurado que coincida con '${hostname || id}'.`, {
+    retryable: false,
+    remediation: 'Llama a culkibo_manage_domain con action "list" para ver los dominios registrados y sus id.',
+    details: { hostname: hostname ?? null, id: id ?? null }
+  });
+}
+
 class McpServer extends EventEmitter {
   constructor() {
     super();
@@ -19,6 +186,8 @@ class McpServer extends EventEmitter {
     return [
       {
         name: 'culkibo_create_project',
+        title: 'Crear proyecto',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
         description: 'Permite a la IA crear un nuevo proyecto (nombre, descripción, icono, gitRepo, puertos, etc.).',
         inputSchema: {
           type: 'object',
@@ -35,6 +204,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_add_resource',
+        title: 'Añadir recurso a un proyecto',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
         description: 'Permite a la IA añadir un recurso a un proyecto (tipo: app, database, service).',
         inputSchema: {
           type: 'object',
@@ -52,11 +223,21 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_list_projects',
+        title: 'Listar proyectos',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            projects: { type: 'array', description: 'Proyectos con sus recursos y estado.' }
+          }
+        },
         description: 'Lista todos los proyectos con sus recursos y estados.',
         inputSchema: { type: 'object', properties: {} }
       },
       {
         name: 'culkibo_get_project',
+        title: 'Ver un proyecto',
+        annotations: { readOnlyHint: true, openWorldHint: false },
         description: 'Obtiene los detalles completos de un proyecto.',
         inputSchema: {
           type: 'object',
@@ -66,6 +247,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_set_project_env',
+        title: 'Inyectar variables de entorno',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Permite a la IA inyectar o actualizar variables de entorno de un proyecto o recurso específico.',
         inputSchema: {
           type: 'object',
@@ -79,6 +262,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_deploy_project',
+        title: 'Desplegar proyecto',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Despliega o publica un proyecto.',
         inputSchema: {
           type: 'object',
@@ -88,6 +273,19 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_list_pods',
+        title: 'Estado de los pods',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            pods: { type: 'object', description: 'Estado de The Forge y The Citadel.' },
+            trafficAllocation: { type: 'object', description: 'Reparto de tráfico en porcentaje.' },
+            totalRequestsServed: { type: 'number' },
+            activeConnections: { type: 'number' },
+            daemon: { type: 'object' },
+            localProcesses: { type: 'object' }
+          }
+        },
         description: 'Inspect live status, metrics (CPU, RAM, latency), and traffic split between The Forge (hot-pod) and The Citadel (production).',
         inputSchema: {
           type: 'object',
@@ -96,6 +294,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_hot_sync',
+        title: 'Registrar cambio en The Forge',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
         description: 'Register a code change against The Forge. NOTE: detection and classification only — the change is not yet transported to or applied on the pod. Returns applied:false.',
         inputSchema: {
           type: 'object',
@@ -107,6 +307,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_switch_traffic',
+        title: 'Repartir tráfico entre Forge y Citadel',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Instantly re-route incoming traffic between The Forge (dev) and The Citadel (prod).',
         inputSchema: {
           type: 'object',
@@ -119,6 +321,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_manage_domain',
+        title: 'Gestionar dominios',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Add or configure custom domain, wildcard domain, or Cloudflare edge routing.',
         inputSchema: {
           type: 'object',
@@ -135,6 +339,31 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_inspect_ingress',
+        title: 'Inspeccionar el enrutado de ingress',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            hostname: { type: 'string' },
+            found: { type: 'boolean' },
+            matchedRoute: {
+              type: ['string', 'null']
+            },
+            isWildcard: { type: 'boolean' },
+            targetPod: {
+              type: ['string', 'null']
+            },
+            targetPort: {
+              type: ['number', 'null']
+            },
+            cloudflareProxied: { type: 'boolean' },
+            tlsIssuer: {
+              type: ['string', 'null']
+            },
+            tlsActive: { type: 'boolean' },
+            trafficSplit: { type: 'object' }
+          }
+        },
         description: 'Inspect edge ingress route resolution and TLS status for an incoming Host header.',
         inputSchema: {
           type: 'object',
@@ -146,6 +375,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_manage_watcher',
+        title: 'Gestionar el vigilante de ficheros',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         description: 'Start, stop, or inspect the directory watcher that detects code changes for The Forge.',
         inputSchema: {
           type: 'object',
@@ -158,6 +389,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_issue_wildcard_ssl',
+        title: 'Emitir certificado wildcard (ACME DNS-01)',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
         description: 'Trigger Let\'s Encrypt ACME DNS-01 wildcard SSL certificate issuance via Cloudflare DNS-01 challenge.',
         inputSchema: {
           type: 'object',
@@ -171,6 +404,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_create_sslip_domain',
+        title: 'Crear dominio comodín instantáneo',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
         description: 'Generate instant Zero-Config wildcard domain with On-Demand TLS (e.g. *.127-0-0-1.sslip.io).',
         inputSchema: {
           type: 'object',
@@ -182,6 +417,14 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_get_logs',
+        title: 'Leer logs de los pods',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            logs: { type: 'array', description: 'Líneas de log más recientes, de la más nueva a la más antigua.' }
+          }
+        },
         description: 'Retrieve real-time streaming or historical container logs from pods.',
         inputSchema: {
           type: 'object',
@@ -194,6 +437,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_docker_status',
+        title: 'Estado del motor Docker',
+        annotations: { readOnlyHint: true, openWorldHint: false },
         description: 'Comprueba el estado del motor Docker (modo nativo vs simulación sandbox), límites de memoria y contenedores.',
         inputSchema: {
           type: 'object',
@@ -204,6 +449,14 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_docker_containers',
+        title: 'Listar contenedores Docker',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            containers: { type: 'array' }
+          }
+        },
         description: 'Lista los contenedores Docker activos o en modo sandbox con sus puertos, estados y métricas.',
         inputSchema: {
           type: 'object',
@@ -215,6 +468,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_export_backup',
+        title: 'Exportar backup de un proyecto',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
         description: 'Genera un backup exportable completo de un proyecto (metadata, volúmenes, envs, dominios).',
         inputSchema: {
           type: 'object',
@@ -226,6 +481,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_restore_backup',
+        title: 'Restaurar un proyecto desde backup',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
         description: 'Restaura un proyecto completo a partir de un archivo de backup JSON.',
         inputSchema: {
           type: 'object',
@@ -237,11 +494,15 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_github_status',
+        title: 'Estado de la conexión con GitHub',
+        annotations: { readOnlyHint: true, openWorldHint: false },
         description: 'Obtiene el estado de conexión con GitHub y el usuario vinculado en Culkibo.',
         inputSchema: { type: 'object', properties: {} }
       },
       {
         name: 'culkibo_github_connect',
+        title: 'Conectar una cuenta de GitHub',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
         description: 'Conecta un Personal Access Token (PAT) de GitHub con permisos de repo a Culkibo.',
         inputSchema: {
           type: 'object',
@@ -253,11 +514,15 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_github_disconnect',
+        title: 'Desconectar la cuenta de GitHub',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Desvincula la cuenta de GitHub de Culkibo.',
         inputSchema: { type: 'object', properties: {} }
       },
       {
         name: 'culkibo_github_list_repos',
+        title: 'Listar repositorios de GitHub',
+        annotations: { readOnlyHint: true, openWorldHint: true },
         description: 'Lista los repositorios accesibles en la cuenta de GitHub conectada con soporte de búsqueda y paginación.',
         inputSchema: {
           type: 'object',
@@ -270,6 +535,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_github_get_branches',
+        title: 'Listar ramas de un repositorio',
+        annotations: { readOnlyHint: true, openWorldHint: true },
         description: 'Lista las ramas disponibles en un repositorio de GitHub.',
         inputSchema: {
           type: 'object',
@@ -282,6 +549,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_github_auto_detect',
+        title: 'Autodetectar el stack de un repositorio',
+        annotations: { readOnlyHint: true, openWorldHint: true },
         description: 'Analiza automáticamente el código fuente de un repositorio de GitHub para inferir su stack tecnológico, comandos de build/start y puertos.',
         inputSchema: {
           type: 'object',
@@ -295,6 +564,8 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_create_project_from_github',
+        title: 'Importar y desplegar desde GitHub',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
         description: 'Importa, autodetecta y despliega automáticamente un proyecto directamente desde GitHub.',
         inputSchema: {
           type: 'object',
@@ -312,7 +583,7 @@ class McpServer extends EventEmitter {
     ];
   }
 
-  logCall(toolName, args, result, success = true, durationMs = 0) {
+  logCall(toolName, args, result, success = true, durationMs = 0, transport = 'MCP stdio/sse') {
     const entry = {
       id: `mcp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       timestamp: new Date().toISOString(),
@@ -321,7 +592,10 @@ class McpServer extends EventEmitter {
       resultSummary: typeof result === 'object' ? JSON.stringify(result).slice(0, 160) : String(result),
       success,
       durationMs: Math.round(durationMs),
-      agent: 'AI Assistant (MCP stdio/sse)'
+      // El transporte deja de ser una cadena fija: ahora hay dos eras vivas y
+      // la auditoría tiene que decir por cuál entró cada llamada.
+      transport,
+      agent: `AI Assistant (${transport})`
     };
     this.auditLog.unshift(entry);
     if (this.auditLog.length > this.maxAuditLogs) this.auditLog.pop();
@@ -333,9 +607,29 @@ class McpServer extends EventEmitter {
     return this.auditLog.slice(0, limit);
   }
 
-  async executeTool(toolName, args = {}) {
+  /**
+   * Ejecuta una herramienta y devuelve el `CallToolResult` neutro respecto a la
+   * era: `resultType` lo añade solo el manejador moderno, porque 2024-11-05 no
+   * lo define y no queremos meterlo en respuestas de la era antigua.
+   *
+   * @param {string} toolName
+   * @param {object} args
+   * @param {{ transport?: string }} context
+   */
+  async executeTool(toolName, args = {}, context = {}) {
     const start = performance.now();
+    const transport = context.transport || 'MCP stdio/sse';
+    const tool = this.getToolsDefinition().find((t) => t.name === toolName);
     try {
+      if (!tool) {
+        throw new McpToolError('UNKNOWN_TOOL', `Esta instalación de Culkibo no expone ninguna herramienta llamada '${toolName}'.`, {
+          retryable: false,
+          remediation: 'Llama a tools/list para ver el catálogo vigente y usa uno de esos nombres.',
+          details: { requested: toolName }
+        });
+      }
+      validateToolArguments(tool, args);
+
       let res;
       switch (toolName) {
         case 'culkibo_create_project':
@@ -351,7 +645,7 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_add_resource': {
           const project = projectManager.getById(args.projectId);
-          if (!project) throw new Error('Project not found');
+          if (!project) throw projectNotFoundError(args.projectId);
           const resource = {
             id: `res_${Date.now()}`,
             type: args.type,
@@ -374,15 +668,15 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_get_project':
           res = projectManager.getById(args.projectId);
-          if (!res) throw new Error('Project not found');
+          if (!res) throw projectNotFoundError(args.projectId);
           break;
 
         case 'culkibo_set_project_env': {
           const project = projectManager.getById(args.projectId);
-          if (!project) throw new Error('Project not found');
+          if (!project) throw projectNotFoundError(args.projectId);
           if (args.resourceId) {
             const resource = project.resources?.find(r => r.id === args.resourceId || r.name === args.resourceId);
-            if (!resource) throw new Error('Resource not found');
+            if (!resource) throw resourceNotFoundError(args.projectId, args.resourceId);
             resource.envVars = { ...(resource.envVars || {}), ...args.envVars };
           } else {
             project.envVars = { ...(project.envVars || {}), ...args.envVars };
@@ -426,17 +720,17 @@ class McpServer extends EventEmitter {
           } else if (args.action === 'delete') {
             const list = domainManager.listDomains();
             const found = list.find(d => d.hostname === args.hostname || d.id === args.id);
-            if (!found) throw new Error('Domain not found');
+            if (!found) throw domainNotFoundError(args);
             res = await domainManager.deleteDomain(found.id);
           } else if (args.action === 'toggle_proxy') {
             const list = domainManager.listDomains();
             const found = list.find(d => d.hostname === args.hostname || d.id === args.id);
-            if (!found) throw new Error('Domain not found');
+            if (!found) throw domainNotFoundError(args);
             res = await domainManager.toggleProxy(found.id);
           } else if (args.action === 'update') {
             const list = domainManager.listDomains();
             const found = list.find(d => d.hostname === args.hostname || d.id === args.id);
-            if (!found) throw new Error('Domain not found');
+            if (!found) throw domainNotFoundError(args);
             const updates = {};
             if (args.targetPod) updates.targetPod = args.targetPod;
             if (args.targetPort) updates.targetPort = args.targetPort;
@@ -581,23 +875,78 @@ class McpServer extends EventEmitter {
         }
 
         default:
-          throw new Error(`Unknown tool: ${toolName}`);
+          // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
+          throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
+            retryable: false,
+            remediation: 'Repórtalo como fallo de Culkibo: el catálogo y el despachador no coinciden.',
+            details: { requested: toolName }
+          });
       }
 
       const durationMs = performance.now() - start;
-      this.logCall(toolName, args, res, true, durationMs);
-      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      this.logCall(toolName, args, res, true, durationMs, transport);
+
+      const result = {
+        content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
+        isError: false
+      };
+      // `structuredContent` evita que el agente tenga que reparsear el texto.
+      // Solo se adjunta si el resultado es JSON estructurado, porque un
+      // escalar suelto no aporta nada frente al bloque de texto.
+      if (res !== null && typeof res === 'object') result.structuredContent = res;
+      return result;
     } catch (err) {
       const durationMs = performance.now() - start;
-      this.logCall(toolName, args, { error: err.message }, false, durationMs);
+      const envelope = this.describeToolFailure(toolName, tool, err, durationMs);
+      this.logCall(toolName, args, { error: envelope.code, message: envelope.message }, false, durationMs, transport);
       return {
         isError: true,
-        content: [{ type: 'text', text: `Error executing ${toolName}: ${err.message}` }]
+        // El error va como JSON en el bloque de texto —no como prosa— para que
+        // el agente lea `code`, `retryable` y `remediation` sin adivinar. No se
+        // adjunta `structuredContent`: ese campo está contratado por el
+        // `outputSchema` de la herramienta, que describe el éxito, no el fallo.
+        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
+        _meta: { [META_CULKIBO_ERROR]: envelope }
       };
     }
   }
 
-  // Handle standard JSON-RPC 2.0 MCP requests
+  /**
+   * Convierte cualquier excepción en un sobre que un agente pueda accionar.
+   *
+   * Los errores que no vienen ya tipados se clasifican por la anotación
+   * `openWorldHint` de la herramienta: si habla con un tercero (Cloudflare,
+   * GitHub, una CA ACME) el fallo es casi siempre transitorio y reintentarlo
+   * tiene sentido; si es local, reintentar sin cambiar nada solo repite el
+   * fallo.
+   */
+  describeToolFailure(toolName, tool, err, durationMs) {
+    const typed = err instanceof McpToolError;
+    const openWorld = Boolean(tool && tool.annotations && tool.annotations.openWorldHint);
+    return {
+      ok: false,
+      tool: toolName,
+      code: typed ? err.code : (openWorld ? 'UPSTREAM_ERROR' : 'INTERNAL_ERROR'),
+      message: err && err.message ? err.message : String(err),
+      retryable: typed ? err.retryable : openWorld,
+      remediation: typed
+        ? err.remediation
+        : (openWorld
+          ? 'El servicio externo falló o no respondió. Reintenta en unos segundos; si persiste, comprueba credenciales y conectividad.'
+          : 'Revisa los argumentos y el estado del daemon con culkibo_docker_status o culkibo_list_pods antes de reintentar.'),
+      details: typed ? err.details : {},
+      durationMs: Math.round(durationMs),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Era antigua (2024-11-05): handshake `initialize` y sesión implícita.
+  //
+  // DEPRECADO. Se mantiene porque romper las configuraciones ya instaladas de
+  // Cursor y Claude Desktop sería peor que arrastrarlo, pero no recibe
+  // funciones nuevas: lo nuevo vive en `handleModernRpc`.
+  // -------------------------------------------------------------------------
   async handleJsonRpc(request) {
     const { id, method, params } = request;
 
@@ -606,12 +955,10 @@ class McpServer extends EventEmitter {
         jsonrpc: '2.0',
         id,
         result: {
-          protocolVersion: '2024-11-05',
+          protocolVersion: LEGACY_PROTOCOL_VERSION,
           capabilities: { tools: {} },
-          serverInfo: {
-            name: 'culkibo-mcp-orchestrator',
-            version: '1.0.0'
-          }
+          serverInfo: SERVER_INFO,
+          instructions: `Este endpoint habla la revisión ${LEGACY_PROTOCOL_VERSION}, deprecada. Culkibo ya sirve la revisión ${PROTOCOL_VERSION} en POST /api/mcp (Streamable HTTP, sin handshake).`
         }
       };
     }
@@ -629,7 +976,7 @@ class McpServer extends EventEmitter {
     if (method === 'tools/call') {
       const toolName = params?.name;
       const args = params?.arguments || {};
-      const toolResult = await this.executeTool(toolName, args);
+      const toolResult = await this.executeTool(toolName, args, { transport: `MCP ${LEGACY_PROTOCOL_VERSION} (deprecado)` });
       return {
         jsonrpc: '2.0',
         id,
@@ -641,8 +988,90 @@ class McpServer extends EventEmitter {
       jsonrpc: '2.0',
       id,
       error: {
-        code: -32601,
-        message: `Method '${method}' not found`
+        code: ERROR_CODES.METHOD_NOT_FOUND,
+        message: `Method '${method}' not found`,
+        data: {
+          supported: ['initialize', 'tools/list', 'tools/call'],
+          hint: `Este endpoint sirve la revisión ${LEGACY_PROTOCOL_VERSION}. Para ${PROTOCOL_VERSION} usa POST /api/mcp.`
+        }
+      }
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Era moderna (2026-07-28): sin handshake, sin sesión, versión por petición.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Respuesta de `server/discover`: versiones, capacidades e identidad en una
+   * sola llamada. La especificación la hace obligatoria.
+   */
+  getDiscoverResult() {
+    return {
+      supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+      capabilities: {
+        // `listChanged: false` es la verdad: el catálogo es estático en el
+        // proceso, así que no prometemos notificaciones que nunca emitiríamos.
+        tools: { listChanged: false }
+      },
+      instructions: [
+        'Culkibo es un orquestador cloud autohospedado. Sus herramientas gestionan proyectos, pods (The Forge para desarrollo y The Citadel para producción), dominios, certificados TLS, contenedores Docker, copias de seguridad y la integración con GitHub.',
+        'Empieza por culkibo_list_projects y culkibo_list_pods para situarte antes de modificar nada.',
+        'Las herramientas anotadas con destructiveHint cambian tráfico en producción, sobrescriben credenciales o borran estado: confírmalas con la persona usuaria antes de llamarlas.',
+        'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation: úsalo para decidir si reintentar o corregir los argumentos.'
+      ].join(' '),
+      // El catálogo no depende de quién pregunte, así que la respuesta es
+      // cacheable por cualquiera.
+      ttlMs: 300000,
+      cacheScope: 'public'
+    };
+  }
+
+  /**
+   * Despacha una petición JSON-RPC de la revisión 2026-07-28.
+   *
+   * Solo recibe peticiones ya validadas por el transporte (cabeceras, `_meta`,
+   * versión). Lo único que puede fallar aquí es el método o la herramienta.
+   *
+   * @param {object} request mensaje JSON-RPC completo
+   * @param {{ transport?: string, isCancelled?: () => boolean }} context
+   */
+  async handleModernRpc(request, context = {}) {
+    const { id, method, params } = request;
+    const transport = context.transport || `MCP ${PROTOCOL_VERSION}`;
+
+    const ok = (result) => ({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        resultType: 'complete',
+        ...result,
+        _meta: { ...(result._meta || {}), [META_SERVER_INFO]: SERVER_INFO }
+      }
+    });
+
+    if (method === 'server/discover') {
+      return ok(this.getDiscoverResult());
+    }
+
+    if (method === 'tools/list') {
+      return ok({ tools: this.getToolsDefinition(), ttlMs: 60000, cacheScope: 'public' });
+    }
+
+    if (method === 'tools/call') {
+      const toolName = params?.name;
+      const args = params?.arguments || {};
+      const toolResult = await this.executeTool(toolName, args, { transport });
+      return ok(toolResult);
+    }
+
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: {
+        code: ERROR_CODES.METHOD_NOT_FOUND,
+        message: `Este servidor no implementa el método '${method}'.`,
+        data: { method, supported: MODERN_METHODS }
       }
     };
   }
@@ -660,15 +1089,51 @@ class McpServer extends EventEmitter {
           }
         }
       },
+      // Clientes con transporte HTTP: el endpoint moderno, un solo POST.
       cursorOrWindsurf: {
+        mcpServers: {
+          culkibo: {
+            url: `${serverUrl}/api/mcp`
+          }
+        }
+      },
+      // Solo para clientes que aún no hablan 2026-07-28. Ver README.
+      legacySse: {
+        deprecated: true,
+        protocolVersion: LEGACY_PROTOCOL_VERSION,
+        note: `Transporte HTTP+SSE deprecado desde la revisión 2025-03-26. Migra a ${serverUrl}/api/mcp.`,
         mcpServers: {
           culkibo: {
             url: `${serverUrl}/api/mcp/sse`
           }
         }
+      },
+      protocol: {
+        current: PROTOCOL_VERSION,
+        supported: SUPPORTED_PROTOCOL_VERSIONS,
+        endpoint: `${serverUrl}/api/mcp`,
+        legacyEndpoint: `${serverUrl}/api/mcp/sse`
       }
     };
   }
 }
 
-module.exports = new McpServer();
+const mcpServer = new McpServer();
+
+// Constantes del protocolo, para que el transporte no las duplique.
+mcpServer.protocol = {
+  PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  LEGACY_PROTOCOL_VERSION,
+  META_PROTOCOL_VERSION,
+  META_CLIENT_INFO,
+  META_CLIENT_CAPABILITIES,
+  META_SERVER_INFO,
+  ERROR_CODES,
+  MODERN_METHODS,
+  NAME_BEARING_METHODS,
+  SERVER_INFO
+};
+mcpServer.McpToolError = McpToolError;
+
+module.exports = mcpServer;

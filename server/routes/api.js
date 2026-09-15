@@ -6,6 +6,7 @@ const domainManager = require('../services/domainManager');
 const sslManager = require('../services/sslManager');
 const cloudflareService = require('../services/cloudflareService');
 const mcpServer = require('../services/mcpServer');
+const mcpStreamableHttp = require('../services/mcpStreamableHttp');
 const projectManager = require('../services/projectManager');
 const coolifyMigrator = require('../services/coolifyMigrator');
 const dockerManager = require('../services/dockerManager');
@@ -663,6 +664,14 @@ router.get('/logs', (req, res) => {
 });
 
 // --- MCP ---
+// Endpoint MCP de la revisión 2026-07-28 (Streamable HTTP). Cuelga de /api, así
+// que hereda el control de origen y de token de authMiddleware: la
+// especificación exige validar `Origin` y responder 403, y eso ya lo hace él.
+router.post('/mcp', mcpStreamableHttp.handlePost);
+// GET y DELETE eran el stream independiente y el cierre de sesión del
+// transporte anterior. Esta revisión los eliminó: 405 con la cabecera Allow.
+router.all('/mcp', mcpStreamableHttp.handleMethodNotAllowed);
+
 router.get('/mcp/tools', (req, res) => {
   try {
     res.json({ tools: mcpServer.getToolsDefinition() });
@@ -671,8 +680,11 @@ router.get('/mcp/tools', (req, res) => {
   }
 });
 
+// DEPRECADO: endpoint de mensajes del transporte HTTP+SSE (revisión
+// 2024-11-05). Se mantiene para no romper las configuraciones ya instaladas.
 router.post('/mcp/message', async (req, res) => {
   try {
+    mcpStreamableHttp.markLegacyTransport(res, 'POST /api/mcp/message');
     const response = await mcpServer.handleJsonRpc(req.body);
     res.json(response);
   } catch (err) {

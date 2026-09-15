@@ -11,6 +11,7 @@ const containerOrchestrator = require('./services/containerOrchestrator');
 const domainManager = require('./services/domainManager');
 const sslManager = require('./services/sslManager');
 const mcpServer = require('./services/mcpServer');
+const mcpStreamableHttp = require('./services/mcpStreamableHttp');
 const projectManager = require('./services/projectManager');
 
 const app = express();
@@ -80,8 +81,15 @@ app.use('/api', authMiddleware);
 
 app.use('/api', apiRouter);
 
-// Model Context Protocol SSE Endpoint for AI Agents (Cursor, Windsurf, Claude Desktop)
+// DEPRECADO — transporte HTTP+SSE de la revisión 2024-11-05.
+//
+// El endpoint vivo es POST /api/mcp (Streamable HTTP, revisión 2026-07-28), que
+// se declara en routes/api.js. Este se mantiene solo para que las
+// configuraciones de Cursor, Windsurf y Claude Desktop ya instaladas sigan
+// funcionando: HTTP+SSE está deprecado desde la revisión 2025-03-26 y es el
+// primero de la lista para desaparecer de la especificación.
 app.get('/api/mcp/sse', (req, res) => {
+  mcpStreamableHttp.markLegacyTransport(res, 'GET /api/mcp/sse');
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -321,7 +329,9 @@ function startServer(port = PORT, host = '0.0.0.0') {
     server.listen(port, host, () => {
       console.log(`\n========================================================`);
       console.log(`🚀 Culkibo Orchestrator v1.0.0 Daemon running`);
-      console.log(`📡 REST API & MCP:    http://localhost:${port}/api`);
+      console.log(`📡 REST API:          http://localhost:${port}/api`);
+      console.log(`🤖 MCP ${mcpServer.protocol.PROTOCOL_VERSION}:     POST http://localhost:${port}/api/mcp`);
+      console.log(`   MCP ${mcpServer.protocol.LEGACY_PROTOCOL_VERSION}:      http://localhost:${port}/api/mcp/sse  (deprecado)`);
       console.log(`⚡ WebSocket Stream:  ws://localhost:${port}/ws`);
       console.log(`✨ Dashboard:         http://localhost:${port}`);
 

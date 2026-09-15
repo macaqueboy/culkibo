@@ -296,7 +296,7 @@ export const SettingsView: React.FC = () => {
           <div className="p-4 bg-slate-50 rounded-xl border border-slate-200/80 flex items-center justify-between">
             <div>
               <div className="text-slate-900 font-semibold text-sm">Control Nativo por IA (MCP)</div>
-              <div className="text-slate-500 text-xs mt-0.5">Autonomía de Cursor, Windsurf y Claude vía stdio y SSE</div>
+              <div className="text-slate-500 text-xs mt-0.5">Autonomía de Cursor, Windsurf y Claude vía stdio y Streamable HTTP (revisión 2026-07-28)</div>
             </div>
             <span className="text-emerald-700 font-semibold flex items-center gap-1 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full text-[11px]">
               <CheckCircle2 className="w-3.5 h-3.5" /> ACTIVO

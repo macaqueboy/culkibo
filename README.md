@@ -18,7 +18,7 @@ instalarlo, esto es lo que te vas a encontrar:
 |---|---|
 | **Ejecución local de proyectos** | Clona de GitHub, detecta monorepos (`/backend`, `/web`, `/src`…), instala dependencias, lanza el proceso y asigna puertos. Node, Vite, Next.js y sitios estáticos |
 | **Ciclo de vida** | Arrancar, parar, hibernar y activar, matando de verdad el árbol de procesos y liberando el puerto en Windows y en Linux |
-| **Servidor MCP** | 26 herramientas, registro de auditoría, transporte stdio y SSE |
+| **Servidor MCP** | Revisión `2026-07-28` sobre Streamable HTTP, `server/discover`, 26 herramientas anotadas (`readOnlyHint`, `destructiveHint`…), errores accionables, auditoría y transporte stdio |
 | **Webhooks de GitHub** | Firma HMAC verificada, despliegue automático al hacer push |
 | **Migrador de Coolify** | Extracción real desde la API v4: aplicaciones, bases de datos, volúmenes, variables |
 | **API de Cloudflare** | Zonas, registros DNS y túneles reales. Sin token entra en modo simulado y lo dice (`isMock: true`) |
@@ -167,16 +167,43 @@ o por la API REST; todavía no tiene comandos propios en la CLI.
 }
 ```
 
-**Cursor, Windsurf y compatibles** — añade el endpoint SSE:
+**Cursor, Windsurf y compatibles** — un solo endpoint, solo POST:
 
 ```
-http://localhost:3030/api/mcp/sse
+http://localhost:3030/api/mcp
 ```
 
-> El servidor MCP declara la revisión `2024-11-05` sobre transporte HTTP+SSE, que está
-> deprecado desde marzo de 2025. La migración a Streamable HTTP está en la
-> especificación. Funciona hoy con los clientes actuales, pero no es la versión vigente
-> del protocolo.
+Ese endpoint habla la revisión vigente **`2026-07-28`** (Streamable HTTP). Lo que implica
+para quien escriba un cliente a mano:
+
+- **No hay handshake.** `initialize` ya no existe. Cada petición declara su versión en
+  `_meta["io.modelcontextprotocol/protocolVersion"]` y en la cabecera
+  `MCP-Protocol-Version`. Si no coinciden, la respuesta es `400` con `-32020`.
+- **Cabeceras obligatorias**: `MCP-Protocol-Version`, `Mcp-Method` y, en `tools/call`,
+  `Mcp-Name`. El servidor comprueba que coinciden con el cuerpo.
+- **`server/discover`** devuelve versiones soportadas, capacidades e identidad en una
+  llamada. Una versión que no se sirve responde `400` con `-32022` y la lista de las que sí.
+- **Solo POST**: `GET` y `DELETE` responden `405`. No hay sesiones (`Mcp-Session-Id` se
+  ignora) ni reanudación (`Last-Event-ID` se ignora).
+- Una notificación se contesta con `202` sin cuerpo. Si la petición trae `progressToken`,
+  la respuesta llega como `text/event-stream`; **cerrar ese stream es la cancelación**.
+
+```bash
+curl -s http://localhost:3030/api/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: server/discover' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+> **Deprecado:** `http://localhost:3030/api/mcp/sse` (y su `POST /api/mcp/message`) sigue
+> sirviendo la revisión `2024-11-05` sobre HTTP+SSE para no romper las configuraciones ya
+> instaladas. Ese transporte está deprecado desde la revisión `2025-03-26` y es el primero
+> de la lista para desaparecer de la especificación: sus respuestas llevan `Deprecation:
+> true` y el daemon lo avisa en el log. Migra a `/api/mcp` en cuanto tu cliente lo soporte.
 
 ---
 
@@ -194,7 +221,7 @@ Levanta su propio daemon si no encuentra uno, así que funciona en frío y en CI
 | `ssl.test.js` | Registro de certificados, TLS bajo demanda, caducidades |
 | `domain.test.js` | Rutas exactas y comodín, incluida la frontera de etiqueta |
 | `orchestrator.test.js` | Detección de cambios, reparto de tráfico, watchers |
-| `mcp.test.js` | JSON-RPC 2.0, catálogo de herramientas, auditoría |
+| `mcp.test.js` | JSON-RPC 2.0, catálogo y anotaciones, auditoría, transporte Streamable HTTP `2026-07-28` (validación de cabeceras, `server/discover`, 405, 202, SSE) |
 | `backup.test.js` | Exportación, restauración y volcados sin shell |
 | `github.test.js` | HMAC de webhooks y despliegue automático |
 | `coolifyMigrator.test.js` | Extracción y agrupación desde la API de Coolify |
@@ -221,7 +248,8 @@ server/
     cloudflareService.js    API de Cloudflare (real + modo simulado)
     sslManager.js           registro de certificados  ⚠ ACME simulado
     domainManager.js        dominios y tabla de enrutado
-    mcpServer.js            servidor MCP (26 herramientas)
+    mcpServer.js            servidor MCP (26 herramientas anotadas, dos eras)
+    mcpStreamableHttp.js    transporte Streamable HTTP de la revisión 2026-07-28
     githubService.js        OAuth, repos y webhooks
     coolifyMigrator.js      importación desde Coolify v4
     notificationService.js  Telegram, Discord, Slack, webhook
