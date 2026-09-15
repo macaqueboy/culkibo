@@ -137,6 +137,7 @@ class ProjectManager extends EventEmitter {
     return this.flushChain;
   }
 
+  /** Escritura atómica de una instantánea. La llama solo `flushToDisk()`. */
   async writeSnapshot() {
     let tempPath = null;
     try {

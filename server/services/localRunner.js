@@ -159,12 +159,31 @@ class LocalRunner {
   }
 
   /**
+   * The port the daemon itself listens on. Nothing here may ever touch it.
+   */
+  daemonPort() {
+    const port = parseInt(process.env.PORT || '3030', 10);
+    return isNaN(port) ? 3030 : port;
+  }
+
+  /**
    * Ensure port is free by killing any lingering zombie process on that port
+   *
+   * Refuses to touch the daemon's own port. `start-local` assigns unset project
+   * ports with `Math.random()` over 3000-9000, which includes 3030: when that
+   * came up, getAvailablePort() called this and Culkibo killed its own control
+   * plane. The in-process guard below (`pid !== process.pid`) does not catch it,
+   * because a daemon started separately from the caller is a different process —
+   * which is exactly the normal deployment shape.
    */
   async killProcessOnPort(port) {
     if (!port) return;
     const numPort = parseInt(port, 10);
     if (isNaN(numPort) || numPort <= 0) return;
+    if (numPort === this.daemonPort()) {
+      console.warn(`[LocalRunner] Se ignora la petición de liberar el puerto ${numPort}: es el del propio daemon`);
+      return;
+    }
 
     try {
       if (process.platform === 'win32') {
@@ -256,7 +275,9 @@ class LocalRunner {
 
     let port = desiredPort || 3001;
     while (port < 65535) {
-      if (await isPortFree(port)) {
+      // Saltar el puerto del daemon: aunque estuviera libre, dárselo a un
+      // proyecto dejaría el panel inaccesible en cuanto arrancase.
+      if (port !== this.daemonPort() && await isPortFree(port)) {
         return port;
       }
       port++;

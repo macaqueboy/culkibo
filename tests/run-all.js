@@ -10,6 +10,7 @@ const testLocalRunner = require('./localRunner.test');
 const testStopLifecycle = require('./stop-lifecycle.test');
 const testCaddy = require('./caddy.test');
 const testDatabases = require('./database.test');
+const testDeploy = require('./deploy.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -42,7 +43,8 @@ async function runAll() {
     { name: 'Local Execution Runner & Dev Server', fn: testLocalRunner },
     { name: 'Project Stop & Hibernate Lifecycle', fn: testStopLifecycle },
     { name: 'Ingress Data Plane (Caddy)', fn: testCaddy },
-    { name: 'Managed Databases (Provision, Backup, S3, Retention)', fn: testDatabases }
+    { name: 'Managed Databases (Provision, Backup, S3, Retention)', fn: testDatabases },
+    { name: 'Production Deploy Pipeline (build, cutover, rollback)', fn: testDeploy }
   ];
 
   for (const suite of suites) {

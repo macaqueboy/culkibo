@@ -35,6 +35,15 @@ class Project {
     this.githubRepo = data.githubRepo || '';
     this.localRunning = data.localRunning !== undefined ? data.localRunning : false;
     this.localPort = data.localPort || null;
+    // Ajustes del despliegue a producción (deployManager). Sin estos campos en
+    // el modelo, cualquier valor que el usuario configurase se perdía en el
+    // siguiente `update()`, porque el constructor reconstruye el objeto entero.
+    // Todos se vuelven a validar en deployManager antes de tocar un argv.
+    this.containerPort = data.containerPort || null;
+    this.healthPath = data.healthPath || '/';
+    this.memoryMb = data.memoryMb || null;
+    this.cpus = data.cpus || null;
+    this.buildArgs = data.buildArgs || {};
   }
 }
 

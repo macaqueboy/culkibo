@@ -18,6 +18,7 @@ const localRunner = require('../services/localRunner');
 const notificationService = require('../services/notificationService');
 const caddyManager = require('../services/caddyManager');
 const ingressManager = require('../services/ingressManager');
+const deployManager = require('../services/deployManager');
 
 // In-memory rate limiting for sensitive endpoints (O(1) Fixed Window)
 const rateLimitMap = new Map();
@@ -55,7 +56,7 @@ router.get('/projects', (req, res) => {
   }
 });
 
-router.post('/projects', (req, res) => {
+router.post('/projects', async (req, res) => {
   try {
     const project = projectManager.create(req.body);
     // Automatically pre-clone and prepare dependencies in the background
@@ -64,6 +65,7 @@ router.post('/projects', (req, res) => {
         console.warn(`[AutoPrepare] Could not auto-prepare ${project.name}:`, err.message);
       });
     }
+    await projectManager.flushToDisk();
     res.status(201).json(project);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -152,6 +154,7 @@ router.post('/projects/:id/hibernate', async (req, res) => {
     // Sin proceso detrás, la ruta apuntaría a un puerto muerto: se retira.
     const ingress = await ingressManager.removeProject(req.params.id);
     res.json({ ...updated, ingress });
+    res.json(updated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -202,6 +205,8 @@ router.post('/projects/:id/start-local', async (req, res) => {
     const ingress = await ingressManager.syncProject(project.id);
 
     res.json({ ...project, ingress });
+    await projectManager.flushToDisk();
+    res.json(project);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -240,6 +245,7 @@ const handleStopProject = async (req, res) => {
     // devolvería 502 y el panel diría que el dominio está servido.
     const ingress = await ingressManager.removeProject(req.params.id);
     res.json({ ...updated, ingress });
+    res.json(updated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -247,6 +253,146 @@ const handleStopProject = async (req, res) => {
 
 router.post('/projects/:id/stop', handleStopProject);
 router.post('/projects/:id/stop-local', handleStopProject);
+
+// --- DESPLIEGUE A PRODUCCIÓN ---
+//
+// `start-local` levanta un servidor de desarrollo; esto construye una imagen y
+// deja un servicio durable detrás del proxy. Son cosas distintas y conviven.
+
+/**
+ * Detección en seco: qué haría Culkibo con este proyecto, sin construir nada.
+ * Es lo que alimenta la vista previa del panel antes de pulsar «Desplegar».
+ */
+router.get('/projects/:id/deploy/strategy', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+
+    const path = require('path');
+    const fs = require('fs');
+    const contextDir = path.join(process.cwd(), 'projects', project.id);
+    if (!fs.existsSync(contextDir)) {
+      return res.json({
+        available: false,
+        reason: 'El proyecto todavía no tiene código clonado en este host',
+        contextDir
+      });
+    }
+    const strategy = await deployManager.detectStrategy(contextDir, project);
+    const dockerfile = strategy.builder === 'generated' ? deployManager.generateDockerfile(strategy) : null;
+    res.json({
+      available: true,
+      contextDir,
+      docker: await deployManager.detectDocker(),
+      hostnames: deployManager.hostnamesFor(project),
+      strategy,
+      generatedDockerfile: dockerfile
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Lanza un despliegue. Responde en cuanto arranca, no al terminar: una build
+ * puede tardar minutos y dejar colgada una petición HTTP tanto tiempo es una
+ * forma garantizada de que un proxy intermedio la corte. El progreso va por
+ * WebSocket (`deploy_event` y el flujo de logs normal).
+ */
+router.post('/projects/:id/deploy', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+
+    const options = {};
+    if (req.body && typeof req.body === 'object') {
+      // Lista blanca explícita: nada de volcar el cuerpo de la petición dentro
+      // de las opciones del desplegador.
+      for (const key of ['healthTimeoutMs', 'drainTimeoutMs', 'healthIntervalMs', 'buildTimeoutMs', 'memoryMb', 'keepReleases']) {
+        const value = Number(req.body[key]);
+        if (Number.isFinite(value) && value > 0) options[key] = value;
+      }
+      if (typeof req.body.version === 'string') options.version = req.body.version;
+    }
+
+    const started = deployManager.deploy(project, options);
+    // Se registra el fallo pero no se deja escapar: el resultado ya queda en el
+    // historial del despliegue y en el flujo de logs.
+    started.catch(() => {});
+
+    projectManager.update(project.id, { lastDeployedAt: new Date().toISOString() });
+    res.status(202).json({
+      accepted: true,
+      message: 'Despliegue iniciado. Sigue el progreso en los logs en vivo.',
+      projectId: project.id
+    });
+  } catch (err) {
+    res.status(409).json({ error: err.message });
+  }
+});
+
+router.get('/projects/:id/deployments', (req, res) => {
+  try {
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    // Se devuelven sin las líneas de log: el historial completo con logs de
+    // veinte builds es del orden de megabytes por petición.
+    const history = deployManager.listDeployments(req.params.id, limit)
+      .map(({ logLines, ...rest }) => ({ ...rest, logLineCount: (logLines || []).length }));
+    res.json({ deployments: history });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/projects/:id/deployments/:deployId', (req, res) => {
+  try {
+    const deployment = deployManager.getDeployment(req.params.id, req.params.deployId);
+    if (!deployment) return res.status(404).json({ error: 'Despliegue no encontrado' });
+    res.json(deployment);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/projects/:id/deploy/status', async (req, res) => {
+  try {
+    res.json(await deployManager.status(req.params.id));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/projects/:id/rollback', async (req, res) => {
+  try {
+    const result = await deployManager.rollback(req.params.id);
+    const { logLines, ...rest } = result;
+    res.json({ ...rest, logLines });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/projects/:id/deploy/stop', async (req, res) => {
+  try {
+    res.json(await deployManager.stopProduction(req.params.id));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Poda manual de la caché de BuildKit. Manual a propósito: podar tras cada
+ * despliegue es exactamente cómo Coolify pasó de 1 a 4,5 minutos de build.
+ */
+router.post('/deploy/prune-cache', async (req, res) => {
+  try {
+    const keepStorageGb = Number((req.body && req.body.keepStorageGb) ?? 10);
+    const untilHours = /** @type {number | null} */ (req.body && req.body.untilHours != null ? Number(req.body.untilHours) : null);
+    res.json(await deployManager.pruneBuildCache({ keepStorageGb, untilHours }));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // --- COOLIFY IMPORT ---
 router.post('/import/coolify/preview', async (req, res) => {
