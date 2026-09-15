@@ -682,10 +682,155 @@ Mitigación: fases con valor demostrable al final de cada una (§13).
 
 ---
 
-## 12. Pendiente de validación
+## 12. Hallazgos verificados (2026-09-15)
 
-Cuatro investigaciones en curso a 2026-09-12. **Ninguna conclusión de este documento que
-dependa de ellas debe considerarse cerrada.**
+Contrastado directamente contra documentación y código fuente primarios. Cada afirmación
+de esta sección tiene fuente; lo que no pudo verificarse queda marcado.
+
+### 12.1 Ingress: Caddy resuelve las tres simulaciones a la vez
+
+**API de administración** — `caddyserver.com/docs/api`
+
+| Aspecto | Dato verificado |
+|---|---|
+| Endpoints | `POST /load` (config completa); `POST` / `PUT` / `PATCH` / `DELETE` sobre `/config/[ruta]`; atajo `/id/[nombre]` |
+| Direccionamiento | Un objeto con `"@id": "mi_ruta"` se alcanza en `/id/mi_ruta/...` en vez de por índice de array |
+| Escucha | `localhost:2019` por defecto, configurable con `CADDY_ADMIN` |
+| Fallo de config | *«If the new config fails for any reason, the old config is rolled back into place without downtime»* — **rollback automático y atómico** |
+| Config idéntica | No recarga. Forzar con `Cache-Control: must-revalidate` |
+| Concurrencia | Control optimista: `GET` → capturar `Etag` → escribir con `If-Match` → reintentar si devuelve **412** |
+| Seguridad | Recomiendan **socket unix con permisos**, no TCP, si hay código no confiable en la máquina |
+
+Esto es decisivo frente a Traefik: el swap de ruta es **síncrono y con rollback**, no un
+poll de 5 segundos.
+
+**TLS bajo demanda** — verificado en `modules/caddytls/ondemand.go`
+
+- El campo `ask` está **deprecado**: *«Deprecated. WILL BE REMOVED SOON. Use 'permission'
+  instead with the http module.»* Se usa `permission` con `{"module": "http", "endpoint": ...}`
+- Caddy hace **GET**, con el parámetro **`domain`**
+- **2xx = permitir**; cualquier otro código = denegar
+- **No sigue redirecciones** (*«following http redirects is not allowed»*)
+- **Timeout de 10 segundos**
+- Límite interno: 10 intentos por cuenta ACME cada 10 segundos
+- El handshake TLS **se retiene** mientras se obtiene el certificado
+
+Nuestro endpoint `ask` son ~20 líneas contra la tabla de dominios. Y a partir de ahí **el
+certificado deja de ser estado nuestro**, que es justamente lo que permitía falsearlo.
+
+**ACME** — `caddyserver/certmagic`
+
+> *«Full support for RFC 9773 (ACME Renewal Information; ARI) extension»*
+
+Decisión cerrada: **no hace falta ninguna librería ACME en Node.** `acme-client` de npm
+lleva sin commits desde julio de 2024, sin ARI y sin perfiles; era un callejón sin salida.
+Con Caddy como dueño del ciclo de vida obtenemos ARI, y **las renovaciones ARI están
+exentas de todos los límites de Let's Encrypt** — el problema que hoy tiene Coolify
+abierto por renovar certificados de dominios ya borrados.
+
+Para wildcard por DNS-01 hace falta compilar Caddy con `caddy-dns/cloudflare` (xcaddy).
+Token único con `Zone.Zone:Read` + `Zone.DNS:Edit`:
+
+```json
+{ "module": "acme",
+  "challenges": { "dns": { "provider": { "name": "cloudflare", "api_token": "{env.CF_API_TOKEN}" } } } }
+```
+
+**Proxy y canario** — verificado en `caddytest/integration/reverseproxy_test.go`
+
+```json
+{ "handler": "reverse_proxy",
+  "load_balancing": { "selection_policy": { "policy": "weighted_round_robin", "weights": [10, 90] } },
+  "upstreams": [ { "dial": "localhost:18081" }, { "dial": "localhost:18082" } ] }
+```
+
+Eso es el reparto Forge/Citadel **real**, sustituyendo el `Math.random()` de Express.
+
+Dos hallazgos que importan para no romper el HMR al promocionar:
+
+- **`StreamCloseDelay`**: *«streaming requests such as WebSockets will not be closed when
+  proxy config is unloaded»*. Sin esto, cada promoción cortaría la tubería del HMR
+- Health checks pasivos: `UnhealthyStatus`, `UnhealthyLatency`, `UnhealthyRequestCount`,
+  `MaxFails`. Y `Cleanup()` drena las conexiones abiertas
+
+Estructura de ruta: `group`, `match`, `handle`, `terminal`. **`group` hace las rutas
+mutuamente excluyentes** — encaja exacto con «o Forge o Citadel, nunca los dos».
+
+### 12.2 MCP: estamos dos eras por detrás, no una versión
+
+Revisión vigente: **`2026-07-28`**. La nuestra declara `2024-11-05`.
+
+**La negociación de versión ya no existe como handshake.** No hay `initialize`. Cada
+petición declara su versión en `_meta["io.modelcontextprotocol/protocolVersion"]` y, sobre
+HTTP, también en la cabecera `MCP-Protocol-Version`. **Si no coinciden, el servidor debe
+responder `400` con error `-32020 HeaderMismatch`.** El servidor acepta o rechaza cada
+petición por separado.
+
+`server/discover` es un **RPC obligatorio** que devuelve versiones soportadas, capacidades
+e identidad en una sola llamada.
+
+**Streamable HTTP cambió de forma en esta misma revisión**, así que las guías de 2025 ya
+no valen:
+
+| | Hasta 2025-11-25 | Desde 2026-07-28 |
+|---|---|---|
+| Endpoint GET para stream | Sí | **Eliminado** → responder `405` |
+| Sesiones (`Mcp-Session-Id`) | Sí | **Eliminadas** → ignorar |
+| Resumabilidad (`Last-Event-ID`) | Sí | **No soportada** → ignorar |
+| Requests del servidor por SSE | Sí | **No.** Ahora MRTR |
+
+Un solo endpoint, **solo POST**. Cada petición es su propio POST; la respuesta es
+`application/json` o `text/event-stream`. Una notificación se contesta con `202 Accepted`
+sin cuerpo. **Cerrar el stream SSE es la señal de cancelación.**
+
+Cabeceras obligatorias: `MCP-Protocol-Version`, `Mcp-Method`, y `Mcp-Name` para
+`tools/call`, `resources/read` y `prompts/get`. El servidor **debe** validar que coinciden
+con el cuerpo — su razón es explícita: evitar que un balanceador enrute por la cabecera
+mientras el servidor ejecuta según el cuerpo.
+
+**MRTR (Multi Round-Trip Requests)** sustituye a sampling, elicitation y roots como
+peticiones del servidor: ahora se devuelve un `InputRequiredResult` con `inputRequests`, y
+el cliente **reintenta la petición original** añadiendo `inputResponses`.
+
+Notificaciones de larga duración: `subscriptions/listen`, cuya respuesta es un stream SSE
+que queda abierto. Conviene emitir una línea de comentario SSE (`:\r\n`) como keep-alive, y
+`X-Accel-Buffering: no` para que los proxies no acumulen.
+
+**Deprecaciones confirmadas** (registro oficial):
+
+| Función | Deprecada en | Retirada más temprana |
+|---|---|---|
+| Roots | `2026-07-28` | tras 2027-07-28 |
+| Sampling | `2026-07-28` | tras 2027-07-28 |
+| Logging | `2026-07-28` | tras 2027-07-28 |
+| Dynamic Client Registration | `2026-07-28` | tras 2027-07-28 |
+| **HTTP+SSE — el nuestro** | **`2025-03-26`** | **tres meses tras SEP-2596 Final** |
+
+El nuestro es el único con retirada inminente. No es deuda técnica cómoda: es el
+transporte que puede dejar de estar en la especificación antes que ningún otro.
+
+**Y algo que ya tenemos hecho sin saberlo:** la especificación exige validar la cabecera
+`Origin` y responder **403** si es inválida, recomienda enlazar solo a localhost y
+autenticar todas las conexiones. Es exactamente el middleware de autenticación que se
+implementó el 2026-09-15. Cumplimos ese requisito antes de migrar el transporte.
+
+### 12.3 Lo que sigue sin verificar
+
+- **`createServerModuleRunner` de Vite 8 en un proceso de larga vida**: la apuesta central
+  del camino B sigue sin validación empírica. Qué le ocurre a los pools de conexiones, los
+  timers y los singletons al reemplazar un módulo
+- **Ramas de datos copy-on-write**: secuencia de comandos exacta por substrato y tiempos
+  reales
+- **Transporte del túnel**: desmontaje de `pgrok` y decisión definitiva
+- **Forma exacta de `server/discover`** y el catálogo concreto de herramientas
+
+---
+
+## 12.4 Investigaciones pendientes
+
+Las cuatro investigaciones lanzadas el 2026-09-12 murieron por límite de gasto de la
+cuenta. Las dos primeras se recuperaron manualmente (§12.1 y §12.2); **las de §12.3 siguen
+abiertas y ninguna conclusión que dependa de ellas debe considerarse cerrada.**
 
 1. **MCP 2026 a fondo** — revisión exacta del protocolo, Streamable HTTP a nivel de
    implementación, `server/discover`, elicitation, auth headless, y el diseño concreto de
