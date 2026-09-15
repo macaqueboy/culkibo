@@ -17,6 +17,7 @@ const githubService = require('../services/githubService');
 const localRunner = require('../services/localRunner');
 const notificationService = require('../services/notificationService');
 const caddyManager = require('../services/caddyManager');
+const ingressManager = require('../services/ingressManager');
 
 // In-memory rate limiting for sensitive endpoints (O(1) Fixed Window)
 const rateLimitMap = new Map();
@@ -88,10 +89,20 @@ router.put('/projects/:id', (req, res) => {
   }
 });
 
-router.delete('/projects/:id', (req, res) => {
+router.delete('/projects/:id', async (req, res) => {
   try {
-    projectManager.delete(req.params.id);
-    res.json({ success: true });
+    const projectId = req.params.id;
+    // Los dominios del proyecto se quedarían apuntando a un proyecto que ya no
+    // existe y su ruta seguiría viva en Caddy: se desvinculan antes de borrar.
+    const attached = domainManager.listByProject(projectId);
+    for (const domain of attached) {
+      try { await domainManager.detachProject(domain.id); } catch (e) {}
+    }
+    projectManager.delete(projectId);
+    const ingress = await ingressManager.removeProject(projectId);
+    // Los dominios desvinculados vuelven a su destino de pod, si lo tenían.
+    if (attached.length > 0) await ingressManager.reconcile();
+    res.json({ success: true, detachedDomains: attached.map(d => d.hostname), ingress });
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -138,7 +149,9 @@ router.post('/projects/:id/hibernate', async (req, res) => {
 
     const updated = projectManager.hibernate(req.params.id);
     await projectManager.flushToDisk();
-    res.json(updated);
+    // Sin proceso detrás, la ruta apuntaría a un puerto muerto: se retira.
+    const ingress = await ingressManager.removeProject(req.params.id);
+    res.json({ ...updated, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -182,7 +195,13 @@ router.post('/projects/:id/start-local', async (req, res) => {
     project.status = 'active';
     project.localRunning = true;
     project = projectManager.update(req.params.id, project);
-    res.json(project);
+
+    // El proyecto ya tiene un puerto vivo: es el momento de publicar (o
+    // refrescar) su ruta en Caddy. Sin Caddy esto devuelve `applied: false` y
+    // el arranque local sigue siendo válido.
+    const ingress = await ingressManager.syncProject(project.id);
+
+    res.json({ ...project, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -217,7 +236,10 @@ const handleStopProject = async (req, res) => {
 
     const updated = projectManager.stop(req.params.id);
     await projectManager.flushToDisk();
-    res.json(updated);
+    // Un proyecto parado no puede seguir teniendo una ruta viva: Caddy
+    // devolvería 502 y el panel diría que el dominio está servido.
+    const ingress = await ingressManager.removeProject(req.params.id);
+    res.json({ ...updated, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -398,7 +420,10 @@ router.post('/pods/hot-sync', async (req, res) => {
 router.post('/pods/switch-traffic', async (req, res) => {
   try {
     const result = await containerOrchestrator.switchTraffic(req.body);
-    res.json(result);
+    // El reparto de tráfico solo existe si lo ejecuta el proxy. Reconciliar
+    // reescribe los pesos `weighted_round_robin` de las rutas afectadas.
+    const ingress = await ingressManager.reconcile();
+    res.json({ ...result, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -407,7 +432,8 @@ router.post('/pods/switch-traffic', async (req, res) => {
 router.post('/pods/deploy', async (req, res) => {
   try {
     const result = await containerOrchestrator.deployRelease(req.body);
-    res.json(result);
+    const ingress = await ingressManager.reconcile();
+    res.json({ ...result, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -425,7 +451,11 @@ router.get('/domains', (req, res) => {
 router.post('/domains', async (req, res) => {
   try {
     const newDomain = await domainManager.addDomain(req.body);
-    res.status(201).json(newDomain);
+    // Dar de alta el dominio y publicar su ruta es UNA sola acción: un registro
+    // en nuestro JSON sin ruta en Caddy es exactamente la divergencia que este
+    // trabajo elimina.
+    const ingress = await ingressManager.reconcile();
+    res.status(201).json({ ...newDomain, ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -434,7 +464,9 @@ router.post('/domains', async (req, res) => {
 router.delete('/domains/:id', async (req, res) => {
   try {
     const removed = await domainManager.deleteDomain(req.params.id);
-    res.json({ success: true, removed });
+    await ingressManager.removeDomain(req.params.id);
+    const ingress = await ingressManager.reconcile();
+    res.json({ success: true, removed, ingress });
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -443,7 +475,8 @@ router.delete('/domains/:id', async (req, res) => {
 router.patch('/domains/:id', async (req, res) => {
   try {
     const updated = await domainManager.updateDomain(req.params.id, req.body);
-    res.json(updated);
+    const ingress = await ingressManager.reconcile();
+    res.json({ ...updated, ingress });
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -458,6 +491,79 @@ router.post('/domains/:id/toggle-proxy', async (req, res) => {
   }
 });
 
+// --- VINCULACIÓN DOMINIO ↔ PROYECTO ---
+//
+// Una sola llamada: crea (o reutiliza) el registro del dominio, lo vincula al
+// proyecto y publica la ruta en Caddy. Antes eran tres pasos en sitios
+// distintos —añadir dominio, editar `project.domains` desde el panel y esperar
+// a que algo enrutase— y el tercero no existía.
+router.post('/projects/:id/domains', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+
+    const hostname = String(req.body.hostname || '').trim().toLowerCase();
+    if (!hostname) return res.status(400).json({ error: 'El nombre de dominio es obligatorio' });
+
+    let domain = domainManager.getByHostname(hostname);
+    if (domain) {
+      if (domain.projectId && domain.projectId !== project.id) {
+        return res.status(409).json({ error: `El dominio ${hostname} ya está vinculado a otro proyecto` });
+      }
+      domain = await domainManager.attachProject(domain.id, project.id);
+    } else {
+      domain = await domainManager.addDomain({
+        hostname,
+        projectId: project.id,
+        targetPod: req.body.targetPod || 'forge',
+        targetPort: req.body.targetPort || project.localPort || project.forgePort || 3001,
+        cloudflareZoneId: req.body.cloudflareZoneId || null,
+        cloudflareProxied: req.body.cloudflareProxied !== false,
+        autoCreateDns: Boolean(req.body.autoCreateDns),
+        serverIp: req.body.serverIp,
+        routingMode: req.body.routingMode || 'cloudflare_proxy'
+      });
+    }
+
+    const domains = Array.from(new Set([...(project.domains || []), hostname]));
+    const updatedProject = projectManager.update(project.id, { domains });
+
+    const ingress = await ingressManager.syncProject(project.id);
+    res.status(201).json({ domain, project: updatedProject, ingress });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Desvincular: quita el hostname del proyecto, borra el registro del dominio y
+// retira la ruta. Las dos mitades caen juntas o no cae ninguna.
+router.delete('/projects/:id/domains/:domainId', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+
+    const domain = domainManager.getById(req.params.domainId);
+    if (!domain) return res.status(404).json({ error: 'Dominio no encontrado' });
+
+    const keep = req.query.keepDomain === '1';
+    if (keep) {
+      await domainManager.detachProject(domain.id);
+    } else {
+      await domainManager.deleteDomain(domain.id);
+    }
+
+    const domains = (project.domains || []).filter(d => d !== domain.hostname);
+    const updatedProject = projectManager.update(project.id, { domains });
+
+    const ingress = await ingressManager.syncProject(project.id);
+    if (keep) await ingressManager.reconcile();
+
+    res.json({ success: true, hostname: domain.hostname, kept: keep, project: updatedProject, ingress });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 router.post('/domains/verify-dns', async (req, res) => {
   try {
     const result = await domainManager.verifyDns(req.body.hostname);
@@ -467,25 +573,58 @@ router.post('/domains/verify-dns', async (req, res) => {
   }
 });
 
-router.get('/ingress/resolve', (req, res) => {
+// Qué regla de Culkibo casa con un Host, y —lo que de verdad decide -si hay o
+// no una ruta equivalente publicada en Caddy. La regla configurada sin ruta
+// publicada no sirve tráfico, y decirlo es la diferencia entre un simulador y
+// un diagnóstico.
+router.get('/ingress/resolve', async (req, res) => {
   try {
     const hostname = req.query.hostname || req.headers.host;
     const route = domainManager.resolveRoute(hostname);
     if (!route) {
-      return res.status(404).json({ found: false, message: `No hay ruta asignada para ${hostname}` });
+      return res.status(404).json({ found: false, message: `No hay ninguna regla configurada para ${hostname}` });
     }
-    const traffic = containerOrchestrator.trafficAllocation;
-    const effectivePod = route.targetPod;
+
+    const state = ingressManager.buildDesiredState();
+    const desired = state.specs.find(s => s.hostnames.includes(route.hostname)) || null;
+    const skipped = state.skipped.find(s => s.hostnames.includes(route.hostname)) || null;
+
+    let liveRoute = null;
+    let ingressAvailable = false;
+    const detection = await caddyManager.detect();
+    ingressAvailable = detection.available;
+    if (detection.available && desired) {
+      try {
+        const stored = await caddyManager.getRoute(desired.projectId);
+        if (stored) {
+          liveRoute = {
+            id: stored['@id'],
+            hosts: (stored.match && stored.match[0] && stored.match[0].host) || [],
+            upstreams: ((stored.handle && stored.handle[0] && stored.handle[0].upstreams) || []).map(u => u.dial)
+          };
+        }
+      } catch (e) { /* la ruta no existe todavía */ }
+    }
+
     res.json({
       found: true,
       hostname,
       matchedRoute: route.hostname,
       isWildcard: route.isWildcard,
       configuredPod: route.targetPod,
-      effectivePod,
-      targetPort: effectivePod === 'forge' ? 3001 : 8080,
+      configuredPort: route.targetPort,
+      projectId: route.projectId || null,
       cloudflareProxied: route.cloudflareProxied,
-      trafficAllocation: traffic
+      trafficAllocation: containerOrchestrator.trafficAllocation,
+      ingressAvailable,
+      // Lo que se serviría de verdad, o por qué no se sirve nada.
+      servedByCaddy: Boolean(liveRoute),
+      liveRoute,
+      desiredUpstreams: desired ? desired.upstreams : [],
+      notServedReason: liveRoute
+        ? null
+        : (skipped ? skipped.reason
+          : (!ingressAvailable ? `Ingress no disponible: ${detection.reason}` : 'La ruta todavía no está publicada en Caddy'))
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1058,18 +1197,72 @@ router.get('/ingress/ask', (req, res) => {
   return res.status(200).type('text/plain').send('ok');
 });
 
+// Estado honesto del ingress.
+//
+// Devuelve lo que hay REALMENTE en Caddy, en qué difiere de lo que Culkibo
+// cree que debería haber, y —lo importante— el resultado de un handshake TLS
+// real contra cada dominio configurado, con el emisor y el `notAfter` que el
+// servidor presenta. El registro propio (sslManager) se inventaba
+// `status: 'active'` y 90 días de caducidad al "emitir"; un campo en nuestro
+// JSON no puede demostrar nada sobre lo que recibe un navegador.
+//
+// `?probe=0` salta los sondeos cuando solo interesa el estado de las rutas.
 router.get('/ingress/status', async (req, res) => {
   try {
-    const detection = await caddyManager.detect({ force: req.query.force === '1' });
-    let routes = [];
-    if (detection.available) {
-      try { routes = await caddyManager.listRoutes(); } catch (e) { /* configuración aún sin cargar */ }
-    }
-    res.json({
-      ...detection,
-      routesManaged: routes.length,
-      routes: routes.map(r => ({ id: r['@id'], hosts: r.match?.[0]?.host || [] }))
+    const status = await ingressManager.status({
+      probe: req.query.probe !== '0',
+      force: req.query.force === '1',
+      probeTimeoutMs: Math.min(parseInt(req.query.timeout, 10) || 3000, 10000)
     });
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fuerza la convergencia del plano de datos al estado deseado. Es el botón que
+// arregla a mano la deriva que `bootstrap()` arregla en cada arranque.
+router.post('/ingress/reconcile', async (req, res) => {
+  try {
+    res.json(await ingressManager.reconcile());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Levanta el plano de datos con Docker cuando no hay ninguno. Mantiene la
+// promesa de "un comando": el usuario no instala Caddy a mano.
+router.post('/ingress/start', async (req, res) => {
+  try {
+    const detection = await caddyManager.detect({ force: true });
+    if (detection.available) {
+      return res.json({ started: false, alreadyRunning: true, message: 'Caddy ya está en marcha.' });
+    }
+    const result = await caddyManager.startWithDocker(req.body || {});
+    if (!result.started) {
+      return res.status(502).json({ ...result, message: `No se pudo levantar Caddy: ${result.error}` });
+    }
+    // Espera corta a que la admin API responda antes de reconciliar.
+    for (let i = 0; i < 10; i++) {
+      const check = await caddyManager.detect({ force: true });
+      if (check.available) break;
+      await new Promise(r => setTimeout(r, 400));
+    }
+    const ingress = await ingressManager.reconcile();
+    res.json({ ...result, ingress, message: 'Caddy levantado y rutas reconciliadas.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Handshake TLS suelto contra un dominio cualquiera, sin pasar por el registro.
+router.get('/ingress/tls', async (req, res) => {
+  try {
+    const hostname = String(req.query.hostname || '').trim();
+    if (!hostname) return res.status(400).json({ error: 'Falta el parámetro hostname' });
+    res.json(await ingressManager.probeTls(hostname, {
+      timeoutMs: Math.min(parseInt(req.query.timeout, 10) || 3000, 10000)
+    }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -61,7 +61,25 @@ async function runAll() {
   console.log(`🏁 TEST SUMMARY: ${passed} passed, ${failed} failed in ${elapsed}s`);
   console.log('======================================================\n');
 
-  if (stopDaemon) await stopDaemon();
+  // Red de seguridad antes de cerrar.
+  //
+  // `server/index.js` instala manejadores globales de `uncaughtException` y
+  // `unhandledRejection` para que el daemon no se caiga nunca. En las pruebas
+  // eso se vuelve en contra: si el cierre se queda a medias, el proceso sigue
+  // vivo reteniendo el puerto 3030. La siguiente ejecución encontraba ese
+  // daemon zombi, `ensureDaemon()` lo reutilizaba en vez de arrancar uno limpio
+  // y las suites fallaban contra un estado que no era el suyo. Un único fallo
+  // se convertía así en una cadena de fallos sin relación con el código.
+  const watchdog = setTimeout(() => {
+    console.error('⚠ El cierre no terminó a tiempo; se fuerza la salida para no dejar el puerto ocupado.');
+    process.exit(failed > 0 ? 1 : 0);
+  }, 5000);
+  if (watchdog.unref) watchdog.unref();
+
+  if (stopDaemon) {
+    try { await stopDaemon(); } catch (e) {}
+  }
+  clearTimeout(watchdog);
 
   if (failed > 0) {
     process.exit(1);
@@ -70,4 +88,7 @@ async function runAll() {
   }
 }
 
-runAll();
+runAll().catch((err) => {
+  console.error('❌ La ejecución de la suite se interrumpió:', err);
+  process.exit(1);
+});

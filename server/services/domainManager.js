@@ -33,6 +33,7 @@ class DomainManager {
         id: 'dom_culkibo_main',
         hostname: 'culkibo.dev',
         isWildcard: false,
+        projectId: null,
         targetPod: 'forge',
         targetPort: 3001,
         status: 'active',
@@ -49,6 +50,7 @@ class DomainManager {
         id: 'dom_culkibo_wildcard',
         hostname: '*.culkibo.dev',
         isWildcard: true,
+        projectId: null,
         targetPod: 'forge',
         targetPort: 3001,
         status: 'active',
@@ -65,6 +67,7 @@ class DomainManager {
         id: 'dom_sslip_preview',
         hostname: 'app-local.127-0-0-1.sslip.io',
         isWildcard: false,
+        projectId: null,
         targetPod: 'citadel',
         targetPort: 8080,
         status: 'active',
@@ -92,7 +95,14 @@ class DomainManager {
       const cert = sslManager.getCertificateByDomain(d.hostname);
       return {
         ...d,
-        certInfo: cert ? {
+        projectId: d.projectId || null,
+        // `certClaim`, no `certInfo`: esto es lo que NUESTRO registro afirma,
+        // no lo que un navegador recibe. El dato verificado sale del handshake
+        // TLS real que hace ingressManager y se publica en /api/ingress/status.
+        // Se renombró a propósito para que ningún consumidor pueda volver a
+        // confundir una afirmación propia con una comprobación.
+        certClaim: cert ? {
+          verified: false,
           issuer: cert.issuer,
           expiresAt: cert.expiresAt,
           daysRemaining: Math.max(0, Math.floor((new Date(cert.expiresAt).getTime() - Date.now()) / 86400000)),
@@ -102,7 +112,30 @@ class DomainManager {
     });
   }
 
-  async addDomain({ hostname, targetPod = 'forge', targetPort = 3001, cloudflareZoneId = null, cloudflareProxied = true, routingMode = 'cloudflare_proxy', autoCreateDns = false, serverIp = '127.0.0.1', sslStatus, sslProvider, migrationSource }) {
+  getByHostname(hostname) {
+    const clean = String(hostname || '').trim().toLowerCase();
+    return this.domains.find(d => d.hostname === clean) || null;
+  }
+
+  getById(id) {
+    return this.domains.find(d => d.id === id) || null;
+  }
+
+  listByProject(projectId) {
+    return this.domains.filter(d => d.projectId === projectId);
+  }
+
+  /** Vincula un dominio ya existente a un proyecto. */
+  async attachProject(id, projectId) {
+    return this.updateDomain(id, { projectId });
+  }
+
+  /** Desvincula el dominio sin borrarlo del registro. */
+  async detachProject(id) {
+    return this.updateDomain(id, { projectId: null });
+  }
+
+  async addDomain({ hostname, targetPod = 'forge', targetPort = 3001, cloudflareZoneId = null, cloudflareProxied = true, routingMode = 'cloudflare_proxy', autoCreateDns = false, serverIp = '127.0.0.1', sslStatus, sslProvider, migrationSource, projectId = null }) {
     const cleanHost = (hostname || '').trim().toLowerCase();
     
     // RFC 1123 domain validation
@@ -125,6 +158,9 @@ class DomainManager {
       id: domainId,
       hostname: cleanHost,
       isWildcard,
+      // El proyecto dueño del dominio. Sin esto no se puede derivar una ruta de
+      // Caddy hacia el puerto vivo del proyecto, solo hacia un pod genérico.
+      projectId: projectId || null,
       targetPod,
       targetPort: parseInt(targetPort, 10),
       status: cert ? 'active' : 'pending_ssl',

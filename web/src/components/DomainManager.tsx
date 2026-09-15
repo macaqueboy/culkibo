@@ -3,6 +3,7 @@ import {
   Globe,
   ShieldCheck,
   ShieldAlert,
+  ShieldOff,
   Cloud,
   Plus,
   Zap,
@@ -14,10 +15,19 @@ import {
   Search,
   ArrowRightLeft,
   AlertTriangle,
+  Link2,
   X
 } from 'lucide-react';
-import type { DomainItem, SslCertificate } from '../lib/api';
+import type { DomainItem, SslCertificate, IngressStatus, TlsProbe } from '../lib/api';
 import { api } from '../lib/api';
+
+/** Fecha corta en castellano para las caducidades de certificado. */
+const formatDate = (iso?: string | null) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleDateString('es-ES', { day: '2-digit', month: 'short', year: 'numeric' });
+};
 
 interface DomainManagerProps {
   onNotify?: (msg: string) => void;
@@ -31,6 +41,8 @@ interface DomainManagerProps {
 export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslProgress, projectId, projectDomains, onDomainAddedToProject, onDomainRemovedFromProject }) => {
   const [domains, setDomains] = useState<DomainItem[]>([]);
   const [certs, setCerts] = useState<SslCertificate[]>([]);
+  const [ingress, setIngress] = useState<IngressStatus | null>(null);
+  const [reconciling, setReconciling] = useState(false);
   const [loading, setLoading] = useState(true);
   const [searchFilter, setSearchFilter] = useState('');
   const [domainTypeFilter, setDomainTypeFilter] = useState<'all' | 'wildcard' | 'custom' | 'sslip'>('all');
@@ -90,12 +102,16 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
   const loadData = async () => {
     try {
       setLoading(true);
-      const [domRes, certRes] = await Promise.all([
+      // El estado del ingress se pide en paralelo y nunca tumba la vista: sin
+      // plano de datos el resto de la pantalla tiene que seguir funcionando.
+      const [domRes, certRes, ingRes] = await Promise.all([
         api.getDomains(),
-        api.getCertificates()
+        api.getCertificates(),
+        api.getIngressStatus().catch(() => null)
       ]);
       setDomains(domRes.domains || []);
       setCerts(certRes.certificates || []);
+      setIngress(ingRes);
     } catch (e) {
       console.error(e);
     } finally {
@@ -107,39 +123,96 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
     loadData();
   }, []);
 
+  /** Handshake TLS real de este dominio, si ya se ha sondeado. */
+  const tlsFor = (hostname: string): TlsProbe | null =>
+    (ingress?.tls || []).find(t => t.hostname === hostname) || null;
+
+  /** Ruta viva en Caddy que sirve este hostname. */
+  const routeFor = (hostname: string) =>
+    (ingress?.routes || []).find(r => r.hosts.includes(hostname)) || null;
+
+  /** Motivo por el que un dominio no tiene ruta publicada. */
+  const skippedReasonFor = (hostname: string) =>
+    (ingress?.skipped || []).find(s => s.hostnames.includes(hostname))?.reason || null;
+
+  const handleReconcile = async () => {
+    setReconciling(true);
+    try {
+      const res = await api.reconcileIngress();
+      await loadData();
+      if (onNotify) {
+        onNotify(res.applied ? 'Rutas de ingress reconciliadas con Caddy' : (res.message || 'No se pudo reconciliar el ingress'));
+      }
+    } catch (err: any) {
+      setErrorBanner(`Error al reconciliar el ingress: ${err.message}`);
+    } finally {
+      setReconciling(false);
+    }
+  };
+
   const handleAddDomain = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newHostname.trim()) return;
+    const hostname = newHostname.trim();
+    if (!hostname) return;
 
     try {
-      await api.addDomain({
-        hostname: newHostname.trim(),
-        targetPod: newTargetEntorno,
-        targetPort: newTargetPort,
-        cloudflareProxied: newProxied,
-        autoCreateDns: autoCreateCfRecord
-      });
-      setShowAddModal(false);
-      
-      if (projectId && onDomainAddedToProject) {
-        onDomainAddedToProject(newHostname.trim());
+      if (projectId) {
+        // Una sola acción: crea el registro, lo vincula al proyecto y publica
+        // la ruta en Caddy. Antes eran tres pasos y el tercero no existía.
+        const res = await api.attachDomainToProject(projectId, {
+          hostname,
+          targetPod: newTargetEntorno,
+          targetPort: newTargetPort,
+          cloudflareProxied: newProxied,
+          autoCreateDns: autoCreateCfRecord
+        });
+        if (onDomainAddedToProject) onDomainAddedToProject(hostname);
+        if (onNotify) {
+          onNotify(res.ingress?.applied
+            ? `${hostname} vinculado y enrutado hacia ${(res.ingress.upstreams || []).join(', ')}`
+            : `${hostname} vinculado. Ingress sin aplicar: ${res.ingress?.message || 'sin detalle'}`);
+        }
+      } else {
+        const res = await api.addDomain({
+          hostname,
+          targetPod: newTargetEntorno,
+          targetPort: newTargetPort,
+          cloudflareProxied: newProxied,
+          autoCreateDns: autoCreateCfRecord
+        });
+        const outcome = (res as any).ingress;
+        if (onNotify) {
+          onNotify(outcome?.applied
+            ? `Dominio ${hostname} añadido y enrutado en Caddy`
+            : `Dominio ${hostname} añadido. Ingress sin aplicar: ${outcome?.message || 'sin detalle'}`);
+        }
       }
-      
+
+      setShowAddModal(false);
       setNewHostname('');
       loadData();
-      if (onNotify) onNotify(`Dominio ${newHostname} añadido con éxito`);
     } catch (err: any) {
       setErrorBanner(`Error al añadir dominio: ${err.message}`);
     }
   };
 
-  const handleLinkDomain = (e: React.FormEvent) => {
+  const handleLinkDomain = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedLinkDomain || !onDomainAddedToProject) return;
-    onDomainAddedToProject(selectedLinkDomain);
-    setShowLinkModal(false);
-    setSelectedLinkDomain('');
-    if (onNotify) onNotify(`Dominio ${selectedLinkDomain} vinculado al proyecto`);
+    if (!selectedLinkDomain || !projectId) return;
+    try {
+      const res = await api.attachDomainToProject(projectId, { hostname: selectedLinkDomain });
+      if (onDomainAddedToProject) onDomainAddedToProject(selectedLinkDomain);
+      setShowLinkModal(false);
+      setSelectedLinkDomain('');
+      loadData();
+      if (onNotify) {
+        onNotify(res.ingress?.applied
+          ? `${selectedLinkDomain} vinculado y enrutado hacia ${(res.ingress.upstreams || []).join(', ')}`
+          : `${selectedLinkDomain} vinculado. Ingress sin aplicar: ${res.ingress?.message || 'sin detalle'}`);
+      }
+    } catch (err: any) {
+      setErrorBanner(`Error al vincular el dominio: ${err.message}`);
+    }
   };
 
   const handleToggleProxy = async (id: string, hostname: string) => {
@@ -169,10 +242,19 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
   };
 
   const handleDeleteDomain = async (id: string, name: string) => {
-    if (projectId && onDomainRemovedFromProject) {
-      if (!confirm(`¿Confirmas desvincular el dominio ${name} del proyecto?`)) return;
-      onDomainRemovedFromProject(name);
-      if (onNotify) onNotify(`Dominio ${name} desvinculado`);
+    // Desvincular y eliminar la ruta son la misma acción: dejar el registro sin
+    // ruta, o la ruta sin registro, es exactamente la divergencia que se quiere
+    // evitar.
+    if (projectId) {
+      if (!confirm(`¿Confirmas desvincular ${name} del proyecto y retirar su ruta del ingress?`)) return;
+      try {
+        await api.detachDomainFromProject(projectId, id);
+        if (onDomainRemovedFromProject) onDomainRemovedFromProject(name);
+        loadData();
+        if (onNotify) onNotify(`Dominio ${name} desvinculado y ruta retirada`);
+      } catch (err: any) {
+        setErrorBanner(`Error al desvincular el dominio: ${err.message}`);
+      }
       return;
     }
 
@@ -180,7 +262,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
     try {
       await api.deleteDomain(id);
       loadData();
-      if (onNotify) onNotify(`Dominio ${name} eliminado`);
+      if (onNotify) onNotify(`Dominio ${name} eliminado y ruta retirada`);
     } catch (err: any) {
       setErrorBanner(`Error al eliminar dominio: ${err.message}`);
     }
@@ -287,6 +369,65 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
         </div>
       )}
 
+      {/* Estado real del plano de datos.
+          Sin Caddy no hay ingress, y el panel tiene que decirlo en vez de
+          dibujar dominios «activos» que nadie sirve. */}
+      {ingress && (
+        <div className={`p-4 rounded-2xl border text-xs shadow-sm ${
+          ingress.available
+            ? (ingress.inSync ? 'bg-white border-slate-200' : 'bg-amber-50 border-amber-200')
+            : 'bg-slate-50 border-slate-200'
+        }`}>
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <div className={`w-8 h-8 rounded-xl border flex items-center justify-center shrink-0 ${
+                ingress.available ? 'bg-emerald-50 border-emerald-200 text-emerald-600' : 'bg-slate-100 border-slate-200 text-slate-500'
+              }`}>
+                {ingress.available ? <Zap className="w-4 h-4" /> : <ShieldOff className="w-4 h-4" />}
+              </div>
+              <div>
+                <div className="font-semibold text-slate-900">
+                  {ingress.available
+                    ? `Plano de datos: Caddy en ${ingress.adminUrl}`
+                    : 'Plano de datos no disponible'}
+                </div>
+                <p className="text-slate-600 mt-0.5 max-w-2xl leading-relaxed">{ingress.message}</p>
+                {ingress.available && (
+                  <p className="text-slate-500 mt-1">
+                    {ingress.routesManaged} ruta(s) publicadas
+                    {ingress.inSync
+                      ? ' · sin divergencia con el estado esperado'
+                      : ` · ${ingress.drift.missing.length} sin publicar, ${ingress.drift.unexpected.length} sobrantes`}
+                    {ingress.lastReconcile && ` · última reconciliación: ${new Date(ingress.lastReconcile.at).toLocaleTimeString('es-ES')}`}
+                  </p>
+                )}
+                {ingress.skipped.length > 0 && (
+                  <ul className="mt-2 space-y-0.5 text-slate-500">
+                    {ingress.skipped.map(s => (
+                      <li key={s.hostnames.join(',')}>
+                        <span className="font-mono text-slate-700">{s.hostnames.join(', ')}</span>: {s.reason}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={handleReconcile}
+                disabled={reconciling || !ingress.available}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Volver a aplicar en Caddy el estado que Culkibo espera"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
+                <span>Reconciliar rutas</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top Header & Actions Bar */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 p-6 rounded-2xl bg-white border border-slate-200 shadow-sm">
         <div>
@@ -296,7 +437,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-900">
-                Dominios y Certificados SSL
+                Dominios y certificados SSL
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
                 Conecta tus dominios, activa certificados Wildcard (*.tudominio.com) y enruta tráfico a tus aplicaciones.
@@ -313,7 +454,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
               className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-semibold transition-all shadow-sm cursor-pointer active:scale-95"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Vincular Existente</span>
+              <span>Vincular existente</span>
             </button>
           )}
 
@@ -323,7 +464,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition-all shadow-sm cursor-pointer active:scale-95"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>Añadir Dominio</span>
+            <span>Añadir dominio</span>
           </button>
 
           {/* Issue Wildcard ACME DNS-01 */}
@@ -332,7 +473,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold transition-all shadow-sm cursor-pointer active:scale-95"
           >
             <Zap className="w-3.5 h-3.5" />
-            <span>Emitir Wildcard SSL</span>
+            <span>Emitir SSL wildcard</span>
           </button>
 
           {/* Zero Config sslip.io */}
@@ -341,7 +482,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 text-xs font-medium transition-all cursor-pointer"
           >
             <Server className="w-3.5 h-3.5 text-blue-600" />
-            <span>Wildcard Rápido (sslip.io)</span>
+            <span>Wildcard rápido (sslip.io)</span>
           </button>
 
           {/* Reload Data */}
@@ -419,17 +560,20 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             <thead>
  <tr className="border-b border-slate-200 bg-slate-50/80 text-[11px] font-semibold text-slate-600">
                 <th className="py-3 px-4">Dominio</th>
-                <th className="py-3 px-4">Entorno Destino</th>
+                <th className="py-3 px-4">Entorno destino</th>
+                <th className="py-3 px-4">Ruta en Caddy</th>
                 <th className="py-3 px-4">Proxy Cloudflare</th>
-                <th className="py-3 px-4">Certificado SSL</th>
+                <th className="py-3 px-4">TLS servido (verificado)</th>
                 <th className="py-3 px-4">Comprobación</th>
                 <th className="py-3 px-4 text-right">Acciones</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs">
               {filteredDomains.map((domain) => {
-                const hasSsl = domain.sslStatus === 'active';
                 const isForge = domain.targetPod === 'forge';
+                const probe = tlsFor(domain.hostname);
+                const liveRoute = routeFor(domain.hostname);
+                const skippedReason = skippedReasonFor(domain.hostname);
 
                 return (
                   <tr key={domain.id} className="hover:bg-slate-50/70 transition-colors">
@@ -441,7 +585,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                         </span>
                         {domain.isWildcard && (
                           <span className="px-1.5 py-0.5 rounded-lg text-[10px] font-semibold bg-amber-50 text-amber-700 border border-amber-200">
-                            WILDCARD (*.)
+                            Comodín
                           </span>
                         )}
                       </div>
@@ -459,12 +603,38 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                             ? 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100'
                             : 'bg-blue-50 border-blue-200 text-blue-800 hover:bg-blue-100'
                         }`}
-                        title={`Clic para cambiar destino a ${isForge ? 'Producción (:8080)' : 'Desarrollo en vivo (:3001)'}`}
+                        title={`Clic para cambiar el destino a ${isForge ? 'Producción (:8080)' : 'Desarrollo en vivo (:3001)'}`}
                       >
                         <span>{isForge ? 'Desarrollo' : 'Producción'}</span>
                         <span className="text-slate-500">:{domain.targetPort}</span>
                         <ArrowRightLeft className="w-3 h-3 ml-0.5 opacity-60" />
                       </button>
+                    </td>
+
+                    {/* Ruta real publicada en Caddy, no la intención guardada */}
+                    <td className="py-3.5 px-4">
+                      {liveRoute ? (
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5 text-emerald-700 font-semibold">
+                            <Link2 className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Publicada</span>
+                          </div>
+                          <div className="text-[11px] text-slate-500 font-mono">
+                            {liveRoute.upstreams.join(', ')}
+                            {liveRoute.weights && ` · pesos ${liveRoute.weights.join('/')}`}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5 text-slate-500 font-medium">
+                            <ShieldOff className="w-3.5 h-3.5 text-slate-400" />
+                            <span>Sin ruta</span>
+                          </div>
+                          <div className="text-[11px] text-slate-400 max-w-[220px]">
+                            {skippedReason || (ingress && !ingress.available ? 'No hay plano de datos' : 'Todavía no publicada')}
+                          </div>
+                        </div>
+                      )}
                     </td>
 
                     {/* Cloudflare Edge Proxy Toggle Button */}
@@ -476,32 +646,62 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                             ? 'bg-orange-50 border-orange-200 text-orange-700 hover:bg-orange-100'
                             : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
                         }`}
-                        title={domain.cloudflareProxied ? 'Proxy Cloudflare activo (Clic para pasar a Solo DNS)' : 'Solo DNS (Clic para activar Proxy Cloudflare)'}
+                        title={domain.cloudflareProxied ? 'Proxy Cloudflare activo (clic para pasar a Solo DNS)' : 'Solo DNS (clic para activar el proxy Cloudflare)'}
                       >
                         <Cloud className={`w-3.5 h-3.5 ${domain.cloudflareProxied ? 'fill-orange-400 text-orange-500' : 'text-slate-400'}`} />
-                        <span>{domain.cloudflareProxied ? 'Proxy Activo (Nube ☁️)' : 'Solo DNS (Gris ☁️)'}</span>
+                        <span>{domain.cloudflareProxied ? 'Proxy activo (nube ☁️)' : 'Solo DNS (gris ☁️)'}</span>
                       </button>
                     </td>
 
-                    {/* SSL Status */}
+                    {/* TLS realmente servido.
+                        Esta columna mostraba `sslStatus === 'active'` leído de
+                        nuestro propio JSON, y unos «días restantes» calculados
+                        sobre una caducidad que nos inventábamos al «emitir».
+                        Ahora sale de un handshake TLS contra el dominio. */}
                     <td className="py-3.5 px-4">
-                      <div className="space-y-0.5">
-                        <div className="flex items-center gap-1.5">
-                          {hasSsl ? (
-                            <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                          ) : (
-                            <ShieldAlert className="w-4 h-4 text-amber-600" />
-                          )}
-                          <span className={`font-semibold ${hasSsl ? 'text-emerald-700' : 'text-amber-700'}`}>
-                            {hasSsl ? 'Seguro & Activo' : 'Pendiente SSL'}
-                          </span>
-                        </div>
-                        {domain.certInfo && (
-                          <div className="text-[11px] text-slate-500">
-                            {domain.certInfo.daysRemaining} días restantes • {domain.certInfo.issuer.split(' ')[0]}
+                      {!probe ? (
+                        <span className="text-[11px] text-slate-400">Sin comprobar todavía</span>
+                      ) : probe.reachable && probe.notAfter ? (
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5">
+                            {probe.trusted && !probe.expired ? (
+                              <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                            ) : (
+                              <ShieldAlert className="w-4 h-4 text-amber-600" />
+                            )}
+                            <span className={`font-semibold ${probe.trusted && !probe.expired ? 'text-emerald-700' : 'text-amber-700'}`}>
+                              {probe.issuer || probe.issuerCN || 'Emisor desconocido'}
+                            </span>
                           </div>
-                        )}
-                      </div>
+                          <div className="text-[11px] text-slate-500">
+                            Caduca el {formatDate(probe.notAfter)}
+                            {typeof probe.daysRemaining === 'number' && ` · ${probe.daysRemaining} días`}
+                          </div>
+                          {!probe.trusted && (
+                            <div className="text-[11px] text-amber-700">
+                              Cadena no validada: {probe.trustError || 'motivo desconocido'}
+                            </div>
+                          )}
+                          {probe.wildcard && (
+                            <div className="text-[11px] text-slate-400">Sondeado en {probe.probed}</div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5 text-slate-500 font-medium">
+                            <ShieldOff className="w-4 h-4 text-slate-400" />
+                            <span>Sin handshake TLS</span>
+                          </div>
+                          <div className="text-[11px] text-slate-400 max-w-[220px]">
+                            {probe.error || 'El servidor no presentó ningún certificado'}
+                          </div>
+                          {domain.certClaim && (
+                            <div className="text-[11px] text-slate-400">
+                              El registro interno afirma {domain.certClaim.issuer}, sin verificar
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </td>
 
                     {/* DNS Verification & Ingress Test */}
@@ -542,7 +742,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
 
               {filteredDomains.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="py-8 text-center text-slate-500">
+                  <td colSpan={7} className="py-8 text-center text-slate-500">
                     No se encontraron dominios con ese criterio de búsqueda.
                   </td>
                 </tr>
@@ -552,17 +752,20 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
         </div>
       </div>
 
-      {/* SSL Certificates Registry Section */}
+      {/* Registro interno de certificados.
+          Es lo que Culkibo anotó al emitir, no lo que un navegador recibe: lo
+          verificado está arriba, en la columna «TLS servido». Se etiqueta como
+          tal para que nadie vuelva a leerlo como una comprobación. */}
       <div className="p-6 rounded-2xl bg-white border border-slate-200 shadow-sm space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <Lock className="w-4 h-4 text-emerald-600" />
+            <Lock className="w-4 h-4 text-slate-500" />
             <h3 className="text-sm font-bold text-slate-900">
-              Bóveda de Certificados SSL
+              Registro interno de certificados
             </h3>
           </div>
           <span className="text-xs font-medium text-slate-500">
-            Renovación automática habilitada (&lt;30 días)
+            Anotaciones propias, no verificadas contra el servidor
           </span>
         </div>
 
@@ -582,8 +785,8 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                       Emisor: {cert.issuer}
                     </span>
                   </div>
-                  <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                    {cert.daysRemaining} DÍAS RESTANTES
+                  <span className="px-2 py-0.5 rounded-lg text-[10px] font-semibold bg-slate-100 text-slate-600 border border-slate-200">
+                    {cert.daysRemaining} días según el registro
                   </span>
                 </div>
 
@@ -596,9 +799,17 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
 
               <div className="pt-2 border-t border-slate-200 flex items-center justify-between text-[11px] text-slate-500">
                 <span>Almacenamiento: ./data/certs/{cert.rootDomain}</span>
-                <span className="text-emerald-700 font-medium flex items-center gap-1">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> Auto-renovable
-                </span>
+                {(() => {
+                  const verified = (ingress?.tls || []).find(t => t.probed === cert.rootDomain && t.reachable && t.notAfter);
+                  return verified ? (
+                    <span className="text-emerald-700 font-medium flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                      Servido de verdad: caduca el {formatDate(verified.notAfter)}
+                    </span>
+                  ) : (
+                    <span className="text-slate-500 font-medium">Sin confirmar en el servidor</span>
+                  );
+                })()}
               </div>
             </div>
           ))}
@@ -610,12 +821,12 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4">
           <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl p-6 shadow-xl space-y-4 text-slate-900">
             <h3 className="text-base font-bold text-slate-900">
-              Vincular Dominio Existente
+              Vincular dominio existente
             </h3>
             <form onSubmit={handleLinkDomain} className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Seleccionar Dominio
+                  Seleccionar dominio
                 </label>
                 <select
                   value={selectedLinkDomain}
@@ -645,7 +856,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                   disabled={!selectedLinkDomain}
                   className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-sm cursor-pointer active:scale-95 transition-all disabled:opacity-50"
                 >
-                  Vincular al Proyecto
+                  Vincular al proyecto
                 </button>
               </div>
             </form>
@@ -658,13 +869,13 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4">
           <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl p-6 shadow-xl space-y-4 text-slate-900">
             <h3 className="text-base font-bold text-slate-900">
-              Añadir Nuevo Dominio
+              Añadir nuevo dominio
             </h3>
 
             <form onSubmit={handleAddDomain} className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Nombre de Dominio o Wildcard
+                  Nombre de dominio o wildcard
                 </label>
                 <input
                   type="text"
@@ -681,7 +892,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Entorno Destino</label>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Entorno destino</label>
                   <select
                     value={newTargetEntorno}
                     onChange={(e) => {
@@ -691,12 +902,12 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                     }}
                     className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs text-slate-900 focus:outline-none focus:bg-white focus:border-amber-500"
                   >
-                    <option value="forge">Desarrollo (Puerto 3001)</option>
-                    <option value="citadel">Producción (Puerto 8080)</option>
+                    <option value="forge">Desarrollo (puerto 3001)</option>
+                    <option value="citadel">Producción (puerto 8080)</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Puerto Interno</label>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Puerto interno</label>
                   <input
                     type="number"
                     value={newTargetPort}
@@ -740,7 +951,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                   type="submit"
                   className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs shadow-sm cursor-pointer active:scale-95 transition-all"
                 >
-                  Guardar y Enrutar
+                  Guardar y enrutar
                 </button>
               </div>
             </form>
@@ -755,7 +966,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             <div className="flex items-center gap-2 text-amber-600">
               <Zap className="w-5 h-5" />
               <h3 className="text-base font-bold text-slate-900">
-                Emitir Certificado Wildcard SSL (*.tudominio.com)
+                Emitir certificado wildcard SSL (*.tudominio.com)
               </h3>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
@@ -765,7 +976,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Dominio Wildcard
+                  Dominio wildcard
                 </label>
                 <input
                   type="text"
@@ -778,7 +989,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Autoridad de Certificación (CA)
+                  Autoridad de certificación (CA)
                 </label>
                 <select
                   value={wildcardProvider}
@@ -823,7 +1034,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                 className="flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-semibold text-xs shadow-sm cursor-pointer active:scale-95 transition-all disabled:opacity-50"
               >
                 <Zap className={`w-4 h-4 ${issuingWildcard ? 'animate-spin' : ''}`} />
-                <span>{issuingWildcard ? 'Emitiendo Wildcard...' : 'Iniciar Emisión SSL'}</span>
+                <span>{issuingWildcard ? 'Emitiendo wildcard...' : 'Iniciar emisión SSL'}</span>
               </button>
             </div>
           </div>
@@ -837,7 +1048,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             <div className="flex items-center gap-2 text-blue-600">
               <Server className="w-5 h-5" />
               <h3 className="text-base font-bold text-slate-900">
-                Wildcard Rápido con sslip.io
+                Wildcard rápido con sslip.io
               </h3>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
@@ -847,7 +1058,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Dirección IP Destino
+                  Dirección IP destino
                 </label>
                 <input
                   type="text"
@@ -875,7 +1086,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                 disabled={issuingSslip}
                 className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs shadow-sm cursor-pointer active:scale-95 transition-all disabled:opacity-50"
               >
-                {issuingSslip ? 'Generando TLS...' : 'Generar Certificado Rápido'}
+                {issuingSslip ? 'Generando TLS...' : 'Generar certificado rápido'}
               </button>
             </div>
           </div>
@@ -888,13 +1099,13 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
           <div className="w-full max-w-lg bg-white border border-slate-200 rounded-2xl p-6 shadow-xl space-y-4 text-slate-900">
             <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
               <Search className="w-4 h-4 text-amber-600" />
-              Comprobador de Resolución DNS en Vivo
+              Comprobador de resolución DNS en vivo
             </h3>
 
             {verifyingDns ? (
               <div className="flex flex-col items-center justify-center py-8 gap-2 text-slate-500">
                 <RefreshCw className="w-6 h-6 animate-spin text-amber-600" />
-                <span className="text-xs font-medium">Consultando servidores DNS con autorización...</span>
+                <span className="text-xs font-medium">Consultando servidores DNS con autoridad...</span>
               </div>
             ) : dnsVerifyResult ? (
               <div className="space-y-3">
@@ -910,14 +1121,14 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                   <div className="flex justify-between">
                     <span className="text-slate-500">Red Cloudflare:</span>
                     <span className={dnsVerifyResult.isCloudflareEdge ? 'text-orange-600 font-bold' : 'text-slate-600 font-medium'}>
-                      {dnsVerifyResult.isCloudflareEdge ? 'SÍ (Proxy Cloudflare Activo ☁️)' : 'NO (DNS Directo)'}
+                      {dnsVerifyResult.isCloudflareEdge ? 'Sí (proxy Cloudflare activo ☁️)' : 'No (DNS directo)'}
                     </span>
                   </div>
                 </div>
 
                 <div>
                   <span className="text-xs font-semibold text-slate-700 block mb-1">
-                    Direcciones IP (Registros A):
+                    Direcciones IP (registros A):
                   </span>
                   <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 font-mono text-xs text-slate-900">
                     {dnsVerifyResult.resolvedIps?.length ? (
@@ -946,7 +1157,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                 onClick={() => setShowDnsVerifyModal(false)}
                 className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold cursor-pointer transition-colors"
               >
-                Cerrar Comprobador
+                Cerrar comprobador
               </button>
             </div>
           </div>
@@ -959,16 +1170,16 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
           <div className="w-full max-w-lg bg-white border border-slate-200 rounded-2xl p-6 shadow-xl space-y-4 text-slate-900">
             <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
               <Zap className="w-4 h-4 text-amber-600" />
-              Simulador de Enrutamiento en el Borde
+              Diagnóstico de enrutamiento
             </h3>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Muestra exactamente hacia qué entorno y puerto enviará el proxy inverso el tráfico que llegue con esta cabecera Host.
+              Compara la regla que Culkibo tiene configurada con la ruta que Caddy está sirviendo de verdad para esta cabecera Host.
             </p>
 
             {testingIngress ? (
               <div className="flex flex-col items-center justify-center py-8 gap-2 text-slate-500 text-xs font-medium">
                 <RefreshCw className="w-6 h-6 animate-spin text-amber-600" />
-                <span>Simulando resolución de paquetes en el enrutador...</span>
+                <span>Consultando la configuración viva de Caddy...</span>
               </div>
             ) : ingressResult ? (
               <div className="space-y-3">
@@ -984,24 +1195,41 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-500">Tipo de regla:</span>
-                      <span className="text-slate-700">{ingressResult.isWildcard ? 'Comodín Wildcard (*.)' : 'Dominio Exacto'}</span>
+                      <span className="text-slate-700">{ingressResult.isWildcard ? 'Comodín wildcard (*.)' : 'Dominio exacto'}</span>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="text-slate-500">Entorno destino:</span>
-                      <span className={`px-2 py-0.5 rounded-lg text-[11px] font-bold ${ingressResult.effectiveEntorno === 'forge' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
-                        {ingressResult.effectiveEntorno === 'forge' ? 'DESARROLLO (Puerto 3001)' : 'PRODUCCIÓN (Puerto 8080)'}
+                      <span className="text-slate-500">Entorno configurado:</span>
+                      <span className={`px-2 py-0.5 rounded-lg text-[11px] font-bold ${ingressResult.configuredPod === 'forge' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
+                        {ingressResult.configuredPod === 'forge' ? 'Desarrollo' : 'Producción'} :{ingressResult.configuredPort}
                       </span>
                     </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-500">Servido por Caddy:</span>
+                      <span className={ingressResult.servedByCaddy ? 'text-emerald-700 font-bold' : 'text-slate-600 font-medium'}>
+                        {ingressResult.servedByCaddy ? 'Sí' : 'No'}
+                      </span>
+                    </div>
+                    {ingressResult.liveRoute && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Destino real:</span>
+                        <span className="text-slate-900">{(ingressResult.liveRoute.upstreams || []).join(', ')}</span>
+                      </div>
+                    )}
+                    {!ingressResult.servedByCaddy && ingressResult.notServedReason && (
+                      <div className="pt-2 border-t border-slate-200 text-amber-700 font-sans">
+                        {ingressResult.notServedReason}
+                      </div>
+                    )}
                     <div className="flex justify-between">
                       <span className="text-slate-500">Proxy Cloudflare:</span>
                       <span className={ingressResult.cloudflareProxied ? 'text-orange-600 font-medium' : 'text-slate-600'}>
-                        {ingressResult.cloudflareProxied ? 'Proxy Activo (Nube Naranja ☁️)' : 'Solo DNS (Nube Gris ☁️)'}
+                        {ingressResult.cloudflareProxied ? 'Proxy activo (nube naranja ☁️)' : 'Solo DNS (nube gris ☁️)'}
                       </span>
                     </div>
                   </div>
                 ) : (
                   <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs font-medium text-red-700">
-                    {ingressResult.message || 'No se encontró una regla de enrutamiento válida.'}
+                    {ingressResult.message || 'No hay ninguna regla configurada para ese dominio.'}
                   </div>
                 )}
               </div>
@@ -1012,7 +1240,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                 onClick={() => setShowIngressModal(false)}
                 className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold cursor-pointer transition-colors"
               >
-                Cerrar Simulador
+                Cerrar diagnóstico
               </button>
             </div>
           </div>

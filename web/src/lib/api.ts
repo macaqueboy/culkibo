@@ -151,6 +151,8 @@ export interface DomainItem {
   id: string;
   hostname: string;
   isWildcard: boolean;
+  /** Proyecto dueño del dominio, o null si va directo a un pod. */
+  projectId: string | null;
   targetPod: 'forge' | 'citadel';
   targetPort: number;
   status: string;
@@ -163,12 +165,80 @@ export interface DomainItem {
   createdAt: string;
   lastCheckedAt: string;
   migrationSource?: string;
-  certInfo?: {
+  /**
+   * Lo que el registro interno AFIRMA sobre el certificado. `verified: false`
+   * siempre: no es una comprobación, es nuestra propia nota. Lo verificado sale
+   * de `IngressStatus.tls`, que es un handshake TLS real.
+   */
+  certClaim?: {
+    verified: false;
     issuer: string;
     expiresAt: string;
     daysRemaining: number;
     isWildcard: boolean;
   } | null;
+}
+
+/** Resultado de un handshake TLS real contra un dominio. */
+export interface TlsProbe {
+  hostname: string;
+  probed: string;
+  wildcard: boolean;
+  reachable: boolean;
+  handshakeMs: number;
+  error?: string;
+  issuer?: string | null;
+  issuerCN?: string | null;
+  subject?: string | null;
+  sans?: string[];
+  notBefore?: string | null;
+  notAfter?: string | null;
+  daysRemaining?: number | null;
+  expired?: boolean | null;
+  trusted?: boolean;
+  trustError?: string | null;
+  protocol?: string | null;
+  alpn?: string | null;
+}
+
+export interface IngressRoute {
+  id: string;
+  hosts: string[];
+  upstreams: string[];
+  weights: number[] | null;
+}
+
+export interface IngressStatus {
+  dataPlane: 'caddy';
+  available: boolean;
+  adminUrl: string;
+  version: string | null;
+  reason: string | null;
+  message: string;
+  routesManaged: number;
+  routesError: string | null;
+  routes: IngressRoute[];
+  desired: Array<{ id: string; kind: string; label?: string; hosts: string[]; upstreams: string[]; weights: number[] | null }>;
+  skipped: Array<{ hostnames: string[]; projectId?: string; reason: string }>;
+  drift: { missing: string[]; unexpected: string[] };
+  inSync: boolean;
+  lastReconcile: { at: string; applied: number; removed: number; skipped: number } | null;
+  tlsProbed: boolean;
+  tls: TlsProbe[];
+  checkedAt: string;
+}
+
+/** Lo que devuelve cualquier acción que toque el plano de datos. */
+export interface IngressOutcome {
+  applied?: boolean;
+  available?: boolean;
+  action?: string;
+  routeId?: string;
+  hostnames?: string[];
+  upstreams?: string[];
+  reason?: string;
+  message?: string;
+  error?: string;
 }
 
 export interface SslCertificate {
@@ -506,6 +576,58 @@ export const api = {
 
   async getIngressResolution(hostname: string): Promise<any> {
     const res = await fetch(`${API_BASE}/ingress/resolve?hostname=${encodeURIComponent(hostname)}`);
+    return res.json();
+  },
+
+  /** Estado real del plano de datos, con handshakes TLS de verdad. */
+  async getIngressStatus(opts: { probe?: boolean; force?: boolean } = {}): Promise<IngressStatus> {
+    const qs = new URLSearchParams();
+    if (opts.probe === false) qs.set('probe', '0');
+    if (opts.force) qs.set('force', '1');
+    const res = await fetch(`${API_BASE}/ingress/status?${qs.toString()}`);
+    if (!res.ok) throw new Error((await res.json()).error || 'No se pudo consultar el ingress');
+    return res.json();
+  },
+
+  async reconcileIngress(): Promise<IngressOutcome> {
+    const res = await fetch(`${API_BASE}/ingress/reconcile`, { method: 'POST' });
+    return res.json();
+  },
+
+  async startIngress(): Promise<any> {
+    const res = await fetch(`${API_BASE}/ingress/start`, { method: 'POST' });
+    return res.json();
+  },
+
+  /** Vincula un dominio a un proyecto: crea el registro Y publica la ruta. */
+  async attachDomainToProject(projectId: string, payload: {
+    hostname: string;
+    targetPod?: string;
+    targetPort?: number;
+    cloudflareZoneId?: string | null;
+    cloudflareProxied?: boolean;
+    autoCreateDns?: boolean;
+  }): Promise<{ domain: DomainItem; project: Project; ingress: IngressOutcome }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/domains`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'No se pudo vincular el dominio');
+    }
+    return res.json();
+  },
+
+  /** Desvincula un dominio: borra el registro Y retira la ruta. */
+  async detachDomainFromProject(projectId: string, domainId: string, keepDomain = false): Promise<any> {
+    const qs = keepDomain ? '?keepDomain=1' : '';
+    const res = await fetch(`${API_BASE}/projects/${projectId}/domains/${domainId}${qs}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'No se pudo desvincular el dominio');
+    }
     return res.json();
   },
 

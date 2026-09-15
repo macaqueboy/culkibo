@@ -7,6 +7,8 @@ const projectManager = require('./projectManager');
 const dockerManager = require('./dockerManager');
 const dbBackupManager = require('./dbBackupManager');
 const githubService = require('./githubService');
+const ingressManager = require('./ingressManager');
+const caddyManager = require('./caddyManager');
 
 // ---------------------------------------------------------------------------
 // Revisiones del protocolo.
@@ -737,12 +739,23 @@ class McpServer extends EventEmitter {
             if (args.cloudflareProxied !== undefined) updates.cloudflareProxied = args.cloudflareProxied;
             res = await domainManager.updateDomain(found.id, updates);
           }
+          // Cualquier cambio en el registro de dominios tiene que llegar al
+          // plano de datos en el mismo paso, o el agente creerá haber publicado
+          // algo que no está publicado.
+          if (args.action && args.action !== 'list') {
+            res = { ...res, ingress: await ingressManager.reconcile() };
+          }
           break;
 
         case 'culkibo_inspect_ingress': {
           const hostname = args.hostname;
           const route = domainManager.resolveRoute(hostname);
-          const cert = sslManager.getCertificateByDomain(hostname);
+          // `tlsIssuer`/`tlsActive` salían del registro propio de certificados,
+          // que se inventaba el emisor y la caducidad. Un agente que pregunte
+          // por el TLS de un dominio tiene que recibir el handshake real, no
+          // nuestra propia afirmación.
+          const tls = await ingressManager.probeTls(hostname, { timeoutMs: 3000 });
+          const detection = await caddyManager.detect();
           res = {
             hostname,
             found: Boolean(route),
@@ -750,9 +763,12 @@ class McpServer extends EventEmitter {
             isWildcard: route?.isWildcard || false,
             targetPod: route?.targetPod || null,
             targetPort: route?.targetPort || null,
+            projectId: route?.projectId || null,
             cloudflareProxied: route?.cloudflareProxied || false,
-            tlsIssuer: cert?.issuer || null,
-            tlsActive: Boolean(cert),
+            dataPlane: 'caddy',
+            ingressAvailable: detection.available,
+            ingressReason: detection.reason,
+            tls,
             trafficSplit: containerOrchestrator.trafficAllocation
           };
           break;
