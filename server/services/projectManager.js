@@ -263,7 +263,12 @@ class ProjectManager extends EventEmitter {
       this.hibernate(id);
     }
     const result = this.projects.delete(id);
-    this.saveProjects();
+    // Vaciado inmediato, no el guardado con rebote de 15 ms que se usaba aquí.
+    // `stop()`, `hibernate()` y `activate()` ya vuelcan directamente; `delete()`
+    // era la excepción, y un borrado seguido de una salida del proceso perdía
+    // el volcado pendiente: los proyectos borrados reaparecían en el siguiente
+    // arranque y el fichero crecía sin fin.
+    this.flushToDisk();
     this.emit('project_deleted', { id });
     return result;
   }

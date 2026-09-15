@@ -676,16 +676,12 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
             onNotify={onNotify} 
             projectId={project.id} 
             projectDomains={project.domains || []}
-            onDomainAddedToProject={async (domain) => {
-              const newDomains = [...(project.domains || []), domain];
-              await api.updateProject(projectId, { domains: Array.from(new Set(newDomains)) });
-              fetchProject();
-            }}
-            onDomainRemovedFromProject={async (domain) => {
-              const newDomains = (project.domains || []).filter(d => d !== domain);
-              await api.updateProject(projectId, { domains: newDomains });
-              fetchProject();
-            }}
+            // Vincular y desvincular ya son una sola llamada al servidor
+            // (registro del dominio + ruta en Caddy), así que aquí solo queda
+            // refrescar. Antes el panel escribía `project.domains` por su
+            // cuenta y nadie publicaba la ruta.
+            onDomainAddedToProject={() => fetchProject()}
+            onDomainRemovedFromProject={() => fetchProject()}
           />
         )}
 

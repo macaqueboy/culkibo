@@ -9,9 +9,9 @@ const { WebSocketServer } = require('ws');
 const apiRouter = require('./routes/api');
 const containerOrchestrator = require('./services/containerOrchestrator');
 const domainManager = require('./services/domainManager');
-const sslManager = require('./services/sslManager');
 const mcpServer = require('./services/mcpServer');
 const projectManager = require('./services/projectManager');
+const ingressManager = require('./services/ingressManager');
 
 const app = express();
 const server = http.createServer(app);
@@ -33,17 +33,6 @@ function reportFatal(kind, err) {
 
 process.on('uncaughtException', (err) => reportFatal('uncaughtException', err));
 process.on('unhandledRejection', (reason) => reportFatal('unhandledRejection', reason));
-
-// Escape untrusted values before interpolating them into an HTML response.
-// The ingress router echoes the client-controlled Host header back to the browser.
-function escapeHtml(value) {
-  return String(value == null ? '' : value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
 
 // Middleware
 const { authMiddleware, corsOptions, resolveToken, authStatus } = require('./middleware/auth');
@@ -102,83 +91,68 @@ app.get('/api/mcp/sse', (req, res) => {
   });
 });
 
-// Edge Ingress Reverse Router Middleware
-// When requests arrive with a configured domain or wildcard Host header,
-// Culkibo routes the ingress traffic to the appropriate Pod (The Forge or The Citadel)
+// ---------------------------------------------------------------------------
+// Este puerto es el plano de CONTROL. El de datos es Caddy.
+//
+// Aquí vivía un "Edge Ingress Router" que, ante una cabecera Host de un dominio
+// configurado, devolvía una página HTML describiendo a qué pod habría enrutado,
+// con una latencia de `24ms` escrita a mano. No enrutaba nada: ninguna petición
+// salía de Node. Se ha borrado. El reparto por peso, el TLS y el proxy inverso
+// los hace Caddy (ver services/caddyManager.js e ingressManager.js).
+//
+// Lo único que queda en Node es decirlo en voz alta cuando una petición de un
+// dominio de ingress llega al puerto equivocado: 421 Misdirected Request es
+// exactamente ese caso —el servidor no puede producir una respuesta para la
+// autoridad solicitada—. Callar y servir el panel haría creer que el dominio
+// está atendido.
+// ---------------------------------------------------------------------------
+const MANAGEMENT_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '']);
+
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api') || req.path === '/ws') {
+  if (req.path.startsWith('/api') || req.path === '/ws' || req.path === '/health') {
     return next();
   }
 
-  const rawHost = req.headers['x-forwarded-host'] || req.headers['x-culkibo-host'] || req.headers.host || '';
-  const host = rawHost.split(':')[0].toLowerCase();
+  const forwarded = req.headers['x-forwarded-host'] || req.headers['x-culkibo-host'];
+  const rawHost = forwarded || req.headers.host || '';
+  const host = String(rawHost).split(':')[0].toLowerCase();
 
-  // Direct server management access via localhost/IP serves the dashboard
-  if ((host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '::1' || host === '') && !req.headers['x-forwarded-host'] && !req.headers['x-culkibo-host']) {
+  // Acceso directo de gestión (localhost / IP): se sirve el panel.
+  if (MANAGEMENT_HOSTS.has(host) && !forwarded) {
     return next();
   }
 
   const matchedRoute = domainManager.resolveRoute(host);
-  if (matchedRoute) {
-    const traffic = containerOrchestrator.trafficAllocation;
-    let targetPod = matchedRoute.targetPod;
-    // If traffic allocation is split, apply dynamic canary routing
-    if (traffic.forge > 0 && traffic.citadel > 0) {
-      targetPod = (Math.random() * 100 < traffic.citadel) ? 'citadel' : 'forge';
-    }
-    const targetPort = targetPod === 'forge' ? 3001 : 8080;
-    const cert = sslManager.getCertificateByDomain(host);
-
-    res.setHeader('X-Culkibo-Ingress', '1');
-    res.setHeader('X-Culkibo-Pod', targetPod);
-    res.setHeader('X-Culkibo-Port', String(targetPort));
-    res.setHeader('X-Culkibo-Domain', matchedRoute.hostname);
-    res.setHeader('X-Culkibo-SSL', cert ? 'active' : 'unconfigured');
-    res.setHeader('X-Culkibo-Latency', `${targetPod === 'forge' ? 24 : 14}ms`);
-
-    // Ingress response payload for routed apps or API consumers
-    if (req.headers.accept && req.headers.accept.includes('application/json')) {
-      return res.json({
-        ingress: 'Culkibo Edge Ingress v1.0.0',
-        domain: host,
-        routedPod: targetPod,
-        targetPort,
-        trafficSplit: traffic,
-        sslActive: Boolean(cert),
-        latencyMs: targetPod === 'forge' ? 24 : 14,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    const safeHost = escapeHtml(host);
-    const safeRule = escapeHtml(matchedRoute.hostname);
-    return res.send(`<!DOCTYPE html>
-<html lang="es">
-  <head>
-    <meta charset="utf-8">
-    <title>${safeHost} — Culkibo Ingress</title>
-    <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #0f172a; padding: 40px; text-align: center; }
-      .badge { display: inline-block; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: bold; font-family: monospace; }
-      .forge { background: #fef3c7; color: #b45309; border: 1px solid #fde68a; }
-      .citadel { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
-      .card { max-width: 600px; margin: 30px auto; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 24px; text-align: left; box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1); }
-    </style>
-  </head>
-  <body>
-    <h2 style="color: #0f172a;">⚡ Enrutado por Culkibo Edge Ingress</h2>
-    <div class="card">
-      <p><strong>Dominio:</strong> <code>${safeHost}</code></p>
-      <p><strong>Regla Coincidente:</strong> <code>${safeRule}</code> (${matchedRoute.isWildcard ? 'Comodín Wildcard' : 'Exacta'})</p>
-      <p><strong>Entorno Activo:</strong> <span class="badge ${targetPod}">${targetPod === 'forge' ? 'DESARROLLO (:3001)' : 'PRODUCCIÓN (:8080)'}</span></p>
-      <p><strong>Distribución de Tráfico:</strong> <code>${traffic.citadel}% Producción / ${traffic.forge}% Desarrollo</code></p>
-      <p><strong>Estado SSL / TLS:</strong> <span style="color: ${cert ? '#059669' : '#d97706'}">${cert ? `Activo (${cert.issuer})` : 'Certificado Pendiente'}</span></p>
-    </div>
-  </body>
-</html>`);
+  if (!matchedRoute) {
+    return next();
   }
 
-  next();
+  res.status(421);
+  res.setHeader('X-Culkibo-Data-Plane', 'caddy');
+  // El Host lo controla el cliente y se refleja en la respuesta. Con
+  // `text/plain` explícito y nosniff no hay forma de que el navegador lo
+  // interprete como marcado.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  if (req.headers.accept && req.headers.accept.includes('application/json')) {
+    return res.json({
+      error: 'Petición dirigida al plano de control',
+      dataPlane: 'caddy',
+      domain: host,
+      matchedRoute: matchedRoute.hostname,
+      isWildcard: Boolean(matchedRoute.isWildcard),
+      routedByDaemon: false,
+      message: `El daemon de Culkibo no enruta tráfico. ${host} lo sirve Caddy en los puertos 80/443. Consulta /api/ingress/status para ver si hay ruta y qué certificado se está sirviendo de verdad.`
+    });
+  }
+
+  return res.type('text/plain').send(
+    `Culkibo: este puerto es el plano de control, no el plano de datos.\n\n` +
+    `Dominio solicitado: ${host}\n` +
+    `Regla configurada:  ${matchedRoute.hostname}\n\n` +
+    `El tráfico de este dominio lo sirve Caddy en los puertos 80 y 443.\n` +
+    `Comprueba el estado real del ingress en /api/ingress/status.\n`
+  );
 });
 
 // Serve frontend static build if available
@@ -202,15 +176,16 @@ if (fs.existsSync(webDistPath)) {
     next();
   });
 } else {
-  // Development fallback route
+  // Página de respaldo cuando el panel no está compilado. Modo claro, como el
+  // resto del producto: era la única superficie que seguía en oscuro.
   app.get('/', (req, res) => {
     res.send(`
-      <html>
-        <head><title>Culkibo Daemon v1.0.0</title><style>body{font-family:sans-serif;background:#0b0e14;color:#f3f4f6;padding:40px;text-align:center;}</style></head>
+      <html lang="es">
+        <head><meta charset="utf-8"><title>Daemon de Culkibo v1.0.0</title><style>body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#f8fafc;color:#0f172a;padding:40px;text-align:center;}code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:1px 5px;}</style></head>
         <body>
-          <h1>⚡ Culkibo Daemon v1.0.0 Live</h1>
-          <p>REST API & WebSocket listening on port ${PORT}.</p>
-          <p>Vite dashboard can be built via <code>npm run build</code> or started in dev mode on port 5173.</p>
+          <h1>Daemon de Culkibo v1.0.0 en marcha</h1>
+          <p>API REST y WebSocket escuchando en el puerto ${PORT}.</p>
+          <p>Compila el panel con <code>npm run build</code>, o arráncalo en modo desarrollo en el puerto 5173.</p>
         </body>
       </html>
     `);
@@ -335,6 +310,17 @@ function startServer(port = PORT, host = '0.0.0.0') {
         console.log(`      exige token siempre con CULKIBO_REQUIRE_TOKEN=1`);
       }
       console.log(`========================================================\n`);
+
+      // Reconciliación de arranque del ingress.
+      //
+      // Va aquí, después de escuchar, porque Caddy necesita poder llamar a
+      // /api/ingress/ask para autorizar certificados en cuanto existan rutas.
+      // No se espera a que termine: si no hay Caddy, el daemon tiene que
+      // arrancar igual — la misma regla camaleón que con Docker.
+      ingressManager.bootstrap({ port }).catch((err) => {
+        console.warn('[Edge:Ingress] La reconciliación de arranque falló:', err.message);
+      });
+
       resolve(server);
     }).on('error', (err) => {
       console.error(`❌ Failed to start server on port ${port}:`, err.message);
