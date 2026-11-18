@@ -5,11 +5,12 @@ import { ProjectDetail } from './components/ProjectDetail';
 import { CoolifyImport } from './components/CoolifyImport';
 import { LiveLogs } from './components/LiveLogs';
 import { SettingsView } from './components/SettingsView';
+import { ServiceCatalog } from './components/ServiceCatalog';
 import { api, type LogEntry } from './lib/api';
 import { deployStream } from './lib/deployStream';
 
 export function App() {
-  const [activeView, setActiveView] = useState<'projects' | 'import' | 'global_logs' | 'settings'>('projects');
+  const [activeView, setActiveView] = useState<'projects' | 'catalog' | 'import' | 'global_logs' | 'settings'>('projects');
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   
   const [latestLog, setLatestLog] = useState<LogEntry | null>(null);
@@ -130,6 +131,7 @@ export function App() {
 
   const getBreadcrumb = () => {
     if (activeView === 'projects') return 'Mis Proyectos';
+    if (activeView === 'catalog') return 'Catálogo de servicios';
     if (activeView === 'import') return 'Mis Proyectos > Importar de Coolify';
     if (activeView === 'global_logs') return 'Actividad Global';
     if (activeView === 'settings') return 'Configuración';
@@ -174,6 +176,10 @@ export function App() {
             onProjectUpdate={fetchProjects}
             incomingLog={latestLog}
           />
+        )}
+
+        {activeView === 'catalog' && !activeProjectId && (
+          <ServiceCatalog onNotify={showToast} />
         )}
 
         {activeView === 'import' && (

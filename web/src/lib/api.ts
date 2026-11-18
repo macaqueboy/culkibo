@@ -12,6 +12,81 @@ async function jsonOrThrow(res: Response, fallback: string) {
   return body;
 }
 
+export interface ServiceCategory {
+  id: string;
+  label: string;
+  count: number;
+}
+
+export interface ServiceTemplate {
+  id: string;
+  name: string;
+  category: string;
+  categoryLabel: string;
+  summary: string;
+  description: string;
+  website: string;
+  licence: string;
+  tags: string[];
+  image: string;
+  port: number;
+  memoryMb: number;
+  cpus: string;
+  totalMemoryMb: number;
+  database: { engine: string; image: string | null } | null;
+  sidecars: { name: string; image: string; memoryMb: number }[];
+  secretNames: string[];
+  nextSteps: string[];
+  notes: string[];
+  installedCount: number;
+}
+
+export interface ServiceInstallation {
+  id: string;
+  templateId: string;
+  templateName: string;
+  name: string;
+  category: string;
+  categoryLabel: string;
+  image: string;
+  domain: string | null;
+  url: string;
+  hostPort: number;
+  appPort: number;
+  containerName: string;
+  networkName: string;
+  sidecars: { name: string; image: string; containerName: string }[];
+  databaseId: string | null;
+  memoryMb: number;
+  cpus: string;
+  status: 'installing' | 'running' | 'degraded' | 'stopped' | 'error';
+  health: string;
+  progress: {
+    step: string;
+    label: string;
+    stepIndex: number;
+    totalSteps: number;
+    message?: string | null;
+    detail?: string | null;
+    failed?: boolean;
+  } | null;
+  ingress: { applied: boolean; reason?: string | null } | null;
+  lastProbe: Record<string, unknown> | null;
+  lastError: string | null;
+  secretNames: string[];
+  nextSteps: string[];
+  notes: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ServiceSecrets {
+  id: string;
+  name: string;
+  secrets: Record<string, string>;
+  database: DbCredentials | null;
+}
+
 // --- Bases de datos gestionadas ---
 
 export interface DbEngine {
@@ -1120,6 +1195,64 @@ export const api = {
     return jsonOrThrow(
       await fetch(`${API_BASE}/projects/${projectId}/deploy/start`, { method: 'POST' }),
       'No se pudo reanudar el servicio'
+    );
+  },
+
+  // --- Catálogo de servicios de un clic ---
+
+  async getCatalog(): Promise<{ templates: ServiceTemplate[]; categories: ServiceCategory[] }> {
+    return jsonOrThrow(await fetch(`${API_BASE}/catalog`), 'No se pudo cargar el catálogo');
+  },
+
+  async getInstallations(): Promise<{ installations: ServiceInstallation[] }> {
+    return jsonOrThrow(await fetch(`${API_BASE}/catalog/installations`), 'No se pudieron cargar los servicios instalados');
+  },
+
+  async installService(body: { templateId: string; name?: string; domain?: string | null }): Promise<ServiceInstallation> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/catalog/install`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }),
+      'No se pudo iniciar la instalación'
+    );
+  },
+
+  async getInstallationSecrets(id: string): Promise<ServiceSecrets> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/catalog/installations/${id}/secrets`),
+      'No se pudieron obtener las credenciales'
+    );
+  },
+
+  async getInstallationLogs(id: string, lines = 300): Promise<{ output: string }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/catalog/installations/${id}/logs?lines=${lines}`),
+      'No se pudieron leer los registros'
+    );
+  },
+
+  async controlInstallation(id: string, action: 'start' | 'stop' | 'restart'): Promise<ServiceInstallation> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/catalog/installations/${id}/${action}`, { method: 'POST' }),
+      'No se pudo cambiar el estado del servicio'
+    );
+  },
+
+  async refreshInstallationHealth(id: string): Promise<ServiceInstallation> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/catalog/installations/${id}/health`, { method: 'POST' }),
+      'No se pudo comprobar la salud del servicio'
+    );
+  },
+
+  async removeInstallation(id: string, deleteVolumes = false): Promise<{ removed: boolean }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/catalog/installations/${id}?deleteVolumes=${deleteVolumes ? '1' : '0'}`, {
+        method: 'DELETE'
+      }),
+      'No se pudo desinstalar el servicio'
     );
   }
 };

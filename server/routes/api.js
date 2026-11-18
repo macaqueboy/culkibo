@@ -19,6 +19,7 @@ const notificationService = require('../services/notificationService');
 const caddyManager = require('../services/caddyManager');
 const ingressManager = require('../services/ingressManager');
 const deployManager = require('../services/deployManager');
+const catalogManager = require('../services/catalogManager');
 
 // In-memory rate limiting for sensitive endpoints (O(1) Fixed Window)
 const rateLimitMap = new Map();
@@ -1816,6 +1817,104 @@ router.post('/webhooks/github', async (req, res) => {
     res.json({ success: true, message: `Evento ${event} recibido sin acción requerida.` });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// --- CATÁLOGO DE SERVICIOS DE UN CLIC ---
+router.use('/catalog', rateLimiter);
+
+router.get('/catalog', (req, res) => {
+  try {
+    res.json({
+      templates: catalogManager.listTemplates(),
+      categories: catalogManager.listCategories()
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/catalog/installations', (req, res) => {
+  try {
+    res.json({ installations: catalogManager.list() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/catalog/installations/:id', (req, res) => {
+  try {
+    res.json(catalogManager.get(req.params.id));
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.post('/catalog/install', async (req, res) => {
+  try {
+    const result = await catalogManager.install(req.body || {});
+    res.status(202).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/catalog/installations/:id/secrets', (req, res) => {
+  try {
+    res.json(catalogManager.getSecrets(req.params.id));
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.get('/catalog/installations/:id/logs', async (req, res) => {
+  try {
+    const lines = Math.min(2000, Math.max(10, parseInt(String(req.query.lines || '200'), 10) || 200));
+    const output = await catalogManager.logs(req.params.id, { lines });
+    res.json(typeof output === 'string' ? { output } : output);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/catalog/installations/:id/start', async (req, res) => {
+  try {
+    res.json(await catalogManager.start(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/catalog/installations/:id/stop', async (req, res) => {
+  try {
+    res.json(await catalogManager.stop(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/catalog/installations/:id/restart', async (req, res) => {
+  try {
+    res.json(await catalogManager.restart(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/catalog/installations/:id/health', async (req, res) => {
+  try {
+    res.json(await catalogManager.refreshHealth(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/catalog/installations/:id', async (req, res) => {
+  try {
+    const deleteVolumes = req.query.deleteVolumes === '1' || req.query.deleteVolumes === 'true' || Boolean(req.body && req.body.deleteVolumes);
+    res.json(await catalogManager.remove(req.params.id, { deleteVolumes }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

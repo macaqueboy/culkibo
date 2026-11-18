@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Settings, RefreshCw, LayoutGrid, Activity, ChevronRight } from 'lucide-react';
+import { Settings, RefreshCw, LayoutGrid, Activity, ChevronRight, Package } from 'lucide-react';
 import { api } from '../lib/api';
 
 interface HeaderProps {
@@ -41,6 +41,7 @@ export const Header: React.FC<HeaderProps> = ({
 
   const navItems = [
     { id: 'projects', label: 'Proyectos', icon: LayoutGrid },
+    { id: 'catalog', label: 'Catálogo', icon: Package },
     { id: 'global_logs', label: 'Actividad Global', icon: Activity },
     { id: 'settings', label: 'Configuración', icon: Settings }
   ];

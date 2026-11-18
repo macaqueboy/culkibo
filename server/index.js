@@ -15,6 +15,7 @@ const projectManager = require('./services/projectManager');
 const databaseManager = require('./services/databaseManager');
 const ingressManager = require('./services/ingressManager');
 const deployManager = require('./services/deployManager');
+const catalogManager = require('./services/catalogManager');
 
 const app = express();
 const server = http.createServer(app);
@@ -317,6 +318,10 @@ databaseManager.on('backup_completed', (data) => broadcast('backup_completed', d
 databaseManager.on('backup_failed', (data) => broadcast('backup_failed', data));
 databaseManager.on('database_created', (data) => broadcast('database_created', data));
 databaseManager.on('database_deleted', (data) => broadcast('database_deleted', data));
+catalogManager.on('service_progress', (data) => broadcast('service_progress', data));
+catalogManager.on('service_installed', (data) => broadcast('service_installed', data));
+catalogManager.on('service_failed', (data) => broadcast('service_failed', data));
+catalogManager.on('service_removed', (data) => broadcast('service_removed', data));
 
 /**
  * @param {number} port

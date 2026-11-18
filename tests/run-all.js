@@ -12,6 +12,7 @@ const testCaddy = require('./caddy.test');
 const testDatabases = require('./database.test');
 const testDeploy = require('./deploy.test');
 const testShellSafety = require('./shell-safety.test');
+const testCatalog = require('./catalog.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -48,7 +49,8 @@ async function runAll() {
     { name: 'Project Stop & Hibernate Lifecycle', fn: testStopLifecycle },
     { name: 'Ingress Data Plane (Caddy)', fn: testCaddy },
     { name: 'Managed Databases (Provision, Backup, S3, Retention)', fn: testDatabases },
-    { name: 'Production Deploy Pipeline (build, cutover, rollback)', fn: testDeploy }
+    { name: 'Production Deploy Pipeline (build, cutover, rollback)', fn: testDeploy },
+    { name: 'One-Click Service Catalog (13 templates, secrets, ports)', fn: testCatalog }
   ];
 
   for (const suite of suites) {
