@@ -391,9 +391,13 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_issue_wildcard_ssl',
-        title: 'Emitir certificado wildcard (ACME DNS-01)',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-        description: 'Trigger Let\'s Encrypt ACME DNS-01 wildcard SSL certificate issuance via Cloudflare DNS-01 challenge.',
+        title: 'Emitir certificado wildcard (NO IMPLEMENTADO)',
+        // `readOnlyHint: true`: la herramienta ya no cambia nada. Un agente no
+        // debe creer que invocarla tiene efecto — antes escribía un PEM falso.
+        // Sin `destructiveHint`/`idempotentHint`: sólo significan algo cuando la
+        // herramienta muta, y ésta no muta.
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'NOT IMPLEMENTED. Culkibo does not issue wildcard certificates: TLS is issued on demand by Caddy at the first handshake of each host, and certificates live in Caddy\'s volume, not in data/certs/. This tool always returns an explanatory error; it never issues anything. Use culkibo_create_sslip_domain or query /api/ingress/status for the real TLS state.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -408,7 +412,7 @@ class McpServer extends EventEmitter {
         name: 'culkibo_create_sslip_domain',
         title: 'Crear dominio comodín instantáneo',
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-        description: 'Generate instant Zero-Config wildcard domain with On-Demand TLS (e.g. *.127-0-0-1.sslip.io).',
+        description: 'Register an instant Zero-Config wildcard hostname (e.g. *.127-0-0-1.sslip.io) whose certificate Caddy issues on demand at the first HTTPS handshake. Culkibo stores no key material and cannot report the certificate\'s issuer or expiry; query /api/ingress/status for the verified handshake.',
         inputSchema: {
           type: 'object',
           properties: {

@@ -11,6 +11,7 @@ const testStopLifecycle = require('./stop-lifecycle.test');
 const testCaddy = require('./caddy.test');
 const testDatabases = require('./database.test');
 const testDeploy = require('./deploy.test');
+const testShellSafety = require('./shell-safety.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -32,6 +33,9 @@ async function runAll() {
   let failed = 0;
 
   const suites = [
+    // Va la primera: es una propiedad estática del código, no depende del
+    // daemon, y si falla el README ha dejado de ser cierto.
+    { name: 'Shell-Safety (sin construcción de comandos de shell)', fn: testShellSafety },
     { name: 'Cloudflare Integration', fn: testCloudflare },
     { name: 'SSL Wildcard & On-Demand TLS', fn: testSsl },
     { name: 'Domain Manager & Routing', fn: testDomain },

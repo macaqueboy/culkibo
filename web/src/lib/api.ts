@@ -172,9 +172,12 @@ export interface DomainItem {
    */
   certClaim?: {
     verified: false;
-    issuer: string;
-    expiresAt: string;
-    daysRemaining: number;
+    /** `caddy_on_demand` cuando el TLS lo emite el plano de datos. */
+    managedBy?: string | null;
+    /** `null` en las entradas delegadas: nadie aquí conoce el emisor. */
+    issuer: string | null;
+    expiresAt: string | null;
+    daysRemaining: number | null;
     isWildcard: boolean;
   } | null;
 }
@@ -241,23 +244,40 @@ export interface IngressOutcome {
   error?: string;
 }
 
+/**
+ * Entrada del registro de certificados.
+ *
+ * Dos formas posibles, y ninguna admite datos inventados:
+ *
+ *  - `status: 'on_disk'` — hay un PEM en `data/certs/`. Emisor, caducidad,
+ *    huella y SANs se leen del X.509 en cada consulta, no se almacenan.
+ *  - `status: 'delegated'` — el certificado lo emite Caddy bajo demanda. No
+ *    hay emisor ni caducidad que el servidor pueda afirmar: llegan `null`.
+ *
+ * Hasta v1.0.0 esto incluía certificados fabricados con caducidad inventada.
+ * El dato verificado sigue estando en `IngressStatus.tls` (handshake real).
+ */
 export interface SslCertificate {
   id: string;
   domain: string;
   rootDomain: string;
   type: string;
   provider: string;
-  issuer: string;
+  issuer: string | null;
+  subject?: string | null;
   sans: string[];
-  status: string;
-  issuedAt: string;
-  expiresAt: string;
+  status: 'on_disk' | 'delegated' | string;
+  verified: boolean;
+  managedBy?: string | null;
+  issuedAt: string | null;
+  expiresAt: string | null;
   autoRenew: boolean;
-  fingerprint: string;
-  keyType: string;
-  daysRemaining: number;
+  fingerprint: string | null;
+  keyType: string | null;
+  daysRemaining: number | null;
   isExpiringSoon: boolean;
   isExpired: boolean;
+  message?: string;
 }
 
 export interface LogEntry {
@@ -636,6 +656,11 @@ export const api = {
     return res.json();
   },
 
+  /**
+   * @deprecated Responde 501: Culkibo no emite comodines. Se conserva porque el
+   * endpoint sigue existiendo para clientes externos (CLI, agentes MCP) y tiene
+   * que devolverles el error explicativo en vez de un 404.
+   */
   async issueWildcardSsl(domain: string, zoneId?: string, provider = 'lets_encrypt'): Promise<any> {
     const res = await fetch(`${API_BASE}/ssl/issue-wildcard`, {
       method: 'POST',

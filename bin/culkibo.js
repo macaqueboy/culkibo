@@ -258,20 +258,16 @@ domainCmd
 
 domainCmd
   .command('issue-wildcard <dominio>')
-  .description('Solicita certificado SSL Wildcard Let\'s Encrypt vía Cloudflare DNS-01')
+  .description('(No implementado) Emisión de comodín por ACME DNS-01')
   .action(async (dominio) => {
-    console.log(`[Culkibo SSL] Iniciando desafío DNS-01 ACME para ${dominio}...`);
-    const res = await sslManager.issueWildcardCertificate({
-      domain: dominio,
-      onProgress: (p) => {
-        console.log(`  [${p.progress}%] ${p.message}`);
-      }
-    });
-    if (res.success) {
-      console.log(`✨ Certificado Wildcard generado y guardado en: ${res.cert?.certPath}`);
-    } else {
-      console.error(`❌ Error en la emisión: ${res.error}`);
-    }
+    const res = await sslManager.issueWildcardCertificate({ domain: dominio });
+    // Nunca devuelve success. Se mantiene el comando —y sale con código 1— para
+    // que quien lo tuviera en un script se entere en vez de creer que funcionó.
+    console.error(`❌ ${res.error}`);
+    console.error('\n   Alternativa: registra el dominio con `culkibo domain add` y deja que');
+    console.error('   Caddy emita el certificado en la primera conexión HTTPS.');
+    console.error('   Comprueba el resultado real con `culkibo ingress <hostname>`.');
+    process.exitCode = 1;
   });
 
 domainCmd
@@ -388,7 +384,11 @@ program
         Tipo: route.isWildcard ? 'Comodín (*)' : 'Exacto',
         Entorno: route.targetPod === 'forge' ? 'Desarrollo (:3001)' : 'Producción (:8080)',
         Cloudflare: route.cloudflareProxied ? 'Proxy (Nube Naranja ☁️)' : 'Solo DNS',
-        TLS: cert ? `Activo (${cert.issuer})` : 'Pendiente',
+        // «Según el registro», no «Activo»: esto es una anotación propia, no un
+        // handshake. Un certificado delegado a Caddy no tiene emisor conocido.
+        TLS: cert
+          ? (cert.managedBy ? 'Delegado en Caddy (bajo demanda)' : `En disco (${cert.issuer || 'emisor desconocido'})`)
+          : 'Sin anotación en el registro',
         RepartoTráfico: `${traffic.citadel}% Prod / ${traffic.forge}% Dev`
       }
     ]);

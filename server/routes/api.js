@@ -153,8 +153,8 @@ router.post('/projects/:id/hibernate', async (req, res) => {
     await projectManager.flushToDisk();
     // Sin proceso detrás, la ruta apuntaría a un puerto muerto: se retira.
     const ingress = await ingressManager.removeProject(req.params.id);
+    // Misma corrección que en handleStopProject: una sola respuesta.
     res.json({ ...updated, ingress });
-    res.json(updated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -244,8 +244,10 @@ const handleStopProject = async (req, res) => {
     // Un proyecto parado no puede seguir teniendo una ruta viva: Caddy
     // devolvería 502 y el panel diría que el dominio está servido.
     const ingress = await ingressManager.removeProject(req.params.id);
+    // Había aquí un segundo `res.json(updated)`. Express lanzaba
+    // ERR_HTTP_HEADERS_SENT, el `catch` intentaba responder 500 y volvía a
+    // lanzar: cada parada dejaba un unhandledRejection en el log del daemon.
     res.json({ ...updated, ingress });
-    res.json(updated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -448,15 +450,12 @@ router.post('/import/coolify/migrate-domain', async (req, res) => {
         updates.cloudflareProxied = true;
       }
       await domainManager.updateDomain(domain.id, updates);
-      
-      sslManager.issueWildcardCertificate({
-        domain: hostname,
-        zoneId: zoneId || domain.cloudflareZoneId,
-        provider: 'lets_encrypt'
-      }).catch(err => console.error('[Migrate Domain] SSL error:', err));
+      // Aquí se lanzaba una emisión de comodín en segundo plano cuyo único
+      // efecto real era escribir un PEM inventado. El certificado lo emite
+      // Caddy en la primera conexión HTTPS al dominio migrado.
     }
-    
-    res.json({ success: true, hostname, dnsResult });
+
+    res.json({ success: true, hostname, dnsResult, tls: 'on_demand' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -487,12 +486,8 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
           const updates = { sslStatus: 'pending_ssl', cloudflareZoneId: zoneId || domain.cloudflareZoneId };
           if (dnsResult && dnsResult.success) updates.cloudflareProxied = true;
           await domainManager.updateDomain(domain.id, updates);
-          
-          sslManager.issueWildcardCertificate({
-            domain: hostname,
-            zoneId: zoneId || domain.cloudflareZoneId,
-            provider: 'lets_encrypt'
-          }).catch(err => console.error(err));
+          // Misma razón que en /migrate-domain: el certificado lo emite Caddy
+          // bajo demanda, no este bucle escribiendo PEMs inventados.
         }
         results.push({ hostname, success: true });
       } catch (e) {
@@ -814,6 +809,12 @@ router.get('/ssl/certificates', (req, res) => {
   }
 });
 
+// Emisión de comodín: 501, no 200 con un certificado inventado.
+//
+// Hasta v1.0.0 este endpoint respondía `{ success: true, cert }` con un PEM
+// fabricado. Ahora `sslManager` devuelve siempre `implemented: false`, y el
+// código HTTP tiene que decir lo mismo que el cuerpo: 501 Not Implemented. El
+// TLS real lo emite Caddy bajo demanda (ver /api/tls/ask y /api/ingress/status).
 router.post('/ssl/issue-wildcard', async (req, res) => {
   try {
     const { domain, zoneId, provider } = req.body;
@@ -827,7 +828,7 @@ router.post('/ssl/issue-wildcard', async (req, res) => {
         containerOrchestrator.emit('ssl_progress', progressData);
       }
     });
-    res.json(result);
+    res.status(result.success ? 200 : 501).json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1004,6 +1005,20 @@ router.get('/mcp/config', (req, res) => {
 });
 
 // --- DOCKER ENGINE ---
+
+// Una referencia con mala forma es un error del cliente, no del servidor.
+// `dockerManager.assertRef()` la rechaza igualmente (es la barrera real), pero
+// atrapándola aquí se devuelve 400 en vez de 500 y el mensaje llega en español.
+function badDockerRef(res, id) {
+  try {
+    dockerManager.assertRef(id);
+    return false;
+  } catch (e) {
+    res.status(400).json({ error: `Identificador de contenedor inválido: ${String(id)}` });
+    return true;
+  }
+}
+
 router.get('/docker/status', async (req, res) => {
   try {
     const status = await dockerManager.checkDockerStatus(req.query.refresh === 'true');
@@ -1027,6 +1042,7 @@ router.get('/docker/containers', async (req, res) => {
 
 router.get('/docker/containers/:id/stats', async (req, res) => {
   try {
+    if (badDockerRef(res, req.params.id)) return;
     const stats = await dockerManager.getContainerStats(req.params.id);
     res.json(stats);
   } catch (err) {
@@ -1036,6 +1052,7 @@ router.get('/docker/containers/:id/stats', async (req, res) => {
 
 router.post('/docker/containers/:id/start', async (req, res) => {
   try {
+    if (badDockerRef(res, req.params.id)) return;
     const result = await dockerManager.startContainer(req.params.id);
     res.json(result);
   } catch (err) {
@@ -1045,6 +1062,7 @@ router.post('/docker/containers/:id/start', async (req, res) => {
 
 router.post('/docker/containers/:id/stop', async (req, res) => {
   try {
+    if (badDockerRef(res, req.params.id)) return;
     const result = await dockerManager.stopContainer(req.params.id);
     res.json(result);
   } catch (err) {
@@ -1054,6 +1072,7 @@ router.post('/docker/containers/:id/stop', async (req, res) => {
 
 router.post('/docker/containers/:id/restart', async (req, res) => {
   try {
+    if (badDockerRef(res, req.params.id)) return;
     const result = await dockerManager.restartContainer(req.params.id);
     res.json(result);
   } catch (err) {
@@ -1063,6 +1082,7 @@ router.post('/docker/containers/:id/restart', async (req, res) => {
 
 router.get('/docker/containers/:id/logs', async (req, res) => {
   try {
+    if (badDockerRef(res, req.params.id)) return;
     const lines = req.query.lines ? parseInt(req.query.lines, 10) : 100;
     const logs = await dockerManager.getLogs(req.params.id, lines);
     res.json(logs);

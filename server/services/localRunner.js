@@ -1,9 +1,41 @@
-const { spawn, exec } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const net = require('net');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+
+/**
+ * Metacaracteres que cmd.exe interpreta incluso dentro de comillas dobles.
+ *
+ * En Windows no existe forma de lanzar un `.cmd`/`.bat` (npm, npx, vite...) sin
+ * pasar por `cmd.exe /c`: desde la corrección de CVE-2024-27980, Node lanza
+ * EINVAL si se intenta con `spawn` directo. Como `cmd.exe` vuelve a parsear la
+ * línea que Node construye, la única defensa real es rechazar los argumentos
+ * que contengan algo que cmd.exe pueda leer como separador. En POSIX no hace
+ * falta: allí se lanza el binario directamente, sin shell intermedio.
+ */
+const CMD_METACHARS = /[&|<>^"%\r\n]/;
+
+/**
+ * Lanza una herramienta sin construir jamás una cadena de shell.
+ *
+ * POSIX: `spawn(bin, argv)` — no hay shell.
+ * Windows: `cmd.exe /c bin ...argv` con los argumentos verificados uno a uno.
+ * Devuelve el ChildProcess para que el llamante gestione stdio y señales.
+ */
+function spawnTool(bin, args, options = {}) {
+  const argv = args.map(String);
+  if (process.platform === 'win32') {
+    for (const a of [bin, ...argv]) {
+      if (CMD_METACHARS.test(a)) {
+        throw new Error(`Argumento rechazado por contener metacaracteres de cmd.exe: ${JSON.stringify(a)}`);
+      }
+    }
+    return spawn('cmd.exe', ['/c', bin, ...argv], { ...options, shell: false });
+  }
+  return spawn(bin, argv, { ...options, shell: false });
+}
 
 let containerOrchestrator = null;
 try {
@@ -142,16 +174,22 @@ class LocalRunner {
     if (!fs.existsSync(dir)) return;
     try {
       if (process.platform === 'win32') {
-        const { execSync } = require('child_process');
+        // Git deja los objetos del paquete en sólo-lectura y `fs.rmSync` falla
+        // con EPERM. `attrib` los libera. Va por argv (`execFileSync`): `dir`
+        // es una ruta derivada del id del proyecto y nunca debe poder cerrar
+        // unas comillas dentro de un comando.
         try {
-          execSync(`attrib -r -s -h "${dir}\\*" /s /d`, { stdio: 'ignore', timeout: 5000 });
-        } catch(e) {}
-        try {
-          execSync(`rmdir /s /q "${dir}"`, { stdio: 'ignore', timeout: 10000 });
+          execFileSync('attrib', ['-r', '-s', '-h', path.join(dir, '*'), '/s', '/d'], {
+            stdio: 'ignore', timeout: 5000, windowsHide: true, shell: false
+          });
         } catch(e) {}
       }
       if (fs.existsSync(dir)) {
-        fs.rmSync(dir, { recursive: true, force: true });
+        // Antes había aquí un `rmdir /s /q` por cmd.exe. `fs.rmSync` con
+        // reintentos hace lo mismo sin shell: los reintentos cubren el EBUSY
+        // transitorio de Windows cuando un antivirus o un proceso recién
+        // muerto todavía tiene un handle abierto.
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
       }
     } catch(e) {
       console.warn(`[LocalRunner] Warning cleaning ${dir}:`, e.message);
@@ -187,12 +225,18 @@ class LocalRunner {
 
     try {
       if (process.platform === 'win32') {
-        const { execSync } = require('child_process');
         const pids = new Set();
 
-        // 1. Query via PowerShell Get-NetTCPConnection
+        // 1. Query via PowerShell Get-NetTCPConnection.
+        //    `execFileSync` lanza powershell.exe directamente: no hay cmd.exe
+        //    de por medio. El script sí es texto, pero lo único que se
+        //    interpola es `numPort`, ya normalizado a entero por el parseInt de
+        //    arriba, así que no hay nada que un llamante pueda inyectar.
         try {
-          const psOut = execSync(`powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort ${numPort} -ErrorAction SilentlyContinue).OwningProcess"`, { timeout: 3000 }).toString().trim();
+          const psOut = execFileSync('powershell', [
+            '-NoProfile', '-NonInteractive', '-Command',
+            `(Get-NetTCPConnection -LocalPort ${numPort} -ErrorAction SilentlyContinue).OwningProcess`
+          ], { timeout: 3000, windowsHide: true, shell: false }).toString().trim();
           psOut.split(/\r?\n/).forEach(s => {
             const p = parseInt(s.trim(), 10);
             if (!isNaN(p) && p > 4 && p !== process.pid) pids.add(p);
@@ -201,7 +245,7 @@ class LocalRunner {
 
         // 2. Fallback via netstat
         try {
-          const netstatOut = execSync(`netstat -ano`, { timeout: 3000 }).toString().trim();
+          const netstatOut = execFileSync('netstat', ['-ano'], { timeout: 3000, windowsHide: true, shell: false }).toString().trim();
           netstatOut.split(/\r?\n/).forEach(line => {
             const parts = line.trim().split(/\s+/);
             if (parts.length >= 4) {
@@ -216,24 +260,33 @@ class LocalRunner {
 
         for (const pid of pids) {
           try {
-            execSync(`taskkill /pid ${pid} /T /F`, { timeout: 4000, stdio: 'ignore' });
+            execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+              timeout: 4000, stdio: 'ignore', windowsHide: true, shell: false
+            });
             console.log(`[LocalRunner] Killed process ${pid} on port ${numPort}`);
           } catch(e) {}
         }
       } else {
-        const { execSync } = require('child_process');
         const pids = new Set();
 
         // lsof is not installed on minimal Debian/Ubuntu VPS images, which is
         // exactly where Culkibo is deployed. Try lsof, then ss, then fuser.
+        //
+        // Antes esto era una lista de cadenas ejecutadas con `shell: '/bin/sh'`
+        // —incluido un `2>/dev/null` que obligaba a tener shell—. Ahora cada
+        // sonda es un argv y la redirección de stderr se hace con `stdio`.
         const probes = [
-          `lsof -ti tcp:${numPort}`,
-          `ss -lptnH 'sport = :${numPort}'`,
-          `fuser ${numPort}/tcp 2>/dev/null`
+          { bin: 'lsof', args: ['-ti', `tcp:${numPort}`] },
+          { bin: 'ss', args: ['-lptnH', `sport = :${numPort}`] },
+          { bin: 'fuser', args: [`${numPort}/tcp`] }
         ];
         for (const probe of probes) {
           try {
-            const out = execSync(probe, { timeout: 3000, shell: '/bin/sh' }).toString();
+            const out = execFileSync(probe.bin, probe.args, {
+              timeout: 3000,
+              shell: false,
+              stdio: ['ignore', 'pipe', 'ignore']
+            }).toString();
             // ss prints users:(("node",pid=1234,fd=23)); lsof/fuser print bare pids.
             const matches = out.match(/pid=(\d+)/g) || [];
             matches.forEach(m => pids.add(parseInt(m.slice(4), 10)));
@@ -350,12 +403,64 @@ class LocalRunner {
    */
   checkCommand(cmd) {
     try {
-      const { execSync } = require('child_process');
-      execSync(process.platform === 'win32' ? `where ${cmd}` : `which ${cmd}`, { stdio: 'ignore' });
+      // `where`/`which` por argv: si `cmd` llegara a contener `; rm -rf /`, con
+      // una cadena de shell se ejecutaría; con argv es sólo un nombre que no se
+      // encuentra y la función devuelve false.
+      execFileSync(process.platform === 'win32' ? 'where' : 'which', [String(cmd)], {
+        stdio: 'ignore', timeout: 5000, windowsHide: true, shell: false
+      });
       return true;
     } catch(e) {
       return false;
     }
+  }
+
+  /**
+   * `npm install` sin shell.
+   *
+   * Los argumentos son constantes, pero `exec()` seguía entregando la cadena a
+   * cmd.exe / sh: una invariante que sólo se mantiene si no hay ni una sola
+   * excepción. Resuelve siempre (nunca rechaza) porque los tres llamantes ya
+   * trataban el fallo de instalación como no fatal.
+   */
+  npmInstall(cwd, { timeout = 300000 } = {}) {
+    return new Promise((resolve) => {
+      let child;
+      try {
+        child = spawnTool('npm', ['install', '--prefer-offline', '--no-audit'], {
+          cwd,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+      } catch (err) {
+        return resolve({ ok: false, error: err.message });
+      }
+
+      // Se conserva sólo la cola de stderr: un `npm install` real supera de
+      // largo el maxBuffer de 1 MB que hacía fallar a `exec` DESPUÉS de haber
+      // instalado correctamente.
+      const stderr = [];
+      child.stderr.on('data', (d) => {
+        stderr.push(d.toString());
+        if (stderr.length > 80) stderr.shift();
+      });
+      child.stdout.on('data', () => {});
+
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch (e) {}
+      }, timeout);
+      if (timer.unref) timer.unref();
+
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        resolve({ ok: false, error: err.message });
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) return resolve({ ok: true });
+        resolve({ ok: false, error: stderr.join('').trim() || `npm install terminó con código ${code}` });
+      });
+    });
   }
 
   /**
@@ -430,18 +535,8 @@ class LocalRunner {
         if (containerOrchestrator) {
           containerOrchestrator.addLog('INFO', 'forge', `Instalando dependencias (npm install) para ${project.name}...`, new Date(), project.id);
         }
-        await new Promise((resolve, reject) => {
-          // A real `npm install` easily exceeds the 1 MB default maxBuffer and
-          // would fail with ERR_CHILD_PROCESS_STDIO_MAXBUFFER after succeeding.
-          exec('npm install --prefer-offline --no-audit', {
-            cwd: projectDir,
-            timeout: 300000,
-            maxBuffer: 32 * 1024 * 1024
-          }, (err, stdout, stderr) => {
-            if (err) return reject(new Error(stderr || err.message));
-            resolve();
-          });
-        });
+        const install = await this.npmInstall(projectDir, { timeout: 300000 });
+        if (!install.ok) throw new Error(install.error);
 
         // The user may have pressed Stop while npm was running. Do not resurrect.
         if (this.isStale(project.id, generation)) {
@@ -520,9 +615,16 @@ class LocalRunner {
     // detached:true — with detached:false the negative-pid kill throws ESRCH and
     // the dev server (plus its forked workers) survives the "stop", leaving a
     // zombie listener on the port. Windows uses `taskkill /T` instead.
-    const child = isWin
-      ? spawn('cmd.exe', ['/c', cmd, ...args], { cwd: projectDir, env, detached: false })
-      : spawn(cmd, args, { cwd: projectDir, env, detached: true });
+    //
+    // `spawnTool` centraliza el único punto del proyecto donde Windows obliga a
+    // pasar por cmd.exe, y valida ahí los argumentos: `pkg.main` sale del
+    // package.json del repositorio clonado, es decir, de código ajeno.
+    const child = spawnTool(cmd, args, {
+      cwd: projectDir,
+      env,
+      detached: !isWin,
+      windowsHide: true
+    });
 
     const stderrBuffer = [];
     const spawnTime = Date.now();
@@ -988,13 +1090,7 @@ class LocalRunner {
           if (containerOrchestrator) {
             containerOrchestrator.addLog('INFO', 'forge', `Instalando dependencias en ${resolved.path}...`, new Date(), project.id);
           }
-          await new Promise((resolve) => {
-            exec('npm install --prefer-offline --no-audit', {
-              cwd: resolved.path,
-              timeout: 180000,
-              maxBuffer: 10 * 1024 * 1024
-            }, () => resolve());
-          });
+          await this.npmInstall(resolved.path, { timeout: 180000 });
         }
 
         // The clone can take minutes. If the user stopped (or restarted) the
@@ -1056,9 +1152,7 @@ class LocalRunner {
 
       const resolved = this.resolveRunnableDirectory(projectDir, project.baseDirectory);
       if (resolved.type === 'node') {
-        await new Promise((resolve) => {
-          exec('npm install --prefer-offline --no-audit', { cwd: resolved.path, timeout: 180000 }, () => resolve());
-        });
+        await this.npmInstall(resolved.path, { timeout: 180000 });
       }
       console.log(`[LocalRunner] Auto-preparation complete for ${project.name}`);
     } catch(e) {
@@ -1135,9 +1229,10 @@ class LocalRunner {
         console.log(`[LocalRunner] Killing process tree for project ${projectId} (PID: ${runner.child.pid})`);
         try {
           if (process.platform === 'win32') {
-            const { execSync } = require('child_process');
             try {
-              execSync(`taskkill /pid ${runner.child.pid} /T /F`, { timeout: 4000, stdio: 'ignore' });
+              execFileSync('taskkill', ['/pid', String(runner.child.pid), '/T', '/F'], {
+                timeout: 4000, stdio: 'ignore', windowsHide: true, shell: false
+              });
             } catch(e) {}
           } else {
             // Process group first (spawned with detached:true so the child leads

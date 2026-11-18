@@ -101,11 +101,19 @@ class DomainManager {
         // TLS real que hace ingressManager y se publica en /api/ingress/status.
         // Se renombró a propósito para que ningún consumidor pueda volver a
         // confundir una afirmación propia con una comprobación.
+        //
+        // `issuer` y `expiresAt` pueden ser `null`: una entrada delegada
+        // (TLS bajo demanda de Caddy) no tiene emisor ni caducidad que
+        // podamos afirmar, y desde que se eliminó la emisión falsa el
+        // registro ya no se los inventa.
         certClaim: cert ? {
           verified: false,
-          issuer: cert.issuer,
-          expiresAt: cert.expiresAt,
-          daysRemaining: Math.max(0, Math.floor((new Date(cert.expiresAt).getTime() - Date.now()) / 86400000)),
+          managedBy: cert.managedBy || null,
+          issuer: cert.issuer || null,
+          expiresAt: cert.expiresAt || null,
+          daysRemaining: cert.expiresAt
+            ? Math.max(0, Math.floor((new Date(cert.expiresAt).getTime() - Date.now()) / 86400000))
+            : null,
           isWildcard: cert.type === 'wildcard_dns01'
         } : null
       };

@@ -1,8 +1,9 @@
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
-const util = require('util');
-const execPromise = util.promisify(exec);
+// Este módulo NO ejecuta procesos: sólo construye la especificación argv del
+// volcado (`buildDbDumpSpec`) para que la ejecute quien corresponda. El
+// `require('child_process')` que había aquí no se usaba y sólo servía para que
+// alguien cayera en la tentación de añadir un `exec()`.
 const projectManager = require('./projectManager');
 const domainManager = require('./domainManager');
 

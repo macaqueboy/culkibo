@@ -158,7 +158,7 @@ async function testToolAnnotations() {
   const mustMutate = [
     'culkibo_create_project', 'culkibo_add_resource', 'culkibo_set_project_env',
     'culkibo_deploy_project', 'culkibo_hot_sync', 'culkibo_switch_traffic',
-    'culkibo_manage_domain', 'culkibo_manage_watcher', 'culkibo_issue_wildcard_ssl',
+    'culkibo_manage_domain', 'culkibo_manage_watcher',
     'culkibo_create_sslip_domain', 'culkibo_export_backup', 'culkibo_restore_backup',
     'culkibo_github_connect', 'culkibo_github_disconnect', 'culkibo_create_project_from_github'
   ];
@@ -178,7 +178,11 @@ async function testToolAnnotations() {
     'culkibo_list_projects', 'culkibo_get_project', 'culkibo_list_pods',
     'culkibo_inspect_ingress', 'culkibo_get_logs', 'culkibo_docker_status',
     'culkibo_docker_containers', 'culkibo_github_status', 'culkibo_github_list_repos',
-    'culkibo_github_get_branches', 'culkibo_github_auto_detect'
+    'culkibo_github_get_branches', 'culkibo_github_auto_detect',
+    // No emite nada: devuelve siempre el error de «no implementado». Estaba en
+    // `mustMutate` porque fabricaba un PEM y lo guardaba en disco como si fuera
+    // un certificado real.
+    'culkibo_issue_wildcard_ssl'
   ];
   for (const name of mustBeReadOnly) {
     assert.strictEqual(byName[name].annotations.readOnlyHint, true, `${name} no muta nada`);
@@ -187,8 +191,17 @@ async function testToolAnnotations() {
   // Las que hablan con un tercero tienen que declararlo: de ahí depende la
   // clasificación de sus fallos como reintentables.
   assert.strictEqual(byName.culkibo_github_list_repos.annotations.openWorldHint, true);
-  assert.strictEqual(byName.culkibo_issue_wildcard_ssl.annotations.openWorldHint, true);
   assert.strictEqual(byName.culkibo_list_pods.annotations.openWorldHint, false);
+
+  // `culkibo_issue_wildcard_ssl` ya no emite nada: devuelve siempre un error
+  // explicativo. Sus anotaciones tienen que decirlo, o un agente creerá que
+  // invocarla cambia algo — que es justo lo que hacía cuando fabricaba un PEM.
+  assert.strictEqual(byName.culkibo_issue_wildcard_ssl.annotations.readOnlyHint, true,
+    'La emisión de comodín no está implementada: no muta nada');
+  assert.strictEqual(byName.culkibo_issue_wildcard_ssl.annotations.openWorldHint, false,
+    'No habla con ninguna CA: ya no hay llamada ACME que pueda fallar de forma reintentable');
+  assert.ok(/NOT IMPLEMENTED/.test(byName.culkibo_issue_wildcard_ssl.description),
+    'La descripción debe advertir al agente de que la herramienta no emite nada');
 
   assert.ok(byName.culkibo_list_pods.outputSchema, 'culkibo_list_pods debe declarar outputSchema');
   console.log(`  ✓ Anotaciones verificadas en las 26 herramientas (${tools.filter(t => t.annotations.readOnlyHint).length} de solo lectura, ${tools.filter(t => t.annotations.destructiveHint).length} destructivas)`);

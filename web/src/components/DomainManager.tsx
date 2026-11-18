@@ -72,30 +72,20 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
   const [showLinkModal, setShowLinkModal] = useState(false);
   const [selectedLinkDomain, setSelectedLinkDomain] = useState('');
 
-  // Wildcard ACME Issuance State
-  const [wildcardDomain, setWildcardDomain] = useState('*.culkibo.dev');
-  const [wildcardProvider, setWildcardProvider] = useState('lets_encrypt');
-  const [issuingWildcard, setIssuingWildcard] = useState(false);
-  const [wildcardProgress, setWildcardProgress] = useState<{ stage: string; progress: number; message: string } | null>(null);
-
   // sslip.io Form
   const [sslipIp, setSslipIp] = useState('127.0.0.1');
   const [issuingSslip, setIssuingSslip] = useState(false);
 
-  // Sync real-time WebSocket SSL progress
+  // Progreso SSL por WebSocket.
+  //
+  // Aquí había una barra de progreso de seis etapas ACME alimentada por este
+  // evento. Las etapas eran `setTimeout` en el servidor y el certificado que
+  // aparecía al final era inventado. Hoy el único `ssl_progress` que emite el
+  // daemon es el aviso de «comodín no implementado», así que se muestra tal
+  // cual, como lo que es: un error.
   useEffect(() => {
-    if (liveSslProgress) {
-      setWildcardProgress(liveSslProgress);
-      if (liveSslProgress.stage === 'installed') {
-        setTimeout(() => {
-          setShowWildcardModal(false);
-          setIssuingWildcard(false);
-          setWildcardProgress(null);
-          loadData();
-        }, 1500);
-      } else if (liveSslProgress.stage === 'error') {
-        setIssuingWildcard(false);
-      }
+    if (liveSslProgress?.message) {
+      setErrorBanner(liveSslProgress.message);
     }
   }, [liveSslProgress]);
 
@@ -296,33 +286,6 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
     }
   };
 
-  const handleIssueWildcard = async () => {
-    setIssuingWildcard(true);
-    setWildcardProgress({ stage: 'submitting', progress: 10, message: 'Iniciando verificación de dominio con Cloudflare...' });
-
-    try {
-      const res = await api.issueWildcardSsl(wildcardDomain, undefined, wildcardProvider);
-      if (res.success) {
-        setWildcardProgress({ stage: 'installed', progress: 100, message: `¡Certificado Wildcard emitido para ${wildcardDomain}!` });
-        setTimeout(() => {
-          setShowWildcardModal(false);
-          setIssuingWildcard(false);
-          setWildcardProgress(null);
-          loadData();
-          if (onNotify) onNotify(`SSL Wildcard emitido para ${wildcardDomain}`);
-        }, 1200);
-      } else {
-        setErrorBanner(`Error de emisión SSL: ${res.error}`);
-        setWildcardProgress({ stage: 'error', progress: 100, message: `Error de emisión: ${res.error}` });
-        setIssuingWildcard(false);
-      }
-    } catch (err: any) {
-      setErrorBanner(`ACME DNS-01 error: ${err.message}`);
-      setWildcardProgress({ stage: 'error', progress: 100, message: `Error de ACME: ${err.message}` });
-      setIssuingWildcard(false);
-    }
-  };
-
   const handleIssueSslip = async () => {
     setIssuingSslip(true);
     try {
@@ -330,7 +293,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
       if (res.success) {
         setShowSslipModal(false);
         loadData();
-        if (onNotify) onNotify(`Certificado automático emitido para ${res.cert.domain}`);
+        // «Registrado», no «emitido»: aquí no se emite nada. Caddy emitirá el
+        // certificado en la primera conexión HTTPS a ese host.
+        if (onNotify) onNotify(`Host ${res.cert.rootDomain} registrado. Caddy emitirá su certificado en el primer acceso HTTPS.`);
       } else {
         setErrorBanner(`Error de sslip: ${res.error}`);
       }
@@ -467,13 +432,14 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             <span>Añadir dominio</span>
           </button>
 
-          {/* Issue Wildcard ACME DNS-01 */}
+          {/* Comodines: explica que no se emiten, en vez de fingir que sí */}
           <button
             onClick={() => setShowWildcardModal(true)}
-            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold transition-all shadow-sm cursor-pointer active:scale-95"
+            title="Culkibo no emite certificados comodín"
+            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 text-xs font-medium transition-all cursor-pointer"
           >
-            <Zap className="w-3.5 h-3.5" />
-            <span>Emitir SSL wildcard</span>
+            <ShieldOff className="w-3.5 h-3.5 text-slate-500" />
+            <span>SSL wildcard</span>
           </button>
 
           {/* Zero Config sslip.io */}
@@ -697,7 +663,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                           </div>
                           {domain.certClaim && (
                             <div className="text-[11px] text-slate-400">
-                              El registro interno afirma {domain.certClaim.issuer}, sin verificar
+                              {domain.certClaim.managedBy
+                                ? 'El registro interno sólo anota que el TLS lo emite Caddy bajo demanda'
+                                : `El registro interno afirma ${domain.certClaim.issuer ?? 'un emisor desconocido'}, sin verificar`}
                             </div>
                           )}
                         </div>
@@ -765,40 +733,62 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
             </h3>
           </div>
           <span className="text-xs font-medium text-slate-500">
-            Anotaciones propias, no verificadas contra el servidor
+            Sólo certificados que existen. Lo verificado está en el handshake
           </span>
         </div>
 
+        {certs.length === 0 && (
+          <p className="text-xs text-slate-500 leading-relaxed">
+            El registro está vacío. No es un error: Culkibo no guarda copia de los
+            certificados que emite Caddy bajo demanda. El estado real de cada dominio
+            sale del handshake TLS de la tabla de arriba.
+          </p>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {certs.map((cert) => (
+          {certs.map((cert) => {
+            const delegated = cert.status === 'delegated';
+            return (
             <div
               key={cert.id}
               className="p-4 rounded-xl bg-slate-50/70 border border-slate-200 flex flex-col justify-between space-y-3"
             >
               <div>
-                <div className="flex items-start justify-between">
+                <div className="flex items-start justify-between gap-2">
                   <div>
                     <span className="text-xs font-bold text-slate-900 block">
                       {cert.domain}
                     </span>
                     <span className="text-[11px] text-slate-500">
-                      Emisor: {cert.issuer}
+                      {delegated ? 'Emisor: lo decide Caddy al emitir' : `Emisor: ${cert.issuer ?? 'desconocido'}`}
                     </span>
                   </div>
-                  <span className="px-2 py-0.5 rounded-lg text-[10px] font-semibold bg-slate-100 text-slate-600 border border-slate-200">
-                    {cert.daysRemaining} días según el registro
+                  <span className="px-2 py-0.5 rounded-lg text-[10px] font-semibold bg-slate-100 text-slate-600 border border-slate-200 shrink-0">
+                    {delegated
+                      ? 'Bajo demanda'
+                      : cert.daysRemaining === null
+                        ? 'Sin caducidad legible'
+                        : `${cert.daysRemaining} días (leído del X.509)`}
                   </span>
                 </div>
 
                 <div className="mt-2 text-xs text-slate-600 space-y-1">
-                  <div>Algoritmo: <span className="font-semibold text-slate-800">{cert.keyType}</span></div>
-                  <div className="truncate font-mono text-[11px]">Huella: <span className="text-slate-500">{cert.fingerprint}</span></div>
+                  {delegated ? (
+                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                      {cert.message ?? 'Culkibo no almacena ni la clave ni la caducidad de este certificado.'}
+                    </p>
+                  ) : (
+                    <>
+                      <div>Algoritmo: <span className="font-semibold text-slate-800">{cert.keyType ?? 'desconocido'}</span></div>
+                      <div className="truncate font-mono text-[11px]">Huella: <span className="text-slate-500">{cert.fingerprint ?? '—'}</span></div>
+                    </>
+                  )}
                   <div>SANs: <span className="font-semibold text-amber-700">{cert.sans?.join(', ')}</span></div>
                 </div>
               </div>
 
-              <div className="pt-2 border-t border-slate-200 flex items-center justify-between text-[11px] text-slate-500">
-                <span>Almacenamiento: ./data/certs/{cert.rootDomain}</span>
+              <div className="pt-2 border-t border-slate-200 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                <span>{delegated ? 'Almacenamiento: volumen de Caddy' : `Almacenamiento: ./data/certs/${cert.rootDomain}`}</span>
                 {(() => {
                   const verified = (ingress?.tls || []).find(t => t.probed === cert.rootDomain && t.reachable && t.notAfter);
                   return verified ? (
@@ -812,7 +802,8 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                 })()}
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -959,82 +950,60 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
         </div>
       )}
 
-      {/* --- MODAL: WILDCARD ACME DNS-01 ISSUER --- */}
+      {/* --- MODAL: WILDCARD DNS-01 — NO IMPLEMENTADO --- */}
+      {/*
+        Antes este modal tenía una barra de progreso con seis etapas ACME. Las
+        etapas eran `setTimeout`, el certificado un PEM inventado y la caducidad
+        un `Date.now() + 90 días` escrito a mano. Se ha sustituido por lo que es
+        cierto: Culkibo no emite comodines, y el TLS por host ya funciona solo.
+      */}
       {showWildcardModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4">
           <div className="w-full max-w-lg bg-white border border-slate-200 rounded-2xl p-6 shadow-xl space-y-4 text-slate-900">
-            <div className="flex items-center gap-2 text-amber-600">
-              <Zap className="w-5 h-5" />
+            <div className="flex items-center gap-2 text-slate-600">
+              <ShieldOff className="w-5 h-5" />
               <h3 className="text-base font-bold text-slate-900">
-                Emitir certificado wildcard SSL (*.tudominio.com)
+                Certificados comodín (*.tudominio.com)
               </h3>
             </div>
-            <p className="text-xs text-slate-600 leading-relaxed">
-              Culkibo gestiona el desafío RFC 8555 ACME DNS-01 inyectando el registro TXT necesario en tu zona de Cloudflare y emitiendo un certificado SSL wildcard válido para <code>*.tudominio.com</code>.
-            </p>
 
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Dominio wildcard
-                </label>
-                <input
-                  type="text"
-                  value={wildcardDomain}
-                  onChange={(e) => setWildcardDomain(e.target.value)}
-                  disabled={issuingWildcard}
-                  className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs text-slate-900 font-mono focus:outline-none focus:bg-white focus:border-amber-500"
-                />
-              </div>
+            <div className="p-3.5 rounded-xl bg-amber-50/70 border border-amber-200">
+              <p className="text-xs text-amber-900 leading-relaxed">
+                <span className="font-semibold">Culkibo no emite certificados comodín.</span>{' '}
+                El desafío ACME DNS-01 no está implementado. Hasta la v1.0.0 esta
+                pantalla simulaba la emisión y guardaba un certificado inventado en{' '}
+                <code>data/certs/</code>: se ha eliminado.
+              </p>
+            </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Autoridad de certificación (CA)
-                </label>
-                <select
-                  value={wildcardProvider}
-                  onChange={(e) => setWildcardProvider(e.target.value)}
-                  disabled={issuingWildcard}
-                  className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs text-slate-900 focus:outline-none focus:bg-white focus:border-amber-500"
-                >
-                  <option value="lets_encrypt">Let's Encrypt (ECDSA P-256 / ACME v2)</option>
-                  <option value="zerossl">ZeroSSL (ECC CA)</option>
-                </select>
-              </div>
-
-              {/* Progress Bar & Stage Indicator */}
-              {wildcardProgress && (
-                <div className="p-3.5 rounded-xl bg-amber-50/70 border border-amber-200 space-y-2">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-amber-800 font-medium">{wildcardProgress.message}</span>
-                    <span className="text-amber-900 font-bold">{wildcardProgress.progress}%</span>
-                  </div>
-                  <div className="w-full h-2 rounded-full bg-amber-100 overflow-hidden">
-                    <div
-                      style={{ width: `${wildcardProgress.progress}%` }}
-                      className="h-full bg-amber-500 transition-all duration-300"
-                    />
-                  </div>
-                </div>
-              )}
+            <div className="space-y-2 text-xs text-slate-600 leading-relaxed">
+              <p>
+                <span className="font-semibold text-slate-800">Lo que sí funciona:</span>{' '}
+                Caddy emite un certificado por host en la primera conexión HTTPS
+                (TLS bajo demanda). Añade el dominio, apunta su DNS a este servidor
+                y el certificado aparece solo en el primer acceso. No hay nada que
+                pulsar aquí.
+              </p>
+              <p>
+                <span className="font-semibold text-slate-800">Si necesitas un comodín de verdad:</span>{' '}
+                hay que compilar Caddy con el módulo <code>caddy-dns/cloudflare</code>{' '}
+                (xcaddy) y darle un token de Cloudflare. La imagen estándar{' '}
+                <code>caddy:2-alpine</code> no lo incluye.
+              </p>
+              <p>
+                El estado real de cada dominio —emisor y caducidad tal como los
+                presenta el servidor— sale del handshake TLS de la tabla, no de
+                ninguna anotación interna.
+              </p>
             </div>
 
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
               <button
                 type="button"
                 onClick={() => setShowWildcardModal(false)}
-                disabled={issuingWildcard}
-                className="px-4 py-2 rounded-xl text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 cursor-pointer transition-colors"
+                className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs shadow-sm cursor-pointer active:scale-95 transition-all"
               >
-                Cerrar
-              </button>
-              <button
-                onClick={handleIssueWildcard}
-                disabled={issuingWildcard}
-                className="flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-semibold text-xs shadow-sm cursor-pointer active:scale-95 transition-all disabled:opacity-50"
-              >
-                <Zap className={`w-4 h-4 ${issuingWildcard ? 'animate-spin' : ''}`} />
-                <span>{issuingWildcard ? 'Emitiendo wildcard...' : 'Iniciar emisión SSL'}</span>
+                Entendido
               </button>
             </div>
           </div>
@@ -1052,7 +1021,10 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
               </h3>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Genera un subdominio comodín instantáneo sin necesidad de configurar DNS propios. Ideal para pruebas locales y previsualización inmediata.
+              Registra un subdominio instantáneo sin configurar DNS propios, ideal para
+              pruebas locales. Culkibo no emite ni almacena el certificado: lo emite Caddy
+              en la primera conexión HTTPS al host, y su estado real aparece en el
+              handshake TLS de la tabla.
             </p>
 
             <div className="space-y-3">
@@ -1086,7 +1058,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
                 disabled={issuingSslip}
                 className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs shadow-sm cursor-pointer active:scale-95 transition-all disabled:opacity-50"
               >
-                {issuingSslip ? 'Generando TLS...' : 'Generar certificado rápido'}
+                {issuingSslip ? 'Registrando host...' : 'Registrar host'}
               </button>
             </div>
           </div>

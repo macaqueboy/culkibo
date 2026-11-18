@@ -1,6 +1,30 @@
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const util = require('util');
-const execPromise = util.promisify(exec);
+const execFilePromise = util.promisify(execFile);
+
+/**
+ * Cliente del motor Docker.
+ *
+ * Todo pasa por `execFile('docker', [argv])`. Nunca se construye una cadena de
+ * shell, porque `exec()` entrega la cadena a `cmd.exe` / `/bin/sh` y cualquier
+ * metacarácter dentro de un ID o de un nombre de contenedor se convierte en
+ * ejecución de comandos. Ésa es exactamente la clase que ha producido 21 avisos
+ * críticos en Coolify y 34 en Dokploy, y dos de esos parches están catalogados
+ * como «incomplete fix»: no se arregla caso a caso, se elimina por construcción.
+ *
+ * Con argv no hay shell, pero sigue existiendo *inyección de argumento*: un
+ * valor que empiece por `-` lo lee `docker` como una opción. Por eso
+ * `assertRef()` valida la forma de cada referencia antes de pasarla, en vez de
+ * confiar en que el llamante lo haya hecho.
+ */
+
+/**
+ * Referencias válidas de Docker: IDs hexadecimales, nombres de contenedor y
+ * nombres de imagen. Docker exige que el primer carácter sea alfanumérico, así
+ * que este patrón no puede empezar por `-` ni contener espacios ni separadores
+ * de shell.
+ */
+const DOCKER_REF = /^[a-zA-Z0-9][a-zA-Z0-9_.\-/:]*$/;
 
 class DockerManager {
   constructor() {
@@ -9,6 +33,33 @@ class DockerManager {
     this.lastCheckTime = 0;
     this.checkIntervalMs = 15000;
     this.cachedStatus = null;
+  }
+
+  /**
+   * Rechaza cualquier referencia que no tenga forma de ID/nombre de Docker.
+   * Defensa en profundidad: aunque no haya shell, un `-v` colado como ID
+   * cambiaría el significado del comando.
+   */
+  assertRef(value, label = 'referencia de contenedor') {
+    const ref = String(value == null ? '' : value);
+    if (!DOCKER_REF.test(ref) || ref.length > 255) {
+      throw new Error(`${label} inválida: ${JSON.stringify(ref)}`);
+    }
+    return ref;
+  }
+
+  /**
+   * Único punto de ejecución. `shell: false` es el valor por defecto de
+   * `execFile`, pero se declara para que sea explícito en la lectura y para que
+   * quede constancia de la invariante que este módulo mantiene.
+   */
+  async docker(args, { timeout = 10000 } = {}) {
+    return execFilePromise('docker', args, {
+      timeout,
+      shell: false,
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024
+    });
   }
 
   /**
@@ -23,7 +74,7 @@ class DockerManager {
 
     try {
       // Intento rápido de consultar docker version
-      const { stdout: versionOut } = await execPromise('docker version --format "{{json .}}"', { timeout: 3500 });
+      const { stdout: versionOut } = await this.docker(['version', '--format', '{{json .}}'], { timeout: 3500 });
       let versionData = {};
       try {
         versionData = JSON.parse(versionOut.trim());
@@ -32,7 +83,7 @@ class DockerManager {
       }
 
       // Comprobar si el server/daemon responde
-      const { stdout: infoOut } = await execPromise('docker info --format "{{json .}}"', { timeout: 4000 });
+      const { stdout: infoOut } = await this.docker(['info', '--format', '{{json .}}'], { timeout: 4000 });
       let infoData = {};
       try {
         infoData = JSON.parse(infoOut.trim());
@@ -105,8 +156,10 @@ class DockerManager {
     }
 
     try {
-      const allFlag = all ? '-a' : '';
-      const { stdout } = await execPromise(`docker ps ${allFlag} --format "{{json .}}"`, { timeout: 5000 });
+      const args = ['ps'];
+      if (all) args.push('-a');
+      args.push('--format', '{{json .}}');
+      const { stdout } = await this.docker(args, { timeout: 5000 });
       const lines = stdout.trim().split('\n').filter(Boolean);
       return lines.map(line => {
         try {
@@ -148,7 +201,8 @@ class DockerManager {
     }
 
     try {
-      const { stdout } = await execPromise(`docker stats ${containerId} --no-stream --format "{{json .}}"`, { timeout: 6000 });
+      const ref = this.assertRef(containerId);
+      const { stdout } = await this.docker(['stats', ref, '--no-stream', '--format', '{{json .}}'], { timeout: 6000 });
       return JSON.parse(stdout.trim());
     } catch (err) {
       return { id: containerId, error: err.message };
@@ -163,7 +217,8 @@ class DockerManager {
     if (!status.available) {
       return { success: true, message: `Contenedor ${containerId} iniciado en sandbox.`, mode: 'sandbox' };
     }
-    const { stdout } = await execPromise(`docker start ${containerId}`);
+    const ref = this.assertRef(containerId);
+    const { stdout } = await this.docker(['start', ref]);
     return { success: true, stdout: stdout.trim(), mode: 'docker_native' };
   }
 
@@ -175,7 +230,8 @@ class DockerManager {
     if (!status.available) {
       return { success: true, message: `Contenedor ${containerId} detenido en sandbox.`, mode: 'sandbox' };
     }
-    const { stdout } = await execPromise(`docker stop ${containerId}`);
+    const ref = this.assertRef(containerId);
+    const { stdout } = await this.docker(['stop', ref], { timeout: 30000 });
     return { success: true, stdout: stdout.trim(), mode: 'docker_native' };
   }
 
@@ -187,7 +243,8 @@ class DockerManager {
     if (!status.available) {
       return { success: true, message: `Contenedor ${containerId} reiniciado en sandbox.`, mode: 'sandbox' };
     }
-    const { stdout } = await execPromise(`docker restart ${containerId}`);
+    const ref = this.assertRef(containerId);
+    const { stdout } = await this.docker(['restart', ref], { timeout: 45000 });
     return { success: true, stdout: stdout.trim(), mode: 'docker_native' };
   }
 
@@ -207,7 +264,11 @@ class DockerManager {
       };
     }
     try {
-      const { stdout, stderr } = await execPromise(`docker logs --tail ${lines} ${containerId}`, { timeout: 5000 });
+      const ref = this.assertRef(containerId);
+      // `--tail` sólo acepta un entero o `all`. Se normaliza aquí para que un
+      // valor arbitrario del llamante no llegue nunca a la línea de comandos.
+      const tail = Number.isFinite(Number(lines)) ? Math.min(Math.max(parseInt(lines, 10) || 100, 1), 10000) : 100;
+      const { stdout, stderr } = await this.docker(['logs', '--tail', String(tail), ref], { timeout: 5000 });
       return {
         containerId,
         output: stdout || stderr
@@ -219,3 +280,4 @@ class DockerManager {
 }
 
 module.exports = new DockerManager();
+module.exports.DockerManager = DockerManager;
