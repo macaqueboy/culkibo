@@ -6,6 +6,7 @@ import { CoolifyImport } from './components/CoolifyImport';
 import { LiveLogs } from './components/LiveLogs';
 import { SettingsView } from './components/SettingsView';
 import { api, type LogEntry } from './lib/api';
+import { deployStream } from './lib/deployStream';
 
 export function App() {
   const [activeView, setActiveView] = useState<'projects' | 'import' | 'global_logs' | 'settings'>('projects');
@@ -56,6 +57,14 @@ export function App() {
             const parsed = JSON.parse(event.data);
             if (parsed.type === 'log') {
               setLatestLog(parsed.data);
+            } else if (parsed.type === 'deploy_log') {
+              // Deliberately NOT state: a verbose build emits thousands of
+              // lines per second, and each WebSocket message is its own
+              // macrotask, so React 19's auto-batching would not merge them.
+              // The panel buffers these in a ref and paints once per frame.
+              deployStream.emitLog(parsed.data);
+            } else if (parsed.type === 'deploy_event') {
+              deployStream.emitEvent(parsed.data);
             } else if (parsed.type === 'traffic_change') {
               showToast(`Tráfico actualizado: ${parsed.data.citadel}% Prod / ${parsed.data.forge}% Dev`);
             } else if (parsed.type === 'ssl_progress') {

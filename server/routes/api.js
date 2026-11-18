@@ -101,6 +101,10 @@ router.delete('/projects/:id', async (req, res) => {
       try { await domainManager.detachProject(domain.id); } catch (e) {}
     }
     projectManager.delete(projectId);
+    // El historial de despliegues y las entregas de webhook ya atendidas son
+    // estado de un proyecto que acaba de dejar de existir.
+    try { deployManager.forget(projectId); } catch (e) {}
+    try { githubService.forgetDeliveries(projectId); } catch (e) {}
     const ingress = await ingressManager.removeProject(projectId);
     // Los dominios desvinculados vuelven a su destino de pod, si lo tenían.
     if (attached.length > 0) await ingressManager.reconcile();
@@ -204,9 +208,8 @@ router.post('/projects/:id/start-local', async (req, res) => {
     // el arranque local sigue siendo válido.
     const ingress = await ingressManager.syncProject(project.id);
 
-    res.json({ ...project, ingress });
     await projectManager.flushToDisk();
-    res.json(project);
+    res.json({ ...project, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -315,7 +318,14 @@ router.post('/projects/:id/deploy', async (req, res) => {
         if (Number.isFinite(value) && value > 0) options[key] = value;
       }
       if (typeof req.body.version === 'string') options.version = req.body.version;
+      // Redesplegar un commit concreto (reintentar un despliegue viejo sin
+      // tocar la rama). Se valida aquí y se vuelve a validar en repoSync.
+      if (typeof req.body.commit === 'string' && /^[0-9a-f]{7,40}$/i.test(req.body.commit.trim())) {
+        options.commit = req.body.commit.trim();
+      }
+      if (req.body.gitSync === false) options.gitSync = false;
     }
+    options.trigger = 'manual';
 
     const started = deployManager.deploy(project, options);
     // Se registra el fallo pero no se deja escapar: el resultado ya queda en el
@@ -377,6 +387,19 @@ router.post('/projects/:id/rollback', async (req, res) => {
 router.post('/projects/:id/deploy/stop', async (req, res) => {
   try {
     res.json(await deployManager.stopProduction(req.params.id));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * El «deshacer» de detener: vuelve a levantar el contenedor de la versión
+ * actual y repone su ruta. Sin este endpoint, «Detener» sería irreversible
+ * desde el panel y tendría que pedir confirmación; con él es un interruptor.
+ */
+router.post('/projects/:id/deploy/start', async (req, res) => {
+  try {
+    res.json(await deployManager.startProduction(req.params.id));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1669,8 +1692,64 @@ router.post('/webhooks/github', async (req, res) => {
       const repoName = payloadRepo?.full_name || project.gitRepo || project.name;
       const now = new Date().toISOString();
 
+      // Idempotencia. GitHub reentrega: por reintento automático cuando la
+      // respuesta tarda, y a mano desde «Redeliver». Sin esta puerta, un push
+      // arranca dos builds del mismo commit y la segunda choca con el bloqueo
+      // del proyecto, dejando un «fallido» en el historial que no lo es.
+      const claim = githubService.claimDelivery(project.id, {
+        deliveryId: req.headers['x-github-delivery'] || null,
+        commitSha
+      });
+      if (!claim.fresh) {
+        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] ${claim.reason} (${shortSha}); no se relanza el despliegue.`, new Date(), project.id);
+        return res.json({
+          success: true,
+          deployed: false,
+          duplicate: true,
+          projectId: project.id,
+          commit: shortSha,
+          reason: claim.reason
+        });
+      }
+
       containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] 🚀 Push recibido en ${repoName} (${pushedBranch}) por ${author}: "${commitMsg.trim()}" (${shortSha})`, new Date(), project.id);
       containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Iniciando despliegue automatizado para ${project.name}...`, new Date(), project.id);
+
+      // --- Construcción real ------------------------------------------------
+      //
+      // Hasta aquí el webhook solo anotaba el push. Ahora dispara el mismo
+      // camino que el botón «Desplegar»: traer el commit exacto que GitHub
+      // acaba de anunciar, construir la imagen, verificar salud y conmutar la
+      // ruta. NO se espera al resultado: una build dura minutos y GitHub corta
+      // la entrega a los 10 s. El progreso va por WebSocket (`deploy_event`) y
+      // queda en el historial del proyecto.
+      let pipeline = { dispatched: false, queued: false, reason: null };
+      const dockerProbe = await deployManager.detectDocker();
+      if (!project.gitRepo) {
+        pipeline.reason = 'El proyecto no tiene repositorio configurado';
+      } else if (!dockerProbe.available) {
+        pipeline.reason = dockerProbe.reason;
+      } else {
+        try {
+          const started = deployManager.enqueue(project, {
+            // El SHA del payload, no «la punta de la rama»: entre el push y el
+            // build puede haber entrado otro commit, y desplegar uno distinto
+            // del que se anunció hace que el historial mienta.
+            commit: /^[0-9a-f]{7,40}$/i.test(commitSha) ? commitSha : null,
+            version: `gh-${shortSha}`,
+            trigger: 'webhook'
+          });
+          pipeline = { dispatched: started.started, queued: started.queued, reason: null };
+        } catch (err) {
+          pipeline.reason = err.message;
+        }
+      }
+
+      if (pipeline.reason) {
+        containerOrchestrator.addLog('WARN', 'citadel', `[Citadel:Deploy] No se lanza la construcción de imagen: ${pipeline.reason}.`, new Date(), project.id);
+      } else if (pipeline.queued) {
+        containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Ya hay un despliegue en curso; ${shortSha} queda en cola y se construirá al terminar.`, new Date(), project.id);
+      }
 
       // Trigger deployment in orchestrator
       await containerOrchestrator.deployRelease({
@@ -1708,7 +1787,17 @@ router.post('/webhooks/github', async (req, res) => {
         timestamp: now
       });
 
-      containerOrchestrator.addLog('SUCCESS', 'citadel', `[GitHub:Webhook] ✅ Despliegue completado para ${project.name} (${shortSha})`, new Date(), project.id);
+      // El mensaje dice la verdad en cada caso: con pipeline real la build
+      // sigue corriendo cuando esta respuesta ya ha salido hacia GitHub.
+      containerOrchestrator.addLog(
+        'SUCCESS',
+        'citadel',
+        pipeline.dispatched || pipeline.queued
+          ? `[GitHub:Webhook] ✅ Despliegue en curso para ${project.name} (${shortSha}); sigue el progreso en la pestaña Despliegues.`
+          : `[GitHub:Webhook] ✅ Despliegue completado para ${project.name} (${shortSha})`,
+        new Date(),
+        project.id
+      );
 
       return res.json({
         success: true,
@@ -1716,7 +1805,11 @@ router.post('/webhooks/github', async (req, res) => {
         projectId: project.id,
         branch: pushedBranch,
         commit: shortSha,
-        deployedAt: now
+        deployedAt: now,
+        // Qué pasó de verdad, para que el que integre el webhook no tenga que
+        // adivinarlo: `building` significa que hay una imagen construyéndose.
+        pipeline: pipeline.dispatched ? 'building' : pipeline.queued ? 'queued' : 'registro',
+        pipelineReason: pipeline.reason
       });
     }
 

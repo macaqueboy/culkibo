@@ -396,6 +396,121 @@ export interface Project {
   localPort?: number;
 }
 
+// --- Despliegue a producción ---
+
+/**
+ * Los estados los nombra el servidor en español y en el orden real del
+ * proceso. Se tipan como unión cerrada más `string` para que un estado nuevo
+ * del backend no rompa la compilación del panel.
+ */
+export type DeployStatus_ =
+  | 'pendiente' | 'sincronizando' | 'construyendo' | 'arrancando'
+  | 'verificando' | 'promocionando' | 'drenando' | 'activo' | 'fallido';
+
+export interface DeployGitInfo {
+  branch: string | null;
+  commit: string | null;
+  shortCommit: string | null;
+  subject: string | null;
+  author: string | null;
+  committedAt?: string | null;
+  action?: 'clonado' | 'actualizado' | 'sin-cambios' | 'omitido' | string;
+  previousCommit?: string | null;
+  discardedChanges?: number;
+}
+
+export interface DeployLogLine {
+  at: string;
+  level: string;
+  message: string;
+}
+
+export interface Deployment {
+  id: string;
+  projectId: string;
+  projectName: string;
+  status: DeployStatus_ | string;
+  kind?: 'rollback';
+  trigger?: 'manual' | 'webhook' | string;
+  imageTag: string;
+  containerName: string;
+  hostPort: number | null;
+  containerPort: number | null;
+  upstream: string | null;
+  hostnames: string[];
+  routeSwitched: boolean;
+  git: DeployGitInfo | null;
+  strategy: { builder: string; stack: string; containerPort: number; healthPath: string; reason: string } | null;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  error: string | null;
+  /** Solo en el detalle; el listado manda `logLineCount`. */
+  logLines?: DeployLogLine[];
+  logLineCount?: number;
+}
+
+export interface DeployRelease {
+  deploymentId: string;
+  projectName: string;
+  imageTag: string;
+  containerName: string;
+  hostPort: number;
+  containerPort: number;
+  upstream: string;
+  healthPath: string;
+  hostnames: string[];
+  version: string;
+  git: DeployGitInfo | null;
+  promotedAt: string;
+}
+
+export interface DeployStatus {
+  docker: { available: boolean; version: string | null; reason: string | null };
+  current: DeployRelease | null;
+  previous: DeployRelease | null;
+  canRollback: boolean;
+  containerState: { status: string; health: string } | null;
+  inProgress: boolean;
+  queued: boolean;
+  lastDeployment: Deployment | null;
+}
+
+export interface DeployStrategyPreview {
+  available: boolean;
+  reason?: string;
+  contextDir: string;
+  docker?: { available: boolean; version: string | null; reason: string | null };
+  hostnames?: string[];
+  strategy?: { builder: string; stack: string; containerPort: number; healthPath: string; reason: string };
+  generatedDockerfile?: string | null;
+}
+
+/** Evento de fase que llega por WebSocket (`deploy_event`). */
+export interface DeployEvent {
+  deploymentId: string;
+  projectId: string;
+  status: string;
+  kind?: string;
+  imageTag: string | null;
+  upstream: string | null;
+  hostnames: string[];
+  commit: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  durationMs: number | null;
+  error: string | null;
+}
+
+/** Línea de build que llega por WebSocket (`deploy_log`). */
+export interface DeployLogEvent {
+  deploymentId: string;
+  projectId: string;
+  at: string;
+  level: string;
+  message: string;
+}
+
 export const api = {
   async getProjects(): Promise<Project[]> {
     const res = await fetch(`${API_BASE}/projects`);
@@ -947,6 +1062,64 @@ export const api = {
     return jsonOrThrow(
       await fetch(`${API_BASE}/databases/storage/test`, { method: 'POST' }),
       'Error al probar el almacenamiento remoto'
+    );
+  },
+
+  // --- Despliegue a producción ---
+
+  async getDeployStatus(projectId: string): Promise<DeployStatus> {
+    return jsonOrThrow(await fetch(`${API_BASE}/projects/${projectId}/deploy/status`), 'Error al leer el estado del despliegue');
+  },
+
+  async getDeployments(projectId: string, limit = 20): Promise<{ deployments: Deployment[] }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/projects/${projectId}/deployments?limit=${limit}`),
+      'Error al leer el historial de despliegues'
+    );
+  },
+
+  async getDeployment(projectId: string, deployId: string): Promise<Deployment> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/projects/${projectId}/deployments/${deployId}`),
+      'Error al leer el despliegue'
+    );
+  },
+
+  async getDeployStrategy(projectId: string): Promise<DeployStrategyPreview> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/projects/${projectId}/deploy/strategy`),
+      'Error al analizar el proyecto'
+    );
+  },
+
+  /** Responde 202 en cuanto arranca: el progreso llega por WebSocket. */
+  async startDeploy(projectId: string, body: { commit?: string } = {}): Promise<{ accepted: boolean; message: string }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/projects/${projectId}/deploy`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }),
+      'No se pudo iniciar el despliegue'
+    );
+  },
+
+  async rollbackDeploy(projectId: string): Promise<Deployment> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/projects/${projectId}/rollback`, { method: 'POST' }),
+      'No se pudo revertir'
+    );
+  },
+
+  async stopDeploy(projectId: string): Promise<{ stopped: boolean; reason?: string; error?: string | null }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/projects/${projectId}/deploy/stop`, { method: 'POST' }),
+      'No se pudo detener el servicio'
+    );
+  },
+
+  async resumeDeploy(projectId: string): Promise<{ started: boolean; reason?: string; error?: string | null }> {
+    return jsonOrThrow(
+      await fetch(`${API_BASE}/projects/${projectId}/deploy/start`, { method: 'POST' }),
+      'No se pudo reanudar el servicio'
     );
   }
 };

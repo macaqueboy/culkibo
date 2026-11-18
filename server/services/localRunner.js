@@ -925,6 +925,19 @@ class LocalRunner {
   gitAuthEnv() {
     const token = this.readGitToken();
     const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+
+    // Desactivar cualquier ayudante de credenciales configurado en la máquina.
+    //
+    // `GIT_TERMINAL_PROMPT=0` solo silencia el prompt de terminal. Git
+    // Credential Manager, que viene con Git para Windows, abre una VENTANA y se
+    // queda esperando: un despliegue automático se quedaría colgado hasta el
+    // tiempo de espera, sin log y sin nadie delante para cerrarla. La forma
+    // documentada de anularlo sin tocar la configuración del usuario es una
+    // entrada vacía por GIT_CONFIG_*, que borra la lista de ayudantes.
+    env.GIT_CONFIG_COUNT = '1';
+    env.GIT_CONFIG_KEY_0 = 'credential.helper';
+    env.GIT_CONFIG_VALUE_0 = '';
+
     if (!token) return { env, cleanup: () => {} };
 
     const isWin = process.platform === 'win32';
@@ -961,20 +974,58 @@ class LocalRunner {
    * 21 critical advisories in Coolify and 34 in Dokploy. spawn() with an argv
    * array has no shell to inject into.
    */
-  gitClone(cloneUrl, targetDir, { timeout = 180000 } = {}) {
+  gitClone(cloneUrl, targetDir, { timeout = 180000, depth = null, branch = null, onLine = null } = {}) {
     const { env, cleanup } = this.gitAuthEnv();
 
+    const args = ['clone', '--progress'];
+
+    // Shallow + single-branch. A deploy builds exactly one commit; the rest of
+    // the history is bytes the build never reads. On a repo with a few thousand
+    // commits this is the difference between seconds and minutes.
+    const depthNum = parseInt(depth, 10);
+    if (Number.isInteger(depthNum) && depthNum > 0) {
+      args.push('--depth', String(depthNum), '--single-branch');
+    }
+
+    if (branch != null && branch !== '') {
+      const name = String(branch);
+      // The branch name reaches argv. There is no shell to inject into, but git
+      // itself would happily read `--upload-pack=...` as a flag, so anything
+      // that could be mistaken for an option is refused outright.
+      if (!/^[A-Za-z0-9._/-]+$/.test(name) || name.startsWith('-') || name.includes('..')) {
+        cleanup();
+        return Promise.reject(new Error(`Nombre de rama no válido: «${name}»`));
+      }
+      args.push('--branch', name);
+    }
+
+    // `--` closes the option list: after it, the URL is a URL even if someone
+    // manages to store a repository whose name starts with a dash.
+    args.push('--', cloneUrl, targetDir);
+
     return new Promise((resolve, reject) => {
-      const child = spawn('git', ['clone', '--progress', cloneUrl, targetDir], {
+      const child = spawn('git', args, {
         env,
         shell: false,
         windowsHide: true
       });
 
       const stderr = [];
+      let buffered = '';
       child.stderr.on('data', (d) => {
-        stderr.push(d.toString());
+        const text = d.toString();
+        stderr.push(text);
         if (stderr.length > 50) stderr.shift();
+        if (!onLine) return;
+        // git reports clone progress on stderr; forwarding it line by line is
+        // what turns a two-minute silence into a visible build log.
+        buffered += text;
+        const lines = buffered.split(/[\r\n]+/);
+        buffered = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed) onLine(this.redactSecrets(trimmed));
+        }
       });
 
       const timer = setTimeout(() => {
@@ -985,6 +1036,7 @@ class LocalRunner {
       const finish = (err) => {
         clearTimeout(timer);
         cleanup();
+        if (onLine && buffered.trim()) onLine(this.redactSecrets(buffered.trim()));
         if (err) reject(err); else resolve();
       };
 

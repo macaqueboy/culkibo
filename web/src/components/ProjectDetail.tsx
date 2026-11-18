@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Settings, Activity, Globe, Variable, Play, Square, Moon, Trash2, ShieldAlert, Database, Server, Copy, Eye, EyeOff, Plus, Search, Upload, Save, CheckCircle2, Box, Cpu, Webhook, GitBranch, Check, RefreshCw, Zap, Power } from 'lucide-react';
+import { Settings, Activity, Globe, Variable, Play, Square, Moon, Trash2, ShieldAlert, Database, Server, Copy, Eye, EyeOff, Plus, Search, Upload, Save, CheckCircle2, Box, Cpu, Webhook, GitBranch, Check, RefreshCw, Zap, Power, Rocket } from 'lucide-react';
 import { api, type Project } from '../lib/api';
 import { LiveLogs } from './LiveLogs';
 import { DomainManager } from './DomainManager';
 import { DatabasesPanel } from './DatabasesPanel';
+import { DeploymentsPanel } from './DeploymentsPanel';
 
 interface ProjectDetailProps {
   projectId: string;
@@ -15,7 +16,7 @@ interface ProjectDetailProps {
 
 export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack, onNotify, onProjectUpdate, incomingLog }) => {
   const [project, setProject] = useState<Project | null>(null);
-  const [activeTab, setActiveTab] = useState<'general' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'deployments' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config'>('general');
   const [loading, setLoading] = useState(false);
   const [simulatingWebhook, setSimulatingWebhook] = useState(false);
 
@@ -33,6 +34,11 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
 
   const [showAddService, setShowAddService] = useState(false);
   const [newService, setNewService] = useState({ name: '', type: 'Aplicación Web', port: '', image: '' });
+
+  // Borrado del proyecto: escalón 3 de confirmación (escribir el nombre).
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [confirmDeleteName, setConfirmDeleteName] = useState('');
+  const [deleting, setDeleting] = useState(false);
 
   const handleAddService = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -251,11 +257,30 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
     }
   };
 
+  /**
+   * Borrado del proyecto: el escalón más alto de confirmación.
+   *
+   * Los tres escalones que usa Culkibo, y por qué son tres y no uno:
+   *   1. Reversible (detener, reanudar) -> interruptor optimista con deshacer,
+   *      sin diálogo. Un diálogo para algo que se deshace en un clic solo
+   *      enseña a pulsar «Aceptar» sin leer.
+   *   2. Recuperable pero con consecuencias (revertir) -> diálogo que dice a QUÉ
+   *      commit se vuelve. Confirmar sin saber el destino no es confirmar.
+   *   3. Destruye datos (esto) -> escribir el nombre del recurso, con la lista
+   *      de lo que se pierde delante. El tecleo no está para molestar: obliga a
+   *      mirar el nombre, que es justo lo que falla cuando alguien borra el
+   *      proyecto equivocado por tener dos pestañas abiertas.
+   */
   const handleDelete = async () => {
-    if (confirm('¿Estás seguro de eliminar este proyecto? Esta acción es irreversible.')) {
+    if (confirmDeleteName.trim() !== project?.name) return;
+    setDeleting(true);
+    try {
       await api.deleteProject(projectId);
       onNotify('Proyecto eliminado');
       onBack();
+    } catch (e: any) {
+      onNotify('Error al eliminar el proyecto: ' + (e?.message || ''));
+      setDeleting(false);
     }
   };
 
@@ -266,6 +291,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
 
   const tabs = [
     { id: 'general', label: 'General', icon: Activity },
+    { id: 'deployments', label: 'Despliegues', icon: Rocket },
     { id: 'logs', label: 'Logs', icon: Activity },
     { id: 'domains', label: 'Dominios', icon: Globe },
     { id: 'databases', label: 'Bases de datos', icon: Database },
@@ -665,6 +691,15 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
               </div>
             </div>
           </div>
+        )}
+
+        {activeTab === 'deployments' && (
+          <DeploymentsPanel
+            projectId={project.id}
+            projectName={project.name}
+            gitBranch={project.gitBranch || 'main'}
+            onNotify={onNotify}
+          />
         )}
 
         {activeTab === 'logs' && (
@@ -1140,14 +1175,80 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
               <h3 className="font-bold text-red-600 flex items-center gap-2 text-lg"><ShieldAlert className="w-5 h-5"/> Zona de Peligro</h3>
               <p className="text-sm text-slate-600 max-w-2xl">Al eliminar este proyecto, se detendrán todos los contenedores asociados, se eliminarán las variables de entorno y los datos en volúmenes. Esta acción no se puede deshacer.</p>
               <div className="pt-2">
-                <button onClick={handleDelete} className="px-5 py-2.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl text-sm font-bold flex items-center gap-2 transition-colors">
-                  <Trash2 className="w-4 h-4" /> Eliminar Proyecto Definitivamente
+                <button
+                  onClick={() => { setConfirmDeleteName(''); setShowDeleteDialog(true); }}
+                  className="px-5 py-2.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl text-sm font-bold flex items-center gap-2 transition-colors"
+                >
+                  <Trash2 className="w-4 h-4" /> Eliminar proyecto definitivamente
                 </button>
               </div>
             </div>
           </div>
         )}
       </div>
+
+      {showDeleteDialog && (
+        <div className="fixed inset-0 bg-slate-900/30 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl w-full max-w-lg shadow-xl p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-red-50 border border-red-100 flex items-center justify-center shrink-0">
+                <ShieldAlert className="w-5 h-5 text-red-600" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="font-bold text-slate-900">Eliminar «{project.name}»</h3>
+                <p className="text-sm text-slate-500 mt-0.5">Esta acción no se puede deshacer.</p>
+              </div>
+            </div>
+
+            {/* Las consecuencias, enumeradas. «Es irreversible» no informa de
+                nada: lo que hay que saber es QUÉ deja de existir. */}
+            <ul className="text-sm text-slate-700 space-y-1.5 bg-slate-50 border border-slate-200 rounded-xl p-4">
+              <li>· Se detienen y eliminan los contenedores del proyecto, en desarrollo y en producción.</li>
+              <li>· Se pierden las <strong>{Object.keys(project.envVars || {}).length}</strong> variables de entorno y sus valores.</li>
+              <li>· Se borran los volúmenes del proyecto y los datos que contengan.</li>
+              <li>
+                · Se desvinculan{' '}
+                <strong>{(project.domains || []).length}</strong> dominio(s) y se retiran sus rutas públicas
+                {(project.domains || []).length > 0 && (
+                  <span className="text-slate-500"> ({(project.domains || []).join(', ')})</span>
+                )}
+                .
+              </li>
+              <li>· Se descarta el historial de despliegues, con él la posibilidad de revertir.</li>
+            </ul>
+
+            <label className="block text-sm">
+              <span className="text-slate-600">
+                Escribe <strong className="font-mono text-slate-900">{project.name}</strong> para confirmar
+              </span>
+              <input
+                autoFocus
+                type="text"
+                value={confirmDeleteName}
+                onChange={(e) => setConfirmDeleteName(e.target.value)}
+                placeholder={project.name}
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 mt-1.5 text-slate-800 font-mono text-sm"
+              />
+            </label>
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                onClick={() => setShowDeleteDialog(false)}
+                className="text-sm font-medium text-slate-600 border border-slate-200 px-4 py-2 rounded-lg hover:bg-slate-50"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleDelete}
+                disabled={deleting || confirmDeleteName.trim() !== project.name}
+                className="inline-flex items-center gap-2 text-sm font-semibold bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Trash2 className="w-4 h-4" /> Eliminar proyecto
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showAddService && (
         <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">

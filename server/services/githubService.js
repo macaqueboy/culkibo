@@ -4,12 +4,35 @@ const axios = require('axios');
 
 const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'github.json');
 
+/**
+ * Ventana durante la cual una entrega repetida se considera la misma entrega.
+ *
+ * GitHub reintenta una entrega que no conteste 2xx a tiempo, y el botón
+ * «Redeliver» del panel de webhooks reenvía el MISMO payload. Diez minutos
+ * cubren de sobra ambos casos sin bloquear un redespliegue deliberado del mismo
+ * commit (para eso está el botón «Desplegar», que no pasa por aquí).
+ */
+const DELIVERY_TTL_MS = 10 * 60 * 1000;
+const DELIVERY_MAX_ENTRIES = 500;
+
 class GithubService {
   constructor() {
     this.apiBase = 'https://api.github.com';
     this.configFile = CONFIG_FILE;
     this.ensureDataDir();
     this.config = this.loadConfig();
+
+    /**
+     * Registro de entregas ya atendidas: clave -> marca de tiempo.
+     *
+     * En memoria a propósito. Persistirlo protegería contra un reinicio del
+     * daemon justo entre dos reintentos de GitHub, que es una ventana de
+     * segundos; a cambio habría que escribir en disco en cada push y podar el
+     * fichero. El coste de un duplicado tras un reinicio es una build de más,
+     * no una corrupción: el despliegue es idempotente por construcción (imagen
+     * nueva, salud, conmutación).
+     */
+    this.deliveries = new Map();
 
     // Mock data for tests and offline/demo environments
     this.mockUser = {
@@ -110,6 +133,80 @@ class GithubService {
         { name: 'staging', commitSha: '7c8d9e0', protected: false }
       ]
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Idempotencia de webhooks
+  // -------------------------------------------------------------------------
+
+  /** Elimina del registro las entregas que ya han caducado. */
+  pruneDeliveries(now = Date.now()) {
+    for (const [key, at] of this.deliveries) {
+      if (now - at > DELIVERY_TTL_MS) this.deliveries.delete(key);
+    }
+    // Tope duro: un atacante con la firma correcta (o un repositorio muy
+    // activo) no puede hacer crecer el mapa sin límite.
+    while (this.deliveries.size > DELIVERY_MAX_ENTRIES) {
+      const oldest = this.deliveries.keys().next().value;
+      if (oldest === undefined) break;
+      this.deliveries.delete(oldest);
+    }
+  }
+
+  /**
+   * Reclama una entrega de webhook. Devuelve `{ fresh: true }` la primera vez y
+   * `{ fresh: false, reason }` en cualquier reentrega dentro de la ventana.
+   *
+   * Se comprueban DOS claves porque GitHub reentrega de dos formas distintas:
+   *
+   *   - un reintento automático repite la cabecera `X-GitHub-Delivery`;
+   *   - el botón «Redeliver» del panel genera un GUID nuevo con el mismo
+   *     payload, así que el GUID no basta y hay que mirar también el commit.
+   *
+   * Sin esto, dos entregas del mismo push arrancan dos builds del mismo commit
+   * a la vez: la segunda encuentra el bloqueo del proyecto, falla, y el
+   * historial se llena de despliegues «fallidos» que nunca lo fueron.
+   *
+   * @param {string} projectId
+   * @param {{deliveryId?: string | null, commitSha?: string | null}} identity
+   */
+  claimDelivery(projectId, { deliveryId = null, commitSha = null } = {}) {
+    const now = Date.now();
+    this.pruneDeliveries(now);
+
+    /** @type {string[]} */
+    const keys = [];
+    if (deliveryId) keys.push(`${projectId}:entrega:${String(deliveryId).slice(0, 100)}`);
+    if (commitSha) keys.push(`${projectId}:commit:${String(commitSha).toLowerCase().slice(0, 40)}`);
+
+    // Sin ninguna de las dos no hay forma de identificar la entrega: se deja
+    // pasar, porque bloquear por defecto sería peor que una build repetida.
+    if (keys.length === 0) return { fresh: true, reason: null };
+
+    for (const key of keys) {
+      const seenAt = this.deliveries.get(key);
+      if (seenAt !== undefined && now - seenAt <= DELIVERY_TTL_MS) {
+        const seconds = Math.round((now - seenAt) / 1000);
+        return {
+          fresh: false,
+          reason: `Entrega duplicada: este push ya se atendió hace ${seconds} s`
+        };
+      }
+    }
+
+    for (const key of keys) this.deliveries.set(key, now);
+    return { fresh: true, reason: null };
+  }
+
+  /** Olvida lo registrado para un proyecto. Lo usan las pruebas y el borrado. */
+  forgetDeliveries(projectId = null) {
+    if (!projectId) {
+      this.deliveries.clear();
+      return;
+    }
+    for (const key of [...this.deliveries.keys()]) {
+      if (key.startsWith(`${projectId}:`)) this.deliveries.delete(key);
+    }
   }
 
   ensureDataDir() {

@@ -300,7 +300,30 @@ async function testGithub() {
     // Verify orchestrator logs received deployment record
     const logs = containerOrchestrator.getLogs({ projectId: testProject.id, limit: 10 });
     assert.ok(logs.some(l => l.message.includes('Push recibido')), 'Orchestrator logs should record push');
-    assert.ok(logs.some(l => l.message.includes('Despliegue completado')), 'Orchestrator logs should record deploy completion');
+    // The closing line depends on which pipeline the webhook could dispatch:
+    // with Docker available it hands the commit to deployManager and the build
+    // outlives the HTTP response ("Despliegue en curso"); without Docker it
+    // only records the release ("Despliegue completado"). Both are a success.
+    assert.ok(
+      logs.some(l => /Despliegue (completado|en curso)/.test(l.message)),
+      'Orchestrator logs should record the deploy outcome'
+    );
+
+    // 7e-bis. Idempotence: GitHub redelivers (automatic retry, or the
+    // "Redeliver" button). The same push must not start a second build.
+    const redeliveryRes = await simulateWebhook(
+      validPushPayload,
+      {
+        'x-github-event': 'push',
+        'x-hub-signature-256': validPushSig,
+        'x-github-delivery': 'd1f8c0de-0000-4000-8000-000000000001'
+      },
+      { projectId: testProject.id }
+    );
+    assert.strictEqual(redeliveryRes.statusCode, 200);
+    assert.strictEqual(redeliveryRes.data.deployed, false, 'A redelivered push must not deploy twice');
+    assert.strictEqual(redeliveryRes.data.duplicate, true, 'The redelivery must be reported as a duplicate');
+    console.log('  ✓ Webhook redelivery of the same commit is idempotent');
 
     // 7f. Disabled auto-deploy toggle prevents deployment
     projectManager.update(testProject.id, { autoDeploy: false });

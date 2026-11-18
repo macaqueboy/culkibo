@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const caddyManager = require('./caddyManager');
+const repoSync = require('./repoSync');
 
 /** @type {any} */
 let containerOrchestrator = null;
@@ -166,6 +167,13 @@ class DeployManager extends EventEmitter {
     super();
     /** projectId -> Promise, para serializar despliegues del mismo proyecto. */
     this.locks = new Map();
+    /**
+     * projectId -> { project, options } pendiente de lanzar cuando termine el
+     * despliegue en curso. Una sola plaza y gana el último: si llegan tres
+     * pushes durante un build de cuatro minutos, lo que hay que desplegar
+     * después es el ÚLTIMO commit, no los tres en fila.
+     */
+    this.pending = new Map();
     /** projectId -> Promise del drenaje en curso (las pruebas lo esperan). */
     this.drains = new Map();
     /** @type {any} */
@@ -219,6 +227,21 @@ class DeployManager extends EventEmitter {
 
   getDeployment(projectId, deploymentId) {
     return this.getState(projectId).history.find(d => d.id === deploymentId) || null;
+  }
+
+  /**
+   * Olvida todo lo que sabemos de un proyecto borrado.
+   *
+   * Sin esto, `deployments.json` acumula el historial de proyectos que ya no
+   * existen y `reconcileRoutes()` reponía al arrancar rutas de Caddy hacia
+   * contenedores de proyectos eliminados.
+   */
+  forget(projectId) {
+    const had = Boolean(this.store[projectId]);
+    delete this.store[projectId];
+    this.pending.delete(projectId);
+    if (had) this.saveStore();
+    return { removed: had };
   }
 
   // -------------------------------------------------------------------------
@@ -876,9 +899,14 @@ class DeployManager extends EventEmitter {
       deploymentId: deployment.id,
       projectId: deployment.projectId,
       status,
+      kind: deployment.kind || 'deploy',
       imageTag: deployment.imageTag,
       upstream: deployment.upstream,
       hostnames: deployment.hostnames,
+      commit: (deployment.git && deployment.git.shortCommit) || null,
+      startedAt: deployment.startedAt || null,
+      finishedAt: deployment.finishedAt || null,
+      durationMs: deployment.durationMs || null,
       error: deployment.error || null
     });
   }
@@ -960,9 +988,43 @@ class DeployManager extends EventEmitter {
     }
     const task = this._deploy(project, options).finally(() => {
       if (this.locks.get(project.id) === task) this.locks.delete(project.id);
+      this.drainPending(project.id);
     });
     this.locks.set(project.id, task);
     return task;
+  }
+
+  /**
+   * Como `deploy()`, pero si ya hay uno en curso lo deja encolado en vez de
+   * fallar.
+   *
+   * Existe por el webhook: durante un build de varios minutos es normal que
+   * lleguen más pushes, y rechazarlos deja la rama desplegada por detrás del
+   * repositorio sin que nadie se entere. Rechazar es correcto para un botón
+   * («ya hay uno en curso», el usuario lo ve); para un disparo automático no lo
+   * es.
+   *
+   * @returns {{started: boolean, queued: boolean, promise?: Promise<any>}}
+   */
+  enqueue(project, options = {}) {
+    if (!project || !project.id) throw new Error('Proyecto inválido');
+    if (this.locks.has(project.id)) {
+      this.pending.set(project.id, { project, options });
+      return { started: false, queued: true };
+    }
+    const promise = this.deploy(project, options);
+    promise.catch(() => {});
+    return { started: true, queued: false, promise };
+  }
+
+  /** Lanza el despliegue que quedó en espera, si lo hay. */
+  drainPending(projectId) {
+    const next = this.pending.get(projectId);
+    if (!next) return;
+    this.pending.delete(projectId);
+    if (this.locks.has(projectId)) return; // otro se adelantó; el suyo drenará
+    const promise = this.deploy(next.project, next.options);
+    promise.catch(() => {});
   }
 
   async _deploy(project, options = {}) {
@@ -991,6 +1053,9 @@ class DeployManager extends EventEmitter {
       hostnames: this.hostnamesFor(project),
       routeSwitched: false,
       strategy: null,
+      /** Qué código es esto exactamente. Lo rellena la sincronización con git. */
+      git: null,
+      trigger: options.trigger || 'manual',
       previous: state.current ? { ...state.current } : null,
       startedAt: new Date().toISOString(),
       finishedAt: null,
@@ -1024,6 +1089,57 @@ class DeployManager extends EventEmitter {
       }
 
       const contextDir = options.contextDir || path.join(process.cwd(), 'projects', project.id);
+
+      // --- 0.5. Código fuente ---------------------------------------------
+      //
+      // Antes se construía lo que hubiera en el directorio. Eso significa que
+      // «desplegar» podía servir un clon de hace tres semanas sin que nada en
+      // la interfaz lo delatase, y que el historial de despliegues no podía
+      // responder a la única pregunta que importa después de una caída: qué
+      // commit hay en producción.
+      //
+      // Se salta cuando la llamada trae su propio `contextDir` (las pruebas y
+      // los despliegues desde un directorio suelto) o con `gitSync: false`.
+      if (!options.contextDir && options.gitSync !== false) {
+        this.setStatus(deployment, 'sincronizando');
+        const sync = await repoSync.sync(project, {
+          commit: options.commit || null,
+          onLine: (line) => this.log(deployment, 'INFO', line)
+        });
+
+        if (!sync.ok) {
+          this.log(deployment, 'ERROR', `No se pudo obtener el código: ${sync.error}`);
+          return finish('fallido', sync.error);
+        }
+
+        deployment.git = {
+          branch: sync.branch,
+          commit: sync.commit,
+          shortCommit: sync.shortCommit,
+          subject: sync.subject,
+          author: sync.author,
+          committedAt: sync.committedAt || null,
+          action: sync.action,
+          previousCommit: sync.previousCommit,
+          discardedChanges: (sync.dirtyFiles || []).length
+        };
+
+        if (sync.action === 'omitido') {
+          this.log(deployment, 'WARN', sync.reason);
+        } else {
+          const verb = sync.action === 'clonado'
+            ? 'Repositorio clonado'
+            : sync.action === 'sin-cambios'
+              ? 'El repositorio ya estaba al día'
+              : 'Repositorio actualizado';
+          this.log(
+            deployment,
+            'INFO',
+            `${verb}: ${sync.shortCommit} en «${sync.branch}»${sync.subject ? ` — ${sync.subject}` : ''}${sync.author ? ` (${sync.author})` : ''}`
+          );
+        }
+      }
+
       if (!fs.existsSync(contextDir)) {
         const msg = `No hay código en ${contextDir}. Clona el repositorio del proyecto antes de desplegar.`;
         this.log(deployment, 'ERROR', msg);
@@ -1160,6 +1276,10 @@ class DeployManager extends EventEmitter {
         healthPath: strategy.healthPath,
         hostnames: deployment.hostnames,
         version,
+        // Viaja con la release, no solo con el registro del despliegue: el
+        // diálogo de rollback tiene que poder decir a QUÉ commit vuelve, y para
+        // eso el commit debe estar en el ancla, no en el historial.
+        git: deployment.git,
         promotedAt: new Date().toISOString()
       };
       const retiring = state.current;
@@ -1430,6 +1550,8 @@ class DeployManager extends EventEmitter {
       upstream: target.upstream,
       hostnames: target.hostnames || [],
       routeSwitched: false,
+      git: target.git || null,
+      trigger: options.trigger || 'manual',
       previous: current ? { ...current } : null,
       startedAt: new Date().toISOString(),
       finishedAt: null,
@@ -1552,13 +1674,18 @@ class DeployManager extends EventEmitter {
         containerState = { status, health };
       }
     }
+    const last = state.history[0] || null;
     return {
       docker,
       current: state.current,
       previous: state.previous,
       canRollback: Boolean(state.previous),
       containerState,
-      lastDeployment: state.history[0] || null
+      // Sin esto el panel no puede distinguir «no hay despliegue» de «hay uno
+      // a medio construir», que es justo cuando el usuario mira la pantalla.
+      inProgress: this.locks.has(projectId),
+      queued: this.pending.has(projectId),
+      lastDeployment: last ? { ...last, logLines: undefined, logLineCount: (last.logLines || []).length } : null
     };
   }
 
@@ -1673,6 +1800,68 @@ class DeployManager extends EventEmitter {
     try { await caddyManager.removeRoute(projectId); } catch (e) {}
     const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000 });
     return { stopped: res.code === 0, containerName: state.current.containerName, error: res.code === 0 ? null : res.stderr.trim() };
+  }
+
+  /**
+   * Vuelve a levantar el servicio que `stopProduction()` paró.
+   *
+   * Es el «deshacer» de detener, y por eso existe: una acción reversible solo
+   * es reversible si hay algo que la deshaga. No reconstruye nada —el
+   * contenedor y su imagen siguen ahí— y repone la ruta de Caddy DESPUÉS de
+   * comprobar que responde, nunca antes: mandar tráfico a algo que todavía
+   * arranca es cambiar un servicio parado por un 502.
+   */
+  async startProduction(projectId, options = {}) {
+    const opts = { ...DEFAULTS, ...options };
+    const state = this.getState(projectId);
+    if (!state.current) return { started: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
+
+    const docker = await this.detectDocker({ force: true });
+    if (!docker.available) return { started: false, reason: docker.reason };
+
+    const target = state.current;
+    const start = await this.runDocker(['start', target.containerName], { timeoutMs: 40000 });
+    if (start.code !== 0) {
+      return {
+        started: false,
+        containerName: target.containerName,
+        error: (start.stderr || '').trim() || `docker start terminó con código ${start.code}`
+      };
+    }
+
+    const health = await this.waitForHealth({
+      hostPort: target.hostPort,
+      healthPath: target.healthPath || DEFAULTS.healthPath,
+      containerName: target.containerName,
+      timeoutMs: opts.healthTimeoutMs,
+      intervalMs: opts.healthIntervalMs
+    });
+    if (!health.healthy) {
+      return {
+        started: false,
+        containerName: target.containerName,
+        error: `El contenedor arrancó pero no pasó la verificación de salud: ${health.reason}`
+      };
+    }
+
+    if ((target.hostnames || []).length > 0 && target.upstream) {
+      try {
+        await caddyManager.upsertRoute({
+          projectId,
+          hostnames: target.hostnames,
+          upstreams: [target.upstream]
+        });
+      } catch (err) {
+        return {
+          started: true,
+          routeRestored: false,
+          containerName: target.containerName,
+          error: `El servicio está arriba, pero no se pudo reponer la ruta: ${err.message}`
+        };
+      }
+    }
+
+    return { started: true, routeRestored: true, containerName: target.containerName, error: null };
   }
 }
 

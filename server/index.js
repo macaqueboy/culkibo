@@ -308,6 +308,10 @@ mcpServer.on('mcp_call', (data) => broadcast('mcp_call', data));
 // etiquetadas con el projectId) y el cambio de fase va por aquí, estructurado,
 // para que el panel pinte la barra de progreso sin tener que parsear texto.
 deployManager.on('deploy_event', (data) => broadcast('deploy_event', data));
+// Y las líneas del build, además, etiquetadas con su deploymentId. El flujo
+// `log` general las lleva sin esa etiqueta, así que el visor de una build
+// concreta no podría separar las suyas de las de otro despliegue simultáneo.
+deployManager.on('deploy_log', (data) => broadcast('deploy_log', data));
 
 databaseManager.on('backup_completed', (data) => broadcast('backup_completed', data));
 databaseManager.on('backup_failed', (data) => broadcast('backup_failed', data));
