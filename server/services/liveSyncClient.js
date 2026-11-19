@@ -79,7 +79,11 @@ class LiveSyncClient extends EventEmitter {
             } else {
               this.enqueue(abs, 'delete');
             }
-          } catch (e) {}
+          } catch (e) {
+            // En Windows un editor puede mantener el handle abierto brevemente (EBUSY);
+            // encolar igualmente para leer tras `quiescenceMs` evita perder cambios.
+            this.enqueue(abs, 'upsert');
+          }
         });
         this.nativeWatcher.on('error', (err) => this.emit('error', err));
       } else {

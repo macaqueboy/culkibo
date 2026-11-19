@@ -85,7 +85,8 @@ async function run({ silent = false } = {}) {
     await client.start();
     await client.reconcileFull();
 
-    const waitFrameAck = (timeoutMs = 5000) => new Promise((resolve, reject) => {
+    const ackTimeout = process.platform === 'win32' ? 15000 : 5000;
+    const waitFrameAck = (timeoutMs = ackTimeout) => new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         client.off('frame_ack', onAck);
         reject(new Error(`Timeout esperando frame_ack (${timeoutMs} ms)`));
@@ -101,7 +102,7 @@ async function run({ silent = false } = {}) {
     for (let i = 0; i < ITERATIONS + 1; i++) {
       const token = `rev_${i}_${Date.now()}_${'x'.repeat((i % 5) + 1)}`;
       const started = process.hrtime.bigint();
-      const ackPromise = waitFrameAck(5000);
+      const ackPromise = waitFrameAck(ackTimeout);
       fs.writeFileSync(path.join(sourceDir, 'index.html'), token, 'utf8');
       const ack = await ackPromise;
       const body = await (await fetch(url)).text();
@@ -121,7 +122,7 @@ async function run({ silent = false } = {}) {
     const onBurstAck = () => { framesSeen++; };
     client.on('frame_ack', onBurstAck);
     const burstStart = process.hrtime.bigint();
-    const firstAck = waitFrameAck(5000);
+    const firstAck = waitFrameAck(ackTimeout);
     for (let k = 0; k < 15; k++) {
       fs.writeFileSync(path.join(sourceDir, `comp_${k}.js`), `export const c = ${k};`, 'utf8');
     }

@@ -69,7 +69,8 @@ router.post('/projects', async (req, res) => {
         console.warn(`[AutoPrepare] Could not auto-prepare ${project.name}:`, err.message);
       });
     }
-    await projectManager.flushToDisk();
+    // `projectManager.create()` ya programa un volcado atómico agrupado (15 ms);
+    // no bloqueamos la respuesta HTTP en I/O de disco igual que PUT /projects/:id.
     res.status(201).json(project);
   } catch (err) {
     res.status(400).json({ error: err.message });

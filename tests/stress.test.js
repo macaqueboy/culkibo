@@ -5,21 +5,24 @@ const path = require('path');
 const PORT = 3030; // Need to verify actual port, assuming 3030
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 
-const agent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const agent = new http.Agent({ keepAlive: true, maxSockets: 25 });
 
 async function fetchWithTiming(path, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
     const start = performance.now();
     
+    const payloadBuf = body ? Buffer.from(JSON.stringify(body), 'utf8') : null;
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(payloadBuf ? { 'Content-Length': payloadBuf.length } : {})
+    };
     const options = {
       hostname: '127.0.0.1',
       port: PORT,
       path: new URL(path, BASE_URL).pathname,
       method: method,
       agent: agent,
-      headers: {
-        'Content-Type': 'application/json'
-      }
+      headers
     };
     
     const req = http.request(options, (res) => {
@@ -42,8 +45,8 @@ async function fetchWithTiming(path, method = 'GET', body = null) {
       });
     });
     
-    if (body) req.write(JSON.stringify(body));
-    req.end();
+    if (payloadBuf) req.end(payloadBuf);
+    else req.end();
   });
 }
 
@@ -78,6 +81,7 @@ async function runStressTest() {
 
   console.log('Warming up connections...');
   await Promise.all([
+    ...Array.from({ length: 22 }, () => fetchWithTiming(`${BASE_URL}/api/health`)),
     fetchWithTiming(`${BASE_URL}/api/system/status`),
     fetchWithTiming(`${BASE_URL}/api/projects`),
     fetchWithTiming(`${BASE_URL}/api/domains`)

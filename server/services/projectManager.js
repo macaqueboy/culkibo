@@ -20,6 +20,8 @@ class ProjectManager extends EventEmitter {
     this._batchingFlush = null;
     /** @type {Buffer | null} */
     this._serializedAll = null;
+    /** @type {Map<string, string>} */
+    this._projectJsonCache = new Map();
     this.ensureDataDir();
     this.loadProjects();
   }
@@ -103,14 +105,22 @@ class ProjectManager extends EventEmitter {
     }
   }
 
-  saveProjects() {
+  /** @param {string | null} [changedId] */
+  invalidateCache(changedId = null) {
     this._serializedAll = null;
+    if (changedId) this._projectJsonCache.delete(changedId);
+    else this._projectJsonCache.clear();
+  }
+
+  /** @param {string | null} [changedId] */
+  saveProjects(changedId = null) {
+    this.invalidateCache(changedId);
     if (this.saveDebounceTimer) {
       clearTimeout(this.saveDebounceTimer);
     }
     this.saveDebounceTimer = setTimeout(async () => {
       this.saveDebounceTimer = null;
-      await this.flushToDisk();
+      await this.flushToDisk(changedId);
     }, 15);
     if (this.saveDebounceTimer.unref) {
       this.saveDebounceTimer.unref();
@@ -133,8 +143,9 @@ class ProjectManager extends EventEmitter {
    * escritura que ocurre DESPUÉS de ella, así que esperarla siempre significa
    * "mi cambio está en disco".
    */
-  flushToDisk() {
-    this._serializedAll = null;
+  /** @param {string | null} [changedId] */
+  flushToDisk(changedId = null) {
+    this.invalidateCache(changedId);
     if (this.saveDebounceTimer) {
       clearTimeout(this.saveDebounceTimer);
       this.saveDebounceTimer = null;
@@ -188,15 +199,13 @@ class ProjectManager extends EventEmitter {
     /** @type {string | null} */
     let tempPath = null;
     try {
-      const data = Array.from(this.projects.values());
-      const serialized = JSON.stringify(data, null, 2);
-
-      // Never let a serialisation glitch blank the store.
-      if (!serialized || serialized.length < 2) {
+      // Reutilizar la caché JSON incremental en lugar de volver a ejecutar
+      // `JSON.stringify(data, null, 2)` en el bucle de eventos bajo ráfagas.
+      const buf = this.getAllSerialized();
+      if (!buf || buf.length < 2) {
         throw new Error('Serialización de proyectos vacía; se aborta la escritura');
       }
 
-      const buf = Buffer.from(serialized, 'utf8');
       tempPath = `${this.dataPath}.${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`;
       await fs.promises.writeFile(tempPath, buf);
 
@@ -259,7 +268,17 @@ class ProjectManager extends EventEmitter {
    */
   getAllSerialized() {
     if (!this._serializedAll) {
-      this._serializedAll = Buffer.from(JSON.stringify(Array.from(this.projects.values())), 'utf8');
+      /** @type {string[]} */
+      const parts = [];
+      for (const [id, proj] of this.projects.entries()) {
+        let entry = this._projectJsonCache.get(id);
+        if (entry === undefined) {
+          entry = JSON.stringify(proj);
+          this._projectJsonCache.set(id, entry);
+        }
+        parts.push(entry);
+      }
+      this._serializedAll = Buffer.from(`[${parts.join(',')}]`, 'utf8');
     }
     return this._serializedAll;
   }
@@ -311,7 +330,7 @@ class ProjectManager extends EventEmitter {
     this.validateProjectData(data);
     const project = new Project(data);
     this.projects.set(project.id, project);
-    this.saveProjects();
+    this.saveProjects(project.id);
     this.emit('project_created', project);
     return project;
   }
@@ -327,7 +346,7 @@ class ProjectManager extends EventEmitter {
     Object.assign(project, data, { updatedAt: new Date().toISOString() });
     const updatedProject = new Project(project);
     this.projects.set(id, updatedProject);
-    this.saveProjects();
+    this.saveProjects(id);
 
     const newWatchPaths = JSON.stringify(updatedProject.watchPaths || []);
     if (wasActive && newWatchPaths !== oldWatchPaths) {
@@ -351,13 +370,7 @@ class ProjectManager extends EventEmitter {
       containerOrchestrator.stopWatching(projectDir);
     }
     const result = this.projects.delete(id);
-    this._serializedAll = null;
-    // Vaciado inmediato, no el guardado con rebote de 15 ms que se usaba aquí.
-    // `stop()`, `hibernate()` y `activate()` ya vuelcan directamente; `delete()`
-    // era la excepción, y un borrado seguido de una salida del proceso perdía
-    // el volcado pendiente: los proyectos borrados reaparecían en el siguiente
-    // arranque y el fichero crecía sin fin.
-    this.flushToDisk();
+    this.flushToDisk(id);
     this.emit('project_deleted', { id });
     return result;
   }

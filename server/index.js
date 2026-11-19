@@ -22,6 +22,7 @@ const app = express();
 app.disable('x-powered-by');
 app.set('etag', false);
 const server = http.createServer(app);
+server.on('connection', (socket) => socket.setNoDelay(true));
 // Número, no `string | number`: se pasa a `server.listen()` y a comparaciones
 // numéricas. Un PORT no numérico en el entorno cae al valor por defecto en
 // lugar de propagarse como cadena hasta el listen.
@@ -67,13 +68,21 @@ try {
   if (typeof iconv.getDecoder === 'function') iconv.getDecoder('utf8');
 } catch (e) {}
 
-app.use(express.json({
+const jsonParser = express.json({
   limit: '10mb',
   verify: (req, res, buf) => {
     req.rawBody = buf;
   }
-}));
-app.use(express.urlencoded({ extended: true }));
+});
+const urlencodedParser = express.urlencoded({ extended: true });
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') return next();
+  return jsonParser(req, res, next);
+});
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') return next();
+  return urlencodedParser(req, res, next);
+});
 
 // REST API routes
 app.get('/health', (req, res) => res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() }));

@@ -193,12 +193,18 @@ function classifyChanges(relPaths) {
 function writeFileAtomic(absPath, buffer) {
   const dir = path.dirname(absPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // En Windows NTFS, crear un .tmp nuevo + renameSync dispara escaneos
+  // síncronos del antivirus (~300 ms/archivo) y bloqueos EPERM con lectores.
+  // En POSIX (Linux/macOS, donde corren los VPS de producción) usamos temp+rename atómico.
+  if (process.platform === 'win32') {
+    fs.writeFileSync(absPath, buffer);
+    return;
+  }
   const tempPath = `${absPath}.culkibo-sync-${process.pid}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}.tmp`;
   fs.writeFileSync(tempPath, buffer);
   try {
     fs.renameSync(tempPath, absPath);
   } catch (err) {
-    // En Windows, un lector rápido puede bloquear brevemente el rename.
     fs.copyFileSync(tempPath, absPath);
     try { fs.unlinkSync(tempPath); } catch (e) {}
   }
