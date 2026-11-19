@@ -549,7 +549,8 @@ function startServer(port = PORT, host = '0.0.0.0', { reconcileIngress = process
 }
 
 if (require.main === module) {
-  startServer(PORT, '0.0.0.0');
+  const bindHost = process.env.HOST || process.env.CULKIBO_HOST || '0.0.0.0';
+  startServer(PORT, bindHost);
 }
 
 module.exports = { app, server, wss, broadcast, startServer };

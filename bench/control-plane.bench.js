@@ -93,7 +93,7 @@ async function run({ silent = false, concurrency = 400, workers = 20, wsClients 
   const bootStart = process.hrtime.bigint();
   const child = spawn(process.execPath, [path.join(rootDir, 'server', 'index.js')], {
     cwd: rootDir,
-    env: { ...process.env, PORT: String(port), NODE_ENV: 'test', CULKIBO_SKIP_RECONCILE: '1' },
+    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', NODE_ENV: 'test', CULKIBO_SKIP_RECONCILE: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
     windowsHide: true
