@@ -97,7 +97,7 @@ function canonicalQueryString(query = {}) {
  * como para construir la URL: codificar dos veces (una aquí y otra en `URL`)
  * es el fallo clásico con claves que contienen espacios o `+`.
  *
- * @returns {{authorization:string, headers:Object, canonicalRequest:string, stringToSign:string, signature:string}}
+ * @returns {{authorization:string, headers:Object, canonicalRequest:string, stringToSign:string, signature:string, signedHeaders:string}}
  */
 function signRequest({
   method,
@@ -191,16 +191,18 @@ function xmlEscape(str) {
 
 class S3Client {
   /**
-   * @param {Object} config
-   * @param {string} config.endpoint  p. ej. https://<cuenta>.r2.cloudflarestorage.com
-   * @param {string} config.region    R2 exige literalmente "auto"
-   * @param {string} config.bucket
-   * @param {string} config.accessKeyId
-   * @param {string} config.secretAccessKey
-   * @param {string} [config.sessionToken]
-   * @param {boolean} [config.forcePathStyle] por defecto true salvo AWS
-   * @param {number} [config.partSizeBytes]
-   * @param {number} [config.timeoutMs]
+   * @param {{
+   *   endpoint?: string,
+   *   region?: string,
+   *   bucket?: string,
+   *   accessKeyId?: string,
+   *   secretAccessKey?: string,
+   *   sessionToken?: string | null,
+   *   forcePathStyle?: boolean,
+   *   partSizeBytes?: number,
+   *   timeoutMs?: number,
+   *   maxRetries?: number
+   * }} [config]
    */
   constructor(config = {}) {
     const missing = ['endpoint', 'bucket', 'accessKeyId', 'secretAccessKey'].filter((k) => !config[k]);
@@ -208,23 +210,25 @@ class S3Client {
       throw new Error(`Configuración S3 incompleta: faltan ${missing.join(', ')}`);
     }
 
+    const endpoint = String(config.endpoint);
+    const bucket = String(config.bucket);
     let url;
     try {
-      url = new URL(config.endpoint);
+      url = new URL(endpoint);
     } catch (e) {
-      throw new Error(`Endpoint S3 inválido: ${config.endpoint}`);
+      throw new Error(`Endpoint S3 inválido: ${endpoint}`);
     }
     if (url.protocol !== 'https:' && url.protocol !== 'http:') {
       throw new Error('El endpoint S3 debe ser http o https');
     }
 
-    if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(config.bucket)) {
-      throw new Error(`Nombre de bucket inválido: ${config.bucket}`);
+    if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) {
+      throw new Error(`Nombre de bucket inválido: ${bucket}`);
     }
 
     this.origin = url.origin;
     this.host = url.host;
-    this.bucket = config.bucket;
+    this.bucket = bucket;
     this.region = config.region || 'auto';
     this.accessKeyId = config.accessKeyId;
     this.secretAccessKey = config.secretAccessKey;
@@ -278,7 +282,12 @@ class S3Client {
    * integridad va cubierta extremo a extremo aunque el transporte sea http
    * (MinIO en una red interna, por ejemplo).
    */
-  async request(method, key, { query = {}, headers = {}, body, expectStatus = [200, 204] } = {}) {
+  /**
+   * @param {string} method
+   * @param {string} key
+   * @param {{ query?: Record<string, any>, headers?: Record<string, any>, body?: any, expectStatus?: number[] }} [opts]
+   */
+  async request(method, key, { query = {}, headers = {}, body = undefined, expectStatus = [200, 204] } = {}) {
     const { canonicalUri, url, host } = this.resolve(key);
     const payload = body === undefined || body === null ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(body);
     const payloadHash = payload ? sha256Hex(payload) : EMPTY_SHA256;
@@ -306,6 +315,7 @@ class S3Client {
     const wire = { ...signed.headers, Authorization: signed.authorization };
     delete wire.host;
 
+    /** @type {any} */
     let lastError = null;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
@@ -327,7 +337,7 @@ class S3Client {
           `S3 ${method} ${maskKey(key)} respondió ${res.status}` +
             (xmlField(text, 'Code') ? `: ${xmlField(text, 'Code')} ${xmlField(text, 'Message') || ''}` : '')
         );
-        err.status = res.status;
+        /** @type {any} */ (err).status = res.status;
         if (!retriable) throw err;
         lastError = err;
       } catch (err) {
@@ -442,7 +452,12 @@ class S3Client {
    * multipart en trozos leídos uno a uno para que la memoria no dependa del
    * tamaño del volcado (un dump de 40 GB no cabe en el heap).
    */
-  async uploadFile(key, filePath, { contentType = 'application/octet-stream', onProgress } = {}) {
+  /**
+   * @param {string} key
+   * @param {string} filePath
+   * @param {{ contentType?: string, onProgress?: ((p: any) => void) | null }} [opts]
+   */
+  async uploadFile(key, filePath, { contentType = 'application/octet-stream', onProgress = null } = {}) {
     const stat = await fs.promises.stat(filePath);
     const total = stat.size;
 
@@ -495,6 +510,7 @@ class S3Client {
     const res = await this.request('GET', key, { expectStatus: [200] });
     await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
     const out = fs.createWriteStream(destPath);
+    if (!res.body) throw new Error('La respuesta S3 no contiene cuerpo descargable');
     const reader = res.body.getReader();
     let bytes = 0;
     for (;;) {
@@ -505,7 +521,7 @@ class S3Client {
         await new Promise((r) => out.once('drain', r));
       }
     }
-    await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+    await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve(undefined))));
     return { key, destPath, sizeBytes: bytes };
   }
 }

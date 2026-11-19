@@ -53,6 +53,7 @@ const B64_SUFFIX = '?=';
  * las entrega en minúscula. Una cabecera repetida llega como array: se trata
  * como malformada en lugar de elegir una, porque elegir sería adivinar.
  */
+/** @returns {any} */
 function headerValue(req, name) {
   const raw = req.headers[name];
   if (raw === undefined) return null;

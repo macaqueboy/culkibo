@@ -20,6 +20,8 @@ const caddyManager = require('../services/caddyManager');
 const ingressManager = require('../services/ingressManager');
 const deployManager = require('../services/deployManager');
 const catalogManager = require('../services/catalogManager');
+const liveSyncEngine = require('../services/liveSyncEngine');
+const { authorizeRequest, authStatus, tokenMatches } = require('../middleware/auth');
 
 // In-memory rate limiting for sensitive endpoints (O(1) Fixed Window)
 const rateLimitMap = new Map();
@@ -51,7 +53,8 @@ router.use('/databases', rateLimiter);
 // --- PROJECTS ---
 router.get('/projects', (req, res) => {
   try {
-    res.json(projectManager.getAll());
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(projectManager.getAllSerialized());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -102,6 +105,7 @@ router.delete('/projects/:id', async (req, res) => {
       try { await domainManager.detachProject(domain.id); } catch (e) {}
     }
     projectManager.delete(projectId);
+    await projectManager.flushToDisk();
     // El historial de despliegues y las entregas de webhook ya atendidas son
     // estado de un proyecto que acaba de dejar de existir.
     try { deployManager.forget(projectId); } catch (e) {}
@@ -449,6 +453,7 @@ router.post('/import/coolify/migrate-domain', async (req, res) => {
   try {
     const { hostname, serverIp, autoCloudflare } = req.body;
     let zoneId = null;
+    /** @type {any} */
     let dnsResult = null;
     
     if (autoCloudflare && serverIp) {
@@ -466,6 +471,7 @@ router.post('/import/coolify/migrate-domain', async (req, res) => {
 
     const domain = domainManager.domains.find(d => d.hostname === hostname);
     if (domain) {
+      /** @type {any} */
       const updates = { 
         sslStatus: 'pending_ssl',
         cloudflareZoneId: zoneId || domain.cloudflareZoneId
@@ -492,6 +498,7 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
     for (const hostname of domains) {
       try {
         let zoneId = null;
+        /** @type {any} */
         let dnsResult = null;
         if (autoCloudflare && serverIp) {
            zoneId = await cloudflareService.findZoneForDomain(hostname);
@@ -507,6 +514,7 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
         }
         const domain = domainManager.domains.find(d => d.hostname === hostname);
         if (domain) {
+          /** @type {any} */
           const updates = { sslStatus: 'pending_ssl', cloudflareZoneId: zoneId || domain.cloudflareZoneId };
           if (dnsResult && dnsResult.success) updates.cloudflareProxied = true;
           await domainManager.updateDomain(domain.id, updates);
@@ -529,6 +537,7 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
 router.get('/server/ip', async (req, res) => {
   try {
     const response = await fetch('https://api.ipify.org?format=json');
+    /** @type {any} */
     const data = await response.json();
     res.json({ ip: data.ip });
   } catch (err) {
@@ -548,9 +557,11 @@ router.get('/system/status', (req, res) => {
       tagline: 'The AI-Era Cloud Orchestrator',
       nodeVersion: process.version,
       uptimeSeconds: Math.floor(process.uptime()),
-      memoryUsageMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      memoryUsageMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       features: {
-        hotReloadImplemented: false, // la detección funciona; el transporte y la aplicación son trabajo pendiente
+        hotReloadImplemented: true,
+        liveSyncImplemented: true,
         acmeDns01Wildcard: true,
         cloudflareTunnels: true,
         nativeMcp: true,
@@ -754,6 +765,7 @@ router.get('/ingress/resolve', async (req, res) => {
     const desired = state.specs.find(s => s.hostnames.includes(route.hostname)) || null;
     const skipped = state.skipped.find(s => s.hostnames.includes(route.hostname)) || null;
 
+    /** @type {any} */
     let liveRoute = null;
     let ingressAvailable = false;
     const detection = await caddyManager.detect();
@@ -1595,6 +1607,7 @@ router.post('/webhooks/github', async (req, res) => {
     }
 
     // Resolve target project
+    /** @type {any} */
     let project = null;
     if (projectId) {
       project = projectManager.getById(projectId);
@@ -1724,6 +1737,7 @@ router.post('/webhooks/github', async (req, res) => {
       // ruta. NO se espera al resultado: una build dura minutos y GitHub corta
       // la entrega a los 10 s. El progreso va por WebSocket (`deploy_event`) y
       // queda en el historial del proyecto.
+      /** @type {{ dispatched: boolean, queued: boolean, reason: string | null }} */
       let pipeline = { dispatched: false, queued: false, reason: null };
       const dockerProbe = await deployManager.detectDocker();
       if (!project.gitRepo) {
@@ -1913,6 +1927,109 @@ router.delete('/catalog/installations/:id', async (req, res) => {
   try {
     const deleteVolumes = req.query.deleteVolumes === '1' || req.query.deleteVolumes === 'true' || Boolean(req.body && req.body.deleteVolumes);
     res.json(await catalogManager.remove(req.params.id, { deleteVolumes }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- AUTENTICACIÓN DEL PANEL REMOTO ---
+router.get('/auth/session', (req, res) => {
+  const decision = authorizeRequest(req);
+  const status = authStatus();
+  res.json({
+    authenticated: decision.ok,
+    method: decision.method || null,
+    requireTokenAlways: status.requireTokenAlways,
+    tokenConfigured: status.tokenConfigured,
+    tokenSource: status.tokenSource
+  });
+});
+
+router.post('/auth/verify', (req, res) => {
+  const token = (req.body && req.body.token) || '';
+  if (!tokenMatches(token)) {
+    return res.status(401).json({ valid: false, error: 'Token inválido' });
+  }
+  res.json({ valid: true });
+});
+
+// --- LIVE SYNC (THE FORGE): SINCRONIZACIÓN SUB-SEGUNDO + MERKLE + ROLLBACK ---
+router.get('/sync/summary', (req, res) => {
+  res.json(liveSyncEngine.getGlobalSummary());
+});
+
+router.get('/projects/:id/sync/status', (req, res) => {
+  const project = projectManager.getById(req.params.id);
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  res.json(liveSyncEngine.getStatus(project.id));
+});
+
+router.post('/projects/:id/sync/frame', (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const result = liveSyncEngine.applyCommitFrame(project.id, req.body || {});
+    res.json(result);
+  } catch (err) {
+    const status = err && err.code === 'PATH_TRAVERSAL_BLOCKED' ? 400 : 400;
+    res.status(status).json({ error: err.message, code: (err && err.code) || 'SYNC_ERROR' });
+  }
+});
+
+router.post('/projects/:id/sync/verify', (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const result = liveSyncEngine.verifySync(project.id, req.body || {});
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/projects/:id/sync/rollback', (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const steps = Number(req.body && req.body.steps) || 1;
+    res.json(liveSyncEngine.rollback(project.id, steps));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * D3 — Promoción de lo ya probado: construye y despliega en Citadel el árbol
+ * exacto sincronizado en disco (sin requerir un `git push` previo).
+ */
+router.post('/projects/:id/sync/promote', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const targetDir = liveSyncEngine.resolveTargetDir(project.id);
+    const verification = liveSyncEngine.verifySync(project.id);
+    const deployment = await deployManager.deploy(project, {
+      contextDir: targetDir,
+      gitSync: false,
+      trigger: 'forge_promote'
+    });
+    res.status(deployment.status === 'activo' ? 200 : 422).json({
+      promoted: deployment.status === 'activo',
+      workspaceDigest: verification.serverDigest,
+      deployment
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- WILDCARD TLS NATIVO VÍA CADDY + CLOUDFLARE DNS-01 ---
+router.post('/ingress/wildcard-dns01', async (req, res) => {
+  try {
+    const { domain, tokenEnv } = req.body || {};
+    if (!domain) return res.status(400).json({ error: 'Indica el dominio raíz (p. ej. midominio.com)' });
+    const result = await caddyManager.configureWildcardDns01(domain, { tokenEnv: tokenEnv || 'CF_API_TOKEN' });
+    res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

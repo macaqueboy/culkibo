@@ -11,6 +11,15 @@ class ProjectManager extends EventEmitter {
     this.projects = new Map();
     this.savingPromise = null;
     this.pendingSave = false;
+    this._lastBackupAt = 0;
+    /** @type {Promise<void> | null} */
+    this._inFlightFlush = null;
+    /** @type {Promise<void> | null} */
+    this._queuedFlush = null;
+    /** @type {Promise<void> | null} */
+    this._batchingFlush = null;
+    /** @type {Buffer | null} */
+    this._serializedAll = null;
     this.ensureDataDir();
     this.loadProjects();
   }
@@ -56,6 +65,7 @@ class ProjectManager extends EventEmitter {
   loadProjects() {
     this.cleanStaleTempFiles();
     if (fs.existsSync(this.dataPath)) {
+      /** @type {any[] | null} */
       let data = null;
       try {
         data = this.readProjectsFile(this.dataPath);
@@ -94,6 +104,7 @@ class ProjectManager extends EventEmitter {
   }
 
   saveProjects() {
+    this._serializedAll = null;
     if (this.saveDebounceTimer) {
       clearTimeout(this.saveDebounceTimer);
     }
@@ -123,22 +134,58 @@ class ProjectManager extends EventEmitter {
    * "mi cambio está en disco".
    */
   flushToDisk() {
+    this._serializedAll = null;
     if (this.saveDebounceTimer) {
       clearTimeout(this.saveDebounceTimer);
       this.saveDebounceTimer = null;
     }
 
-    this.flushChain = (this.flushChain || Promise.resolve())
-      // Un fallo de escritura ya se registra dentro; no debe romper la cadena
-      // ni impedir que los cambios siguientes se intenten guardar.
-      .catch(() => {})
-      .then(() => this.writeSnapshot());
+    // Group Commit (fase 1): si no hay escritura activa, agrupa en el mismo
+    // turno del bucle de eventos (2 ms) todas las mutaciones que llegan juntas
+    // en una ráfaga concurrente en UNA sola escritura atómica a disco.
+    if (!this._inFlightFlush) {
+      if (!this._batchingFlush) {
+        this._batchingFlush = new Promise((resolve) => {
+          const t = setTimeout(() => {
+            this._batchingFlush = null;
+            const p = this.writeSnapshot().finally(() => {
+              if (this._inFlightFlush === p) this._inFlightFlush = null;
+            });
+            this._inFlightFlush = p;
+            this.flushChain = p;
+            resolve(p);
+          }, 2);
+          if (t.unref) t.unref();
+        });
+        this.flushChain = this._batchingFlush;
+      }
+      return this._batchingFlush;
+    }
 
-    return this.flushChain;
+    // Group Commit (fase 2): ya hay una escritura en curso que pudo capturar
+    // `this.projects` antes de esta mutación. Todos los llamantes concurrentes
+    // que lleguen durante esta escritura comparten UNA única escritura posterior.
+    if (!this._queuedFlush) {
+      const next = this._inFlightFlush
+        .catch(() => {})
+        .then(() => {
+          this._queuedFlush = null;
+          const p = this.writeSnapshot().finally(() => {
+            if (this._inFlightFlush === p) this._inFlightFlush = null;
+          });
+          this._inFlightFlush = p;
+          return p;
+        });
+      this._queuedFlush = next;
+      this.flushChain = next;
+    }
+
+    return this._queuedFlush;
   }
 
   /** Escritura atómica de una instantánea. La llama solo `flushToDisk()`. */
   async writeSnapshot() {
+    /** @type {string | null} */
     let tempPath = null;
     try {
       const data = Array.from(this.projects.values());
@@ -149,19 +196,14 @@ class ProjectManager extends EventEmitter {
         throw new Error('Serialización de proyectos vacía; se aborta la escritura');
       }
 
+      const buf = Buffer.from(serialized, 'utf8');
       tempPath = `${this.dataPath}.${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`;
-      await fs.promises.writeFile(tempPath, serialized, 'utf8');
+      await fs.promises.writeFile(tempPath, buf);
 
-      // Verify what actually landed on disk before it replaces the live file.
-      const verify = await fs.promises.readFile(tempPath, 'utf8');
-      if (verify.length !== Buffer.byteLength(serialized, 'utf8') && verify !== serialized) {
-        throw new Error('El archivo temporal no coincide con los datos serializados');
-      }
-      JSON.parse(verify);
-
-      // Keep the last known-good copy so a half-written replace is recoverable.
-      if (fs.existsSync(this.dataPath)) {
-        try { await fs.promises.copyFile(this.dataPath, `${this.dataPath}.bak`); } catch (e) {}
+      // Verify exact byte count landed on disk without re-parsing hundreds of KB on the event loop.
+      const st = await fs.promises.stat(tempPath);
+      if (st.size !== buf.length) {
+        throw new Error(`El archivo temporal no coincide en tamaño (${st.size} != ${buf.length})`);
       }
 
       // On Windows, rename() throws EPERM/EBUSY while another handle (an editor,
@@ -169,6 +211,7 @@ class ProjectManager extends EventEmitter {
       // is transient, so retry before resorting to copyFile — which truncates the
       // destination first and is the one path that can leave a 0-byte file.
       let renamed = false;
+      /** @type {any} */
       let lastErr = null;
       for (let attempt = 0; attempt < 5 && !renamed; attempt++) {
         try {
@@ -186,6 +229,14 @@ class ProjectManager extends EventEmitter {
         try { await fs.promises.unlink(tempPath); } catch(e) {}
       }
       tempPath = null;
+
+      // Refresh the .bak recovery snapshot in the background (throttled) so
+      // concurrent HTTP writes never stall waiting on a duplicate disk copy.
+      const now = Date.now();
+      if (now - this._lastBackupAt > 5000) {
+        this._lastBackupAt = now;
+        fs.promises.copyFile(this.dataPath, `${this.dataPath}.bak`).catch(() => {});
+      }
     } catch (err) {
       console.error('Error flushing projects to disk:', err);
       if (tempPath) {
@@ -201,10 +252,26 @@ class ProjectManager extends EventEmitter {
     return Array.from(this.projects.values());
   }
 
+  /**
+   * Buffer JSON pre-serializado de `getAll()`, invalidado en cada mutación.
+   * Evita repetir `JSON.stringify` de cientos de KB bajo lecturas concurrentes.
+   * @returns {Buffer}
+   */
+  getAllSerialized() {
+    if (!this._serializedAll) {
+      this._serializedAll = Buffer.from(JSON.stringify(Array.from(this.projects.values())), 'utf8');
+    }
+    return this._serializedAll;
+  }
+
   getById(id) {
     return this.projects.get(id);
   }
 
+  /**
+   * @param {any} data
+   * @param {string | null} [id]
+   */
   validateProjectData(data, id = null) {
     if (id && (!/^[a-zA-Z0-9_-]+$/.test(id) || id.includes('../') || id.includes('..\\'))) {
       throw new Error('Invalid project ID (path traversal detected)');
@@ -278,9 +345,13 @@ class ProjectManager extends EventEmitter {
   delete(id) {
     const project = this.projects.get(id);
     if (project && project.status === 'active') {
-      this.hibernate(id);
+      // Detener el watcher directamente sin hacer un flush intermedio de hibernación
+      // que se sobrescribiría un microsegundo después al borrar el proyecto.
+      const projectDir = path.join(process.cwd(), 'projects', id);
+      containerOrchestrator.stopWatching(projectDir);
     }
     const result = this.projects.delete(id);
+    this._serializedAll = null;
     // Vaciado inmediato, no el guardado con rebote de 15 ms que se usaba aquí.
     // `stop()`, `hibernate()` y `activate()` ya vuelcan directamente; `delete()`
     // era la excepción, y un borrado seguido de una salida del proceso perdía

@@ -262,6 +262,7 @@ class IngressManager {
 
     // La política de TLS bajo demanda solo se instala si Caddy no tiene ya la
     // suya. Pisarla sería decidir por el usuario cómo emite certificados.
+    /** @type {string | null} */
     let note = null;
     if (!full.apps.tls) {
       await caddyManager.write('PUT', '/config/apps/tls', base.apps.tls);
@@ -407,6 +408,7 @@ class IngressManager {
    * haber perdido su configuración, o haber sido editado por fuera, y sin esto
    * nuestra idea del mundo y la suya se separan sin que nadie lo note.
    */
+  /** @param {{ port?: number }} [opts] */
   async bootstrap({ port } = {}) {
     if (port) this.daemonPort = Number(port);
 
@@ -496,6 +498,7 @@ class IngressManager {
 
     return new Promise((resolve) => {
       const startedAt = Date.now();
+      /** @type {tls.TLSSocket | null} */
       let socket = null;
       let settled = false;
 
@@ -507,7 +510,7 @@ class IngressManager {
       };
 
       try {
-        socket = tls.connect({
+        const s = tls.connect({
           // Se conecta a la IP ya resuelta y se envía el nombre por SNI: así el
           // socket no vuelve a pasar por `dns.lookup`.
           host: resolved.address,
@@ -516,7 +519,7 @@ class IngressManager {
           rejectUnauthorized: false,
           ALPNProtocols: ['h2', 'http/1.1']
         }, () => {
-          const cert = socket.getPeerCertificate(false) || {};
+          const cert = s.getPeerCertificate(false) || {};
           if (!cert.valid_to) {
             return finish({ reachable: true, error: 'El servidor no presentó ningún certificado' });
           }
@@ -528,20 +531,21 @@ class IngressManager {
             issuer: (cert.issuer && (cert.issuer.O || cert.issuer.CN)) || null,
             issuerCN: (cert.issuer && cert.issuer.CN) || null,
             subject: (cert.subject && cert.subject.CN) || null,
-            sans: cert.subjectaltname ? cert.subjectaltname.split(', ').map(s => s.replace(/^DNS:/, '')) : [],
+            sans: cert.subjectaltname ? cert.subjectaltname.split(', ').map(x => x.replace(/^DNS:/, '')) : [],
             notBefore: Number.isNaN(notBefore.getTime()) ? null : notBefore.toISOString(),
             notAfter: hasNotAfter ? notAfter.toISOString() : null,
             daysRemaining: hasNotAfter ? Math.floor((notAfter.getTime() - Date.now()) / 86400000) : null,
             expired: hasNotAfter ? notAfter.getTime() <= Date.now() : null,
-            trusted: socket.authorized === true,
-            trustError: socket.authorized ? null : (socket.authorizationError ? String(socket.authorizationError) : null),
-            protocol: typeof socket.getProtocol === 'function' ? socket.getProtocol() : null,
-            alpn: socket.alpnProtocol || null
+            trusted: s.authorized === true,
+            trustError: s.authorized ? null : (s.authorizationError ? String(s.authorizationError) : null),
+            protocol: typeof s.getProtocol === 'function' ? s.getProtocol() : null,
+            alpn: s.alpnProtocol || null
           });
         });
+        socket = s;
 
-        socket.setTimeout(timeoutMs, () => finish({ reachable: false, error: `Sin respuesta TLS en ${timeoutMs} ms` }));
-        socket.on('error', (err) => finish({ reachable: false, error: err.message }));
+        s.setTimeout(timeoutMs, () => finish({ reachable: false, error: `Sin respuesta TLS en ${timeoutMs} ms` }));
+        s.on('error', (err) => finish({ reachable: false, error: err.message }));
       } catch (err) {
         finish({ reachable: false, error: err.message });
       }
@@ -619,5 +623,5 @@ class IngressManager {
   }
 }
 
-module.exports = new IngressManager();
-module.exports.IngressManager = IngressManager;
+const ingressManagerInstance = Object.assign(new IngressManager(), { IngressManager });
+module.exports = ingressManagerInstance;

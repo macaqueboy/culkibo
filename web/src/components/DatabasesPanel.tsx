@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Database, Plus, Play, Square, RefreshCw, Trash2, Eye, EyeOff, Copy, Check,
   ShieldAlert, Clock, CloudUpload, History, Lock, Globe, AlertTriangle, Server
@@ -54,7 +54,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     endpoint: '', region: 'auto', bucket: '', accessKeyId: '', secretAccessKey: '', prefix: 'culkibo/'
   });
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       const [dbs, eng, status, store] = await Promise.all([
         api.getDatabases(projectId),
@@ -70,9 +70,30 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos');
     }
-  };
+  }, [projectId, onNotify]);
 
-  useEffect(() => { load(); }, [projectId]);
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      api.getDatabases(projectId),
+      api.getDbEngines(),
+      api.getDbDockerStatus(),
+      api.getDbStorage()
+    ])
+      .then(([dbs, eng, status, store]) => {
+        if (!active) return;
+        setDatabases(dbs.databases);
+        setEngines(eng.engines);
+        setDockerOk(status.available);
+        setDockerReason(status.reason);
+        setStorage(store);
+      })
+      .catch((err) => {
+        if (!active) return;
+        onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos');
+      });
+    return () => { active = false; };
+  }, [projectId, onNotify]);
 
   // Mientras algo esté arrancando conviene refrescar: la sonda de salud tarda
   // decenas de segundos y el usuario no debería tener que recargar a mano.
@@ -80,7 +101,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     if (!databases.some((d) => d.health === 'starting' || d.health === 'unknown')) return;
     const t = setInterval(async () => {
       for (const d of databases.filter((x) => x.health === 'starting' || x.health === 'unknown')) {
-        try { await api.refreshDatabaseHealth(d.id); } catch (e) { /* silencio */ }
+        try { await api.refreshDatabaseHealth(d.id); } catch { /* silencio */ }
       }
       const dbs = await api.getDatabases(projectId).catch(() => null);
       if (dbs) setDatabases(dbs.databases);

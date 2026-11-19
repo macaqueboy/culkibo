@@ -347,7 +347,10 @@ class SslManager {
    * Cloudflare: un TXT de desafío para una orden ACME que nunca va a existir es
    * basura en la zona DNS del usuario.
    */
-  async issueWildcardCertificate({ domain, zoneId, provider = 'lets_encrypt', onProgress } = {}) {
+  /**
+   * @param {{ domain?: string, zoneId?: string | null, provider?: string, onProgress?: ((payload: any) => void) | null }} [opts]
+   */
+  async issueWildcardCertificate({ domain = '', zoneId = null, provider = 'lets_encrypt', onProgress = null } = {}) {
     const rootDomain = String(domain || '').replace(/^\*\./, '').toLowerCase();
     const wildcardDomain = rootDomain ? `*.${rootDomain}` : '*';
 
@@ -451,6 +454,5 @@ class SslManager {
   }
 }
 
-module.exports = new SslManager();
-module.exports.SslManager = SslManager;
-module.exports.MANAGED_BY_CADDY = MANAGED_BY_CADDY;
+const sslManagerInstance = Object.assign(new SslManager(), { SslManager, MANAGED_BY_CADDY });
+module.exports = sslManagerInstance;

@@ -320,6 +320,7 @@ class GithubService {
 
   getStatus() {
     const isConnected = Boolean(this.config && this.config.token && this.config.user);
+    /** @type {string | null} */
     let tokenMasked = null;
     if (isConnected && this.config.token) {
       const t = this.config.token;
@@ -364,8 +365,8 @@ class GithubService {
           (r.language && r.language.toLowerCase().includes(q))
         );
       }
-      const pageNum = parseInt(page, 10) || 1;
-      const limit = parseInt(perPage, 10) || 30;
+      const pageNum = parseInt(String(page), 10) || 1;
+      const limit = parseInt(String(perPage), 10) || 30;
       const startIdx = (pageNum - 1) * limit;
       const paged = filtered.slice(startIdx, startIdx + limit);
       return {
@@ -376,8 +377,8 @@ class GithubService {
       };
     }
 
-    const pageNum = parseInt(page, 10) || 1;
-    const limit = parseInt(perPage, 10) || 30;
+    const pageNum = parseInt(String(page), 10) || 1;
+    const limit = parseInt(String(perPage), 10) || 30;
 
     // If searching on real GitHub, try Search API across all user's repos
     if (search && this.config.user?.login) {

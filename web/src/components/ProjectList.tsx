@@ -246,17 +246,16 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   const [sortBy, setSortBy] = useState<'recent' | 'name' | 'domains' | 'status'>('recent');
   const [showCreateModal, setShowCreateModal] = useState(false);
 
-  // Sync parentProjects into localProjects whenever the parent refetches.
-  // The previous `length > 0` guard meant deleting the last project left its
-  // card on screen until a manual reload: an empty list is a valid state.
-  useEffect(() => {
+  // Sync parentProjects into localProjects whenever the parent refetches
+  // (derived during render to avoid cascading setState-in-effect renders).
+  const [prevParentProjects, setPrevParentProjects] = useState(parentProjects);
+  if (parentProjects !== prevParentProjects) {
+    setPrevParentProjects(parentProjects);
     if (Array.isArray(parentProjects)) {
       setLocalProjects(parentProjects);
-      // Keep the skeleton up until real data lands, so the initial empty array
-      // does not flash the "no projects yet" empty state.
       if (parentProjects.length > 0) setLoading(false);
     }
-  }, [parentProjects]);
+  }
 
   const fetchProjects = () => {
     setLoading(true);
@@ -273,7 +272,17 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   };
 
   useEffect(() => {
-    fetchProjects();
+    let active = true;
+    api.getProjects()
+      .then((data) => {
+        if (!active) return;
+        setLocalProjects(data);
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.error(err);
+        if (active) setLoading(false);
+      });
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -282,7 +291,10 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       }
     };
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    return () => {
+      active = false;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
   }, []);
 
   const handleStartLocal = async (e: React.MouseEvent, id: string) => {

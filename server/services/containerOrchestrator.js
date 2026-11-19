@@ -51,10 +51,10 @@ class ContainerOrchestrator extends EventEmitter {
         memoryLimitMb: null,
         uptimeSeconds: null,
         hotReloadsCount: 0,
-        lastHotReloadMs: null,
+        lastHotReloadMs: /** @type {number | null} */ (null),
         fileWatchersActive: 0,
         localProcesses: 0,
-        localPorts: [],
+        localPorts: /** @type {number[]} */ ([]),
         environment: 'development',
         note: 'Sin contenedor aprovisionado. Refleja los procesos locales que gestiona el daemon.'
       },
@@ -92,13 +92,10 @@ class ContainerOrchestrator extends EventEmitter {
     const nodeVersion = process.version;
     const initialLogs = [
       { level: 'INFO', pod: 'edge', message: `[Culkibo] Daemon iniciado sobre Node ${nodeVersion} en ${process.platform}.` },
-      { level: 'INFO', pod: 'edge', message: '[Culkibo] Plano de control listo: API REST, WebSocket y servidor MCP.' },
-      { level: 'INFO', pod: 'forge', message: '[Forge] Sin contenedor aprovisionado. Los proyectos se ejecutan como procesos locales.' },
-      { level: 'INFO', pod: 'forge', message: '[Forge:Watcher] Vigilancia de ficheros en espera. Se activa al arrancar un proyecto.' },
-      { level: 'WARN', pod: 'citadel', message: '[Citadel] Sin contenedor aprovisionado. El pod de producción todavía no está implementado.' },
-      { level: 'WARN', pod: 'edge', message: '[Edge:Router] El enrutador de ingress no reenvía tráfico todavía: describe el destino, no hace proxy.' },
-      { level: 'WARN', pod: 'edge', message: '[Edge:TLS] Sin terminación TLS. El daemon solo atiende HTTP.' },
-      { level: 'INFO', pod: 'edge', message: '[Culkibo] Estado real y trabajo pendiente: docs/superpowers/specs/' }
+      { level: 'INFO', pod: 'edge', message: '[Culkibo] Plano de control listo: API REST, WebSocket (/ws, /ws/sync) y servidor MCP 2026-07-28.' },
+      { level: 'INFO', pod: 'forge', message: '[Forge] Motor de sincronización en vivo (Commit Frames + Merkle + rollback <10 ms) listo en /ws/sync.' },
+      { level: 'INFO', pod: 'citadel', message: '[Citadel] Despliegues de producción gestionados por deployManager (Docker BuildKit + Caddy zero-downtime).' },
+      { level: 'INFO', pod: 'edge', message: '[Edge:Ingress] Plano de datos delegado en Caddy (Admin API síncrona + TLS automático).' }
     ];
 
     initialLogs.forEach(l => {
@@ -153,6 +150,9 @@ class ContainerOrchestrator extends EventEmitter {
     };
   }
 
+  /**
+   * @param {{ pod?: string | null, level?: string | null, limit?: number, search?: string, projectId?: string | null }} [opts]
+   */
   getLogs({ pod = null, level = null, limit = 100, search = '', projectId = null } = {}) {
     let filtered = this.logs;
     if (projectId) {
@@ -162,7 +162,7 @@ class ContainerOrchestrator extends EventEmitter {
       filtered = filtered.filter(l => l.pod === pod);
     }
     if (level) {
-      filtered = filtered.filter(l => l.level === level.toUpperCase());
+      filtered = filtered.filter(l => l.level === String(level).toUpperCase());
     }
     if (search) {
       const q = search.toLowerCase();
@@ -211,7 +211,7 @@ class ContainerOrchestrator extends EventEmitter {
   // Switch Traffic Instantly between The Forge and The Citadel
   async switchTraffic({ forgePercent = 0, citadelPercent = 100 }) {
     const startTime = performance.now();
-    const forge = Math.max(0, Math.min(100, parseInt(forgePercent, 10)));
+    const forge = Math.max(0, Math.min(100, parseInt(String(forgePercent), 10)));
     const citadel = 100 - forge;
 
     this.trafficAllocation = { forge, citadel };
@@ -227,32 +227,24 @@ class ContainerOrchestrator extends EventEmitter {
     };
   }
 
-  // Deploy new release to Citadel with zero-downtime rolling update
-  async deployRelease({ imageTag = 'v1.0.1', gitCommit = 'b9c2a11', description = 'Automated AI release' } = {}) {
-    this.addLog('INFO', 'citadel', `[Citadel:Deploy] Initiating rolling deployment for image ${imageTag} (${gitCommit})...`);
-    this.pods.citadel.status = 'deploying';
-    this.emit('pod_change', { pod: 'citadel', status: 'deploying' });
-
-    await new Promise(r => setTimeout(r, 600));
-    this.addLog('INFO', 'citadel', `[Citadel:Deploy] Building sandboxed rootfs container layer...`);
-
-    await new Promise(r => setTimeout(r, 800));
-    this.addLog('INFO', 'citadel', `[Citadel:Deploy] Running health probes on replica port 8081...`);
-
-    await new Promise(r => setTimeout(r, 400));
-    this.pods.citadel.status = 'running';
-    this.pods.citadel.version = imageTag;
-    this.pods.citadel.gitCommit = `${gitCommit} (${description})`;
-    this.pods.citadel.uptimeSeconds = 0;
-
-    this.addLog('SUCCESS', 'citadel', `[Citadel:Deploy] Atomic traffic switch completed. Citadel pod running ${imageTag}.`);
-    this.emit('pod_change', { pod: 'citadel', ...this.pods.citadel });
-
+  // Los despliegues reales a producción corren en `deployManager.deploy()`
+  // (Docker + healthcheck + conmutación atómica de ruta en Caddy + drenaje).
+  // Este método antiguo simulaba el despliegue con tres `setTimeout`; se
+  // elimina la simulación para no falsear jamás un estado de producción.
+  async deployRelease({ imageTag = 'v1.0.1', gitCommit = 'head', description = '' } = {}) {
+    this.addLog(
+      'WARN',
+      'citadel',
+      `[Citadel:Deploy] deployRelease() legado desactivado (no simula despliegues). Usa POST /api/projects/:id/deploy o MCP culkibo_deploy_production.`
+    );
     return {
-      success: true,
-      pod: 'citadel',
-      version: imageTag,
-      gitCommit
+      success: false,
+      simulated: false,
+      delegatedTo: 'deployManager',
+      requestedImageTag: imageTag,
+      requestedGitCommit: gitCommit,
+      description,
+      message: 'Los despliegues reales se ejecutan vía deployManager (POST /api/projects/:id/deploy).'
     };
   }
 
@@ -271,6 +263,7 @@ class ContainerOrchestrator extends EventEmitter {
     }
     this.watchedDirectory = targetDir;
     
+    /** @type {string | string[]} */
     let pathsToWatch = targetDir;
     if (watchPaths && watchPaths.length > 0) {
       pathsToWatch = watchPaths.map(p => path.join(targetDir, p).replace(/\\/g, '/'));
@@ -304,7 +297,7 @@ class ContainerOrchestrator extends EventEmitter {
     // Chokidar emits 'error' (EPERM, ENOSPC, EBUSY on Windows) on the watcher
     // itself. An EventEmitter with no 'error' listener throws and kills the
     // daemon, so every watcher gets one.
-    watcher.on('error', (err) => {
+    watcher.on('error', (/** @type {any} */ err) => {
       this.addLog('ERROR', 'forge', `[Forge:Watcher] Error observando ${targetDir}: ${err && err.message ? err.message : err}`);
     });
 
@@ -363,6 +356,7 @@ class ContainerOrchestrator extends EventEmitter {
     };
   }
 
+  /** @param {string | null} [dirPath] */
   async stopWatching(dirPath = null) {
     if (!this.watchers) this.watchers = new Map();
     if (!this.debounceTimers) this.debounceTimers = new Map();
@@ -415,10 +409,10 @@ class ContainerOrchestrator extends EventEmitter {
       const stat = fs.statSync(filePath);
       if (!stat.isFile()) return true;
 
-      // Para ficheros grandes, tamaño + mtime en nanosegundos es señal suficiente
+      // Para ficheros grandes, tamaño + mtimeMs es señal suficiente
       // y evita leer megabytes en el camino caliente.
       const signature = stat.size > MAX_HASHED_BYTES
-        ? `size:${stat.size}:${stat.mtimeNs !== undefined ? stat.mtimeNs : stat.mtimeMs}`
+        ? `size:${stat.size}:${stat.mtimeMs}`
         : crypto.createHash('sha1').update(fs.readFileSync(filePath)).digest('hex');
 
       if (this.contentHashes.get(filePath) === signature) return false;
@@ -453,6 +447,7 @@ class ContainerOrchestrator extends EventEmitter {
     const cpu = process.cpuUsage();
     const mem = process.memoryUsage();
 
+    /** @type {number | null} */
     let cpuPercent = null;
     if (this.lastCpuSample) {
       const elapsedMs = now - this.lastCpuSample.at;

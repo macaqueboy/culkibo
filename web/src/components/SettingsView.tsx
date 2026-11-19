@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { CheckCircle2, Shield, Folder, Server, ExternalLink, Unlink, Key, AlertCircle, RefreshCw } from 'lucide-react';
-import { api, type GitHubStatus } from '../lib/api';
+import { CheckCircle2, Shield, Folder, Server, ExternalLink, Unlink, Key, AlertCircle, RefreshCw, LogOut } from 'lucide-react';
+import { api, clearAuthToken, getAuthToken, type GitHubStatus } from '../lib/api';
+import { McpInspector } from './McpInspector';
 
 export const SettingsView: React.FC = () => {
   const [sysStatus, setSysStatus] = useState<any>(null);
@@ -326,7 +327,23 @@ export const SettingsView: React.FC = () => {
             <span className="text-blue-700 font-bold">./data/cloudflare-config.json</span>
           </div>
         </div>
+
+        {getAuthToken() && (
+          <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
+            <span className="text-xs text-slate-600">Sesión remota autenticada con token en este navegador.</span>
+            <button
+              onClick={() => { clearAuthToken(); window.location.reload(); }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 hover:bg-rose-100 cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Cerrar sesión</span>
+            </button>
+          </div>
+        )}
       </div>
+
+      {/* Inspector MCP 2026-07-28 integrado */}
+      <McpInspector />
     </div>
   );
 };

@@ -51,7 +51,7 @@ async function runStressTest() {
   // Reutiliza el daemon si ya está activo; si no, levanta uno para la prueba.
   // Nota: los `process.exit()` del final lo cierran igualmente.
   const { ensureDaemon } = require('./helpers/daemon');
-  await ensureDaemon({ quiet: true });
+  const stopDaemon = await ensureDaemon({ quiet: true });
 
   // Barrido PREVIO, no solo posterior.
   //
@@ -139,6 +139,10 @@ async function runStressTest() {
         }
       } catch (e) {}
     }
+  }
+
+  if (stopDaemon) {
+    try { await stopDaemon(); } catch (e) {}
   }
 
   if (avgLatency > 200) {

@@ -489,6 +489,10 @@ class DeployManager extends EventEmitter {
       };
     }
 
+    if (exists('go.mod')) {
+      return { stack: 'go', containerPort: 8080 };
+    }
+
     if (exists('requirements.txt') || exists('pyproject.toml')) {
       const entry = ['main.py', 'app.py', 'wsgi.py', 'manage.py'].find(f => exists(f)) || null;
       return { stack: 'python', containerPort: 8000, pythonEntry: entry };
@@ -506,11 +510,46 @@ class DeployManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   /**
+   * `.dockerignore` por defecto cuando el repo no aporta uno propio.
+   *
+   * BuildKit lee automáticamente `<dockerfile>.dockerignore` (aquí
+   * `.culkibo/Dockerfile.dockerignore`), así que nunca modificamos ni ensuciamos
+   * el árbol del usuario y evitamos enviar cientos de MB de `node_modules` o
+   * `.git` al daemon de Docker en cada despliegue.
+   */
+  defaultDockerignore() {
+    return [
+      '# Generado por Culkibo para acelerar el contexto de construcción.',
+      '.git',
+      '.github',
+      '.culkibo',
+      'node_modules',
+      '.next',
+      'dist',
+      'build',
+      'coverage',
+      '.env',
+      '.env.*',
+      '!.env.example',
+      '*.log',
+      '.DS_Store',
+      '__pycache__',
+      '.venv',
+      'venv',
+      ''
+    ].join('\n');
+  }
+
+  /**
    * Devuelve el texto del Dockerfile que construiría este proyecto.
    *
    * Función pura: recibe la estrategia, devuelve una cadena. Se prueba sin
    * Docker y sin tocar el disco. Todo lo interpolado ya viene saneado (versión
    * de Node entera, puertos enteros, rutas validadas).
+   *
+   * Usa BuildKit (`syntax=docker/dockerfile:1.7`) con montajes de caché
+   * persistentes (`--mount=type=cache`) para que las reconstrucciones sucesivas
+   * reutilicen la caché de paquetes sin bajar todo de red cada vez.
    */
   generateDockerfile(strategy) {
     const port = sanitizePort(strategy.containerPort, DEFAULTS.containerPort);
@@ -524,20 +563,21 @@ class DeployManager extends EventEmitter {
 
     if (strategy.stack === 'next') {
       return [
+        '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
         `FROM ${nodeTag} AS deps`,
         'WORKDIR /app',
         'COPY package*.json ./',
-        // `npm ci` cuando hay lockfile: reproducible y mucho más rápido. El
-        // fallback a `npm install` existe porque muchos repos no lo versionan.
-        'RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
+        // `npm ci` cuando hay lockfile + caché persistente BuildKit para
+        // evitar re-descargas cuando solo cambia una dependencia.
+        'RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
         '',
         `FROM ${nodeTag} AS build`,
         'WORKDIR /app',
         'COPY --from=deps /app/node_modules ./node_modules',
         'COPY . .',
         'ENV NEXT_TELEMETRY_DISABLED=1',
-        'RUN npm run build',
+        'RUN --mount=type=cache,target=/app/.next/cache npm run build',
         '',
         `FROM ${nodeTag} AS runtime`,
         'WORKDIR /app',
@@ -554,11 +594,12 @@ class DeployManager extends EventEmitter {
 
     if (strategy.stack === 'vite') {
       return [
+        '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
         `FROM ${nodeTag} AS build`,
         'WORKDIR /app',
         'COPY package*.json ./',
-        'RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
+        'RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
         'COPY . .',
         'RUN npm run build',
         '',
@@ -577,11 +618,12 @@ class DeployManager extends EventEmitter {
         ? 'CMD ["npm", "run", "start"]'
         : 'CMD ["node", "."]';
       return [
+        '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
         `FROM ${nodeTag} AS build`,
         'WORKDIR /app',
         'COPY package*.json ./',
-        'RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
+        'RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
         'COPY . .',
         buildStep,
         // Se poda a producción DESPUÉS del build: las devDependencies hacen
@@ -601,17 +643,41 @@ class DeployManager extends EventEmitter {
       ].join('\n');
     }
 
+    if (strategy.stack === 'go') {
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        'FROM golang:1.23-alpine AS build',
+        'WORKDIR /app',
+        'COPY go.mod go.su[m] ./',
+        'RUN --mount=type=cache,target=/go/pkg/mod go mod download',
+        'COPY . .',
+        'RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /app/server .',
+        '',
+        'FROM alpine:3.21 AS runtime',
+        'WORKDIR /app',
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        'COPY --from=build --chown=culkibo:culkibo /app/server /app/server',
+        'USER culkibo',
+        `ENV PORT=${port}`,
+        `EXPOSE ${port}`,
+        'CMD ["/app/server"]',
+        ''
+      ].join('\n');
+    }
+
     if (strategy.stack === 'python') {
       const entry = /^[A-Za-z0-9._-]+\.py$/.test(String(strategy.pythonEntry || '')) ? strategy.pythonEntry : 'main.py';
       return [
+        '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
         'FROM python:3.12-slim AS runtime',
         'WORKDIR /app',
-        'ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1',
+        'ENV PYTHONUNBUFFERED=1',
         // Las dependencias se copian e instalan antes que el código para que un
         // cambio en un .py no invalide la capa de instalación.
         'COPY requirements.tx[t] pyproject.tom[l] ./',
-        'RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; elif [ -f pyproject.toml ]; then pip install .; fi',
+        'RUN --mount=type=cache,target=/root/.cache/pip if [ -f requirements.txt ]; then pip install -r requirements.txt; elif [ -f pyproject.toml ]; then pip install .; fi',
         'COPY . .',
         'RUN useradd --create-home --shell /usr/sbin/nologin culkibo && chown -R culkibo /app',
         'USER culkibo',
@@ -624,6 +690,7 @@ class DeployManager extends EventEmitter {
     if (strategy.stack === 'static') {
       const root = outputDir === '.' ? '.' : outputDir;
       return [
+        '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
         'FROM nginx:1.27-alpine AS runtime',
         spaConf,
@@ -648,7 +715,7 @@ class DeployManager extends EventEmitter {
     const port = sanitizePort(strategy.containerPort, DEFAULTS.containerPort);
     const p = sanitizeHealthPath(strategy.healthPath) || '/';
     const url = `http://127.0.0.1:${port}${p}`;
-    if (strategy.stack === 'vite' || strategy.stack === 'static') {
+    if (strategy.stack === 'vite' || strategy.stack === 'static' || strategy.stack === 'go') {
       return `wget -q -O /dev/null ${url} || exit 1`; // busybox wget, presente en alpine
     }
     if (strategy.stack === 'python') {
@@ -1357,8 +1424,11 @@ class DeployManager extends EventEmitter {
       const genDir = path.join(contextDir, '.culkibo');
       fs.mkdirSync(genDir, { recursive: true });
       fs.writeFileSync(path.join(genDir, 'Dockerfile'), text, 'utf8');
+      if (!fs.existsSync(path.join(contextDir, '.dockerignore'))) {
+        fs.writeFileSync(path.join(genDir, 'Dockerfile.dockerignore'), this.defaultDockerignore(), 'utf8');
+      }
       dockerfile = path.join('.culkibo', 'Dockerfile');
-      this.log(deployment, 'INFO', `Dockerfile generado en .culkibo/Dockerfile (stack: ${strategy.stack})`);
+      this.log(deployment, 'INFO', `Dockerfile generado en .culkibo/Dockerfile (stack: ${strategy.stack}, BuildKit cache mounts activos)`);
     }
 
     const buildArgNames = Object.keys(project.buildArgs || {}).filter(isValidEnvName);
@@ -1834,7 +1904,8 @@ class DeployManager extends EventEmitter {
       healthPath: target.healthPath || DEFAULTS.healthPath,
       containerName: target.containerName,
       timeoutMs: opts.healthTimeoutMs,
-      intervalMs: opts.healthIntervalMs
+      intervalMs: opts.healthIntervalMs,
+      onProgress: null
     });
     if (!health.healthy) {
       return {

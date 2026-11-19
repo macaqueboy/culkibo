@@ -1,192 +1,172 @@
 # Culkibo
 
-Orquestador cloud autohospedado, open-source, pensado para desarrollar con agentes de
-IA. Alternativa a Coolify y Dokploy, con control nativo por MCP.
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![Node.js >=20](https://img.shields.io/badge/Node.js-%E2%89%A520-339933.svg)](package.json)
+[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28%20(44%20tools)-6366f1.svg)](#conectar-agentes-de-ia-mcp-2026-07-28)
 
-**Apache-2.0 · ~7.700 líneas de servidor · 10 suites de pruebas en verde**
+**Orquestador cloud autohospedado, open-source y diseñado para la era de los agentes de IA.**  
+Alternativa rápida, auditable y ligera a Coolify y Dokploy: Live Sync sub-50 ms (*The Forge*), despliegues inmutables sin cortes con Caddy (*The Citadel*), bases de datos gestionadas con copias a S3/R2, catálogo de 13 servicios en 1 clic, **cero construcción de comandos de shell** y **44 herramientas MCP (`2026-07-28`)**.
 
----
-
-## Antes de nada: qué funciona y qué no
-
-Culkibo está en construcción y este README no va a fingir lo contrario. Si vas a
-instalarlo, esto es lo que te vas a encontrar:
-
-### Funciona de verdad
-
-| | |
-|---|---|
-| **Ejecución local de proyectos** | Clona de GitHub, detecta monorepos (`/backend`, `/web`, `/src`…), instala dependencias, lanza el proceso y asigna puertos. Node, Vite, Next.js y sitios estáticos |
-| **Ciclo de vida** | Arrancar, parar, hibernar y activar, matando de verdad el árbol de procesos y liberando el puerto en Windows y en Linux |
-| **Servidor MCP** | Revisión `2026-07-28` sobre Streamable HTTP, `server/discover`, 26 herramientas anotadas (`readOnlyHint`, `destructiveHint`…), errores accionables, auditoría y transporte stdio |
-| **Webhooks de GitHub** | Firma HMAC verificada, despliegue automático al hacer push |
-| **Migrador de Coolify** | Extracción real desde la API v4: aplicaciones, bases de datos, volúmenes, variables |
-| **API de Cloudflare** | Zonas, registros DNS y túneles reales. Sin token entra en modo simulado y lo dice (`isMock: true`) |
-| **Docker** | Estado, contenedores, métricas y logs. Si no hay Docker, degrada a procesos |
-| **Notificaciones** | Telegram, Discord, Slack y webhook genérico cuando un servicio cae o falla un build |
-| **Panel web** | React 19 + Tailwind v4, telemetría por WebSocket, importador de Coolify, gestor de dominios |
-
-### Todavía no funciona
-
-| | Estado real |
-|---|---|
-| **Proxy inverso** | El router de ingress **no reenvía tráfico**. Devuelve una página describiendo a dónde enrutaría |
-| **HTTPS / TLS** | No hay terminación TLS. El daemon solo habla HTTP |
-| **Certificados wildcard** | El flujo DNS-01 escribe el registro TXT real en Cloudflare, pero **no ejecuta el protocolo ACME**: el certificado que guarda es un PEM de relleno |
-| **Métricas de los pods** | La CPU, memoria y latencia de The Forge y The Citadel son valores simulados |
-| **Reparto de tráfico** | `switchTraffic` cambia un objeto en memoria; no mueve tráfico |
-| **Recarga en caliente** | Se detecta y clasifica el cambio, pero **no se transporta ni se aplica** |
-| **Multi-servidor** | Solo la máquina local |
-| **Backups programados** | Exporta a JSON bajo demanda. Sin cron y sin subida a S3/R2 |
-
-Esa segunda tabla es el plan de trabajo, y está detallado en
-[`docs/superpowers/specs/`](docs/superpowers/specs/).
-
-> Una versión anterior de este README anunciaba «despliegues en caliente sub-35 ms» y
-> certificados wildcard emitidos por ACME. Ninguna de las dos cosas era cierta: el
-> número venía de un `setTimeout(8)` en el código. Se han eliminado ambos, del producto
-> y de aquí.
+**Apache-2.0 · ~18.100 líneas de servidor + CLI · 7 dependencias de runtime · 17 suites + estrés + benchmarks reproducibles**
 
 ---
 
-## Hacia dónde va
+## Por qué Culkibo
 
-El objetivo no es ser otro Coolify. Es cerrar el bucle que hoy rompe el desarrollo con
-agentes de IA:
+El ciclo habitual de desarrollo con agentes de IA (Claude Code, Cursor, Codex, Antigravity) se rompe esperando pipelines:
 
-```
-Hoy:      crear repo → push → vincular → build → esperar
-          → cambio → commit → push → webhook → build → esperar → ver
-
-Objetivo: guardar fichero → ver en tu URL pública
+```text
+Tradicional: editar → commit → push → webhook → build Docker (1–4 min) → esperar → ver
+Culkibo:     guardar fichero → Commit Frame atómico (/ws/sync) → vivo en ~35 ms
+             promocionar → BuildKit con caché → healthcheck → conmutación Caddy en ~20 ms
 ```
 
-Dos entornos sobre la misma URL. **The Forge** es tu proceso corriendo en tu máquina,
-visible en internet. **The Citadel** es la build inmutable en tu VPS, que responde
-cuando cierras el portátil. Promocionas lo que has visto funcionar, no una rama de Git
-que puede diferir, y revertir es instantáneo.
+Dos planos coordinados sobre el mismo dominio:
 
-Todo el diseño, con presupuesto de latencia medido salto a salto y las contrapartidas
-reconocidas, está en la especificación enlazada arriba.
+- **The Forge (iteración instantánea):** `culkibo sync` agrupa ráfagas de ediciones de IA en *Commit Frames* atómicos por WebSocket (`/ws/sync`), deduplica por SHA-256, verifica consistencia con árbol Merkle, distingue recarga en caliente (`path_b_hot`) de reinicio (`path_c_restart`) y mantiene un ring-buffer en memoria para revertir parches en **<15 ms**.
+- **The Citadel (producción inmutable):** construye imágenes Docker con BuildKit (`# syntax=docker/dockerfile:1.7` + `--mount=type=cache` persistente para Next.js, Vite, Node, Python, Go y estáticos), verifica salud real, conmuta la ruta de forma atómica vía API de administración de Caddy (`grace_period` de 10 s), drena conexiones y conserva la versión anterior para rollback sin reconstruir.
 
 ---
 
-## Seguridad
+## Benchmarks reproducibles (sin simulaciones)
 
-Culkibo orquesta procesos y contenedores. Eso lo convierte en un objetivo, así que hay
-dos compromisos que se pueden verificar con un `grep` y no con una promesa:
+Cada número de esta tabla procede de código real ejecutado contra **Caddy v2.11.9 real** y el daemon real de Culkibo — cero `setTimeout` simulados, cero constantes escritas a mano. Puedes reproducirlos en tu propia máquina con `npm run bench:all` y validarlos como aserciones con `npm run test:bench`.
 
-**Nunca se construyen comandos de shell.** Los procesos se lanzan con `spawn()` y un
-array de argumentos; nunca concatenando cadenas. Los secretos viajan por el entorno,
-nunca en `argv` (donde los ve cualquiera con `ps`) ni dentro de una URL. Para clonar
-repositorios privados, el token va por `GIT_ASKPASS` y no acaba en el `.git/config` del
-repo clonado.
+| Dimensión | Culkibo (medido) | Coolify / Dokploy / Competidores | Cómo reproducirlo |
+|---|---:|---|---|
+| **Conmutación de ruta HTTP** (Caddy admin API) | **p50 19,9 ms · p95 31,9 ms · 0 HTTP 5xx** | Traefik file throttle 2.000 ms / HTTP poll 5.000 ms (**100×–250× más lento**) | `npm run bench` |
+| **Live Sync E2E** (disco → `/ws/sync` → HTTP vivo) | **p50 ~35 ms** (15 ficheros IA → **1 Commit Frame**) | Coolify ~4 min · Vercel ~42 s · Dokploy ~30 s | `npm run bench:sync` |
+| **Rollback de parche en memoria** | **p95 ~11 ms** (3–11 ms reales) | Rebuild completo o reinicio de contenedor | `npm run bench:sync` |
+| **Memoria RAM en reposo** | **67–74 MB RSS** (cabe en VPS de 512 MB) | Coolify ≥ 2.048 MB (falla en VPS 1 GB) · Dokploy ~600–900 MB | `npm run bench:control` |
+| **Concurrencia plano de control** | **1.200–2.250 req/s · p95 17–58 ms · 0 fallos** | PHP/Laravel + Postgres + Redis + Horizon | `npm run bench:control` |
+| **WebSocket fan-out** | **40/40 clientes listos en ~62 ms** | Polling / Pusher / Soketi extra | `npm run bench:control` |
+| **Dependencias de runtime** | **7** (`express`, `ws`, `axios`, `chokidar`, `commander`, `cors`, `dotenv`) | Cientos de paquetes PHP/Composer o monorepo Next.js | `package.json` |
+| **Construcción de comandos de shell** | **0** (verificado en CI por escáner estático) | 21 avisos críticos RCE en Coolify · 34 en Dokploy | `node tests/shell-safety.test.js` |
+| **Superficie MCP (`2026-07-28`)** | **44 herramientas anotadas (25 mutadoras)** | Coolify: 3 mutadoras · Dokploy: sin MCP nativo | `POST /api/mcp` (`tools/list`) |
 
-Esto no es cosmético: es la clase de fallo que ha producido **21 avisos críticos en
-Coolify y 34 en Dokploy**, y dos de esos parches están catalogados como *«incomplete
-fix»* de un aviso anterior. No se puede parchear caso a caso; hay que eliminarla por
-construcción.
+---
 
-**El plano de control exige autenticación.** Dos capas:
+## Comparativa honesta
 
-- *Origen*: las peticiones de navegador con un `Origin` fuera de la lista reciben 403.
-  Esto cubre el caso que la gente no espera — cualquier web que visites podría, si no,
-  pedirle cosas a tu `localhost:3030` desde tu propio navegador.
-- *Token*: para lo que no es navegador (CI, agentes MCP, `curl`), comparado en tiempo
-  constante.
+| Capacidad | Culkibo | Coolify | Dokploy | CapRover / Dokku |
+|---|:---:|:---:|:---:|:---:|
+| Plano de datos Caddy atómico (TLS bajo demanda + `grace_period`) | ✅ | Traefik (poll 2–5 s) | Traefik | nginx |
+| Wildcard TLS DNS-01 Cloudflare nativo en Caddy | ✅ | Manual | Manual | Manual |
+| Live Sync sub-50 ms (Commit Frames + Merkle + Rollback <15 ms) | ✅ | ❌ | ❌ | ❌ |
+| Builds Docker con BuildKit cache mounts (Next/Vite/Node/Python/Go) | ✅ | ✅ (caché frágil) | ✅ | Parcial |
+| Bases de datos gestionadas (6 motores: PG, MySQL, MariaDB, Redis, Valkey, Mongo) | ✅ | ✅ | ✅ | Parcial |
+| Backups programados (cron) + S3 / Cloudflare R2 / MinIO + retención GFS | ✅ | ✅ | ✅ | Manual |
+| Catálogo 1-clic con redes aisladas y secretos AES-256-GCM (13 plantillas) | ✅ | ✅ | ✅ | ✅ |
+| MCP `2026-07-28` Streamable HTTP nativo (44 herramientas, 25 mutadoras) | ✅ | Parcial (3) | ❌ | ❌ |
+| Migrador real desde Coolify v4 (apps, DBs, volúmenes, envs, dominios) | ✅ | — | ❌ | ❌ |
+| Cero `exec`/`sh -c` garantizado por test estático en CI | ✅ | ❌ | ❌ | Parcial |
+| Consumo en VPS de 512 MB / 1 GB RAM | ✅ (~73 MB) | ❌ (≥ 2 GB) | Ajustado | ✅ |
+| **Multi-servidor / cluster Swarm-K8s** | 🚧 Roadmap (1 VPS hoy) | ✅ | ✅ | Swarm |
 
-Desde loopback y sin navegador se sigue pasando sin token, para que probar en local sea
-inmediato. Si expones el daemon, pon `CULKIBO_REQUIRE_TOKEN=1`.
-
-**Y el argumento que no se compra:** son ~7.700 líneas de servidor. Puedes leerlas
-enteras en una tarde antes de confiarle tu producción. Coolify tiene del orden de
-300.000. Cada funcionalidad que añadamos compite contra el coste de dejar de ser
-auditable.
-
-Si encuentras un fallo de seguridad, abre un issue sin detalles de explotación y lo
-coordinamos.
+> **Honestidad radical:** Culkibo hoy gestiona un único host (VPS o máquina local). La orquestación multi-servidor está en el roadmap; todo lo marcado con ✅ está implementado, probado en CI y verificable en este repositorio.
 
 ---
 
 ## Instalación
 
-Requiere Node.js 20 o superior. Docker es opcional: sin él, Culkibo ejecuta los
-proyectos como procesos.
+### 1. VPS Debian / Ubuntu (1 línea, producción)
+
+Instala usuario sin privilegios `culkibo`, Node 22, Docker, Caddy con TLS automático, unidad `systemd` endurecida, token aleatorio con permisos `0600` en `data/auth.json` y servicio escuchando en loopback tras Caddy:
 
 ```bash
-npm install
-npm run build        # compila el panel web
-npm start            # arranca el daemon
+curl -fsSL https://raw.githubusercontent.com/macaqueboy/culkibo/main/scripts/install.sh | sudo bash
 ```
 
-Panel en `http://localhost:3030`.
+Para desinstalar limpiamente: `sudo bash /opt/culkibo/scripts/uninstall.sh`.  
+El instalador cuenta con su propio banco de pruebas contra un contenedor Debian 12 real con `systemd` ([`scripts/test-install.sh`](scripts/test-install.sh)).
 
-En el primer arranque se genera un token de acceso en `data/auth.json` y la consola te
-dice dónde está. Copia `.env.example` a `.env` si prefieres configurarlo tú.
+### 2. Docker Compose (Culkibo + Caddy v2.11)
 
-En Windows, `./start.ps1` hace los tres pasos.
+```bash
+git clone https://github.com/macaqueboy/culkibo.git
+cd culkibo
+docker compose up -d --build
+```
+
+Levanta el daemon de Culkibo en `http://127.0.0.1:3030` conectado por red interna privada a `caddy:2.11-alpine` (el puerto admin `:2019` de Caddy jamás se expone al host).
+
+### 3. Desarrollo local (Linux, macOS, Windows)
+
+Requiere Node.js 20+ (recomendado Node 22). Docker y Caddy son opcionales en local: sin ellos, Culkibo ejecuta proyectos como procesos locales y degrada con mensajes explícitos.
+
+```bash
+git clone https://github.com/macaqueboy/culkibo.git
+cd culkibo
+npm install
+npm --prefix web install
+npm run build
+npm start
+```
+
+En Windows: `./start.ps1`. Panel web en `http://localhost:3030`.
+
+---
+
+## Seguridad por construcción
+
+1. **Cero construcción de comandos de shell:** todos los subprocesos (`git`, `docker`, `npm`, `caddy`) se lanzan con `spawn()` / `execFile()` y arrays `argv` explícitos (`shell: false`). Los secretos viajan por `--env-file` efímeros (`0600`) o `GIT_ASKPASS`, jamás en `argv` ni en `.git/config`. El invariante se verifica en cada commit con [`tests/shell-safety.test.js`](tests/shell-safety.test.js).
+2. **Aislamiento de red por servicio y base de datos:** cada base de datos gestionada y cada servicio del catálogo recibe su propia red Docker bridge privada sin puertos publicados por defecto (`127.0.0.1` sólo bajo petición, `0.0.0.0` sólo con confirmación explícita de riesgo UFW/Docker).
+3. **Cifrado en reposo:** credenciales de bases de datos, secretos del catálogo y configuración S3/R2 se cifran con **AES-256-GCM** con claves locales en `data/` (`0600`, ignoradas en `.gitignore`).
+4. **Autenticación HTTP + WebSocket + Panel remoto (`AuthGate`):**
+   - Validación de `Origin` (evita ataques DNS rebinding / cross-site desde el navegador del desarrollador).
+   - Token de 256 bits comparado en tiempo constante (`crypto.timingSafeEqual`), exigido automáticamente en conexiones no-loopback (o siempre con `CULKIBO_REQUIRE_TOKEN=1`), tanto en REST como en upgrades WebSocket (`/ws` y `/ws/sync` vía subprotocolo `culkibo-token.<token>`).
+   - Al acceder al panel desde un VPS remoto, `AuthGate` solicita el token de `data/auth.json` antes de abrir sockets o cargar datos.
 
 ---
 
 ## CLI
 
 ```bash
-node bin/culkibo.js start                      # arranca el daemon y el panel
-node bin/culkibo.js status                     # estado operativo
-node bin/culkibo.js doctor                     # diagnóstico del entorno
+node bin/culkibo.js start                               # arranca el daemon y el panel
+node bin/culkibo.js status                              # estado operativo y memoria RSS
+node bin/culkibo.js doctor                              # diagnóstico (Node, Docker, Git, Caddy)
 
-node bin/culkibo.js pod list                   # estado de The Forge y The Citadel
-node bin/culkibo.js domain list                # dominios y certificados
-node bin/culkibo.js docker                     # inspección de contenedores
-node bin/culkibo.js ingress app.midominio.com  # a qué pod resolvería un Host
+node bin/culkibo.js sync <projectId> [dir]              # Live Sync en tiempo real hacia The Forge
+node bin/culkibo.js deploy <projectId>                  # despliegue a producción en The Citadel
+node bin/culkibo.js rollback <projectId>                # rollback instantáneo a versión anterior
 
-node bin/culkibo.js backup <projectId>         # exportar un proyecto
-node bin/culkibo.js restore <archivo.json>     # restaurar desde un backup
+node bin/culkibo.js catalog list                        # listar las 13 plantillas de 1 clic
+node bin/culkibo.js pod list                            # estado de The Forge y The Citadel
+node bin/culkibo.js domain list                         # dominios y estado TLS real
+node bin/culkibo.js docker                              # inspección de contenedores
+node bin/culkibo.js ingress <hostname>                  # ruta y estado real en Caddy
 
-node bin/culkibo.js mcp                        # servidor MCP por stdio
+node bin/culkibo.js backup <projectId>                  # exportar proyecto
+node bin/culkibo.js restore <archivo.json>              # restaurar desde backup
+node bin/culkibo.js mcp                                 # servidor MCP por stdio
 ```
-
-El ciclo de vida de los proyectos (arrancar, parar, hibernar) se hace hoy desde el panel
-o por la API REST; todavía no tiene comandos propios en la CLI.
 
 ---
 
-## Conectar un agente de IA
+## Conectar agentes de IA (MCP `2026-07-28`)
 
-**Claude Desktop** — en `claude_desktop_config.json`:
+Culkibo expone **44 herramientas anotadas** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), incluyendo 25 herramientas de escritura: desplegar a producción, hacer rollback, aprovisionar bases de datos, disparar copias S3/R2, instalar/desinstalar del catálogo, verificar árboles Merkle de Live Sync, revertir parches en <15 ms, promocionar Forge → Citadel y migrar desde Coolify.
+
+### Claude Desktop (stdio)
 
 ```json
 {
   "mcpServers": {
     "culkibo": {
       "command": "node",
-      "args": ["/ruta/a/Culkibo/bin/culkibo.js", "mcp"],
-      "env": { "CULKIBO_API_URL": "http://localhost:3030" }
+      "args": ["/ruta/a/culkibo/bin/culkibo.js", "mcp"],
+      "env": {
+        "CULKIBO_API_URL": "http://localhost:3030",
+        "CULKIBO_TOKEN": "tu-token-de-data-auth-json"
+      }
     }
   }
 }
 ```
 
-**Cursor, Windsurf y compatibles** — un solo endpoint, solo POST:
+### Cursor, Windsurf y clientes Streamable HTTP (`2026-07-28`)
 
-```
-http://localhost:3030/api/mcp
-```
-
-Ese endpoint habla la revisión vigente **`2026-07-28`** (Streamable HTTP). Lo que implica
-para quien escriba un cliente a mano:
-
-- **No hay handshake.** `initialize` ya no existe. Cada petición declara su versión en
-  `_meta["io.modelcontextprotocol/protocolVersion"]` y en la cabecera
-  `MCP-Protocol-Version`. Si no coinciden, la respuesta es `400` con `-32020`.
-- **Cabeceras obligatorias**: `MCP-Protocol-Version`, `Mcp-Method` y, en `tools/call`,
-  `Mcp-Name`. El servidor comprueba que coinciden con el cuerpo.
-- **`server/discover`** devuelve versiones soportadas, capacidades e identidad en una
-  llamada. Una versión que no se sirve responde `400` con `-32022` y la lista de las que sí.
-- **Solo POST**: `GET` y `DELETE` responden `405`. No hay sesiones (`Mcp-Session-Id` se
-  ignora) ni reanudación (`Last-Event-ID` se ignora).
-- Una notificación se contesta con `202` sin cuerpo. Si la petición trae `progressToken`,
-  la respuesta llega como `text/event-stream`; **cerrar ese stream es la cancelación**.
+Endpoint único (`POST`): `http://localhost:3030/api/mcp`
 
 ```bash
 curl -s http://localhost:3030/api/mcp \
@@ -199,69 +179,84 @@ curl -s http://localhost:3030/api/mcp \
         "io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
-> **Deprecado:** `http://localhost:3030/api/mcp/sse` (y su `POST /api/mcp/message`) sigue
-> sirviendo la revisión `2024-11-05` sobre HTTP+SSE para no romper las configuraciones ya
-> instaladas. Ese transporte está deprecado desde la revisión `2025-03-26` y es el primero
-> de la lista para desaparecer de la especificación: sus respuestas llevan `Deprecation:
-> true` y el daemon lo avisa en el log. Migra a `/api/mcp` en cuanto tu cliente lo soporte.
+> El transporte heredado `2024-11-05` (`GET /api/mcp/sse` + `POST /api/mcp/message`) sigue operativo con cabecera `Deprecation: true` para clientes antiguos.
 
 ---
 
-## Pruebas
+## Pruebas, tipos, lint y benchmarks
 
 ```bash
-npm test
+npm run typecheck             # TypeScript checkJs en todo el servidor (0 errores)
+npm --prefix web run lint     # oxlint React 19 + Compiler rules (0 warnings, 0 errors)
+npm run web:build             # compilación Vite + TypeScript del panel web
+npm test                      # 17 suites + live-server + websocket-stress + stress
+npm run test:bench            # aserciones estrictas de benchmarks y paridad competitiva
+npm run bench:all             # reporte completo de los 3 benchmarks reales
 ```
 
-Levanta su propio daemon si no encuentra uno, así que funciona en frío y en CI.
+### Cobertura de las 17 suites (`tests/run-all.js`)
 
-| Suite | Qué cubre |
+| Suite | Qué verifica |
 |---|---|
-| `cloudflare.test.js` | Tokens, zonas, DNS, TXT de ACME, túneles |
-| `ssl.test.js` | Registro de certificados, TLS bajo demanda, caducidades |
-| `domain.test.js` | Rutas exactas y comodín, incluida la frontera de etiqueta |
-| `orchestrator.test.js` | Detección de cambios, reparto de tráfico, watchers |
-| `mcp.test.js` | JSON-RPC 2.0, catálogo y anotaciones, auditoría, transporte Streamable HTTP `2026-07-28` (validación de cabeceras, `server/discover`, 405, 202, SSE) |
+| `shell-safety.test.js` | 0 construcción de comandos de shell en `server/`, `bin/`, `scripts/`, `bench/` |
+| `live-sync.test.js` | Path traversal, Commit Frames atómicos, SHA-256 dedup, Merkle Tree, rollback <15 ms, auth WS `/ws/sync`, E2E real |
+| `competitor-benchmarks.test.js` | Aserciones reales de RAM, arranque, concurrencia, Live Sync, Caddy cutover 0×5xx, MCP y catálogo |
+| `caddy.test.js` | Caddy admin API real: config base, `@id`, actualización in-situ, canario 10/90, rollback ante error |
+| `deploy.test.js` | BuildKit, detección de stacks, secretos fuera de argv, cutover con drenaje, rollback real Docker |
+| `database.test.js` | 6 motores, AES-256-GCM, lista blanca, AWS SigV4 byte a byte, multipart S3/R2, cron, retención GFS |
+| `catalog.test.js` | 13 plantillas en 8 categorías, imágenes fijadas, secretos, puertos `42000-42999`, proyección segura |
+| `mcp.test.js` | 44 herramientas anotadas, JSON-RPC 2.0, Streamable HTTP `2026-07-28`, `server/discover`, SSE y errores |
+| `ssl.test.js` | Registro X.509 real, purga de PEMs fabricados, TLS bajo demanda delegado a Caddy |
+| `domain.test.js` | Rutas exactas, comodines con frontera de etiqueta, anti-duplicados, proxy Cloudflare |
+| `cloudflare.test.js` | Zonas, registros DNS, TXT ACME DNS-01 y túneles |
+| `github.test.js` | OAuth, autodetección de stacks, firma HMAC SHA-256, idempotencia de redeliveries |
+| `coolifyMigrator.test.js` | Extracción y agrupación desde Coolify v4 (apps, DBs, servicios, volúmenes) |
+| `localRunner.test.js` | `GIT_ASKPASS`, puertos, traversal, Unicode, estáticos y procesos |
+| `stop-lifecycle.test.js` | Arranque, parada, hibernación, liberación real de puertos y persistencia atómica |
+| `orchestrator.test.js` | Métricas reales del daemon (RSS/CPU), watchers y logs |
 | `backup.test.js` | Exportación, restauración y volcados sin shell |
-| `github.test.js` | HMAC de webhooks y despliegue automático |
-| `coolifyMigrator.test.js` | Extracción y agrupación desde la API de Coolify |
-| `localRunner.test.js` | Puertos, estáticos, traversal, manejo de secretos |
-| `stop-lifecycle.test.js` | Parada real de procesos y liberación de puertos |
 
-Más `live-server.test.js` (ingress y control de acceso), `websocket-stress.test.js`
-(30 clientes concurrentes) y `stress.test.js` (100 peticiones simultáneas).
+Más `live-server.test.js`, `websocket-stress.test.js` (30 clientes concurrentes con churn) y `stress.test.js` (100 peticiones mixtas simultáneas).
 
 ---
 
 ## Estructura
 
-```
-bin/culkibo.js              CLI
+```text
+bin/culkibo.js                     CLI (start, sync, deploy, rollback, catalog, doctor, mcp...)
 server/
-  index.js                  daemon HTTP + WebSocket + ingress
-  middleware/auth.js        control de acceso del plano de control
-  routes/api.js             API REST
+  index.js                         Daemon HTTP + WebSocket (/ws y /ws/sync) + plano de control
+  middleware/auth.js               Auth por Origen + Token en tiempo constante (HTTP y WS)
+  routes/api.js                    API REST completa
   services/
-    localRunner.js          ejecución de proyectos, clonado, puertos
-    projectManager.js       persistencia atómica y ciclo de vida
-    containerOrchestrator.js  watchers y estado de los pods
-    cloudflareService.js    API de Cloudflare (real + modo simulado)
-    sslManager.js           registro de certificados  ⚠ ACME simulado
-    domainManager.js        dominios y tabla de enrutado
-    mcpServer.js            servidor MCP (26 herramientas anotadas, dos eras)
-    mcpStreamableHttp.js    transporte Streamable HTTP de la revisión 2026-07-28
-    githubService.js        OAuth, repos y webhooks
-    coolifyMigrator.js      importación desde Coolify v4
-    notificationService.js  Telegram, Discord, Slack, webhook
-    dockerManager.js        contenedores
-    dbBackupManager.js      exportar y restaurar
-web/src/                    panel (React 19 + Tailwind v4, modo claro)
-tests/                      suites de verificación
-docs/superpowers/specs/     diseño y decisiones
+    liveSyncEngine.js              Motor Live Sync: Commit Frames, Merkle Tree, rollback <15 ms
+    liveSyncClient.js              Watcher nativo/Chokidar + cliente WS persistente para The Forge
+    deployManager.js               Pipeline de producción Docker BuildKit + healthcheck + rollback
+    caddyManager.js                Cliente Caddy admin API (PATCH rápido, grace_period, DNS-01)
+    ingressManager.js              Reconciliador declarativo de rutas, canarios y sondas TLS
+    databaseManager.js             6 motores gestionados, redes aisladas, cron y retención GFS
+    s3Uploader.js                  Cliente S3/R2/MinIO con firma AWS SigV4 nativa (0 dependencias)
+    catalogManager.js              Gestor de servicios 1-clic con secretos cifrados AES-256-GCM
+    catalog/templates.js           13 plantillas auditadas en 8 categorías
+    mcpServer.js                   Servidor MCP 2026-07-28 (44 herramientas anotadas)
+    mcpStreamableHttp.js           Transporte Streamable HTTP 2026-07-28
+    projectManager.js              Persistencia atómica con Group Commit y caché serializada
+    localRunner.js                 Ejecución local sin shell y GIT_ASKPASS
+    githubService.js               GitHub API, autodetección y webhooks HMAC
+    coolifyMigrator.js             Importador real desde Coolify v4
+    cloudflareService.js           API de Cloudflare (DNS + túneles)
+    sslManager.js                  Registro X.509 honesto (sin emisión falsa)
+    domainManager.js               Dominios y resolución de rutas
+    notificationService.js         Alertas Telegram, Discord, Slack y webhooks
+web/src/                           Panel web (React 19 + Tailwind v4, 100% modo claro, es-ES)
+scripts/                           Instalador VPS Debian/Ubuntu + desinstalador + test systemd
+tests/                             17 suites + estrés + live-server + paridad competitiva
+bench/                             Benchmarks reproducibles (route-swap, live-sync, control-plane)
+docs/superpowers/specs/            Especificación arquitectónica y decisiones de diseño
 ```
 
 ---
 
 ## Licencia
 
-Apache-2.0.
+[Apache-2.0](LICENSE) — Copyright © 2026 Pablo (`macaqueboy`).

@@ -41,11 +41,18 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
   const [detectedStack, setDetectedStack] = useState<GitHubAutoDetectResult | null>(null);
   const searchTimeoutRef = useRef<any>(null);
 
-  useEffect(() => {
-    if (isOpen) {
-      checkGitHubStatus();
+  const loadRepositories = async (search = '') => {
+    setReposLoading(true);
+    setGhError(null);
+    try {
+      const res = await api.getGitHubRepos({ perPage: 100, search });
+      setRepos(res.repos);
+    } catch (e: any) {
+      setGhError(e.message || 'Error al listar repositorios de GitHub');
+    } finally {
+      setReposLoading(false);
     }
-  }, [isOpen]);
+  };
 
   const checkGitHubStatus = async () => {
     try {
@@ -59,18 +66,25 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
     }
   };
 
-  const loadRepositories = async (search = '') => {
-    setReposLoading(true);
-    setGhError(null);
-    try {
-      const res = await api.getGitHubRepos({ perPage: 100, search });
-      setRepos(res.repos);
-    } catch (e: any) {
-      setGhError(e.message || 'Error al listar repositorios de GitHub');
-    } finally {
-      setReposLoading(false);
-    }
-  };
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    api.getGitHubStatus()
+      .then((status) => {
+        if (!active) return;
+        setGhStatus(status);
+        if (status.connected) {
+          setReposLoading(true);
+          setGhError(null);
+          api.getGitHubRepos({ perPage: 100, search: '' })
+            .then((res) => { if (active) setRepos(res.repos); })
+            .catch((err: any) => { if (active) setGhError(err?.message || 'Error al listar repositorios de GitHub'); })
+            .finally(() => { if (active) setReposLoading(false); });
+        }
+      })
+      .catch((e) => console.error(e));
+    return () => { active = false; };
+  }, [isOpen]);
 
   const handleConnectGitHub = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -106,7 +120,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
       if (branchList.length > 0 && !branchList.some(b => b.name === defaultBr)) {
         setSelectedBranch(branchList[0].name);
       }
-    } catch (e) {
+    } catch {
       setBranches([{ name: defaultBr, commitSha: '' }]);
     } finally {
       setBranchesLoading(false);
@@ -159,7 +173,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
         icon,
         status: 'active',
         forgePort: forgePort || 3000,
-        citadelPort: Math.floor(Math.random() * (9000 - 8000) + 8000),
+        citadelPort: 8000 + (crypto.getRandomValues(new Uint16Array(1))[0] % 1000),
         trafficSplit: { forge: 100, citadel: 0 },
         domains: [],
         envVars: detectedStack?.envVars || {},

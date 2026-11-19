@@ -414,10 +414,15 @@ const CRON_FIELDS = [
 class DatabaseManager extends EventEmitter {
   constructor() {
     super();
+    /** @type {{ version: number, databases: any[], s3: any }} */
     this.state = { version: 1, databases: [], s3: null };
+    /** @type {Buffer | null} */
     this.key = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
     this.schedulerTimer = null;
+    /** @type {Set<string>} */
     this.runningBackups = new Set();
+    /** @type {any} */
     this.dockerChecked = null;
     this.ensureDirs();
     this.load();
@@ -493,7 +498,11 @@ class DatabaseManager extends EventEmitter {
   // Docker (siempre argv, nunca cadena de shell)
   // -------------------------------------------------------------------------
 
-  async docker(args, { env, timeout = 60000, input = null, inputFile = null } = {}) {
+  /**
+   * @param {string[]} args
+   * @param {{ env?: Record<string, string> | null, timeout?: number, input?: any, inputFile?: string | null }} [opts]
+   */
+  async docker(args, { env = null, timeout = 60000, input = null, inputFile = null } = {}) {
     if (!Array.isArray(args)) throw new Error('Los argumentos de docker deben ser un array');
 
     if (!input && !inputFile) {
@@ -593,15 +602,16 @@ class DatabaseManager extends EventEmitter {
   /**
    * Crea una base de datos gestionada.
    *
-   * @param {Object} opts
-   * @param {string} opts.projectId
-   * @param {string} opts.engine     postgres | mysql | mariadb | redis | valkey | mongodb
-   * @param {string} [opts.name]     nombre visible
-   * @param {string} [opts.dbName]   nombre de la base (validado como identificador)
-   * @param {string} [opts.username] usuario (validado como identificador)
-   * @param {string} [opts.image]    sobreescritura de imagen, con la misma validación
-   * @param {number} [opts.memoryMb] límite de memoria, por defecto 512
-   * @param {number} [opts.cpus]     límite de CPU, por defecto 1
+   * @param {{
+   *   projectId?: string,
+   *   engine?: string,
+   *   name?: string,
+   *   dbName?: string,
+   *   username?: string,
+   *   image?: string,
+   *   memoryMb?: number | string,
+   *   cpus?: number | string
+   * }} [opts]
    */
   async provision(opts = {}) {
     const engineKey = String(opts.engine || '').toLowerCase();
@@ -623,7 +633,7 @@ class DatabaseManager extends EventEmitter {
 
     const id = `db_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
     const password = generatePassword();
-    const memoryMb = Math.max(128, Math.min(65536, parseInt(opts.memoryMb, 10) || 512));
+    const memoryMb = Math.max(128, Math.min(65536, parseInt(String(opts.memoryMb ?? ''), 10) || 512));
     const cpus = Math.max(0.1, Math.min(32, Number(opts.cpus) || 1));
 
     const record = {
@@ -755,7 +765,8 @@ class DatabaseManager extends EventEmitter {
    * Docker no permite cambiar el mapeo de puertos de un contenedor existente,
    * así que se recrea conservando el volumen (los datos no se tocan).
    */
-  async setExposure(id, { enabled, hostPort, bindAddress, acknowledgeRisk } = {}) {
+  /** @param {string} id @param {{ enabled?: boolean, hostPort?: number | null, bindAddress?: string, acknowledgeRisk?: boolean }} [opts] */
+  async setExposure(id, { enabled = false, hostPort = null, bindAddress = '127.0.0.1', acknowledgeRisk = false } = {}) {
     const record = this.mustGet(id);
     const engine = ENGINES[record.engine];
 
@@ -770,7 +781,7 @@ class DatabaseManager extends EventEmitter {
     if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(bind)) {
       throw new Error('Dirección de enlace inválida: use una IPv4 (127.0.0.1 para sólo local)');
     }
-    const port = parseInt(hostPort, 10) || engine.port;
+    const port = parseInt(String(hostPort ?? ''), 10) || engine.port;
     if (!(port > 0 && port < 65536)) throw new Error('Puerto de host inválido');
 
     const publicBind = bind === '0.0.0.0';
@@ -992,7 +1003,8 @@ class DatabaseManager extends EventEmitter {
     };
   }
 
-  list({ projectId } = {}) {
+  /** @param {{ projectId?: string | null }} [opts] */
+  list({ projectId = null } = {}) {
     return this.state.databases
       .filter((d) => !projectId || d.projectId === projectId)
       .map((d) => this.toPublic(d));
@@ -1112,6 +1124,7 @@ class DatabaseManager extends EventEmitter {
     const baseName = `${record.engine}_${record.id}_${stamp}${engine.dumpExt}`;
     const containerPath = `/tmp/${baseName}`;
     const localPath = path.join(this.backupDir(id), baseName);
+    /** @type {string | null} */
     let configInContainer = null;
 
     try {
@@ -1174,6 +1187,7 @@ class DatabaseManager extends EventEmitter {
       }
 
       const stat = fs.statSync(finalPath);
+      /** @type {any} */
       const entry = {
         id: `bk_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`,
         fileName: path.basename(finalPath),
@@ -1185,7 +1199,7 @@ class DatabaseManager extends EventEmitter {
         remote: null
       };
 
-      const s3 = this.s3ClientFor(record);
+      const s3 = this.s3ClientFor();
       if (s3) {
         const key = `${this.s3Prefix()}${record.projectId}/${record.id}/${entry.fileName}`;
         const uploaded = await s3.uploadFile(key, finalPath, { contentType: 'application/gzip' });
@@ -1270,12 +1284,14 @@ class DatabaseManager extends EventEmitter {
    * `remoteKey` permite restaurar algo que no está en el historial (por
    * ejemplo, tras reinstalar el orquestador).
    */
-  async restore(id, { backupId, remoteKey } = {}) {
+  /** @param {string} id @param {{ backupId?: string | null, remoteKey?: string | null }} [opts] */
+  async restore(id, { backupId = null, remoteKey = null } = {}) {
     const record = this.mustGet(id);
     const engine = ENGINES[record.engine];
     if (!(await this.isDockerAvailable())) throw new Error('Docker no está disponible');
 
     const dir = this.backupDir(id);
+    /** @type {string | null} */
     let archivePath = null;
     let downloaded = false;
 
@@ -1290,7 +1306,7 @@ class DatabaseManager extends EventEmitter {
           throw new Error('La copia local no coincide con su sha256: fichero corrupto, no se restaura');
         }
       } else if (entry.remote && entry.remote.key) {
-        const s3 = this.s3ClientFor(record);
+        const s3 = this.s3ClientFor();
         if (!s3) throw new Error('La copia sólo existe en remoto y no hay S3 configurado');
         archivePath = path.join(dir, entry.fileName);
         await s3.downloadFile(entry.remote.key, archivePath);
@@ -1299,7 +1315,7 @@ class DatabaseManager extends EventEmitter {
         throw new Error('La copia no está ni en disco ni en el bucket');
       }
     } else if (remoteKey) {
-      const s3 = this.s3ClientFor(record);
+      const s3 = this.s3ClientFor();
       if (!s3) throw new Error('No hay almacenamiento S3 configurado');
       archivePath = path.join(dir, `remote_${path.basename(String(remoteKey))}`);
       await s3.downloadFile(String(remoteKey), archivePath);
@@ -1309,6 +1325,7 @@ class DatabaseManager extends EventEmitter {
     }
 
     // Descomprimir a un fichero plano que la herramienta sepa leer.
+    /** @type {string} */
     let plainPath = archivePath;
     let madeTemp = false;
     if (archivePath.endsWith('.gz') && !archivePath.endsWith('.archive.gz')) {
@@ -1411,17 +1428,17 @@ class DatabaseManager extends EventEmitter {
    * política mal configurada no puede dejar a nadie sin ninguna copia.
    *
    * @param {Array<{id:string, createdAt:string}>} backups
-   * @param {{daily:number, weekly:number}} policy
+   * @param {{daily?:number | string, weekly?:number | string}} [policy]
    * @returns {{keep:string[], prune:string[], reasons:Object}}
    */
   planRetention(backups, policy = {}) {
-    const daily = Math.max(0, parseInt(policy.daily, 10) || 0);
-    const weekly = Math.max(0, parseInt(policy.weekly, 10) || 0);
+    const daily = Math.max(0, parseInt(String(policy.daily ?? 0), 10) || 0);
+    const weekly = Math.max(0, parseInt(String(policy.weekly ?? 0), 10) || 0);
 
     const sorted = (backups || [])
       .filter((b) => b && b.id && b.createdAt)
       .slice()
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
     const keep = new Set();
     const reasons = {};
@@ -1442,7 +1459,7 @@ class DatabaseManager extends EventEmitter {
       x.setHours(0, 0, 0, 0);
       x.setDate(x.getDate() + 3 - ((x.getDay() + 6) % 7));
       const jan4 = new Date(x.getFullYear(), 0, 4);
-      const week = 1 + Math.round(((x - jan4) / 86400000 - 3 + ((jan4.getDay() + 6) % 7)) / 7);
+      const week = 1 + Math.round(((x.getTime() - jan4.getTime()) / 86400000 - 3 + ((jan4.getDay() + 6) % 7)) / 7);
       return `${x.getFullYear()}-W${String(week).padStart(2, '0')}`;
     };
 
@@ -1478,7 +1495,7 @@ class DatabaseManager extends EventEmitter {
     if (!plan.prune.length) return { pruned: 0, kept: plan.keep.length };
 
     const dir = this.backupDir(id);
-    const s3 = this.s3ClientFor(record);
+    const s3 = this.s3ClientFor();
     let pruned = 0;
 
     for (const backupId of plan.prune) {
@@ -1498,11 +1515,12 @@ class DatabaseManager extends EventEmitter {
     return { pruned, kept: record.backups.length };
   }
 
-  setRetention(id, { daily, weekly } = {}) {
+  /** @param {string} id @param {{ daily?: number | string, weekly?: number | string }} [opts] */
+  setRetention(id, { daily = 0, weekly = 0 } = {}) {
     const record = this.mustGet(id);
     record.retention = {
-      daily: Math.max(0, Math.min(365, parseInt(daily, 10) || 0)),
-      weekly: Math.max(0, Math.min(260, parseInt(weekly, 10) || 0))
+      daily: Math.max(0, Math.min(365, parseInt(String(daily), 10) || 0)),
+      weekly: Math.max(0, Math.min(260, parseInt(String(weekly), 10) || 0))
     };
     if (record.retention.daily === 0 && record.retention.weekly === 0) {
       throw new Error('La retención no puede ser 0 diarias y 0 semanales');
@@ -1612,7 +1630,8 @@ class DatabaseManager extends EventEmitter {
     return null;
   }
 
-  setSchedule(id, { enabled, cron } = {}) {
+  /** @param {string} id @param {{ enabled?: boolean, cron?: string }} [opts] */
+  setSchedule(id, { enabled = false, cron = '' } = {}) {
     const record = this.mustGet(id);
     const expr = cron || record.schedule.cron || '0 3 * * *';
     this.parseCron(expr); // valida o lanza antes de guardar nada
@@ -1798,10 +1817,11 @@ class DatabaseManager extends EventEmitter {
   }
 }
 
-const instance = new DatabaseManager();
+const instance = Object.assign(new DatabaseManager(), {
+  ENGINES,
+  generatePassword,
+  encryptSecret,
+  decryptSecret
+});
 
 module.exports = instance;
-module.exports.ENGINES = ENGINES;
-module.exports.generatePassword = generatePassword;
-module.exports.encryptSecret = encryptSecret;
-module.exports.decryptSecret = decryptSecret;

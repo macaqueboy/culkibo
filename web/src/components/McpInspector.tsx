@@ -29,7 +29,16 @@ export const McpInspector: React.FC = () => {
   };
 
   useEffect(() => {
-    loadMcpData();
+    let active = true;
+    Promise.all([api.getMcpTools(), api.getMcpAudit(), api.getMcpConfig()])
+      .then(([toolsRes, auditRes, cfgRes]) => {
+        if (!active) return;
+        setTools(toolsRes.tools || []);
+        setAuditLog(auditRes.auditLog || []);
+        setMcpConfig(cfgRes);
+      })
+      .catch((e) => console.error(e));
+    return () => { active = false; };
   }, []);
 
   const handleSelectTool = (toolName: string) => {
@@ -97,7 +106,7 @@ export const McpInspector: React.FC = () => {
         <div className="flex items-center gap-2">
           <span className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-emerald-500" />
-            9 Herramientas Listas
+            {tools.length} herramientas listas
           </span>
           <button
             onClick={loadMcpData}

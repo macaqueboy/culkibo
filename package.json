@@ -14,9 +14,13 @@
     "build": "npm --prefix web run build",
     "test": "node tests/run-all.js && node tests/live-server.test.js && node tests/websocket-stress.test.js && node tests/stress.test.js",
     "test:stress": "node tests/stress.test.js",
+    "test:bench": "node tests/competitor-benchmarks.test.js",
     "cli": "node bin/culkibo.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "bench": "node bench/route-swap.bench.js"
+    "bench": "node bench/route-swap.bench.js",
+    "bench:sync": "node bench/live-sync.bench.js",
+    "bench:control": "node bench/control-plane.bench.js",
+    "bench:all": "node bench/run-all.bench.js"
   },
   "keywords": [
     "culkibo",

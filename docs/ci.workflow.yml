@@ -1,0 +1,81 @@
+name: Culkibo CI & Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-benchmark:
+    name: Verificación completa (Node 22 + Caddy + Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Instalar dependencias (servidor y panel web)
+        run: |
+          npm ci
+          npm --prefix web ci
+
+      - name: Instalar y arrancar Caddy v2.11.9 real (plano de datos)
+        run: |
+          curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.11.9/caddy_2.11.9_linux_amd64.tar.gz" -o /tmp/caddy.tar.gz
+          tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
+          sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
+          caddy version
+          nohup caddy run > /tmp/caddy.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:2019/config/ >/dev/null 2>&1; then
+              echo "Caddy admin API disponible en 127.0.0.1:2019"
+              exit 0
+            fi
+            sleep 0.25
+          done
+          cat /tmp/caddy.log
+          exit 1
+
+      - name: Seguridad estática (0 construcción de comandos de shell)
+        run: node tests/shell-safety.test.js
+
+      - name: Verificación de tipos del servidor (TypeScript checkJs)
+        run: npm run typecheck
+
+      - name: Lint y compilación del panel web (React 19 + Vite)
+        run: |
+          npm --prefix web run lint
+          npm run web:build
+
+      - name: Validación de sintaxis de scripts de instalación VPS
+        run: bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install.sh
+
+      - name: Suite completa de pruebas (17 módulos + estrés + benchmarks)
+        env:
+          DOCKER_BUILDKIT: '1'
+        run: npm test
+
+      - name: Benchmarks reproducibles contra Caddy real y plano de control
+        run: |
+          echo "## Resultados de benchmarks (ubuntu-latest · Caddy v2.11.9)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          npm run bench:all | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verificar construcción de imagen Docker de producción
+        env:
+          DOCKER_BUILDKIT: '1'
+        run: docker build -t culkibo:ci .

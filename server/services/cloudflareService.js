@@ -182,6 +182,7 @@ class CloudflareService {
           'Content-Type': 'application/json'
         }
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return {
@@ -220,6 +221,7 @@ class CloudflareService {
           'Content-Type': 'application/json'
         }
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return { success: true, zones: data.result, count: data.result.length, isMock: false };
@@ -243,6 +245,7 @@ class CloudflareService {
           'Content-Type': 'application/json'
         }
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return { success: true, records: data.result, count: data.result.length, isMock: false };
@@ -266,6 +269,7 @@ class CloudflareService {
         ttl: parseInt(ttl, 10),
         proxied: Boolean(proxied),
         proxiable: ['A', 'AAAA', 'CNAME'].includes(type.toUpperCase()),
+        locked: false,
         comment,
         created_on: new Date().toISOString()
       };
@@ -289,6 +293,7 @@ class CloudflareService {
           comment
         })
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return { success: true, record: data.result, isMock: false };
@@ -318,6 +323,7 @@ class CloudflareService {
         },
         body: JSON.stringify(updates)
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return { success: true, record: data.result, isMock: false };
@@ -342,6 +348,7 @@ class CloudflareService {
           'Content-Type': 'application/json'
         }
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return { success: true, recordId: data.result.id, isMock: false };
@@ -384,6 +391,7 @@ class CloudflareService {
           'Content-Type': 'application/json'
         }
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return { success: true, tunnels: data.result, isMock: false };
@@ -426,6 +434,7 @@ class CloudflareService {
           config_src: 'cloudflare'
         })
       });
+      /** @type {any} */
       const data = await res.json();
       if (data.success) {
         return { success: true, tunnel: data.result, isMock: false };

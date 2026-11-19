@@ -76,18 +76,14 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
   const [sslipIp, setSslipIp] = useState('127.0.0.1');
   const [issuingSslip, setIssuingSslip] = useState(false);
 
-  // Progreso SSL por WebSocket.
-  //
-  // Aquí había una barra de progreso de seis etapas ACME alimentada por este
-  // evento. Las etapas eran `setTimeout` en el servidor y el certificado que
-  // aparecía al final era inventado. Hoy el único `ssl_progress` que emite el
-  // daemon es el aviso de «comodín no implementado», así que se muestra tal
-  // cual, como lo que es: un error.
-  useEffect(() => {
+  // Progreso SSL por WebSocket (ajuste derivado al cambiar la prop sin cascada de efecto).
+  const [prevSslProgressMsg, setPrevSslProgressMsg] = useState<string | undefined>(undefined);
+  if (liveSslProgress?.message !== prevSslProgressMsg) {
+    setPrevSslProgressMsg(liveSslProgress?.message);
     if (liveSslProgress?.message) {
       setErrorBanner(liveSslProgress.message);
     }
-  }, [liveSslProgress]);
+  }
 
   const loadData = async () => {
     try {
@@ -110,7 +106,23 @@ export const DomainManager: React.FC<DomainManagerProps> = ({ onNotify, liveSslP
   };
 
   useEffect(() => {
-    loadData();
+    let active = true;
+    Promise.all([
+      api.getDomains(),
+      api.getCertificates(),
+      api.getIngressStatus().catch(() => null)
+    ])
+      .then(([domRes, certRes, ingRes]) => {
+        if (!active) return;
+        setDomains(domRes.domains || []);
+        setCerts(certRes.certificates || []);
+        setIngress(ingRes);
+      })
+      .catch((e) => console.error(e))
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
   }, []);
 
   /** Handshake TLS real de este dominio, si ya se ha sondeado. */

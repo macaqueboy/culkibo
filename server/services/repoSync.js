@@ -203,7 +203,7 @@ class RepoSync {
 
         emit(`Clonando ${display} (rama ${branch}, clon superficial de 1 commit)...`);
         try {
-          await localRunner.gitClone(cloneUrl, dir, { timeout: timeoutMs, depth: 1, branch, onLine: emit });
+          await localRunner.gitClone(String(cloneUrl), dir, { timeout: timeoutMs, depth: 1, branch, onLine: emit });
         } catch (err) {
           return { ok: false, error: localRunner.redactSecrets(err.message), dir, dirtyFiles: [] };
         }
@@ -232,10 +232,10 @@ class RepoSync {
       // por qué.
       const currentRemote = await runGit(['remote', 'get-url', 'origin'], { cwd: dir, env, timeoutMs: 20000 });
       if (currentRemote.code !== 0) {
-        await runGit(['remote', 'add', 'origin', '--', cloneUrl], { cwd: dir, env, timeoutMs: 20000 });
+        await runGit(['remote', 'add', 'origin', '--', String(cloneUrl)], { cwd: dir, env, timeoutMs: 20000 });
       } else if ((currentRemote.stdout || '').trim() !== cloneUrl) {
         emit('El repositorio remoto configurado ha cambiado; se actualiza «origin».');
-        const setUrl = await runGit(['remote', 'set-url', 'origin', '--', cloneUrl], { cwd: dir, env, timeoutMs: 20000 });
+        const setUrl = await runGit(['remote', 'set-url', 'origin', '--', String(cloneUrl)], { cwd: dir, env, timeoutMs: 20000 });
         if (setUrl.code !== 0) {
           return { ok: false, error: this.errorOf(setUrl, 'No se pudo actualizar la URL del repositorio'), dir, dirtyFiles: [] };
         }

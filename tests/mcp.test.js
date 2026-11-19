@@ -137,7 +137,7 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 26, 'El catálogo debe seguir teniendo 26 herramientas');
+  assert.strictEqual(tools.length, 44, 'El catálogo debe tener 44 herramientas anotadas con paridad completa de escritura');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -358,7 +358,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 26);
+    assert.strictEqual(list.result.tools.length, 44);
     console.log(`  ✓ tools/list sobre Streamable HTTP (${list.result.tools.length} herramientas)`);
 
     // 8. tools/call con salida estructurada.

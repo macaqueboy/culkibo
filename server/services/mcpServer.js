@@ -9,6 +9,11 @@ const dbBackupManager = require('./dbBackupManager');
 const githubService = require('./githubService');
 const ingressManager = require('./ingressManager');
 const caddyManager = require('./caddyManager');
+const deployManager = require('./deployManager');
+const databaseManager = require('./databaseManager');
+const catalogManager = require('./catalogManager');
+const liveSyncEngine = require('./liveSyncEngine');
+const coolifyMigrator = require('./coolifyMigrator');
 
 // ---------------------------------------------------------------------------
 // Revisiones del protocolo.
@@ -66,6 +71,11 @@ const NAME_BEARING_METHODS = ['tools/call', 'resources/read', 'prompts/get'];
  * y qué hacer a continuación.
  */
 class McpToolError extends Error {
+  /**
+   * @param {string} code
+   * @param {string} message
+   * @param {{ retryable?: boolean, remediation?: string | null, details?: Record<string, any> }} [opts]
+   */
   constructor(code, message, { retryable = false, remediation = null, details = {} } = {}) {
     super(message);
     this.name = 'McpToolError';
@@ -585,6 +595,243 @@ class McpServer extends EventEmitter {
           },
           required: ['owner', 'repo']
         }
+      },
+
+      // --- Producción (deployManager: Docker BuildKit + Caddy zero-downtime) ---
+      {
+        name: 'culkibo_deploy_strategy',
+        title: 'Analizar estrategia de despliegue',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Inspecciona en seco el repositorio del proyecto (Dockerfile, railpack, nixpacks o Dockerfile generado con BuildKit) sin construir nada.',
+        inputSchema: {
+          type: 'object',
+          properties: { projectId: { type: 'string', description: 'ID del proyecto' } },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_deploy_production',
+        title: 'Desplegar a producción (zero-downtime)',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        description: 'Construye la imagen Docker con caché BuildKit, verifica salud en el nuevo contenedor, conmuta la ruta atómica en Caddy y drena el contenedor anterior sin caídas.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'ID del proyecto' },
+            commit: { type: 'string', description: 'Hash de commit específico opcional' },
+            gitSync: { type: 'boolean', description: 'Si false, despliega el árbol ya presente en disco (default true)' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_list_deployments',
+        title: 'Listar despliegues de producción',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Devuelve el estado actual de producción (Citadel) y el historial reciente de despliegues de un proyecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'ID del proyecto' },
+            limit: { type: 'number', description: 'Máximo de entradas (default 10)' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_rollback_deployment',
+        title: 'Revertir despliegue en producción',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        description: 'Revierte a la release anterior conmutando la ruta en Caddy (sin reconstruir la imagen cuando el contenedor anterior sigue en reserva).',
+        inputSchema: {
+          type: 'object',
+          properties: { projectId: { type: 'string', description: 'ID del proyecto' } },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_prune_build_cache',
+        title: 'Podar caché de construcción Docker',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        description: 'Libera espacio de caché de Docker BuildKit bajo demanda (nunca se ejecuta automáticamente).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            keepStorage: { type: 'string', description: 'Espacio a conservar (p. ej. "5gb", "500mb")' },
+            olderThan: { type: 'string', description: 'Antigüedad mínima (p. ej. "168h")' }
+          }
+        }
+      },
+
+      // --- Bases de datos gestionadas + copias S3/R2 ---
+      {
+        name: 'culkibo_list_databases',
+        title: 'Listar bases de datos gestionadas',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Lista las bases de datos gestionadas (PostgreSQL 18, MySQL 9, MariaDB 12.3, Valkey, Redis, MongoDB 8) con su salud y copias programadas. Nunca expone contraseñas.',
+        inputSchema: {
+          type: 'object',
+          properties: { projectId: { type: 'string', description: 'Filtrar opcionalmente por proyecto' } }
+        }
+      },
+      {
+        name: 'culkibo_create_database',
+        title: 'Aprovisionar base de datos gestionada',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        description: 'Aprovisiona en un clic una base de datos aislada en la red del proyecto con contraseña de 192 bits cifrada en AES-256-GCM y cero puertos expuestos por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'ID del proyecto propietario' },
+            engine: { type: 'string', enum: ['postgres', 'mysql', 'mariadb', 'valkey', 'redis', 'mongodb'], description: 'Motor de base de datos' },
+            name: { type: 'string', description: 'Nombre legible de la base de datos' },
+            dbName: { type: 'string', description: 'Nombre lógico del esquema (opcional)' },
+            memoryMb: { type: 'number', description: 'Límite de RAM en MB (opcional)' }
+          },
+          required: ['projectId', 'engine']
+        }
+      },
+      {
+        name: 'culkibo_database_backup',
+        title: 'Ejecutar copia de seguridad de base de datos',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        description: 'Genera un volcado comprimido en disco y lo sube automáticamente a S3/R2 si hay almacenamiento remoto configurado.',
+        inputSchema: {
+          type: 'object',
+          properties: { databaseId: { type: 'string', description: 'ID de la base de datos' } },
+          required: ['databaseId']
+        }
+      },
+      {
+        name: 'culkibo_database_credentials',
+        title: 'Consultar credenciales de base de datos',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Devuelve explícitamente las credenciales descifradas y la cadena de conexión interna de una base de datos gestionada.',
+        inputSchema: {
+          type: 'object',
+          properties: { databaseId: { type: 'string', description: 'ID de la base de datos' } },
+          required: ['databaseId']
+        }
+      },
+      {
+        name: 'culkibo_delete_database',
+        title: 'Eliminar base de datos gestionada',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        description: 'Elimina una base de datos gestionada y opcionalmente su volumen persistente de datos.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            databaseId: { type: 'string', description: 'ID de la base de datos' },
+            deleteVolume: { type: 'boolean', description: 'Borrar también el volumen persistente (irreversible, default false)' }
+          },
+          required: ['databaseId']
+        }
+      },
+
+      // --- Catálogo de servicios de un clic ---
+      {
+        name: 'culkibo_list_catalog_templates',
+        title: 'Explorar catálogo de servicios de un clic',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Lista las 13 plantillas curadas del catálogo de un clic (n8n, Ghost, Plausible, Uptime Kuma, Metabase, MinIO, Gitea, Vaultwarden, Umami, Listmonk, NocoDB, Stirling-PDF, Redis Commander).',
+        inputSchema: {
+          type: 'object',
+          properties: { category: { type: 'string', description: 'Filtrar opcionalmente por categoría' } }
+        }
+      },
+      {
+        name: 'culkibo_install_catalog_service',
+        title: 'Instalar servicio del catálogo en un clic',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        description: 'Instala un servicio del catálogo con red aislada, base de datos gestionada, secretos criptográficos y ruta HTTPS automática en Caddy.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            templateId: { type: 'string', description: 'ID de plantilla (p. ej. n8n, ghost, uptime-kuma, plausible)' },
+            name: { type: 'string', description: 'Nombre de la instalación (opcional)' },
+            domain: { type: 'string', description: 'Dominio público opcional para HTTPS automático' }
+          },
+          required: ['templateId']
+        }
+      },
+      {
+        name: 'culkibo_list_catalog_installations',
+        title: 'Listar servicios instalados del catálogo',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Lista todos los servicios instalados desde el catálogo junto con su estado, salud y URL.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'culkibo_uninstall_catalog_service',
+        title: 'Desinstalar servicio del catálogo',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        description: 'Desinstala un servicio del catálogo, retirando contenedores, red y ruta de ingress.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            installationId: { type: 'string', description: 'ID de la instalación' },
+            deleteVolumes: { type: 'boolean', description: 'Borrar también los volúmenes persistentes y BD (default false)' }
+          },
+          required: ['installationId']
+        }
+      },
+
+      // --- Sincronización en vivo (The Forge: Commit Frames + Merkle + Rollback + Promoción) ---
+      {
+        name: 'culkibo_verify_sync',
+        title: 'Verificar integridad de sincronización (Merkle)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Calcula el árbol Merkle real en disco de un proyecto y reporta estado de sincronización, divergencia y percentiles reales de latencia (p50/p95/p99).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'ID del proyecto' },
+            clientDigest: { type: 'string', description: 'Digest SHA-256 raíz opcional del árbol local del agente para comprobar cero divergencia' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_rollback_sync',
+        title: 'Revertir parche en vivo (<10 ms)',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        description: 'Revierte los últimos commit frames de sincronización en vivo directamente desde el historial de parches en memoria sin reconstruir.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'ID del proyecto' },
+            steps: { type: 'number', description: 'Número de commit frames a revertir (default 1)' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_promote_forge',
+        title: 'Promocionar Forge verificado a Citadel',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        description: 'Congela el árbol exacto verificado en The Forge y lo despliega a producción (The Citadel) con zero-downtime sin requerir un git push previo.',
+        inputSchema: {
+          type: 'object',
+          properties: { projectId: { type: 'string', description: 'ID del proyecto' } },
+          required: ['projectId']
+        }
+      },
+
+      // --- Migrador de Coolify v4 vía MCP ---
+      {
+        name: 'culkibo_migrate_coolify',
+        title: 'Migrar proyectos desde Coolify v4',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        description: 'Conecta con la API v4 de una instancia de Coolify para previsualizar (`mode: "preview"`) o importar (`mode: "import"`) todos sus proyectos, apps, bases de datos, variables y volúmenes.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            coolifyUrl: { type: 'string', description: 'URL base de Coolify (p. ej. https://coolify.midominio.com)' },
+            apiToken: { type: 'string', description: 'API Token de Coolify v4' },
+            mode: { type: 'string', enum: ['preview', 'import'], description: 'preview solo inspecciona; import crea los proyectos en Culkibo (default preview)' }
+          },
+          required: ['coolifyUrl', 'apiToken']
+        }
       }
     ];
   }
@@ -619,8 +866,8 @@ class McpServer extends EventEmitter {
    * lo define y no queremos meterlo en respuestas de la era antigua.
    *
    * @param {string} toolName
-   * @param {object} args
-   * @param {{ transport?: string }} context
+   * @param {any} args
+   * @param {{ transport?: string }} [context]
    */
   async executeTool(toolName, args = {}, context = {}) {
     const start = performance.now();
@@ -894,6 +1141,156 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_deploy_strategy': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw new McpToolError('NOT_FOUND', `Proyecto '${args.projectId}' no encontrado.`, { remediation: 'Usa culkibo_list_projects para obtener un projectId válido.' });
+          const contextDir = liveSyncEngine.resolveTargetDir(project.id);
+          const strategy = await deployManager.detectStrategy(contextDir, project);
+          res = { projectId: project.id, contextDir, strategy };
+          break;
+        }
+
+        case 'culkibo_deploy_production': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw new McpToolError('NOT_FOUND', `Proyecto '${args.projectId}' no encontrado.`, { remediation: 'Usa culkibo_list_projects para obtener un projectId válido.' });
+          res = await deployManager.deploy(project, {
+            commit: args.commit || null,
+            gitSync: args.gitSync !== false,
+            trigger: 'mcp'
+          });
+          break;
+        }
+
+        case 'culkibo_list_deployments': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw new McpToolError('NOT_FOUND', `Proyecto '${args.projectId}' no encontrado.`, { remediation: 'Usa culkibo_list_projects para obtener un projectId válido.' });
+          res = {
+            projectId: project.id,
+            status: await deployManager.status(project.id),
+            deployments: deployManager.listDeployments(project.id, Number(args.limit) || 10)
+          };
+          break;
+        }
+
+        case 'culkibo_rollback_deployment': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw new McpToolError('NOT_FOUND', `Proyecto '${args.projectId}' no encontrado.`, { remediation: 'Usa culkibo_list_projects para obtener un projectId válido.' });
+          res = await deployManager.rollback(project);
+          break;
+        }
+
+        case 'culkibo_prune_build_cache': {
+          res = await deployManager.pruneBuildCache({
+            keepStorage: args.keepStorage || undefined,
+            olderThan: args.olderThan || undefined
+          });
+          break;
+        }
+
+        case 'culkibo_list_databases': {
+          res = {
+            engines: databaseManager.listEngines(),
+            databases: databaseManager.list({ projectId: args.projectId || undefined })
+          };
+          break;
+        }
+
+        case 'culkibo_create_database': {
+          res = await databaseManager.provision({
+            projectId: args.projectId,
+            engine: args.engine,
+            name: args.name,
+            dbName: args.dbName,
+            memoryMb: args.memoryMb
+          });
+          break;
+        }
+
+        case 'culkibo_database_backup': {
+          res = await databaseManager.runBackup(args.databaseId, { trigger: 'mcp' });
+          break;
+        }
+
+        case 'culkibo_database_credentials': {
+          res = databaseManager.getCredentials(args.databaseId);
+          break;
+        }
+
+        case 'culkibo_delete_database': {
+          res = await databaseManager.remove(args.databaseId, { deleteVolume: Boolean(args.deleteVolume) });
+          break;
+        }
+
+        case 'culkibo_list_catalog_templates': {
+          const all = catalogManager.listTemplates();
+          const templates = args.category ? all.filter((t) => t.category === args.category) : all;
+          res = { categories: catalogManager.listCategories(), templates };
+          break;
+        }
+
+        case 'culkibo_install_catalog_service': {
+          res = await catalogManager.install({
+            templateId: args.templateId,
+            name: args.name,
+            domain: args.domain || null
+          });
+          break;
+        }
+
+        case 'culkibo_list_catalog_installations': {
+          res = { installations: catalogManager.list() };
+          break;
+        }
+
+        case 'culkibo_uninstall_catalog_service': {
+          res = await catalogManager.remove(args.installationId, { deleteVolumes: Boolean(args.deleteVolumes) });
+          break;
+        }
+
+        case 'culkibo_verify_sync': {
+          const verification = liveSyncEngine.verifySync(args.projectId, {
+            clientDigest: args.clientDigest || null
+          });
+          res = { ...verification, telemetry: liveSyncEngine.getStatus(args.projectId) };
+          break;
+        }
+
+        case 'culkibo_rollback_sync': {
+          res = liveSyncEngine.rollback(args.projectId, Number(args.steps) || 1);
+          break;
+        }
+
+        case 'culkibo_promote_forge': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw new McpToolError('NOT_FOUND', `Proyecto '${args.projectId}' no encontrado.`, { remediation: 'Usa culkibo_list_projects para obtener un projectId válido.' });
+          const targetDir = liveSyncEngine.resolveTargetDir(project.id);
+          const verification = liveSyncEngine.verifySync(project.id);
+          const deployment = await deployManager.deploy(project, {
+            contextDir: targetDir,
+            gitSync: false,
+            trigger: 'mcp_forge_promote'
+          });
+          res = { promoted: deployment.status === 'activo', workspaceDigest: verification.serverDigest, deployment };
+          break;
+        }
+
+        case 'culkibo_migrate_coolify': {
+          const mode = args.mode === 'import' ? 'import' : 'preview';
+          if (mode === 'preview') {
+            const preview = await coolifyMigrator.previewMigration(args.coolifyUrl, args.apiToken);
+            res = { mode: 'preview', ...preview };
+          } else {
+            const migration = await coolifyMigrator.executeMigration(args.coolifyUrl, args.apiToken, {
+              apps: Array.isArray(args.apps) ? args.apps : [],
+              dbs: Array.isArray(args.dbs) ? args.dbs : [],
+              services: Array.isArray(args.services) ? args.services : []
+            });
+            await projectManager.flushToDisk();
+            res = { mode: 'import', ...migration };
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -1053,7 +1450,7 @@ class McpServer extends EventEmitter {
    * Solo recibe peticiones ya validadas por el transporte (cabeceras, `_meta`,
    * versión). Lo único que puede fallar aquí es el método o la herramienta.
    *
-   * @param {object} request mensaje JSON-RPC completo
+   * @param {any} request mensaje JSON-RPC completo
    * @param {{ transport?: string, isCancelled?: () => boolean }} context
    */
   async handleModernRpc(request, context = {}) {
@@ -1138,22 +1535,22 @@ class McpServer extends EventEmitter {
   }
 }
 
-const mcpServer = new McpServer();
-
-// Constantes del protocolo, para que el transporte no las duplique.
-mcpServer.protocol = {
-  PROTOCOL_VERSION,
-  SUPPORTED_PROTOCOL_VERSIONS,
-  LEGACY_PROTOCOL_VERSION,
-  META_PROTOCOL_VERSION,
-  META_CLIENT_INFO,
-  META_CLIENT_CAPABILITIES,
-  META_SERVER_INFO,
-  ERROR_CODES,
-  MODERN_METHODS,
-  NAME_BEARING_METHODS,
-  SERVER_INFO
-};
-mcpServer.McpToolError = McpToolError;
+const mcpServer = Object.assign(new McpServer(), {
+  // Constantes del protocolo, para que el transporte no las duplique.
+  protocol: {
+    PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    LEGACY_PROTOCOL_VERSION,
+    META_PROTOCOL_VERSION,
+    META_CLIENT_INFO,
+    META_CLIENT_CAPABILITIES,
+    META_SERVER_INFO,
+    ERROR_CODES,
+    MODERN_METHODS,
+    NAME_BEARING_METHODS,
+    SERVER_INFO
+  },
+  McpToolError
+});
 
 module.exports = mcpServer;

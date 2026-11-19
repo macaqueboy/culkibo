@@ -1,0 +1,54 @@
+services:
+  caddy:
+    image: caddy:2.11-alpine
+    container_name: culkibo-caddy
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        printf '{\n  admin 0.0.0.0:2019 {\n    origins caddy:2019 localhost:2019 127.0.0.1:2019\n  }\n}\n' > /tmp/Caddyfile
+        exec caddy run --config /tmp/Caddyfile --adapter caddyfile
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - culkibo_internal
+
+  culkibo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: culkibo-daemon
+    restart: unless-stopped
+    depends_on:
+      - caddy
+    environment:
+      NODE_ENV: production
+      PORT: "3030"
+      HOST: "0.0.0.0"
+      CULKIBO_CADDY_ADMIN: "http://caddy:2019"
+      # Opcional: define CULKIBO_TOKEN o deja que se genere en data/auth.json
+      CULKIBO_TOKEN: "${CULKIBO_TOKEN:-}"
+    ports:
+      - "127.0.0.1:3030:3030"
+    volumes:
+      - culkibo_data:/app/data
+      - culkibo_projects:/app/projects
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - culkibo_internal
+
+volumes:
+  caddy_data:
+  caddy_config:
+  culkibo_data:
+  culkibo_projects:
+
+networks:
+  culkibo_internal:
+    driver: bridge

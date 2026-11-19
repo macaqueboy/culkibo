@@ -173,8 +173,8 @@ class NotificationService extends EventEmitter {
 
   /**
    * Envía una alerta por todos los canales activos.
-   * @param {{event:string, level?:string, title:string, message:string,
-   *          projectId?:string, projectName?:string, url?:string, force?:boolean}} payload
+   * @param {{event?:string, level?:string, title?:string, message?:string,
+   *          projectId?:string | null, projectName?:string | null, url?:string | null, force?:boolean}} [payload]
    */
   async notify(payload = {}) {
     const {

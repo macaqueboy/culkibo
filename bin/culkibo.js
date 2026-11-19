@@ -14,6 +14,10 @@ const mcpServer = require('../server/services/mcpServer');
 const dockerManager = require('../server/services/dockerManager');
 const dbBackupManager = require('../server/services/dbBackupManager');
 const projectManager = require('../server/services/projectManager');
+const caddyManager = require('../server/services/caddyManager');
+const deployManager = require('../server/services/deployManager');
+const catalogManager = require('../server/services/catalogManager');
+const { LiveSyncClient } = require('../server/services/liveSyncClient');
 
 const program = new Command();
 
@@ -91,6 +95,14 @@ program
       console.log(`\x1b[33m  ⚠️ Motor Docker:\x1b[0m Inactivo o no detectado. Modo Sandbox de Procesos activado`);
     }
 
+    // 2b. Caddy (Plano de datos)
+    const caddyStatus = await caddyManager.detect({ force: true });
+    if (caddyStatus.available) {
+      console.log(`\x1b[32m  ✓ Plano de datos Caddy:\x1b[0m Activo en ${caddyStatus.adminUrl}`);
+    } else {
+      console.log(`\x1b[33m  ⚠️ Plano de datos Caddy:\x1b[0m No detectado (${caddyStatus.reason}). El panel sigue operativo sin ingress real.`);
+    }
+
     // 3. Permisos de disco
     const dirsToCheck = ['./data', './projects', './data/backups'];
     dirsToCheck.forEach(d => {
@@ -116,7 +128,7 @@ program
     // 5. Verificación de puertos
     const checkPort = (port) => new Promise(resolve => {
       const tester = net.createServer()
-        .once('error', err => resolve({ port, free: false, error: err.code }))
+        .once('error', (/** @type {any} */ err) => resolve({ port, free: false, error: err.code }))
         .once('listening', () => tester.once('close', () => resolve({ port, free: true })).close())
         .listen(port, '0.0.0.0');
     });
@@ -232,7 +244,7 @@ domainCmd
       Puerto: d.targetPort,
       Cloudflare: d.cloudflareProxied ? 'Proxy Activo (Nube Naranja ☁️)' : 'Solo DNS',
       SSL: d.sslStatus === 'active' ? 'Activo' : d.sslStatus,
-      Validez: d.certInfo ? `${d.certInfo.daysRemaining} días` : 'N/D'
+      Validez: d.certClaim && d.certClaim.daysRemaining != null ? `${d.certClaim.daysRemaining} días` : 'N/D'
     })));
   });
 
@@ -240,7 +252,7 @@ domainCmd
   .command('add <hostname>')
   .description('Añade un nuevo dominio o subdominio comodín (*.dominio.com)')
   .option('--pod <pod>', 'Entorno destino (forge o citadel)', 'citadel')
-  .option('--port <port>', 'Puerto destino', 8080)
+  .option('--port <port>', 'Puerto destino', '8080')
   .option('--no-proxy', 'Desactivar proxy de Cloudflare')
   .action(async (hostname, options) => {
     try {
@@ -392,6 +404,105 @@ program
         RepartoTráfico: `${traffic.citadel}% Prod / ${traffic.forge}% Dev`
       }
     ]);
+  });
+
+// Live Sync (The Forge): sincronización local -> daemon en milisegundos
+program
+  .command('sync <projectId> [directorio]')
+  .description('Sincroniza un directorio local en tiempo real vía Commit Frames + Merkle hacia el daemon')
+  .option('-u, --url <wsUrl>', 'URL del WebSocket del daemon', process.env.CULKIBO_SYNC_URL || 'ws://127.0.0.1:3030/ws/sync')
+  .option('-t, --token <token>', 'Token de autenticación (CULKIBO_TOKEN)', process.env.CULKIBO_TOKEN || '')
+  .option('-q, --quiescence <ms>', 'Ventana de agrupación de ráfagas en ms', '12')
+  .option('--reconcile', 'Sincronizar todo el árbol inicial al conectar', true)
+  .action(async (projectId, directorio = process.cwd(), options) => {
+    const client = new LiveSyncClient({
+      projectId,
+      sourceDir: directorio,
+      wsUrl: options.url,
+      token: options.token || null,
+      quiescenceMs: parseInt(options.quiescence, 10) || 12
+    });
+
+    client.on('frame_ack', (ack) => {
+      console.log(`⚡ [Forge] Frame #${ack.seq} · ${ack.written} escritos, ${ack.deleted} borrados, ${ack.dedupSkipped} sin cambios · ${ack.applyMs} ms [${ack.mode}]`);
+    });
+    client.on('sync_error', (err) => {
+      console.error(`❌ [Forge] ${err.message}`);
+    });
+
+    try {
+      await client.start();
+      console.log(`\n⚡ Culkibo Live Sync activo`);
+      console.log(`   Proyecto:   ${projectId}`);
+      console.log(`   Directorio: ${path.resolve(directorio)}`);
+      console.log(`   Destino:    ${options.url}`);
+      if (options.reconcile) {
+        const rec = await client.reconcileFull();
+        console.log(`   Merkle:     ${rec.rootDigest.slice(0, 12)} (${rec.changed} ficheros sincronizados)\n`);
+      }
+      process.on('SIGINT', async () => {
+        await client.stop();
+        process.exit(0);
+      });
+    } catch (err) {
+      console.error(`❌ No se pudo iniciar Live Sync: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+// Despliegue a producción y rollback instantáneo
+program
+  .command('deploy <projectId>')
+  .description('Despliega un proyecto a producción (Docker BuildKit + healthcheck + swap Caddy)')
+  .option('--no-git-sync', 'Desplegar el árbol local tal cual (promoción desde Forge)')
+  .action(async (projectId, options) => {
+    const project = projectManager.getById(projectId);
+    if (!project) {
+      console.error(`❌ Proyecto "${projectId}" no encontrado.`);
+      process.exit(1);
+    }
+    const result = await deployManager.deploy(project, { gitSync: options.gitSync, trigger: 'cli' });
+    if (result.status === 'activo') {
+      console.log(`\x1b[32m✅ Despliegue ${result.id} activo en ${result.durationMs} ms (${result.upstream || 'sin ruta'})\x1b[0m`);
+    } else {
+      console.error(`❌ Despliegue fallido: ${result.error}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('rollback <projectId>')
+  .description('Revierte un proyecto a la versión de producción anterior por conmutación de ruta')
+  .action(async (projectId) => {
+    const project = projectManager.getById(projectId);
+    if (!project) {
+      console.error(`❌ Proyecto "${projectId}" no encontrado.`);
+      process.exit(1);
+    }
+    try {
+      const result = await deployManager.rollback(project);
+      console.log(`\x1b[32m✅ Rollback completado (${result.id})\x1b[0m`);
+    } catch (err) {
+      console.error(`❌ Error en rollback: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+// Catálogo de servicios
+const catalogCmd = program.command('catalog').description('Catálogo de servicios autohospedados de un clic');
+catalogCmd
+  .command('list')
+  .description('Lista las plantillas disponibles en el catálogo')
+  .action(() => {
+    const templates = catalogManager.listTemplates();
+    console.table(templates.map(t => ({
+      ID: t.id,
+      Nombre: t.name,
+      Categoría: t.categoryLabel,
+      Imagen: t.image,
+      RAM_Total: `${t.totalMemoryMb} MB`,
+      BD: t.database ? t.database.engine : '—'
+    })));
   });
 
 // Transporte stdio MCP

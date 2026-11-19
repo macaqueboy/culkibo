@@ -53,15 +53,16 @@ async function testOrchestrator() {
   assert.strictEqual(switchRes.trafficAllocation.citadel, 70);
   console.log('  ✓ Traffic routing switch passed (30% Forge / 70% Citadel)');
 
-  // 4. Rolling deployment to Citadel
+  // 4. Legacy deployRelease() ya no simula despliegues falsos con setTimeout:
+  //    los despliegues reales viven en deployManager.
   const deployRes = await containerOrchestrator.deployRelease({
     imageTag: 'v1.0.2',
     gitCommit: 'c0ffe31',
     description: 'Automated test release'
   });
-  assert.strictEqual(deployRes.success, true);
-  assert.strictEqual(deployRes.version, 'v1.0.2');
-  console.log('  ✓ Zero-downtime rolling deployment to Citadel passed');
+  assert.strictEqual(deployRes.success, false, 'deployRelease legado no debe fingir un despliegue');
+  assert.strictEqual(deployRes.delegatedTo, 'deployManager');
+  console.log('  ✓ Legacy deployRelease() rechazado honestamente (delegado en deployManager)');
 
   // 5. Logs streaming & retrieval
   const logs = containerOrchestrator.getLogs({ limit: 10 });

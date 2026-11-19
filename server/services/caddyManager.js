@@ -64,6 +64,7 @@ class CaddyManager {
       return this.lastDetection;
     }
 
+    /** @type {{ available: boolean, adminUrl: string, version: string | null, reason: string | null }} */
     let result = { available: false, adminUrl: this.adminUrl, version: null, reason: null };
     try {
       const res = await fetch(`${this.adminUrl}/config/`, { headers: this.adminHeaders(), signal: AbortSignal.timeout(2500) });
@@ -94,7 +95,7 @@ class CaddyManager {
     const detection = await this.detect();
     if (!detection.available) {
       const err = new Error(`Caddy no está disponible: ${detection.reason}`);
-      err.code = 'CADDY_UNAVAILABLE';
+      /** @type {any} */ (err).code = 'CADDY_UNAVAILABLE';
       throw err;
     }
     return detection;
@@ -130,6 +131,12 @@ class CaddyManager {
    * 412. Lo implementamos aquí una vez para que ningún llamante tenga que
    * acordarse.
    */
+  /**
+   * @param {string} method
+   * @param {string} path
+   * @param {any} body
+   * @param {{ etag?: string | null, retries?: number }} [opts]
+   */
   async write(method, path, body, { etag = null, retries = 3 } = {}) {
     for (let attempt = 0; attempt <= retries; attempt++) {
       const headers = this.adminHeaders({ 'Content-Type': 'application/json' });
@@ -147,7 +154,7 @@ class CaddyManager {
       // 412: alguien escribió entremedias. El llamante debe releer y reintentar.
       if (res.status === 412 && attempt < retries) {
         const conflict = new Error('PRECONDITION_FAILED');
-        conflict.code = 'ETAG_CONFLICT';
+        /** @type {any} */ (conflict).code = 'ETAG_CONFLICT';
         throw conflict;
       }
 
@@ -193,11 +200,59 @@ class CaddyManager {
    * Consecuencia de diseño: el certificado deja de ser un campo en nuestro
    * JSON. Eso es lo que hace imposible volver a falsearlo.
    */
-  buildBaseConfig({ askEndpoint, httpPort = 80, httpsPort = 443, automaticHttps = true }) {
+  buildBaseConfig({
+    askEndpoint,
+    httpPort = 80,
+    httpsPort = 443,
+    automaticHttps = true,
+    wildcardDomains = [],
+    cloudflareDnsTokenEnv = 'CF_API_TOKEN'
+  }) {
+    /** @type {any[]} */
+    const policies = [];
+
+    // Wildcard TLS real vía DNS-01 de Cloudflare (requiere Caddy compilado con
+    // `caddy-dns/cloudflare`, p. ej. desde caddyserver.com/api/download o xcaddy).
+    // Ni Coolify ni Dokploy traen DNS-01 integrado por defecto.
+    const cleanWildcards = Array.isArray(wildcardDomains)
+      ? wildcardDomains.map(d => String(d).trim().toLowerCase()).filter(Boolean)
+      : [];
+    if (cleanWildcards.length > 0) {
+      policies.push({
+        subjects: cleanWildcards,
+        issuers: [{
+          module: 'acme',
+          challenges: {
+            dns: {
+              provider: {
+                name: 'cloudflare',
+                api_token: `{env.${cloudflareDnsTokenEnv}}`
+              }
+            }
+          }
+        }]
+      });
+    }
+
+    policies.push({
+      on_demand: true,
+      issuers: [{ module: 'acme' }]
+    });
+
+    const adminHost = this.adminUrl.replace(/^https?:\/\//, '');
+    const isLoopbackAdmin = /^(localhost|127\.0\.0\.1|\[::1\]):/i.test(adminHost);
+    const adminPort = (adminHost.split(':')[1] || '2019').replace(/[^0-9]/g, '') || '2019';
+
     return {
-      admin: { listen: this.adminUrl.replace(/^https?:\/\//, '') },
+      admin: isLoopbackAdmin
+        ? { listen: adminHost }
+        : { listen: `0.0.0.0:${adminPort}`, origins: [adminHost, `localhost:${adminPort}`, `127.0.0.1:${adminPort}`] },
       apps: {
         http: {
+          // Ventana de drenaje real en recargas de configuración (10 s). En
+          // Linux (SO_REUSEPORT) garantiza cero peticiones cortadas al cambiar
+          // de upstream.
+          grace_period: 10000000000,
           servers: {
             culkibo: {
               listen: [`:${httpPort}`, `:${httpsPort}`],
@@ -212,12 +267,7 @@ class CaddyManager {
         },
         tls: {
           automation: {
-            policies: [
-              {
-                on_demand: true,
-                issuers: [{ module: 'acme' }]
-              }
-            ],
+            policies,
             on_demand: {
               // `ask` está deprecado ("WILL BE REMOVED SOON") en favor de
               // `permission` con el módulo http.
@@ -260,6 +310,9 @@ class CaddyManager {
    *
    * `terminal: true` corta la evaluación en cuanto una ruta casa, para que un
    * proyecto no pueda recibir tráfico de otro por un matcher más laxo.
+   */
+  /**
+   * @param {{ projectId: string, hostnames: string[], upstreams: string[], weights?: number[] | null }} spec
    */
   buildRoute({ projectId, hostnames, upstreams, weights = null }) {
     if (!Array.isArray(hostnames) || hostnames.length === 0) {
@@ -309,13 +362,36 @@ class CaddyManager {
   /**
    * Crea o reemplaza la ruta de un proyecto.
    *
-   * PATCH sobre /id/<id> reemplaza el objeto entero de forma atómica; si no
-   * existe todavía, se añade al array de rutas del servidor.
+   * Camino rápido: intenta `PATCH /id/<id>` directamente en un único viaje de
+   * ida y vuelta contra la Admin API (sin `GET` previo). Solo cuando la ruta
+   * todavía no existe (404) hace el `POST` sobre `/routes` con control
+   * optimista `ETag`/`If-Match`. Esto reduce a la mitad la latencia de
+   * conmutación en caliente (p50 en unos pocos milisegundos).
    */
   async upsertRoute(spec) {
     await this.requireAvailable();
     const route = this.buildRoute(spec);
     const id = route['@id'];
+
+    // Fast path: 1 solo roundtrip HTTP cuando la ruta ya existe (caso común
+    // en promociones, canarios y rollbacks).
+    const fastRes = await fetch(`${this.adminUrl}/id/${id}`, {
+      method: 'PATCH',
+      headers: this.adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(route),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (fastRes.ok) {
+      return { created: false, id, route };
+    }
+    if (fastRes.status !== 404 && fastRes.status !== 400) {
+      // Si falló por un motivo distinto de «no existe», respetamos el protocolo
+      // ETag completo o propagamos el error real de Caddy.
+      const detail = await fastRes.text();
+      if (!/unknown object ID/i.test(detail)) {
+        throw new Error(`PATCH /id/${id} devolvió ${fastRes.status}: ${detail}`);
+      }
+    }
 
     return this.mutate(async () => {
       const existing = await this.getWithEtag(`/id/${id}`);
@@ -329,6 +405,42 @@ class CaddyManager {
       // POST sobre un array añade al final.
       await this.write('POST', routesPath, route, { etag: current.etag });
       return { created: true, id, route };
+    });
+  }
+
+  /**
+   * Configura o actualiza la política de certificados wildcard DNS-01 con
+   * Cloudflare directamente en Caddy (requiere módulo `dns.providers.cloudflare`).
+   */
+  async configureWildcardDns01(rootDomain, { tokenEnv = 'CF_API_TOKEN' } = {}) {
+    await this.requireAvailable();
+    const cleanRoot = String(rootDomain || '').trim().toLowerCase().replace(/^\*\./, '');
+    if (!cleanRoot || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(cleanRoot)) {
+      throw new Error(`Dominio raíz inválido para wildcard DNS-01: ${rootDomain}`);
+    }
+    const subjects = [`*.${cleanRoot}`, cleanRoot];
+    const policy = {
+      subjects,
+      issuers: [{
+        module: 'acme',
+        challenges: {
+          dns: {
+            provider: {
+              name: 'cloudflare',
+              api_token: `{env.${tokenEnv}}`
+            }
+          }
+        }
+      }]
+    };
+    const policiesPath = '/config/apps/tls/automation/policies';
+    return this.mutate(async () => {
+      const current = await this.getWithEtag(policiesPath);
+      const list = Array.isArray(current.value) ? current.value : [];
+      const filtered = list.filter(p => !(Array.isArray(p.subjects) && p.subjects.includes(`*.${cleanRoot}`)));
+      const next = [policy, ...filtered];
+      await this.write('PUT', policiesPath, next, { etag: current.etag });
+      return { applied: true, subjects, provider: 'cloudflare', tokenEnv };
     });
   }
 
@@ -420,5 +532,5 @@ class CaddyManager {
   }
 }
 
-module.exports = new CaddyManager();
-module.exports.CaddyManager = CaddyManager;
+const caddyManagerInstance = Object.assign(new CaddyManager(), { CaddyManager });
+module.exports = caddyManagerInstance;

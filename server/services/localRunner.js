@@ -37,11 +37,13 @@ function spawnTool(bin, args, options = {}) {
   return spawn(bin, argv, { ...options, shell: false });
 }
 
+/** @type {any} */
 let containerOrchestrator = null;
 try {
   containerOrchestrator = require('./containerOrchestrator');
 } catch(e) {}
 
+/** @type {any} */
 let notificationService = null;
 try {
   notificationService = require('./notificationService');
@@ -104,7 +106,7 @@ class LocalRunner {
         server.closeAllConnections();
       }
     } catch (e) {}
-    await new Promise((resolve) => {
+    await new Promise((/** @type {(value?: void) => void} */ resolve) => {
       let done = false;
       const finish = () => { if (!done) { done = true; resolve(); } };
       try { server.close(finish); } catch (e) { return finish(); }
@@ -482,7 +484,8 @@ class LocalRunner {
    * Serve a loading page while installing dependencies, then spawn the real process
    */
   async installDepsAndStart(project, projectDir, port) {
-    let tempServer = null;
+    /** @type {http.Server} */
+    let tempServer;
     let statusMessage = 'Instalando dependencias necesarias (npm install)...';
     let isError = false;
 
@@ -518,7 +521,7 @@ class LocalRunner {
 </html>`);
     });
 
-    await new Promise((resolve) => tempServer.listen(port, '0.0.0.0', resolve));
+    await new Promise((/** @type {(value?: void) => void} */ resolve) => tempServer.listen(port, '0.0.0.0', () => resolve()));
 
     this.activeRunners.set(project.id, {
       type: 'temporary_loading',
@@ -924,6 +927,7 @@ class LocalRunner {
    */
   gitAuthEnv() {
     const token = this.readGitToken();
+    /** @type {Record<string, any>} */
     const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
 
     // Desactivar cualquier ayudante de credenciales configurado en la máquina.
@@ -973,6 +977,10 @@ class LocalRunner {
    * repository URL becomes command injection — the exact class that produced
    * 21 critical advisories in Coolify and 34 in Dokploy. spawn() with an argv
    * array has no shell to inject into.
+   *
+   * @param {string} cloneUrl
+   * @param {string} targetDir
+   * @param {{ timeout?: number, depth?: number | null, branch?: string | null, onLine?: ((line: string) => void) | null }} [opts]
    */
   gitClone(cloneUrl, targetDir, { timeout = 180000, depth = null, branch = null, onLine = null } = {}) {
     const { env, cleanup } = this.gitAuthEnv();
@@ -982,7 +990,7 @@ class LocalRunner {
     // Shallow + single-branch. A deploy builds exactly one commit; the rest of
     // the history is bytes the build never reads. On a repo with a few thousand
     // commits this is the difference between seconds and minutes.
-    const depthNum = parseInt(depth, 10);
+    const depthNum = parseInt(String(depth ?? ''), 10);
     if (Number.isInteger(depthNum) && depthNum > 0) {
       args.push('--depth', String(depthNum), '--single-branch');
     }
@@ -1003,7 +1011,7 @@ class LocalRunner {
     // manages to store a repository whose name starts with a dash.
     args.push('--', cloneUrl, targetDir);
 
-    return new Promise((resolve, reject) => {
+    return new Promise((/** @type {(value?: void) => void} */ resolve, reject) => {
       const child = spawn('git', args, {
         env,
         shell: false,
@@ -1066,10 +1074,14 @@ class LocalRunner {
     }
 
     const cloneUrl = this.normalizeGitUrl(rawGitUrl);
+    if (!cloneUrl) {
+      throw new Error(`URL de repositorio Git inválida: ${rawGitUrl}`);
+    }
     const displayUrl = this.redactSecrets(rawGitUrl);
     const generation = this.currentGeneration(project.id);
 
-    let tempServer = null;
+    /** @type {http.Server} */
+    let tempServer;
     let statusMessage = `Clonando repositorio ${displayUrl}...`;
     let isError = false;
 
@@ -1105,7 +1117,7 @@ class LocalRunner {
 </html>`);
     });
 
-    await new Promise((resolve) => tempServer.listen(port, '0.0.0.0', resolve));
+    await new Promise((/** @type {(value?: void) => void} */ resolve) => tempServer.listen(port, '0.0.0.0', () => resolve()));
 
     this.activeRunners.set(project.id, {
       type: 'temporary_loading',
@@ -1198,6 +1210,7 @@ class LocalRunner {
 
     console.log(`[LocalRunner] Auto-preparing project ${project.name} in background...`);
     const cloneUrl = this.normalizeGitUrl(gitUrl);
+    if (!cloneUrl) return;
     try {
       this.cleanDirectory(projectDir);
       await this.gitClone(cloneUrl, projectDir, { timeout: 180000 });

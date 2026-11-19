@@ -124,7 +124,7 @@ class CoolifyMigrator {
       importedApps: 0,
       importedDbs: 0,
       importedServices: 0,
-      errors: []
+      errors: /** @type {string[]} */ ([])
     };
 
     const appsToImport = selectedApps.length > 0 ? apps.filter(app => selectedApps.includes(app.uuid)) : apps;

@@ -143,7 +143,23 @@ class DomainManager {
     return this.updateDomain(id, { projectId: null });
   }
 
-  async addDomain({ hostname, targetPod = 'forge', targetPort = 3001, cloudflareZoneId = null, cloudflareProxied = true, routingMode = 'cloudflare_proxy', autoCreateDns = false, serverIp = '127.0.0.1', sslStatus, sslProvider, migrationSource, projectId = null }) {
+  /**
+   * @param {{
+   *   hostname: string,
+   *   targetPod?: string,
+   *   targetPort?: number | string,
+   *   cloudflareZoneId?: string | null,
+   *   cloudflareProxied?: boolean,
+   *   routingMode?: string,
+   *   autoCreateDns?: boolean,
+   *   serverIp?: string,
+   *   sslStatus?: string,
+   *   sslProvider?: string,
+   *   migrationSource?: string,
+   *   projectId?: string | null
+   * }} opts
+   */
+  async addDomain({ hostname, targetPod = 'forge', targetPort = 3001, cloudflareZoneId = null, cloudflareProxied = true, routingMode = 'cloudflare_proxy', autoCreateDns = false, serverIp = '127.0.0.1', sslStatus = undefined, sslProvider = undefined, migrationSource = undefined, projectId = null }) {
     const cleanHost = (hostname || '').trim().toLowerCase();
     
     // RFC 1123 domain validation
@@ -170,7 +186,7 @@ class DomainManager {
       // Caddy hacia el puerto vivo del proyecto, solo hacia un pod genérico.
       projectId: projectId || null,
       targetPod,
-      targetPort: parseInt(targetPort, 10),
+      targetPort: parseInt(String(targetPort), 10),
       status: cert ? 'active' : 'pending_ssl',
       cloudflareProxied: Boolean(cloudflareProxied),
       cloudflareZoneId,
@@ -236,8 +252,8 @@ class DomainManager {
     const clean = hostname.replace(/^\*\./, '');
     const result = {
       hostname: clean,
-      resolvedIps: [],
-      cnames: [],
+      resolvedIps: /** @type {string[]} */ ([]),
+      cnames: /** @type {string[]} */ ([]),
       hasDnsRecords: false,
       isCloudflareEdge: false,
       lookupDurationMs: 0

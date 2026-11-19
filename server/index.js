@@ -16,8 +16,11 @@ const databaseManager = require('./services/databaseManager');
 const ingressManager = require('./services/ingressManager');
 const deployManager = require('./services/deployManager');
 const catalogManager = require('./services/catalogManager');
+const liveSyncEngine = require('./services/liveSyncEngine');
 
 const app = express();
+app.disable('x-powered-by');
+app.set('etag', false);
 const server = http.createServer(app);
 // Número, no `string | number`: se pasa a `server.listen()` y a comparaciones
 // numéricas. Un PORT no numérico en el entorno cae al valor por defecto en
@@ -42,7 +45,7 @@ process.on('uncaughtException', (err) => reportFatal('uncaughtException', err));
 process.on('unhandledRejection', (reason) => reportFatal('unhandledRejection', reason));
 
 // Middleware
-const { authMiddleware, corsOptions, resolveToken, authStatus } = require('./middleware/auth');
+const { authMiddleware, authorizeRequest, corsOptions, resolveToken, authStatus } = require('./middleware/auth');
 
 // `cors({ origin: '*' })` dejaba que cualquier web que el usuario visitase
 // pilotara el daemon desde su propio navegador. Ahora la lista de orígenes es
@@ -56,6 +59,14 @@ app.use((req, res, next) => {
   containerOrchestrator.recordRequest();
   next();
 });
+// Pre-cargar el decodificador UTF-8 de body-parser al arranque para que el
+// primer POST en caliente no bloquee el bucle de eventos con un require() tardío.
+try {
+  /** @type {any} */
+  const iconv = require('iconv-lite');
+  if (typeof iconv.getDecoder === 'function') iconv.getDecoder('utf8');
+} catch (e) {}
+
 app.use(express.json({
   limit: '10mb',
   verify: (req, res, buf) => {
@@ -214,12 +225,118 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ error: err.message || 'Error interno del servidor' });
 });
 
-// WebSocket server for ultra-fast telemetry & log streaming
-const wss = new WebSocketServer({ server, path: '/ws' });
+// WebSocket servers:
+//  - `/ws`      telemetría y logs en vivo del panel
+//  - `/ws/sync` tubería persistente de Commit Frames de Live Sync (The Forge)
+// Ambos pasan por la misma autorización (Origin + Token) antes del upgrade.
+const wss = new WebSocketServer({ noServer: true });
+const syncWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 const clients = new Set();
+
+server.on('upgrade', (req, socket, head) => {
+  const pathname = (req.url || '/').split('?')[0];
+  if (pathname !== '/ws' && pathname !== '/ws/sync') {
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const decision = authorizeRequest(req);
+  if (!decision.ok) {
+    const code = decision.status === 403 ? '403 Forbidden' : '401 Unauthorized';
+    socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
+
+  const target = pathname === '/ws/sync' ? syncWss : wss;
+  target.handleUpgrade(req, socket, head, (ws) => {
+    target.emit('connection', ws, req);
+  });
+});
 
 // Conexiones activas reales, para que getPods() deje de inventarlas.
 containerOrchestrator.setConnectionCounter(() => clients.size);
+
+// Tubería persistente de Live Sync (/ws/sync): Commit Frames atómicos + Merkle.
+syncWss.on('connection', (ws) => {
+  /** @type {string | null} */
+  let boundProjectId = null;
+
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (e) {
+      ws.send(JSON.stringify({ type: 'error', code: 'BAD_JSON', error: 'Mensaje JSON inválido' }));
+      return;
+    }
+
+    try {
+      if (msg.type === 'hello') {
+        if (!msg.projectId) throw new Error('hello requiere projectId');
+        boundProjectId = String(msg.projectId);
+        if (msg.targetDir) liveSyncEngine.setTargetDir(boundProjectId, msg.targetDir);
+        const session = liveSyncEngine.registerClient(boundProjectId);
+        const verification = liveSyncEngine.verifySync(boundProjectId, {
+          clientDigest: msg.clientDigest || null,
+          targetDir: msg.targetDir || null
+        });
+        ws.send(JSON.stringify({
+          type: 'hello_ack',
+          projectId: boundProjectId,
+          lastSeq: session.lastSeq,
+          serverDigest: verification.serverDigest,
+          inSync: verification.inSync,
+          fileCount: verification.fileCount,
+          targetDir: verification.targetDir
+        }));
+        return;
+      }
+
+      if (msg.type === 'frame') {
+        const pid = String(msg.projectId || boundProjectId || '');
+        if (!pid) throw new Error('frame requiere projectId');
+        const result = liveSyncEngine.applyCommitFrame(pid, msg, { targetDir: msg.targetDir || undefined });
+        ws.send(JSON.stringify({ type: 'frame_ack', ...result }));
+        return;
+      }
+
+      if (msg.type === 'verify') {
+        const pid = String(msg.projectId || boundProjectId || '');
+        if (!pid) throw new Error('verify requiere projectId');
+        const result = liveSyncEngine.verifySync(pid, {
+          clientDigest: msg.clientDigest || null,
+          clientFiles: msg.clientFiles || null,
+          targetDir: msg.targetDir || null
+        });
+        ws.send(JSON.stringify({ type: 'verify_ack', ...result }));
+        return;
+      }
+
+      if (msg.type === 'rollback') {
+        const pid = String(msg.projectId || boundProjectId || '');
+        if (!pid) throw new Error('rollback requiere projectId');
+        const result = liveSyncEngine.rollback(pid, msg.steps || 1);
+        ws.send(JSON.stringify({ type: 'rollback_ack', ...result }));
+        return;
+      }
+
+      ws.send(JSON.stringify({ type: 'error', code: 'UNKNOWN_TYPE', error: `Tipo de mensaje no soportado: ${msg.type}` }));
+    } catch (err) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        seq: msg && msg.seq ? msg.seq : null,
+        code: (err && err.code) || 'SYNC_ERROR',
+        error: err && err.message ? err.message : String(err)
+      }));
+    }
+  });
+
+  ws.on('close', () => {
+    if (boundProjectId) liveSyncEngine.unregisterClient(boundProjectId);
+  });
+});
 
 wss.on('connection', (ws) => {
   clients.add(ws);
@@ -281,6 +398,7 @@ const heartbeatTimer = setInterval(() => {
 if (heartbeatTimer.unref) heartbeatTimer.unref();
 
 function broadcast(type, data) {
+  if (clients.size === 0) return;
   const payload = JSON.stringify({ type, data, timestamp: new Date().toISOString() });
   for (const client of clients) {
     if (client.readyState === 1) { // OPEN
@@ -322,6 +440,26 @@ catalogManager.on('service_progress', (data) => broadcast('service_progress', da
 catalogManager.on('service_installed', (data) => broadcast('service_installed', data));
 catalogManager.on('service_failed', (data) => broadcast('service_failed', data));
 catalogManager.on('service_removed', (data) => broadcast('service_removed', data));
+liveSyncEngine.on('sync_applied', (data) => {
+  broadcast('sync_applied', data);
+  containerOrchestrator.addLog(
+    'HOT_SYNC',
+    'forge',
+    `[Forge:LiveSync] Frame #${data.seq} (${data.written} escritos, ${data.deleted} borrados, ${data.dedupSkipped} sin cambios) aplicado en ${data.applyMs}ms [${data.mode}]`,
+    new Date(),
+    data.projectId
+  );
+});
+liveSyncEngine.on('sync_rollback', (data) => {
+  broadcast('sync_rollback', data);
+  containerOrchestrator.addLog(
+    'INFO',
+    'forge',
+    `[Forge:Rollback] Revertidos ${data.restoredFiles.length} fichero(s) en ${data.durationMs}ms`,
+    new Date(),
+    data.projectId
+  );
+});
 
 /**
  * @param {number} port
@@ -333,7 +471,7 @@ catalogManager.on('service_removed', (data) => broadcast('service_removed', data
  *   las suyas al arrancar haría fallar esa suite en cuanto la máquina tuviera
  *   un despliegue real. En producción se reponen siempre.
  */
-function startServer(port = PORT, host = '0.0.0.0', { reconcileIngress = true } = {}) {
+function startServer(port = PORT, host = '0.0.0.0', { reconcileIngress = process.env.CULKIBO_SKIP_RECONCILE !== '1' } = {}) {
   return new Promise((resolve, reject) => {
     server.listen(port, host, () => {
       console.log(`\n========================================================`);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Settings, Activity, Globe, Variable, Play, Square, Moon, Trash2, ShieldAlert, Database, Server, Copy, Eye, EyeOff, Plus, Search, Upload, Save, CheckCircle2, Box, Cpu, Webhook, GitBranch, Check, RefreshCw, Zap, Power, Rocket } from 'lucide-react';
 import { api, type Project } from '../lib/api';
 import { LiveLogs } from './LiveLogs';
@@ -40,12 +40,29 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
   const [confirmDeleteName, setConfirmDeleteName] = useState('');
   const [deleting, setDeleting] = useState(false);
 
+  const fetchProject = useCallback(async () => {
+    try {
+      const found = await api.getProject(projectId);
+      if (found) {
+        setProject(found);
+        const text = Object.entries(found.envVars || {}).map(([k,v]) => `${k}=${v}`).join('\n');
+        setEnvText(text);
+        setEnvRows(Object.entries(found.envVars || {}).map(([k,v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }, [projectId]);
+
   const handleAddService = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!project) return;
     try {
+      const randId = Array.from(crypto.getRandomValues(new Uint8Array(4)))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
       const updatedResources = [...(project.resources || []), {
-        id: `res_${Date.now()}`,
+        id: `res_${randId}`,
         name: newService.name,
         type: newService.type.toLowerCase().includes('database') || newService.type.toLowerCase().includes('redis') || newService.type.toLowerCase().includes('mongo') ? 'database' : 'app',
         port: newService.port,
@@ -56,44 +73,49 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
       onNotify('Servicio añadido correctamente');
       setShowAddService(false);
       setNewService({ name: '', type: 'Aplicación Web', port: '', image: '' });
-      fetchProject();
-    } catch (error) {
+      void fetchProject();
+    } catch {
       onNotify('Error al añadir servicio');
     }
   };
 
-  const fetchProject = async () => {
-    try {
-      const found = await api.getProject(projectId);
-      if (found) {
+  useEffect(() => {
+    let active = true;
+    api.getProject(projectId)
+      .then((found) => {
+        if (!active || !found) return;
         setProject(found);
         const text = Object.entries(found.envVars || {}).map(([k,v]) => `${k}=${v}`).join('\n');
         setEnvText(text);
-        setEnvRows(Object.entries(found.envVars || {}).map(([k,v], i) => ({ key: k, value: v as string, id: `row_${i}_${Date.now()}` })));
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  useEffect(() => {
-    fetchProject();
+        setEnvRows(Object.entries(found.envVars || {}).map(([k,v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
+      })
+      .catch((e) => console.error(e));
+    return () => { active = false; };
   }, [projectId]);
 
+  const projectName = project?.name;
   useEffect(() => {
-    if (incomingLog) {
-      const msg = incomingLog.message || '';
-      if (
-        incomingLog.projectId === projectId ||
-        msg.includes(projectId) ||
-        (project && msg.includes(project.name)) ||
-        msg.includes('GitHub:Webhook') ||
-        msg.includes('Despliegue completado')
-      ) {
-        fetchProject();
-      }
-    }
-  }, [incomingLog]);
+    if (!incomingLog) return;
+    const msg = incomingLog.message || '';
+    const relevant =
+      incomingLog.projectId === projectId ||
+      msg.includes(projectId) ||
+      (projectName && msg.includes(projectName)) ||
+      msg.includes('GitHub:Webhook') ||
+      msg.includes('Despliegue completado');
+    if (!relevant) return;
+    let active = true;
+    api.getProject(projectId)
+      .then((found) => {
+        if (!active || !found) return;
+        setProject(found);
+        const text = Object.entries(found.envVars || {}).map(([k,v]) => `${k}=${v}`).join('\n');
+        setEnvText(text);
+        setEnvRows(Object.entries(found.envVars || {}).map(([k,v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
+      })
+      .catch((e) => console.error(e));
+    return () => { active = false; };
+  }, [incomingLog, projectId, projectName]);
 
   const handleSimulatePush = async () => {
     if (!project) return;
@@ -236,7 +258,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
       await api.updateProject(projectId, { envVars: newVars });
       onNotify('Variables actualizadas correctamente');
       fetchProject();
-    } catch (e) {
+    } catch {
       onNotify('Error al guardar variables');
     }
   };
@@ -252,7 +274,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
       await api.updateProject(projectId, { envVars: newVars });
       onNotify('Variables actualizadas correctamente');
       fetchProject();
-    } catch (e) {
+    } catch {
       onNotify('Error al guardar variables');
     }
   };
@@ -925,7 +947,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                   await api.updateProject(projectId, updates);
                   onNotify('Configuración guardada correctamente');
                   fetchProject();
-                } catch (err) {
+                } catch {
                   onNotify('Error al guardar configuración');
                 }
               }} className="space-y-4">
@@ -1008,7 +1030,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                         await api.updateProject(projectId, { autoDeploy: nextState });
                         onNotify(`Auto-despliegue ${nextState ? 'activado' : 'desactivado'}`);
                         fetchProject();
-                      } catch (e) {
+                      } catch {
                         onNotify('Error al actualizar estado');
                       }
                     }}
@@ -1064,7 +1086,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                           await api.updateProject(projectId, { webhookSecret: newSecret });
                           onNotify('Nuevo secreto de webhook generado y guardado');
                           fetchProject();
-                        } catch (e) {
+                        } catch {
                           onNotify('Error al regenerar secreto');
                         }
                       }}

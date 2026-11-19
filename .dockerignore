@@ -1,0 +1,15 @@
+node_modules
+web/node_modules
+web/dist
+.git
+.claude
+data
+projects
+.env
+.env.*
+!.env.example
+*.log
+*.png
+tests
+bench
+docs

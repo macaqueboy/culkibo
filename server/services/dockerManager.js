@@ -267,7 +267,7 @@ class DockerManager {
       const ref = this.assertRef(containerId);
       // `--tail` sólo acepta un entero o `all`. Se normaliza aquí para que un
       // valor arbitrario del llamante no llegue nunca a la línea de comandos.
-      const tail = Number.isFinite(Number(lines)) ? Math.min(Math.max(parseInt(lines, 10) || 100, 1), 10000) : 100;
+      const tail = Number.isFinite(Number(lines)) ? Math.min(Math.max(parseInt(String(lines), 10) || 100, 1), 10000) : 100;
       const { stdout, stderr } = await this.docker(['logs', '--tail', String(tail), ref], { timeout: 5000 });
       return {
         containerId,
@@ -279,5 +279,5 @@ class DockerManager {
   }
 }
 
-module.exports = new DockerManager();
-module.exports.DockerManager = DockerManager;
+const dockerManagerInstance = Object.assign(new DockerManager(), { DockerManager });
+module.exports = dockerManagerInstance;

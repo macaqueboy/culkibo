@@ -1,4 +1,38 @@
 const API_BASE = '/api';
+const TOKEN_STORAGE_KEY = 'culkibo_control_token';
+
+export function getAuthToken(): string | null {
+  try {
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setAuthToken(token: string): void {
+  try {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // Entornos sin storage
+  }
+}
+
+export function clearAuthToken(): void {
+  try {
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // Entornos sin storage
+  }
+}
+
+export function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const token = getAuthToken();
+  const headers = new Headers(init.headers || {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  return window.fetch(input, { ...init, headers });
+}
 
 /**
  * El backend devuelve `{ error }` con el motivo en español en cada fallo. Sin
@@ -10,6 +44,39 @@ async function jsonOrThrow(res: Response, fallback: string) {
   const body = await res.json().catch(() => null);
   if (!res.ok) throw new Error((body && body.error) || fallback);
   return body;
+}
+
+export interface AuthSession {
+  authenticated: boolean;
+  method: string | null;
+  requireTokenAlways: boolean;
+  tokenConfigured: boolean;
+  tokenSource: string;
+}
+
+export interface LiveSyncStatus {
+  projectId: string;
+  targetDir: string;
+  connectedClients: number;
+  lastSeq: number;
+  framesApplied: number;
+  filesWritten: number;
+  filesDeleted: number;
+  dedupSkipped: number;
+  bytesSynced: number;
+  rollbacksCount: number;
+  driftDetected: boolean;
+  lastPath: string | null;
+  lastReason: string | null;
+  lastAppliedAt: string | null;
+  lastApplyMs: number | null;
+  historyDepth: number;
+  latencyMs: {
+    samples: number;
+    p50: number | null;
+    p95: number | null;
+    p99: number | null;
+  };
 }
 
 export interface ServiceCategory {
@@ -360,6 +427,7 @@ export interface LogEntry {
   timestamp: string;
   level: 'INFO' | 'DEBUG' | 'WARN' | 'ERROR' | 'HOT_SYNC' | 'SUCCESS';
   pod: string;
+  projectId?: string;
   message: string;
 }
 
@@ -588,47 +656,47 @@ export interface DeployLogEvent {
 
 export const api = {
   async getProjects(): Promise<Project[]> {
-    const res = await fetch(`${API_BASE}/projects`);
+    const res = await apiFetch(`${API_BASE}/projects`);
     return res.json();
   },
   async getProject(id: string): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects/${id}`);
+    const res = await apiFetch(`${API_BASE}/projects/${id}`);
     return res.json();
   },
   async createProject(data: any): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    const res = await apiFetch(`${API_BASE}/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
     return res.json();
   },
   async updateProject(id: string, data: any): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    const res = await apiFetch(`${API_BASE}/projects/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
     return res.json();
   },
   async deleteProject(id: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/projects/${id}`, { method: 'DELETE' });
+    const res = await apiFetch(`${API_BASE}/projects/${id}`, { method: 'DELETE' });
     return res.json();
   },
   async activateProject(id: string): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects/${id}/activate`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/projects/${id}/activate`, { method: 'POST' });
     return res.json();
   },
   async hibernateProject(id: string): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects/${id}/hibernate`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/projects/${id}/hibernate`, { method: 'POST' });
     return res.json();
   },
   async startLocal(id: string): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects/${id}/start-local`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/projects/${id}/start-local`, { method: 'POST' });
     return res.json();
   },
   async stopLocal(id: string): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects/${id}/stop-local`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/projects/${id}/stop-local`, { method: 'POST' });
     return res.json();
   },
   async stopProject(id: string): Promise<Project> {
-    const res = await fetch(`${API_BASE}/projects/${id}/stop`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/projects/${id}/stop`, { method: 'POST' });
     return res.json();
   },
   async previewCoolify(apiUrl: string, apiToken: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/import/coolify/preview`, {
+    const res = await apiFetch(`${API_BASE}/import/coolify/preview`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ apiUrl, apiToken })
@@ -637,7 +705,7 @@ export const api = {
     return res.json();
   },
   async importCoolify(apiUrl: string, apiToken: string, selectedApps: string[], selectedDbs: string[], selectedServices: string[]): Promise<any> {
-    const res = await fetch(`${API_BASE}/import/coolify`, {
+    const res = await apiFetch(`${API_BASE}/import/coolify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ apiUrl, apiToken, selectedApps, selectedDbs, selectedServices })
@@ -646,7 +714,7 @@ export const api = {
     return res.json();
   },
   async migrateDomain(hostname: string, serverIp: string, autoCloudflare: boolean): Promise<any> {
-    const res = await fetch(`${API_BASE}/import/coolify/migrate-domain`, {
+    const res = await apiFetch(`${API_BASE}/import/coolify/migrate-domain`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hostname, serverIp, autoCloudflare })
@@ -655,7 +723,7 @@ export const api = {
     return res.json();
   },
   async migrateDomainsBatch(domains: string[], serverIp: string, autoCloudflare: boolean): Promise<any> {
-    const res = await fetch(`${API_BASE}/import/coolify/migrate-domains-batch`, {
+    const res = await apiFetch(`${API_BASE}/import/coolify/migrate-domains-batch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ domains, serverIp, autoCloudflare })
@@ -664,17 +732,17 @@ export const api = {
     return res.json();
   },
   async getServerIp(): Promise<{ ip: string | null }> {
-    const res = await fetch(`${API_BASE}/server/ip`);
+    const res = await apiFetch(`${API_BASE}/server/ip`);
     if (!res.ok) return { ip: null };
     return res.json();
   },
   async getPods(): Promise<PodsData> {
-    const res = await fetch(`${API_BASE}/pods`);
+    const res = await apiFetch(`${API_BASE}/pods`);
     return res.json();
   },
 
   async triggerHotSync(changedFile = 'src/app.ts'): Promise<{ success: boolean; syncDurationMs: number; reloadsTotal: number }> {
-    const res = await fetch(`${API_BASE}/pods/hot-sync`, {
+    const res = await apiFetch(`${API_BASE}/pods/hot-sync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ changedFile })
@@ -683,7 +751,7 @@ export const api = {
   },
 
   async switchTraffic(forgePercent: number, citadelPercent: number): Promise<any> {
-    const res = await fetch(`${API_BASE}/pods/switch-traffic`, {
+    const res = await apiFetch(`${API_BASE}/pods/switch-traffic`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ forgePercent, citadelPercent })
@@ -692,7 +760,7 @@ export const api = {
   },
 
   async deployRelease(imageTag: string, description: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/pods/deploy`, {
+    const res = await apiFetch(`${API_BASE}/pods/deploy`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ imageTag, description })
@@ -701,7 +769,7 @@ export const api = {
   },
 
   async getDomains(): Promise<{ domains: DomainItem[] }> {
-    const res = await fetch(`${API_BASE}/domains`);
+    const res = await apiFetch(`${API_BASE}/domains`);
     return res.json();
   },
 
@@ -713,7 +781,7 @@ export const api = {
     cloudflareProxied?: boolean;
     autoCreateDns?: boolean;
   }): Promise<DomainItem> {
-    const res = await fetch(`${API_BASE}/domains`, {
+    const res = await apiFetch(`${API_BASE}/domains`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -726,7 +794,7 @@ export const api = {
   },
 
   async updateDomain(id: string, updates: Partial<DomainItem>): Promise<DomainItem> {
-    const res = await fetch(`${API_BASE}/domains/${id}`, {
+    const res = await apiFetch(`${API_BASE}/domains/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates)
@@ -739,7 +807,7 @@ export const api = {
   },
 
   async toggleDomainProxy(id: string): Promise<DomainItem> {
-    const res = await fetch(`${API_BASE}/domains/${id}/toggle-proxy`, {
+    const res = await apiFetch(`${API_BASE}/domains/${id}/toggle-proxy`, {
       method: 'POST'
     });
     if (!res.ok) {
@@ -750,12 +818,12 @@ export const api = {
   },
 
   async deleteDomain(id: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/domains/${id}`, { method: 'DELETE' });
+    const res = await apiFetch(`${API_BASE}/domains/${id}`, { method: 'DELETE' });
     return res.json();
   },
 
   async verifyDns(hostname: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/domains/verify-dns`, {
+    const res = await apiFetch(`${API_BASE}/domains/verify-dns`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hostname })
@@ -764,12 +832,12 @@ export const api = {
   },
 
   async getWatcherStatus(): Promise<{ isWatching: boolean; directory: string | null; fileWatchersActive: number }> {
-    const res = await fetch(`${API_BASE}/watcher/status`);
+    const res = await apiFetch(`${API_BASE}/watcher/status`);
     return res.json();
   },
 
   async startWatcher(directory?: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/watcher/start`, {
+    const res = await apiFetch(`${API_BASE}/watcher/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ directory })
@@ -778,14 +846,14 @@ export const api = {
   },
 
   async stopWatcher(): Promise<any> {
-    const res = await fetch(`${API_BASE}/watcher/stop`, {
+    const res = await apiFetch(`${API_BASE}/watcher/stop`, {
       method: 'POST'
     });
     return res.json();
   },
 
   async getIngressResolution(hostname: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/ingress/resolve?hostname=${encodeURIComponent(hostname)}`);
+    const res = await apiFetch(`${API_BASE}/ingress/resolve?hostname=${encodeURIComponent(hostname)}`);
     return res.json();
   },
 
@@ -794,18 +862,18 @@ export const api = {
     const qs = new URLSearchParams();
     if (opts.probe === false) qs.set('probe', '0');
     if (opts.force) qs.set('force', '1');
-    const res = await fetch(`${API_BASE}/ingress/status?${qs.toString()}`);
+    const res = await apiFetch(`${API_BASE}/ingress/status?${qs.toString()}`);
     if (!res.ok) throw new Error((await res.json()).error || 'No se pudo consultar el ingress');
     return res.json();
   },
 
   async reconcileIngress(): Promise<IngressOutcome> {
-    const res = await fetch(`${API_BASE}/ingress/reconcile`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/ingress/reconcile`, { method: 'POST' });
     return res.json();
   },
 
   async startIngress(): Promise<any> {
-    const res = await fetch(`${API_BASE}/ingress/start`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/ingress/start`, { method: 'POST' });
     return res.json();
   },
 
@@ -818,7 +886,7 @@ export const api = {
     cloudflareProxied?: boolean;
     autoCreateDns?: boolean;
   }): Promise<{ domain: DomainItem; project: Project; ingress: IngressOutcome }> {
-    const res = await fetch(`${API_BASE}/projects/${projectId}/domains`, {
+    const res = await apiFetch(`${API_BASE}/projects/${projectId}/domains`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -833,7 +901,7 @@ export const api = {
   /** Desvincula un dominio: borra el registro Y retira la ruta. */
   async detachDomainFromProject(projectId: string, domainId: string, keepDomain = false): Promise<any> {
     const qs = keepDomain ? '?keepDomain=1' : '';
-    const res = await fetch(`${API_BASE}/projects/${projectId}/domains/${domainId}${qs}`, { method: 'DELETE' });
+    const res = await apiFetch(`${API_BASE}/projects/${projectId}/domains/${domainId}${qs}`, { method: 'DELETE' });
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.error || 'No se pudo desvincular el dominio');
@@ -842,7 +910,7 @@ export const api = {
   },
 
   async getCertificates(): Promise<{ certificates: SslCertificate[] }> {
-    const res = await fetch(`${API_BASE}/ssl/certificates`);
+    const res = await apiFetch(`${API_BASE}/ssl/certificates`);
     return res.json();
   },
 
@@ -852,7 +920,7 @@ export const api = {
    * que devolverles el error explicativo en vez de un 404.
    */
   async issueWildcardSsl(domain: string, zoneId?: string, provider = 'lets_encrypt'): Promise<any> {
-    const res = await fetch(`${API_BASE}/ssl/issue-wildcard`, {
+    const res = await apiFetch(`${API_BASE}/ssl/issue-wildcard`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ domain, zoneId, provider })
@@ -861,7 +929,7 @@ export const api = {
   },
 
   async issueOnDemandSslip(ip = '127.0.0.1', service = 'sslip.io'): Promise<any> {
-    const res = await fetch(`${API_BASE}/ssl/issue-ondemand-sslip`, {
+    const res = await apiFetch(`${API_BASE}/ssl/issue-ondemand-sslip`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ip, service })
@@ -870,12 +938,12 @@ export const api = {
   },
 
   async getCloudflareConfig(): Promise<any> {
-    const res = await fetch(`${API_BASE}/cloudflare/config`);
+    const res = await apiFetch(`${API_BASE}/cloudflare/config`);
     return res.json();
   },
 
   async saveCloudflareConfig(payload: { apiToken?: string; accountId?: string; useMock?: boolean }): Promise<any> {
-    const res = await fetch(`${API_BASE}/cloudflare/config`, {
+    const res = await apiFetch(`${API_BASE}/cloudflare/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -884,7 +952,7 @@ export const api = {
   },
 
   async verifyCloudflareToken(apiToken?: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/cloudflare/verify-token`, {
+    const res = await apiFetch(`${API_BASE}/cloudflare/verify-token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ apiToken })
@@ -893,22 +961,22 @@ export const api = {
   },
 
   async getCloudflareZones(): Promise<any> {
-    const res = await fetch(`${API_BASE}/cloudflare/zones`);
+    const res = await apiFetch(`${API_BASE}/cloudflare/zones`);
     return res.json();
   },
 
   async getCloudflareRecords(zoneId: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/cloudflare/zones/${zoneId}/dns-records`);
+    const res = await apiFetch(`${API_BASE}/cloudflare/zones/${zoneId}/dns-records`);
     return res.json();
   },
 
   async getCloudflareTunnels(): Promise<any> {
-    const res = await fetch(`${API_BASE}/cloudflare/tunnels`);
+    const res = await apiFetch(`${API_BASE}/cloudflare/tunnels`);
     return res.json();
   },
 
   async createCloudflareTunnel(name: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/cloudflare/tunnels`, {
+    const res = await apiFetch(`${API_BASE}/cloudflare/tunnels`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name })
@@ -923,17 +991,17 @@ export const api = {
     if (params.limit) qs.set('limit', String(params.limit));
     if (params.search) qs.set('search', params.search);
     if (params.projectId) qs.set('projectId', params.projectId);
-    const res = await fetch(`${API_BASE}/logs?${qs.toString()}`);
+    const res = await apiFetch(`${API_BASE}/logs?${qs.toString()}`);
     return res.json();
   },
 
   async getMcpTools(): Promise<{ tools: any[] }> {
-    const res = await fetch(`${API_BASE}/mcp/tools`);
+    const res = await apiFetch(`${API_BASE}/mcp/tools`);
     return res.json();
   },
 
   async executeMcpTool(name: string, args: any = {}): Promise<any> {
-    const res = await fetch(`${API_BASE}/mcp/message`, {
+    const res = await apiFetch(`${API_BASE}/mcp/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -947,27 +1015,27 @@ export const api = {
   },
 
   async getMcpAudit(): Promise<{ auditLog: McpAuditEntry[] }> {
-    const res = await fetch(`${API_BASE}/mcp/audit`);
+    const res = await apiFetch(`${API_BASE}/mcp/audit`);
     return res.json();
   },
 
   async getMcpConfig(): Promise<any> {
-    const res = await fetch(`${API_BASE}/mcp/config`);
+    const res = await apiFetch(`${API_BASE}/mcp/config`);
     return res.json();
   },
 
   async getSystemStatus(): Promise<any> {
-    const res = await fetch(`${API_BASE}/system/status`);
+    const res = await apiFetch(`${API_BASE}/system/status`);
     return res.json();
   },
 
   async getGitHubStatus(): Promise<GitHubStatus> {
-    const res = await fetch(`${API_BASE}/github/status`);
+    const res = await apiFetch(`${API_BASE}/github/status`);
     return res.json();
   },
 
   async connectGitHub(token: string): Promise<{ success: boolean; user: GitHubUser }> {
-    const res = await fetch(`${API_BASE}/github/connect`, {
+    const res = await apiFetch(`${API_BASE}/github/connect`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token })
@@ -980,7 +1048,7 @@ export const api = {
   },
 
   async disconnectGitHub(): Promise<{ success: boolean }> {
-    const res = await fetch(`${API_BASE}/github/disconnect`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE}/github/disconnect`, { method: 'POST' });
     return res.json();
   },
 
@@ -990,7 +1058,7 @@ export const api = {
     if (params.perPage) qs.set('perPage', String(params.perPage));
     if (params.search) qs.set('search', params.search);
     if (params.sort) qs.set('sort', params.sort);
-    const res = await fetch(`${API_BASE}/github/repos?${qs.toString()}`);
+    const res = await apiFetch(`${API_BASE}/github/repos?${qs.toString()}`);
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.error || 'Error al obtener repositorios');
@@ -999,7 +1067,7 @@ export const api = {
   },
 
   async getGitHubBranches(owner: string, repo: string): Promise<GitHubBranch[]> {
-    const res = await fetch(`${API_BASE}/github/repos/${owner}/${repo}/branches`);
+    const res = await apiFetch(`${API_BASE}/github/repos/${owner}/${repo}/branches`);
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.error || 'Error al obtener ramas');
@@ -1008,7 +1076,7 @@ export const api = {
   },
 
   async autoDetectGitHub(owner: string, repo: string, branch = 'main'): Promise<GitHubAutoDetectResult> {
-    const res = await fetch(`${API_BASE}/github/auto-detect`, {
+    const res = await apiFetch(`${API_BASE}/github/auto-detect`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ owner, repo, branch })
@@ -1023,21 +1091,21 @@ export const api = {
   // --- BASES DE DATOS GESTIONADAS ---
 
   async getDbEngines(): Promise<{ engines: DbEngine[] }> {
-    return jsonOrThrow(await fetch(`${API_BASE}/databases/engines`), 'Error al leer el catálogo de motores');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/databases/engines`), 'Error al leer el catálogo de motores');
   },
 
   async getDbDockerStatus(): Promise<{ available: boolean; reason: string | null }> {
-    return jsonOrThrow(await fetch(`${API_BASE}/databases/status`), 'Error al consultar Docker');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/databases/status`), 'Error al consultar Docker');
   },
 
   async getDatabases(projectId?: string): Promise<{ databases: ManagedDatabase[] }> {
     const q = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
-    return jsonOrThrow(await fetch(`${API_BASE}/databases${q}`), 'Error al listar bases de datos');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/databases${q}`), 'Error al listar bases de datos');
   },
 
   async createDatabase(data: Record<string, unknown>): Promise<ManagedDatabase & { connectionString: string }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases`, {
+      await apiFetch(`${API_BASE}/databases`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
       }),
       'Error al aprovisionar la base de datos'
@@ -1049,23 +1117,23 @@ export const api = {
     if (opts.deleteVolume) q.set('deleteVolume', 'true');
     if (opts.deleteBackups) q.set('deleteBackups', 'true');
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/${id}?${q.toString()}`, { method: 'DELETE' }),
+      await apiFetch(`${API_BASE}/databases/${id}?${q.toString()}`, { method: 'DELETE' }),
       'Error al eliminar la base de datos'
     );
   },
 
   /** Devuelve la contraseña en claro. Sólo a petición explícita del usuario. */
   async getDatabaseCredentials(id: string): Promise<DbCredentials> {
-    return jsonOrThrow(await fetch(`${API_BASE}/databases/${id}/credentials`), 'Error al leer las credenciales');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/databases/${id}/credentials`), 'Error al leer las credenciales');
   },
 
   async refreshDatabaseHealth(id: string): Promise<ManagedDatabase> {
-    return jsonOrThrow(await fetch(`${API_BASE}/databases/${id}/health`), 'Error al comprobar el estado');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/databases/${id}/health`), 'Error al comprobar el estado');
   },
 
   async controlDatabase(id: string, action: 'start' | 'stop' | 'restart'): Promise<ManagedDatabase> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/${id}/${action}`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/databases/${id}/${action}`, { method: 'POST' }),
       'Error al cambiar el estado de la base de datos'
     );
   },
@@ -1075,7 +1143,7 @@ export const api = {
     body: { enabled: boolean; hostPort?: number; bindAddress?: string; acknowledgeRisk?: boolean }
   ): Promise<ManagedDatabase & { warning: string | null }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/${id}/exposure`, {
+      await apiFetch(`${API_BASE}/databases/${id}/exposure`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'Error al cambiar la exposición'
@@ -1083,19 +1151,19 @@ export const api = {
   },
 
   async getDatabaseBackups(id: string): Promise<{ backups: DbBackup[] }> {
-    return jsonOrThrow(await fetch(`${API_BASE}/databases/${id}/backups`), 'Error al listar las copias');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/databases/${id}/backups`), 'Error al listar las copias');
   },
 
   async runDatabaseBackup(id: string): Promise<{ success: boolean; backup: DbBackup }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/${id}/backups`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/databases/${id}/backups`, { method: 'POST' }),
       'Error al ejecutar la copia'
     );
   },
 
   async restoreDatabase(id: string, body: { backupId?: string; remoteKey?: string }): Promise<any> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/${id}/restore`, {
+      await apiFetch(`${API_BASE}/databases/${id}/restore`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'Error al restaurar'
@@ -1104,7 +1172,7 @@ export const api = {
 
   async setDatabaseSchedule(id: string, body: { enabled: boolean; cron?: string }): Promise<ManagedDatabase> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/${id}/schedule`, {
+      await apiFetch(`${API_BASE}/databases/${id}/schedule`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'Error al guardar la programación'
@@ -1113,7 +1181,7 @@ export const api = {
 
   async setDatabaseRetention(id: string, body: { daily: number; weekly: number }): Promise<ManagedDatabase> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/${id}/retention`, {
+      await apiFetch(`${API_BASE}/databases/${id}/retention`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'Error al guardar la retención'
@@ -1121,12 +1189,12 @@ export const api = {
   },
 
   async getDbStorage(): Promise<DbStorageConfig> {
-    return jsonOrThrow(await fetch(`${API_BASE}/databases/storage`), 'Error al leer el almacenamiento remoto');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/databases/storage`), 'Error al leer el almacenamiento remoto');
   },
 
   async setDbStorage(body: Record<string, unknown> | null): Promise<DbStorageConfig> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/storage`, {
+      await apiFetch(`${API_BASE}/databases/storage`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'Error al guardar el almacenamiento remoto'
@@ -1135,7 +1203,7 @@ export const api = {
 
   async testDbStorage(): Promise<{ success: boolean; endpoint: string; bucket: string }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/databases/storage/test`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/databases/storage/test`, { method: 'POST' }),
       'Error al probar el almacenamiento remoto'
     );
   },
@@ -1143,26 +1211,26 @@ export const api = {
   // --- Despliegue a producción ---
 
   async getDeployStatus(projectId: string): Promise<DeployStatus> {
-    return jsonOrThrow(await fetch(`${API_BASE}/projects/${projectId}/deploy/status`), 'Error al leer el estado del despliegue');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/projects/${projectId}/deploy/status`), 'Error al leer el estado del despliegue');
   },
 
   async getDeployments(projectId: string, limit = 20): Promise<{ deployments: Deployment[] }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/projects/${projectId}/deployments?limit=${limit}`),
+      await apiFetch(`${API_BASE}/projects/${projectId}/deployments?limit=${limit}`),
       'Error al leer el historial de despliegues'
     );
   },
 
   async getDeployment(projectId: string, deployId: string): Promise<Deployment> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/projects/${projectId}/deployments/${deployId}`),
+      await apiFetch(`${API_BASE}/projects/${projectId}/deployments/${deployId}`),
       'Error al leer el despliegue'
     );
   },
 
   async getDeployStrategy(projectId: string): Promise<DeployStrategyPreview> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/projects/${projectId}/deploy/strategy`),
+      await apiFetch(`${API_BASE}/projects/${projectId}/deploy/strategy`),
       'Error al analizar el proyecto'
     );
   },
@@ -1170,7 +1238,7 @@ export const api = {
   /** Responde 202 en cuanto arranca: el progreso llega por WebSocket. */
   async startDeploy(projectId: string, body: { commit?: string } = {}): Promise<{ accepted: boolean; message: string }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/projects/${projectId}/deploy`, {
+      await apiFetch(`${API_BASE}/projects/${projectId}/deploy`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'No se pudo iniciar el despliegue'
@@ -1179,21 +1247,21 @@ export const api = {
 
   async rollbackDeploy(projectId: string): Promise<Deployment> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/projects/${projectId}/rollback`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/projects/${projectId}/rollback`, { method: 'POST' }),
       'No se pudo revertir'
     );
   },
 
   async stopDeploy(projectId: string): Promise<{ stopped: boolean; reason?: string; error?: string | null }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/projects/${projectId}/deploy/stop`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/projects/${projectId}/deploy/stop`, { method: 'POST' }),
       'No se pudo detener el servicio'
     );
   },
 
   async resumeDeploy(projectId: string): Promise<{ started: boolean; reason?: string; error?: string | null }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/projects/${projectId}/deploy/start`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/projects/${projectId}/deploy/start`, { method: 'POST' }),
       'No se pudo reanudar el servicio'
     );
   },
@@ -1201,16 +1269,16 @@ export const api = {
   // --- Catálogo de servicios de un clic ---
 
   async getCatalog(): Promise<{ templates: ServiceTemplate[]; categories: ServiceCategory[] }> {
-    return jsonOrThrow(await fetch(`${API_BASE}/catalog`), 'No se pudo cargar el catálogo');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/catalog`), 'No se pudo cargar el catálogo');
   },
 
   async getInstallations(): Promise<{ installations: ServiceInstallation[] }> {
-    return jsonOrThrow(await fetch(`${API_BASE}/catalog/installations`), 'No se pudieron cargar los servicios instalados');
+    return jsonOrThrow(await apiFetch(`${API_BASE}/catalog/installations`), 'No se pudieron cargar los servicios instalados');
   },
 
   async installService(body: { templateId: string; name?: string; domain?: string | null }): Promise<ServiceInstallation> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/catalog/install`, {
+      await apiFetch(`${API_BASE}/catalog/install`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -1221,38 +1289,101 @@ export const api = {
 
   async getInstallationSecrets(id: string): Promise<ServiceSecrets> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/catalog/installations/${id}/secrets`),
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/secrets`),
       'No se pudieron obtener las credenciales'
     );
   },
 
   async getInstallationLogs(id: string, lines = 300): Promise<{ output: string }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/catalog/installations/${id}/logs?lines=${lines}`),
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/logs?lines=${lines}`),
       'No se pudieron leer los registros'
     );
   },
 
   async controlInstallation(id: string, action: 'start' | 'stop' | 'restart'): Promise<ServiceInstallation> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/catalog/installations/${id}/${action}`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/${action}`, { method: 'POST' }),
       'No se pudo cambiar el estado del servicio'
     );
   },
 
   async refreshInstallationHealth(id: string): Promise<ServiceInstallation> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/catalog/installations/${id}/health`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/health`, { method: 'POST' }),
       'No se pudo comprobar la salud del servicio'
     );
   },
 
   async removeInstallation(id: string, deleteVolumes = false): Promise<{ removed: boolean }> {
     return jsonOrThrow(
-      await fetch(`${API_BASE}/catalog/installations/${id}?deleteVolumes=${deleteVolumes ? '1' : '0'}`, {
+      await apiFetch(`${API_BASE}/catalog/installations/${id}?deleteVolumes=${deleteVolumes ? '1' : '0'}`, {
         method: 'DELETE'
       }),
       'No se pudo desinstalar el servicio'
+    );
+  },
+
+  // --- Autenticación del plano de control ---
+
+  async getAuthSession(): Promise<AuthSession> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/auth/session`), 'No se pudo verificar la sesión');
+  },
+
+  async verifyAuthToken(token: string): Promise<{ valid: boolean }> {
+    return jsonOrThrow(
+      await window.fetch(`${API_BASE}/auth/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ token })
+      }),
+      'Token inválido'
+    );
+  },
+
+  // --- Live Sync (The Forge) ---
+
+  async getSyncStatus(projectId: string): Promise<LiveSyncStatus> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/projects/${projectId}/sync/status`), 'No se pudo consultar el estado de sincronización');
+  },
+
+  async verifyProjectSync(projectId: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/sync/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      }),
+      'No se pudo verificar el árbol Merkle'
+    );
+  },
+
+  async rollbackProjectSync(projectId: string, steps = 1): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/sync/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ steps })
+      }),
+      'No se pudo revertir el último parche'
+    );
+  },
+
+  async promoteForge(projectId: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/sync/promote`, { method: 'POST' }),
+      'No se pudo promocionar el espacio de trabajo a producción'
+    );
+  },
+
+  async configureWildcardDns01(domain: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/wildcard-dns01`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain })
+      }),
+      'No se pudo configurar el certificado wildcard DNS-01 en Caddy'
     );
   }
 };

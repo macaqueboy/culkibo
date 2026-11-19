@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useDeferredValue } from 'react';
 import { Play, Pause, Trash2, Download, Search, Terminal } from 'lucide-react';
 import type { LogEntry } from '../lib/api';
 import { api } from '../lib/api';
@@ -8,13 +8,20 @@ interface LiveLogsProps {
   projectId?: string;
 }
 
+const MAX_RENDERED_LOGS = 1000;
+
 export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selectedPod, setSelectedPod] = useState<string>('all');
   const [selectedLevel, setSelectedLevel] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const deferredSearch = useDeferredValue(searchQuery);
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const terminalEndRef = useRef<HTMLDivElement>(null);
+  // Contrapresión: las líneas del WebSocket se acumulan en un ref y se vuelcan
+  // como máximo una vez por fotograma (<=60 renders/s aunque entren 5.000/s).
+  const pendingRef = useRef<LogEntry[]>([]);
+  const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
     const params: any = { limit: 120 };
@@ -25,15 +32,31 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
   }, [projectId]);
 
   useEffect(() => {
-    if (incomingLog && !isPaused) {
-      setLogs((prev) => [incomingLog, ...prev.slice(0, 500)]);
+    if (!incomingLog || isPaused) return;
+    if (projectId && incomingLog.projectId && incomingLog.projectId !== 'global' && incomingLog.projectId !== projectId) {
+      return;
     }
-  }, [incomingLog, isPaused]);
+    pendingRef.current.unshift(incomingLog);
+    if (rafRef.current === null) {
+      rafRef.current = window.requestAnimationFrame(() => {
+        rafRef.current = null;
+        const batch = pendingRef.current;
+        pendingRef.current = [];
+        if (batch.length > 0) {
+          setLogs((prev) => [...batch, ...prev].slice(0, MAX_RENDERED_LOGS));
+        }
+      });
+    }
+  }, [incomingLog, isPaused, projectId]);
+
+  useEffect(() => () => {
+    if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
+  }, []);
 
   const filteredLogs = logs.filter((log) => {
     if (selectedPod !== 'all' && log.pod !== selectedPod) return false;
     if (selectedLevel !== 'all' && log.level !== selectedLevel.toUpperCase()) return false;
-    if (searchQuery && !log.message.toLowerCase().includes(searchQuery.toLowerCase())) return false;
+    if (deferredSearch && !log.message.toLowerCase().includes(deferredSearch.toLowerCase())) return false;
     return true;
   });
 

@@ -70,9 +70,30 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify }) => {
       setLoading(false);
     }
   };
-  loadRef.current = load;
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    loadRef.current = load;
+  });
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([api.getCatalog(), api.getInstallations()])
+      .then(([cat, inst]) => {
+        if (!active) return;
+        setTemplates(cat.templates);
+        setCategories(cat.categories);
+        setInstallations(inst.installations);
+        setLoadError(null);
+      })
+      .catch((err) => {
+        if (!active) return;
+        setLoadError(err instanceof Error ? err.message : 'No se pudo cargar el catálogo');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, []);
 
   // Mientras haya algo instalándose se refresca solo. El progreso llega también
   // por WebSocket, pero el sondeo es lo que hace que recargar la página no

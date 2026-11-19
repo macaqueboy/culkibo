@@ -198,9 +198,11 @@ function resolveEnv(env, context) {
 class CatalogManager extends EventEmitter {
   constructor() {
     super();
+    /** @type {{ version: number, installations: any[] }} */
     this.state = { version: 1, installations: [] };
+    /** @type {Buffer | null} */
     this.key = null;
-    /** Instalaciones en curso en ESTE proceso, para no lanzar dos a la vez. */
+    /** @type {Set<string>} Instalaciones en curso en ESTE proceso, para no lanzar dos a la vez. */
     this.inFlight = new Set();
     this.ensureDirs();
     this.load();
@@ -417,6 +419,7 @@ class CatalogManager extends EventEmitter {
       secrets[key] = generateSecret(spec);
     }
 
+    /** @type {any} */
     const record = {
       id,
       templateId: tpl.id,
@@ -493,6 +496,7 @@ class CatalogManager extends EventEmitter {
     await databaseManager.ensureNetwork(record.id);
 
     // --- 2. Base de datos gestionada ---------------------------------------
+    /** @type {any} */
     let dbContext = null;
     if (tpl.database) {
       this.setProgress(record, 'base_datos', `Aprovisionando ${tpl.database.engine}`);
@@ -840,7 +844,7 @@ class CatalogManager extends EventEmitter {
 
   async logs(id, { lines = 200 } = {}) {
     const record = this.mustGet(id);
-    const count = Math.max(1, Math.min(2000, parseInt(lines, 10) || 200));
+    const count = Math.max(1, Math.min(2000, parseInt(String(lines), 10) || 200));
     const { stdout, stderr } = await this.docker(
       ['logs', '--tail', String(count), record.containerName],
       { timeout: 20000 }
@@ -864,7 +868,13 @@ class CatalogManager extends EventEmitter {
    */
   async remove(id, { deleteVolumes = false } = {}) {
     const record = this.mustGet(id);
-    const removed = { containers: [], volumes: [], network: null, database: null, domain: null };
+    const removed = {
+      containers: /** @type {string[]} */ ([]),
+      volumes: /** @type {string[]} */ ([]),
+      network: /** @type {string | null} */ (null),
+      database: /** @type {string | null} */ (null),
+      domain: /** @type {string | null} */ (null)
+    };
 
     if (await this.isDockerAvailable()) {
       for (const name of this.allContainerNames(record)) {
@@ -985,6 +995,7 @@ class CatalogManager extends EventEmitter {
    */
   getSecrets(id) {
     const record = this.mustGet(id);
+    /** @type {any} */
     const out = { id: record.id, name: record.name, secrets: this.decryptSecrets(record), database: null };
     if (record.databaseId) {
       try { out.database = databaseManager.getCredentials(record.databaseId); } catch (e) {}
@@ -998,10 +1009,13 @@ class CatalogManager extends EventEmitter {
   }
 }
 
-module.exports = new CatalogManager();
-module.exports.CatalogManager = CatalogManager;
-module.exports.resolvePlaceholders = resolvePlaceholders;
-module.exports.resolveEnv = resolveEnv;
-module.exports.generateSecret = generateSecret;
-module.exports.STEPS = STEPS;
-module.exports.PORT_RANGE = { start: PORT_RANGE_START, end: PORT_RANGE_END };
+const catalogManager = Object.assign(new CatalogManager(), {
+  CatalogManager,
+  resolvePlaceholders,
+  resolveEnv,
+  generateSecret,
+  STEPS,
+  PORT_RANGE: { start: PORT_RANGE_START, end: PORT_RANGE_END }
+});
+
+module.exports = catalogManager;
