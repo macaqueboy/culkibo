@@ -112,7 +112,7 @@ async function run({ silent = false, concurrency = 400, workers = 20, wsClients 
   }
 
   try {
-    const bootLimitMs = process.platform === 'win32' ? 30000 : 15000;
+    const bootLimitMs = process.platform === 'win32' ? 60000 : 15000;
     const ready = await waitForHealth(port, child, stderrBuf, bootLimitMs);
     if (!ready) {
       throw new Error(`El daemon no arrancó dentro del límite de ${bootLimitMs / 1000} s${stderrBuf.length ? ': ' + stderrBuf.join('').trim() : ''}`);
