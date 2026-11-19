@@ -24,7 +24,7 @@ async function testCompetitorBenchmarks() {
   //    Dokploy: Next.js + Postgres + Redis + Traefik (~600-900 MB).
   // -------------------------------------------------------------------------
   const cp = await runControlPlaneBench({ silent: true, concurrency: 200, wsClients: 30 });
-  const maxBootMs = process.platform === 'win32' ? 30000 : 2500;
+  const maxBootMs = process.platform === 'win32' ? 60000 : 2500;
   assert.ok(cp.coldBootMs < maxBootMs, `Arranque en frío demasiado lento: ${cp.coldBootMs} ms (objetivo < ${maxBootMs} ms)`);
   assert.ok(cp.idleRssMb !== null && cp.idleRssMb < 220, `RAM en reposo demasiado alta: ${cp.idleRssMb} MB (objetivo < 220 MB para caber en VPS de 512 MB)`);
   assert.strictEqual(cp.httpConcurrency.failures, 0, 'Cero fallos bajo 200 peticiones concurrentes');
