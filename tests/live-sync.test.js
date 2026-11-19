@@ -163,7 +163,8 @@ async function testLiveSync() {
 
     assert.strictEqual(body2, '<h1>v2-live-synced</h1>', 'El servidor HTTP vivo debe servir v2 tras el Commit Frame');
     assert.strictEqual(ack.mode, 'path_b_hot');
-    assert.ok(totalEndToEndMs < 1000, `Sincronización end-to-end tardó ${totalEndToEndMs}ms`);
+    const maxE2eMs = process.platform === 'win32' ? 3000 : 800;
+    assert.ok(totalEndToEndMs < maxE2eMs, `Sincronización end-to-end tardó ${totalEndToEndMs}ms (objetivo < ${maxE2eMs}ms)`);
 
     // Verificación Merkle post-sync: cero divergencia
     const finalLocalTree = computeMerkleTree(sourceDir);
