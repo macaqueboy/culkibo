@@ -24,8 +24,9 @@ async function testCatalog() {
   // -------------------------------------------------------------------------
   const problems = validateCatalog();
   assert.deepStrictEqual(problems, [], `El catálogo tiene problemas de formato:\n${problems.join('\n')}`);
-  assert.ok(TEMPLATES.length >= 10, 'El catálogo debe traer al menos diez plantillas');
-  console.log(`  ✓ ${TEMPLATES.length} plantillas válidas en ${CATEGORIES.length} categorías`);
+  assert.ok(TEMPLATES.length >= 14, 'El catálogo debe traer al menos catorce plantillas (incluyendo WordPress)');
+  assert.ok(TEMPLATES.some((t) => t.id === 'wordpress'), 'El catálogo debe incluir la plantilla de WordPress');
+  console.log(`  ✓ ${TEMPLATES.length} plantillas válidas en ${CATEGORIES.length} categorías (incluye WordPress)`);
 
   // -------------------------------------------------------------------------
   // 2. Ninguna imagen usa una etiqueta móvil
@@ -99,7 +100,7 @@ async function testCatalog() {
       assert.ok(used, `${tpl.id}: el secreto ${key} se genera pero no llega a ninguna variable`);
     }
   }
-  console.log('  ✓ Las 13 plantillas resuelven sus variables sin marcadores huérfanos');
+  console.log(`  ✓ Las ${TEMPLATES.length} plantillas resuelven sus variables sin marcadores huérfanos`);
 
   // -------------------------------------------------------------------------
   // 5. Un marcador desconocido revienta en vez de colarse

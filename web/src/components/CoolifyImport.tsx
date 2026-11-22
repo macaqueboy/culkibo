@@ -144,9 +144,9 @@ export const CoolifyImport: React.FC<{ onComplete: () => void, onCancel: () => v
   };
 
   const typeConfig = {
-    app: { icon: Server, label: 'App', color: 'blue', bgHover: 'hover:bg-blue-50', badge: 'bg-blue-100 text-blue-700' },
-    database: { icon: Database, label: 'BD', color: 'emerald', bgHover: 'hover:bg-emerald-50', badge: 'bg-emerald-100 text-emerald-700' },
-    service: { icon: Box, label: 'Servicio', color: 'purple', bgHover: 'hover:bg-purple-50', badge: 'bg-purple-100 text-purple-700' },
+    app: { icon: Server, label: 'App', checkboxClass: 'text-blue-600 focus:ring-blue-500', iconClass: 'text-blue-500', bgHover: 'hover:bg-blue-50', badge: 'bg-blue-100 text-blue-700' },
+    database: { icon: Database, label: 'BD', checkboxClass: 'text-emerald-600 focus:ring-emerald-500', iconClass: 'text-emerald-500', bgHover: 'hover:bg-emerald-50', badge: 'bg-emerald-100 text-emerald-700' },
+    service: { icon: Box, label: 'Servicio', checkboxClass: 'text-purple-600 focus:ring-purple-500', iconClass: 'text-purple-500', bgHover: 'hover:bg-purple-50', badge: 'bg-purple-100 text-purple-700' },
   };
 
   const getVolCount = (r: CoolifyResource) => r.local_persistent_volumes?.length || r.persistent_volumes?.length || r.volumes?.length || 0;
@@ -164,8 +164,8 @@ export const CoolifyImport: React.FC<{ onComplete: () => void, onCancel: () => v
 
     return (
       <label key={resource.uuid} className={`flex items-center gap-3 p-3 bg-white border border-slate-200 rounded-lg cursor-pointer ${cfg.bgHover} transition-colors`}>
-        <input type="checkbox" checked={isChecked} onChange={() => toggleResource(resource.uuid)} className={`w-4 h-4 rounded border-slate-300 text-${cfg.color}-600 focus:ring-${cfg.color}-500`} />
-        <Icon className={`w-4 h-4 text-${cfg.color}-500 flex-shrink-0`} />
+        <input type="checkbox" checked={isChecked} onChange={() => toggleResource(resource.uuid)} className={`w-4 h-4 rounded border-slate-300 ${cfg.checkboxClass}`} />
+        <Icon className={`w-4 h-4 ${cfg.iconClass} flex-shrink-0`} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium text-slate-900 truncate">{resource.name}</span>
@@ -359,7 +359,7 @@ export const CoolifyImport: React.FC<{ onComplete: () => void, onCancel: () => v
             {!hasCloudflare && (
               <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-sm">
                 <p className="font-medium text-slate-800 mb-2">Crea un registro A en tu proveedor DNS para cada dominio:</p>
-                <code className="block bg-slate-800 text-slate-100 p-2 rounded-lg">Tipo: A | Host: @ | Valor: {serverIp || '{serverIp}'} | TTL: 300</code>
+                <code className="block bg-white border border-slate-200 text-slate-800 font-mono text-xs p-2.5 rounded-lg">Tipo: A | Host: @ | Valor: {serverIp || '{serverIp}'} | TTL: 300</code>
               </div>
             )}
 

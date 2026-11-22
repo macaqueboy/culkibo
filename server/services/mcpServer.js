@@ -1,3 +1,4 @@
+const path = require('path');
 const { EventEmitter } = require('events');
 const containerOrchestrator = require('./containerOrchestrator');
 const domainManager = require('./domainManager');
@@ -14,6 +15,38 @@ const databaseManager = require('./databaseManager');
 const catalogManager = require('./catalogManager');
 const liveSyncEngine = require('./liveSyncEngine');
 const coolifyMigrator = require('./coolifyMigrator');
+const wordpressMigrator = require('./wordpressMigrator');
+const universalImporter = require('./universalImporter');
+
+const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars)/i;
+const REDACTED_RESULT_TOOLS = new Set([
+  'culkibo_database_credentials',
+  'culkibo_github_connect',
+  'culkibo_create_database',
+  'culkibo_set_project_env'
+]);
+
+/** Redacta recursivamente tokens, contraseñas y secretos antes de guardar o emitir auditoría MCP. */
+function redactForAudit(value, depth = 0) {
+  if (depth > 5) return '[…]';
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') {
+    if (/(ghp_|gho_|github_pat_|sk_|bearer\s+)/i.test(value)) return '***';
+    return value.length > 240 ? `${value.slice(0, 240)}…` : value;
+  }
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.slice(0, 25).map(v => redactForAudit(v, depth + 1));
+  /** @type {Record<string, any>} */
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (SENSITIVE_KEY_RE.test(k)) {
+      out[k] = typeof v === 'object' && v !== null ? '[oculto]' : '***';
+    } else {
+      out[k] = redactForAudit(v, depth + 1);
+    }
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Revisiones del protocolo.
@@ -192,10 +225,19 @@ class McpServer extends EventEmitter {
     super();
     this.auditLog = [];
     this.maxAuditLogs = 500;
+    /** @type {any[] | null} */
+    this._toolsCache = null;
+    /** @type {Map<string, any> | null} */
+    this._toolsByName = null;
+    /** @type {Buffer | null} */
+    this._toolsSerializedCache = null;
+    /** @type {any | null} */
+    this._discoverCache = null;
   }
 
   getToolsDefinition() {
-    return [
+    if (this._toolsCache) return this._toolsCache;
+    this._toolsCache = [
       {
         name: 'culkibo_create_project',
         title: 'Crear proyecto',
@@ -657,8 +699,8 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            keepStorage: { type: 'string', description: 'Espacio a conservar (p. ej. "5gb", "500mb")' },
-            olderThan: { type: 'string', description: 'Antigüedad mínima (p. ej. "168h")' }
+            keepStorageGb: { type: 'number', description: 'GB de caché a conservar (default 10)' },
+            untilHours: { type: 'number', description: 'Opcional: podar entradas con más de N horas de antigüedad' }
           }
         }
       },
@@ -733,7 +775,7 @@ class McpServer extends EventEmitter {
         name: 'culkibo_list_catalog_templates',
         title: 'Explorar catálogo de servicios de un clic',
         annotations: { readOnlyHint: true, openWorldHint: false },
-        description: 'Lista las 13 plantillas curadas del catálogo de un clic (n8n, Ghost, Plausible, Uptime Kuma, Metabase, MinIO, Gitea, Vaultwarden, Umami, Listmonk, NocoDB, Stirling-PDF, Redis Commander).',
+        description: 'Lista las 14 plantillas curadas del catálogo de un clic (WordPress, n8n, Ghost, Plausible, Uptime Kuma, Metabase, MinIO, Gitea, Vaultwarden, Umami, Listmonk, NocoDB, Stirling-PDF, Redis Commander).',
         inputSchema: {
           type: 'object',
           properties: { category: { type: 'string', description: 'Filtrar opcionalmente por categoría' } }
@@ -832,21 +874,90 @@ class McpServer extends EventEmitter {
           },
           required: ['coolifyUrl', 'apiToken']
         }
+      },
+
+      // --- Migrador de WordPress, Importador Compose y Acceso Remoto ---
+      {
+        name: 'culkibo_analyze_wordpress',
+        title: 'Analizar web WordPress para migración',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        description: 'Inspecciona una web WordPress en vivo (HTML + /wp-json) para detectar versión, tema, plugins, WooCommerce, Cloudflare y generar un plan de migración sin cortes a Culkibo.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'URL pública del sitio WordPress (p. ej. https://mitienda.com)' }
+          },
+          required: ['url']
+        }
+      },
+      {
+        name: 'culkibo_import_compose',
+        title: 'Importar stack desde Docker Compose',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        description: 'Analiza un archivo docker-compose.yml (mode: "parse") o lo importa como proyecto Culkibo (mode: "import"), detectando bases de datos y avisos de producción.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            yamlText: { type: 'string', description: 'Contenido completo del archivo docker-compose.yml' },
+            projectName: { type: 'string', description: 'Nombre del proyecto en Culkibo (opcional)' },
+            mode: { type: 'string', enum: ['parse', 'import'], description: 'parse solo analiza; import crea el proyecto (default parse)' }
+          },
+          required: ['yamlText']
+        }
+      },
+      {
+        name: 'culkibo_get_remote_access',
+        title: 'Consultar configuración de acceso remoto y agentes',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Devuelve el estado de acceso remoto del daemon (dominio del panel, túneles Cloudflare, endpoints MCP/WebSocket y plantillas listas para clientes de IA).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            serverUrl: { type: 'string', description: 'URL base del servidor Culkibo (opcional)' }
+          }
+        }
       }
     ];
+    this._toolsByName = new Map(this._toolsCache.map((t) => [t.name, t]));
+    return this._toolsCache;
+  }
+
+  /** Buffer JSON pre-serializado para GET /api/mcp/tools. */
+  getToolsSerialized() {
+    if (!this._toolsSerializedCache) {
+      const tools = this.getToolsDefinition();
+      this._toolsSerializedCache = Buffer.from(JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        tools,
+        count: tools.length
+      }), 'utf8');
+    }
+    return this._toolsSerializedCache;
+  }
+
+  getToolByName(toolName) {
+    if (!this._toolsByName) this.getToolsDefinition();
+    return (this._toolsByName && this._toolsByName.get(toolName)) || null;
   }
 
   logCall(toolName, args, result, success = true, durationMs = 0, transport = 'MCP stdio/sse') {
+    const safeArgs = redactForAudit(args);
+    let resultSummary;
+    if (REDACTED_RESULT_TOOLS.has(toolName) && success) {
+      resultSummary = '[resultado sensible ocultado en auditoría]';
+    } else if (typeof result === 'object' && result !== null) {
+      resultSummary = JSON.stringify(redactForAudit(result)).slice(0, 160);
+    } else {
+      resultSummary = String(redactForAudit(result));
+    }
     const entry = {
       id: `mcp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       timestamp: new Date().toISOString(),
       toolName,
-      args,
-      resultSummary: typeof result === 'object' ? JSON.stringify(result).slice(0, 160) : String(result),
+      args: safeArgs,
+      resultSummary,
       success,
       durationMs: Math.round(durationMs),
-      // El transporte deja de ser una cadena fija: ahora hay dos eras vivas y
-      // la auditoría tiene que decir por cuál entró cada llamada.
       transport,
       agent: `AI Assistant (${transport})`
     };
@@ -861,10 +972,6 @@ class McpServer extends EventEmitter {
   }
 
   /**
-   * Ejecuta una herramienta y devuelve el `CallToolResult` neutro respecto a la
-   * era: `resultType` lo añade solo el manejador moderno, porque 2024-11-05 no
-   * lo define y no queremos meterlo en respuestas de la era antigua.
-   *
    * @param {string} toolName
    * @param {any} args
    * @param {{ transport?: string }} [context]
@@ -872,7 +979,7 @@ class McpServer extends EventEmitter {
   async executeTool(toolName, args = {}, context = {}) {
     const start = performance.now();
     const transport = context.transport || 'MCP stdio/sse';
-    const tool = this.getToolsDefinition().find((t) => t.name === toolName);
+    const tool = this.getToolByName(toolName);
     try {
       if (!tool) {
         throw new McpToolError('UNKNOWN_TOOL', `Esta instalación de Culkibo no expone ninguna herramienta llamada '${toolName}'.`, {
@@ -958,6 +1065,7 @@ class McpServer extends EventEmitter {
             forgePercent: args.forgePercent !== undefined ? args.forgePercent : 100 - (args.citadelPercent || 0),
             citadelPercent: args.citadelPercent !== undefined ? args.citadelPercent : 100
           });
+          res = { ...res, ingress: await ingressManager.reconcile() };
           break;
 
         case 'culkibo_manage_domain':
@@ -1029,7 +1137,7 @@ class McpServer extends EventEmitter {
           if (args.action === 'start') {
             res = containerOrchestrator.watchDirectory(args.directory || process.cwd());
           } else if (args.action === 'stop') {
-            res = containerOrchestrator.stopWatching();
+            res = await containerOrchestrator.stopWatching();
           } else {
             res = containerOrchestrator.getWatcherStatus();
           }
@@ -1054,7 +1162,7 @@ class McpServer extends EventEmitter {
             targetPort: 3001,
             routingMode: 'direct_dns'
           });
-          res = { success: true, certificate: sslRes.cert, domain: newDom };
+          res = { success: true, certificate: sslRes.cert, domain: newDom, ingress: await ingressManager.reconcile() };
           break;
 
         case 'culkibo_get_logs':
@@ -1175,14 +1283,14 @@ class McpServer extends EventEmitter {
         case 'culkibo_rollback_deployment': {
           const project = projectManager.getById(args.projectId);
           if (!project) throw new McpToolError('NOT_FOUND', `Proyecto '${args.projectId}' no encontrado.`, { remediation: 'Usa culkibo_list_projects para obtener un projectId válido.' });
-          res = await deployManager.rollback(project);
+          res = await deployManager.rollback(project.id);
           break;
         }
 
         case 'culkibo_prune_build_cache': {
           res = await deployManager.pruneBuildCache({
-            keepStorage: args.keepStorage || undefined,
-            olderThan: args.olderThan || undefined
+            keepStorageGb: args.keepStorageGb !== undefined ? Number(args.keepStorageGb) : 10,
+            untilHours: args.untilHours !== undefined ? Number(args.untilHours) : null
           });
           break;
         }
@@ -1288,6 +1396,34 @@ class McpServer extends EventEmitter {
             await projectManager.flushToDisk();
             res = { mode: 'import', ...migration };
           }
+          break;
+        }
+
+        case 'culkibo_analyze_wordpress': {
+          res = await wordpressMigrator.analyzeSite(args.url);
+          break;
+        }
+
+        case 'culkibo_import_compose': {
+          if (args.mode === 'import') {
+            res = await universalImporter.importDockerCompose({
+              yamlText: args.yamlText,
+              projectName: args.projectName || ''
+            });
+          } else {
+            res = universalImporter.parseDockerCompose(args.yamlText);
+          }
+          break;
+        }
+
+        case 'culkibo_get_remote_access': {
+          const base = args.serverUrl || (ingressManager.panelDomain ? `https://${ingressManager.panelDomain}` : `http://localhost:${process.env.PORT || 3030}`);
+          res = {
+            panelDomain: ingressManager.panelDomain || null,
+            caddy: await caddyManager.detect(),
+            cloudflare: cloudflareService.getConfigStatus(),
+            clientConfigs: this.getClientConfigs(base)
+          };
           break;
         }
 
@@ -1424,24 +1560,25 @@ class McpServer extends EventEmitter {
    * sola llamada. La especificación la hace obligatoria.
    */
   getDiscoverResult() {
-    return {
-      supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
-      capabilities: {
-        // `listChanged: false` es la verdad: el catálogo es estático en el
-        // proceso, así que no prometemos notificaciones que nunca emitiríamos.
-        tools: { listChanged: false }
-      },
-      instructions: [
-        'Culkibo es un orquestador cloud autohospedado. Sus herramientas gestionan proyectos, pods (The Forge para desarrollo y The Citadel para producción), dominios, certificados TLS, contenedores Docker, copias de seguridad y la integración con GitHub.',
-        'Empieza por culkibo_list_projects y culkibo_list_pods para situarte antes de modificar nada.',
-        'Las herramientas anotadas con destructiveHint cambian tráfico en producción, sobrescriben credenciales o borran estado: confírmalas con la persona usuaria antes de llamarlas.',
-        'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation: úsalo para decidir si reintentar o corregir los argumentos.'
-      ].join(' '),
-      // El catálogo no depende de quién pregunte, así que la respuesta es
-      // cacheable por cualquiera.
-      ttlMs: 300000,
-      cacheScope: 'public'
-    };
+    if (!this._discoverCache) {
+      this._discoverCache = {
+        supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+        capabilities: {
+          // `listChanged: false` es la verdad: el catálogo es estático en el
+          // proceso, así que no prometemos notificaciones que nunca emitiríamos.
+          tools: { listChanged: false }
+        },
+        instructions: [
+          'Culkibo es un orquestador cloud autohospedado. Sus herramientas gestionan proyectos, pods (The Forge para desarrollo y The Citadel para producción), dominios, certificados TLS, contenedores Docker, copias de seguridad, migración WordPress/Compose/Coolify y la integración con GitHub.',
+          'Empieza por culkibo_list_projects y culkibo_list_pods para situarte antes de modificar nada.',
+          'Las herramientas anotadas con destructiveHint cambian tráfico en producción, sobrescriben credenciales o borran estado: confírmalas con la persona usuaria antes de llamarlas.',
+          'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation: úsalo para decidir si reintentar o corregir los argumentos.'
+        ].join(' '),
+        ttlMs: 300000,
+        cacheScope: 'public'
+      };
+    }
+    return this._discoverCache;
   }
 
   /**
@@ -1493,15 +1630,22 @@ class McpServer extends EventEmitter {
     };
   }
 
-  getClientConfigs(serverUrl = 'http://localhost:3030') {
+  getClientConfigs(serverUrl = 'http://localhost:3030', { includeAuthPlaceholder = false } = {}) {
+    const cleanUrl = String(serverUrl || 'http://localhost:3030').replace(/\/+$/, '');
+    const cliEntry = path.resolve(__dirname, '..', '..', 'bin', 'culkibo.js');
+    const isRemote = !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(cleanUrl);
+    const needAuth = includeAuthPlaceholder || isRemote;
+    const remoteHeaders = needAuth ? { Authorization: 'Bearer TU_CULKIBO_TOKEN' } : undefined;
+
     return {
       claudeDesktop: {
         mcpServers: {
           culkibo: {
             command: 'node',
-            args: ['c:\\Users\\pablo\\Desktop\\Culkibo\\bin\\culkibo.js', 'mcp'],
+            args: [cliEntry, 'mcp'],
             env: {
-              CULKIBO_API_URL: serverUrl
+              CULKIBO_API_URL: cleanUrl,
+              ...(needAuth ? { CULKIBO_TOKEN: 'TU_CULKIBO_TOKEN' } : {})
             }
           }
         }
@@ -1510,26 +1654,41 @@ class McpServer extends EventEmitter {
       cursorOrWindsurf: {
         mcpServers: {
           culkibo: {
-            url: `${serverUrl}/api/mcp`
+            url: `${cleanUrl}/api/mcp`,
+            ...(remoteHeaders ? { headers: remoteHeaders } : {})
           }
         }
       },
+      vscodeCopilot: {
+        servers: {
+          culkibo: {
+            type: 'http',
+            url: `${cleanUrl}/api/mcp`,
+            ...(remoteHeaders ? { headers: remoteHeaders } : {})
+          }
+        }
+      },
+      claudeCodeCli: needAuth
+        ? `claude mcp add --transport http culkibo ${cleanUrl}/api/mcp --header "Authorization: Bearer TU_CULKIBO_TOKEN"`
+        : `claude mcp add --transport http culkibo ${cleanUrl}/api/mcp`,
       // Solo para clientes que aún no hablan 2026-07-28. Ver README.
       legacySse: {
         deprecated: true,
         protocolVersion: LEGACY_PROTOCOL_VERSION,
-        note: `Transporte HTTP+SSE deprecado desde la revisión 2025-03-26. Migra a ${serverUrl}/api/mcp.`,
+        note: `Transporte HTTP+SSE deprecado desde la revisión 2025-03-26. Migra a ${cleanUrl}/api/mcp.`,
         mcpServers: {
           culkibo: {
-            url: `${serverUrl}/api/mcp/sse`
+            url: `${cleanUrl}/api/mcp/sse`,
+            ...(remoteHeaders ? { headers: remoteHeaders } : {})
           }
         }
       },
       protocol: {
         current: PROTOCOL_VERSION,
         supported: SUPPORTED_PROTOCOL_VERSIONS,
-        endpoint: `${serverUrl}/api/mcp`,
-        legacyEndpoint: `${serverUrl}/api/mcp/sse`
+        endpoint: `${cleanUrl}/api/mcp`,
+        legacyEndpoint: `${cleanUrl}/api/mcp/sse`,
+        wsUrl: `${cleanUrl.replace(/^http/, 'ws')}/ws/sync`
       }
     };
   }

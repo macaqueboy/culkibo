@@ -1,4 +1,6 @@
 const { spawn } = require('child_process');
+const http = require('http');
+const https = require('https');
 
 /**
  * Cliente del plano de datos: Caddy.
@@ -33,16 +35,86 @@ class CaddyManager {
     this.lastDetection = null;
     this.detectionAt = 0;
     this.detectionTtlMs = 15000;
+    this.httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 60000 });
+    this.httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 60000 });
+  }
+
+  /**
+   * Petición HTTP persistente contra la Admin API de Caddy con keep-alive real,
+   * `TCP_NODELAY` y drenaje garantizado del cuerpo (evita la fuga de sockets de undici).
+   *
+   * @param {string} method
+   * @param {string} reqPath
+   * @param {{ headers?: Record<string, string>, body?: string | null, timeoutMs?: number, readBody?: boolean }} [opts]
+   * @returns {Promise<{ status: number, ok: boolean, headers: Record<string, any>, text: string }>}
+   */
+  adminRequest(method, reqPath, { headers = {}, body = null, timeoutMs = 10000, readBody = true } = {}) {
+    return new Promise((resolve, reject) => {
+      const target = new URL(reqPath, this.adminUrl);
+      const isHttps = target.protocol === 'https:';
+      const payloadBuf = body != null ? Buffer.from(body, 'utf8') : null;
+      const reqHeaders = {
+        ...this.adminHeaders(),
+        ...headers,
+        ...(payloadBuf ? { 'Content-Length': String(payloadBuf.length) } : {})
+      };
+
+      const req = (isHttps ? https : http).request(
+        {
+          hostname: target.hostname,
+          port: target.port || (isHttps ? 443 : 80),
+          path: `${target.pathname}${target.search}`,
+          method,
+          headers: reqHeaders,
+          agent: isHttps ? this.httpsAgent : this.httpAgent
+        },
+        (res) => {
+          const status = res.statusCode || 0;
+          const ok = status >= 200 && status < 300;
+          if (!readBody && ok) {
+            res.resume();
+            res.once('end', () => {
+              clearTimeout(timer);
+              resolve({ status, ok, headers: res.headers, text: '' });
+            });
+            return;
+          }
+          /** @type {Buffer[]} */
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.once('end', () => {
+            clearTimeout(timer);
+            const text = chunks.length ? Buffer.concat(chunks).toString('utf8') : '';
+            resolve({ status, ok, headers: res.headers, text });
+          });
+          res.once('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        }
+      );
+
+      req.on('socket', (sock) => {
+        if (typeof sock.setNoDelay === 'function') sock.setNoDelay(true);
+      });
+
+      const timer = setTimeout(() => {
+        req.destroy(new Error(`Timeout (${timeoutMs} ms) en ${method} ${reqPath}`));
+      }, timeoutMs);
+      if (timer.unref) timer.unref();
+
+      req.once('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+
+      if (payloadBuf) req.end(payloadBuf);
+      else req.end();
+    });
   }
 
   /**
    * Cabeceras para hablar con la API de administración.
-   *
-   * El `Origin` explícito no es opcional: Caddy valida ese encabezado para
-   * defenderse de DNS rebinding —una web que visitaras podría, si no, reconfigurar
-   * tu proxy desde tu propio navegador— y el `fetch` de Node envía un origen
-   * vacío, que Caddy rechaza con `403 client is not allowed to access from
-   * origin ''`. `curl` funciona porque no envía ninguno.
    */
   adminHeaders(extra = {}) {
     return { Origin: this.adminUrl, ...extra };
@@ -53,10 +125,7 @@ class CaddyManager {
   // ---------------------------------------------------------------------
 
   /**
-   * ¿Hay un Caddy con el que hablar?
-   *
-   * No lanza nunca. Si no lo hay, el daemon sigue funcionando sin ingress real
-   * y lo dice — el mismo principio camaleón que usamos con Docker.
+   * ¿Hay un Caddy con el que hablar? 1 sola petición ligera keep-alive.
    */
   async detect({ force = false } = {}) {
     const now = Date.now();
@@ -67,11 +136,17 @@ class CaddyManager {
     /** @type {{ available: boolean, adminUrl: string, version: string | null, reason: string | null }} */
     let result = { available: false, adminUrl: this.adminUrl, version: null, reason: null };
     try {
-      const res = await fetch(`${this.adminUrl}/config/`, { headers: this.adminHeaders(), signal: AbortSignal.timeout(2500) });
+      const res = await this.adminRequest('GET', '/reverse_proxy/upstreams', { timeoutMs: 2000, readBody: false });
       if (res.ok) {
-        result = { available: true, adminUrl: this.adminUrl, version: await this.readVersion(), reason: null };
+        result = { available: true, adminUrl: this.adminUrl, version: 'activo', reason: null };
       } else {
-        result.reason = `La API de administración respondió ${res.status}`;
+        // Algunos Caddy recién arrancados sin server http responden 404 a /reverse_proxy/upstreams pero 200 a /config/
+        const cfgRes = await this.adminRequest('GET', '/config/', { timeoutMs: 2000, readBody: false });
+        if (cfgRes.ok) {
+          result = { available: true, adminUrl: this.adminUrl, version: 'activo', reason: null };
+        } else {
+          result.reason = `La API de administración respondió ${cfgRes.status}`;
+        }
       }
     } catch (err) {
       result.reason = `No hay ninguna API de administración de Caddy en ${this.adminUrl}`;
@@ -84,7 +159,7 @@ class CaddyManager {
 
   async readVersion() {
     try {
-      const res = await fetch(`${this.adminUrl}/reverse_proxy/upstreams`, { headers: this.adminHeaders(), signal: AbortSignal.timeout(1500) });
+      const res = await this.adminRequest('GET', '/reverse_proxy/upstreams', { timeoutMs: 1500, readBody: false });
       return res.ok ? 'activo' : null;
     } catch (e) {
       return null;
@@ -105,61 +180,46 @@ class CaddyManager {
   // Admin API
   // ---------------------------------------------------------------------
 
-  /**
-   * Lectura que además devuelve el ETag, necesario para escribir sin pisar a
-   * nadie.
-   */
-  async getWithEtag(path) {
-    const res = await fetch(`${this.adminUrl}${path}`, { headers: this.adminHeaders(), signal: AbortSignal.timeout(5000) });
+  async getWithEtag(reqPath) {
+    const res = await this.adminRequest('GET', reqPath, { timeoutMs: 5000, readBody: true });
     if (res.status === 404) return { found: false, value: null, etag: null };
-    if (!res.ok) throw new Error(`GET ${path} devolvió ${res.status}: ${await res.text()}`);
-    const etag = res.headers.get('etag');
-    const text = await res.text();
-    return { found: true, value: text ? JSON.parse(text) : null, etag };
+    if (!res.ok) throw new Error(`GET ${reqPath} devolvió ${res.status}: ${res.text}`);
+    const etag = res.headers.etag || null;
+    return { found: true, value: res.text ? JSON.parse(res.text) : null, etag };
   }
 
-  async get(path) {
-    return (await this.getWithEtag(path)).value;
+  async get(reqPath) {
+    return (await this.getWithEtag(reqPath)).value;
   }
 
-  /**
-   * Escritura con control de concurrencia optimista.
-   *
-   * Caddy da garantías ACID por petición, pero un ciclo leer-modificar-escribir
-   * puede pisar un cambio concurrente. El protocolo documentado es: capturar el
-   * ETag al leer, enviar `If-Match`, y reintentar desde la lectura si responde
-   * 412. Lo implementamos aquí una vez para que ningún llamante tenga que
-   * acordarse.
-   */
   /**
    * @param {string} method
-   * @param {string} path
+   * @param {string} reqPath
    * @param {any} body
    * @param {{ etag?: string | null, retries?: number }} [opts]
    */
-  async write(method, path, body, { etag = null, retries = 3 } = {}) {
+  async write(method, reqPath, body, { etag = null, retries = 3 } = {}) {
     for (let attempt = 0; attempt <= retries; attempt++) {
-      const headers = this.adminHeaders({ 'Content-Type': 'application/json' });
+      /** @type {Record<string, string>} */
+      const headers = { 'Content-Type': 'application/json' };
       if (etag) headers['If-Match'] = etag;
 
-      const res = await fetch(`${this.adminUrl}${path}`, {
-        method,
+      const res = await this.adminRequest(method, reqPath, {
         headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(10000)
+        body: body === undefined ? null : JSON.stringify(body),
+        timeoutMs: 10000,
+        readBody: false
       });
 
       if (res.ok) return true;
 
-      // 412: alguien escribió entremedias. El llamante debe releer y reintentar.
       if (res.status === 412 && attempt < retries) {
         const conflict = new Error('PRECONDITION_FAILED');
         /** @type {any} */ (conflict).code = 'ETAG_CONFLICT';
         throw conflict;
       }
 
-      const detail = await res.text();
-      throw new Error(`${method} ${path} devolvió ${res.status}: ${detail}`);
+      throw new Error(`${method} ${reqPath} devolvió ${res.status}: ${res.text}`);
     }
     return false;
   }
@@ -283,13 +343,13 @@ class CaddyManager {
   async loadBaseConfig(options) {
     await this.requireAvailable();
     const config = this.buildBaseConfig(options);
-    const res = await fetch(`${this.adminUrl}/load`, {
-      method: 'POST',
-      headers: this.adminHeaders({ 'Content-Type': 'application/json' }),
+    const res = await this.adminRequest('POST', '/load', {
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
-      signal: AbortSignal.timeout(15000)
+      timeoutMs: 15000,
+      readBody: false
     });
-    if (!res.ok) throw new Error(`No se pudo cargar la configuración base: ${res.status} ${await res.text()}`);
+    if (!res.ok) throw new Error(`No se pudo cargar la configuración base: ${res.status} ${res.text}`);
     return config;
   }
 
@@ -373,36 +433,34 @@ class CaddyManager {
     const route = this.buildRoute(spec);
     const id = route['@id'];
 
-    // Fast path: 1 solo roundtrip HTTP cuando la ruta ya existe (caso común
-    // en promociones, canarios y rollbacks).
-    const fastRes = await fetch(`${this.adminUrl}/id/${id}`, {
-      method: 'PATCH',
-      headers: this.adminHeaders({ 'Content-Type': 'application/json' }),
+    // Fast path: 1 solo roundtrip HTTP keep-alive cuando la ruta ya existe.
+    const fastRes = await this.adminRequest('PATCH', `/id/${id}`, {
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(route),
-      signal: AbortSignal.timeout(10000)
+      timeoutMs: 10000,
+      readBody: false
     });
     if (fastRes.ok) {
       return { created: false, id, route };
     }
     if (fastRes.status !== 404 && fastRes.status !== 400) {
-      // Si falló por un motivo distinto de «no existe», respetamos el protocolo
-      // ETag completo o propagamos el error real de Caddy.
-      const detail = await fastRes.text();
-      if (!/unknown object ID/i.test(detail)) {
-        throw new Error(`PATCH /id/${id} devolvió ${fastRes.status}: ${detail}`);
+      if (!/unknown object ID/i.test(fastRes.text)) {
+        throw new Error(`PATCH /id/${id} devolvió ${fastRes.status}: ${fastRes.text}`);
       }
     }
 
+    // Si el fast-path indicó que no existe, vamos directo a POST /routes (sin GET /id redundante).
+    const routesPath = '/config/apps/http/servers/culkibo/routes';
     return this.mutate(async () => {
-      const existing = await this.getWithEtag(`/id/${id}`);
-      if (existing.found) {
-        await this.write('PATCH', `/id/${id}`, route, { etag: existing.etag });
-        return { created: false, id, route };
-      }
-
-      const routesPath = '/config/apps/http/servers/culkibo/routes';
       const current = await this.getWithEtag(routesPath);
-      // POST sobre un array añade al final.
+      const list = Array.isArray(current.value) ? current.value : [];
+      if (list.some((r) => r && r['@id'] === id)) {
+        const existing = await this.getWithEtag(`/id/${id}`);
+        if (existing.found) {
+          await this.write('PATCH', `/id/${id}`, route, { etag: existing.etag });
+          return { created: false, id, route };
+        }
+      }
       await this.write('POST', routesPath, route, { etag: current.etag });
       return { created: true, id, route };
     });
@@ -413,11 +471,15 @@ class CaddyManager {
    * Cloudflare directamente en Caddy (requiere módulo `dns.providers.cloudflare`).
    */
   async configureWildcardDns01(rootDomain, { tokenEnv = 'CF_API_TOKEN' } = {}) {
-    await this.requireAvailable();
     const cleanRoot = String(rootDomain || '').trim().toLowerCase().replace(/^\*\./, '');
     if (!cleanRoot || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(cleanRoot)) {
       throw new Error(`Dominio raíz inválido para wildcard DNS-01: ${rootDomain}`);
     }
+    const cleanEnv = String(tokenEnv || 'CF_API_TOKEN').trim();
+    if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(cleanEnv)) {
+      throw new Error(`Nombre de variable de entorno inválido para token DNS-01: ${tokenEnv}`);
+    }
+    await this.requireAvailable();
     const subjects = [`*.${cleanRoot}`, cleanRoot];
     const policy = {
       subjects,
@@ -427,7 +489,7 @@ class CaddyManager {
           dns: {
             provider: {
               name: 'cloudflare',
-              api_token: `{env.${tokenEnv}}`
+              api_token: `{env.${cleanEnv}}`
             }
           }
         }
@@ -439,8 +501,8 @@ class CaddyManager {
       const list = Array.isArray(current.value) ? current.value : [];
       const filtered = list.filter(p => !(Array.isArray(p.subjects) && p.subjects.includes(`*.${cleanRoot}`)));
       const next = [policy, ...filtered];
-      await this.write('PUT', policiesPath, next, { etag: current.etag });
-      return { applied: true, subjects, provider: 'cloudflare', tokenEnv };
+      await this.write(current.found ? 'PATCH' : 'PUT', policiesPath, next, { etag: current.etag });
+      return { applied: true, subjects, provider: 'cloudflare', tokenEnv: cleanEnv };
     });
   }
 
@@ -464,35 +526,34 @@ class CaddyManager {
   }
 
   /**
-   * Reconciliación: deja Caddy exactamente con las rutas que Culkibo cree que
-   * debe haber.
-   *
-   * Hace falta porque Caddy puede reiniciarse, perder su configuración o ser
-   * editado por fuera, y entonces nuestra idea del mundo y la suya divergen en
-   * silencio. Dokploy tiene un fallo abierto exactamente por esto: tras un
-   * reinicio sucio, los adjuntos de red no se vuelven a aplicar y el estado real
-   * deja de coincidir con el modelo, sin aviso.
+   * Reconciliación atómica por diff en un único PUT (en lugar de N+M recargas).
+   * Si las rutas deseadas ya coinciden exactamente con Caddy, 0 escrituras / 0 recargas.
    */
   async reconcile(desiredSpecs) {
     await this.requireAvailable();
-    const desiredIds = new Set(desiredSpecs.map(s => this.routeId(s.projectId)));
-    const applied = [];
-    const removed = [];
+    const desiredRoutes = desiredSpecs.map((spec) => this.buildRoute(spec));
+    const desiredIds = new Set(desiredRoutes.map((r) => r['@id']));
+    const routesPath = '/config/apps/http/servers/culkibo/routes';
 
-    for (const spec of desiredSpecs) {
-      const result = await this.upsertRoute(spec);
-      applied.push(result.id);
-    }
+    return this.mutate(async () => {
+      const current = await this.getWithEtag(routesPath);
+      const existingAll = Array.isArray(current.value) ? current.value : [];
+      const foreign = existingAll.filter((r) => !(r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX)));
+      const existingCulkibo = existingAll.filter((r) => r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX));
 
-    for (const route of await this.listRoutes()) {
-      if (!desiredIds.has(route['@id'])) {
-        const projectId = route['@id'].slice(ID_PREFIX.length);
-        await this.removeRoute(projectId);
-        removed.push(route['@id']);
+      const removed = existingCulkibo
+        .filter((r) => !desiredIds.has(r['@id']))
+        .map((r) => r['@id']);
+      const applied = desiredRoutes.map((r) => r['@id']);
+
+      const nextRoutes = [...foreign, ...desiredRoutes];
+      if (JSON.stringify(existingAll) === JSON.stringify(nextRoutes)) {
+        return { applied, removed, unchanged: true };
       }
-    }
 
-    return { applied, removed };
+      await this.write(current.found ? 'PATCH' : 'PUT', routesPath, nextRoutes, { etag: current.etag });
+      return { applied, removed, unchanged: false };
+    });
   }
 
   // ---------------------------------------------------------------------
@@ -500,22 +561,40 @@ class CaddyManager {
   // ---------------------------------------------------------------------
 
   /**
-   * Levanta Caddy en un contenedor.
-   *
-   * Mantiene la promesa de "un comando": el usuario no instala nada. Si hay
-   * Docker, Culkibo se trae el plano de datos solo.
+   * Levanta Caddy en un contenedor (con validación estricta anti inyección de flags).
    */
   async startWithDocker({ image = 'caddy:2-alpine', containerName = 'culkibo-caddy', httpPort = 80, httpsPort = 443, adminPort = 2019 } = {}) {
+    const cleanImage = String(image || 'caddy:2-alpine').trim();
+    const cleanName = String(containerName || 'culkibo-caddy').trim();
+    const pHttp = Number(httpPort);
+    const pHttps = Number(httpsPort);
+    const pAdmin = Number(adminPort);
+
+    if (
+      cleanImage.startsWith('-') ||
+      !/^(?:caddy(?::[a-zA-Z0-9._-]+)?|(?:ghcr\.io|docker\.io)\/[a-z0-9._-]+\/caddy:[a-zA-Z0-9._-]+)$/.test(cleanImage)
+    ) {
+      throw new Error(`Imagen de Caddy no permitida: ${cleanImage}`);
+    }
+    if (cleanName.startsWith('-') || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(cleanName)) {
+      throw new Error(`Nombre de contenedor inválido: ${cleanName}`);
+    }
+    /** @type {Array<[string, number]>} */
+    const portChecks = [['httpPort', pHttp], ['httpsPort', pHttps], ['adminPort', pAdmin]];
+    for (const [label, p] of portChecks) {
+      if (!Number.isInteger(p) || p < 1 || p > 65535) {
+        throw new Error(`Puerto inválido (${label}): ${p}`);
+      }
+    }
+
     const args = [
-      'run', '-d', '--name', containerName, '--restart', 'unless-stopped',
-      '-p', `${httpPort}:80`,
-      '-p', `${httpsPort}:443`,
-      // La admin API solo escucha en loopback del host: es la recomendación de
-      // seguridad de Caddy y aquí es control total sobre el ingress.
-      '-p', `127.0.0.1:${adminPort}:2019`,
+      'run', '-d', '--name', cleanName, '--restart', 'unless-stopped',
+      '-p', `${pHttp}:80`,
+      '-p', `${pHttps}:443`,
+      '-p', `127.0.0.1:${pAdmin}:2019`,
       '-v', 'culkibo_caddy_data:/data',
       '-v', 'culkibo_caddy_config:/config',
-      image,
+      cleanImage,
       'caddy', 'run', '--config', '/dev/null', '--adapter', 'caddyfile'
     ];
 
@@ -525,7 +604,7 @@ class CaddyManager {
       child.stderr.on('data', d => stderr.push(d.toString()));
       child.on('error', (err) => resolve({ started: false, error: err.message }));
       child.on('close', (code) => {
-        if (code === 0) return resolve({ started: true, containerName });
+        if (code === 0) return resolve({ started: true, containerName: cleanName });
         resolve({ started: false, error: stderr.join('').trim() || `docker run terminó con código ${code}` });
       });
     });

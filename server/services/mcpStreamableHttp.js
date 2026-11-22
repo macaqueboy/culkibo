@@ -104,13 +104,28 @@ function shouldStream(req, body) {
 }
 
 function writeSseMessage(res, message) {
-  res.write(`data: ${JSON.stringify(message)}\n\n`);
+  if (res.writableEnded || res.destroyed) return;
+  try {
+    res.write(`data: ${JSON.stringify(message)}\n\n`);
+  } catch (e) {}
 }
 
 /**
  * POST /api/mcp — el endpoint MCP.
  */
 async function handlePost(req, res) {
+  try {
+    return await _handlePostInner(req, res);
+  } catch (err) {
+    if (!res.headersSent) {
+      return sendError(res, 500, jsonRpcError(null, ERROR_CODES.INTERNAL_ERROR, `Fallo inesperado en transporte MCP: ${err.message}`));
+    }
+    try { res.end(); } catch (e) {}
+    return null;
+  }
+}
+
+async function _handlePostInner(req, res) {
   const body = req.body;
 
   // 1. Sobre JSON-RPC. Esta revisión no define lotes (arrays) sobre HTTP.
@@ -310,16 +325,19 @@ async function respondStreaming(req, res, body) {
     stopTimers();
   });
 
-  res.write(':\r\n');
-  timers.push(setInterval(() => {
-    if (alive()) res.write(':\r\n');
-  }, SSE_KEEPALIVE_MS));
+  try { res.write(':\r\n'); } catch (e) {}
+  const kaTimer = setInterval(() => {
+    if (!alive()) return;
+    try { res.write(':\r\n'); } catch (e) {}
+  }, SSE_KEEPALIVE_MS);
+  if (kaTimer.unref) kaTimer.unref();
+  timers.push(kaTimer);
 
   const progressToken = body.params && body.params._meta ? body.params._meta.progressToken : undefined;
   if (progressToken !== undefined) {
     const startedAt = Date.now();
     let lastProgress = 0;
-    timers.push(setInterval(() => {
+    const progTimer = setInterval(() => {
       if (!alive()) return;
       // `progress` cuenta segundos transcurridos y `total` se omite a
       // propósito: no sabemos cuánto tarda una emisión ACME ni un despliegue,
@@ -335,7 +353,9 @@ async function respondStreaming(req, res, body) {
           message: `Culkibo sigue ejecutando '${body.params && body.params.name ? body.params.name : body.method}' (${elapsed} s).`
         }
       });
-    }, PROGRESS_INTERVAL_MS));
+    }, PROGRESS_INTERVAL_MS);
+    if (progTimer.unref) progTimer.unref();
+    timers.push(progTimer);
   }
 
   let envelope;

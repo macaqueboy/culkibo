@@ -2,20 +2,27 @@ const axios = require('axios');
 const projectManager = require('./projectManager');
 const domainManager = require('./domainManager');
 const localRunner = require('./localRunner');
+const { assertSafeUrl } = require('./ssrfGuard');
 
 class CoolifyMigrator {
   async fetchFromApi(apiUrl, apiToken, endpoint) {
     try {
-      const url = `${apiUrl.trim().replace(/\/+$/, '')}${endpoint}`;
+      const { url: safeBase } = await assertSafeUrl(apiUrl, { blockSearchAndHash: true });
+      const url = `${safeBase.origin}${safeBase.pathname.replace(/\/+$/, '')}${endpoint}`;
       const response = await axios.get(url, {
         headers: {
           'Authorization': `Bearer ${apiToken}`,
           'Accept': 'application/json'
         },
+        maxRedirects: 0,
+        maxContentLength: 20 * 1024 * 1024,
         timeout: 30000 // Aumentado a 30s para APIs lentas
       });
       return response.data || [];
     } catch (err) {
+      if (err && /SSRF|inválida|protocolo|metadatos|privada/i.test(String(err.message || ''))) {
+        throw err;
+      }
       console.error(`Coolify fetch error on ${endpoint}:`, err.message);
       if (endpoint === '/api/v1/applications' && (!err.response || err.response.status >= 500)) {
         throw new Error('No se pudo conectar a la API de Coolify. Verifica URL y Token.');
@@ -31,9 +38,10 @@ class CoolifyMigrator {
     const results = [];
     for (const item of list) {
       try {
-        const details = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${item.uuid}`);
-        const envs = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${item.uuid}/envs`);
-        const storages = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${item.uuid}/storages`);
+        const safeUuid = encodeURIComponent(String(item.uuid || ''));
+        const details = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}`);
+        const envs = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/envs`);
+        const storages = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/storages`);
         
         // fetchFromApi returns [] on error. If it's an array, it means it failed (or is unexpectedly an array).
         const detailsObj = Array.isArray(details) ? {} : (details || {});

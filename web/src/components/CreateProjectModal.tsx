@@ -5,13 +5,19 @@ import { api, type GitHubStatus, type GitHubRepo, type GitHubBranch, type GitHub
 interface CreateProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: (createdProjectId?: string) => void;
 }
 
 const EMOJIS = ['🚀', '⚡', '🌐', '📦', '🤖', '🎮', '💎', '🔥', '🐳', '🐍'];
 
 export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, onClose, onSuccess }) => {
-  const [tab, setTab] = useState<'manual' | 'github'>('manual');
+  const [tab, setTab] = useState<'giturl' | 'github' | 'manual'>('giturl');
+
+  // Public Git URL state (zero PAT required)
+  const [publicGitUrl, setPublicGitUrl] = useState('');
+  const [publicGitBranch, setPublicGitBranch] = useState('');
+  const [inspectingUrl, setInspectingUrl] = useState(false);
+  const [inspectedUrl, setInspectedUrl] = useState<any>(null);
 
   // Manual form state
   const [name, setName] = useState('');
@@ -158,6 +164,27 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
     }
   };
 
+  const handleInspectPublicUrl = async () => {
+    if (!publicGitUrl.trim()) return;
+    setInspectingUrl(true);
+    setGhError(null);
+    try {
+      const info = await api.inspectGitUrl(publicGitUrl.trim(), publicGitBranch.trim() || undefined);
+      setInspectedUrl(info);
+      setName(info.suggestedName || info.repo || 'mi-app');
+      setDescription(info.description || '');
+      if (info.icon) setIcon(info.icon);
+      if (info.port) setForgePort(info.port);
+      if (info.buildCommand) setBuildCommand(info.buildCommand);
+      if (info.startCommand) setStartCommand(info.startCommand);
+      if (info.defaultBranch && !publicGitBranch) setPublicGitBranch(info.defaultBranch);
+    } catch (err: any) {
+      setGhError(err?.message || 'No se pudo analizar esa URL Git');
+    } finally {
+      setInspectingUrl(false);
+    }
+  };
+
   if (!isOpen) return null;
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -167,6 +194,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
     setLoading(true);
     try {
       const isGitHub = tab === 'github' && Boolean(selectedRepo);
+      const isPublicGit = tab === 'giturl' && Boolean(inspectedUrl || publicGitUrl.trim());
       const projectPayload: any = {
         name: name.trim(),
         description: description.trim(),
@@ -177,13 +205,13 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
         trafficSplit: { forge: 100, citadel: 0 },
         domains: [],
         envVars: detectedStack?.envVars || {},
-        source: isGitHub ? 'github' : 'manual',
+        source: isGitHub ? 'github' : isPublicGit ? `${inspectedUrl?.provider || 'git'}-import` : 'manual',
         startCommand,
         buildCommand,
-        gitRepo: isGitHub && selectedRepo ? selectedRepo.clone_url : '',
-        gitBranch: isGitHub ? selectedBranch : 'main',
-        githubOwner: isGitHub && selectedRepo ? selectedRepo.owner.login : '',
-        githubRepo: isGitHub && selectedRepo ? selectedRepo.name : '',
+        gitRepo: isGitHub && selectedRepo ? selectedRepo.clone_url : isPublicGit ? (inspectedUrl?.cloneUrl || publicGitUrl.trim()) : '',
+        gitBranch: isGitHub ? selectedBranch : isPublicGit ? (publicGitBranch.trim() || inspectedUrl?.defaultBranch || 'main') : 'main',
+        githubOwner: isGitHub && selectedRepo ? selectedRepo.owner.login : (isPublicGit && inspectedUrl?.provider === 'github' ? inspectedUrl.owner : ''),
+        githubRepo: isGitHub && selectedRepo ? selectedRepo.name : (isPublicGit && inspectedUrl?.provider === 'github' ? inspectedUrl.repo : ''),
         watchPaths: detectedStack?.watchPaths || ['src/**', 'public/**'],
         autoDeploy: isGitHub ? true : false
       };
@@ -192,7 +220,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
       if (created && created.id) {
         await api.activateProject(created.id);
       }
-      onSuccess();
+      onSuccess(created?.id);
       onClose();
       resetForm();
     } catch (err: any) {
@@ -213,6 +241,9 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
     setSelectedRepo(null);
     setDetectedStack(null);
     setRepoSearch('');
+    setPublicGitUrl('');
+    setPublicGitBranch('');
+    setInspectedUrl(null);
     setGhError(null);
   };
 
@@ -234,10 +265,11 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
         <div className="flex border-b border-slate-200 bg-slate-50/40 p-1.5 gap-1.5">
           <button
             type="button"
-            onClick={() => setTab('manual')}
-            className={`flex-1 py-2 px-3 text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-2 ${tab === 'manual' ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'}`}
+            onClick={() => setTab('giturl')}
+            className={`flex-1 py-2 px-2.5 text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer ${tab === 'giturl' ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'}`}
           >
-            <span>🚀</span> Plantillas Rápidas / Manual
+            <GitBranch className="w-3.5 h-3.5" />
+            Pegar URL Git
           </button>
           <button
             type="button"
@@ -245,15 +277,22 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
               setTab('github');
               if (!ghStatus?.connected) checkGitHubStatus();
             }}
-            className={`flex-1 py-2 px-3 text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-2 ${tab === 'github' ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'}`}
+            className={`flex-1 py-2 px-2.5 text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer ${tab === 'github' ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'}`}
           >
-            <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
+            <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
               <path fillRule="evenodd" clipRule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" />
             </svg>
-            Crear desde GitHub
+            Mi GitHub
             {ghStatus?.connected && (
               <span className="w-2 h-2 rounded-full bg-emerald-500" title="Cuenta conectada" />
             )}
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab('manual')}
+            className={`flex-1 py-2 px-2.5 text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer ${tab === 'manual' ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'}`}
+          >
+            <span>🚀</span> Manual / Plantilla
           </button>
         </div>
 
@@ -262,6 +301,64 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
           {ghError && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-center gap-2">
               <span className="font-bold">Error:</span> {ghError}
+            </div>
+          )}
+
+          {/* PUBLIC GIT URL TAB (Zero Token Required) */}
+          {tab === 'giturl' && (
+            <div className="space-y-4">
+              <p className="text-xs text-slate-600">
+                Pega cualquier enlace de GitHub, GitLab, Bitbucket o Gitea (público o <code className="font-mono">usuario/repo</code>) y detectamos tu stack al instante sin pedirte ningún token.
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={publicGitUrl}
+                  onChange={(e) => setPublicGitUrl(e.target.value)}
+                  placeholder="https://github.com/usuario/mi-app"
+                  className="flex-1 px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono focus:bg-white focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={handleInspectPublicUrl}
+                  disabled={inspectingUrl || !publicGitUrl.trim()}
+                  className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${inspectingUrl ? 'animate-spin' : ''}`} />
+                  <span>{inspectingUrl ? 'Analizando…' : 'Detectar'}</span>
+                </button>
+              </div>
+
+              {(inspectedUrl || name) && (
+                <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3 text-xs">
+                  {inspectedUrl?.framework && (
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-slate-800">Stack detectado:</span>
+                      <span className="px-2 py-0.5 rounded-full bg-blue-50 border border-blue-200 text-blue-700 font-bold">
+                        {inspectedUrl.framework}
+                      </span>
+                    </div>
+                  )}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block font-medium text-slate-700 mb-1">Nombre del proyecto</label>
+                      <input type="text" value={name} onChange={(e) => setName(e.target.value)} required className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs" />
+                    </div>
+                    <div>
+                      <label className="block font-medium text-slate-700 mb-1">Rama</label>
+                      <input type="text" value={publicGitBranch} onChange={(e) => setPublicGitBranch(e.target.value)} placeholder="main" className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono" />
+                    </div>
+                    <div>
+                      <label className="block font-medium text-slate-700 mb-1">Comando Build</label>
+                      <input type="text" value={buildCommand} onChange={(e) => setBuildCommand(e.target.value)} placeholder="npm run build" className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono" />
+                    </div>
+                    <div>
+                      <label className="block font-medium text-slate-700 mb-1">Comando Start</label>
+                      <input type="text" value={startCommand} onChange={(e) => setStartCommand(e.target.value)} placeholder="npm start" className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono" />
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

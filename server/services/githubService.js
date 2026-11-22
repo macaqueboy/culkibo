@@ -1,8 +1,18 @@
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const { atomicWriteJsonSync } = require('./ssrfGuard');
 
 const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'github.json');
+const GH_SEGMENT_RE = /^[A-Za-z0-9_.-]{1,100}$/;
+
+function assertGhSegment(value, label) {
+  const s = String(value || '').trim();
+  if (!GH_SEGMENT_RE.test(s) || s === '.' || s === '..') {
+    throw new Error(`${label} de GitHub inválido`);
+  }
+  return encodeURIComponent(s);
+}
 
 /**
  * Ventana durante la cual una entrega repetida se considera la misma entrega.
@@ -230,9 +240,7 @@ class GithubService {
 
   saveConfig(data) {
     this.ensureDataDir();
-    const tempFile = this.configFile + '.tmp';
-    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
-    fs.renameSync(tempFile, this.configFile);
+    atomicWriteJsonSync(this.configFile, data, 0o600);
     this.config = data;
     return this.config;
   }
@@ -488,7 +496,9 @@ class GithubService {
     }
 
     try {
-      const res = await axios.get(`${this.apiBase}/repos/${owner}/${repo}/branches`, {
+      const safeOwner = assertGhSegment(owner, 'Propietario');
+      const safeRepo = assertGhSegment(repo, 'Repositorio');
+      const res = await axios.get(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/branches`, {
         headers: this.getHeaders(),
         params: { per_page: 100 },
         timeout: 10000
@@ -663,8 +673,10 @@ class GithubService {
     }
 
     try {
+      const safeOwner = assertGhSegment(owner, 'Propietario');
+      const safeRepo = assertGhSegment(repo, 'Repositorio');
       // 1. Check root directory contents
-      const contentsRes = await axios.get(`${this.apiBase}/repos/${owner}/${repo}/contents`, {
+      const contentsRes = await axios.get(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/contents`, {
         headers: this.getHeaders(),
         params: { ref: branch },
         timeout: 10000
@@ -692,7 +704,7 @@ class GithubService {
       // 3. Check for package.json
       if (fileNames.includes('package.json')) {
         try {
-          const pkgRes = await axios.get(`${this.apiBase}/repos/${owner}/${repo}/contents/package.json`, {
+          const pkgRes = await axios.get(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/contents/package.json`, {
             headers: this.getHeaders(),
             params: { ref: branch },
             timeout: 10000

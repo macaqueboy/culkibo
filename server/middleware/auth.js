@@ -34,6 +34,22 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost']);
 
 /** @type {string | null} */
 let cachedToken = null;
+/** @type {Buffer | null} */
+let cachedTokenBuf = null;
+/** @type {Set<string>} */
+const dynamicOrigins = new Set();
+
+/** Permite registrar un origen adicional en caliente (p. ej. dominio propio del panel). */
+function addAllowedOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return;
+  try {
+    const parsed = new URL(origin.trim());
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      dynamicOrigins.add(parsed.origin);
+      cachedOriginsKey = null;
+    }
+  } catch (e) {}
+}
 
 /** Token activo. Se genera y persiste la primera vez si no hay ninguno. */
 function resolveToken() {
@@ -41,20 +57,23 @@ function resolveToken() {
 
   if (process.env.CULKIBO_TOKEN) {
     cachedToken = process.env.CULKIBO_TOKEN;
+    cachedTokenBuf = Buffer.from(cachedToken, 'utf8');
     return cachedToken;
   }
 
   try {
     if (fs.existsSync(AUTH_FILE)) {
       const stored = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
-      if (stored.token) {
+      if (typeof stored.token === 'string' && stored.token) {
         cachedToken = stored.token;
+        cachedTokenBuf = Buffer.from(stored.token, 'utf8');
         return cachedToken;
       }
     }
   } catch (e) {}
 
   cachedToken = crypto.randomBytes(32).toString('hex');
+  cachedTokenBuf = Buffer.from(cachedToken, 'utf8');
   try {
     fs.mkdirSync(path.dirname(AUTH_FILE), { recursive: true });
     fs.writeFileSync(AUTH_FILE, JSON.stringify({ token: cachedToken, createdAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
@@ -73,13 +92,15 @@ let cachedOriginsSet = null;
 function allowedOrigins() {
   const port = process.env.PORT || 3030;
   const raw = process.env.CULKIBO_ALLOWED_ORIGINS || '';
-  const key = `${port}|${raw}`;
+  const dynKey = dynamicOrigins.size ? Array.from(dynamicOrigins).join(',') : '';
+  const key = `${port}|${raw}|${dynKey}`;
   if (cachedOriginsSet && cachedOriginsKey === key) return cachedOriginsSet;
 
   const configured = raw.split(',').map(s => s.trim()).filter(Boolean);
   cachedOriginsKey = key;
   cachedOriginsSet = new Set([
     ...configured,
+    ...dynamicOrigins,
     `http://localhost:${port}`,
     `http://127.0.0.1:${port}`,
     // Servidor de desarrollo de Vite
@@ -99,11 +120,18 @@ function isOriginAllowed(origin, req = null) {
 
   // Si el panel está servido desde el propio host de este daemon (p. ej. un
   // VPS con dominio propio o IP pública), el mismo origen (`Origin.host === Host`)
-  // nunca es un ataque cross-site; sigue exigiendo token cuando no es loopback.
+  // se permite siempre que se autentique con token (nunca exime loopback).
   if (req && req.headers) {
     try {
-      const originHost = new URL(origin).host.toLowerCase();
-      const reqHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
+      const parsedOrigin = new URL(origin);
+      if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') return false;
+      const originHost = parsedOrigin.host.toLowerCase();
+      const peerAddr = req.socket?.remoteAddress || '';
+      const trustFwd = LOOPBACK.has(peerAddr);
+      const rawHost = (trustFwd && req.headers['x-forwarded-host'])
+        ? req.headers['x-forwarded-host']
+        : req.headers.host;
+      const reqHost = String(rawHost || '').split(',')[0].trim().toLowerCase();
       if (originHost && reqHost && originHost === reqHost) return true;
     } catch (e) {}
   }
@@ -114,13 +142,12 @@ function isOriginAllowed(origin, req = null) {
 /** Comparación en tiempo constante: una comparación normal filtra el token. */
 function tokenMatches(provided) {
   if (!provided) return false;
-  const expected = resolveToken();
-  if (!expected) return false;
-  const a = Buffer.from(String(provided));
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return false;
+  if (!cachedTokenBuf) resolveToken();
+  if (!cachedTokenBuf) return false;
+  const a = Buffer.from(String(provided), 'utf8');
+  if (a.length !== cachedTokenBuf.length) return false;
   try {
-    return crypto.timingSafeEqual(a, b);
+    return crypto.timingSafeEqual(a, cachedTokenBuf);
   } catch (e) {
     return false;
   }
@@ -148,28 +175,48 @@ function extractToken(req) {
   return null;
 }
 
+/**
+ * Comprueba si la petición procede realmente de loopback local.
+ * Protege tanto HTTP como upgrades WebSocket crudos detrás de Caddy/Nginx:
+ * si hay cabeceras `X-Forwarded-For` / `Forwarded`, el origen real debe ser
+ * también loopback; de lo contrario se exige token obligatorio.
+ */
 function isLoopback(req) {
-  const ip = (req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
-  return LOOPBACK.has(ip) || LOOPBACK.has(req.ip);
+  const peer = req.socket?.remoteAddress || '';
+  if (peer && !LOOPBACK.has(peer)) return false;
+
+  const xff = req.headers && req.headers['x-forwarded-for'];
+  if (xff) {
+    const first = String(xff).split(',')[0].trim().replace(/^::ffff:/, '');
+    return LOOPBACK.has(first);
+  }
+
+  const fwd = req.headers && req.headers.forwarded;
+  if (fwd) {
+    const m = String(fwd).match(/for=(?:"?\[?)([^;\s,"\]]+)/i);
+    if (!m) return false;
+    return LOOPBACK.has(m[1].replace(/^::ffff:/, ''));
+  }
+
+  if (peer) return true;
+  const ip = (req.ip || '').replace(/^::ffff:/, '');
+  return LOOPBACK.has(ip);
 }
 
 /**
  * Rutas que no pueden exigir token porque las llama un tercero que no lo tiene.
  * El webhook de GitHub se autentica por su propia firma HMAC, que ya se verifica.
  */
-const PUBLIC_PATHS = [
-  /^\/health$/,
-  /^\/api\/health$/,
-  /^\/api\/auth\/session$/,
-  /^\/api\/webhooks\/github$/,
-  // Caddy consulta este endpoint en el primer handshake TLS de un dominio
-  // desconocido y no tiene forma de presentar un token. Solo revela si un
-  // dominio está configurado aquí, que es deducible resolviendo el DNS.
-  /^\/api\/ingress\/ask$/
-];
+const PUBLIC_PATHS = new Set([
+  '/health',
+  '/api/health',
+  '/api/auth/session',
+  '/api/webhooks/github',
+  '/api/ingress/ask'
+]);
 
 function isPublicPath(reqPath) {
-  return PUBLIC_PATHS.some(re => re.test(reqPath));
+  return PUBLIC_PATHS.has(reqPath);
 }
 
 /**
@@ -195,12 +242,14 @@ function authorizeRequest(req) {
   }
 
   const requireToken = process.env.CULKIBO_REQUIRE_TOKEN === '1';
-  if (!requireToken && isLoopback(req) && !origin) {
-    return { ok: true, method: 'loopback' };
-  }
-
-  if (!requireToken && isLoopback(req) && origin && isOriginAllowed(origin, req)) {
-    return { ok: true, method: 'loopback_origin' };
+  if (!requireToken && isLoopback(req)) {
+    // Sin cabecera Origin (curl local, CLI, tests) -> permitido en loopback.
+    if (!origin) return { ok: true, method: 'loopback' };
+    // Con cabecera Origin en loopback sin token: exigir lista blanca explícita
+    // (evita DNS rebinding donde attacker.example resuelve a 127.0.0.1).
+    if (allowedOrigins().has(origin)) {
+      return { ok: true, method: 'loopback_origin' };
+    }
   }
 
   return {
@@ -212,9 +261,6 @@ function authorizeRequest(req) {
 }
 
 function authMiddleware(req, res, next) {
-  // El middleware se monta en '/api', así que req.path viene recortado
-  // ('/health' en lugar de '/api/health'). Se compara siempre contra la ruta
-  // completa para que las exenciones no dependan de dónde esté montado.
   const fullPath = (req.originalUrl || req.url || '').split('?')[0];
   if (isPublicPath(fullPath)) return next();
 
@@ -234,9 +280,6 @@ function corsOptions() {
       callback(null, false);
     },
     credentials: false,
-    // Las tres últimas son obligatorias en el transporte Streamable HTTP de MCP
-    // 2026-07-28: sin declararlas aquí, el preflight del navegador tumba
-    // cualquier cliente MCP que viva en una página.
     allowedHeaders: [
       'Content-Type', 'Authorization', 'X-Culkibo-Token', 'X-Hub-Signature-256', 'X-GitHub-Event',
       'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name'
@@ -247,7 +290,7 @@ function corsOptions() {
 /** Resumen para el arranque y para /api/system/status. Nunca devuelve el token. */
 function authStatus() {
   return {
-    tokenConfigured: Boolean(process.env.CULKIBO_TOKEN || fs.existsSync(AUTH_FILE)),
+    tokenConfigured: Boolean(cachedToken || process.env.CULKIBO_TOKEN || fs.existsSync(AUTH_FILE)),
     tokenSource: process.env.CULKIBO_TOKEN ? 'env' : 'data/auth.json',
     requireTokenAlways: process.env.CULKIBO_REQUIRE_TOKEN === '1',
     allowedOrigins: Array.from(allowedOrigins())
@@ -261,6 +304,7 @@ module.exports = {
   resolveToken,
   authStatus,
   isOriginAllowed,
+  addAllowedOrigin,
   tokenMatches,
   isLoopback
 };

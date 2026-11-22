@@ -4,6 +4,46 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const { assertContainedPath, isPrivateIp, isMetadataIp } = require('./ssrfGuard');
+
+const PROJECTS_ROOT = path.resolve(process.cwd(), 'projects');
+
+/** Puertos reservados del sistema/infraestructura que `killProcessOnPort` JAMÁS debe matar. */
+const RESERVED_PORTS = new Set([22, 53, 80, 443, 2019, 2375, 2376, 3306, 5432, 6379, 27017]);
+
+/** Variables del entorno del host que un proyecto no fiable NO puede heredar ni sobreescribir. */
+const SAFE_HOST_ENV_ALLOWLIST = [
+  'PATH', 'Path', 'PATHEXT', 'COMSPEC', 'ComSpec', 'SystemRoot', 'SYSTEMROOT',
+  'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
+  'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'OS', 'NUMBER_OF_PROCESSORS',
+  'ProgramFiles', 'ProgramFiles(x86)', 'CommonProgramFiles', 'PROGRAMDATA'
+];
+
+const BLOCKED_PROJECT_ENV_KEYS = new Set([
+  'PATH', 'PATHEXT', 'COMSPEC', 'SYSTEMROOT', 'WINDIR',
+  'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH',
+  'NODE_OPTIONS', 'BASH_ENV', 'ENV', 'IFS',
+  'DOCKER_HOST', 'DOCKER_CONFIG', 'DOCKER_CONTEXT', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY',
+  'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'GIT_EXEC_PATH'
+]);
+
+/** Construye un entorno limpio para subprocesos de usuario (sin secretos del daemon ni secuestro de PATH/LD_PRELOAD). */
+function buildSafeChildEnv(extraEnv = {}, projectEnvVars = {}) {
+  /** @type {Record<string, string>} */
+  const env = {};
+  for (const key of SAFE_HOST_ENV_ALLOWLIST) {
+    if (process.env[key] !== undefined) env[key] = String(process.env[key]);
+  }
+  for (const [k, v] of Object.entries(projectEnvVars || {})) {
+    if (!k || BLOCKED_PROJECT_ENV_KEYS.has(k.toUpperCase())) continue;
+    if (/^(CULKIBO_|CLOUDFLARE_|GITHUB_TOKEN)/i.test(k)) continue;
+    env[k] = String(v == null ? '' : v);
+  }
+  for (const [k, v] of Object.entries(extraEnv || {})) {
+    if (v !== undefined) env[k] = String(v);
+  }
+  return env;
+}
 
 /**
  * Metacaracteres que cmd.exe interpreta incluso dentro de comillas dobles.
@@ -78,6 +118,17 @@ class LocalRunner {
     // abort instead of resurrecting a project the user just stopped.
     this.runGenerations = new Map(); // projectId -> number
     this.startLocks = new Map(); // projectId -> Promise (serialises concurrent start())
+    /** @type {{ mtimeMs: number, token: string | null } | null} */
+    this._gitTokenCache = null;
+  }
+
+  /** Resuelve y confina el directorio de un proyecto dentro de `projects/`. */
+  resolveProjectDir(projectId) {
+    const id = String(projectId || '').trim();
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) {
+      throw new Error(`Identificador de proyecto inválido: ${id.slice(0, 40)}`);
+    }
+    return assertContainedPath(PROJECTS_ROOT, id);
   }
 
   currentGeneration(projectId) {
@@ -124,14 +175,22 @@ class LocalRunner {
 
     // 1. Check if preferredBaseDir is specified (e.g. from Coolify base_directory)
     if (preferredBaseDir && preferredBaseDir !== '/') {
-      const cleanBase = preferredBaseDir.replace(/^\/+/, '').replace(/\/+$/, '');
-      const customPath = path.join(projectDir, cleanBase);
-      if (fs.existsSync(customPath)) {
-        if (fs.existsSync(path.join(customPath, 'package.json'))) {
-          return { type: 'node', path: customPath };
+      const cleanBase = String(preferredBaseDir).replace(/^\/+/, '').replace(/\/+$/, '');
+      if (cleanBase && !cleanBase.includes('\0') && !cleanBase.split(/[\\/]+/).includes('..')) {
+        /** @type {string | null} */
+        let customPath = null;
+        try {
+          customPath = assertContainedPath(projectDir, cleanBase);
+        } catch (e) {
+          customPath = null;
         }
-        if (fs.existsSync(path.join(customPath, 'index.html')) || fs.existsSync(path.join(customPath, 'public', 'index.html'))) {
-          return { type: 'static', path: customPath };
+        if (customPath && fs.existsSync(customPath)) {
+          if (fs.existsSync(path.join(customPath, 'package.json'))) {
+            return { type: 'node', path: customPath };
+          }
+          if (fs.existsSync(path.join(customPath, 'index.html')) || fs.existsSync(path.join(customPath, 'public', 'index.html'))) {
+            return { type: 'static', path: customPath };
+          }
         }
       }
     }
@@ -219,10 +278,14 @@ class LocalRunner {
   async killProcessOnPort(port) {
     if (!port) return;
     const numPort = parseInt(port, 10);
-    if (isNaN(numPort) || numPort <= 0) return;
-    if (numPort === this.daemonPort()) {
-      console.warn(`[LocalRunner] Se ignora la petición de liberar el puerto ${numPort}: es el del propio daemon`);
+    if (isNaN(numPort) || numPort < 1024 || numPort > 65535) return;
+    if (numPort === this.daemonPort() || RESERVED_PORTS.has(numPort)) {
+      console.warn(`[LocalRunner] Se ignora la petición de liberar el puerto reservado ${numPort}`);
       return;
+    }
+    // Nunca matar el puerto de otro runner activo gestionado por Culkibo.
+    for (const runner of this.activeRunners.values()) {
+      if (runner && runner.port === numPort) return;
     }
 
     try {
@@ -314,11 +377,9 @@ class LocalRunner {
   }
 
   /**
-   * Find an available port starting from desiredPort
+   * Find an available port starting from desiredPort (never kills unknown host processes).
    */
   async getAvailablePort(desiredPort) {
-    await this.killProcessOnPort(desiredPort);
-
     const isPortFree = (port) => new Promise((resolve) => {
       const tester = net.createServer()
         .once('error', () => resolve(false))
@@ -328,11 +389,11 @@ class LocalRunner {
         .listen(port);
     });
 
-    let port = desiredPort || 3001;
+    const reservedActive = new Set(Array.from(this.activeRunners.values()).map(r => r && r.port).filter(Boolean));
+    let port = Math.max(1024, parseInt(String(desiredPort || 3001), 10) || 3001);
     while (port < 65535) {
-      // Saltar el puerto del daemon: aunque estuviera libre, dárselo a un
-      // proyecto dejaría el panel inaccesible en cuanto arrancase.
-      if (port !== this.daemonPort() && await isPortFree(port)) {
+      // Saltar el puerto del daemon, puertos reservados y otros proyectos activos.
+      if (port !== this.daemonPort() && !RESERVED_PORTS.has(port) && !reservedActive.has(port) && await isPortFree(port)) {
         return port;
       }
       port++;
@@ -370,7 +431,7 @@ class LocalRunner {
     project.localPort = port;
     project.localRunning = true;
 
-    const projectDir = path.join(process.cwd(), 'projects', project.id);
+    const projectDir = this.resolveProjectDir(project.id);
     const resolved = this.resolveRunnableDirectory(projectDir, project.baseDirectory);
 
     // Case 0: PHP / Laravel project detected
@@ -431,6 +492,7 @@ class LocalRunner {
       try {
         child = spawnTool('npm', ['install', '--prefer-offline', '--no-audit'], {
           cwd,
+          env: buildSafeChildEnv(),
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe']
         });
@@ -521,7 +583,10 @@ class LocalRunner {
 </html>`);
     });
 
-    await new Promise((/** @type {(value?: void) => void} */ resolve) => tempServer.listen(port, '0.0.0.0', () => resolve()));
+    await new Promise((/** @type {(value?: void) => void} */ resolve, reject) => {
+      tempServer.once('error', reject);
+      tempServer.listen(port, '0.0.0.0', () => resolve());
+    });
 
     this.activeRunners.set(project.id, {
       type: 'temporary_loading',
@@ -604,29 +669,25 @@ class LocalRunner {
 
     console.log(`[LocalRunner] Starting real process for ${project.name}: ${cmd} ${args.join(' ')} on port ${port} (cwd: ${projectDir})`);
 
-    const env = {
-      ...process.env,
+    const env = buildSafeChildEnv({
       PORT: String(port),
       HOST: '0.0.0.0',
-      NODE_ENV: 'development',
-      ...(project.envVars || {})
-    };
+      NODE_ENV: 'development'
+    }, project.envVars || {});
 
     const isWin = process.platform === 'win32';
-    // On POSIX, stop() kills the whole tree with `process.kill(-pid)`. That only
-    // works if the child is its own process-group leader, which requires
-    // detached:true — with detached:false the negative-pid kill throws ESRCH and
-    // the dev server (plus its forked workers) survives the "stop", leaving a
-    // zombie listener on the port. Windows uses `taskkill /T` instead.
-    //
-    // `spawnTool` centraliza el único punto del proyecto donde Windows obliga a
-    // pasar por cmd.exe, y valida ahí los argumentos: `pkg.main` sale del
-    // package.json del repositorio clonado, es decir, de código ajeno.
     const child = spawnTool(cmd, args, {
       cwd: projectDir,
       env,
       detached: !isWin,
       windowsHide: true
+    });
+
+    child.on('error', (err) => {
+      console.error(`[LocalRunner] Spawn error for ${project.name}:`, err.message);
+      if (containerOrchestrator) {
+        containerOrchestrator.addLog('ERROR', 'forge', `Error al lanzar el proceso: ${err.message}`, new Date(), project.id);
+      }
     });
 
     const stderrBuffer = [];
@@ -811,6 +872,28 @@ class LocalRunner {
       : projectDir;
 
     const rootDir = path.resolve(publicDir);
+    const realRoot = fs.existsSync(rootDir) ? fs.realpathSync(rootDir) : rootDir;
+
+    const streamFile = (targetPath, contentType, res) => {
+      try {
+        const realTarget = fs.realpathSync(targetPath);
+        const rel = path.relative(realRoot, realTarget);
+        if (rel.startsWith('..') || path.isAbsolute(rel)) {
+          res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('403 Forbidden');
+        }
+      } catch (e) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('404 Not Found');
+      }
+      res.writeHead(200, { 'Content-Type': contentType });
+      const rs = fs.createReadStream(targetPath);
+      rs.on('error', () => {
+        if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end();
+      });
+      return rs.pipe(res);
+    };
 
     const server = http.createServer((req, res) => {
       let reqPath = (req.url || '/').split('?')[0].split('#')[0];
@@ -842,15 +925,13 @@ class LocalRunner {
           '.jpg': 'image/jpeg',
           '.svg': 'image/svg+xml'
         };
-        res.writeHead(200, { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' });
-        return fs.createReadStream(filePath).pipe(res);
+        return streamFile(filePath, mimeTypes[ext] || 'application/octet-stream', res);
       }
 
       // SPA Fallback to index.html
       const fallbackIndex = path.join(publicDir, 'index.html');
       if (fs.existsSync(fallbackIndex)) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        return fs.createReadStream(fallbackIndex).pipe(res);
+        return streamFile(fallbackIndex, 'text/html; charset=utf-8', res);
       }
 
       res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -875,11 +956,13 @@ class LocalRunner {
   }
 
   /**
-   * Normalize Git URLs to authenticated or standard HTTPS format
+   * Normalize Git URLs to authenticated or standard HTTPS format.
+   * Rejects `file://`, local filesystem paths and SSRF metadata/private IPs.
    */
   normalizeGitUrl(rawUrl) {
     if (!rawUrl) return null;
     const url = String(rawUrl).trim();
+    if (!url || /[\x00-\x1f\x7f\s]/.test(url)) return null;
 
     // The credential username is safe to embed: it is a fixed literal, not a
     // secret. Embedding it means git only ever prompts for the password, which
@@ -897,47 +980,79 @@ class LocalRunner {
     if (sshMatch) return gh(sshMatch[1], sshMatch[2]);
 
     // https://github.com/owner/repo(.git)?
-    const httpMatch = url.match(/^https?:\/\/github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_.-]+)$/);
+    const httpMatch = url.match(/^https?:\/\/(?:[^@\s/]+@)?github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_.-]+)$/);
     if (httpMatch) return gh(httpMatch[1], httpMatch[2]);
 
-    return url;
+    // Reject file:// and local paths unless explicitly enabled for hermetic tests.
+    if (/^file:/i.test(url) || /^[a-zA-Z]:[\\/]/.test(url) || url.startsWith('/') || url.startsWith('\\\\')) {
+      if (process.env.CULKIBO_ALLOW_LOCAL_GIT === '1') return url;
+      return null;
+    }
+
+    // Generic HTTPS/HTTP Git remotes (GitLab, Bitbucket, Gitea, self-hosted)
+    if (/^https?:\/\//i.test(url)) {
+      try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.toLowerCase();
+        if (host === 'localhost' || host.endsWith('.local') || isMetadataIp(host) || (net.isIP(host) && isPrivateIp(host))) {
+          if (process.env.CULKIBO_ALLOW_LOCAL_GIT !== '1') return null;
+        }
+        return parsed.toString();
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Standard SSH remote (git@gitlab.com:org/repo.git)
+    if (/^git@[a-zA-Z0-9.-]+:[a-zA-Z0-9_./-]+$/.test(url)) {
+      return url;
+    }
+
+    return null;
   }
 
-  /** Read the stored GitHub PAT, or null. Never log or interpolate the result. */
+  /** ¿Esta URL pertenece a github.com? Sólo a ella se le entrega el PAT de GitHub. */
+  isGitHubRemote(cloneUrl) {
+    if (!cloneUrl) return true; // Compatibilidad con llamadas sin URL (p.ej. tests heredados)
+    try {
+      const parsed = new URL(String(cloneUrl));
+      return parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'github.com';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** Read the stored GitHub PAT, or null (stat-cached). Never log or interpolate the result. */
   readGitToken() {
     try {
       const ghFile = path.join(process.cwd(), 'data', 'github.json');
-      if (!fs.existsSync(ghFile)) return null;
+      const stat = fs.statSync(ghFile);
+      if (this._gitTokenCache && this._gitTokenCache.mtimeMs === stat.mtimeMs) {
+        return this._gitTokenCache.token;
+      }
       const gh = JSON.parse(fs.readFileSync(ghFile, 'utf8'));
-      return gh.token || null;
+      const token = gh.token || null;
+      this._gitTokenCache = { mtimeMs: stat.mtimeMs, token };
+      return token;
     } catch (e) {
+      this._gitTokenCache = null;
       return null;
     }
   }
 
   /**
    * Build the environment for a git subprocess so the PAT is supplied over
-   * GIT_ASKPASS instead of being embedded in the clone URL.
-   *
-   * A token in the URL leaks into `ps` output, into the cloned repo's
-   * .git/config, into git's own error messages, and into any log that echoes
-   * the command. Via askpass it lives only in the child's environment.
+   * GIT_ASKPASS ONLY for github.com remotes instead of leaking to arbitrary URLs.
    *
    * Returns { env, cleanup }. Always call cleanup().
    */
-  gitAuthEnv() {
-    const token = this.readGitToken();
+  /** @param {string | null} [cloneUrl] */
+  gitAuthEnv(cloneUrl = null) {
+    const token = this.isGitHubRemote(cloneUrl) ? this.readGitToken() : null;
     /** @type {Record<string, any>} */
     const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
 
     // Desactivar cualquier ayudante de credenciales configurado en la máquina.
-    //
-    // `GIT_TERMINAL_PROMPT=0` solo silencia el prompt de terminal. Git
-    // Credential Manager, que viene con Git para Windows, abre una VENTANA y se
-    // queda esperando: un despliegue automático se quedaría colgado hasta el
-    // tiempo de espera, sin log y sin nadie delante para cerrarla. La forma
-    // documentada de anularlo sin tocar la configuración del usuario es una
-    // entrada vacía por GIT_CONFIG_*, que borra la lista de ayudantes.
     env.GIT_CONFIG_COUNT = '1';
     env.GIT_CONFIG_KEY_0 = 'credential.helper';
     env.GIT_CONFIG_VALUE_0 = '';
@@ -948,13 +1063,12 @@ class LocalRunner {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-git-'));
     const helper = path.join(dir, isWin ? 'askpass.cmd' : 'askpass.sh');
 
-    // git invokes the helper with the prompt as argv[1] and reads the secret
-    // from stdout. Because the URL already carries the username, the only
-    // prompt is for the password.
+    // En Windows, EnableDelayedExpansion con `!CULKIBO_GIT_TOKEN!` evita que
+    // caracteres especiales (`&`, `|`, `%`) dentro de un token se interpreten.
     fs.writeFileSync(
       helper,
       isWin
-        ? '@echo off\r\necho %CULKIBO_GIT_TOKEN%\r\n'
+        ? '@echo off\r\nsetlocal EnableDelayedExpansion\r\necho(!CULKIBO_GIT_TOKEN!\r\n'
         : '#!/bin/sh\nprintf \'%s\' "$CULKIBO_GIT_TOKEN"\n',
       { mode: 0o700 }
     );
@@ -973,17 +1087,15 @@ class LocalRunner {
   /**
    * Clone a repository without a shell.
    *
-   * `exec()` runs the string through cmd.exe / sh, so any metacharacter in a
-   * repository URL becomes command injection — the exact class that produced
-   * 21 critical advisories in Coolify and 34 in Dokploy. spawn() with an argv
-   * array has no shell to inject into.
-   *
    * @param {string} cloneUrl
    * @param {string} targetDir
    * @param {{ timeout?: number, depth?: number | null, branch?: string | null, onLine?: ((line: string) => void) | null }} [opts]
    */
   gitClone(cloneUrl, targetDir, { timeout = 180000, depth = null, branch = null, onLine = null } = {}) {
-    const { env, cleanup } = this.gitAuthEnv();
+    if (!cloneUrl || /^file:/i.test(cloneUrl) && process.env.CULKIBO_ALLOW_LOCAL_GIT !== '1') {
+      return Promise.reject(new Error('URL de repositorio rechazada por política de seguridad'));
+    }
+    const { env, cleanup } = this.gitAuthEnv(cloneUrl);
 
     const args = ['clone', '--progress'];
 
@@ -1059,7 +1171,7 @@ class LocalRunner {
   /** Strip anything that looks like a credential out of text bound for a log or UI. */
   redactSecrets(text) {
     const token = this.readGitToken();
-    let out = String(text == null ? '' : text).replace(/https:\/\/[^@\s/]+@/g, 'https://***@');
+    let out = String(text == null ? '' : text).replace(/(https?|ssh):\/\/[^@\s/]+@/gi, '$1://***@');
     if (token) out = out.split(token).join('***');
     return out;
   }
@@ -1117,7 +1229,10 @@ class LocalRunner {
 </html>`);
     });
 
-    await new Promise((/** @type {(value?: void) => void} */ resolve) => tempServer.listen(port, '0.0.0.0', () => resolve()));
+    await new Promise((/** @type {(value?: void) => void} */ resolve, reject) => {
+      tempServer.once('error', reject);
+      tempServer.listen(port, '0.0.0.0', () => resolve());
+    });
 
     this.activeRunners.set(project.id, {
       type: 'temporary_loading',
@@ -1202,7 +1317,7 @@ class LocalRunner {
    */
   async prepareProject(project) {
     if (!project || !project.id) return;
-    const projectDir = path.join(process.cwd(), 'projects', project.id);
+    const projectDir = this.resolveProjectDir(project.id);
     if (fs.existsSync(projectDir)) return; // Already present
 
     const gitUrl = project.gitRepo || (project.resources && project.resources.find(r => r.gitRepo)?.gitRepo);

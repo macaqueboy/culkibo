@@ -6,6 +6,31 @@ const path = require('path');
 
 const caddyManager = require('./caddyManager');
 const repoSync = require('./repoSync');
+const { atomicWriteJsonSync } = require('./ssrfGuard');
+
+const TMP_ENV_DIR = path.join(__dirname, '..', '..', 'data', '.tmp');
+
+/** Variables del host que un proyecto jamás puede sobreescribir al invocar herramientas del host. */
+const HOST_HIJACK_ENV_BLOCKLIST = new Set([
+  'PATH', 'PATHEXT', 'COMSPEC', 'SYSTEMROOT', 'WINDIR',
+  'DOCKER_HOST', 'DOCKER_CONFIG', 'DOCKER_CONTEXT', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY', 'DOCKER_API_VERSION',
+  'BUILDKIT_HOST', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH',
+  'NODE_OPTIONS', 'BASH_ENV', 'ENV', 'IFS',
+  'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'GIT_EXEC_PATH',
+  'HOME', 'USERPROFILE', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'
+]);
+
+/** Filtra variables de usuario antes de mezclarlas con el entorno de un proceso del host (build/nixpacks). */
+function filterSafeHostEnv(vars) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [k, v] of Object.entries(vars || {})) {
+    if (!isValidEnvName(k)) continue;
+    if (HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase())) continue;
+    out[k] = String(v == null ? '' : v);
+  }
+  return out;
+}
 
 /** @type {any} */
 let containerOrchestrator = null;
@@ -180,6 +205,9 @@ class DeployManager extends EventEmitter {
     this.dockerProbe = null;
     this.dockerProbeAt = 0;
     this.dockerProbeTtlMs = 15000;
+    /** Cachés TTL de 60 s para evitar spawns repetitivos de `hasBinary` y `ensureNetwork`. */
+    this._binaryCache = new Map();
+    this._networkCache = new Map();
     /** @type {Record<string, any>} */
     this.store = this.loadStore();
   }
@@ -200,14 +228,10 @@ class DeployManager extends EventEmitter {
     return {};
   }
 
-  /** Escritura atómica: temporal + rename, igual que projectManager. */
+  /** Escritura atómica con permisos 0600. */
   saveStore() {
     try {
-      const dir = path.dirname(STORE_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const temp = `${STORE_FILE}.${Date.now()}.tmp`;
-      fs.writeFileSync(temp, JSON.stringify(this.store, null, 2), 'utf8');
-      fs.renameSync(temp, STORE_FILE);
+      atomicWriteJsonSync(STORE_FILE, this.store, 0o600);
     } catch (e) {
       console.error('[DeployManager] No se pudo guardar deployments.json:', e.message);
     }
@@ -348,11 +372,16 @@ class DeployManager extends EventEmitter {
     return this.dockerProbe;
   }
 
-  /** ¿Está `bin` en el PATH? Se usa para railpack / nixpacks. */
+  /** ¿Está `bin` en el PATH? Cacheado 60 s para no spawnear por cada build. */
   async hasBinary(bin) {
     if (!/^[a-z0-9_-]+$/i.test(bin)) return false;
+    const now = Date.now();
+    const cached = this._binaryCache.get(bin);
+    if (cached && (now - cached.at) < 60000) return cached.ok;
     const res = await this.runTool(bin, ['--version'], { timeoutMs: 4000 });
-    return res.code === 0;
+    const ok = res.code === 0;
+    this._binaryCache.set(bin, { at: now, ok });
+    return ok;
   }
 
   // -------------------------------------------------------------------------
@@ -601,7 +630,7 @@ class DeployManager extends EventEmitter {
         'COPY package*.json ./',
         'RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
         'COPY . .',
-        'RUN npm run build',
+        'RUN --mount=type=cache,target=/app/node_modules/.vite npm run build',
         '',
         'FROM nginx:1.27-alpine AS runtime',
         spaConf,
@@ -620,15 +649,21 @@ class DeployManager extends EventEmitter {
       return [
         '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
-        `FROM ${nodeTag} AS build`,
+        `FROM ${nodeTag} AS deps`,
         'WORKDIR /app',
         'COPY package*.json ./',
         'RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund || npm install --no-audit --no-fund',
+        '',
+        `FROM ${nodeTag} AS prod-deps`,
+        'WORKDIR /app',
+        'COPY package*.json ./',
+        'RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --no-audit --no-fund || npm install --omit=dev --no-audit --no-fund',
+        '',
+        `FROM ${nodeTag} AS build`,
+        'WORKDIR /app',
+        'COPY --from=deps /app/node_modules ./node_modules',
         'COPY . .',
         buildStep,
-        // Se poda a producción DESPUÉS del build: las devDependencies hacen
-        // falta para compilar y estorban en la imagen final.
-        'RUN npm prune --omit=dev || true',
         '',
         `FROM ${nodeTag} AS runtime`,
         'WORKDIR /app',
@@ -636,6 +671,7 @@ class DeployManager extends EventEmitter {
         `ENV PORT=${port}`,
         'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
         'COPY --from=build --chown=culkibo:culkibo /app ./',
+        'COPY --from=prod-deps --chown=culkibo:culkibo /app/node_modules ./node_modules',
         'USER culkibo',
         `EXPOSE ${port}`,
         startCmd,
@@ -674,12 +710,11 @@ class DeployManager extends EventEmitter {
         'FROM python:3.12-slim AS runtime',
         'WORKDIR /app',
         'ENV PYTHONUNBUFFERED=1',
-        // Las dependencias se copian e instalan antes que el código para que un
-        // cambio en un .py no invalide la capa de instalación.
+        // Crear usuario antes del COPY evita un `chown -R` lento en cada cambio de código.
+        'RUN useradd --create-home --shell /usr/sbin/nologin culkibo',
         'COPY requirements.tx[t] pyproject.tom[l] ./',
         'RUN --mount=type=cache,target=/root/.cache/pip if [ -f requirements.txt ]; then pip install -r requirements.txt; elif [ -f pyproject.toml ]; then pip install .; fi',
-        'COPY . .',
-        'RUN useradd --create-home --shell /usr/sbin/nologin culkibo && chown -R culkibo /app',
+        'COPY --chown=culkibo:culkibo . .',
         'USER culkibo',
         `EXPOSE ${port}`,
         `CMD ["python", "${entry}"]`,
@@ -803,7 +838,7 @@ class DeployManager extends EventEmitter {
    */
   /**
    * @param {{containerName: string, imageTag: string, hostPort: number, containerPort: number,
-   *   envNames?: string[], network?: string | null, memoryMb?: number, cpus?: string | number,
+   *   envNames?: string[], envFile?: string | null, network?: string | null, memoryMb?: number, cpus?: string | number,
    *   pidsLimit?: number, healthCmd?: string | null, labels?: Record<string, any>}} spec
    * @returns {string[]}
    */
@@ -813,6 +848,7 @@ class DeployManager extends EventEmitter {
     hostPort,
     containerPort,
     envNames = [],
+    envFile = null,
     network = DEFAULTS.network,
     memoryMb = DEFAULTS.memoryMb,
     cpus = DEFAULTS.cpus,
@@ -843,8 +879,12 @@ class DeployManager extends EventEmitter {
 
     if (network) args.push('--network', network);
 
-    for (const name of envNames) {
-      if (isValidEnvName(name)) args.push('-e', name);
+    if (envFile) {
+      args.push('--env-file', envFile);
+    } else {
+      for (const name of envNames) {
+        if (isValidEnvName(name)) args.push('-e', name);
+      }
     }
 
     if (healthCmd) {
@@ -863,12 +903,22 @@ class DeployManager extends EventEmitter {
   // Utilidades de red y puertos
   // -------------------------------------------------------------------------
 
-  /** Crea la red de Culkibo si no existe. Idempotente. */
+  /** Crea la red de Culkibo si no existe. Idempotente y cacheada 60 s. */
   async ensureNetwork(name = DEFAULTS.network) {
+    const now = Date.now();
+    const cachedAt = this._networkCache.get(name);
+    if (cachedAt && (now - cachedAt) < 60000) return true;
     const inspect = await this.runDocker(['network', 'inspect', name], { timeoutMs: 8000 });
-    if (inspect.code === 0) return true;
+    if (inspect.code === 0) {
+      this._networkCache.set(name, now);
+      return true;
+    }
     const created = await this.runDocker(['network', 'create', name], { timeoutMs: 10000 });
-    return created.code === 0;
+    if (created.code === 0) {
+      this._networkCache.set(name, now);
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -1003,19 +1053,14 @@ class DeployManager extends EventEmitter {
     const url = `http://127.0.0.1:${hostPort}${healthPath}`;
     let attempts = 0;
     let lastError = 'sin respuesta';
+    const backoff = [100, 150, 250, 500];
 
     while (Date.now() < deadline) {
       attempts++;
 
-      if (containerName) {
-        const state = await this.runDocker(['inspect', '-f', '{{.State.Running}}', containerName], { timeoutMs: 5000 });
-        if (state.code === 0 && (state.stdout || '').trim() === 'false') {
-          return { healthy: false, attempts, reason: 'El contenedor se detuvo durante el arranque (revisa los logs de la build)' };
-        }
-      }
-
+      // Sondeo HTTP primero: si el servicio ya está listo ahorra un `docker inspect` por intento.
       try {
-        const res = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(Math.min(5000, intervalMs * 4)) });
+        const res = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(Math.min(5000, Math.max(1000, intervalMs * 4))) });
         if (res.status < 500) {
           return { healthy: true, attempts, status: res.status };
         }
@@ -1024,10 +1069,19 @@ class DeployManager extends EventEmitter {
         lastError = err.name === 'TimeoutError' ? 'tiempo de espera agotado' : 'conexión rechazada';
       }
 
+      // Solo comprobar si el contenedor murió cuando el HTTP aún no responde.
+      if (containerName) {
+        const state = await this.runDocker(['inspect', '-f', '{{.State.Running}}', containerName], { timeoutMs: 5000 });
+        if (state.code === 0 && (state.stdout || '').trim() === 'false') {
+          return { healthy: false, attempts, reason: 'El contenedor se detuvo durante el arranque (revisa los logs de la build)' };
+        }
+      }
+
       if (onProgress && attempts % 5 === 0) {
         onProgress(`Esperando a que el servicio responda en ${healthPath} (intento ${attempts}: ${lastError})`);
       }
-      await new Promise(r => setTimeout(r, intervalMs));
+      const waitMs = attempts <= backoff.length ? Math.min(intervalMs, backoff[attempts - 1]) : intervalMs;
+      await new Promise(r => setTimeout(r, waitMs));
     }
 
     return { healthy: false, attempts, reason: `No respondió en ${Math.round(timeoutMs / 1000)} s (${lastError})` };
@@ -1106,14 +1160,17 @@ class DeployManager extends EventEmitter {
     const envNames = Object.keys(envVars).filter(isValidEnvName);
     const rejectedEnv = Object.keys(envVars).filter(k => !isValidEnvName(k));
 
+    const suffix = crypto.randomBytes(3).toString('hex');
     /** @type {any} */
     const deployment = {
-      id: `dep_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      id: `dep_${Date.now()}_${suffix}`,
       projectId: project.id,
       projectName: project.name || project.id,
       status: 'pendiente',
       imageTag: `culkibo/${slug}:${version}`,
-      containerName: `culkibo_${slug}_${version}`,
+      // Sufijo aleatorio: evita colisiones si el usuario redespliega la misma `version`
+      // y garantiza que `forceRemove` jamás pueda tocar el contenedor activo.
+      containerName: `culkibo_${slug}_${version}_${suffix}`,
       hostPort: null,
       containerPort: null,
       upstream: null,
@@ -1247,12 +1304,25 @@ class DeployManager extends EventEmitter {
       const hostPort = await this.findFreePort();
       deployment.hostPort = hostPort;
 
+      // Los valores de las variables del contenedor viajan en un `--env-file`
+      // temporal 0600 (eliminado al instante), jamás mezclados con `process.env`
+      // del CLI de Docker en el host ni expuestos en `ps`.
+      /** @type {string | null} */
+      let envFile = null;
+      if (envNames.length > 0) {
+        fs.mkdirSync(TMP_ENV_DIR, { recursive: true });
+        envFile = path.join(TMP_ENV_DIR, `depenv_${crypto.randomBytes(8).toString('hex')}`);
+        const lines = envNames.map(k => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n]+/g, ' ')}`);
+        fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+      }
+
       const runArgs = this.runArgs({
         containerName: deployment.containerName,
         imageTag: deployment.imageTag,
         hostPort,
         containerPort: strategy.containerPort,
-        envNames,
+        envNames: envFile ? [] : envNames,
+        envFile,
         network: opts.network,
         memoryMb: sanitizePort(project.memoryMb, opts.memoryMb),
         cpus: /^[0-9]+(\.[0-9]+)?$/.test(String(project.cpus || '')) ? String(project.cpus) : opts.cpus,
@@ -1265,14 +1335,21 @@ class DeployManager extends EventEmitter {
         }
       });
 
-      // Los VALORES de las variables viajan aquí, en el entorno del hijo, nunca
-      // en argv. Es la única forma de que `ps` no los vea.
-      const runEnv = { ...process.env, ...envVars };
-      const run = await this.runDocker(runArgs, { timeoutMs: 60000, env: runEnv });
+      let run;
+      try {
+        run = await this.runDocker(runArgs, { timeoutMs: 60000 });
+      } finally {
+        if (envFile) {
+          try { fs.unlinkSync(envFile); } catch (e) {}
+        }
+      }
+      const protectedContainers = new Set(
+        [state.current && state.current.containerName, state.previous && state.previous.containerName].filter(Boolean)
+      );
       if (run.code !== 0) {
         const msg = this.redact(run.stderr.trim() || `docker run terminó con código ${run.code}`, Object.values(envVars));
         this.log(deployment, 'ERROR', `No se pudo arrancar el contenedor: ${msg}`);
-        await this.forceRemove(deployment.containerName);
+        await this.forceRemove(deployment.containerName, protectedContainers);
         return finish('fallido', msg);
       }
       this.log(deployment, 'INFO', `Contenedor ${deployment.containerName} arrancado en 127.0.0.1:${hostPort}`);
@@ -1293,7 +1370,7 @@ class DeployManager extends EventEmitter {
       if (!health.healthy) {
         this.log(deployment, 'ERROR', `La versión nueva no pasó la verificación de salud: ${health.reason}`);
         await this.captureContainerLogs(deployment, deployment.containerName);
-        await this.forceRemove(deployment.containerName);
+        await this.forceRemove(deployment.containerName, protectedContainers);
         this.notify({
           event: 'deploy_failed',
           level: 'error',
@@ -1325,7 +1402,7 @@ class DeployManager extends EventEmitter {
           // No se promociona a medias: si la ruta no se puede mover, el
           // contenedor nuevo se retira y la versión anterior sigue intacta.
           this.log(deployment, 'ERROR', `No se pudo conmutar la ruta: ${switched.error}. Se conserva la versión anterior.`);
-          await this.forceRemove(deployment.containerName);
+          await this.forceRemove(deployment.containerName, protectedContainers);
           return finish('fallido', switched.error);
         }
       }
@@ -1378,7 +1455,10 @@ class DeployManager extends EventEmitter {
       return finish('activo');
     } catch (err) {
       this.log(deployment, 'ERROR', `Error inesperado en el despliegue: ${err.message}`);
-      try { await this.forceRemove(deployment.containerName); } catch (e) {}
+      const protectedSet = new Set(
+        [state.current && state.current.containerName, state.previous && state.previous.containerName].filter(Boolean)
+      );
+      try { await this.forceRemove(deployment.containerName, protectedSet); } catch (e) {}
       return finish('fallido', err.message);
     }
   }
@@ -1404,7 +1484,7 @@ class DeployManager extends EventEmitter {
         // usa el CLI para construir, pero sí `docker load` al final, y lee
         // BUILDKIT_HOST del entorno. Los valores de las variables van aquí para
         // que la forma `--env NOMBRE` de nixpacks los encuentre.
-        env: { ...process.env, DOCKER_BUILDKIT: '1', ...envVars },
+        env: { ...process.env, DOCKER_BUILDKIT: '1', ...filterSafeHostEnv(envVars) },
         onLine
       });
       if (res.code !== 0) {
@@ -1449,7 +1529,7 @@ class DeployManager extends EventEmitter {
       cwd: contextDir,
       // Los valores de los build args viajan por el entorno, igual que los de
       // ejecución. `--build-arg NOMBRE` sin `=` los toma de aquí.
-      env: { ...process.env, DOCKER_BUILDKIT: '1', ...(project.buildArgs || {}) },
+      env: { ...process.env, DOCKER_BUILDKIT: '1', ...filterSafeHostEnv(project.buildArgs || {}) },
       onLine
     });
 
@@ -1480,7 +1560,7 @@ class DeployManager extends EventEmitter {
    */
   async switchRoute(deployment, hostnames, dial) {
     try {
-      const detection = await caddyManager.detect({ force: true });
+      const detection = await caddyManager.detect();
       if (!detection.available) {
         return { ok: false, error: `Caddy no está disponible: ${detection.reason}` };
       }
@@ -1564,8 +1644,10 @@ class DeployManager extends EventEmitter {
     return { removed, keep };
   }
 
-  async forceRemove(containerName) {
+  /** @param {string} containerName @param {Set<string> | null} [protectedNames] */
+  async forceRemove(containerName, protectedNames = null) {
     if (!containerName) return;
+    if (protectedNames && protectedNames.has(containerName)) return;
     await this.runDocker(['rm', '-f', containerName], { timeoutMs: 20000 });
   }
 
@@ -1596,7 +1678,20 @@ class DeployManager extends EventEmitter {
    * En ningún caso se reconstruye la imagen: el rollback no puede depender de
    * que un build vuelva a salir bien.
    */
-  async rollback(projectId, options = {}) {
+  async rollback(projectOrId, options = {}) {
+    const projectId = (projectOrId && typeof projectOrId === 'object') ? projectOrId.id : projectOrId;
+    if (!projectId || typeof projectId !== 'string') throw new Error('Proyecto inválido');
+    if (this.locks.has(projectId)) {
+      throw new Error('Ya hay una operación de despliegue o rollback en curso para este proyecto');
+    }
+    const task = this._rollback(projectId, options).finally(() => {
+      if (this.locks.get(projectId) === task) this.locks.delete(projectId);
+    });
+    this.locks.set(projectId, task);
+    return task;
+  }
+
+  async _rollback(projectId, options = {}) {
     const opts = { ...DEFAULTS, ...options };
     const state = this.getState(projectId);
     if (!state.previous) {
@@ -1863,76 +1958,92 @@ class DeployManager extends EventEmitter {
     return { applied, failed };
   }
 
-  /** Detiene el servicio de producción de un proyecto sin borrar nada. */
-  async stopProduction(projectId) {
-    const state = this.getState(projectId);
-    if (!state.current) return { stopped: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
-    try { await caddyManager.removeRoute(projectId); } catch (e) {}
-    const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000 });
-    return { stopped: res.code === 0, containerName: state.current.containerName, error: res.code === 0 ? null : res.stderr.trim() };
+  /** Detiene el servicio de producción de un proyecto sin borrar nada (serializado por lock). */
+  async stopProduction(projectOrId) {
+    const projectId = (projectOrId && typeof projectOrId === 'object') ? projectOrId.id : projectOrId;
+    if (!projectId || typeof projectId !== 'string') throw new Error('Proyecto inválido');
+    if (this.locks.has(projectId)) {
+      throw new Error('Hay un despliegue en curso para este proyecto; espera a que termine antes de detenerlo');
+    }
+    const task = (async () => {
+      const state = this.getState(projectId);
+      if (!state.current) return { stopped: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
+      try { await caddyManager.removeRoute(projectId); } catch (e) {}
+      const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000 });
+      return { stopped: res.code === 0, containerName: state.current.containerName, error: res.code === 0 ? null : res.stderr.trim() };
+    })().finally(() => {
+      if (this.locks.get(projectId) === task) this.locks.delete(projectId);
+    });
+    this.locks.set(projectId, task);
+    return task;
   }
 
   /**
-   * Vuelve a levantar el servicio que `stopProduction()` paró.
-   *
-   * Es el «deshacer» de detener, y por eso existe: una acción reversible solo
-   * es reversible si hay algo que la deshaga. No reconstruye nada —el
-   * contenedor y su imagen siguen ahí— y repone la ruta de Caddy DESPUÉS de
-   * comprobar que responde, nunca antes: mandar tráfico a algo que todavía
-   * arranca es cambiar un servicio parado por un 502.
+   * Vuelve a levantar el servicio que `stopProduction()` paró (serializado por lock).
    */
-  async startProduction(projectId, options = {}) {
-    const opts = { ...DEFAULTS, ...options };
-    const state = this.getState(projectId);
-    if (!state.current) return { started: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
-
-    const docker = await this.detectDocker({ force: true });
-    if (!docker.available) return { started: false, reason: docker.reason };
-
-    const target = state.current;
-    const start = await this.runDocker(['start', target.containerName], { timeoutMs: 40000 });
-    if (start.code !== 0) {
-      return {
-        started: false,
-        containerName: target.containerName,
-        error: (start.stderr || '').trim() || `docker start terminó con código ${start.code}`
-      };
+  async startProduction(projectOrId, options = {}) {
+    const projectId = (projectOrId && typeof projectOrId === 'object') ? projectOrId.id : projectOrId;
+    if (!projectId || typeof projectId !== 'string') throw new Error('Proyecto inválido');
+    if (this.locks.has(projectId)) {
+      throw new Error('Hay un despliegue en curso para este proyecto; espera a que termine antes de arrancarlo');
     }
+    const task = (async () => {
+      const opts = { ...DEFAULTS, ...options };
+      const state = this.getState(projectId);
+      if (!state.current) return { started: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
 
-    const health = await this.waitForHealth({
-      hostPort: target.hostPort,
-      healthPath: target.healthPath || DEFAULTS.healthPath,
-      containerName: target.containerName,
-      timeoutMs: opts.healthTimeoutMs,
-      intervalMs: opts.healthIntervalMs,
-      onProgress: null
-    });
-    if (!health.healthy) {
-      return {
-        started: false,
-        containerName: target.containerName,
-        error: `El contenedor arrancó pero no pasó la verificación de salud: ${health.reason}`
-      };
-    }
+      const docker = await this.detectDocker({ force: true });
+      if (!docker.available) return { started: false, reason: docker.reason };
 
-    if ((target.hostnames || []).length > 0 && target.upstream) {
-      try {
-        await caddyManager.upsertRoute({
-          projectId,
-          hostnames: target.hostnames,
-          upstreams: [target.upstream]
-        });
-      } catch (err) {
+      const target = state.current;
+      const start = await this.runDocker(['start', target.containerName], { timeoutMs: 40000 });
+      if (start.code !== 0) {
         return {
-          started: true,
-          routeRestored: false,
+          started: false,
           containerName: target.containerName,
-          error: `El servicio está arriba, pero no se pudo reponer la ruta: ${err.message}`
+          error: (start.stderr || '').trim() || `docker start terminó con código ${start.code}`
         };
       }
-    }
 
-    return { started: true, routeRestored: true, containerName: target.containerName, error: null };
+      const health = await this.waitForHealth({
+        hostPort: target.hostPort,
+        healthPath: target.healthPath || DEFAULTS.healthPath,
+        containerName: target.containerName,
+        timeoutMs: opts.healthTimeoutMs,
+        intervalMs: opts.healthIntervalMs,
+        onProgress: null
+      });
+      if (!health.healthy) {
+        return {
+          started: false,
+          containerName: target.containerName,
+          error: `El contenedor arrancó pero no pasó la verificación de salud: ${health.reason}`
+        };
+      }
+
+      if ((target.hostnames || []).length > 0 && target.upstream) {
+        try {
+          await caddyManager.upsertRoute({
+            projectId,
+            hostnames: target.hostnames,
+            upstreams: [target.upstream]
+          });
+        } catch (err) {
+          return {
+            started: true,
+            routeRestored: false,
+            containerName: target.containerName,
+            error: `El servicio está arriba, pero no se pudo reponer la ruta: ${err.message}`
+          };
+        }
+      }
+
+      return { started: true, routeRestored: true, containerName: target.containerName, error: null };
+    })().finally(() => {
+      if (this.locks.get(projectId) === task) this.locks.delete(projectId);
+    });
+    this.locks.set(projectId, task);
+    return task;
   }
 }
 
@@ -1941,6 +2052,6 @@ class DeployManager extends EventEmitter {
 const instance = /** @type {any} */ (new DeployManager());
 instance.DeployManager = DeployManager;
 instance.DEFAULTS = DEFAULTS;
-instance.helpers = { safeSlug, isValidEnvName, sanitizeHealthPath, sanitizeNodeMajor, sanitizePort };
+instance.helpers = { safeSlug, isValidEnvName, sanitizeHealthPath, sanitizeNodeMajor, sanitizePort, filterSafeHostEnv };
 
 module.exports = instance;

@@ -1,11 +1,21 @@
 const crypto = require('crypto');
 
+const PROJECT_ID_RE = /^[a-zA-Z0-9_-]{1,80}$/;
+
 class Project {
   constructor(data) {
     // `proj_${Date.now()}` collides when several projects are created inside the
     // same millisecond (bulk Coolify import), silently overwriting each other in
     // the Map. Suffix with entropy while keeping the id filesystem/URL safe.
-    this.id = data.id || `proj_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    if (data.id !== undefined && data.id !== null && data.id !== '') {
+      const rawId = String(data.id);
+      if (!PROJECT_ID_RE.test(rawId)) {
+        throw new Error(`Invalid project ID: ${rawId.slice(0, 40)}`);
+      }
+      this.id = rawId;
+    } else {
+      this.id = `proj_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    }
     this.name = data.name || 'Nuevo Proyecto';
     this.description = data.description || '';
     this.icon = data.icon || '🚀';

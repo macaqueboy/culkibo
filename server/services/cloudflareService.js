@@ -1,7 +1,15 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./ssrfGuard');
 
 const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'cloudflare-config.json');
+const CF_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+function assertCfId(value, label = 'ID de Cloudflare') {
+  const s = String(value || '').trim();
+  if (!CF_ID_RE.test(s)) throw new Error(`${label} inválido`);
+  return encodeURIComponent(s);
+}
 
 class CloudflareService {
   constructor() {
@@ -129,13 +137,25 @@ class CloudflareService {
       this.config.useMock = true;
     } else if (newConfig.useMock !== undefined) {
       this.config.useMock = Boolean(newConfig.useMock);
+    } else {
+      // Un token real recién configurado desactiva el modo simulado automáticamente.
+      this.config.useMock = false;
     }
-    const dir = path.dirname(CONFIG_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(this.config, null, 2), 'utf8');
+    atomicWriteJsonSync(CONFIG_FILE, this.config, 0o600);
     return this.config;
+  }
+
+  /** Estado seguro para la UI sin exponer el token en claro. */
+  getConfigStatus() {
+    const token = String(this.config.apiToken || '');
+    const isMock = Boolean(this.config.useMock || !token || this.isSimulatedToken(token));
+    return {
+      isConfigured: Boolean(token && !this.isSimulatedToken(token)),
+      useMock: isMock,
+      accountId: this.config.accountId || '',
+      defaultZoneId: this.config.defaultZoneId || '',
+      tokenMasked: token ? (token.length > 8 ? `${token.slice(0, 4)}••••${token.slice(-4)}` : '••••••••') : null
+    };
   }
 
   async findZoneForDomain(domain) {
@@ -177,6 +197,7 @@ class CloudflareService {
     try {
       const res = await fetch(`${this.apiBase}/user/tokens/verify`, {
         method: 'GET',
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json'
@@ -216,6 +237,7 @@ class CloudflareService {
 
     try {
       const res = await fetch(`${this.apiBase}/zones?status=active&per_page=50`, {
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           'Content-Type': 'application/json'
@@ -239,7 +261,9 @@ class CloudflareService {
     }
 
     try {
-      const res = await fetch(`${this.apiBase}/zones/${zoneId}/dns_records?per_page=100`, {
+      const safeZone = assertCfId(zoneId, 'Zone ID');
+      const res = await fetch(`${this.apiBase}/zones/${safeZone}/dns_records?per_page=100`, {
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           'Content-Type': 'application/json'
@@ -278,8 +302,10 @@ class CloudflareService {
     }
 
     try {
-      const res = await fetch(`${this.apiBase}/zones/${zoneId}/dns_records`, {
+      const safeZone = assertCfId(zoneId, 'Zone ID');
+      const res = await fetch(`${this.apiBase}/zones/${safeZone}/dns_records`, {
         method: 'POST',
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           'Content-Type': 'application/json'
@@ -315,8 +341,11 @@ class CloudflareService {
     }
 
     try {
-      const res = await fetch(`${this.apiBase}/zones/${zoneId}/dns_records/${recordId}`, {
+      const safeZone = assertCfId(zoneId, 'Zone ID');
+      const safeRec = assertCfId(recordId, 'Record ID');
+      const res = await fetch(`${this.apiBase}/zones/${safeZone}/dns_records/${safeRec}`, {
         method: 'PATCH',
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           'Content-Type': 'application/json'
@@ -341,8 +370,11 @@ class CloudflareService {
     }
 
     try {
-      const res = await fetch(`${this.apiBase}/zones/${zoneId}/dns_records/${recordId}`, {
+      const safeZone = assertCfId(zoneId, 'Zone ID');
+      const safeRec = assertCfId(recordId, 'Record ID');
+      const res = await fetch(`${this.apiBase}/zones/${safeZone}/dns_records/${safeRec}`, {
         method: 'DELETE',
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           'Content-Type': 'application/json'
@@ -385,7 +417,9 @@ class CloudflareService {
       if (!accountId) {
         return { success: false, error: 'Cloudflare Account ID required to list tunnels', tunnels: [] };
       }
-      const res = await fetch(`${this.apiBase}/accounts/${accountId}/cfd_tunnel?is_deleted=false`, {
+      const safeAccount = assertCfId(accountId, 'Account ID');
+      const res = await fetch(`${this.apiBase}/accounts/${safeAccount}/cfd_tunnel?is_deleted=false`, {
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           'Content-Type': 'application/json'
@@ -423,8 +457,10 @@ class CloudflareService {
     try {
       const accountId = this.config.accountId;
       if (!accountId) throw new Error('Cloudflare Account ID required');
-      const res = await fetch(`${this.apiBase}/accounts/${accountId}/cfd_tunnel`, {
+      const safeAccount = assertCfId(accountId, 'Account ID');
+      const res = await fetch(`${this.apiBase}/accounts/${safeAccount}/cfd_tunnel`, {
         method: 'POST',
+        signal: AbortSignal.timeout(10000),
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           'Content-Type': 'application/json'

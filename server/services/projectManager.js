@@ -157,7 +157,7 @@ class ProjectManager extends EventEmitter {
     if (!this._inFlightFlush) {
       if (!this._batchingFlush) {
         this._batchingFlush = new Promise((resolve) => {
-          const t = setTimeout(() => {
+          setTimeout(() => {
             this._batchingFlush = null;
             const p = this.writeSnapshot().finally(() => {
               if (this._inFlightFlush === p) this._inFlightFlush = null;
@@ -166,7 +166,6 @@ class ProjectManager extends EventEmitter {
             this.flushChain = p;
             resolve(p);
           }, 2);
-          if (t.unref) t.unref();
         });
         this.flushChain = this._batchingFlush;
       }
@@ -207,7 +206,7 @@ class ProjectManager extends EventEmitter {
       }
 
       tempPath = `${this.dataPath}.${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`;
-      await fs.promises.writeFile(tempPath, buf);
+      await fs.promises.writeFile(tempPath, buf, { mode: 0o600 });
 
       // Verify exact byte count landed on disk without re-parsing hundreds of KB on the event loop.
       const st = await fs.promises.stat(tempPath);
@@ -237,6 +236,7 @@ class ProjectManager extends EventEmitter {
         await fs.promises.copyFile(tempPath, this.dataPath);
         try { await fs.promises.unlink(tempPath); } catch(e) {}
       }
+      try { await fs.promises.chmod(this.dataPath, 0o600); } catch (e) {}
       tempPath = null;
 
       // Refresh the .bak recovery snapshot in the background (throttled) so
@@ -244,7 +244,9 @@ class ProjectManager extends EventEmitter {
       const now = Date.now();
       if (now - this._lastBackupAt > 5000) {
         this._lastBackupAt = now;
-        fs.promises.copyFile(this.dataPath, `${this.dataPath}.bak`).catch(() => {});
+        fs.promises.copyFile(this.dataPath, `${this.dataPath}.bak`)
+          .then(() => fs.promises.chmod(`${this.dataPath}.bak`, 0o600).catch(() => {}))
+          .catch(() => {});
       }
     } catch (err) {
       console.error('Error flushing projects to disk:', err);
@@ -288,47 +290,73 @@ class ProjectManager extends EventEmitter {
   }
 
   /**
+   * Serialización JSON en caché por proyecto (O(1) en lecturas repetidas).
+   * @param {string} id
+   * @returns {string | null}
+   */
+  getByIdSerialized(id) {
+    const proj = this.projects.get(id);
+    if (!proj) return null;
+    let cached = this._projectJsonCache.get(id);
+    if (cached === undefined) {
+      cached = JSON.stringify(proj);
+      this._projectJsonCache.set(id, cached);
+    }
+    return cached;
+  }
+
+  /**
    * @param {any} data
    * @param {string | null} [id]
    */
   validateProjectData(data, id = null) {
-    if (id && (!/^[a-zA-Z0-9_-]+$/.test(id) || id.includes('../') || id.includes('..\\'))) {
-      throw new Error('Invalid project ID (path traversal detected)');
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('Invalid project payload');
     }
-    if (data.name) {
-      // Culkibo is a Spanish-first product: the previous ASCII allowlist silently
-      // destroyed accents, ñ and emoji ("Aplicación Núcleo" -> "Aplicacin Ncleo")
-      // on every single update, including the implicit update done by start-local.
-      // Keep Unicode intact; strip only control characters and the angle brackets
-      // that could break out of the HTML the local runner renders. Every consumer
-      // that prints a name into markup escapes it as well.
-      data.name = Array.from(String(data.name))
-        .filter((ch) => {
-          const code = ch.codePointAt(0) ?? 0;
-          return code > 31 && code !== 127 && ch !== String.fromCharCode(60) && ch !== String.fromCharCode(62);
-        })
-        .join('')
+    const effectiveId = id !== null && id !== undefined ? id : data.id;
+    if (effectiveId !== undefined && effectiveId !== null && effectiveId !== '') {
+      const idStr = String(effectiveId);
+      if (!/^[a-zA-Z0-9_-]{1,80}$/.test(idStr)) {
+        throw new Error('Invalid project ID (path traversal detected)');
+      }
+    }
+    if (data.name !== undefined && data.name !== null) {
+      // Keep Unicode intact; strip only control characters and angle brackets
+      // in one fast regex pass instead of allocating per-char arrays.
+      data.name = String(data.name)
+        .replace(/[\x00-\x1f\x7f<>]/g, '')
         .slice(0, 120)
         .trim();
     }
+    if (data.baseDirectory !== undefined && data.baseDirectory !== null && data.baseDirectory !== '') {
+      const baseDir = String(data.baseDirectory).trim();
+      if (baseDir.includes('\0') || baseDir.split(/[\\/]+/).includes('..')) {
+        throw new Error('Invalid baseDirectory (path traversal detected)');
+      }
+    }
     if (data.watchPaths && Array.isArray(data.watchPaths)) {
       data.watchPaths.forEach(p => {
-        if (p.includes('../') || p.includes('..\\') || p.includes(';')) {
+        if (typeof p !== 'string' || p.includes('../') || p.includes('..\\') || p.includes(';') || p.includes('\0')) {
           throw new Error('Invalid watch path detected');
         }
       });
     }
-    if (data.startCommand && data.startCommand.includes(';')) {
-      throw new Error('Invalid start command');
+    if (data.startCommand !== undefined && data.startCommand !== null) {
+      if (typeof data.startCommand !== 'string' || data.startCommand.includes(';')) {
+        throw new Error('Invalid start command');
+      }
     }
-    if (data.buildCommand && data.buildCommand.includes(';')) {
-      throw new Error('Invalid build command');
+    if (data.buildCommand !== undefined && data.buildCommand !== null) {
+      if (typeof data.buildCommand !== 'string' || data.buildCommand.includes(';')) {
+        throw new Error('Invalid build command');
+      }
     }
   }
 
   create(data) {
-    this.validateProjectData(data);
-    const project = new Project(data);
+    const safeData = data && typeof data === 'object' ? { ...data } : {};
+    this.validateProjectData(safeData);
+    const project = new Project(safeData);
     this.projects.set(project.id, project);
     this.saveProjects(project.id);
     this.emit('project_created', project);
@@ -336,14 +364,18 @@ class ProjectManager extends EventEmitter {
   }
 
   update(id, data) {
-    this.validateProjectData(data, id);
+    const safeData = data && typeof data === 'object' ? { ...data } : {};
+    // Never let a caller overwrite immutable identity/audit fields via PUT.
+    delete safeData.id;
+    delete safeData.createdAt;
+    this.validateProjectData(safeData, id);
     const project = this.projects.get(id);
     if (!project) throw new Error('Project not found');
     
     const wasActive = project.status === 'active';
     const oldWatchPaths = JSON.stringify(project.watchPaths || []);
     
-    Object.assign(project, data, { updatedAt: new Date().toISOString() });
+    Object.assign(project, safeData, { id, updatedAt: new Date().toISOString() });
     const updatedProject = new Project(project);
     this.projects.set(id, updatedProject);
     this.saveProjects(id);

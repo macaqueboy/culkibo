@@ -48,6 +48,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
   const [creds, setCreds] = useState<Record<string, DbCredentials>>({});
   const [backups, setBackups] = useState<Record<string, DbBackup[]>>({});
   const [copied, setCopied] = useState<string | null>(null);
+  const [confirmDestroyId, setConfirmDestroyId] = useState<string | null>(null);
   const [storage, setStorage] = useState<DbStorageConfig>({ configured: false });
   const [showStorageForm, setShowStorageForm] = useState(false);
   const [storageForm, setStorageForm] = useState({
@@ -124,7 +125,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     setCreating(engine.engine);
     try {
       const created = await api.createDatabase({ projectId, engine: engine.engine, name: engine.label });
-      onNotify(`${engine.label} aprovisionado. Guarde la cadena de conexión desde «Credenciales».`);
+      onNotify(`${engine.label} aprovisionado. Guarda o inyecta la cadena de conexión desde «Gestionar».`);
       await load();
       setExpanded(created.id);
     } catch (err) {
@@ -158,6 +159,16 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     const res = await api.setDatabaseExposure(db.id, { enabled, hostPort: db.port });
     if (res.warning) onNotify(res.warning);
     await load();
+  });
+
+  const handleInjectEnv = (db: ManagedDatabase) => guard(`inj-${db.id}`, async () => {
+    const c = creds[db.id] || await api.getDatabaseCredentials(db.id);
+    if (!creds[db.id]) setCreds((prev) => ({ ...prev, [db.id]: c }));
+    const project = await api.getProject(projectId);
+    const key = db.engine === 'valkey' || db.engine === 'redis' ? 'REDIS_URL' : 'DATABASE_URL';
+    const nextEnv = { ...(project.envVars || {}), [key]: c.internalConnectionString };
+    await api.updateProject(projectId, { envVars: nextEnv });
+    onNotify(`Variable ${key} inyectada en las variables del proyecto`);
   });
 
   return (
@@ -300,12 +311,20 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
                     {creds[db.id] && (
                       <button
                         onClick={() => copy(creds[db.id].internalConnectionString, `conn-${db.id}`)}
-                        className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600"
+                        className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer"
                         title="Copiar"
                       >
                         {copied === `conn-${db.id}` ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
                       </button>
                     )}
+                    <button
+                      onClick={() => handleInjectEnv(db)}
+                      disabled={busy === `inj-${db.id}`}
+                      className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shrink-0 cursor-pointer disabled:opacity-50"
+                      title="Guarda automáticamente la cadena de conexión en las variables de entorno del proyecto"
+                    >
+                      {busy === `inj-${db.id}` ? 'Inyectando…' : `Inyectar ${db.engine === 'valkey' ? 'REDIS_URL' : 'DATABASE_URL'}`}
+                    </button>
                   </div>
                 </section>
 
@@ -320,7 +339,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
                       <span className="font-mono"> 127.0.0.1</span>, nunca en todas las interfaces:
                       las reglas que escribe Docker se evalúan <strong>antes</strong> que UFW, así que un
                       puerto abierto a 0.0.0.0 queda accesible aunque el cortafuegos diga lo contrario.
-                      Para acceso remoto, use un túnel SSH.
+                      Para acceso remoto, usa un túnel SSH.
                     </p>
                     <button
                       onClick={() => handleExpose(db, !db.exposure.enabled)}
@@ -478,20 +497,39 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
                       >
                         Eliminar y conservar datos
                       </button>
-                      <button
-                        onClick={() => guard(`del-${db.id}`, async () => {
-                          if (!window.confirm(
-                            `Se borrará el volumen «${db.volumeName}» y TODOS sus datos de forma irreversible. ¿Continuar?`
-                          )) return;
-                          await api.deleteDatabase(db.id, { deleteVolume: true, deleteBackups: true });
-                          onNotify('Base de datos y volumen eliminados');
-                          await load();
-                        })}
-                        disabled={busy === `del-${db.id}`}
-                        className="text-sm font-medium text-red-700 border border-red-200 bg-red-50 px-3 py-1.5 rounded-lg hover:bg-red-100 disabled:opacity-50 flex items-center gap-1.5"
-                      >
-                        <Trash2 className="w-4 h-4" /> Eliminar y borrar datos
-                      </button>
+                      {confirmDestroyId === db.id ? (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => guard(`del-${db.id}`, async () => {
+                              setConfirmDestroyId(null);
+                              await api.deleteDatabase(db.id, { deleteVolume: true, deleteBackups: true });
+                              onNotify('Base de datos y volumen eliminados');
+                              await load();
+                            })}
+                            disabled={busy === `del-${db.id}`}
+                            className="text-xs font-semibold text-white bg-red-600 hover:bg-red-700 px-3 py-1.5 rounded-lg cursor-pointer"
+                          >
+                            Sí, borrar datos para siempre
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDestroyId(null)}
+                            className="text-xs font-medium text-slate-600 border border-slate-200 bg-white px-2.5 py-1.5 rounded-lg cursor-pointer"
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDestroyId(db.id)}
+                          disabled={busy === `del-${db.id}`}
+                          className="text-sm font-medium text-red-700 border border-red-200 bg-red-50 px-3 py-1.5 rounded-lg hover:bg-red-100 disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4" /> Eliminar y borrar datos
+                        </button>
+                      )}
                     </div>
                   </div>
                 </section>

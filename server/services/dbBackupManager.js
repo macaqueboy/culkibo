@@ -6,6 +6,7 @@ const path = require('path');
 // alguien cayera en la tentación de añadir un `exec()`.
 const projectManager = require('./projectManager');
 const domainManager = require('./domainManager');
+const { assertContainedPath } = require('./ssrfGuard');
 
 class DbBackupManager {
   constructor() {
@@ -92,7 +93,7 @@ class DbBackupManager {
     const spec = this.buildDbDumpSpec(dbType, options);
     const quote = (v) => (/[\s"'$`\\;|&<>()]/.test(v) ? JSON.stringify(v) : v);
     const envPrefix = Object.keys(spec.env).map(k => `${k}=********`).join(' ');
-    const args = spec.args.map(a => quote(String(a).replace(/(--password=).*/, '$1********')));
+    const args = spec.args.map(a => quote(String(a).replace(/(--password=)[\s\S]*/, '$1********')));
     return [envPrefix, spec.program, ...args].filter(Boolean).join(' ');
   }
 
@@ -122,7 +123,7 @@ class DbBackupManager {
       checksum: `sha256_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
     };
 
-    await fs.promises.writeFile(backupFilePath, JSON.stringify(exportBundle, null, 2), 'utf8');
+    await fs.promises.writeFile(backupFilePath, JSON.stringify(exportBundle, null, 2), { encoding: 'utf8', mode: 0o600 });
 
     return {
       success: true,
@@ -138,15 +139,30 @@ class DbBackupManager {
 
   /**
    * Importa y restaura un proyecto desde un archivo de backup JSON.
+   * Por seguridad, desde API/MCP el archivo debe estar contenido en `this.backupsDir`;
+   * la CLI local puede pasar `{ allowExternalPath: true }`.
    */
-  async restoreProject(backupFilePathOrName) {
-    let filePath = backupFilePathOrName;
-    if (!path.isAbsolute(filePath)) {
-      filePath = path.join(this.backupsDir, backupFilePathOrName);
+  async restoreProject(backupFilePathOrName, { allowExternalPath = false } = {}) {
+    const rawInput = String(backupFilePathOrName || '').trim();
+    if (!rawInput || rawInput.includes('\0')) {
+      throw new Error('Ruta de backup inválida');
+    }
+    let filePath;
+    if (allowExternalPath && path.isAbsolute(rawInput)) {
+      filePath = path.resolve(rawInput);
+    } else if (path.isAbsolute(rawInput)) {
+      const resolved = path.resolve(rawInput);
+      const rel = path.relative(path.resolve(this.backupsDir), resolved);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        throw new Error('Ruta de backup fuera del directorio permitido (data/backups)');
+      }
+      filePath = resolved;
+    } else {
+      filePath = assertContainedPath(this.backupsDir, rawInput);
     }
 
     if (!fs.existsSync(filePath)) {
-      throw new Error(`Archivo de backup no encontrado: ${filePath}`);
+      throw new Error(`Archivo de backup no encontrado: ${path.basename(filePath)}`);
     }
 
     const raw = await fs.promises.readFile(filePath, 'utf8');

@@ -84,13 +84,15 @@ function percentile(values, p) {
 
 /**
  * Normaliza y valida una ruta relativa dentro de `baseDir`.
- * Lanza error con `code = 'PATH_TRAVERSAL_BLOCKED'` si intenta escapar.
+ * Lanza error con `code = 'PATH_TRAVERSAL_BLOCKED'` si intenta escapar
+ * (incluyendo escapes por enlace simbólico en directorios ancestros o en el fichero hoja).
  *
  * @param {string} baseDir
  * @param {string} relPath
+ * @param {{ realBase?: string | null, verifiedDirs?: Set<string> }} [ctx]
  * @returns {{ rel: string, abs: string }}
  */
-function resolveSafeFilePath(baseDir, relPath) {
+function resolveSafeFilePath(baseDir, relPath, ctx = {}) {
   if (typeof relPath !== 'string' || !relPath.trim()) {
     const err = new Error('Ruta de fichero vacía');
     /** @type {any} */ (err).code = 'INVALID_PATH';
@@ -137,25 +139,44 @@ function resolveSafeFilePath(baseDir, relPath) {
     throw err;
   }
 
-  // Comprueba que ningún ancestro existente sea un symlink hacia fuera.
-  let checkDir = path.dirname(resolvedTarget);
-  if (fs.existsSync(resolvedBase)) {
-    const realBase = fs.realpathSync(resolvedBase);
-    while (checkDir.length >= resolvedBase.length) {
-      if (fs.existsSync(checkDir)) {
-        const realCheck = fs.realpathSync(checkDir);
-        const relReal = path.relative(realBase, realCheck);
-        if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
-          const err = new Error(`Escape por enlace simbólico bloqueado: ${relPath}`);
-          /** @type {any} */ (err).code = 'PATH_TRAVERSAL_BLOCKED';
-          throw err;
+  // Comprueba que ningún ancestro existente sea un symlink hacia fuera (cacheado por frame).
+  const targetDir = path.dirname(resolvedTarget);
+  const verifiedDirs = ctx.verifiedDirs;
+  if (!verifiedDirs || !verifiedDirs.has(targetDir)) {
+    const realBase = ctx.realBase !== undefined
+      ? ctx.realBase
+      : (fs.existsSync(resolvedBase) ? fs.realpathSync(resolvedBase) : null);
+    if (realBase) {
+      let checkDir = targetDir;
+      while (checkDir.length >= resolvedBase.length) {
+        if (fs.existsSync(checkDir)) {
+          const realCheck = fs.realpathSync(checkDir);
+          const relReal = path.relative(realBase, realCheck);
+          if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+            const err = new Error(`Escape por enlace simbólico bloqueado: ${relPath}`);
+            /** @type {any} */ (err).code = 'PATH_TRAVERSAL_BLOCKED';
+            throw err;
+          }
+          if (verifiedDirs) verifiedDirs.add(targetDir);
+          break;
         }
-        break;
+        const parent = path.dirname(checkDir);
+        if (parent === checkDir) break;
+        checkDir = parent;
       }
-      const parent = path.dirname(checkDir);
-      if (parent === checkDir) break;
-      checkDir = parent;
     }
+  }
+
+  // Comprueba también el propio fichero hoja (impide leer o sobrescribir symlinks externos).
+  try {
+    const st = fs.lstatSync(resolvedTarget);
+    if (st.isSymbolicLink()) {
+      const err = new Error(`Enlace simbólico de destino bloqueado: ${relPath}`);
+      /** @type {any} */ (err).code = 'PATH_TRAVERSAL_BLOCKED';
+      throw err;
+    }
+  } catch (e) {
+    if (e && e.code !== 'ENOENT') throw e;
   }
 
   return { rel: cleanRel, abs: resolvedTarget };
@@ -184,31 +205,51 @@ function classifyChanges(relPaths) {
   };
 }
 
+let tempSeq = 0;
+
 /**
- * Escritura atómica en disco: temporal en el mismo directorio + rename.
+ * Escritura atómica en disco: temporal en el mismo directorio + rename (POSIX),
+ * o escritura directa en Windows NTFS para evitar bloqueos síncronos del AV.
  *
  * @param {string} absPath
  * @param {Buffer} buffer
+ * @param {Set<string> | null} [ensuredDirs]
  */
-function writeFileAtomic(absPath, buffer) {
+function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
   const dir = path.dirname(absPath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  // En Windows NTFS, crear un .tmp nuevo + renameSync dispara escaneos
-  // síncronos del antivirus (~300 ms/archivo) y bloqueos EPERM con lectores.
-  // En POSIX (Linux/macOS, donde corren los VPS de producción) usamos temp+rename atómico.
+  if (!ensuredDirs || !ensuredDirs.has(dir)) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (ensuredDirs) ensuredDirs.add(dir);
+  }
   if (process.platform === 'win32') {
     fs.writeFileSync(absPath, buffer);
     return;
   }
-  const tempPath = `${absPath}.culkibo-sync-${process.pid}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}.tmp`;
+  const tempPath = `${absPath}.culkibo-sync-${process.pid}-${++tempSeq}.tmp`;
   fs.writeFileSync(tempPath, buffer);
   try {
     fs.renameSync(tempPath, absPath);
   } catch (err) {
+    try {
+      const st = fs.lstatSync(absPath);
+      if (st.isSymbolicLink()) {
+        try { fs.unlinkSync(tempPath); } catch (e) {}
+        throw new Error(`Rechazado escribir sobre enlace simbólico: ${absPath}`);
+      }
+    } catch (e) {
+      if (e && e.code !== 'ENOENT') throw e;
+    }
     fs.copyFileSync(tempPath, absPath);
     try { fs.unlinkSync(tempPath); } catch (e) {}
   }
 }
+
+/** Caché por (absPath -> { mtimeMs, size, hash }) para árboles Merkle ultrarrápidos. */
+/** @type {Map<string, { mtimeMs: number, size: number, hash: string }>} */
+const merkleFileCache = new Map();
+const MAX_MERKLE_CACHE_ENTRIES = 25000;
+const MAX_MERKLE_FILES = 20000;
+const MAX_MERKLE_DEPTH = 20;
 
 /**
  * Calcula el árbol determinista de hashes (Merkle plano ordenado por ruta) de
@@ -219,15 +260,17 @@ function writeFileAtomic(absPath, buffer) {
  */
 function computeMerkleTree(baseDir) {
   /** @type {Record<string, string>} */
-  const files = {};
+  const files = Object.create(null);
   let totalBytes = 0;
+  let scannedFiles = 0;
 
   if (!fs.existsSync(baseDir)) {
     return { rootDigest: sha256(''), fileCount: 0, totalBytes: 0, files };
   }
 
-  /** @param {string} dir @param {string} prefix */
-  const walk = (dir, prefix) => {
+  /** @param {string} dir @param {string} prefix @param {number} depth */
+  const walk = (dir, prefix, depth) => {
+    if (depth > MAX_MERKLE_DEPTH || scannedFiles >= MAX_MERKLE_FILES) return;
     let entries;
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -237,24 +280,36 @@ function computeMerkleTree(baseDir) {
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     for (const entry of entries) {
+      if (scannedFiles >= MAX_MERKLE_FILES) break;
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
         if (IGNORED_DIRS.has(entry.name)) continue;
-        walk(path.join(dir, entry.name), prefix ? `${prefix}/${entry.name}` : entry.name);
+        walk(path.join(dir, entry.name), prefix ? `${prefix}/${entry.name}` : entry.name, depth + 1);
       } else if (entry.isFile()) {
         if (IGNORED_FILES.has(entry.name) || entry.name.includes('.culkibo-sync-')) continue;
         const abs = path.join(dir, entry.name);
         const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
         try {
-          const buf = fs.readFileSync(abs);
-          totalBytes += buf.length;
-          files[rel] = sha256(buf);
+          const st = fs.statSync(abs);
+          if (st.size > MAX_FILE_BYTES) continue;
+          scannedFiles++;
+          totalBytes += st.size;
+          const cached = merkleFileCache.get(abs);
+          if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+            files[rel] = cached.hash;
+          } else {
+            const buf = fs.readFileSync(abs);
+            const h = sha256(buf);
+            files[rel] = h;
+            if (merkleFileCache.size >= MAX_MERKLE_CACHE_ENTRIES) merkleFileCache.clear();
+            merkleFileCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, hash: h });
+          }
         } catch (e) {}
       }
     }
   };
 
-  walk(baseDir, '');
+  walk(baseDir, '', 0);
 
   const sortedKeys = Object.keys(files).sort();
   const rootHasher = crypto.createHash('sha256');
@@ -272,7 +327,7 @@ function computeMerkleTree(baseDir) {
 
 /**
  * Compara dos mapas de archivos `{ relPath: sha256 }` y devuelve la divergencia
- * exacta.
+ * exacta (protegido contra colisiones con Object.prototype).
  *
  * @param {Record<string, string>} clientFiles
  * @param {Record<string, string>} serverFiles
@@ -285,15 +340,18 @@ function diffMerkleTrees(clientFiles, serverFiles) {
   /** @type {string[]} */
   const extraOnServer = [];
 
-  for (const [rel, hash] of Object.entries(clientFiles || {})) {
-    if (!(rel in serverFiles)) {
+  const cMap = clientFiles || {};
+  const sMap = serverFiles || {};
+
+  for (const [rel, hash] of Object.entries(cMap)) {
+    if (!Object.prototype.hasOwnProperty.call(sMap, rel)) {
       missingOnServer.push(rel);
-    } else if (serverFiles[rel] !== hash) {
+    } else if (sMap[rel] !== hash) {
       staleOnServer.push(rel);
     }
   }
-  for (const rel of Object.keys(serverFiles || {})) {
-    if (!(rel in (clientFiles || {}))) {
+  for (const rel of Object.keys(sMap)) {
+    if (!Object.prototype.hasOwnProperty.call(cMap, rel)) {
       extraOnServer.push(rel);
     }
   }
@@ -306,6 +364,27 @@ function diffMerkleTrees(clientFiles, serverFiles) {
     divergentCount: missingOnServer.length + staleOnServer.length + extraOnServer.length
   };
 }
+
+/** Calcula p50/p95/p99 en un solo ordenamiento. */
+function computePercentiles(samples) {
+  if (!samples || samples.length === 0) {
+    return { samples: 0, p50: null, p95: null, p99: null };
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const pick = (p) => {
+    const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+    return Number(sorted[Math.max(0, idx)].toFixed(2));
+  };
+  return {
+    samples: sorted.length,
+    p50: pick(50),
+    p95: pick(95),
+    p99: pick(99)
+  };
+}
+
+const MAX_PATCH_HISTORY_BYTES = 32 * 1024 * 1024; // 32 MiB por sesión
+const MAX_RECENT_FRAMES = 25;
 
 class LiveSyncEngine extends EventEmitter {
   constructor() {
@@ -328,7 +407,13 @@ class LiveSyncEngine extends EventEmitter {
     if (this.targetOverrides.has(projectId)) {
       return /** @type {string} */ (this.targetOverrides.get(projectId));
     }
-    return path.join(process.cwd(), 'projects', String(projectId).replace(/[^a-zA-Z0-9_-]/g, ''));
+    const cleanId = String(projectId || '').trim();
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(cleanId)) {
+      const err = new Error(`Identificador de proyecto inválido para Live Sync: ${projectId}`);
+      /** @type {any} */ (err).code = 'INVALID_PROJECT_ID';
+      throw err;
+    }
+    return path.join(process.cwd(), 'projects', cleanId);
   }
 
   /** Registra un directorio objetivo explícito (usado por proyectos locales y tests). */
@@ -356,7 +441,9 @@ class LiveSyncEngine extends EventEmitter {
         lastAppliedAt: null,
         lastApplyMs: null,
         latencySamples: /** @type {number[]} */ ([]),
-        patchHistory: /** @type {any[]} */ ([])
+        patchHistory: /** @type {any[]} */ ([]),
+        patchHistoryBytes: 0,
+        recentFrames: /** @type {any[]} */ ([])
       };
       this.sessions.set(projectId, s);
     }
@@ -377,12 +464,17 @@ class LiveSyncEngine extends EventEmitter {
     this.emit('sync_client', { projectId, connectedClients: s.connectedClients });
   }
 
+  /** Emite el evento `sync_applied` (permite enviarlo tras `frame_ack` en /ws/sync). */
+  emitApplied(result) {
+    this.emit('sync_applied', result);
+  }
+
   /**
    * Aplica un Commit Frame atómico sobre el directorio vivo del proyecto.
    *
    * @param {string} projectId
-   * @param {{ seq?: number, files?: Array<{ path: string, op?: 'upsert' | 'delete', content?: string, encoding?: 'utf8' | 'base64', sha256?: string }>, clientSentAtMs?: number }} frame
-   * @param {{ targetDir?: string }} [options]
+   * @param {{ seq?: number, files?: Array<{ path: string, op?: 'upsert' | 'delete', content?: string, buffer?: Buffer, encoding?: 'utf8' | 'base64', sha256?: string }>, clientSentAtMs?: number }} frame
+   * @param {{ targetDir?: string, deferEmit?: boolean }} [options]
    */
   applyCommitFrame(projectId, frame, options = {}) {
     const startedNs = process.hrtime.bigint();
@@ -396,30 +488,36 @@ class LiveSyncEngine extends EventEmitter {
       throw new Error(`El commit frame supera el máximo permitido (${MAX_FILES_PER_FRAME} ficheros)`);
     }
 
-    // 1. Validación previa de TODAS las rutas y payloads antes de escribir nada
-    //    (atomicidad a nivel de transacción).
+    const realBase = fs.existsSync(baseDir) ? fs.realpathSync(baseDir) : null;
+    const pathCtx = { realBase, verifiedDirs: new Set() };
+
     /** @type {Array<{ rel: string, abs: string, op: 'upsert' | 'delete', buffer: Buffer | null, hash: string | null }>} */
     const prepared = [];
     for (const item of frame.files) {
-      const { rel, abs } = resolveSafeFilePath(baseDir, item.path);
+      const { rel, abs } = resolveSafeFilePath(baseDir, item.path, pathCtx);
       const op = item.op === 'delete' ? 'delete' : 'upsert';
       if (op === 'upsert') {
-        const encoding = item.encoding === 'base64' ? 'base64' : 'utf8';
-        const buffer = Buffer.from(String(item.content ?? ''), encoding);
+        const buffer = Buffer.isBuffer(item.buffer)
+          ? item.buffer
+          : Buffer.from(String(item.content ?? ''), item.encoding === 'base64' ? 'base64' : 'utf8');
         if (buffer.length > MAX_FILE_BYTES) {
           throw new Error(`El fichero ${rel} supera el límite de ${MAX_FILE_BYTES} bytes`);
         }
-        const computedHash = sha256(buffer);
-        if (item.sha256 && item.sha256 !== computedHash) {
-          throw new Error(`Checksum SHA-256 inválido para ${rel}`);
+        /** @type {string | null} */
+        let verifiedHash = null;
+        if (item.sha256) {
+          const computedHash = sha256(buffer);
+          if (item.sha256 !== computedHash) {
+            throw new Error(`Checksum SHA-256 inválido para ${rel}`);
+          }
+          verifiedHash = computedHash;
         }
-        prepared.push({ rel, abs, op, buffer, hash: computedHash });
+        prepared.push({ rel, abs, op, buffer, hash: verifiedHash });
       } else {
         prepared.push({ rel, abs, op, buffer: null, hash: null });
       }
     }
 
-    // 2. Comprobación de secuencia monótona para detectar eventos perdidos.
     let reconcileRequired = false;
     const seq = typeof frame.seq === 'number' && Number.isInteger(frame.seq) && frame.seq > 0
       ? frame.seq
@@ -430,11 +528,15 @@ class LiveSyncEngine extends EventEmitter {
     }
     if (seq > session.lastSeq) session.lastSeq = seq;
 
-    if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true });
+    const ensuredDirs = new Set();
+    if (!realBase && !fs.existsSync(baseDir)) {
+      fs.mkdirSync(baseDir, { recursive: true });
+    }
+    ensuredDirs.add(baseDir);
 
-    // 3. Captura del estado previo (para rollback <10ms) + deduplicación + escritura atómica.
     /** @type {Array<{ rel: string, abs: string, existed: boolean, prevBuffer: Buffer | null }>} */
     const undoEntries = [];
+    let undoBytes = 0;
     let written = 0;
     let deleted = 0;
     let dedupSkipped = 0;
@@ -443,16 +545,27 @@ class LiveSyncEngine extends EventEmitter {
     const changedPaths = [];
 
     for (const entry of prepared) {
-      const existed = fs.existsSync(entry.abs) && fs.statSync(entry.abs).isFile();
-      const prevBuffer = existed ? fs.readFileSync(entry.abs) : null;
+      let existed = false;
+      /** @type {Buffer | null} */
+      let prevBuffer = null;
+      try {
+        prevBuffer = fs.readFileSync(entry.abs);
+        existed = true;
+      } catch (e) {
+        if (!e || (e.code !== 'ENOENT' && e.code !== 'EISDIR')) {
+          throw e;
+        }
+      }
 
       if (entry.op === 'upsert' && entry.buffer !== null) {
-        if (prevBuffer && sha256(prevBuffer) === entry.hash) {
+        if (prevBuffer && prevBuffer.length === entry.buffer.length && prevBuffer.equals(entry.buffer)) {
           dedupSkipped++;
           continue;
         }
         undoEntries.push({ rel: entry.rel, abs: entry.abs, existed, prevBuffer });
-        writeFileAtomic(entry.abs, entry.buffer);
+        if (prevBuffer) undoBytes += prevBuffer.length;
+        writeFileAtomic(entry.abs, entry.buffer, ensuredDirs);
+        merkleFileCache.delete(entry.abs);
         written++;
         bytesWritten += entry.buffer.length;
         changedPaths.push(entry.rel);
@@ -462,7 +575,9 @@ class LiveSyncEngine extends EventEmitter {
           continue;
         }
         undoEntries.push({ rel: entry.rel, abs: entry.abs, existed: true, prevBuffer });
+        if (prevBuffer) undoBytes += prevBuffer.length;
         fs.unlinkSync(entry.abs);
+        merkleFileCache.delete(entry.abs);
         deleted++;
         changedPaths.push(entry.rel);
       }
@@ -471,20 +586,28 @@ class LiveSyncEngine extends EventEmitter {
     const classification = classifyChanges(changedPaths.length > 0 ? changedPaths : prepared.map(p => p.rel));
 
     if (undoEntries.length > 0) {
-      session.patchHistory.unshift({
+      const patch = {
         patchId: `patch_${seq}_${Date.now()}`,
         seq,
         appliedAt: new Date().toISOString(),
         files: changedPaths,
         classification: classification.path,
+        byteSize: undoBytes,
         undoEntries
-      });
-      if (session.patchHistory.length > MAX_PATCH_HISTORY) {
-        session.patchHistory.pop();
+      };
+      session.patchHistory.unshift(patch);
+      session.patchHistoryBytes = (session.patchHistoryBytes || 0) + undoBytes;
+      while (
+        session.patchHistory.length > MAX_PATCH_HISTORY ||
+        (session.patchHistory.length > 1 && session.patchHistoryBytes > MAX_PATCH_HISTORY_BYTES)
+      ) {
+        const evicted = session.patchHistory.pop();
+        if (evicted) session.patchHistoryBytes = Math.max(0, session.patchHistoryBytes - (evicted.byteSize || 0));
       }
     }
 
     const applyMs = Number((Number(process.hrtime.bigint() - startedNs) / 1e6).toFixed(2));
+    const appliedAt = new Date().toISOString();
     session.framesApplied++;
     session.filesWritten += written;
     session.filesDeleted += deleted;
@@ -492,11 +615,27 @@ class LiveSyncEngine extends EventEmitter {
     session.bytesSynced += bytesWritten;
     session.lastPath = classification.path;
     session.lastReason = classification.reason;
-    session.lastAppliedAt = new Date().toISOString();
+    session.lastAppliedAt = appliedAt;
     session.lastApplyMs = applyMs;
     session.latencySamples.push(applyMs);
     if (session.latencySamples.length > MAX_LATENCY_SAMPLES) {
       session.latencySamples.shift();
+    }
+
+    session.recentFrames.unshift({
+      seq,
+      appliedAt,
+      written,
+      deleted,
+      dedupSkipped,
+      bytesWritten,
+      applyMs,
+      mode: classification.path,
+      files: changedPaths.slice(0, 10),
+      totalFiles: changedPaths.length
+    });
+    if (session.recentFrames.length > MAX_RECENT_FRAMES) {
+      session.recentFrames.pop();
     }
 
     const result = {
@@ -516,7 +655,9 @@ class LiveSyncEngine extends EventEmitter {
       historyDepth: session.patchHistory.length
     };
 
-    this.emit('sync_applied', result);
+    if (!options.deferEmit) {
+      this.emit('sync_applied', result);
+    }
     return result;
   }
 
@@ -539,17 +680,20 @@ class LiveSyncEngine extends EventEmitter {
     const restoredFiles = [];
     /** @type {string[]} */
     const revertedPatchIds = [];
+    const ensuredDirs = new Set();
 
     for (let i = 0; i < count; i++) {
       const patch = session.patchHistory.shift();
       if (!patch) break;
+      session.patchHistoryBytes = Math.max(0, (session.patchHistoryBytes || 0) - (patch.byteSize || 0));
       revertedPatchIds.push(patch.patchId);
       for (const entry of patch.undoEntries) {
         if (entry.existed && entry.prevBuffer !== null) {
-          writeFileAtomic(entry.abs, entry.prevBuffer);
+          writeFileAtomic(entry.abs, entry.prevBuffer, ensuredDirs);
         } else if (fs.existsSync(entry.abs)) {
           fs.unlinkSync(entry.abs);
         }
+        merkleFileCache.delete(entry.abs);
         restoredFiles.push(entry.rel);
       }
     }
@@ -639,12 +783,8 @@ class LiveSyncEngine extends EventEmitter {
       lastAppliedAt: s.lastAppliedAt,
       lastApplyMs: s.lastApplyMs,
       historyDepth: s.patchHistory.length,
-      latencyMs: {
-        samples: s.latencySamples.length,
-        p50: percentile(s.latencySamples, 50),
-        p95: percentile(s.latencySamples, 95),
-        p99: percentile(s.latencySamples, 99)
-      }
+      recentFrames: s.recentFrames || [],
+      latencyMs: computePercentiles(s.latencySamples)
     };
   }
 
@@ -669,12 +809,7 @@ class LiveSyncEngine extends EventEmitter {
       activeSessions: active.length,
       connectedClients: totalClients,
       totalFramesApplied: totalFrames,
-      latencyMs: {
-        samples: allSamples.length,
-        p50: percentile(allSamples, 50),
-        p95: percentile(allSamples, 95),
-        p99: percentile(allSamples, 99)
-      },
+      latencyMs: computePercentiles(allSamples),
       sessions: active
     };
   }

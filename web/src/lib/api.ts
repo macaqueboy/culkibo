@@ -1,15 +1,21 @@
 const API_BASE = '/api';
 const TOKEN_STORAGE_KEY = 'culkibo_control_token';
 
+let _cachedToken: string | null | undefined;
+
 export function getAuthToken(): string | null {
+  if (_cachedToken !== undefined) return _cachedToken;
   try {
-    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    _cachedToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    return _cachedToken;
   } catch {
+    _cachedToken = null;
     return null;
   }
 }
 
 export function setAuthToken(token: string): void {
+  _cachedToken = token;
   try {
     window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
   } catch {
@@ -18,6 +24,7 @@ export function setAuthToken(token: string): void {
 }
 
 export function clearAuthToken(): void {
+  _cachedToken = null;
   try {
     window.localStorage.removeItem(TOKEN_STORAGE_KEY);
   } catch {
@@ -54,6 +61,17 @@ export interface AuthSession {
   tokenSource: string;
 }
 
+export interface LiveSyncRecentFrame {
+  seq: number;
+  written: number;
+  deleted: number;
+  dedupSkipped: number;
+  applyMs: number;
+  mode: string;
+  reason?: string;
+  at: string;
+}
+
 export interface LiveSyncStatus {
   projectId: string;
   targetDir: string;
@@ -71,11 +89,130 @@ export interface LiveSyncStatus {
   lastAppliedAt: string | null;
   lastApplyMs: number | null;
   historyDepth: number;
+  recentFrames?: LiveSyncRecentFrame[];
   latencyMs: {
     samples: number;
     p50: number | null;
     p95: number | null;
     p99: number | null;
+  };
+}
+
+export interface WordPressAnalysis {
+  success: boolean;
+  url: string;
+  hostname: string;
+  httpStatus: number;
+  isWordPress: boolean;
+  siteName: string;
+  siteDescription: string;
+  wpVersion: string | null;
+  generator: string | null;
+  restApiAvailable: boolean;
+  theme: string | null;
+  themes: string[];
+  plugins: string[];
+  hasWooCommerce: boolean;
+  postTypes: string[];
+  usesHttps: boolean;
+  usesCloudflare: boolean;
+  serverHeader: string | null;
+  resolvedIps: string[];
+  estimatedRamMb: number;
+  suggestedSlug: string;
+  migrationPlan: string[];
+}
+
+export interface ComposeParsedService {
+  name: string;
+  image: string;
+  build: string;
+  kind: 'app' | 'database';
+  dbEngine: string | null;
+  dbLabel: string | null;
+  ports: string[];
+  containerPort: number | null;
+  volumes: string[];
+  envVars: Record<string, string>;
+  dependsOn: string[];
+  warnings: string[];
+}
+
+export interface ComposeParseResult {
+  success: boolean;
+  servicesCount: number;
+  appsCount: number;
+  databasesCount: number;
+  services: ComposeParsedService[];
+}
+
+export interface GitInspectResult {
+  success: boolean;
+  provider: string;
+  host: string;
+  owner: string;
+  repo: string;
+  suggestedName: string;
+  cloneUrl: string;
+  defaultBranch: string;
+  description: string;
+  language: string | null;
+  isPrivate: boolean;
+  framework: string | null;
+  buildCommand: string;
+  startCommand: string;
+  port: number;
+  icon: string;
+  verifiedPublic: boolean;
+}
+
+export interface PlatformParseResult {
+  success: boolean;
+  platform: string;
+  name: string;
+  gitRepo: string;
+  gitBranch: string;
+  framework: string | null;
+  buildCommand: string;
+  startCommand: string;
+  outputDirectory: string;
+  baseDirectory: string;
+  healthPath: string;
+  port: number;
+  domains: string[];
+  envVars: Record<string, string>;
+  recommendedDatabases: Array<{ engine: string; label: string; envKey: string }>;
+  notes: string[];
+}
+
+export interface RemoteAccessInfo {
+  panelDomain: string | null;
+  currentOrigin: string;
+  recommendedUrl: string;
+  serverIp: string | null;
+  auth: AuthSession & { allowedOrigins?: string[] };
+  caddy: { available: boolean; adminUrl?: string; version?: string | null; reason?: string | null };
+  cloudflare: { isConfigured: boolean; hasApiToken: boolean; accountId: string | null; tokenMasked?: string | null; useMock?: boolean };
+  tunnels: Array<{ id: string; name: string; status?: string; created_at?: string }>;
+  tunnelsMock: boolean;
+  clientConfigs: any;
+  cliUpdateCommand: string;
+}
+
+export interface NotificationsConfig {
+  enabled: boolean;
+  events: {
+    service_down: boolean;
+    deploy_failed: boolean;
+    deploy_succeeded: boolean;
+    ssl_issued: boolean;
+    project_stopped: boolean;
+  };
+  channels: {
+    telegram: { enabled: boolean; botToken: string; chatId: string; configured?: boolean };
+    discord: { enabled: boolean; webhookUrl: string; configured?: boolean };
+    slack: { enabled: boolean; webhookUrl: string; configured?: boolean };
+    webhook: { enabled: boolean; url: string; secretHeader?: string; configured?: boolean };
   };
 }
 
@@ -1376,14 +1513,213 @@ export const api = {
     );
   },
 
-  async configureWildcardDns01(domain: string): Promise<any> {
+  async configureWildcardDns01(domain: string, tokenEnv = 'CF_API_TOKEN'): Promise<any> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/ingress/wildcard-dns01`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domain })
+        body: JSON.stringify({ domain, tokenEnv })
       }),
       'No se pudo configurar el certificado wildcard DNS-01 en Caddy'
     );
+  },
+
+  async getSyncSummary(): Promise<any> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/sync/summary`), 'No se pudo consultar el resumen de Live Sync');
+  },
+
+  // --- Migrador WordPress ---
+
+  async analyzeWordPress(url: string): Promise<WordPressAnalysis> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/wordpress/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url })
+      }),
+      'No se pudo analizar la web WordPress'
+    );
+  },
+
+  async provisionWordPress(payload: {
+    name: string;
+    domain?: string | null;
+    sourceUrl?: string | null;
+    useSslip?: boolean;
+    serverIp?: string | null;
+  }): Promise<{ success: boolean; installation: ServiceInstallation; previewUrl: string; wpAdminUrl: string; migrationChecklist: string[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/wordpress/provision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo aprovisionar WordPress'
+    );
+  },
+
+  async importWordPressSql(payload: {
+    installationId: string;
+    sqlContent: string;
+    oldDomain?: string;
+    newDomain?: string;
+  }): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/wordpress/import-sql`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo importar el volcado SQL'
+    );
+  },
+
+  // --- Importador Universal (Docker Compose, cualquier Git, Vercel/Netlify/Railway/Render/Dokploy) ---
+
+  async parseCompose(yamlText: string): Promise<ComposeParseResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/compose/parse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ yamlText })
+      }),
+      'No se pudo analizar el archivo docker-compose.yml'
+    );
+  },
+
+  async applyCompose(payload: { yamlText: string; projectName?: string; selectedServices?: string[] }): Promise<{ success: boolean; project: Project; importedServices: number; databasesDetected: any[]; warnings: string[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/compose/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo importar el stack Docker Compose'
+    );
+  },
+
+  async inspectGitUrl(gitUrl: string, branch?: string): Promise<GitInspectResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/git/inspect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gitUrl, branch })
+      }),
+      'No se pudo inspeccionar la URL del repositorio Git'
+    );
+  },
+
+  async parsePlatformConfig(payload: { platform?: string; configText?: string; envText?: string }): Promise<PlatformParseResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/platform/parse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo leer la configuración de la plataforma'
+    );
+  },
+
+  async createImportedProject(payload: {
+    name: string;
+    description?: string;
+    icon?: string;
+    platform?: string;
+    source?: string;
+    gitRepo?: string;
+    gitBranch?: string;
+    buildCommand?: string;
+    startCommand?: string;
+    baseDirectory?: string;
+    healthPath?: string;
+    port?: number;
+    envVars?: Record<string, string>;
+    domains?: string[];
+  }): Promise<{ success: boolean; project: Project }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/universal/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo crear el proyecto importado'
+    );
+  },
+
+  // --- Acceso remoto, Notificaciones, Mantenimiento y MCP moderno ---
+
+  async getRemoteAccess(): Promise<RemoteAccessInfo> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/system/remote-access`), 'No se pudo consultar el acceso remoto');
+  },
+
+  async setPanelDomain(domain: string): Promise<{ success: boolean; panelDomain: string | null; url?: string; ingress?: IngressOutcome }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/panel-domain`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain })
+      }),
+      'No se pudo guardar el dominio del panel'
+    );
+  },
+
+  async getNotificationsConfig(): Promise<NotificationsConfig> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/notifications/config`), 'No se pudo leer la configuración de notificaciones');
+  },
+
+  async saveNotificationsConfig(payload: Partial<NotificationsConfig>): Promise<NotificationsConfig> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/notifications/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo guardar la configuración de notificaciones'
+    );
+  },
+
+  async testNotifications(): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/notifications/test`, { method: 'POST' }),
+      'No se pudo enviar la alerta de prueba'
+    );
+  },
+
+  async pruneBuildCache(opts: { keepStorageGb?: number; untilHours?: number | null } = {}): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/deploy/prune-cache`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts)
+      }),
+      'No se pudo limpiar la caché de compilación'
+    );
+  },
+
+  async callMcpModern(toolName: string, args: Record<string, unknown> = {}): Promise<any> {
+    const res = await apiFetch(`${API_BASE}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'MCP-Protocol-Version': '2026-07-28',
+        'Mcp-Method': 'tools/call',
+        'Mcp-Name': toolName
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: Date.now(),
+        method: 'tools/call',
+        params: {
+          name: toolName,
+          arguments: args,
+          _meta: {
+            'modelcontextprotocol.io/protocolVersion': '2026-07-28',
+            'modelcontextprotocol.io/clientInfo': { name: 'culkibo-dashboard', version: '1.0.0' }
+          }
+        }
+      })
+    });
+    return res.json();
   }
 };

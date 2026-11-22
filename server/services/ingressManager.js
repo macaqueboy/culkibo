@@ -6,6 +6,16 @@ const domainManager = require('./domainManager');
 const projectManager = require('./projectManager');
 const localRunner = require('./localRunner');
 const containerOrchestrator = require('./containerOrchestrator');
+const { isPrivateIp, isMetadataIp } = require('./ssrfGuard');
+
+/** @type {any} */
+let _deployManager = null;
+function getDeployManager() {
+  if (!_deployManager) {
+    try { _deployManager = require('./deployManager'); } catch (e) {}
+  }
+  return _deployManager;
+}
 
 /**
  * Plano de control del ingress: traduce el estado de Culkibo (proyectos +
@@ -47,6 +57,10 @@ class IngressManager {
     /** Marca temporal de la última comprobación del servidor en Caddy. */
     this.serverReadyAt = 0;
     this.serverReadyTtlMs = 15000;
+    /** Caché de sondeos TLS de 30 s por hostname para evitar bloquear el panel. */
+    this._tlsCache = new Map();
+    /** Dominio propio opcional para exponer el panel de Culkibo con HTTPS vía Caddy. */
+    this.panelDomain = process.env.CULKIBO_PANEL_DOMAIN || null;
   }
 
   /**
@@ -82,10 +96,10 @@ class IngressManager {
   // Estado deseado
   // ---------------------------------------------------------------------
 
-  /** El proyecto al que pertenece un dominio, o null si no está vinculado. */
+  /** El proyecto al que pertenece un dominio, o null si no está vinculado (O(1) por id). */
   projectForDomain(domain, projects) {
     if (domain.projectId) {
-      const byId = projects.find(p => p.id === domain.projectId);
+      const byId = projectManager.getById(domain.projectId) || projects.find(p => p.id === domain.projectId);
       if (byId) return byId;
     }
     // Modelo anterior: `Project.domains` es una lista de hostnames. Se sigue
@@ -96,13 +110,15 @@ class IngressManager {
   /**
    * Destino real de un proyecto, o null si no hay ninguno.
    *
-   * La fuente de verdad es el runner, no el JSON: el registro puede seguir
-   * diciendo `localRunning: true` después de que el proceso haya muerto, y
-   * publicar una ruta hacia un puerto muerto es justo el tipo de mentira que
-   * este trabajo elimina.
+   * Respeta tanto procesos locales activos (`localRunner`) como despliegues
+   * de producción activos (`deployManager.store[project.id].current`), evitando
+   * que `reconcile()` borre jamás rutas de producción vivas.
    */
   upstreamForProject(project) {
     if (!project) return null;
+    const dm = getDeployManager();
+    const prod = dm && dm.store && dm.store[project.id] && dm.store[project.id].current;
+    if (prod && prod.upstream) return prod.upstream;
     const livePort = localRunner.isRunning(project.id) ? localRunner.getPort(project.id) : null;
     const port = livePort || (project.localRunning ? project.localPort : null);
     if (!port) return null;
@@ -174,6 +190,7 @@ class IngressManager {
 
     // Una sola ruta por proyecto, con todos sus hostnames: así el @id del
     // proyecto es la unidad de alta y de baja, y no quedan restos sueltos.
+    const includedProjectIds = new Set();
     for (const entry of grouped.values()) {
       const project = entry.project;
       const upstream = this.upstreamForProject(project);
@@ -185,12 +202,44 @@ class IngressManager {
         });
         continue;
       }
+      includedProjectIds.add(project.id);
       specs.push({
         projectId: project.id,
         hostnames: entry.domains.map(d => d.hostname),
         upstreams: [upstream],
         kind: 'project',
         label: project.name
+      });
+    }
+
+    // Incluir también despliegues de producción activos cuyos hostnames viven
+    // en `deployManager.store` pero aún no tienen registro en `domainManager`,
+    // para que `reconcile()` jamás elimine rutas de producción vivas.
+    const dm = getDeployManager();
+    if (dm && dm.store) {
+      for (const [projectId, state] of Object.entries(dm.store)) {
+        if (includedProjectIds.has(projectId)) continue;
+        const cur = state && state.current;
+        if (cur && cur.upstream && Array.isArray(cur.hostnames) && cur.hostnames.length > 0) {
+          specs.push({
+            projectId,
+            hostnames: cur.hostnames,
+            upstreams: [cur.upstream],
+            kind: 'production',
+            label: cur.projectName || projectId
+          });
+        }
+      }
+    }
+
+    // Ruta opcional del propio panel de Culkibo (Acceso Remoto con HTTPS).
+    if (this.panelDomain) {
+      specs.push({
+        projectId: 'culkibo_panel',
+        hostnames: [this.panelDomain],
+        upstreams: [`127.0.0.1:${this.daemonPort}`],
+        kind: 'panel',
+        label: 'Panel Culkibo'
       });
     }
 
@@ -483,12 +532,20 @@ class IngressManager {
     }
   }
 
-  async probeTls(hostname, { timeoutMs = 3000, port = 443 } = {}) {
+  async probeTls(hostname, { timeoutMs = 3000, port = 443, fresh = false } = {}) {
     const raw = String(hostname || '').trim().toLowerCase();
     const target = raw.replace(/^\*\./, '');
     const base = { hostname: raw, probed: target, wildcard: raw.startsWith('*.') };
 
     if (!target) return { ...base, reachable: false, error: 'Hostname vacío' };
+
+    const cacheKey = `${target}:${port}`;
+    if (!fresh) {
+      const cached = this._tlsCache.get(cacheKey);
+      if (cached && (Date.now() - cached.at) < 30000) {
+        return { ...cached.result, hostname: raw, wildcard: raw.startsWith('*.'), cached: true };
+      }
+    }
 
     const startedResolve = Date.now();
     const resolved = await this.resolveAddress(target, timeoutMs);
@@ -496,7 +553,14 @@ class IngressManager {
       return { ...base, handshakeMs: Date.now() - startedResolve, reachable: false, error: resolved.error };
     }
 
-    return new Promise((resolve) => {
+    // Protección SSRF: bloquear sondeos TLS a IPs privadas/metadatos salvo dominios registrados o dev local.
+    const isRegistered = Boolean(domainManager.getByHostname(raw) || domainManager.getByHostname(target));
+    const isDevLocal = target === 'localhost' || target.endsWith('.sslip.io') || target.endsWith('.nip.io');
+    if (isMetadataIp(resolved.address) || (isPrivateIp(resolved.address) && !isRegistered && !isDevLocal)) {
+      return { ...base, address: resolved.address, reachable: false, error: 'Dirección IP privada/interna bloqueada por protección SSRF' };
+    }
+
+    const probeResult = await new Promise((resolve) => {
       const startedAt = Date.now();
       /** @type {tls.TLSSocket | null} */
       let socket = null;
@@ -550,6 +614,10 @@ class IngressManager {
         finish({ reachable: false, error: err.message });
       }
     });
+
+    if (this._tlsCache.size > 128) this._tlsCache.clear();
+    this._tlsCache.set(cacheKey, { at: Date.now(), result: probeResult });
+    return probeResult;
   }
 
   /**

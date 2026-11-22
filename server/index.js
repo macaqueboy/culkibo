@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { WebSocketServer } = require('ws');
 
 const apiRouter = require('./routes/api');
@@ -22,6 +23,9 @@ const app = express();
 app.disable('x-powered-by');
 app.set('etag', false);
 const server = http.createServer(app);
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.requestTimeout = 300000;
 server.on('connection', (socket) => socket.setNoDelay(true));
 // Número, no `string | number`: se pasa a `server.listen()` y a comparaciones
 // numéricas. Un PORT no numérico en el entorno cae al valor por defecto en
@@ -46,7 +50,7 @@ process.on('uncaughtException', (err) => reportFatal('uncaughtException', err));
 process.on('unhandledRejection', (reason) => reportFatal('unhandledRejection', reason));
 
 // Middleware
-const { authMiddleware, authorizeRequest, corsOptions, resolveToken, authStatus } = require('./middleware/auth');
+const { authMiddleware, authorizeRequest, corsOptions, resolveToken, authStatus, isLoopback } = require('./middleware/auth');
 
 // `cors({ origin: '*' })` dejaba que cualquier web que el usuario visitase
 // pilotara el daemon desde su propio navegador. Ahora la lista de orígenes es
@@ -68,13 +72,20 @@ try {
   if (typeof iconv.getDecoder === 'function') iconv.getDecoder('utf8');
 } catch (e) {}
 
-const jsonParser = express.json({
-  limit: '10mb',
-  verify: (req, res, buf) => {
+const captureWebhookRawBody = (req, _res, buf) => {
+  if (req.url && req.url.startsWith('/api/webhooks/github')) {
     req.rawBody = buf;
   }
+};
+const jsonParser = express.json({
+  limit: '10mb',
+  verify: captureWebhookRawBody
 });
-const urlencodedParser = express.urlencoded({ extended: true });
+const urlencodedParser = express.urlencoded({
+  extended: true,
+  limit: '2mb',
+  verify: captureWebhookRawBody
+});
 app.use((req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD') return next();
   return jsonParser(req, res, next);
@@ -87,42 +98,48 @@ app.use((req, res, next) => {
 // REST API routes
 app.get('/health', (req, res) => res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() }));
 app.get('/api/health', (req, res) => res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() }));
-// Todo lo que cuelga de /api pasa por el control de acceso — incluido el
-// endpoint SSE del MCP, que se declara más abajo. Queda fuera a propósito el
-// router de ingress: esas peticiones vienen de internet contra un dominio
-// enrutado y no llevan credencial, que es justo lo que se espera.
-// /health y el webhook de GitHub están exentos dentro del propio middleware.
 app.use('/api', authMiddleware);
 
 app.use('/api', apiRouter);
 
 // DEPRECADO — transporte HTTP+SSE de la revisión 2024-11-05.
-//
-// El endpoint vivo es POST /api/mcp (Streamable HTTP, revisión 2026-07-28), que
-// se declara en routes/api.js. Este se mantiene solo para que las
-// configuraciones de Cursor, Windsurf y Claude Desktop ya instaladas sigan
-// funcionando: HTTP+SSE está deprecado desde la revisión 2025-03-26 y es el
-// primero de la lista para desaparecer de la especificación.
+let activeSseClients = 0;
+const MAX_SSE_CLIENTS = 50;
 app.get('/api/mcp/sse', (req, res) => {
+  if (activeSseClients >= MAX_SSE_CLIENTS) {
+    return res.status(503).json({ error: 'Demasiados clientes SSE conectados simultáneamente' });
+  }
+  activeSseClients++;
   mcpStreamableHttp.markLegacyTransport(res, 'GET /api/mcp/sse');
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
+    'X-Accel-Buffering': 'no'
   });
 
-  res.write(`event: endpoint\ndata: /api/mcp/message\n\n`);
+  const safeWrite = (chunk) => {
+    if (res.writableEnded || res.destroyed) return;
+    try { res.write(chunk); } catch (e) { cleanup(); }
+  };
+
+  safeWrite(`event: endpoint\ndata: /api/mcp/message\n\n`);
 
   const onMcp = (entry) => {
-    res.write(`event: mcp_event\ndata: ${JSON.stringify(entry)}\n\n`);
+    safeWrite(`event: mcp_event\ndata: ${JSON.stringify(entry)}\n\n`);
+  };
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    activeSseClients = Math.max(0, activeSseClients - 1);
+    mcpServer.off('mcp_call', onMcp);
   };
 
   mcpServer.on('mcp_call', onMcp);
-
-  req.on('close', () => {
-    mcpServer.off('mcp_call', onMcp);
-  });
+  req.on('close', cleanup);
+  res.on('error', cleanup);
 });
 
 // ---------------------------------------------------------------------------
@@ -238,9 +255,84 @@ app.use((err, req, res, next) => {
 //  - `/ws`      telemetría y logs en vivo del panel
 //  - `/ws/sync` tubería persistente de Commit Frames de Live Sync (The Forge)
 // Ambos pasan por la misma autorización (Origin + Token) antes del upgrade.
-const wss = new WebSocketServer({ noServer: true });
-const syncWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+const syncWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
 const clients = new Set();
+const syncClients = new Set();
+
+/** Valida si un targetDir explícito está permitido en /ws/sync (anti-escritura arbitraria). */
+function resolveAllowedSyncTargetDir(rawDir, req) {
+  if (!rawDir) return null;
+  if (process.env.CULKIBO_ALLOW_SYNC_TARGET_DIR === '1') {
+    return path.resolve(String(rawDir));
+  }
+  // Nunca permitir que un cliente remoto sobreescriba rutas arbitrarias del host.
+  if (!isLoopback(req)) {
+    const err = new Error('No se permite especificar targetDir desde conexiones remotas');
+    /** @type {any} */ (err).code = 'TARGET_DIR_FORBIDDEN';
+    throw err;
+  }
+  const resolved = path.resolve(String(rawDir));
+  const allowedRoots = [path.resolve(process.cwd(), 'projects'), path.resolve(os.tmpdir())];
+  const inside = allowedRoots.some((root) => {
+    const rel = path.relative(root, resolved);
+    return rel && rel !== '.' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  });
+  if (!inside) {
+    const err = new Error('targetDir fuera de los directorios de trabajo permitidos');
+    /** @type {any} */ (err).code = 'TARGET_DIR_FORBIDDEN';
+    throw err;
+  }
+  return resolved;
+}
+
+/**
+ * Decodifica una trama binaria rápida de Commit Frame (`/ws/sync`):
+ * `[1B magic 0x01][4B uint32BE metaLen][JSON meta][buffers concatenados]`
+ * Evita base64 (+33%) y parseo de cadenas gigantes.
+ * @param {Buffer} buf
+ */
+function decodeBinarySyncFrame(buf) {
+  if (buf.length < 5 || buf[0] !== 0x01) {
+    throw new Error('Trama binaria de sincronización inválida');
+  }
+  const metaLen = buf.readUInt32BE(1);
+  const headerEnd = 5 + metaLen;
+  if (headerEnd > buf.length) {
+    throw new Error('Cabecera de trama binaria truncada');
+  }
+  const meta = JSON.parse(buf.subarray(5, headerEnd).toString('utf8'));
+  let offset = headerEnd;
+  const files = (meta.files || []).map((f) => {
+    if (f.op === 'delete') return { path: f.path, op: 'delete' };
+    const byteLen = Number(f.byteLength || 0);
+    if (!Number.isInteger(byteLen) || byteLen < 0 || offset + byteLen > buf.length) {
+      throw new Error(`Longitud binaria inválida para ${f.path}`);
+    }
+    const contentBuf = buf.subarray(offset, offset + byteLen);
+    offset += byteLen;
+    return {
+      path: f.path,
+      op: 'upsert',
+      buffer: contentBuf,
+      sha256: f.sha256
+    };
+  });
+  return { ...meta, type: 'frame', files };
+}
+
+function safeWsSend(ws, obj) {
+  if (ws.readyState !== 1) return;
+  try {
+    ws.send(JSON.stringify(obj), (err) => {
+      if (err) {
+        try { ws.terminate(); } catch (e) {}
+      }
+    });
+  } catch (e) {
+    try { ws.terminate(); } catch (e2) {}
+  }
+}
 
 server.on('upgrade', (req, socket, head) => {
   const pathname = (req.url || '/').split('?')[0];
@@ -267,59 +359,96 @@ server.on('upgrade', (req, socket, head) => {
 // Conexiones activas reales, para que getPods() deje de inventarlas.
 containerOrchestrator.setConnectionCounter(() => clients.size);
 
-// Tubería persistente de Live Sync (/ws/sync): Commit Frames atómicos + Merkle.
-syncWss.on('connection', (ws) => {
+// Tubería persistente de Live Sync (/ws/sync): Commit Frames atómicos (JSON o binario) + Merkle.
+syncWss.on('connection', (ws, req) => {
+  syncClients.add(ws);
+  ws.isAlive = true;
+  if (ws._socket && typeof ws._socket.setNoDelay === 'function') {
+    ws._socket.setNoDelay(true);
+  }
+  ws.on('pong', () => { ws.isAlive = true; });
+
   /** @type {string | null} */
   let boundProjectId = null;
 
-  ws.on('message', (raw) => {
+  const cleanupSync = () => {
+    syncClients.delete(ws);
+    if (boundProjectId) {
+      const prev = boundProjectId;
+      boundProjectId = null;
+      liveSyncEngine.unregisterClient(prev);
+      broadcast('sync_client', { projectId: prev, connected: false, connectedClients: liveSyncEngine.getStatus(prev).connectedClients });
+    }
+  };
+
+  ws.on('error', () => {
+    cleanupSync();
+    try { ws.terminate(); } catch (e) {}
+  });
+
+  ws.on('message', (raw, isBinary) => {
     let msg;
     try {
-      msg = JSON.parse(raw.toString());
+      if (isBinary) {
+        const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(/** @type {any} */ (raw));
+        msg = decodeBinarySyncFrame(buf);
+      } else {
+        msg = JSON.parse(raw.toString());
+      }
     } catch (e) {
-      ws.send(JSON.stringify({ type: 'error', code: 'BAD_JSON', error: 'Mensaje JSON inválido' }));
+      safeWsSend(ws, { type: 'error', code: 'BAD_FRAME', error: e.message || 'Mensaje inválido' });
       return;
     }
 
     try {
       if (msg.type === 'hello') {
         if (!msg.projectId) throw new Error('hello requiere projectId');
-        boundProjectId = String(msg.projectId);
-        if (msg.targetDir) liveSyncEngine.setTargetDir(boundProjectId, msg.targetDir);
+        const nextPid = String(msg.projectId);
+        const safeDir = resolveAllowedSyncTargetDir(msg.targetDir, req);
+        if (boundProjectId && boundProjectId !== nextPid) {
+          liveSyncEngine.unregisterClient(boundProjectId);
+        }
+        boundProjectId = nextPid;
+        if (safeDir) liveSyncEngine.setTargetDir(boundProjectId, safeDir);
         const session = liveSyncEngine.registerClient(boundProjectId);
         const verification = liveSyncEngine.verifySync(boundProjectId, {
           clientDigest: msg.clientDigest || null,
-          targetDir: msg.targetDir || null
+          targetDir: safeDir
         });
-        ws.send(JSON.stringify({
+        safeWsSend(ws, {
           type: 'hello_ack',
           projectId: boundProjectId,
           lastSeq: session.lastSeq,
           serverDigest: verification.serverDigest,
           inSync: verification.inSync,
           fileCount: verification.fileCount,
-          targetDir: verification.targetDir
-        }));
+          targetDir: verification.targetDir,
+          binaryFramesSupported: true
+        });
+        broadcast('sync_client', { projectId: boundProjectId, connected: true, connectedClients: session.connectedClients });
         return;
       }
 
       if (msg.type === 'frame') {
         const pid = String(msg.projectId || boundProjectId || '');
         if (!pid) throw new Error('frame requiere projectId');
-        const result = liveSyncEngine.applyCommitFrame(pid, msg, { targetDir: msg.targetDir || undefined });
-        ws.send(JSON.stringify({ type: 'frame_ack', ...result }));
+        const safeDir = resolveAllowedSyncTargetDir(msg.targetDir, req);
+        const result = liveSyncEngine.applyCommitFrame(pid, msg, { targetDir: safeDir || undefined, deferEmit: true });
+        safeWsSend(ws, { type: 'frame_ack', ...result });
+        setImmediate(() => liveSyncEngine.emitApplied(result));
         return;
       }
 
       if (msg.type === 'verify') {
         const pid = String(msg.projectId || boundProjectId || '');
         if (!pid) throw new Error('verify requiere projectId');
+        const safeDir = resolveAllowedSyncTargetDir(msg.targetDir, req);
         const result = liveSyncEngine.verifySync(pid, {
           clientDigest: msg.clientDigest || null,
           clientFiles: msg.clientFiles || null,
-          targetDir: msg.targetDir || null
+          targetDir: safeDir
         });
-        ws.send(JSON.stringify({ type: 'verify_ack', ...result }));
+        safeWsSend(ws, { type: 'verify_ack', ...result });
         return;
       }
 
@@ -327,31 +456,53 @@ syncWss.on('connection', (ws) => {
         const pid = String(msg.projectId || boundProjectId || '');
         if (!pid) throw new Error('rollback requiere projectId');
         const result = liveSyncEngine.rollback(pid, msg.steps || 1);
-        ws.send(JSON.stringify({ type: 'rollback_ack', ...result }));
+        safeWsSend(ws, { type: 'rollback_ack', ...result });
         return;
       }
 
-      ws.send(JSON.stringify({ type: 'error', code: 'UNKNOWN_TYPE', error: `Tipo de mensaje no soportado: ${msg.type}` }));
+      safeWsSend(ws, { type: 'error', code: 'UNKNOWN_TYPE', error: `Tipo de mensaje no soportado: ${msg.type}` });
     } catch (err) {
-      ws.send(JSON.stringify({
+      safeWsSend(ws, {
         type: 'error',
         seq: msg && msg.seq ? msg.seq : null,
         code: (err && err.code) || 'SYNC_ERROR',
         error: err && err.message ? err.message : String(err)
-      }));
+      });
     }
   });
 
-  ws.on('close', () => {
-    if (boundProjectId) liveSyncEngine.unregisterClient(boundProjectId);
-  });
+  ws.on('close', cleanupSync);
 });
+
+// Caché de 150 ms del payload inicial de `/ws` para fan-out concurrente sin
+// repetir JSON.stringify N veces cuando decenas de pestañas conectan a la vez.
+/** @type {{ at: number, payload: string } | null} */
+let cachedInitialState = null;
+function getInitialWsPayload() {
+  const now = Date.now();
+  if (cachedInitialState && now - cachedInitialState.at < 150) {
+    return cachedInitialState.payload;
+  }
+  const payload = JSON.stringify({
+    type: 'initial_state',
+    data: {
+      pods: containerOrchestrator.getPods(),
+      logs: containerOrchestrator.getLogs({ limit: 40 }),
+      mcpAudit: mcpServer.getAuditLog(20)
+    }
+  });
+  cachedInitialState = { at: now, payload };
+  return payload;
+}
 
 wss.on('connection', (ws) => {
   clients.add(ws);
 
   // Liveness flag for the heartbeat sweep below.
   ws.isAlive = true;
+  if (ws._socket && typeof ws._socket.setNoDelay === 'function') {
+    ws._socket.setNoDelay(true);
+  }
   ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('error', () => {
@@ -361,14 +512,7 @@ wss.on('connection', (ws) => {
 
   // Send initial snapshot safely
   try {
-    ws.send(JSON.stringify({
-      type: 'initial_state',
-      data: {
-        pods: containerOrchestrator.getPods(),
-        logs: containerOrchestrator.getLogs({ limit: 40 }),
-        mcpAudit: mcpServer.getAuditLog(20)
-      }
-    }));
+    ws.send(getInitialWsPayload());
   } catch (e) {
     clients.delete(ws);
   }
@@ -387,20 +531,21 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Half-open TCP connections never emit 'close', so a laptop that sleeps or a
-// network that drops would leak an entry in `clients` forever. Sweep them.
+// Half-open TCP connections never emit 'close', so sweep both `/ws` and `/ws/sync`.
 const WS_HEARTBEAT_MS = 30000;
 const heartbeatTimer = setInterval(() => {
-  for (const ws of clients) {
-    if (ws.isAlive === false) {
-      clients.delete(ws);
-      try { ws.terminate(); } catch (e) {}
-      continue;
-    }
-    ws.isAlive = false;
-    try { ws.ping(); } catch (e) {
-      clients.delete(ws);
-      try { ws.terminate(); } catch (e2) {}
+  for (const pool of [clients, syncClients]) {
+    for (const ws of pool) {
+      if (ws.isAlive === false) {
+        pool.delete(ws);
+        try { ws.terminate(); } catch (e) {}
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch (e) {
+        pool.delete(ws);
+        try { ws.terminate(); } catch (e2) {}
+      }
     }
   }
 }, WS_HEARTBEAT_MS);
@@ -548,9 +693,58 @@ function startServer(port = PORT, host = '0.0.0.0', { reconcileIngress = process
   });
 }
 
+let shuttingDown = false;
+async function shutdown(signal = 'SIGTERM') {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[Culkibo] Recibida señal ${signal}; cerrando limpiamente...`);
+  try { clearInterval(heartbeatTimer); } catch (e) {}
+  try { databaseManager.stopScheduler(); } catch (e) {}
+  try { containerOrchestrator.stop(); } catch (e) {}
+  try {
+    const localRunner = require('./services/localRunner');
+    if (localRunner && localRunner.activeRunners) {
+      const stops = [];
+      for (const [pid, runner] of Array.from(localRunner.activeRunners.entries())) {
+        stops.push(localRunner.stop(pid, runner.port).catch(() => {}));
+      }
+      await Promise.allSettled(stops);
+    }
+  } catch (e) {}
+  try {
+    for (const ws of [...clients, ...syncClients]) {
+      try { ws.close(1001, 'Server shutting down'); } catch (e) {}
+    }
+    wss.close();
+    syncWss.close();
+  } catch (e) {}
+  try {
+    if (deployManager && deployManager.drains && deployManager.drains.size > 0) {
+      await Promise.race([
+        Promise.allSettled(Array.from(deployManager.drains.values())),
+        new Promise((r) => setTimeout(r, 4000))
+      ]);
+    }
+  } catch (e) {}
+  try { await projectManager.flushToDisk(); } catch (e) {}
+  await new Promise((resolve) => {
+    try {
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+      server.close(() => resolve(undefined));
+      const t = setTimeout(() => resolve(undefined), 2000);
+      if (t.unref) t.unref();
+    } catch (e) { resolve(undefined); }
+  });
+}
+
 if (require.main === module) {
   const bindHost = process.env.HOST || process.env.CULKIBO_HOST || '0.0.0.0';
   startServer(PORT, bindHost);
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.on(sig, () => {
+      shutdown(sig).finally(() => process.exit(0));
+    });
+  }
 }
 
-module.exports = { app, server, wss, broadcast, startServer };
+module.exports = { app, server, wss, syncWss, broadcast, startServer, shutdown };

@@ -28,6 +28,10 @@ async function testMcp() {
   assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_list_pods'));
   assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_hot_sync'));
   assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_issue_wildcard_ssl'));
+  assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_analyze_wordpress'));
+  assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_import_compose'));
+  assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_get_remote_access'));
+  assert.ok(toolsRes.result.tools.length >= 47, `Se esperaban >=47 herramientas MCP, hay ${toolsRes.result.tools.length}`);
   console.log(`  ✓ MCP tools/list passed (${toolsRes.result.tools.length} AI tools exposed)`);
 
   // 3. tools/call: culkibo_list_pods
@@ -137,7 +141,7 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 44, 'El catálogo debe tener 44 herramientas anotadas con paridad completa de escritura');
+  assert.strictEqual(tools.length, 47, 'El catálogo debe tener 47 herramientas anotadas con paridad completa de escritura');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -160,7 +164,8 @@ async function testToolAnnotations() {
     'culkibo_deploy_project', 'culkibo_hot_sync', 'culkibo_switch_traffic',
     'culkibo_manage_domain', 'culkibo_manage_watcher',
     'culkibo_create_sslip_domain', 'culkibo_export_backup', 'culkibo_restore_backup',
-    'culkibo_github_connect', 'culkibo_github_disconnect', 'culkibo_create_project_from_github'
+    'culkibo_github_connect', 'culkibo_github_disconnect', 'culkibo_create_project_from_github',
+    'culkibo_import_compose'
   ];
   for (const name of mustMutate) {
     assert.strictEqual(byName[name].annotations.readOnlyHint, false, `${name} muta estado y no puede anotarse como readOnly`);
@@ -182,7 +187,8 @@ async function testToolAnnotations() {
     // No emite nada: devuelve siempre el error de «no implementado». Estaba en
     // `mustMutate` porque fabricaba un PEM y lo guardaba en disco como si fuera
     // un certificado real.
-    'culkibo_issue_wildcard_ssl'
+    'culkibo_issue_wildcard_ssl',
+    'culkibo_analyze_wordpress', 'culkibo_get_remote_access'
   ];
   for (const name of mustBeReadOnly) {
     assert.strictEqual(byName[name].annotations.readOnlyHint, true, `${name} no muta nada`);
@@ -358,7 +364,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 44);
+    assert.strictEqual(list.result.tools.length, 47);
     console.log(`  ✓ tools/list sobre Streamable HTTP (${list.result.tools.length} herramientas)`);
 
     // 8. tools/call con salida estructurada.

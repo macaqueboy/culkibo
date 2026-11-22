@@ -1,8 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
+const { assertSafeUrl, atomicWriteJsonSync } = require('./ssrfGuard');
 
 const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'notifications.json');
+const TELEGRAM_TOKEN_RE = /^\d{5,15}:[A-Za-z0-9_-]{20,80}$/;
+const DISCORD_WEBHOOK_HOSTS = new Set(['discord.com', 'discordapp.com', 'ptb.discord.com', 'canary.discord.com']);
+const SLACK_WEBHOOK_HOSTS = new Set(['hooks.slack.com', 'hooks.gov-slack.com']);
 
 const DEFAULT_CONFIG = {
   enabled: false,
@@ -82,16 +86,7 @@ class NotificationService extends EventEmitter {
   }
 
   saveConfig() {
-    const dir = path.dirname(CONFIG_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const tempPath = `${CONFIG_FILE}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(this.config, null, 2), 'utf8');
-    try {
-      fs.renameSync(tempPath, CONFIG_FILE);
-    } catch (err) {
-      fs.copyFileSync(tempPath, CONFIG_FILE);
-      try { fs.unlinkSync(tempPath); } catch (e) {}
-    }
+    atomicWriteJsonSync(CONFIG_FILE, this.config, 0o600);
   }
 
   mask(value) {
@@ -194,11 +189,18 @@ class NotificationService extends EventEmitter {
         if (this.config.events[event] === false) return { sent: false, reason: 'event_muted' };
 
         const dedupeKey = `${event}:${projectId || ''}:${title}`;
+        const now = Date.now();
         const last = this.lastSentAt.get(dedupeKey) || 0;
-        if (Date.now() - last < this.dedupeWindowMs) {
+        if (now - last < this.dedupeWindowMs) {
           return { sent: false, reason: 'deduplicated' };
         }
-        this.lastSentAt.set(dedupeKey, Date.now());
+        if (this.lastSentAt.size > 500) {
+          for (const [k, at] of this.lastSentAt) {
+            if (now - at >= this.dedupeWindowMs) this.lastSentAt.delete(k);
+          }
+          if (this.lastSentAt.size > 500) this.lastSentAt.clear();
+        }
+        this.lastSentAt.set(dedupeKey, now);
       }
 
       const channels = force
@@ -262,8 +264,11 @@ class NotificationService extends EventEmitter {
 
     if (name === 'telegram') {
       const { botToken, chatId } = this.config.channels.telegram;
+      if (!TELEGRAM_TOKEN_RE.test(String(botToken || '').trim())) {
+        throw new Error('Formato de botToken de Telegram inválido');
+      }
       const text = `${meta.emoji} *${this.escapeMarkdown(heading)}*\n${this.escapeMarkdown(message)}${url ? `\n${url}` : ''}`;
-      return this.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      return this.post(`https://api.telegram.org/bot${encodeURIComponent(String(botToken).trim())}/sendMessage`, {
         chat_id: chatId,
         text,
         parse_mode: 'Markdown',
@@ -272,7 +277,12 @@ class NotificationService extends EventEmitter {
     }
 
     if (name === 'discord') {
-      return this.post(this.config.channels.discord.webhookUrl, {
+      const preParsed = new URL(this.config.channels.discord.webhookUrl);
+      if (preParsed.protocol !== 'https:' || !DISCORD_WEBHOOK_HOSTS.has(preParsed.hostname.toLowerCase()) || !preParsed.pathname.startsWith('/api/webhooks/')) {
+        throw new Error('La URL de Discord debe ser un webhook oficial (https://discord.com/api/webhooks/...)');
+      }
+      const { url: parsed } = await assertSafeUrl(preParsed.toString(), { requireHttps: true });
+      return this.post(parsed.toString(), {
         username: 'Culkibo',
         embeds: [{
           title: `${meta.emoji} ${heading}`,
@@ -286,14 +296,20 @@ class NotificationService extends EventEmitter {
     }
 
     if (name === 'slack') {
-      return this.post(this.config.channels.slack.webhookUrl, {
+      const preParsed = new URL(this.config.channels.slack.webhookUrl);
+      if (preParsed.protocol !== 'https:' || !SLACK_WEBHOOK_HOSTS.has(preParsed.hostname.toLowerCase())) {
+        throw new Error('La URL de Slack debe ser un webhook oficial (https://hooks.slack.com/...)');
+      }
+      const { url: parsed } = await assertSafeUrl(preParsed.toString(), { requireHttps: true });
+      return this.post(parsed.toString(), {
         text: `${meta.emoji} *${heading}*\n${message}${url ? `\n<${url}|Abrir en Culkibo>` : ''}`
       });
     }
 
     if (name === 'webhook') {
       const { url: target, secretHeader } = this.config.channels.webhook;
-      return this.post(target, {
+      const { url: parsed } = await assertSafeUrl(target, { requireHttps: true });
+      return this.post(parsed.toString(), {
         source: 'culkibo',
         level,
         title: heading,
@@ -312,13 +328,12 @@ class NotificationService extends EventEmitter {
   }
 
   async post(url, body, extraHeaders = {}) {
-    if (!/^https:\/\//i.test(url)) {
-      throw new Error('La URL de destino debe usar HTTPS');
-    }
+    await assertSafeUrl(url, { requireHttps: true });
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...extraHeaders },
       body: JSON.stringify(body),
+      redirect: 'error',
       signal: AbortSignal.timeout(8000)
     });
     if (!res.ok) {

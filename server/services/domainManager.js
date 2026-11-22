@@ -3,13 +3,63 @@ const path = require('path');
 const dns = require('dns').promises;
 const sslManager = require('./sslManager');
 const cloudflareService = require('./cloudflareService');
+const { atomicWriteJsonSync } = require('./ssrfGuard');
 
 const DOMAINS_FILE = path.join(__dirname, '..', '..', 'data', 'domains.json');
+const DOMAIN_REGEX = /^(?:\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+const UPDATABLE_DOMAIN_FIELDS = new Set([
+  'hostname',
+  'projectId',
+  'targetPod',
+  'targetPort',
+  'cloudflareProxied',
+  'cloudflareZoneId',
+  'sslStatus',
+  'sslCertId',
+  'sslProvider',
+  'routingMode',
+  'status',
+  'serviceId',
+  'serviceName',
+  'lastCheckedAt',
+  'migrationSource'
+]);
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`DNS timeout after ${ms}ms`)), ms);
+    if (timer.unref) timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 class DomainManager {
   constructor() {
     this.ensureDirectory();
     this.domains = this.loadDomains();
+    /** @type {Map<string, any>} */
+    this._exactIndex = new Map();
+    /** @type {any[]} */
+    this._wildcards = [];
+    /** @type {{ sslVersion: number, buffer: Buffer } | null} */
+    this._serializedCache = null;
+    this.rebuildIndex();
+  }
+
+  rebuildIndex() {
+    this._exactIndex.clear();
+    this._wildcards = [];
+    this._serializedCache = null;
+    for (const d of this.domains) {
+      if (!d || typeof d.hostname !== 'string') continue;
+      const host = d.hostname.toLowerCase();
+      if (d.isWildcard && host.startsWith('*.')) {
+        this._wildcards.push({ domain: d, root: host.slice(2), suffix: `.${host.slice(2)}` });
+      } else {
+        this._exactIndex.set(host, d);
+      }
+    }
   }
 
   ensureDirectory() {
@@ -85,14 +135,16 @@ class DomainManager {
 
   saveDomains() {
     this.ensureDirectory();
-    const tempPath = DOMAINS_FILE + '.tmp';
-    fs.writeFileSync(tempPath, JSON.stringify(this.domains, null, 2), 'utf8');
-    fs.renameSync(tempPath, DOMAINS_FILE);
+    this.rebuildIndex();
+    atomicWriteJsonSync(DOMAINS_FILE, this.domains, 0o600);
   }
 
   listDomains() {
+    // Una sola pasada de verificación sobre el registro SSL en vez de O(D × C).
+    const certs = sslManager.listCertificates();
+    const now = Date.now();
     return this.domains.map(d => {
-      const cert = sslManager.getCertificateByDomain(d.hostname);
+      const cert = sslManager.matchCertificate(d.hostname, certs);
       return {
         ...d,
         projectId: d.projectId || null,
@@ -112,7 +164,7 @@ class DomainManager {
           issuer: cert.issuer || null,
           expiresAt: cert.expiresAt || null,
           daysRemaining: cert.expiresAt
-            ? Math.max(0, Math.floor((new Date(cert.expiresAt).getTime() - Date.now()) / 86400000))
+            ? Math.max(0, Math.floor((new Date(cert.expiresAt).getTime() - now) / 86400000))
             : null,
           isWildcard: cert.type === 'wildcard_dns01'
         } : null
@@ -120,9 +172,34 @@ class DomainManager {
     });
   }
 
+  /**
+   * Buffer JSON pre-serializado de `listDomains()` cuando el registro de
+   * dominios y el de SSL no han cambiado (evita recomputar bajo ráfagas).
+   * @returns {Buffer}
+   */
+  getAllSerialized() {
+    const sslVer = sslManager.version || 0;
+    // Sólo usar caché cuando no hay certificados `on_disk` cuya existencia
+    // en disco deba comprobarse con `statSync` en cada lectura.
+    const hasOnDisk = sslManager.registry.some(c => c && c.managedBy !== sslManager.MANAGED_BY_CADDY);
+    if (!hasOnDisk && this._serializedCache && this._serializedCache.sslVersion === sslVer) {
+      return this._serializedCache.buffer;
+    }
+    const buf = Buffer.from(JSON.stringify(this.listDomains()), 'utf8');
+    if (!hasOnDisk) {
+      this._serializedCache = { sslVersion: sslVer, buffer: buf };
+    }
+    return buf;
+  }
+
   getByHostname(hostname) {
     const clean = String(hostname || '').trim().toLowerCase();
-    return this.domains.find(d => d.hostname === clean) || null;
+    if (!clean) return null;
+    if (clean.startsWith('*.')) {
+      const w = this._wildcards.find(x => x.domain.hostname === clean);
+      return w ? w.domain : null;
+    }
+    return this._exactIndex.get(clean) || this.domains.find(d => d.hostname === clean) || null;
   }
 
   getById(id) {
@@ -163,19 +240,38 @@ class DomainManager {
     const cleanHost = (hostname || '').trim().toLowerCase();
     
     // RFC 1123 domain validation
-    const domainRegex = /^(?:\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
-    if (!domainRegex.test(cleanHost) && cleanHost !== 'localhost') {
+    if (!DOMAIN_REGEX.test(cleanHost) && cleanHost !== 'localhost') {
       throw new Error(`Invalid domain format (RFC 1123 required): ${cleanHost}`);
     }
     
     const isWildcard = cleanHost.startsWith('*.');
+    const parsedPort = parseInt(String(targetPort), 10);
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+      throw new Error(`Invalid targetPort: ${targetPort}`);
+    }
 
     const existing = this.domains.find(d => d.hostname === cleanHost);
     if (existing) {
       throw new Error(`Domain ${cleanHost} is already configured in Culkibo`);
     }
 
-    const domainId = `dom_${Date.now()}`;
+    // Si piden autoCreateDns sin zoneId explícito, intentar resolver la zona en Cloudflare automáticamente.
+    let resolvedZoneId = cloudflareZoneId || null;
+    if (autoCreateDns && !resolvedZoneId) {
+      try {
+        const zonesRes = await cloudflareService.listZones();
+        const zones = Array.isArray(zonesRes && zonesRes.zones) ? zonesRes.zones : [];
+        const hostWithoutWildcard = isWildcard ? cleanHost.slice(2) : cleanHost;
+        const matchedZone = zones
+          .filter(z => z && z.name && (hostWithoutWildcard === z.name || hostWithoutWildcard.endsWith(`.${z.name}`)))
+          .sort((a, b) => b.name.length - a.name.length)[0];
+        if (matchedZone && matchedZone.id) resolvedZoneId = matchedZone.id;
+      } catch (err) {
+        console.warn('[DomainManager] No se pudo auto-detectar la zona de Cloudflare:', err.message);
+      }
+    }
+
+    const domainId = `dom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const cert = sslManager.getCertificateByDomain(cleanHost);
 
     const newDomain = {
@@ -186,10 +282,10 @@ class DomainManager {
       // Caddy hacia el puerto vivo del proyecto, solo hacia un pod genérico.
       projectId: projectId || null,
       targetPod,
-      targetPort: parseInt(String(targetPort), 10),
+      targetPort: parsedPort,
       status: cert ? 'active' : 'pending_ssl',
       cloudflareProxied: Boolean(cloudflareProxied),
-      cloudflareZoneId,
+      cloudflareZoneId: resolvedZoneId,
       sslStatus: sslStatus || (cert ? 'active' : 'unconfigured'),
       sslCertId: cert ? cert.id : null,
       sslProvider: sslProvider || (cert ? cert.provider : null),
@@ -200,10 +296,10 @@ class DomainManager {
     };
 
     // If Cloudflare Zone is specified and autoCreateDns is requested, create record in Cloudflare
-    if (cloudflareZoneId && autoCreateDns) {
+    if (resolvedZoneId && autoCreateDns) {
       try {
         const recordName = isWildcard ? cleanHost : cleanHost;
-        await cloudflareService.createDnsRecord(cloudflareZoneId, {
+        await cloudflareService.createDnsRecord(resolvedZoneId, {
           type: 'A',
           name: recordName,
           content: serverIp,
@@ -233,7 +329,36 @@ class DomainManager {
   async updateDomain(id, updates) {
     const idx = this.domains.findIndex(d => d.id === id);
     if (idx < 0) throw new Error('Domain not found');
-    this.domains[idx] = { ...this.domains[idx], ...updates, updatedAt: new Date().toISOString() };
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
+      throw new Error('Invalid domain update payload');
+    }
+    /** @type {Record<string, any>} */
+    const safeUpdates = {};
+    for (const [k, v] of Object.entries(updates)) {
+      if (!UPDATABLE_DOMAIN_FIELDS.has(k)) continue;
+      safeUpdates[k] = v;
+    }
+    if (safeUpdates.hostname !== undefined) {
+      const cleanHost = String(safeUpdates.hostname || '').trim().toLowerCase();
+      if (!DOMAIN_REGEX.test(cleanHost) && cleanHost !== 'localhost') {
+        throw new Error(`Invalid domain format (RFC 1123 required): ${cleanHost}`);
+      }
+      const conflict = this.domains.find((d, i) => i !== idx && d.hostname === cleanHost);
+      if (conflict) throw new Error(`Domain ${cleanHost} is already configured in Culkibo`);
+      safeUpdates.hostname = cleanHost;
+      safeUpdates.isWildcard = cleanHost.startsWith('*.');
+    }
+    if (safeUpdates.targetPort !== undefined) {
+      const parsedPort = parseInt(String(safeUpdates.targetPort), 10);
+      if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+        throw new Error(`Invalid targetPort: ${safeUpdates.targetPort}`);
+      }
+      safeUpdates.targetPort = parsedPort;
+    }
+    if (safeUpdates.cloudflareProxied !== undefined) {
+      safeUpdates.cloudflareProxied = Boolean(safeUpdates.cloudflareProxied);
+    }
+    this.domains[idx] = { ...this.domains[idx], ...safeUpdates, updatedAt: new Date().toISOString() };
     this.saveDomains();
     return this.domains[idx];
   }
@@ -249,7 +374,7 @@ class DomainManager {
 
   // Live DNS resolution checker
   async verifyDns(hostname) {
-    const clean = hostname.replace(/^\*\./, '');
+    const clean = String(hostname || '').trim().toLowerCase().replace(/^\*\./, '');
     const result = {
       hostname: clean,
       resolvedIps: /** @type {string[]} */ ([]),
@@ -261,23 +386,22 @@ class DomainManager {
 
     const start = performance.now();
     try {
-      // Resolve A records
-      try {
-        result.resolvedIps = await dns.resolve4(clean);
+      const [aRes, cnameRes] = await Promise.allSettled([
+        withTimeout(dns.resolve4(clean), 4000),
+        withTimeout(dns.resolveCname(clean), 4000)
+      ]);
+      if (aRes.status === 'fulfilled' && Array.isArray(aRes.value)) {
+        result.resolvedIps = aRes.value;
         result.hasDnsRecords = result.resolvedIps.length > 0;
-      } catch (e) {
-        // A record lookup failed or domain is CNAME
       }
-
-      // Check CNAME if no A record or as complement
-      try {
-        result.cnames = await dns.resolveCname(clean);
+      if (cnameRes.status === 'fulfilled' && Array.isArray(cnameRes.value)) {
+        result.cnames = cnameRes.value;
         if (result.cnames.length > 0) result.hasDnsRecords = true;
-      } catch (e) {}
+      }
 
       // Detect Cloudflare IPs (Cloudflare IP ranges 172.67.*, 104.21.*, etc.)
       result.isCloudflareEdge = result.resolvedIps.some(ip =>
-        ip.startsWith('104.21.') || ip.startsWith('172.67.') || ip.startsWith('104.20.')
+        ip.startsWith('104.21.') || ip.startsWith('172.67.') || ip.startsWith('104.20.') || ip.startsWith('104.18.') || ip.startsWith('188.114.')
       );
 
       result.lookupDurationMs = Math.round(performance.now() - start);
@@ -288,25 +412,23 @@ class DomainManager {
     }
   }
 
-  // Routing resolution: given an HTTP Host header, find destination pod
+  // Routing resolution: given an HTTP Host header, find destination pod (O(1) exact)
   resolveRoute(hostHeader) {
     if (!hostHeader) return null;
-    const host = hostHeader.split(':')[0].toLowerCase();
+    const host = String(hostHeader).split(':')[0].toLowerCase();
 
-    // Exact match
-    let match = this.domains.find(d => d.hostname === host);
-    if (match) return match;
+    // O(1) exact match
+    const exact = this._exactIndex.get(host);
+    if (exact) return exact;
 
-    // Wildcard match. The boundary dot is mandatory: a bare endsWith() made
-    // `*.culkibo.dev` also match `evilculkibo.dev`, letting an unrelated domain
-    // (or a forged Host header) claim another tenant's ingress route.
-    match = this.domains.find(d => {
-      if (!d.isWildcard) return false;
-      const root = d.hostname.slice(2); // remove '*.'
-      return host.endsWith(`.${root}`) && host !== root;
-    });
+    // Wildcard match with mandatory boundary dot
+    for (const entry of this._wildcards) {
+      if (host.endsWith(entry.suffix) && host !== entry.root) {
+        return entry.domain;
+      }
+    }
 
-    return match || null;
+    return null;
   }
 }
 

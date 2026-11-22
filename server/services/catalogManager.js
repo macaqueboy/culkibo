@@ -7,7 +7,15 @@ const EventEmitter = require('events');
 const databaseManager = require('./databaseManager');
 const domainManager = require('./domainManager');
 const ingressManager = require('./ingressManager');
+const { atomicWriteJsonSync } = require('./ssrfGuard');
 const { TEMPLATES, CATEGORIES, validateCatalog } = require('./catalog/templates');
+
+const CATEGORY_MAP = new Map(CATEGORIES.map((c) => [c.id, c.label]));
+const CATEGORIES_WITH_COUNT = CATEGORIES.map((c) => ({
+  ...c,
+  count: TEMPLATES.filter((t) => t.category === c.id).length
+}));
+const TEMPLATE_MAP = new Map(TEMPLATES.map((t) => [t.id, t]));
 
 /**
  * Instalador de servicios del catálogo.
@@ -204,6 +212,10 @@ class CatalogManager extends EventEmitter {
     this.key = null;
     /** @type {Set<string>} Instalaciones en curso en ESTE proceso, para no lanzar dos a la vez. */
     this.inFlight = new Set();
+    /** @type {Set<number>} Puertos reservados en memoria antes de añadir el registro (evita TOCTOU). */
+    this.pendingPorts = new Set();
+    /** @type {Buffer | null} */
+    this._catalogSerializedCache = null;
     this.ensureDirs();
     this.load();
   }
@@ -247,11 +259,9 @@ class CatalogManager extends EventEmitter {
   }
 
   save() {
+    this._catalogSerializedCache = null;
     try {
-      const tmp = `${DATA_FILE}.${Date.now()}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2), { encoding: 'utf8', mode: 0o600 });
-      fs.renameSync(tmp, DATA_FILE);
-      try { fs.chmodSync(DATA_FILE, 0o600); } catch (e) {}
+      atomicWriteJsonSync(DATA_FILE, this.state, 0o600);
     } catch (err) {
       console.error('[Catálogo] No se pudo guardar services.json:', err.message);
     }
@@ -272,7 +282,7 @@ class CatalogManager extends EventEmitter {
       id: t.id,
       name: t.name,
       category: t.category,
-      categoryLabel: (CATEGORIES.find((c) => c.id === t.category) || {}).label || t.category,
+      categoryLabel: CATEGORY_MAP.get(t.category) || t.category,
       summary: t.summary,
       description: t.description,
       website: t.website,
@@ -298,14 +308,23 @@ class CatalogManager extends EventEmitter {
   }
 
   listCategories() {
-    return CATEGORIES.map((c) => ({
-      ...c,
-      count: TEMPLATES.filter((t) => t.category === c.id).length
-    }));
+    return CATEGORIES_WITH_COUNT;
+  }
+
+  /** Buffer JSON pre-serializado para GET /api/catalog. */
+  getCatalogSerialized() {
+    if (!this._catalogSerializedCache) {
+      this._catalogSerializedCache = Buffer.from(JSON.stringify({
+        categories: this.listCategories(),
+        templates: this.listTemplates(),
+        installations: this.list()
+      }), 'utf8');
+    }
+    return this._catalogSerializedCache;
   }
 
   getTemplate(templateId) {
-    const tpl = TEMPLATES.find((t) => t.id === templateId);
+    const tpl = TEMPLATE_MAP.get(templateId);
     if (!tpl) throw new Error(`La plantilla «${templateId}» no existe en el catálogo`);
     return tpl;
   }
@@ -354,8 +373,10 @@ class CatalogManager extends EventEmitter {
   async allocatePort() {
     const reserved = this.reservedPorts();
     for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
-      if (reserved.has(port)) continue;
+      if (reserved.has(port) || this.pendingPorts.has(port)) continue;
+      this.pendingPorts.add(port);
       if (await this.portIsFree(port)) return port;
+      this.pendingPorts.delete(port);
     }
     throw new Error(`No queda ningún puerto libre entre ${PORT_RANGE_START} y ${PORT_RANGE_END}`);
   }
@@ -364,7 +385,7 @@ class CatalogManager extends EventEmitter {
   // Progreso
   // -------------------------------------------------------------------------
 
-  setProgress(record, stepKey, message, extra = {}) {
+  setProgress(record, stepKey, message, extra = {}, { persist = true } = {}) {
     const index = STEPS.findIndex((s) => s.key === stepKey);
     record.progress = {
       step: stepKey,
@@ -377,7 +398,8 @@ class CatalogManager extends EventEmitter {
       ...extra
     };
     record.updatedAt = record.progress.updatedAt;
-    this.save();
+    if (persist) this.save();
+    else this._catalogSerializedCache = null;
     this.emit('service_progress', { id: record.id, name: record.name, ...record.progress });
   }
 
@@ -456,6 +478,7 @@ class CatalogManager extends EventEmitter {
     };
 
     this.state.installations.push(record);
+    this.pendingPorts.delete(hostPort);
     this.setProgress(record, 'validar', `Preparando la instalación de ${tpl.name}`);
 
     this.inFlight.add(id);
@@ -465,7 +488,15 @@ class CatalogManager extends EventEmitter {
     this.runInstall(record, tpl, secrets)
       .catch((err) => {
         record.status = 'error';
-        record.lastError = this.redact(err.message, secrets);
+        /** @type {Record<string, any>} */
+        const redactBag = { ...secrets };
+        if (record.databaseId) {
+          try {
+            const dbCreds = databaseManager.getCredentials(record.databaseId);
+            if (dbCreds && dbCreds.password) redactBag.__db_password = dbCreds.password;
+          } catch (e) {}
+        }
+        record.lastError = this.redact(err.message, redactBag);
         this.setProgress(record, record.progress ? record.progress.step : 'validar', `Falló: ${record.lastError}`, {
           failed: true
         });
@@ -765,16 +796,17 @@ class CatalogManager extends EventEmitter {
       if (last.healthy) {
         return { ...last, attempts: attempt, checkedAt: new Date().toISOString() };
       }
-      // El mensaje se actualiza en cada intento: una barra que no se mueve
-      // durante dos minutos parece colgada aunque no lo esté.
+      // Emitir progreso por WebSocket sin saturar el disco con save() en cada sondeo.
       const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
       this.setProgress(
         record,
         'sonda',
         `Esperando respuesta en ${readiness.path} (${last.detail}); quedan ${left} s`,
-        { attempts: attempt }
+        { attempts: attempt },
+        { persist: attempt === 1 || attempt % 5 === 0 }
       );
-      await new Promise((r) => setTimeout(r, 2000));
+      const delay = attempt <= 2 ? 400 : attempt <= 5 ? 800 : 1500;
+      await new Promise((r) => setTimeout(r, delay));
     }
 
     return { ...last, attempts: attempt, checkedAt: new Date().toISOString() };
@@ -852,6 +884,12 @@ class CatalogManager extends EventEmitter {
     // Docker manda a stderr todo lo que el proceso escribió en su stderr, que
     // en la mayoría de estas imágenes es el registro entero. Se unen los dos.
     const secrets = this.decryptSecrets(record);
+    if (record.databaseId) {
+      try {
+        const dbCreds = databaseManager.getCredentials(record.databaseId);
+        if (dbCreds && dbCreds.password) secrets.__db_password = dbCreds.password;
+      } catch (e) {}
+    }
     return {
       id: record.id,
       containerName: record.containerName,
@@ -947,14 +985,14 @@ class CatalogManager extends EventEmitter {
    * un endpoint aparte y deliberadamente incómodo de llamar por accidente.
    */
   toPublic(record) {
-    const tpl = TEMPLATES.find((t) => t.id === record.templateId);
+    const tpl = TEMPLATE_MAP.get(record.templateId);
     return {
       id: record.id,
       templateId: record.templateId,
       templateName: record.templateName || (tpl ? tpl.name : record.templateId),
       name: record.name,
       category: record.category,
-      categoryLabel: (CATEGORIES.find((c) => c.id === record.category) || {}).label || record.category,
+      categoryLabel: CATEGORY_MAP.get(record.category) || record.category,
       image: record.image,
       domain: record.domain,
       url: record.url,

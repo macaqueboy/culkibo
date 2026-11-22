@@ -1,22 +1,25 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Settings, Activity, Globe, Variable, Play, Square, Moon, Trash2, ShieldAlert, Database, Server, Copy, Eye, EyeOff, Plus, Search, Upload, Save, CheckCircle2, Box, Cpu, Webhook, GitBranch, Check, RefreshCw, Zap, Power, Rocket } from 'lucide-react';
 import { api, type Project } from '../lib/api';
+import { liveEvents } from '../lib/liveEvents';
 import { LiveLogs } from './LiveLogs';
 import { DomainManager } from './DomainManager';
 import { DatabasesPanel } from './DatabasesPanel';
 import { DeploymentsPanel } from './DeploymentsPanel';
+import { LiveForgePanel } from './LiveForgePanel';
 
 interface ProjectDetailProps {
   projectId: string;
   onBack: () => void;
   onNotify: (msg: string) => void;
   onProjectUpdate?: () => void;
+  onOpenCatalog?: () => void;
   incomingLog?: any;
 }
 
-export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack, onNotify, onProjectUpdate, incomingLog }) => {
+export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack, onNotify, onProjectUpdate, onOpenCatalog, incomingLog }) => {
   const [project, setProject] = useState<Project | null>(null);
-  const [activeTab, setActiveTab] = useState<'general' | 'deployments' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'live' | 'deployments' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config'>('general');
   const [loading, setLoading] = useState(false);
   const [simulatingWebhook, setSimulatingWebhook] = useState(false);
 
@@ -31,9 +34,13 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
   const [envRows, setEnvRows] = useState<{ key: string, value: string, id: string }[]>([]);
   const [showValues, setShowValues] = useState<Record<string, boolean>>({});
   const [searchVar, setSearchVar] = useState('');
+  const envFileInputRef = useRef<HTMLInputElement>(null);
 
-  const [showAddService, setShowAddService] = useState(false);
-  const [newService, setNewService] = useState({ name: '', type: 'Aplicación Web', port: '', image: '' });
+  // Storage inline forms (real persistence via api.updateProject)
+  const [showVolumeForm, setShowVolumeForm] = useState(false);
+  const [volForm, setVolForm] = useState({ name: '', mount_path: '/data', host_path: '' });
+  const [showMountForm, setShowMountForm] = useState(false);
+  const [mountForm, setMountForm] = useState({ mount_path: '/etc/app/config.json', content: '', chmod: '644' });
 
   // Borrado del proyecto: escalón 3 de confirmación (escribir el nombre).
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -45,77 +52,121 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
       const found = await api.getProject(projectId);
       if (found) {
         setProject(found);
-        const text = Object.entries(found.envVars || {}).map(([k,v]) => `${k}=${v}`).join('\n');
+        const text = Object.entries(found.envVars || {}).map(([k, v]) => `${k}=${v}`).join('\n');
         setEnvText(text);
-        setEnvRows(Object.entries(found.envVars || {}).map(([k,v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
+        setEnvRows(Object.entries(found.envVars || {}).map(([k, v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
       }
     } catch (e) {
       console.error(e);
     }
   }, [projectId]);
 
-  const handleAddService = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!project) return;
-    try {
-      const randId = Array.from(crypto.getRandomValues(new Uint8Array(4)))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-      const updatedResources = [...(project.resources || []), {
-        id: `res_${randId}`,
-        name: newService.name,
-        type: newService.type.toLowerCase().includes('database') || newService.type.toLowerCase().includes('redis') || newService.type.toLowerCase().includes('mongo') ? 'database' : 'app',
-        port: newService.port,
-        image: newService.image,
-        ports: [newService.port]
-      }];
-      await api.updateProject(projectId, { resources: updatedResources });
-      onNotify('Servicio añadido correctamente');
-      setShowAddService(false);
-      setNewService({ name: '', type: 'Aplicación Web', port: '', image: '' });
-      void fetchProject();
-    } catch {
-      onNotify('Error al añadir servicio');
-    }
-  };
-
   useEffect(() => {
     let active = true;
     api.getProject(projectId)
       .then((found) => {
         if (!active || !found) return;
         setProject(found);
-        const text = Object.entries(found.envVars || {}).map(([k,v]) => `${k}=${v}`).join('\n');
+        const text = Object.entries(found.envVars || {}).map(([k, v]) => `${k}=${v}`).join('\n');
         setEnvText(text);
-        setEnvRows(Object.entries(found.envVars || {}).map(([k,v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
+        setEnvRows(Object.entries(found.envVars || {}).map(([k, v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
       })
       .catch((e) => console.error(e));
     return () => { active = false; };
   }, [projectId]);
 
-  const projectName = project?.name;
+  // Suscripción ligera a cambios del proyecto sin disparar un GET en cada línea de log.
   useEffect(() => {
-    if (!incomingLog) return;
-    const msg = incomingLog.message || '';
-    const relevant =
-      incomingLog.projectId === projectId ||
-      msg.includes(projectId) ||
-      (projectName && msg.includes(projectName)) ||
-      msg.includes('GitHub:Webhook') ||
-      msg.includes('Despliegue completado');
-    if (!relevant) return;
-    let active = true;
-    api.getProject(projectId)
-      .then((found) => {
-        if (!active || !found) return;
-        setProject(found);
-        const text = Object.entries(found.envVars || {}).map(([k,v]) => `${k}=${v}`).join('\n');
-        setEnvText(text);
-        setEnvRows(Object.entries(found.envVars || {}).map(([k,v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
-      })
-      .catch((e) => console.error(e));
-    return () => { active = false; };
-  }, [incomingLog, projectId, projectName]);
+    return liveEvents.onProjectChange((ev) => {
+      if (ev.action === 'update' && ev.project && ev.project.id === projectId) {
+        setProject(ev.project);
+      } else if (ev.action === 'deleted' && ev.id === projectId) {
+        onBack();
+      }
+    });
+  }, [projectId, onBack]);
+
+  const handleImportEnvFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const content = String(reader.result || '');
+      setEnvText(content);
+      setEnvMode('raw');
+      onNotify(`Archivo ${file.name} cargado. Pulsa «Guardar Variables» para aplicarlo.`);
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const handleAddVolume = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!project || !volForm.name.trim() || !volForm.mount_path.trim()) return;
+    try {
+      const nextVolumes = [
+        ...(project.volumes || []),
+        {
+          name: volForm.name.trim(),
+          mount_path: volForm.mount_path.trim(),
+          host_path: volForm.host_path.trim() || undefined
+        }
+      ];
+      await api.updateProject(projectId, { volumes: nextVolumes });
+      setVolForm({ name: '', mount_path: '/data', host_path: '' });
+      setShowVolumeForm(false);
+      onNotify('Volumen persistente guardado');
+      void fetchProject();
+    } catch {
+      onNotify('Error al añadir volumen');
+    }
+  };
+
+  const handleRemoveVolume = async (index: number) => {
+    if (!project) return;
+    const nextVolumes = (project.volumes || []).filter((_, i) => i !== index);
+    try {
+      await api.updateProject(projectId, { volumes: nextVolumes });
+      onNotify('Volumen eliminado');
+      void fetchProject();
+    } catch {
+      onNotify('Error al eliminar volumen');
+    }
+  };
+
+  const handleAddFileMount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!project || !mountForm.mount_path.trim()) return;
+    try {
+      const nextMounts = [
+        ...(project.fileMounts || []),
+        {
+          mount_path: mountForm.mount_path.trim(),
+          content: mountForm.content,
+          chmod: mountForm.chmod.trim() || '644'
+        }
+      ];
+      await api.updateProject(projectId, { fileMounts: nextMounts });
+      setMountForm({ mount_path: '/etc/app/config.json', content: '', chmod: '644' });
+      setShowMountForm(false);
+      onNotify('Archivo montado guardado');
+      void fetchProject();
+    } catch {
+      onNotify('Error al añadir archivo montado');
+    }
+  };
+
+  const handleRemoveFileMount = async (index: number) => {
+    if (!project) return;
+    const nextMounts = (project.fileMounts || []).filter((_, i) => i !== index);
+    try {
+      await api.updateProject(projectId, { fileMounts: nextMounts });
+      onNotify('Archivo montado eliminado');
+      void fetchProject();
+    } catch {
+      onNotify('Error al eliminar archivo montado');
+    }
+  };
 
   const handleSimulatePush = async () => {
     if (!project) return;
@@ -134,7 +185,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
           head_commit: {
             id: `${shortSha}1234567890`,
             message: `test: actualización en tiempo real (${shortSha})`,
-            author: { name: 'Pablo Developer' }
+            author: { name: project.lastCommit?.author || 'Culkibo Webhook Test' }
           },
           repository: {
             full_name: project.gitRepo || `${project.githubOwner || 'user'}/${project.githubRepo || project.name}`,
@@ -144,8 +195,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
       });
       const data = await res.json();
       if (res.ok && data.deployed) {
-        onNotify(`🚀 Despliegue simulado con éxito (${shortSha})`);
-        fetchProject();
+        onNotify(`Despliegue simulado con éxito (${shortSha})`);
+        void fetchProject();
       } else {
         onNotify(`Webhook recibido: ${data.reason || data.error || 'OK'}`);
       }
@@ -313,6 +364,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
 
   const tabs = [
     { id: 'general', label: 'General', icon: Activity },
+    { id: 'live', label: 'En vivo', icon: Zap },
     { id: 'deployments', label: 'Despliegues', icon: Rocket },
     { id: 'logs', label: 'Logs', icon: Activity },
     { id: 'domains', label: 'Dominios', icon: Globe },
@@ -515,9 +567,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
         </div>
       )}
 
-      <div className="flex border-b border-slate-200 gap-8 px-2">
+      <div className="flex border-b border-slate-200 gap-6 px-2 overflow-x-auto">
         {tabs.map(t => (
-          <button key={t.id} onClick={() => setActiveTab(t.id as any)} className={`flex items-center gap-2 pb-4 text-sm font-medium border-b-2 transition-all ${activeTab === t.id ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-800'}`}>
+          <button key={t.id} onClick={() => setActiveTab(t.id as any)} className={`flex items-center gap-2 pb-4 text-sm font-medium border-b-2 transition-all whitespace-nowrap cursor-pointer shrink-0 ${activeTab === t.id ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-800'}`}>
             <t.icon className={`w-4 h-4 ${activeTab === t.id ? 'text-slate-900' : 'text-slate-400'}`} />
             {t.label}
           </button>
@@ -525,19 +577,30 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
       </div>
 
       <div className="py-2">
+        {activeTab === 'live' && (
+          <LiveForgePanel projectId={project.id} projectName={project.name} onNotify={onNotify} />
+        )}
+
         {activeTab === 'general' && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div className="lg:col-span-2 space-y-6">
               {/* Resources Section */}
               <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50/50 gap-2 flex-wrap">
                   <h3 className="font-semibold text-slate-900 flex items-center gap-2">
                     <Box className="w-5 h-5 text-indigo-500" />
                     Recursos y Contenedores
                   </h3>
-                  <button onClick={() => setShowAddService(true)} className="text-sm font-medium text-slate-600 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-sm flex items-center gap-1">
-                    <Plus className="w-4 h-4" /> Añadir Servicio
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={() => setActiveTab('databases')} className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer">
+                      <Database className="w-3.5 h-3.5" /> Añadir BD
+                    </button>
+                    {onOpenCatalog && (
+                      <button type="button" onClick={onOpenCatalog} className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer">
+                        <Plus className="w-3.5 h-3.5" /> Catálogo 1 clic
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="p-6">
                   {project.resources && project.resources.length > 0 ? (
@@ -680,9 +743,20 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                       <div className="bg-emerald-500 h-2.5 rounded-full" style={{ width: `${project.trafficSplit?.citadel || 0}%` }}></div>
                     </div>
                   </div>
-                  <div className="pt-4 border-t border-slate-100">
-                    <button className="w-full py-2 bg-slate-900 text-white rounded-xl text-sm font-medium hover:bg-slate-800 transition-colors shadow-sm">
-                      Publicar a Producción
+                  <div className="pt-4 border-t border-slate-100 space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('deployments')}
+                      className="w-full py-2.5 bg-slate-900 text-white rounded-xl text-sm font-semibold hover:bg-slate-800 transition-colors shadow-sm cursor-pointer"
+                    >
+                      Publicar a Producción →
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('live')}
+                      className="w-full py-2 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
+                    >
+                      Abrir Live Sync (The Forge)
                     </button>
                   </div>
                 </div>
@@ -844,7 +918,16 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                 <div className="space-y-4">
                   <div className="flex justify-between items-center text-sm text-slate-500">
                     <p>Pega el contenido de tu archivo <code className="bg-slate-100 px-1 rounded text-slate-700">.env</code> aquí.</p>
-                    <button className="flex items-center gap-1.5 hover:text-slate-900 transition-colors"><Upload className="w-4 h-4" /> Importar archivo</button>
+                    <div>
+                      <input ref={envFileInputRef} type="file" accept=".env,.txt" onChange={handleImportEnvFile} className="hidden" />
+                      <button
+                        type="button"
+                        onClick={() => envFileInputRef.current?.click()}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium transition-colors cursor-pointer"
+                      >
+                        <Upload className="w-3.5 h-3.5" /> Importar archivo .env
+                      </button>
+                    </div>
                   </div>
                   <textarea
                     value={envText}
@@ -867,27 +950,47 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
         {activeTab === 'storage' && (
           <div className="space-y-6">
             <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-              <div className="flex justify-between items-center mb-4">
+              <div className="flex justify-between items-center mb-2">
                 <h3 className="font-bold text-slate-900 flex items-center gap-2 text-lg"><Database className="w-5 h-5"/> Volúmenes Persistentes</h3>
-                <button className="text-sm font-medium text-slate-600 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-sm flex items-center gap-1">
-                  <Plus className="w-4 h-4" /> Añadir Volumen
+                <button
+                  type="button"
+                  onClick={() => setShowVolumeForm((prev) => !prev)}
+                  className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" /> {showVolumeForm ? 'Cerrar' : 'Añadir Volumen'}
                 </button>
               </div>
+
+              {showVolumeForm && (
+                <form onSubmit={handleAddVolume} className="p-4 rounded-xl bg-slate-50 border border-slate-200 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                  <input required value={volForm.name} onChange={(e) => setVolForm({ ...volForm, name: e.target.value })} placeholder="Nombre (ej. uploads)" className="px-3 py-2 bg-white border border-slate-300 rounded-lg" />
+                  <input required value={volForm.mount_path} onChange={(e) => setVolForm({ ...volForm, mount_path: e.target.value })} placeholder="Ruta contenedor (/data)" className="px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
+                  <div className="flex gap-2">
+                    <input value={volForm.host_path} onChange={(e) => setVolForm({ ...volForm, host_path: e.target.value })} placeholder="Ruta host (opcional)" className="flex-1 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
+                    <button type="submit" className="px-3 py-2 rounded-lg bg-slate-900 text-white font-semibold cursor-pointer">Guardar</button>
+                  </div>
+                </form>
+              )}
+
               <div className="border border-slate-200 rounded-xl overflow-hidden">
- <div className="grid grid-cols-[1.5fr_1fr_1fr] gap-4 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
+                <div className="grid grid-cols-[1.5fr_1fr_1fr_auto] gap-4 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
                   <div>Nombre</div>
                   <div>Ruta Contenedor (Mount)</div>
                   <div>Ruta Host</div>
+                  <div />
                 </div>
                 <div className="divide-y divide-slate-100">
                   {(!project.volumes || project.volumes.length === 0) && (
                     <div className="p-8 text-center text-slate-500 text-sm">No hay volúmenes configurados.</div>
                   )}
                   {project.volumes?.map((vol, i) => (
-                    <div key={i} className="grid grid-cols-[1.5fr_1fr_1fr] gap-4 p-3 items-center text-sm">
-                      <div className="font-medium text-slate-700">{vol.name || `Volumen ${i+1}`}</div>
+                    <div key={i} className="grid grid-cols-[1.5fr_1fr_1fr_auto] gap-4 p-3 items-center text-sm">
+                      <div className="font-medium text-slate-700">{vol.name || `Volumen ${i + 1}`}</div>
                       <div className="font-mono text-slate-500">{vol.mount_path || vol.mountPath || '/data'}</div>
                       <div className="font-mono text-slate-500">{vol.host_path || vol.hostPath || '-'}</div>
+                      <button type="button" onClick={() => void handleRemoveVolume(i)} className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer" title="Eliminar volumen">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -895,27 +998,49 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
             </div>
 
             <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-              <div className="flex justify-between items-center mb-4">
+              <div className="flex justify-between items-center mb-2">
                 <h3 className="font-bold text-slate-900 flex items-center gap-2 text-lg"><Box className="w-5 h-5"/> Archivos Montados (File Mounts)</h3>
-                <button className="text-sm font-medium text-slate-600 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-sm flex items-center gap-1">
-                  <Plus className="w-4 h-4" /> Montar Archivo
+                <button
+                  type="button"
+                  onClick={() => setShowMountForm((prev) => !prev)}
+                  className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" /> {showMountForm ? 'Cerrar' : 'Montar Archivo'}
                 </button>
               </div>
+
+              {showMountForm && (
+                <form onSubmit={handleAddFileMount} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <input required value={mountForm.mount_path} onChange={(e) => setMountForm({ ...mountForm, mount_path: e.target.value })} placeholder="Ruta de montaje (/etc/app/config.json)" className="sm:col-span-2 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
+                    <input value={mountForm.chmod} onChange={(e) => setMountForm({ ...mountForm, chmod: e.target.value })} placeholder="chmod (644)" className="px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
+                  </div>
+                  <textarea value={mountForm.content} onChange={(e) => setMountForm({ ...mountForm, content: e.target.value })} rows={3} placeholder="Contenido del archivo (opcional)" className="w-full p-2.5 bg-white border border-slate-300 rounded-lg font-mono" />
+                  <div className="flex justify-end">
+                    <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white font-semibold cursor-pointer">Guardar archivo montado</button>
+                  </div>
+                </form>
+              )}
+
               <div className="border border-slate-200 rounded-xl overflow-hidden">
- <div className="grid grid-cols-[2fr_1fr] gap-4 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
+                <div className="grid grid-cols-[2fr_1fr_auto] gap-4 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
                   <div>Ruta de Montaje</div>
-                  <div>Permisos (chmod / chown)</div>
+                  <div>Permisos</div>
+                  <div />
                 </div>
                 <div className="divide-y divide-slate-100">
                   {(!project.fileMounts || project.fileMounts.length === 0) && (
                     <div className="p-8 text-center text-slate-500 text-sm">No hay archivos montados.</div>
                   )}
                   {project.fileMounts?.map((fm, i) => (
-                    <div key={i} className="grid grid-cols-[2fr_1fr] gap-4 p-3 items-center text-sm">
+                    <div key={i} className="grid grid-cols-[2fr_1fr_auto] gap-4 p-3 items-center text-sm">
                       <div className="font-mono text-slate-700">{fm.mountPath || fm.mount_path || '/etc/config.json'}</div>
                       <div className="font-mono text-slate-500 text-xs bg-slate-100 px-2 py-1 rounded inline-block w-max">
-                        chmod {fm.chmod || '644'} &bull; chown {fm.chown || 'root:root'}
+                        chmod {fm.chmod || '644'}
                       </div>
+                      <button type="button" onClick={() => void handleRemoveFileMount(i)} className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer" title="Eliminar archivo montado">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -1268,42 +1393,6 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                 <Trash2 className="w-4 h-4" /> Eliminar proyecto
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {showAddService && (
-        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl animate-in fade-in zoom-in-95 duration-200">
-            <h3 className="text-xl font-bold text-slate-900 mb-4">Añadir Servicio</h3>
-            <form onSubmit={handleAddService} className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Nombre del Servicio</label>
-                <input required type="text" value={newService.name} onChange={e => setNewService({...newService, name: e.target.value})} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20" placeholder="Ej: mi-bd-postgres" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Tipo</label>
-                <select value={newService.type} onChange={e => setNewService({...newService, type: e.target.value})} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20">
-                  <option>Aplicación Web</option>
-                  <option>Base de Datos PostgreSQL</option>
-                  <option>Redis</option>
-                  <option>MongoDB</option>
-                  <option>Docker Compose</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Puerto</label>
-                <input required type="text" value={newService.port} onChange={e => setNewService({...newService, port: e.target.value})} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20" placeholder="Ej: 5432" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Imagen o Repositorio Git</label>
-                <input required type="text" value={newService.image} onChange={e => setNewService({...newService, image: e.target.value})} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20" placeholder="Ej: postgres:15-alpine" />
-              </div>
-              <div className="flex justify-end gap-3 mt-6">
-                <button type="button" onClick={() => setShowAddService(false)} className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-900 transition-colors">Cancelar</button>
-                <button type="submit" className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-sm font-medium transition-colors shadow-sm">Añadir Servicio</button>
-              </div>
-            </form>
           </div>
         </div>
       )}

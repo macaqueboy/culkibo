@@ -1,0 +1,348 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Zap,
+  ShieldCheck,
+  RotateCcw,
+  Rocket,
+  Copy,
+  Check,
+  RefreshCw,
+  CheckCircle2,
+  AlertTriangle,
+  Radio,
+  Terminal,
+  Loader2
+} from 'lucide-react';
+import { api, type LiveSyncStatus, type LiveSyncRecentFrame } from '../lib/api';
+import { liveEvents } from '../lib/liveEvents';
+
+interface LiveForgePanelProps {
+  projectId: string;
+  projectName: string;
+  onNotify: (msg: string) => void;
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, projectName, onNotify }) => {
+  const [status, setStatus] = useState<LiveSyncStatus | null>(null);
+  const [frames, setFrames] = useState<LiveSyncRecentFrame[]>([]);
+  const [merkle, setMerkle] = useState<{ inSync: boolean; serverDigest: string; fileCount: number } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busyAction, setBusyAction] = useState<'verify' | 'rollback' | 'promote' | null>(null);
+  const [cmdMode, setCmdMode] = useState<'local' | 'remote'>('local');
+  const [copiedCmd, setCopiedCmd] = useState(false);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      const s = await api.getSyncStatus(projectId);
+      setStatus(s);
+      if (Array.isArray(s.recentFrames)) setFrames(s.recentFrames);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    let active = true;
+    api.getSyncStatus(projectId)
+      .then((s) => {
+        if (!active) return;
+        setStatus(s);
+        if (Array.isArray(s.recentFrames)) setFrames(s.recentFrames);
+      })
+      .catch((err) => console.error(err))
+      .finally(() => { if (active) setLoading(false); });
+
+    const offApplied = liveEvents.onSyncApplied((ev) => {
+      if (ev.projectId !== projectId) return;
+      setFrames((prev) => [
+        {
+          seq: ev.seq,
+          written: ev.written,
+          deleted: ev.deleted,
+          dedupSkipped: ev.dedupSkipped,
+          applyMs: ev.applyMs,
+          mode: ev.mode,
+          reason: ev.reason,
+          at: ev.timestamp || new Date().toISOString()
+        },
+        ...prev
+      ].slice(0, 25));
+      void loadStatus();
+    });
+    const offRollback = liveEvents.onSyncRollback((ev) => {
+      if (ev.projectId !== projectId) return;
+      void loadStatus();
+    });
+    const offClient = liveEvents.onSyncClient((ev) => {
+      if (ev.projectId !== projectId) return;
+      setStatus((prev) => (prev ? { ...prev, connectedClients: ev.connectedClients } : prev));
+    });
+    return () => {
+      active = false;
+      offApplied();
+      offRollback();
+      offClient();
+    };
+  }, [projectId, loadStatus]);
+
+  const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.port === '5173' ? 'localhost:3030' : window.location.host;
+  const syncCommand = cmdMode === 'local'
+    ? `npx culkibo sync ${projectId}`
+    : `npx culkibo sync ${projectId} --url ${wsProto}//${host}/ws/sync --token TU_CULKIBO_TOKEN`;
+
+  const handleCopyCmd = () => {
+    navigator.clipboard.writeText(syncCommand);
+    setCopiedCmd(true);
+    setTimeout(() => setCopiedCmd(false), 1800);
+    onNotify('Comando de Live Sync copiado');
+  };
+
+  const handleVerify = async () => {
+    setBusyAction('verify');
+    try {
+      const res = await api.verifyProjectSync(projectId);
+      setMerkle({
+        inSync: Boolean(res.inSync),
+        serverDigest: res.serverDigest || '',
+        fileCount: res.fileCount || 0
+      });
+      onNotify(`Árbol Merkle verificado (${res.fileCount || 0} archivos)`);
+    } catch (err: any) {
+      onNotify(err?.message || 'Error al verificar integridad');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRollback = async () => {
+    setBusyAction('rollback');
+    try {
+      const res = await api.rollbackProjectSync(projectId, 1);
+      onNotify(`Rollback aplicado en ${res.durationMs ?? '<1'} ms (${(res.restoredFiles || []).length} archivo(s))`);
+      await loadStatus();
+    } catch (err: any) {
+      onNotify(err?.message || 'No hay parches recientes para revertir');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handlePromote = async () => {
+    setBusyAction('promote');
+    try {
+      const res = await api.promoteForge(projectId);
+      onNotify(res.promoted
+        ? `¡${projectName} promocionado a producción sin cortes!`
+        : 'Promoción lanzada; revisa la pestaña Despliegues.');
+    } catch (err: any) {
+      onNotify(err?.message || 'No se pudo promocionar a producción');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="p-10 bg-white rounded-2xl border border-slate-200 text-center text-xs text-slate-500 flex items-center justify-center gap-2">
+        <Loader2 className="w-4 h-4 animate-spin" /> Cargando telemetría de Live Sync…
+      </div>
+    );
+  }
+
+  const connected = (status?.connectedClients || 0) > 0;
+
+  return (
+    <div className="space-y-6">
+      {/* Banner de estado */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-5">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className={`w-10 h-10 rounded-xl flex items-center justify-center border shrink-0 ${
+              connected ? 'bg-emerald-50 border-emerald-200 text-emerald-600' : 'bg-slate-100 border-slate-200 text-slate-500'
+            }`}>
+              <Zap className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-base font-bold text-slate-900">Sincronización en vivo (The Forge)</h3>
+                <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold border ${
+                  connected
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-slate-100 text-slate-600 border-slate-200'
+                }`}>
+                  <span className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
+                  {connected ? `${status?.connectedClients} cliente(s) conectado(s)` : 'Esperando conexión'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Cada cambio en tu editor o en tu agente de IA llega al servidor por tramas binarias WebSocket en milisegundos, con verificación Merkle y rollback instantáneo.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap shrink-0">
+            <button
+              type="button"
+              onClick={handleVerify}
+              disabled={busyAction !== null}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white hover:bg-slate-50 border border-slate-200 text-xs font-semibold text-slate-700 cursor-pointer disabled:opacity-50"
+            >
+              {busyAction === 'verify' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />}
+              <span>Verificar Merkle</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleRollback}
+              disabled={busyAction !== null || (status?.historyDepth || 0) === 0}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-200 text-xs font-semibold text-amber-800 cursor-pointer disabled:opacity-50"
+            >
+              {busyAction === 'rollback' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+              <span>Rollback &lt;10 ms</span>
+            </button>
+            <button
+              type="button"
+              onClick={handlePromote}
+              disabled={busyAction !== null}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer disabled:opacity-50"
+            >
+              {busyAction === 'promote' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Rocket className="w-3.5 h-3.5" />}
+              <span>Promocionar a Producción</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Métricas reales */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80">
+            <div className="text-slate-500">Latencia p50 / p95</div>
+            <div className="font-mono font-bold text-slate-900 text-base mt-1 tabular-nums">
+              {status?.latencyMs?.p50 != null ? `${status.latencyMs.p50} / ${status.latencyMs.p95} ms` : '—'}
+            </div>
+          </div>
+          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80">
+            <div className="text-slate-500">Frames aplicados</div>
+            <div className="font-mono font-bold text-slate-900 text-base mt-1 tabular-nums">{status?.framesApplied ?? 0}</div>
+          </div>
+          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80">
+            <div className="text-slate-500">Archivos sincronizados</div>
+            <div className="font-mono font-bold text-slate-900 text-base mt-1 tabular-nums">
+              {status?.filesWritten ?? 0} <span className="text-xs font-normal text-slate-400">({formatBytes(status?.bytesSynced || 0)})</span>
+            </div>
+          </div>
+          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80">
+            <div className="text-slate-500">Historial rollback</div>
+            <div className="font-mono font-bold text-slate-900 text-base mt-1 tabular-nums">{status?.historyDepth ?? 0} pasos</div>
+          </div>
+        </div>
+
+        {merkle && (
+          <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>Integridad verificada ({merkle.fileCount} archivos)</span>
+            </div>
+            <span className="font-mono text-[11px] bg-white px-2 py-0.5 rounded border border-emerald-200 truncate max-w-xs">
+              Merkle: {merkle.serverDigest.slice(0, 20)}…
+            </span>
+          </div>
+        )}
+
+        {/* Comando para conectar editor */}
+        <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <span className="text-xs font-semibold text-slate-800 flex items-center gap-1.5">
+              <Terminal className="w-3.5 h-3.5 text-slate-500" />
+              Conecta tu carpeta local con este servidor:
+            </span>
+            <div className="flex items-center gap-1 bg-white p-0.5 rounded-lg border border-slate-200 text-[11px]">
+              <button
+                type="button"
+                onClick={() => setCmdMode('local')}
+                className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${cmdMode === 'local' ? 'bg-slate-900 text-white' : 'text-slate-600'}`}
+              >
+                Este equipo
+              </button>
+              <button
+                type="button"
+                onClick={() => setCmdMode('remote')}
+                className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${cmdMode === 'remote' ? 'bg-slate-900 text-white' : 'text-slate-600'}`}
+              >
+                Servidor remoto (VPS)
+              </button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-xl px-3.5 py-2.5">
+            <code className="flex-1 text-xs font-mono text-slate-800 overflow-x-auto whitespace-nowrap">{syncCommand}</code>
+            <button
+              type="button"
+              onClick={handleCopyCmd}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-700 cursor-pointer shrink-0"
+            >
+              {copiedCmd ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+              <span>{copiedCmd ? 'Copiado' : 'Copiar'}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Feed de Commit Frames en vivo */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
+            <Radio className="w-4 h-4 text-blue-600" />
+            <span>Últimos Commit Frames recibidos</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadStatus()}
+            className="p-1.5 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-200/70 cursor-pointer"
+            title="Refrescar"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        {frames.length === 0 ? (
+          <div className="p-8 text-center text-xs text-slate-500 space-y-1">
+            <AlertTriangle className="w-5 h-5 text-slate-300 mx-auto mb-1" />
+            <p className="font-medium text-slate-700">Aún no ha llegado ningún Commit Frame.</p>
+            <p>Ejecuta el comando de arriba en tu carpeta de código y guarda cualquier archivo para verlo aquí al instante.</p>
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100 text-xs">
+            {frames.map((f) => (
+              <div key={`${f.seq}-${f.at}`} className="px-5 py-3 flex items-center justify-between gap-3 hover:bg-slate-50/70">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="font-mono font-bold text-slate-900 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded">
+                    #{f.seq}
+                  </span>
+                  <span className="text-slate-700">
+                    <strong>{f.written}</strong> escritos · <strong>{f.deleted}</strong> borrados · {f.dedupSkipped} sin cambios
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200 text-[10px] font-semibold">
+                    {f.mode}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3 shrink-0 font-mono text-slate-500">
+                  <span className="text-emerald-700 font-semibold">{f.applyMs} ms</span>
+                  <span>{new Date(f.at).toLocaleTimeString('es-ES')}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};

@@ -21,34 +21,78 @@ const ingressManager = require('../services/ingressManager');
 const deployManager = require('../services/deployManager');
 const catalogManager = require('../services/catalogManager');
 const liveSyncEngine = require('../services/liveSyncEngine');
-const { authorizeRequest, authStatus, tokenMatches } = require('../middleware/auth');
+const wordpressMigrator = require('../services/wordpressMigrator');
+const universalImporter = require('../services/universalImporter');
+const { authorizeRequest, authStatus, tokenMatches, addAllowedOrigin } = require('../middleware/auth');
+const { isPrivateIp } = require('../services/ssrfGuard');
 
-// In-memory rate limiting for sensitive endpoints (O(1) Fixed Window)
+// In-memory rate limiting (O(1) Fixed Window with bounded Map pruning)
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 60000;
 const MAX_REQUESTS_PER_WINDOW = 500;
 
-function rateLimiter(req, res, next) {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || process.env.NODE_ENV === 'test') {
-    return next();
-  }
-  const now = Date.now();
-  let entry = rateLimitMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
-    rateLimitMap.set(ip, entry);
-  }
-  entry.count++;
-  if (entry.count > MAX_REQUESTS_PER_WINDOW) {
-    return res.status(429).json({ error: 'Demasiadas peticiones. Por favor, inténtelo de nuevo en un minuto.' });
-  }
-  next();
+function createRateLimiter({ max = MAX_REQUESTS_PER_WINDOW, windowMs = RATE_LIMIT_WINDOW_MS, prefix = 'global', bypassLoopback = true } = {}) {
+  return function rateLimiterMiddleware(req, res, next) {
+    const ip = (req && (req.ip || req.socket?.remoteAddress)) || 'unknown';
+    if (process.env.NODE_ENV === 'test') return next();
+    if (bypassLoopback && (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1')) {
+      return next();
+    }
+    const now = Date.now();
+    if (rateLimitMap.size > 4000) {
+      for (const [k, v] of rateLimitMap) {
+        if (now > v.resetAt) rateLimitMap.delete(k);
+      }
+      if (rateLimitMap.size > 4000) rateLimitMap.clear();
+    }
+    const key = `${prefix}:${ip}`;
+    let entry = rateLimitMap.get(key);
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + windowMs };
+      rateLimitMap.set(key, entry);
+    }
+    entry.count++;
+    if (entry.count > max) {
+      return res.status(429).json({ error: 'Demasiadas peticiones. Por favor, inténtalo de nuevo en un minuto.' });
+    }
+    next();
+  };
 }
 
+const rateLimiter = createRateLimiter();
+const authVerifyLimiter = createRateLimiter({ max: 10, windowMs: 60000, prefix: 'auth', bypassLoopback: false });
+const webhookLimiter = createRateLimiter({ max: 60, windowMs: 60000, prefix: 'webhook', bypassLoopback: true });
+const askLimiter = createRateLimiter({ max: 120, windowMs: 60000, prefix: 'ask', bypassLoopback: true });
+const importLimiter = createRateLimiter({ max: 30, windowMs: 60000, prefix: 'import', bypassLoopback: true });
+
 router.use('/projects', rateLimiter);
-router.use('/import/coolify', rateLimiter);
+router.use('/import', importLimiter);
 router.use('/databases', rateLimiter);
+router.use('/auth/verify', authVerifyLimiter);
+router.use('/webhooks/github', webhookLimiter);
+router.use('/ingress/ask', askLimiter);
+
+const DOMAINS_JSON_PREFIX = Buffer.from('{"domains":', 'utf8');
+const DOMAINS_JSON_SUFFIX = Buffer.from('}', 'utf8');
+let _cachedPublicIp = { at: 0, ip: /** @type {string | null} */ (null) };
+const _askLogThrottle = new Map();
+
+async function detectPublicIp() {
+  const now = Date.now();
+  if (_cachedPublicIp.ip && (now - _cachedPublicIp.at) < 300000) {
+    return _cachedPublicIp.ip;
+  }
+  try {
+    const response = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) });
+    /** @type {any} */
+    const data = await response.json();
+    if (data && typeof data.ip === 'string') {
+      _cachedPublicIp = { at: now, ip: data.ip };
+      return data.ip;
+    }
+  } catch (e) {}
+  return _cachedPublicIp.ip || null;
+}
 
 // --- PROJECTS ---
 router.get('/projects', (req, res) => {
@@ -79,9 +123,10 @@ router.post('/projects', async (req, res) => {
 
 router.get('/projects/:id', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    res.json(project);
+    const serialized = projectManager.getByIdSerialized(req.params.id);
+    if (!serialized) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(serialized);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -99,6 +144,13 @@ router.put('/projects/:id', (req, res) => {
 router.delete('/projects/:id', async (req, res) => {
   try {
     const projectId = req.params.id;
+    const existing = projectManager.getById(projectId);
+    if (!existing) return res.status(404).json({ error: 'Proyecto no encontrado' });
+
+    // Detener procesos locales y limpiar sesiones de sincronización antes de borrar.
+    try { await localRunner.stop(projectId, existing.localPort); } catch (e) {}
+    try { liveSyncEngine.resetSession(projectId); } catch (e) {}
+
     // Los dominios del proyecto se quedarían apuntando a un proyecto que ya no
     // existe y su ruta seguiría viva en Caddy: se desvinculan antes de borrar.
     const attached = domainManager.listByProject(projectId);
@@ -314,6 +366,10 @@ router.post('/projects/:id/deploy', async (req, res) => {
   try {
     const project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    // Comprobación síncrona antes de devolver 202 para que un doble clic reciba 409 inmediato.
+    if (deployManager.locks.has(project.id)) {
+      return res.status(409).json({ error: 'Ya hay un despliegue en curso para este proyecto' });
+    }
 
     const options = {};
     if (req.body && typeof req.body === 'object') {
@@ -494,7 +550,13 @@ router.post('/import/coolify/migrate-domain', async (req, res) => {
 
 router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
   try {
-    const { domains, serverIp, autoCloudflare } = req.body;
+    const { domains, serverIp, autoCloudflare } = req.body || {};
+    if (!Array.isArray(domains) || domains.length === 0) {
+      return res.status(400).json({ error: 'Se requiere una lista no vacía de dominios' });
+    }
+    if (domains.length > 50) {
+      return res.status(400).json({ error: 'Máximo 50 dominios por lote' });
+    }
     const results = [];
     for (const hostname of domains) {
       try {
@@ -519,14 +581,12 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
           const updates = { sslStatus: 'pending_ssl', cloudflareZoneId: zoneId || domain.cloudflareZoneId };
           if (dnsResult && dnsResult.success) updates.cloudflareProxied = true;
           await domainManager.updateDomain(domain.id, updates);
-          // Misma razón que en /migrate-domain: el certificado lo emite Caddy
-          // bajo demanda, no este bucle escribiendo PEMs inventados.
         }
         results.push({ hostname, success: true });
       } catch (e) {
         results.push({ hostname, success: false, error: e.message });
       }
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 250));
     }
     res.json({ success: true, results });
   } catch (err) {
@@ -534,16 +594,101 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
   }
 });
 
+// --- MIGRADOR WORDPRESS + IMPORTADOR UNIVERSAL (COMPOSE / GIT / PLATAFORMAS) ---
+router.post('/import/wordpress/analyze', async (req, res) => {
+  try {
+    const { url } = req.body || {};
+    if (!url) return res.status(400).json({ error: 'Indica la URL de tu web WordPress' });
+    const analysis = await wordpressMigrator.analyzeSite(url);
+    res.json(analysis);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/import/wordpress/provision', async (req, res) => {
+  try {
+    const { name, domain, sourceUrl, useSslip, serverIp } = req.body || {};
+    const effectiveIp = serverIp || (useSslip ? await detectPublicIp() : null);
+    const result = await wordpressMigrator.provisionWordPress({
+      name,
+      domain,
+      sourceUrl,
+      useSslip: Boolean(useSslip),
+      serverIp: effectiveIp
+    });
+    res.status(202).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/import/wordpress/import-sql', async (req, res) => {
+  try {
+    const { installationId, sqlContent, oldDomain, newDomain } = req.body || {};
+    if (!installationId || !sqlContent) {
+      return res.status(400).json({ error: 'Se requieren installationId y el contenido SQL' });
+    }
+    const result = await wordpressMigrator.importSqlDump({ installationId, sqlContent, oldDomain, newDomain });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/import/compose/parse', (req, res) => {
+  try {
+    const { yamlText } = req.body || {};
+    res.json(universalImporter.parseDockerCompose(yamlText));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/import/compose/apply', async (req, res) => {
+  try {
+    const { yamlText, projectName, selectedServices } = req.body || {};
+    const result = await universalImporter.importDockerCompose({ yamlText, projectName, selectedServices });
+    await projectManager.flushToDisk();
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/import/git/inspect', async (req, res) => {
+  try {
+    const { gitUrl, branch } = req.body || {};
+    res.json(await universalImporter.inspectGitUrl(gitUrl, { branch }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/import/platform/parse', (req, res) => {
+  try {
+    res.json(universalImporter.parsePlatformConfig(req.body || {}));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/import/universal/create', async (req, res) => {
+  try {
+    const result = await universalImporter.createImportedProject(req.body || {});
+    await projectManager.flushToDisk();
+    if (result.project && result.project.gitRepo) {
+      localRunner.prepareProject(result.project).catch(() => {});
+    }
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // --- SYSTEM & HEALTH ---
 router.get('/server/ip', async (req, res) => {
-  try {
-    const response = await fetch('https://api.ipify.org?format=json');
-    /** @type {any} */
-    const data = await response.json();
-    res.json({ ip: data.ip });
-  } catch (err) {
-    res.json({ ip: null });
-  }
+  res.json({ ip: await detectPublicIp() });
 });
 
 router.get('/health', (req, res) => {
@@ -552,14 +697,16 @@ router.get('/health', (req, res) => {
 
 router.get('/system/status', (req, res) => {
   try {
+    const mem = process.memoryUsage();
     res.json({
       name: 'Culkibo',
       version: '1.0.0',
       tagline: 'The AI-Era Cloud Orchestrator',
       nodeVersion: process.version,
       uptimeSeconds: Math.floor(process.uptime()),
-      memoryUsageMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
-      heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      memoryUsageMb: Math.round(mem.rss / 1024 / 1024),
+      heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+      panelDomain: ingressManager.panelDomain || null,
       features: {
         hotReloadImplemented: true,
         liveSyncImplemented: true,
@@ -568,7 +715,9 @@ router.get('/system/status', (req, res) => {
         nativeMcp: true,
         onDemandTls: true,
         dualDockerMode: true,
-        backupRestoreEngine: true
+        backupRestoreEngine: true,
+        wordpressMigrator: true,
+        universalImporter: true
       }
     });
   } catch (err) {
@@ -576,10 +725,67 @@ router.get('/system/status', (req, res) => {
   }
 });
 
+router.get('/system/remote-access', async (req, res) => {
+  try {
+    const [serverIp, caddy, tunnelsRes] = await Promise.all([
+      detectPublicIp(),
+      caddyManager.detect(),
+      cloudflareService.listTunnels().catch(() => ({ success: false, tunnels: [], isMock: false }))
+    ]);
+    /** @type {any} */
+    const tunnelsInfo = tunnelsRes;
+    const protocol = req.protocol;
+    const host = req.get('host');
+    const baseUrl = ingressManager.panelDomain ? `https://${ingressManager.panelDomain}` : `${protocol}://${host}`;
+    res.json({
+      panelDomain: ingressManager.panelDomain || null,
+      currentOrigin: `${protocol}://${host}`,
+      recommendedUrl: baseUrl,
+      serverIp,
+      auth: authStatus(),
+      caddy,
+      cloudflare: cloudflareService.getConfigStatus(),
+      tunnels: Array.isArray(tunnelsInfo.tunnels) ? tunnelsInfo.tunnels : [],
+      tunnelsMock: Boolean(tunnelsInfo.isMock),
+      clientConfigs: mcpServer.getClientConfigs(baseUrl, { includeAuthPlaceholder: Boolean(ingressManager.panelDomain) }),
+      cliUpdateCommand: 'culkibo update'
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/system/panel-domain', async (req, res) => {
+  try {
+    const raw = String((req.body && req.body.domain) || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (!raw) {
+      ingressManager.panelDomain = null;
+      const ingress = await ingressManager.reconcile();
+      return res.json({ success: true, panelDomain: null, ingress });
+    }
+    if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/.test(raw)) {
+      return res.status(400).json({ error: `Dominio de panel inválido: «${raw}»` });
+    }
+    ingressManager.panelDomain = raw;
+    addAllowedOrigin(`https://${raw}`);
+    addAllowedOrigin(`http://${raw}`);
+    const ingress = await ingressManager.reconcile();
+    res.json({
+      success: true,
+      panelDomain: raw,
+      url: `https://${raw}`,
+      ingress
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // --- PODS & TRAFFIC ---
 router.get('/pods', (req, res) => {
   try {
-    res.json(containerOrchestrator.getPods());
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(containerOrchestrator.getPodsSerialized());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -619,7 +825,8 @@ router.post('/pods/deploy', async (req, res) => {
 // --- DOMAINS ---
 router.get('/domains', (req, res) => {
   try {
-    res.json({ domains: domainManager.listDomains() });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(Buffer.concat([DOMAINS_JSON_PREFIX, domainManager.getAllSerialized(), DOMAINS_JSON_SUFFIX]));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -892,12 +1099,11 @@ router.delete('/ssl/certificates/:id', (req, res) => {
 // --- CLOUDFLARE ---
 router.get('/cloudflare/config', (req, res) => {
   try {
-    const cfg = cloudflareService.config;
+    const status = cloudflareService.getConfigStatus();
     res.json({
-      isConfigured: Boolean(cfg.apiToken),
-      accountId: cfg.accountId ? `${cfg.accountId.slice(0, 4)}...${cfg.accountId.slice(-4)}` : '',
-      hasToken: Boolean(cfg.apiToken),
-      useMock: cfg.useMock
+      ...status,
+      accountId: status.accountId ? `${status.accountId.slice(0, 4)}...${status.accountId.slice(-4)}` : '',
+      hasToken: Boolean(cloudflareService.config.apiToken)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1004,7 +1210,8 @@ router.all('/mcp', mcpStreamableHttp.handleMethodNotAllowed);
 
 router.get('/mcp/tools', (req, res) => {
   try {
-    res.json({ tools: mcpServer.getToolsDefinition() });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(mcpServer.getToolsSerialized());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1381,10 +1588,25 @@ router.post('/databases/:id/retention/apply', async (req, res) => {
 // revela si un dominio está configurado, que es información que cualquiera
 // puede deducir resolviendo el DNS.
 router.get('/ingress/ask', (req, res) => {
+  // Sólo Caddy (en loopback o red privada Docker bridge) puede consultar este endpoint.
+  const remoteIp = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  const isLocalOrPrivate = remoteIp === '127.0.0.1' || remoteIp === '::1' || isPrivateIp(remoteIp);
+  if (!isLocalOrPrivate && process.env.NODE_ENV !== 'test') {
+    return res.status(403).type('text/plain').send('acceso restringido al plano de datos local');
+  }
+
   const domain = String(req.query.domain || '').trim().toLowerCase();
 
   if (!domain) {
     return res.status(400).type('text/plain').send('falta el parámetro domain');
+  }
+  if (!/^[a-z0-9.-]{1,253}$/.test(domain)) {
+    return res.status(400).type('text/plain').send('parámetro domain inválido');
+  }
+
+  // Permitir también el dominio del propio panel de Culkibo si está configurado.
+  if (ingressManager.panelDomain && domain === ingressManager.panelDomain) {
+    return res.status(200).type('text/plain').send('ok');
   }
 
   const route = domainManager.resolveRoute(domain);
@@ -1396,7 +1618,13 @@ router.get('/ingress/ask', (req, res) => {
     return res.status(403).type('text/plain').send(`dominio deshabilitado: ${domain}`);
   }
 
-  containerOrchestrator.addLog('INFO', 'edge', `[Edge:TLS] Certificado autorizado para ${domain} (regla: ${route.hostname})`);
+  const now = Date.now();
+  const lastLog = _askLogThrottle.get(domain) || 0;
+  if (now - lastLog > 60000) {
+    if (_askLogThrottle.size > 500) _askLogThrottle.clear();
+    _askLogThrottle.set(domain, now);
+    containerOrchestrator.addLog('INFO', 'edge', `[Edge:TLS] Certificado autorizado para ${domain} (regla: ${route.hostname})`);
+  }
   return res.status(200).type('text/plain').send('ok');
 });
 
@@ -1840,10 +2068,8 @@ router.use('/catalog', rateLimiter);
 
 router.get('/catalog', (req, res) => {
   try {
-    res.json({
-      templates: catalogManager.listTemplates(),
-      categories: catalogManager.listCategories()
-    });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(catalogManager.getCatalogSerialized());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

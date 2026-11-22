@@ -19,17 +19,16 @@ async function runTests() {
 
   const realCreate = projectManager.create;
   const realAddDomain = domainManager.addDomain;
+  const originalFetch = migrator.fetchFromApi;
   const restoreSingletons = () => {
     projectManager.create = realCreate;
     domainManager.addDomain = realAddDomain;
+    migrator.fetchFromApi = originalFetch;
   };
 
   try {
   projectManager.create = () => {};
   domainManager.addDomain = async () => {};
-
-  // Override fetchFromApi for mocking
-  const originalFetch = migrator.fetchFromApi.bind(migrator);
   
   // Fixtures
   const appFixture = {

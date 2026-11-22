@@ -11,6 +11,7 @@ import {
   type ServiceInstallation,
   type ServiceSecrets
 } from '../lib/api';
+import { liveEvents } from '../lib/liveEvents';
 
 interface Props {
   onNotify: (msg: string) => void;
@@ -95,13 +96,26 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify }) => {
     return () => { active = false; };
   }, []);
 
-  // Mientras haya algo instalándose se refresca solo. El progreso llega también
-  // por WebSocket, pero el sondeo es lo que hace que recargar la página no
-  // pierda el hilo de una instalación que lleva tres minutos descargando.
+  // Progreso instantáneo por WebSocket + respaldo por sondeo si alguien recarga.
+  useEffect(() => {
+    const offProg = liveEvents.onServiceProgress((ev) => {
+      setInstallations((prev) => prev.map((inst) => (
+        inst.id === ev.id ? { ...inst, progress: ev.progress ?? inst.progress } : inst
+      )));
+    });
+    const offDone = liveEvents.onServiceInstalled(() => loadRef.current());
+    const offFail = liveEvents.onServiceFailed(() => loadRef.current());
+    return () => {
+      offProg();
+      offDone();
+      offFail();
+    };
+  }, []);
+
   const installing = installations.some((i) => i.status === 'installing');
   useEffect(() => {
     if (!installing) return;
-    const timer = setInterval(() => loadRef.current(), 1500);
+    const timer = setInterval(() => loadRef.current(), 2500);
     return () => clearInterval(timer);
   }, [installing]);
 
@@ -384,6 +398,15 @@ const InstallDialog: React.FC<{
 }> = ({ template, onCancel, onConfirm }) => {
   const [name, setName] = useState(template.name);
   const [domain, setDomain] = useState('');
+  const [serverIp, setServerIp] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    api.getServerIp()
+      .then((res) => { if (active && res?.ip) setServerIp(res.ip); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, []);
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-900/20 backdrop-blur-[2px] flex items-start justify-center p-4 overflow-y-auto">
@@ -423,8 +446,8 @@ const InstallDialog: React.FC<{
             <Globe className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
             <p className="leading-relaxed">
               Con un dominio, el servicio se publica con HTTPS automático: apunta antes un registro A
-              a la IP de este servidor. Sin dominio, queda accesible sólo desde el propio servidor en
-              un puerto local, y podrás añadirle uno después.
+              a {serverIp ? <strong className="font-mono text-slate-800">{serverIp}</strong> : 'la IP de este servidor'}.
+              Sin dominio, queda accesible sólo desde el propio servidor en un puerto local, y podrás añadirle uno después.
             </p>
           </div>
 

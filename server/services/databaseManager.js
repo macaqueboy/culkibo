@@ -1,7 +1,9 @@
 const fs = require('fs');
 const path = require('path');
+const net = require('net');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const { pipeline } = require('stream/promises');
 const EventEmitter = require('events');
 const { execFile, spawn } = require('child_process');
 const util = require('util');
@@ -9,6 +11,7 @@ const execFilePromise = util.promisify(execFile);
 
 const dbBackupManager = require('./dbBackupManager');
 const { S3Client, redactKey } = require('./s3Uploader');
+const { atomicWriteJsonSync } = require('./ssrfGuard');
 
 /**
  * Bases de datos gestionadas: aprovisionamiento en un clic, copias programadas,
@@ -470,10 +473,7 @@ class DatabaseManager extends EventEmitter {
 
   save() {
     try {
-      const tmp = `${DATA_FILE}.${Date.now()}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2), { encoding: 'utf8', mode: 0o600 });
-      fs.renameSync(tmp, DATA_FILE);
-      try { fs.chmodSync(DATA_FILE, 0o600); } catch (e) {}
+      atomicWriteJsonSync(DATA_FILE, this.state, 0o600);
     } catch (err) {
       console.error('[Databases] No se pudo guardar databases.json:', err.message);
     }
@@ -484,14 +484,17 @@ class DatabaseManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   listEngines() {
-    return Object.entries(ENGINES).map(([key, e]) => ({
-      engine: key,
-      label: e.label,
-      image: e.image,
-      port: e.port,
-      licence: e.licence,
-      requiresDatabaseName: !e.noDatabaseName
-    }));
+    if (!this._cachedEngines) {
+      this._cachedEngines = Object.entries(ENGINES).map(([key, e]) => ({
+        engine: key,
+        label: e.label,
+        image: e.image,
+        port: e.port,
+        licence: e.licence,
+        requiresDatabaseName: !e.noDatabaseName
+      }));
+    }
+    return this._cachedEngines;
   }
 
   // -------------------------------------------------------------------------
@@ -518,6 +521,7 @@ class DatabaseManager extends EventEmitter {
     // Con stdin hace falta spawn. Se usa para restaurar volcados SQL sin
     // redirección de shell: el fichero se canaliza al proceso hijo desde Node.
     return new Promise((resolve, reject) => {
+      const MAX_CAPTURE_BYTES = 1024 * 1024;
       const child = spawn('docker', args, {
         env: env ? { ...process.env, ...env } : process.env,
         windowsHide: true,
@@ -525,15 +529,44 @@ class DatabaseManager extends EventEmitter {
       });
       let stdout = '';
       let stderr = '';
-      child.stdout.on('data', (d) => { stdout += d.toString(); });
-      child.stderr.on('data', (d) => { stderr += d.toString(); });
-      child.on('error', reject);
+      let settled = false;
+      let timedOut = false;
+
+      const finish = (err, val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try { child.kill('SIGKILL'); } catch (e) {}
+        finish(new Error(`docker ${args[0]} agotó el tiempo de espera (${timeout} ms)`));
+      }, timeout);
+      if (timer.unref) timer.unref();
+
+      child.stdout.on('data', (d) => {
+        if (stdout.length < MAX_CAPTURE_BYTES) stdout += d.toString().slice(0, MAX_CAPTURE_BYTES - stdout.length);
+      });
+      child.stderr.on('data', (d) => {
+        if (stderr.length < MAX_CAPTURE_BYTES) stderr += d.toString().slice(0, MAX_CAPTURE_BYTES - stderr.length);
+      });
+      child.stdin.on('error', () => {});
+      child.on('error', (err) => finish(err));
       child.on('close', (code) => {
-        if (code === 0) resolve({ stdout, stderr });
-        else reject(new Error(`docker ${args[0]} salió con código ${code}: ${stderr.slice(0, 500)}`));
+        if (timedOut) return;
+        if (code === 0) finish(null, { stdout, stderr });
+        else finish(new Error(`docker ${args[0]} salió con código ${code}: ${stderr.slice(0, 500)}`));
       });
       if (inputFile) {
-        fs.createReadStream(inputFile).pipe(child.stdin).on('error', reject);
+        const rs = fs.createReadStream(inputFile);
+        rs.on('error', (err) => {
+          try { child.kill('SIGKILL'); } catch (e) {}
+          finish(err);
+        });
+        rs.pipe(child.stdin);
       } else {
         child.stdin.end(input);
       }
@@ -777,18 +810,20 @@ class DatabaseManager extends EventEmitter {
       return { ...this.toPublic(record), warning: null };
     }
 
-    const bind = String(bindAddress || '127.0.0.1');
-    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(bind)) {
-      throw new Error('Dirección de enlace inválida: use una IPv4 (127.0.0.1 para sólo local)');
+    const bind = String(bindAddress || '127.0.0.1').trim();
+    if (!net.isIPv4(bind)) {
+      throw new Error('Dirección de enlace inválida: usa una IPv4 válida (127.0.0.1 para sólo local)');
     }
     const port = parseInt(String(hostPort ?? ''), 10) || engine.port;
     if (!(port > 0 && port < 65536)) throw new Error('Puerto de host inválido');
 
-    const publicBind = bind === '0.0.0.0';
+    // Cualquier IP fuera de 127.0.0.0/8 (no sólo 0.0.0.0, también la IP pública o LAN del host)
+    // queda expuesta en iptables ANTES que UFW: exige confirmación explícita.
+    const publicBind = !bind.startsWith('127.');
     if (publicBind && acknowledgeRisk !== true) {
       throw new Error(
-        'Publicar en 0.0.0.0 expone la base de datos a toda la red y las reglas de Docker se ' +
-        'saltan UFW/firewalld. Repita la operación con acknowledgeRisk: true si es lo que quiere.'
+        `Publicar en ${bind} expone la base de datos fuera de loopback y las reglas de Docker se ` +
+        'saltan UFW/firewalld. Repite la operación con acknowledgeRisk: true si es lo que quieres.'
       );
     }
 
@@ -1232,26 +1267,12 @@ class DatabaseManager extends EventEmitter {
     }
   }
 
-  gzipFile(src, dest) {
-    return new Promise((resolve, reject) => {
-      const rs = fs.createReadStream(src);
-      const ws = fs.createWriteStream(dest);
-      rs.on('error', reject);
-      ws.on('error', reject);
-      ws.on('finish', resolve);
-      rs.pipe(zlib.createGzip({ level: 6 })).pipe(ws);
-    });
+  async gzipFile(src, dest) {
+    await pipeline(fs.createReadStream(src), zlib.createGzip({ level: 6 }), fs.createWriteStream(dest));
   }
 
-  gunzipFile(src, dest) {
-    return new Promise((resolve, reject) => {
-      const rs = fs.createReadStream(src);
-      const ws = fs.createWriteStream(dest);
-      rs.on('error', reject);
-      ws.on('error', reject);
-      ws.on('finish', resolve);
-      rs.pipe(zlib.createGunzip()).pipe(ws);
-    });
+  async gunzipFile(src, dest) {
+    await pipeline(fs.createReadStream(src), zlib.createGunzip(), fs.createWriteStream(dest));
   }
 
   sha256File(filePath) {
@@ -1543,7 +1564,11 @@ class DatabaseManager extends EventEmitter {
    * rechaza.
    */
   parseCron(expression) {
-    const expr = CRON_ALIASES[String(expression || '').trim()] || String(expression || '').trim();
+    const raw = String(expression || '').trim();
+    if (raw.length > 200) {
+      throw new Error('Expresión cron demasiado larga (máximo 200 caracteres)');
+    }
+    const expr = CRON_ALIASES[raw] || raw;
     const parts = expr.split(/\s+/).filter(Boolean);
     if (parts.length !== 5) {
       throw new Error(`Expresión cron inválida: se esperan 5 campos, hay ${parts.length}`);

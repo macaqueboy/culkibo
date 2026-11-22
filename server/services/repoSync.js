@@ -124,9 +124,9 @@ function runGit(args, { cwd = undefined, env = undefined, timeoutMs = 120000, on
 }
 
 class RepoSync {
-  /** Directorio de trabajo del proyecto en este host. */
+  /** Directorio de trabajo del proyecto en este host (confinado en projects/). */
   projectDir(project) {
-    return path.join(process.cwd(), 'projects', project.id);
+    return localRunner.resolveProjectDir(project.id);
   }
 
   /**
@@ -181,8 +181,11 @@ class RepoSync {
     const wanted = commit ? String(commit).trim().toLowerCase() : null;
 
     const cloneUrl = localRunner.normalizeGitUrl(rawUrl);
+    if (!cloneUrl) {
+      return { ok: false, error: `URL de repositorio Git no permitida o inválida: «${rawUrl}»`, dir, dirtyFiles: [] };
+    }
     const display = localRunner.redactSecrets(rawUrl);
-    const { env, cleanup } = localRunner.gitAuthEnv();
+    const { env, cleanup } = localRunner.gitAuthEnv(cloneUrl);
 
     try {
       fs.mkdirSync(path.dirname(dir), { recursive: true });
@@ -222,15 +225,14 @@ class RepoSync {
       }
 
       // --- Caso 2: ya hay repositorio -------------------------------------
-      const before = await runGit(['rev-parse', 'HEAD'], { cwd: dir, env, timeoutMs: 20000 });
+      // Lanzar rev-parse, remote get-url y status en paralelo ahorra 2 spawns secuenciales.
+      const [before, currentRemote, status] = await Promise.all([
+        runGit(['rev-parse', 'HEAD'], { cwd: dir, env, timeoutMs: 20000 }),
+        runGit(['remote', 'get-url', 'origin'], { cwd: dir, env, timeoutMs: 20000 }),
+        runGit(['status', '--porcelain'], { cwd: dir, env, timeoutMs: 60000 })
+      ]);
       const previousCommit = before.code === 0 ? (before.stdout || '').trim() : null;
 
-      // El remoto puede haber cambiado, y además `normalizeGitUrl` incorpora el
-      // usuario `x-access-token` solo cuando hay token: si la cuenta de GitHub
-      // se conectó DESPUÉS del clon, la URL guardada pediría contraseña por
-      // terminal y, con GIT_TERMINAL_PROMPT=0, el fetch fallaría sin explicar
-      // por qué.
-      const currentRemote = await runGit(['remote', 'get-url', 'origin'], { cwd: dir, env, timeoutMs: 20000 });
       if (currentRemote.code !== 0) {
         await runGit(['remote', 'add', 'origin', '--', String(cloneUrl)], { cwd: dir, env, timeoutMs: 20000 });
       } else if ((currentRemote.stdout || '').trim() !== cloneUrl) {
@@ -243,7 +245,6 @@ class RepoSync {
 
       // Árbol sucio. Se descarta, pero se dice qué se descarta: perder cambios
       // en silencio es peor que perderlos.
-      const status = await runGit(['status', '--porcelain'], { cwd: dir, env, timeoutMs: 60000 });
       const dirtyFiles = (status.stdout || '')
         .split(/\r?\n/)
         .map(s => s.trim())
@@ -257,16 +258,12 @@ class RepoSync {
         if (reset.code !== 0) {
           return { ok: false, error: this.errorOf(reset, 'No se pudo descartar los cambios locales'), dir, dirtyFiles };
         }
+        // Sólo invocar `git clean -fd` cuando realmente hay ficheros sucios/sin rastrear.
+        await runGit(
+          ['clean', '-fd', '--exclude=node_modules', '--exclude=.culkibo'],
+          { cwd: dir, env, timeoutMs: 120000, onLine: emit }
+        );
       }
-
-      // `clean` sin `-x`: los ficheros ignorados (un .env local, por ejemplo)
-      // sobreviven. `node_modules` y `.culkibo` se excluyen porque volver a
-      // instalarlos en cada despliegue es tirar la caché a la basura, que es
-      // exactamente cómo Coolify pasó de 1 a 4,5 minutos de build.
-      await runGit(
-        ['clean', '-fd', '--exclude=node_modules', '--exclude=.culkibo'],
-        { cwd: dir, env, timeoutMs: 120000, onLine: emit }
-      );
 
       /** @type {string} */
       let ref;

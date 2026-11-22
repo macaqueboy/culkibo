@@ -2,7 +2,13 @@ const { EventEmitter } = require('events');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const chokidar = require('chokidar');
+
+/** @type {any} */
+let _chokidar = null;
+function getChokidar() {
+  if (!_chokidar) _chokidar = require('chokidar');
+  return _chokidar;
+}
 
 class ContainerOrchestrator extends EventEmitter {
   constructor() {
@@ -12,6 +18,7 @@ class ContainerOrchestrator extends EventEmitter {
       citadel: 100
     };
 
+    // Ring-buffer con índice descendente en push (O(1) en addLog, sin unshift O(N)).
     this.logs = [];
     this.maxLogs = 2000;
     this.watcher = null;
@@ -23,6 +30,12 @@ class ContainerOrchestrator extends EventEmitter {
     this.requestsServed = 0;
     this.connectionCounter = () => 0;
     this.lastCpuSample = null;
+    /** @type {{ at: number, data: any } | null} */
+    this._metricsCache = null;
+    /** @type {{ at: number, buffer: Buffer } | null} */
+    this._podsSerializedCache = null;
+    /** @type {any} */
+    this._localRunner = null;
 
     // Se creaban perezosamente con `if (!this.x) this.x = new Map()` repartido
     // por varios métodos, así que había caminos que los tocaban sin inicializar.
@@ -113,9 +126,10 @@ class ContainerOrchestrator extends EventEmitter {
       message
     };
 
-    this.logs.unshift(logEntry);
-    if (this.logs.length > this.maxLogs) {
-      this.logs.pop();
+    // Almacenamos cronológicamente al final (O(1) amortized) y leemos en reverso.
+    this.logs.push(logEntry);
+    if (this.logs.length > this.maxLogs + 250) {
+      this.logs.splice(0, this.logs.length - this.maxLogs);
     }
 
     this.emit('log', logEntry);
@@ -150,25 +164,35 @@ class ContainerOrchestrator extends EventEmitter {
     };
   }
 
+  /** Buffer JSON pre-serializado de `getPods()` con TTL de 250 ms para ráfagas. */
+  getPodsSerialized() {
+    const now = Date.now();
+    if (this._podsSerializedCache && (now - this._podsSerializedCache.at) < 250) {
+      return this._podsSerializedCache.buffer;
+    }
+    const buf = Buffer.from(JSON.stringify(this.getPods()), 'utf8');
+    this._podsSerializedCache = { at: now, buffer: buf };
+    return buf;
+  }
+
   /**
    * @param {{ pod?: string | null, level?: string | null, limit?: number, search?: string, projectId?: string | null }} [opts]
    */
   getLogs({ pod = null, level = null, limit = 100, search = '', projectId = null } = {}) {
-    let filtered = this.logs;
-    if (projectId) {
-      filtered = filtered.filter(l => l.projectId === projectId);
+    const cap = Math.max(1, Math.min(2000, Number(limit) || 100));
+    const upperLevel = level ? String(level).toUpperCase() : null;
+    const q = search ? String(search).toLowerCase() : '';
+    /** @type {any[]} */
+    const out = [];
+    for (let i = this.logs.length - 1; i >= 0 && out.length < cap; i--) {
+      const l = this.logs[i];
+      if (projectId && l.projectId !== projectId) continue;
+      if (pod && l.pod !== pod) continue;
+      if (upperLevel && l.level !== upperLevel) continue;
+      if (q && !l.message.toLowerCase().includes(q)) continue;
+      out.push(l);
     }
-    if (pod) {
-      filtered = filtered.filter(l => l.pod === pod);
-    }
-    if (level) {
-      filtered = filtered.filter(l => l.level === String(level).toUpperCase());
-    }
-    if (search) {
-      const q = search.toLowerCase();
-      filtered = filtered.filter(l => l.message.toLowerCase().includes(q));
-    }
-    return filtered.slice(0, limit);
+    return out;
   }
 
   // Detección de un cambio de fichero. Todavía no lo transporta ni lo aplica.
@@ -277,7 +301,7 @@ class ContainerOrchestrator extends EventEmitter {
     // pudiera siquiera empezar — más de la mitad del presupuesto total.
     // La escritura parcial se descarta comparando el hash del contenido, no
     // esperando a que el fichero se quede quieto.
-    const watcher = chokidar.watch(pathsToWatch, {
+    const watcher = getChokidar().watch(pathsToWatch, {
       ignored: /(^|[\/\\])\..|node_modules|dist|\.git|\.next|data[\\\/]certs/,
       persistent: false,
       ignoreInitial: true
@@ -444,6 +468,9 @@ class ContainerOrchestrator extends EventEmitter {
    */
   getDaemonMetrics() {
     const now = Date.now();
+    if (this._metricsCache && (now - this._metricsCache.at) < 250) {
+      return this._metricsCache.data;
+    }
     const cpu = process.cpuUsage();
     const mem = process.memoryUsage();
 
@@ -458,21 +485,23 @@ class ContainerOrchestrator extends EventEmitter {
     }
     this.lastCpuSample = { at: now, user: cpu.user, system: cpu.system };
 
-    return {
+    const data = {
       cpuPercent,
       memoryMb: Math.round(mem.rss / 1024 / 1024),
       heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
       uptimeSeconds: Math.round(process.uptime()),
       measured: true
     };
+    this._metricsCache = { at: now, data };
+    return data;
   }
 
   /** Procesos que el runner local tiene realmente en marcha. */
   getLocalProcessStats() {
     try {
-      // require diferido: localRunner ya nos importa a nosotros.
-      const localRunner = require('./localRunner');
-      const runners = Array.from(localRunner.activeRunners.values());
+      // require diferido cacheado: localRunner ya nos importa a nosotros.
+      if (!this._localRunner) this._localRunner = require('./localRunner');
+      const runners = Array.from(this._localRunner.activeRunners.values());
       return {
         count: runners.length,
         ports: runners.map(r => r.port).filter(Boolean),

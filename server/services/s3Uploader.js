@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { isMetadataIp } = require('./ssrfGuard');
 
 /**
  * Cliente S3 mínimo: SigV4 firmado a mano sobre `node:crypto` y el `fetch`
@@ -221,6 +222,10 @@ class S3Client {
     if (url.protocol !== 'https:' && url.protocol !== 'http:') {
       throw new Error('El endpoint S3 debe ser http o https');
     }
+    const hostLower = url.hostname.toLowerCase();
+    if (isMetadataIp(hostLower) || hostLower === 'metadata.google.internal' || hostLower === 'metadata.goog') {
+      throw new Error(`Endpoint S3 bloqueado por protección SSRF (metadatos cloud): ${url.hostname}`);
+    }
 
     if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) {
       throw new Error(`Nombre de bucket inválido: ${bucket}`);
@@ -323,6 +328,7 @@ class S3Client {
           method,
           headers: wire,
           body: payload,
+          redirect: 'manual',
           signal: AbortSignal.timeout(this.timeoutMs)
         });
 
@@ -505,24 +511,39 @@ class S3Client {
     }
   }
 
-  /** Descarga a disco en streaming, para restaurar desde remoto. */
+  /** Descarga a disco en streaming, para restaurar desde remoto (con limpieza segura en error). */
   async downloadFile(key, destPath) {
     const res = await this.request('GET', key, { expectStatus: [200] });
     await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
-    const out = fs.createWriteStream(destPath);
     if (!res.body) throw new Error('La respuesta S3 no contiene cuerpo descargable');
+    const out = fs.createWriteStream(destPath, { mode: 0o600 });
     const reader = res.body.getReader();
     let bytes = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.length;
-      if (!out.write(Buffer.from(value))) {
-        await new Promise((r) => out.once('drain', r));
+    /** @type {Error | null} */
+    let streamErr = null;
+    out.on('error', (err) => { streamErr = err; });
+    try {
+      for (;;) {
+        if (streamErr) throw streamErr;
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.length;
+        if (!out.write(Buffer.from(value))) {
+          await new Promise((resolve, reject) => {
+            out.once('drain', resolve);
+            out.once('error', reject);
+          });
+        }
       }
+      await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve(undefined))));
+      if (streamErr) throw streamErr;
+      return { key, destPath, sizeBytes: bytes };
+    } catch (err) {
+      try { await reader.cancel(); } catch (e) {}
+      try { out.destroy(); } catch (e) {}
+      try { await fs.promises.unlink(destPath); } catch (e) {}
+      throw err;
     }
-    await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve(undefined))));
-    return { key, destPath, sizeBytes: bytes };
   }
 }
 

@@ -1,9 +1,12 @@
 const fs = require('fs');
 const path = require('path');
+const net = require('net');
 const crypto = require('crypto');
+const { atomicWriteJsonSync } = require('./ssrfGuard');
 
 const CERTS_DIR = path.join(__dirname, '..', '..', 'data', 'certs');
 const REGISTRY_FILE = path.join(CERTS_DIR, 'registry.json');
+const ALLOWED_SSLIP_SERVICES = new Set(['sslip.io', 'nip.io']);
 
 /**
  * Registro de certificados TLS.
@@ -85,6 +88,7 @@ class SslManager {
     // no acierta y no se informa de él. La promesa —nunca publicar un
     // certificado que no existe— se mantiene intacta.
     this.parseCache = new Map();
+    this.version = 0;
     this.registry = this.loadRegistry();
   }
 
@@ -245,7 +249,8 @@ class SslManager {
 
   saveRegistry() {
     this.ensureDirectory();
-    fs.writeFileSync(REGISTRY_FILE, JSON.stringify(this.registry, null, 2), 'utf8');
+    this.version++;
+    atomicWriteJsonSync(REGISTRY_FILE, this.registry, 0o600);
   }
 
   /**
@@ -319,14 +324,15 @@ class SslManager {
     return out;
   }
 
-  getCertificateByDomain(domain) {
+  /**
+   * Busca un certificado coincidente sobre una lista ya resuelta (evita
+   * repetir `listCertificates()` en O(D×C) al proyectar todos los dominios).
+   */
+  matchCertificate(domain, certs) {
     const clean = String(domain || '').toLowerCase();
-    // Se busca sobre `listCertificates()` y no sobre `this.registry` para que
-    // nadie pueda obtener por esta vía una entrada que la otra ya descartó.
-    return this.listCertificates().find(c => {
+    return certs.find(c => {
       if (c.domain === clean || c.rootDomain === clean) return true;
       if (c.sans && c.sans.includes(clean)) return true;
-      // Match wildcard
       if (typeof c.domain === 'string' && c.domain.startsWith('*.')) {
         // Same boundary-dot rule as DomainManager.resolveRoute: a wildcard cert
         // for *.culkibo.dev must not be reported as covering evilculkibo.dev.
@@ -335,6 +341,10 @@ class SslManager {
       }
       return false;
     }) || undefined;
+  }
+
+  getCertificateByDomain(domain) {
+    return this.matchCertificate(domain, this.listCertificates());
   }
 
   /**
@@ -394,8 +404,16 @@ class SslManager {
    * mantiene porque el panel y el servidor MCP leen `cert.rootDomain`.
    */
   async issueOnDemandSslip({ ip = '127.0.0.1', service = 'sslip.io' } = {}) {
-    const formattedIp = String(ip).replace(/\./g, '-');
-    const domain = `${formattedIp}.${service}`;
+    const cleanIp = String(ip || '').trim();
+    if (!net.isIPv4(cleanIp)) {
+      throw new Error(`Dirección IPv4 inválida para sslip/nip.io: «${cleanIp}»`);
+    }
+    const cleanService = String(service || 'sslip.io').trim().toLowerCase();
+    if (!ALLOWED_SSLIP_SERVICES.has(cleanService)) {
+      throw new Error(`Servicio de DNS dinámico no soportado: «${cleanService}» (usa sslip.io o nip.io)`);
+    }
+    const formattedIp = cleanIp.replace(/\./g, '-');
+    const domain = `${formattedIp}.${cleanService}`;
     const wildcardDomain = `*.${domain}`;
 
     const record = {

@@ -172,6 +172,67 @@ const TEMPLATES = [
 
   // -------------------------------------------------------------------------
   {
+    id: 'wordpress',
+    name: 'WordPress',
+    category: 'contenido',
+    summary: 'Webs, blogs y tiendas WooCommerce en un clic, con MariaDB aislada y HTTPS automático.',
+    description:
+      'El CMS más usado del mundo, listo para producción o migración desde otro hosting. ' +
+      'Incluye base de datos MariaDB cifrada en red privada, límite de subida de 512 MB para ' +
+      'importar backups y detección automática de HTTPS detrás de Caddy.',
+    website: 'https://wordpress.org',
+    licence: 'GPLv2+',
+    tags: ['cms', 'wordpress', 'woocommerce', 'blog', 'tienda'],
+    database: { engine: 'mariadb', dbName: 'wordpress', username: 'wordpress', memoryMb: 512 },
+    secrets: {
+      WORDPRESS_AUTH_KEY: { bytes: 32, encoding: 'base64url' },
+      WORDPRESS_SECURE_AUTH_KEY: { bytes: 32, encoding: 'base64url' },
+      WORDPRESS_LOGGED_IN_KEY: { bytes: 32, encoding: 'base64url' },
+      WORDPRESS_NONCE_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'wordpress:6.7.2-apache',
+      port: 80,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        WORDPRESS_DB_HOST: '{{db.host}}:{{db.port}}',
+        WORDPRESS_DB_USER: '{{db.user}}',
+        WORDPRESS_DB_PASSWORD: '{{db.password}}',
+        WORDPRESS_DB_NAME: '{{db.name}}',
+        WORDPRESS_AUTH_KEY: '{{secret.WORDPRESS_AUTH_KEY}}',
+        WORDPRESS_SECURE_AUTH_KEY: '{{secret.WORDPRESS_SECURE_AUTH_KEY}}',
+        WORDPRESS_LOGGED_IN_KEY: '{{secret.WORDPRESS_LOGGED_IN_KEY}}',
+        WORDPRESS_NONCE_KEY: '{{secret.WORDPRESS_NONCE_KEY}}',
+        WORDPRESS_CONFIG_EXTRA:
+          "if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') { $_SERVER['HTTPS'] = 'on'; }"
+      },
+      files: [
+        {
+          name: 'culkibo-uploads.ini',
+          path: '/usr/local/etc/php/conf.d/culkibo-uploads.ini',
+          content:
+            'file_uploads = On\n' +
+            'memory_limit = 512M\n' +
+            'upload_max_filesize = 512M\n' +
+            'post_max_size = 512M\n' +
+            'max_execution_time = 300\n'
+        }
+      ],
+      volumes: [{ name: 'content', path: '/var/www/html/wp-content' }],
+      readiness: { path: '/', expect: [200, 301, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/wp-admin para completar la instalación en 1 minuto o importar tu copia de WordPress.',
+      'Si vienes de otro hosting, puedes restaurar tu volcado .sql desde el asistente de migración o usar All-in-One WP Migration (hasta 512 MB).'
+    ],
+    notes: [
+      'Todas las fotos, temas y plugins viven en un volumen persistente (/var/www/html/wp-content) protegido contra reinicios.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
     id: 'ghost',
     name: 'Ghost',
     category: 'contenido',

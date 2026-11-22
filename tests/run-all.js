@@ -15,6 +15,8 @@ const testShellSafety = require('./shell-safety.test');
 const testCatalog = require('./catalog.test');
 const testLiveSync = require('./live-sync.test');
 const testCompetitorBenchmarks = require('./competitor-benchmarks.test');
+const testSecurityHardening = require('./security-hardening.test');
+const testImporters = require('./importers.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -52,8 +54,10 @@ async function runAll() {
     { name: 'Ingress Data Plane (Caddy)', fn: testCaddy },
     { name: 'Managed Databases (Provision, Backup, S3, Retention)', fn: testDatabases },
     { name: 'Production Deploy Pipeline (build, cutover, rollback)', fn: testDeploy },
-    { name: 'One-Click Service Catalog (13 templates, secrets, ports)', fn: testCatalog },
+    { name: 'One-Click Service Catalog (14 templates, secrets, ports)', fn: testCatalog },
     { name: 'Live Sync Engine (Commit Frames, Merkle, Rollback <10ms, WS)', fn: testLiveSync },
+    { name: 'Security Hardening (SSRF, Proxy Loopback, Symlinks, Redaction)', fn: testSecurityHardening },
+    { name: 'WordPress Migrator & Universal Importer (Compose/Git/Platforms)', fn: testImporters },
     { name: 'Competitor Benchmarks & Parity Verification', fn: testCompetitorBenchmarks }
   ];
 

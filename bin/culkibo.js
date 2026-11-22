@@ -5,19 +5,38 @@ const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const { spawn } = require('child_process');
 
-const containerOrchestrator = require('../server/services/containerOrchestrator');
-const domainManager = require('../server/services/domainManager');
-const sslManager = require('../server/services/sslManager');
-const cloudflareService = require('../server/services/cloudflareService');
-const mcpServer = require('../server/services/mcpServer');
-const dockerManager = require('../server/services/dockerManager');
-const dbBackupManager = require('../server/services/dbBackupManager');
-const projectManager = require('../server/services/projectManager');
-const caddyManager = require('../server/services/caddyManager');
-const deployManager = require('../server/services/deployManager');
-const catalogManager = require('../server/services/catalogManager');
-const { LiveSyncClient } = require('../server/services/liveSyncClient');
+// Carga perezosa de servicios: comandos ligeros (`--version`, `status`, `update`)
+// arrancan al instante sin levantar timers ni leer JSONs innecesarios.
+const svc = {
+  get containerOrchestrator() { return require('../server/services/containerOrchestrator'); },
+  get domainManager() { return require('../server/services/domainManager'); },
+  get sslManager() { return require('../server/services/sslManager'); },
+  get cloudflareService() { return require('../server/services/cloudflareService'); },
+  get mcpServer() { return require('../server/services/mcpServer'); },
+  get dockerManager() { return require('../server/services/dockerManager'); },
+  get dbBackupManager() { return require('../server/services/dbBackupManager'); },
+  get projectManager() { return require('../server/services/projectManager'); },
+  get caddyManager() { return require('../server/services/caddyManager'); },
+  get deployManager() { return require('../server/services/deployManager'); },
+  get catalogManager() { return require('../server/services/catalogManager'); },
+  get LiveSyncClient() { return require('../server/services/liveSyncClient').LiveSyncClient; }
+};
+
+function runSpawnStep(bin, args, cwd) {
+  return new Promise((/** @type {(v?: void) => void} */ resolve, reject) => {
+    const isWin = process.platform === 'win32';
+    const cmd = isWin && bin === 'npm' ? 'cmd.exe' : bin;
+    const argv = isWin && bin === 'npm' ? ['/c', 'npm', ...args] : args;
+    const child = spawn(cmd, argv, { cwd, stdio: 'inherit', shell: false });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${bin} ${args.join(' ')} terminó con código ${code}`));
+    });
+  });
+}
 
 const program = new Command();
 
@@ -88,7 +107,7 @@ program
     }
 
     // 2. Docker Daemon
-    const dockerStatus = await dockerManager.checkDockerStatus(true);
+    const dockerStatus = await svc.dockerManager.checkDockerStatus(true);
     if (dockerStatus.available) {
       console.log(`\x1b[32m  ✓ Motor Docker:\x1b[0m Activo (${dockerStatus.serverVersion}) — Modo Nativo`);
     } else {
@@ -96,7 +115,7 @@ program
     }
 
     // 2b. Caddy (Plano de datos)
-    const caddyStatus = await caddyManager.detect({ force: true });
+    const caddyStatus = await svc.caddyManager.detect({ force: true });
     if (caddyStatus.available) {
       console.log(`\x1b[32m  ✓ Plano de datos Caddy:\x1b[0m Activo en ${caddyStatus.adminUrl}`);
     } else {
@@ -118,7 +137,7 @@ program
     });
 
     // 4. Cloudflare
-    const cfConfig = cloudflareService.config;
+    const cfConfig = svc.cloudflareService.config;
     if (cfConfig.apiToken) {
       console.log(`\x1b[32m  ✓ Cloudflare API:\x1b[0m Token configurado correctamente`);
     } else {
@@ -146,9 +165,10 @@ program
   .description('Vigila un directorio y notifica los cambios al entorno de Desarrollo')
   .action((directorio = process.cwd()) => {
     try {
+      const containerOrchestrator = svc.containerOrchestrator;
       const res = containerOrchestrator.watchDirectory(directorio);
       console.log(`\n⚡ [Desarrollo] Monitoreando ${res.directory} (${res.fileWatchersActive} rutas vigiladas)`);
-      console.log(`   Vigilancia activa. Los cambios se detectan y registran; el transporte al pod remoto aún no está implementado.\n`);
+      console.log(`   Vigilancia activa. Los cambios se detectan y registran; para sincronizar con un daemon usa "culkibo sync <projectId>".\n`);
 
       containerOrchestrator.on('pod_change', (pod) => {
         if (pod.lastHotReloadMs) {
@@ -173,7 +193,7 @@ podCmd
   .command('list')
   .description('Muestra el estado y métricas en tiempo real de los entornos')
   .action(() => {
-    const data = containerOrchestrator.getPods();
+    const data = svc.containerOrchestrator.getPods();
     console.log('\n--- Estado de Entornos Culkibo ---');
     console.table([
       {
@@ -203,7 +223,7 @@ podCmd
   .option('-f, --file <file>', 'Archivo modificado', 'src/app.ts')
   .action(async (options) => {
     console.log(`[Culkibo CLI] Disparando sincronización en caliente para ${options.file}...`);
-    const res = await containerOrchestrator.triggerHotSync({ changedFile: options.file });
+    const res = await svc.containerOrchestrator.triggerHotSync({ changedFile: options.file });
     console.log(`✨ Sincronizado en ${res.syncDurationMs}ms. Recargas totales: ${res.reloadsTotal}`);
   });
 
@@ -225,7 +245,7 @@ podCmd
       forge = parseInt(parts[0], 10) || 0;
       citadel = parseInt(parts[1], 10) || (100 - forge);
     }
-    const res = await containerOrchestrator.switchTraffic({ forgePercent: forge, citadelPercent: citadel });
+    const res = await svc.containerOrchestrator.switchTraffic({ forgePercent: forge, citadelPercent: citadel });
     console.log(`Tráfico enrutado: ${res.trafficAllocation.citadel}% Producción / ${res.trafficAllocation.forge}% Desarrollo (en ${res.switchDurationMs}ms)`);
   });
 
@@ -236,7 +256,7 @@ domainCmd
   .command('list')
   .description('Lista los dominios configurados y el estado de sus certificados')
   .action(() => {
-    const domains = domainManager.listDomains();
+    const domains = svc.domainManager.listDomains();
     console.log('\n--- Dominios Configurados en Culkibo ---');
     console.table(domains.map(d => ({
       Dominio: d.hostname,
@@ -256,7 +276,7 @@ domainCmd
   .option('--no-proxy', 'Desactivar proxy de Cloudflare')
   .action(async (hostname, options) => {
     try {
-      const res = await domainManager.addDomain({
+      const res = await svc.domainManager.addDomain({
         hostname,
         targetPod: options.pod,
         targetPort: options.port,
@@ -272,13 +292,9 @@ domainCmd
   .command('issue-wildcard <dominio>')
   .description('(No implementado) Emisión de comodín por ACME DNS-01')
   .action(async (dominio) => {
-    const res = await sslManager.issueWildcardCertificate({ domain: dominio });
-    // Nunca devuelve success. Se mantiene el comando —y sale con código 1— para
-    // que quien lo tuviera en un script se entere en vez de creer que funcionó.
+    const res = await svc.sslManager.issueWildcardCertificate({ domain: dominio });
     console.error(`❌ ${res.error}`);
-    console.error('\n   Alternativa: registra el dominio con `culkibo domain add` y deja que');
-    console.error('   Caddy emita el certificado en la primera conexión HTTPS.');
-    console.error('   Comprueba el resultado real con `culkibo ingress <hostname>`.');
+    console.error('\n   Alternativa: configura Wildcard DNS-01 en Caddy con POST /api/ingress/wildcard-dns01 o desde el panel Dominios.');
     process.exitCode = 1;
   });
 
@@ -287,13 +303,13 @@ domainCmd
   .description('Alterna el proxy de Cloudflare (Nube Naranja vs Solo DNS)')
   .action(async (idODominio) => {
     try {
-      const domains = domainManager.listDomains();
+      const domains = svc.domainManager.listDomains();
       const match = domains.find(d => d.id === idODominio || d.hostname === idODominio);
       if (!match) {
         console.error(`❌ Dominio "${idODominio}" no encontrado.`);
         process.exit(1);
       }
-      const updated = await domainManager.toggleProxy(match.id);
+      const updated = await svc.domainManager.toggleProxy(match.id);
       console.log(`✨ Dominio ${updated.hostname}: ${updated.cloudflareProxied ? 'Proxy Cloudflare Activado (Nube Naranja ☁️)' : 'Solo DNS (Nube Gris ☁️)'}`);
     } catch (err) {
       console.error(`❌ Error al alternar proxy: ${err.message}`);
@@ -305,13 +321,13 @@ domainCmd
   .description('Elimina un dominio configurado')
   .action(async (idODominio) => {
     try {
-      const domains = domainManager.listDomains();
+      const domains = svc.domainManager.listDomains();
       const match = domains.find(d => d.id === idODominio || d.hostname === idODominio);
       if (!match) {
         console.error(`❌ Dominio "${idODominio}" no encontrado.`);
         process.exit(1);
       }
-      await domainManager.deleteDomain(match.id);
+      await svc.domainManager.deleteDomain(match.id);
       console.log(`✨ Dominio ${match.hostname} eliminado con éxito.`);
     } catch (err) {
       console.error(`❌ Error al eliminar dominio: ${err.message}`);
@@ -325,7 +341,7 @@ program
   .action(async (projectId) => {
     try {
       console.log(`[Culkibo Backup] Exportando proyecto ${projectId}...`);
-      const res = await dbBackupManager.exportProject(projectId);
+      const res = await svc.dbBackupManager.exportProject(projectId);
       console.log(`\x1b[32m✅ Respaldo generado con éxito:\x1b[0m ${res.fullPath}`);
       console.log(`   Recursos: ${res.resourcesCount} | Dominios: ${res.domainsCount}`);
     } catch (err) {
@@ -339,7 +355,7 @@ program
   .action(async (archivoBackup) => {
     try {
       console.log(`[Culkibo Restore] Restaurando desde ${archivoBackup}...`);
-      const res = await dbBackupManager.restoreProject(archivoBackup);
+      const res = await svc.dbBackupManager.restoreProject(archivoBackup, { allowExternalPath: true });
       console.log(`\x1b[32m✅ Proyecto restaurado con éxito:\x1b[0m ${res.restoredName} (ID: ${res.restoredProjectId})`);
     } catch (err) {
       console.error(`❌ Error al restaurar proyecto:`, err.message);
@@ -353,7 +369,7 @@ dockerCmd
   .command('status')
   .description('Comprueba la conexión con el daemon de Docker')
   .action(async () => {
-    const status = await dockerManager.checkDockerStatus(true);
+    const status = await svc.dockerManager.checkDockerStatus(true);
     console.log('\n--- Estado del Motor Docker ---');
     console.log(`Modo:         ${status.mode === 'docker_native' ? '\x1b[32mNativo (Docker Daemon)\x1b[0m' : '\x1b[33mSandbox de Procesos Ultrarrápido\x1b[0m'}`);
     console.log(`Versión:      ${status.clientVersion || 'N/D'}`);
@@ -365,7 +381,7 @@ dockerCmd
   .command('list')
   .description('Lista contenedores en ejecución')
   .action(async () => {
-    const list = await dockerManager.listContainers({ all: false });
+    const list = await svc.dockerManager.listContainers({ all: false });
     console.log('\n--- Contenedores Activos ---');
     console.table(list.map(c => ({
       ID: c.id?.substring(0, 12) || 'N/D',
@@ -381,13 +397,13 @@ program
   .command('ingress <hostname>')
   .description('Inspecciona el enrutamiento y SSL para una cabecera Host entrante')
   .action((hostname) => {
-    const route = domainManager.resolveRoute(hostname);
+    const route = svc.domainManager.resolveRoute(hostname);
     if (!route) {
       console.log(`\n❌ No hay ruta asignada para "${hostname}".`);
       return;
     }
-    const cert = sslManager.getCertificateByDomain(hostname);
-    const traffic = containerOrchestrator.trafficAllocation;
+    const cert = svc.sslManager.getCertificateByDomain(hostname);
+    const traffic = svc.containerOrchestrator.trafficAllocation;
     console.log(`\n--- Inspector de Enrutamiento Ingress: ${hostname} ---`);
     console.table([
       {
@@ -396,8 +412,6 @@ program
         Tipo: route.isWildcard ? 'Comodín (*)' : 'Exacto',
         Entorno: route.targetPod === 'forge' ? 'Desarrollo (:3001)' : 'Producción (:8080)',
         Cloudflare: route.cloudflareProxied ? 'Proxy (Nube Naranja ☁️)' : 'Solo DNS',
-        // «Según el registro», no «Activo»: esto es una anotación propia, no un
-        // handshake. Un certificado delegado a Caddy no tiene emisor conocido.
         TLS: cert
           ? (cert.managedBy ? 'Delegado en Caddy (bajo demanda)' : `En disco (${cert.issuer || 'emisor desconocido'})`)
           : 'Sin anotación en el registro',
@@ -415,7 +429,7 @@ program
   .option('-q, --quiescence <ms>', 'Ventana de agrupación de ráfagas en ms', '12')
   .option('--reconcile', 'Sincronizar todo el árbol inicial al conectar', true)
   .action(async (projectId, directorio = process.cwd(), options) => {
-    const client = new LiveSyncClient({
+    const client = new svc.LiveSyncClient({
       projectId,
       sourceDir: directorio,
       wsUrl: options.url,
@@ -430,6 +444,11 @@ program
       console.error(`❌ [Forge] ${err.message}`);
     });
 
+    const stopSync = async () => {
+      await client.stop();
+      process.exit(0);
+    };
+
     try {
       await client.start();
       console.log(`\n⚡ Culkibo Live Sync activo`);
@@ -440,10 +459,8 @@ program
         const rec = await client.reconcileFull();
         console.log(`   Merkle:     ${rec.rootDigest.slice(0, 12)} (${rec.changed} ficheros sincronizados)\n`);
       }
-      process.on('SIGINT', async () => {
-        await client.stop();
-        process.exit(0);
-      });
+      process.once('SIGINT', stopSync);
+      process.once('SIGTERM', stopSync);
     } catch (err) {
       console.error(`❌ No se pudo iniciar Live Sync: ${err.message}`);
       process.exit(1);
@@ -456,16 +473,21 @@ program
   .description('Despliega un proyecto a producción (Docker BuildKit + healthcheck + swap Caddy)')
   .option('--no-git-sync', 'Desplegar el árbol local tal cual (promoción desde Forge)')
   .action(async (projectId, options) => {
-    const project = projectManager.getById(projectId);
-    if (!project) {
-      console.error(`❌ Proyecto "${projectId}" no encontrado.`);
-      process.exit(1);
-    }
-    const result = await deployManager.deploy(project, { gitSync: options.gitSync, trigger: 'cli' });
-    if (result.status === 'activo') {
-      console.log(`\x1b[32m✅ Despliegue ${result.id} activo en ${result.durationMs} ms (${result.upstream || 'sin ruta'})\x1b[0m`);
-    } else {
-      console.error(`❌ Despliegue fallido: ${result.error}`);
+    try {
+      const project = svc.projectManager.getById(projectId);
+      if (!project) {
+        console.error(`❌ Proyecto "${projectId}" no encontrado.`);
+        process.exit(1);
+      }
+      const result = await svc.deployManager.deploy(project, { gitSync: options.gitSync, trigger: 'cli' });
+      if (result.status === 'activo') {
+        console.log(`\x1b[32m✅ Despliegue ${result.id} activo en ${result.durationMs} ms (${result.upstream || 'sin ruta'})\x1b[0m`);
+      } else {
+        console.error(`❌ Despliegue fallido: ${result.error}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`❌ Error al desplegar: ${err.message}`);
       process.exit(1);
     }
   });
@@ -474,13 +496,13 @@ program
   .command('rollback <projectId>')
   .description('Revierte un proyecto a la versión de producción anterior por conmutación de ruta')
   .action(async (projectId) => {
-    const project = projectManager.getById(projectId);
+    const project = svc.projectManager.getById(projectId);
     if (!project) {
       console.error(`❌ Proyecto "${projectId}" no encontrado.`);
       process.exit(1);
     }
     try {
-      const result = await deployManager.rollback(project);
+      const result = await svc.deployManager.rollback(project.id);
       console.log(`\x1b[32m✅ Rollback completado (${result.id})\x1b[0m`);
     } catch (err) {
       console.error(`❌ Error en rollback: ${err.message}`);
@@ -494,7 +516,7 @@ catalogCmd
   .command('list')
   .description('Lista las plantillas disponibles en el catálogo')
   .action(() => {
-    const templates = catalogManager.listTemplates();
+    const templates = svc.catalogManager.listTemplates();
     console.table(templates.map(t => ({
       ID: t.id,
       Nombre: t.name,
@@ -505,11 +527,30 @@ catalogCmd
     })));
   });
 
+// Auto-actualización limpia sin shell
+program
+  .command('update')
+  .description('Actualiza Culkibo desde GitHub (git pull --ff-only + dependencias + panel web)')
+  .action(async () => {
+    const rootDir = path.resolve(__dirname, '..');
+    console.log('\n🔄 Actualizando Culkibo desde origin/main...');
+    try {
+      await runSpawnStep('git', ['pull', '--ff-only'], rootDir);
+      await runSpawnStep('npm', ['install', '--no-audit', '--no-fund'], rootDir);
+      await runSpawnStep('npm', ['run', 'web:build'], rootDir);
+      console.log('\x1b[32m✅ Culkibo actualizado. Reinicia el servicio (p. ej. systemctl restart culkibo) para aplicar cambios.\x1b[0m\n');
+    } catch (err) {
+      console.error(`\x1b[31m❌ Error al actualizar Culkibo:\x1b[0m ${err.message}`);
+      process.exit(1);
+    }
+  });
+
 // Transporte stdio MCP
 program
   .command('mcp')
   .description('Ejecuta el servidor MCP sobre entrada/salida estándar (stdio)')
   .action(() => {
+    const mcpServer = svc.mcpServer;
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -520,6 +561,8 @@ program
       try {
         if (!line.trim()) return;
         const request = JSON.parse(line);
+        // Las notificaciones JSON-RPC (sin `id`) no llevan respuesta según especificación.
+        if (!('id' in request) || request.id === undefined) return;
         const response = await mcpServer.handleJsonRpc(request);
         process.stdout.write(JSON.stringify(response) + '\n');
       } catch (err) {

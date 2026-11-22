@@ -73,8 +73,11 @@ class DockerManager {
     }
 
     try {
-      // Intento rápido de consultar docker version
-      const { stdout: versionOut } = await this.docker(['version', '--format', '{{json .}}'], { timeout: 3500 });
+      // Ejecutar version e info en paralelo ahorra un spawn completo (~200-500 ms).
+      const [{ stdout: versionOut }, { stdout: infoOut }] = await Promise.all([
+        this.docker(['version', '--format', '{{json .}}'], { timeout: 3500 }),
+        this.docker(['info', '--format', '{{json .}}'], { timeout: 4000 })
+      ]);
       let versionData = {};
       try {
         versionData = JSON.parse(versionOut.trim());
@@ -82,8 +85,6 @@ class DockerManager {
         versionData = { raw: versionOut.trim() };
       }
 
-      // Comprobar si el server/daemon responde
-      const { stdout: infoOut } = await this.docker(['info', '--format', '{{json .}}'], { timeout: 4000 });
       let infoData = {};
       try {
         infoData = JSON.parse(infoOut.trim());
