@@ -499,7 +499,7 @@ class LocalRunner {
     }
 
     // Case 3: Project directory does not exist or has no code, but git repository is configured
-    const gitUrl = project.gitRepo || (project.resources && project.resources.find(r => r.gitRepo)?.gitRepo);
+    const gitUrl = this.extractProjectGitUrl(project);
     if (gitUrl) {
       return this.cloneAndStartProject(project, projectDir, gitUrl, port);
     }
@@ -1423,7 +1423,7 @@ class LocalRunner {
     const projectDir = this.resolveProjectDir(project.id);
     if (fs.existsSync(projectDir)) return; // Already present
 
-    const gitUrl = project.gitRepo || (project.resources && project.resources.find(r => r.gitRepo)?.gitRepo);
+    const gitUrl = this.extractProjectGitUrl(project);
     if (!gitUrl) return;
 
     const cloneUrl = this.normalizeGitUrl(gitUrl);
@@ -1454,9 +1454,46 @@ class LocalRunner {
   }
 
   /**
+   * Extrae la URL Git real de un proyecto, descartando el valor placeholder
+   * `coollabsio/coolify` que Coolify v4 deja en apps de tipo `dockerimage`.
+   */
+  extractProjectGitUrl(project) {
+    if (!project) return null;
+    if (project.gitRepo && String(project.gitRepo).trim()) {
+      return String(project.gitRepo).trim();
+    }
+    if (!Array.isArray(project.resources)) return null;
+    for (const r of project.resources) {
+      if (!r || !r.gitRepo) continue;
+      const repo = String(r.gitRepo).trim();
+      const isDockerImg = r.buildConfig?.build_pack === 'dockerimage' || Boolean(r.gitDetails?.docker_registry_image_name);
+      if (isDockerImg && /^(?:https?:\/\/github\.com\/)?coollabsio\/coolify(?:\.git)?$/i.test(repo)) {
+        continue;
+      }
+      if (repo) return repo;
+    }
+    return null;
+  }
+
+  /** Detecta si un proyecto importado se despliega desde una imagen Docker precompilada (sin Git). */
+  extractDockerImage(project) {
+    if (!project || !Array.isArray(project.resources)) return null;
+    for (const r of project.resources) {
+      const name = r?.gitDetails?.docker_registry_image_name || r?.image;
+      if (r?.buildConfig?.build_pack === 'dockerimage' && name) {
+        const tag = r?.gitDetails?.docker_registry_image_tag || 'latest';
+        return name.includes(':') && !name.startsWith('localhost:') ? name : `${name}:${tag}`;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Fallback sandbox server for apps without local code (100% offline CSS)
    */
   async startFallbackServer(project, projectDir, port) {
+    const dockerImage = this.extractDockerImage(project);
+    const dPort = this.daemonPort();
     const server = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`<!DOCTYPE html>
@@ -1469,11 +1506,18 @@ class LocalRunner {
 <body>
   <div class="card">
     <h1>${escapeHtml(project.name)}</h1>
-    <span class="pill ok">Ejecutándose en local :${port}</span>
-    <p>Este proyecto todavía no tiene código en el directorio local de Culkibo. Clona su repositorio o añade archivos en <code>${escapeHtml(projectDir)}</code>.</p>
+    ${dockerImage
+      ? `<span class="pill warn">Imagen Docker precompilada (:${port})</span>
+         <p>Este proyecto importado desde Coolify usa la imagen Docker <code>${escapeHtml(dockerImage)}</code> y no tiene un repositorio Git configurado.</p>
+         <p>Para ejecutarlo en local, arranca <strong>Docker Desktop</strong> y despliega el contenedor, o añade la URL de su repositorio Git en <strong>Configuración</strong> del proyecto.</p>`
+      : `<span class="pill ok">Ejecutándose en local :${port}</span>
+         <p>Este proyecto todavía no tiene código en el directorio local de Culkibo. Clona su repositorio, sincronízalo con <code>culkibo sync</code> o añade archivos en <code>${escapeHtml(projectDir)}</code>.</p>`}
+    <div class="actions">
+      <a href="http://localhost:${dPort}/#/projects/${encodeURIComponent(project.id)}" class="btn">Configurar en Culkibo</a>
+    </div>
     <div class="foot">
       <span>Culkibo v1.0.0 Local Runner</span>
-      <a href="http://localhost:${this.daemonPort()}" style="color:#18181b;font-weight:600;text-decoration:none;">Volver a Culkibo &rarr;</a>
+      <a href="http://localhost:${dPort}" style="color:#18181b;font-weight:600;text-decoration:none;">Volver a Culkibo &rarr;</a>
     </div>
   </div>
 </body>

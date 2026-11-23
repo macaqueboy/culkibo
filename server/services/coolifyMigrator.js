@@ -252,8 +252,15 @@ class CoolifyMigrator {
         };
 
         const proj = getProjectForResource(app);
-        if (!proj.gitRepo && (app.git_repository || app.git_full_url)) {
-            proj.gitRepo = app.git_repository || app.git_full_url;
+        // Coolify v4 deja por defecto `git_repository: "coollabsio/coolify"` en apps de tipo
+        // `dockerimage` (sin repo Git real). Jamás debemos importarlo como código fuente del proyecto.
+        const rawRepo = String(app.git_repository || app.git_full_url || '').trim();
+        const isCoolifyDummyRepo = app.build_pack === 'dockerimage'
+          || (Boolean(app.docker_registry_image_name) && /^(?:https?:\/\/github\.com\/)?coollabsio\/coolify(?:\.git)?$/i.test(rawRepo));
+        const effectiveGitRepo = isCoolifyDummyRepo ? '' : rawRepo;
+
+        if (!proj.gitRepo && effectiveGitRepo) {
+            proj.gitRepo = effectiveGitRepo;
         }
         if (!proj.gitBranch && app.git_branch) {
             proj.gitBranch = app.git_branch;
@@ -273,7 +280,7 @@ class CoolifyMigrator {
             type: 'app',
             name: app.name || 'Coolify App',
             description: app.description || `App migrada de Coolify (${app.uuid})`,
-            gitRepo: app.git_repository || app.git_full_url || '',
+            gitRepo: effectiveGitRepo,
             domains: domains,
             envVars: common.envVars,
             volumes: common.volumes,
