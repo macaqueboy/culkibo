@@ -18,14 +18,35 @@ const OFFLINE_PAGE_CSS = `
   h1{margin:0 0 6px;font-size:18px;font-weight:600;color:#18181b;}
   .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:3px 10px;border-radius:999px;border:1px solid #e4e4e7;background:#f4f4f5;color:#3f3f46;}
   .pill.warn{background:#fffbeb;border-color:#fde68a;color:#92400e;}
+  .pill.err{background:#fef2f2;border-color:#fecaca;color:#991b1b;}
   .pill.ok{background:#ecfdf5;border-color:#a7f3d0;color:#065f46;}
   p{font-size:14px;color:#52525b;line-height:1.55;margin:14px 0;}
   code{background:#f4f4f5;border:1px solid #e4e4e7;border-radius:6px;padding:1px 6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#18181b;}
-  pre{background:#fafafa;border:1px solid #e4e4e7;border-radius:8px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#27272a;overflow:auto;max-height:240px;white-space:pre-wrap;margin:14px 0;}
-  .btn{display:inline-block;text-decoration:none;background:#18181b;color:#fff;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:600;}
+  pre{background:#fafafa;border:1px solid #e4e4e7;border-radius:8px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#27272a;overflow:auto;max-height:220px;white-space:pre-wrap;word-break:break-word;margin:10px 0 0;}
+  details{margin:14px 0;border:1px solid #e4e4e7;border-radius:8px;padding:10px 12px;background:#fafafa;}
+  summary{cursor:pointer;font-size:12px;font-weight:600;color:#52525b;}
+  .actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px;}
+  .btn{display:inline-block;text-decoration:none;background:#18181b;color:#fff;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:600;border:0;cursor:pointer;}
   .btn:hover{background:#27272a;}
+  .btn-ghost{display:inline-block;text-decoration:none;background:#fff;color:#3f3f46;padding:8px 14px;border-radius:8px;font-size:13px;font-weight:500;border:1px solid #e4e4e7;}
+  .btn-ghost:hover{background:#f4f4f5;color:#18181b;}
   .foot{margin-top:18px;padding-top:14px;border-top:1px solid #f4f4f5;display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#71717a;}
 `;
+
+/** Traduce errores técnicos de git a un mensaje claro y accionable en español. */
+function explainGitError(rawMsg) {
+  const s = String(rawMsg || '').toLowerCase();
+  if (s.includes('invalid username or token') || s.includes('authentication failed') || s.includes('could not read username') || s.includes('password authentication is not supported')) {
+    return 'GitHub rechazó el acceso: el repositorio es privado, no existe o el Personal Access Token guardado en Ajustes → Integraciones ha caducado o no tiene permiso «repo».';
+  }
+  if (s.includes('repository not found') || s.includes('not found')) {
+    return 'No se encontró el repositorio Git. Comprueba que la URL del proyecto en Configuración es correcta y accesible.';
+  }
+  if (s.includes('could not resolve host') || s.includes('unable to access') || s.includes('timed out')) {
+    return 'No se pudo conectar con el servidor Git remoto. Revisa tu conexión a Internet o un posible proxy/cortafuegos.';
+  }
+  return 'Ocurrió un error al preparar el código local del proyecto. Revisa el diagnóstico técnico o la URL del repositorio en Configuración.';
+}
 
 /** Puertos reservados del sistema/infraestructura que `killProcessOnPort` JAMÁS debe matar. */
 const RESERVED_PORTS = new Set([22, 53, 80, 443, 2019, 2375, 2376, 3306, 5432, 6379, 27017]);
@@ -578,32 +599,42 @@ class LocalRunner {
     let isError = false;
 
     tempServer = http.createServer((req, res) => {
+      const reqUrl = String(req.url || '/');
+      if (isError && reqUrl.includes('retry=1')) {
+        res.writeHead(302, { Location: '/' });
+        res.end();
+        setImmediate(async () => {
+          await this.closeServer(tempServer);
+          this.activeRunners.delete(project.id);
+          await this.start(project).catch(() => {});
+        });
+        return;
+      }
+      const dPort = this.daemonPort();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      const actionsHtml = isError
-        ? `<div class="space-y-2">
-            <button onclick="window.location.reload()" class="w-full px-4 py-2.5 bg-slate-900 text-white rounded-xl text-xs font-semibold hover:bg-slate-800 transition-colors">
-              Reintentar
-            </button>
-            <a href="http://localhost:3030" class="block text-xs text-slate-500 hover:text-slate-800">Volver a Culkibo</a>
-          </div>`
-        : `<div class="text-xs text-slate-400">Instalando paquetes de Node.js. Esta página se actualizará automáticamente en unos segundos.</div>
-          <script>setTimeout(() => window.location.reload(), 4000);</script>`;
-
       res.end(`<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <title>Instalando dependencias — ${escapeHtml(project.name)}</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>${isError ? 'Error al instalar' : 'Instalando dependencias'} — ${escapeHtml(project.name)}</title>
+  <style>${OFFLINE_PAGE_CSS}</style>
 </head>
-<body class="bg-slate-50 flex items-center justify-center min-h-screen font-sans p-4">
-  <div class="bg-white p-8 rounded-2xl border border-slate-200 shadow-sm max-w-md w-full text-center space-y-4">
-    <div class="w-12 h-12 rounded-2xl ${isError ? 'bg-rose-50 text-rose-600' : 'bg-blue-50 text-blue-600 animate-bounce'} flex items-center justify-center text-2xl mx-auto">
-      ${isError ? '⚠️' : '⚡'}
+<body>
+  <div class="card">
+    <h1>${isError ? `No se pudo iniciar ${escapeHtml(project.name)}` : `Instalando ${escapeHtml(project.name)}`}</h1>
+    <span class="pill ${isError ? 'err' : 'warn'}">${isError ? 'Error de instalación' : 'Instalando dependencias'}</span>
+    <p>${isError ? 'Falló la instalación de dependencias de Node.js antes de arrancar el servidor local.' : 'Instalando paquetes de Node.js (npm install). Esta página se actualizará automáticamente al terminar.'}</p>
+    ${isError
+      ? `<details open><summary>Detalle técnico</summary><pre>${escapeHtml(statusMessage)}</pre></details>
+         <div class="actions">
+           <a href="/?retry=1" class="btn">Reintentar</a>
+           <a href="http://localhost:${dPort}/#/projects/${encodeURIComponent(project.id)}" class="btn-ghost">Abrir proyecto en Culkibo</a>
+         </div>`
+      : `<pre>${escapeHtml(statusMessage)}</pre><script>setTimeout(() => window.location.reload(), 4000);</script>`}
+    <div class="foot">
+      <span>Culkibo v1.0.0 Local Runner</span>
+      <a href="http://localhost:${dPort}" style="color:#18181b;font-weight:600;text-decoration:none;">Volver a Culkibo &rarr;</a>
     </div>
-    <h1 class="text-lg font-bold text-slate-900">${escapeHtml(project.name)}</h1>
-    <p class="text-xs text-slate-600 font-mono bg-slate-50 p-3 rounded-xl border border-slate-100 break-all">${escapeHtml(statusMessage)}</p>
-    ${actionsHtml}
   </div>
 </body>
 </html>`);
@@ -847,6 +878,7 @@ class LocalRunner {
    * Diagnostic server for PHP / Laravel projects when PHP is not installed locally
    */
   async startPhpRequirementsServer(project, projectDir, port) {
+    const dPort = this.daemonPort();
     const server = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`<!DOCTYPE html>
@@ -854,25 +886,16 @@ class LocalRunner {
 <head>
   <meta charset="utf-8">
   <title>${escapeHtml(project.name)} — Aplicación PHP / Laravel</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <style>${OFFLINE_PAGE_CSS}</style>
 </head>
-<body class="bg-slate-50 min-h-screen flex items-center justify-center font-sans p-4">
-  <div class="max-w-xl w-full bg-white p-8 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-    <div class="flex items-center gap-3">
-      <div class="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center text-2xl">
-        🐘
-      </div>
-      <div>
-        <h1 class="text-xl font-bold text-slate-900">${escapeHtml(project.name)}</h1>
-        <span class="text-xs text-indigo-800 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-full font-semibold">
-          Aplicación PHP / Laravel
-        </span>
-      </div>
-    </div>
-    <p class="text-sm text-slate-600">Este proyecto es una aplicación PHP/Laravel. Para ejecutarla en local, inicia <strong>Docker Desktop</strong> o instala <strong>PHP</strong> en tu sistema.</p>
-    <div class="pt-2 border-t border-slate-100 flex justify-between items-center text-xs text-slate-400">
+<body>
+  <div class="card">
+    <h1>${escapeHtml(project.name)}</h1>
+    <span class="pill warn">Aplicación PHP / Laravel</span>
+    <p>Este proyecto es una aplicación PHP/Laravel. Para ejecutarla en local, inicia <strong>Docker Desktop</strong> o instala <strong>PHP</strong> en tu sistema.</p>
+    <div class="foot">
       <span>Culkibo v1.0.0 Local Runner</span>
-      <a href="http://localhost:3030" class="text-blue-600 hover:underline">Volver a Culkibo &rarr;</a>
+      <a href="http://localhost:${dPort}" style="color:#18181b;font-weight:600;text-decoration:none;">Volver a Culkibo &rarr;</a>
     </div>
   </div>
 </body>
@@ -1067,7 +1090,9 @@ class LocalRunner {
         return this._gitTokenCache.token;
       }
       const gh = JSON.parse(fs.readFileSync(ghFile, 'utf8'));
-      const token = gh.token || null;
+      const rawToken = gh.token || null;
+      // Nunca enviar tokens de prueba/mock a GitHub real
+      const token = rawToken && !/^ghp_mock_/i.test(String(rawToken)) ? rawToken : null;
       this._gitTokenCache = { mtimeMs: stat.mtimeMs, token };
       return token;
     } catch (e) {
@@ -1125,13 +1150,25 @@ class LocalRunner {
    *
    * @param {string} cloneUrl
    * @param {string} targetDir
-   * @param {{ timeout?: number, depth?: number | null, branch?: string | null, onLine?: ((line: string) => void) | null }} [opts]
+   * @param {{ timeout?: number, depth?: number | null, branch?: string | null, onLine?: ((line: string) => void) | null, useAuth?: boolean }} [opts]
    */
-  gitClone(cloneUrl, targetDir, { timeout = 180000, depth = null, branch = null, onLine = null } = {}) {
+  async gitClone(cloneUrl, targetDir, { timeout = 180000, depth = null, branch = null, onLine = null, useAuth = true } = {}) {
     if (!cloneUrl || /^file:/i.test(cloneUrl) && process.env.CULKIBO_ALLOW_LOCAL_GIT !== '1') {
-      return Promise.reject(new Error('URL de repositorio rechazada por política de seguridad'));
+      throw new Error('URL de repositorio rechazada por política de seguridad');
     }
-    const { env, cleanup } = this.gitAuthEnv(cloneUrl);
+    const willTryAuth = useAuth && this.isGitHubRemote(cloneUrl) && Boolean(this.readGitToken());
+    const { env, cleanup } = willTryAuth
+      ? this.gitAuthEnv(cloneUrl)
+      : {
+          env: {
+            ...process.env,
+            GIT_TERMINAL_PROMPT: '0',
+            GIT_CONFIG_COUNT: '1',
+            GIT_CONFIG_KEY_0: 'credential.helper',
+            GIT_CONFIG_VALUE_0: ''
+          },
+          cleanup: () => {}
+        };
 
     const args = ['clone', '--progress'];
 
@@ -1150,7 +1187,7 @@ class LocalRunner {
       // that could be mistaken for an option is refused outright.
       if (!/^[A-Za-z0-9._/-]+$/.test(name) || name.startsWith('-') || name.includes('..')) {
         cleanup();
-        return Promise.reject(new Error(`Nombre de rama no válido: «${name}»`));
+        throw new Error(`Nombre de rama no válido: «${name}»`);
       }
       args.push('--branch', name);
     }
@@ -1159,49 +1196,57 @@ class LocalRunner {
     // manages to store a repository whose name starts with a dash.
     args.push('--', cloneUrl, targetDir);
 
-    return new Promise((/** @type {(value?: void) => void} */ resolve, reject) => {
-      const child = spawn('git', args, {
-        env,
-        shell: false,
-        windowsHide: true
+    try {
+      await new Promise((/** @type {(value?: void) => void} */ resolve, reject) => {
+        const child = spawn('git', args, {
+          env,
+          shell: false,
+          windowsHide: true
+        });
+
+        const stderr = [];
+        let buffered = '';
+        child.stderr.on('data', (d) => {
+          const text = d.toString();
+          stderr.push(text);
+          if (stderr.length > 50) stderr.shift();
+          if (!onLine) return;
+          // git reports clone progress on stderr; forwarding it line by line is
+          // what turns a two-minute silence into a visible build log.
+          buffered += text;
+          const lines = buffered.split(/[\r\n]+/);
+          buffered = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed) onLine(this.redactSecrets(trimmed));
+          }
+        });
+
+        const timer = setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch (e) {}
+        }, timeout);
+        if (timer.unref) timer.unref();
+
+        const finish = (err) => {
+          clearTimeout(timer);
+          cleanup();
+          if (onLine && buffered.trim()) onLine(this.redactSecrets(buffered.trim()));
+          if (err) reject(err); else resolve();
+        };
+
+        child.on('error', (err) => finish(err));
+        child.on('close', (code) => {
+          if (code === 0) return finish();
+          finish(new Error(this.redactSecrets(stderr.join('').trim()) || `git clone terminó con código ${code}`));
+        });
       });
-
-      const stderr = [];
-      let buffered = '';
-      child.stderr.on('data', (d) => {
-        const text = d.toString();
-        stderr.push(text);
-        if (stderr.length > 50) stderr.shift();
-        if (!onLine) return;
-        // git reports clone progress on stderr; forwarding it line by line is
-        // what turns a two-minute silence into a visible build log.
-        buffered += text;
-        const lines = buffered.split(/[\r\n]+/);
-        buffered = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed) onLine(this.redactSecrets(trimmed));
-        }
-      });
-
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch (e) {}
-      }, timeout);
-      if (timer.unref) timer.unref();
-
-      const finish = (err) => {
-        clearTimeout(timer);
-        cleanup();
-        if (onLine && buffered.trim()) onLine(this.redactSecrets(buffered.trim()));
-        if (err) reject(err); else resolve();
-      };
-
-      child.on('error', (err) => finish(err));
-      child.on('close', (code) => {
-        if (code === 0) return finish();
-        finish(new Error(this.redactSecrets(stderr.join('').trim()) || `git clone terminó con código ${code}`));
-      });
-    });
+    } catch (err) {
+      if (willTryAuth && /invalid username or token|authentication failed|could not read username|403/i.test(String(err?.message || ''))) {
+        this.cleanDirectory(targetDir);
+        return this.gitClone(cloneUrl, targetDir, { timeout, depth, branch, onLine, useAuth: false });
+      }
+      throw err;
+    }
   }
 
   /** Strip anything that looks like a credential out of text bound for a log or UI. */
@@ -1230,36 +1275,56 @@ class LocalRunner {
 
     /** @type {http.Server} */
     let tempServer;
-    let statusMessage = `Clonando repositorio ${displayUrl}...`;
+    let statusMessage = `Clonando repositorio ${displayUrl}…`;
+    let friendlyHint = '';
     let isError = false;
 
     tempServer = http.createServer((req, res) => {
+      const reqUrl = String(req.url || '/');
+      if (isError && reqUrl.includes('retry=1')) {
+        res.writeHead(302, { Location: '/' });
+        res.end();
+        setImmediate(async () => {
+          await this.closeServer(tempServer);
+          this.activeRunners.delete(project.id);
+          this.cloningLocks.delete(project.id);
+          await this.start(project).catch(() => {});
+        });
+        return;
+      }
+      const dPort = this.daemonPort();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <title>Preparando ${escapeHtml(project.name)} en Local</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>${isError ? 'Error al preparar' : 'Preparando'} ${escapeHtml(project.name)} — Culkibo</title>
+  <style>${OFFLINE_PAGE_CSS}</style>
 </head>
-<body class="bg-slate-50 flex items-center justify-center min-h-screen font-sans p-4">
-  <div class="bg-white p-8 rounded-2xl border border-slate-200 shadow-sm max-w-md w-full text-center space-y-4">
-    <div class="w-12 h-12 rounded-2xl ${isError ? 'bg-rose-50 text-rose-600' : 'bg-blue-50 text-blue-600 animate-bounce'} flex items-center justify-center text-2xl mx-auto">
-      ${isError ? '⚠️' : '⚡'}
-    </div>
-    <h1 class="text-lg font-bold text-slate-900">Preparando ${escapeHtml(project.name)}</h1>
-    <p class="text-xs text-slate-600 font-mono bg-slate-50 p-3 rounded-xl border border-slate-100 break-all">${escapeHtml(statusMessage)}</p>
+<body>
+  <div class="card">
+    <h1>${isError ? `No se pudo preparar ${escapeHtml(project.name)}` : `Preparando ${escapeHtml(project.name)}`}</h1>
+    <span class="pill ${isError ? 'err' : 'warn'}">${isError ? 'Error al clonar repositorio' : 'Clonando e instalando en local'}</span>
     ${isError ? `
-      <div class="space-y-2">
-        <button onclick="window.location.reload()" class="w-full px-4 py-2.5 bg-slate-900 text-white rounded-xl text-xs font-semibold hover:bg-slate-800 transition-colors">
-          Reintentar
-        </button>
-        <a href="http://localhost:3030" class="block text-xs text-slate-500 hover:text-slate-800">Volver a Culkibo</a>
+      <p>${escapeHtml(friendlyHint || explainGitError(statusMessage))}</p>
+      <details>
+        <summary>Ver diagnóstico técnico de Git</summary>
+        <pre>${escapeHtml(statusMessage)}</pre>
+      </details>
+      <div class="actions">
+        <a href="/?retry=1" class="btn">Reintentar</a>
+        <a href="http://localhost:${dPort}/#/settings" class="btn-ghost">Revisar token GitHub</a>
+        <a href="http://localhost:${dPort}/#/projects/${encodeURIComponent(project.id)}" class="btn-ghost">Ir al proyecto</a>
       </div>
     ` : `
-      <div class="text-xs text-slate-400">Esta página se actualizará automáticamente cuando el servidor esté listo.</div>
+      <p>Descargando el código desde <code>${escapeHtml(displayUrl)}</code>. Esta página se actualizará automáticamente en cuanto arranque el servidor local.</p>
+      <pre>${escapeHtml(statusMessage)}</pre>
       <script>setTimeout(() => window.location.reload(), 3000);</script>
     `}
+    <div class="foot">
+      <span>Culkibo v1.0.0 Local Runner</span>
+      <a href="http://localhost:${dPort}" style="color:#18181b;font-weight:600;text-decoration:none;">Volver a Culkibo &rarr;</a>
+    </div>
   </div>
 </body>
 </html>`);
@@ -1332,7 +1397,8 @@ class LocalRunner {
         this.cloningLocks.delete(project.id);
         // Strip any token from error message
         const safeMessage = this.redactSecrets(err.message);
-        statusMessage = `Error al preparar: ${safeMessage}`;
+        friendlyHint = explainGitError(safeMessage);
+        statusMessage = safeMessage;
         alert({
           event: 'deploy_failed',
           level: 'error',

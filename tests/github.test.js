@@ -11,6 +11,7 @@ async function testGithub() {
 
   // Backup any existing github config
   const originalConfig = { ...githubService.config };
+  const createdProjectIds = [];
 
   try {
     // 1. Initial Status Check
@@ -113,6 +114,7 @@ async function testGithub() {
       autoDeploy: true,
       icon: '⚡'
     });
+    createdProjectIds.push(testProject.id);
 
     assert.ok(testProject.id, 'Test project created');
     assert.strictEqual(testProject.webhookSecret, testSecret);
@@ -352,6 +354,7 @@ async function testGithub() {
       webhookSecret: projSecret,
       autoDeploy: true
     });
+    createdProjectIds.push(projectSub.id);
     const projectExact = projectManager.create({
       name: 'Frontend App',
       gitRepo: 'https://github.com/pablo-developer/test-unique-frontend.git',
@@ -359,6 +362,7 @@ async function testGithub() {
       webhookSecret: projSecret,
       autoDeploy: true
     });
+    createdProjectIds.push(projectExact.id);
 
     const slugPushPayload = {
       ref: 'refs/heads/main',
@@ -428,9 +432,16 @@ async function testGithub() {
 
     console.log('✅ All GitHub & Webhook tests passed!\n');
   } finally {
-    // Restore initial github config
-    if (originalConfig && originalConfig.token) {
+    // Limpiar siempre proyectos temporales de prueba aunque falle alguna aserción
+    for (const pid of createdProjectIds) {
+      try { projectManager.delete(pid); } catch (e) {}
+    }
+    try { await projectManager.flushToDisk(); } catch (e) {}
+    // Restaurar exactamente la configuración original de GitHub (o desconectar si no había token)
+    if (originalConfig && originalConfig.token && !/^ghp_mock_/i.test(originalConfig.token)) {
       githubService.saveConfig(originalConfig);
+    } else {
+      try { await githubService.disconnect(); } catch (e) {}
     }
   }
 }

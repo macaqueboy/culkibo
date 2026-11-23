@@ -2,9 +2,11 @@ const assert = require('assert');
 const http = require('http');
 const { app, server } = require('../server/index');
 const containerOrchestrator = require('../server/services/containerOrchestrator');
+const githubService = require('../server/services/githubService');
 
 async function testLiveServer() {
   console.log('🧪 Testing Live Server, Control Plane & Honest Ingress Status...');
+  const originalGhConfig = { ...githubService.config };
 
   await new Promise((resolve) => {
     server.listen(3031, () => {
@@ -287,6 +289,11 @@ async function testLiveServer() {
 
     console.log('✅ Live Server, Control Plane, Honest Ingress Status, Static Dashboard & GitHub APIs verified successfully!\n');
   } finally {
+    if (originalGhConfig && originalGhConfig.token && !/^ghp_mock_/i.test(originalGhConfig.token)) {
+      githubService.saveConfig(originalGhConfig);
+    } else {
+      try { await githubService.disconnect(); } catch (e) {}
+    }
     await containerOrchestrator.stop();
     await new Promise((resolve) => server.close(resolve));
   }
