@@ -300,11 +300,14 @@ do_uninstall() {
     fi
   fi
 
-  # Reglas de cortafuegos que pusimos nosotros, reconocibles por su comentario.
+  # Reglas de cortafuegos que pusimos nosotros (solo si llevan el comentario 'culkibo' para no romper otros servicios).
   if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
-    ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
-    ok "Reglas de cortafuegos de Culkibo retiradas"
+    if ufw status 2>/dev/null | grep -q "# culkibo"; then
+      ufw --force delete allow 80/tcp  comment 'culkibo' >/dev/null 2>&1 || true
+      ufw --force delete allow 443/tcp comment 'culkibo' >/dev/null 2>&1 || true
+      ufw --force delete allow 443/udp comment 'culkibo' >/dev/null 2>&1 || true
+      ok "Reglas de cortafuegos de Culkibo retiradas"
+    fi
   fi
 
   if [ "$PURGE" = "1" ]; then
@@ -396,15 +399,15 @@ preflight() {
     port_in_use 80  && blocked="80"
     port_in_use 443 && blocked="${blocked:+$blocked y }443"
     if [ -n "$blocked" ]; then
-      # No se aborta la instalación entera por esto: Culkibo sigue siendo útil
-      # sin plano de datos. Pero desplegar Caddy encima de un Nginx que ya
-      # sirve algo tumbaría un sitio en producción, y eso no se hace en
-      # silencio.
-      local owner80 owner443
-      owner80=$(port_owner 80); owner443=$(port_owner 443)
-      warn "El puerto $blocked ya está en uso${owner80:+ (80: $owner80)}${owner443:+ (443: $owner443)}."
-      warn "No se levantará Caddy: pararía lo que ya está sirviendo ahí. Culkibo se instalará sin plano de datos."
-      WITH_CADDY=0
+      if has docker && docker ps --filter "name=^culkibo-caddy$" --filter "status=running" -q 2>/dev/null | grep -q .; then
+        ok "Puertos 80 y 443 gestionados por nuestro propio culkibo-caddy (reinstalación idempotente)"
+      else
+        local owner80 owner443
+        owner80=$(port_owner 80); owner443=$(port_owner 443)
+        warn "El puerto $blocked ya está en uso${owner80:+ (80: $owner80)}${owner443:+ (443: $owner443)}."
+        warn "No se levantará Caddy: pararía lo que ya está sirviendo ahí. Culkibo se instalará sin plano de datos."
+        WITH_CADDY=0
+      fi
     else
       ok "Puertos 80 y 443 libres"
     fi
@@ -838,7 +841,8 @@ start_data_plane() {
   if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow 80/tcp  comment 'culkibo' >/dev/null 2>&1 || true
     ufw allow 443/tcp comment 'culkibo' >/dev/null 2>&1 || true
-    ok "UFW: abiertos 80 y 443 (HTTP y HTTPS)"
+    ufw allow 443/udp comment 'culkibo' >/dev/null 2>&1 || true
+    ok "UFW: abiertos 80/tcp, 443/tcp y 443/udp (HTTP, HTTPS y HTTP/3 QUIC)"
     if [ "$BIND_ADDR" != "0.0.0.0" ]; then
       info "El puerto $PORT NO se ha abierto a propósito: el plano de control no debe estar en internet."
     fi

@@ -448,6 +448,121 @@ class SslManager {
   }
 
   /**
+   * Instala un certificado PEM real proporcionado por el usuario (p. ej.
+   * Cloudflare Origin CA de 15 años o certificado corporativo), verificando con
+   * `crypto.X509Certificate` y `crypto.createPrivateKey` que la clave privada
+   * corresponde criptográficamente a la clave pública del certificado.
+   */
+  uploadCustomCertificate({ domain = '', certPem = '', keyPem = '', provider = 'custom_pem' } = {}) {
+    const cleanCert = String(certPem || '').trim();
+    const cleanKey = String(keyPem || '').trim();
+    if (!cleanCert.includes('-----BEGIN CERTIFICATE-----')) {
+      throw new Error('El certificado debe estar en formato PEM (-----BEGIN CERTIFICATE-----)');
+    }
+    if (!cleanKey.includes('-----BEGIN') || !cleanKey.includes('PRIVATE KEY-----')) {
+      throw new Error('La clave privada debe estar en formato PEM (-----BEGIN ... PRIVATE KEY-----)');
+    }
+
+    /** @type {crypto.X509Certificate} */
+    let x509;
+    try {
+      x509 = new crypto.X509Certificate(cleanCert);
+    } catch (err) {
+      throw new Error(`Certificado X.509 inválido: ${err.message}`);
+    }
+
+    /** @type {crypto.KeyObject} */
+    let privKey;
+    try {
+      privKey = crypto.createPrivateKey(cleanKey);
+    } catch (err) {
+      throw new Error(`Clave privada inválida o protegida con contraseña: ${err.message}`);
+    }
+
+    const derivedPubDer = crypto.createPublicKey(privKey).export({ type: 'spki', format: 'der' });
+    const certPubDer = x509.publicKey.export({ type: 'spki', format: 'der' });
+    if (!derivedPubDer.equals(certPubDer)) {
+      throw new Error('La clave privada no coincide con la clave pública del certificado X.509');
+    }
+
+    const sans = x509.subjectAltName
+      ? x509.subjectAltName.split(/,\s*/).map((s) => s.replace(/^DNS:/i, '').trim().toLowerCase()).filter(Boolean)
+      : [];
+    const subjectCnMatch = String(x509.subject || '').match(/CN=([^\n,]+)/);
+    const detectedDomain = String(domain || '').trim().toLowerCase()
+      || sans[0]
+      || (subjectCnMatch ? subjectCnMatch[1].trim().toLowerCase() : '');
+    if (!detectedDomain) {
+      throw new Error('No se pudo determinar el dominio del certificado (indícalo explícitamente)');
+    }
+    const rootDomain = detectedDomain.replace(/^\*\./, '');
+    const safeSlug = rootDomain.replace(/[^a-z0-9.-]/g, '_');
+    const certDir = path.join(CERTS_DIR, `custom_${safeSlug}_${Date.now()}`);
+    fs.mkdirSync(certDir, { recursive: true, mode: 0o700 });
+
+    const certPath = path.join(certDir, 'fullchain.pem');
+    const keyPath = path.join(certDir, 'privkey.pem');
+    fs.writeFileSync(certPath, `${cleanCert}\n`, { mode: 0o600 });
+    fs.writeFileSync(keyPath, `${cleanKey}\n`, { mode: 0o600 });
+
+    const notAfter = new Date(x509.validTo);
+    const notBefore = new Date(x509.validFrom);
+    const issuerMatch = String(x509.issuer || '').match(/(?:O|CN)=([^\n,]+)/);
+    const record = {
+      id: `cert_custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      domain: detectedDomain,
+      rootDomain,
+      type: detectedDomain.startsWith('*.') || sans.some((s) => s.startsWith('*.')) ? 'custom_wildcard' : 'custom_pem',
+      provider: provider || 'custom_pem',
+      managedBy: 'on_disk',
+      sans: sans.length > 0 ? sans : [detectedDomain],
+      issuer: issuerMatch ? issuerMatch[1].trim() : 'Personalizado',
+      issuedAt: Number.isNaN(notBefore.getTime()) ? null : notBefore.toISOString(),
+      expiresAt: Number.isNaN(notAfter.getTime()) ? null : notAfter.toISOString(),
+      fingerprint: x509.fingerprint256 || null,
+      keyType: privKey.asymmetricKeyType || null,
+      certPath,
+      keyPath,
+      status: 'on_disk',
+      autoRenew: false,
+      registeredAt: new Date().toISOString()
+    };
+
+    this.registry.unshift(record);
+    this.saveRegistry();
+    return {
+      success: true,
+      cert: this.listCertificates().find((c) => c.id === record.id) || record
+    };
+  }
+
+  /**
+   * Lista pares `{ certificate, key }` válidos en disco para inyectarlos en
+   * `apps.tls.certificates.load_files` de Caddy.
+   * @param {{ containerMountPrefix?: string | null }} [opts]
+   */
+  listCaddyLoadFiles({ containerMountPrefix = null } = {}) {
+    /** @type {Array<{ id: string, domain: string, certificate: string, key: string }>} */
+    const files = [];
+    for (const entry of this.registry) {
+      if (!entry || !entry.certPath || !entry.keyPath) continue;
+      if (!fs.existsSync(entry.certPath) || !fs.existsSync(entry.keyPath)) continue;
+      let certPath = entry.certPath;
+      let keyPath = entry.keyPath;
+      if (containerMountPrefix) {
+        const relCert = path.relative(CERTS_DIR, entry.certPath).replace(/\\/g, '/');
+        const relKey = path.relative(CERTS_DIR, entry.keyPath).replace(/\\/g, '/');
+        if (!relCert.startsWith('..') && !relKey.startsWith('..')) {
+          certPath = `${containerMountPrefix.replace(/\/+$/, '')}/${relCert}`;
+          keyPath = `${containerMountPrefix.replace(/\/+$/, '')}/${relKey}`;
+        }
+      }
+      files.push({ id: entry.id, domain: entry.domain, certificate: certPath, key: keyPath });
+    }
+    return files;
+  }
+
+  /**
    * Da de baja una entrada del registro.
    *
    * No revoca nada en la CA: Culkibo no tiene la cuenta ACME. El nombre se

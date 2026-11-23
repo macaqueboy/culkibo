@@ -295,7 +295,6 @@ function computeMerkleTree(baseDir) {
     } catch (e) {
       return;
     }
-    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     for (const entry of entries) {
       if (scannedFiles >= MAX_MERKLE_FILES) break;
@@ -314,12 +313,18 @@ function computeMerkleTree(baseDir) {
           totalBytes += st.size;
           const cached = merkleFileCache.get(abs);
           if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+            // Refresca posición LRU en O(1)
+            merkleFileCache.delete(abs);
+            merkleFileCache.set(abs, cached);
             files[rel] = cached.hash;
           } else {
             const buf = fs.readFileSync(abs);
             const h = sha256(buf);
             files[rel] = h;
-            if (merkleFileCache.size >= MAX_MERKLE_CACHE_ENTRIES) merkleFileCache.clear();
+            if (merkleFileCache.size >= MAX_MERKLE_CACHE_ENTRIES) {
+              const oldest = merkleFileCache.keys().next().value;
+              if (oldest !== undefined) merkleFileCache.delete(oldest);
+            }
             merkleFileCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, hash: h });
           }
         } catch (e) {}
@@ -468,11 +473,37 @@ class LiveSyncEngine extends EventEmitter {
         patchHistoryBytes: 0,
         recentFrames: /** @type {any[]} */ ([]),
         fileCache: /** @type {Map<string, { buf: Buffer, mtimeMs: number, size: number }>} */ (new Map()),
-        fileCacheBytes: 0
+        fileCacheBytes: 0,
+        lastActiveMs: Date.now(),
+        cachedRealBaseKey: /** @type {string | null} */ (null),
+        cachedRealBase: /** @type {string | null} */ (null),
+        verifiedDirs: /** @type {Set<string>} */ (new Set())
       };
       this.sessions.set(projectId, s);
     }
+    s.lastActiveMs = Date.now();
     return s;
+  }
+
+  /** Libera buffers en RAM (fileCache + patchHistory) de sesiones desconectadas tras `maxIdleMs`. */
+  evictIdleSessions(maxIdleMs = 15 * 60 * 1000) {
+    const now = Date.now();
+    let evicted = 0;
+    for (const s of this.sessions.values()) {
+      if (s.connectedClients > 0) continue;
+      if (now - (s.lastActiveMs || 0) < maxIdleMs) continue;
+      if (s.fileCache && s.fileCache.size > 0) {
+        s.fileCache.clear();
+        s.fileCacheBytes = 0;
+        evicted++;
+      }
+      if (s.patchHistory && s.patchHistory.length > 0) {
+        s.patchHistory = [];
+        s.patchHistoryBytes = 0;
+      }
+      if (s.verifiedDirs) s.verifiedDirs.clear();
+    }
+    return evicted;
   }
 
   registerClient(projectId) {
@@ -513,13 +544,25 @@ class LiveSyncEngine extends EventEmitter {
       throw new Error(`El commit frame supera el máximo permitido (${MAX_FILES_PER_FRAME} ficheros)`);
     }
 
-    /** @type {string | null} */
-    let realBase = null;
-    try { realBase = fs.realpathSync(baseDir); } catch (e) { realBase = null; }
+    // Reutilizar realBase y verifiedDirs en la sesión para el mismo baseDir (evita realpathSync en cada frame)
     const resolvedBase = path.resolve(baseDir);
-    const verifiedDirs = new Set();
-    if (realBase) verifiedDirs.add(resolvedBase);
-    const pathCtx = { realBase, verifiedDirs };
+    if (session.cachedRealBaseKey !== resolvedBase) {
+      session.cachedRealBaseKey = resolvedBase;
+      try { session.cachedRealBase = fs.realpathSync(baseDir); } catch (e) { session.cachedRealBase = null; }
+      session.verifiedDirs = new Set();
+      if (session.cachedRealBase) session.verifiedDirs.add(resolvedBase);
+    } else if (!session.cachedRealBase && fs.existsSync(baseDir)) {
+      try {
+        session.cachedRealBase = fs.realpathSync(baseDir);
+        session.verifiedDirs.add(resolvedBase);
+      } catch (e) {}
+    }
+    if (session.verifiedDirs.size > 500) {
+      session.verifiedDirs.clear();
+      if (session.cachedRealBase) session.verifiedDirs.add(resolvedBase);
+    }
+    const realBase = session.cachedRealBase;
+    const pathCtx = { realBase, verifiedDirs: session.verifiedDirs };
 
     /** @type {Array<{ rel: string, abs: string, op: 'upsert' | 'delete', buffer: Buffer | null, hash: string | null, stat: import('fs').Stats | null }>} */
     const prepared = [];
@@ -607,17 +650,29 @@ class LiveSyncEngine extends EventEmitter {
             const prevCached = cache.get(entry.abs);
             if (prevCached) session.fileCacheBytes = Math.max(0, session.fileCacheBytes - prevCached.buf.length);
             if (entry.buffer.length <= 512 * 1024) {
-              if (cache.size >= MAX_SESSION_CACHE_ENTRIES || session.fileCacheBytes + entry.buffer.length > MAX_SESSION_CACHE_BYTES) {
-                cache.clear();
-                session.fileCacheBytes = 0;
+              // Evicción LRU O(1) incremental en lugar de vaciar la caché completa de golpe
+              while (
+                cache.size > 0 &&
+                (cache.size >= MAX_SESSION_CACHE_ENTRIES || session.fileCacheBytes + entry.buffer.length > MAX_SESSION_CACHE_BYTES)
+              ) {
+                const oldestKey = cache.keys().next().value;
+                if (oldestKey === undefined) break;
+                const oldestVal = cache.get(oldestKey);
+                cache.delete(oldestKey);
+                if (oldestVal) session.fileCacheBytes = Math.max(0, session.fileCacheBytes - oldestVal.buf.length);
               }
+              cache.delete(entry.abs);
               cache.set(entry.abs, { buf: entry.buffer, mtimeMs: postStat.mtimeMs, size: postStat.size });
               session.fileCacheBytes += entry.buffer.length;
             } else {
               cache.delete(entry.abs);
             }
             if (entry.hash) {
-              if (merkleFileCache.size >= MAX_MERKLE_CACHE_ENTRIES) merkleFileCache.clear();
+              if (merkleFileCache.size >= MAX_MERKLE_CACHE_ENTRIES) {
+                const oldestMerkle = merkleFileCache.keys().next().value;
+                if (oldestMerkle !== undefined) merkleFileCache.delete(oldestMerkle);
+              }
+              merkleFileCache.delete(entry.abs);
               merkleFileCache.set(entry.abs, { mtimeMs: postStat.mtimeMs, size: postStat.size, hash: entry.hash });
             } else {
               merkleFileCache.delete(entry.abs);

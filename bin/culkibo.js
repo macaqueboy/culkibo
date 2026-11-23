@@ -496,6 +496,8 @@ program
       const result = await svc.deployManager.deploy(project, { gitSync: options.gitSync, trigger: 'cli' });
       if (result.status === 'activo') {
         console.log(`\x1b[32m✅ Despliegue ${result.id} activo en ${result.durationMs} ms (${result.upstream || 'sin ruta'})\x1b[0m`);
+        // Esperar al drenaje para no dejar el contenedor anterior vivo al terminar el proceso CLI
+        await svc.deployManager.awaitDrain(project.id);
       } else {
         console.error(`❌ Despliegue fallido: ${result.error}`);
         process.exit(1);
@@ -518,6 +520,7 @@ program
     try {
       const result = await svc.deployManager.rollback(project.id);
       console.log(`\x1b[32m✅ Rollback completado (${result.id})\x1b[0m`);
+      await svc.deployManager.awaitDrain(project.id);
     } catch (err) {
       console.error(`❌ Error en rollback: ${err.message}`);
       process.exit(1);
@@ -551,6 +554,7 @@ program
     try {
       await runSpawnStep('git', ['pull', '--ff-only'], rootDir);
       await runSpawnStep('npm', ['install', '--no-audit', '--no-fund'], rootDir);
+      await runSpawnStep('npm', ['--prefix', 'web', 'ci', '--no-audit', '--no-fund'], rootDir);
       await runSpawnStep('npm', ['run', 'web:build'], rootDir);
       console.log('\x1b[32m✅ Culkibo actualizado. Reinicia el servicio (p. ej. systemctl restart culkibo) para aplicar cambios.\x1b[0m\n');
     } catch (err) {
@@ -564,6 +568,14 @@ program
   .command('mcp')
   .description('Ejecuta el servidor MCP sobre entrada/salida estándar (stdio)')
   .action(() => {
+    // En transporte MCP stdio, stdout está reservado 100% a tramas JSON-RPC: redirigir logs de servicios a stderr.
+    const toStderr = (...args) => {
+      try { process.stderr.write(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') + '\n'); } catch (e) {}
+    };
+    console.log = toStderr;
+    console.info = toStderr;
+    console.warn = toStderr;
+
     const mcpServer = svc.mcpServer;
     const rl = readline.createInterface({
       input: process.stdin,

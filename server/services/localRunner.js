@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const { assertContainedPath, isPrivateIp, isMetadataIp } = require('./ssrfGuard');
+const portRegistry = require('./portRegistry');
 
 const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
   ? path.resolve(process.env.CULKIBO_DATA_DIR)
@@ -138,6 +139,9 @@ class LocalRunner {
     this.startLocks = new Map(); // projectId -> Promise (serialises concurrent start())
     /** @type {{ mtimeMs: number, token: string | null } | null} */
     this._gitTokenCache = null;
+    portRegistry.registerProvider('localRunner', () =>
+      Array.from(this.activeRunners.values()).map((r) => r && r.port).filter(Boolean)
+    );
   }
 
   /** Resuelve y confina el directorio de un proyecto dentro de `projects/`. */
@@ -301,9 +305,13 @@ class LocalRunner {
       console.warn(`[LocalRunner] Se ignora la petición de liberar el puerto reservado ${numPort}`);
       return;
     }
-    // Nunca matar el puerto de otro runner activo gestionado por Culkibo.
+    // Nunca matar el puerto de otro runner activo ni un puerto reservado por deploy/catálogo/BD.
     for (const runner of this.activeRunners.values()) {
       if (runner && runner.port === numPort) return;
+    }
+    if (portRegistry.isProtectedPort(numPort, 'localRunner')) {
+      console.warn(`[LocalRunner] Se ignora la petición de liberar el puerto ${numPort} (protegido por portRegistry)`);
+      return;
     }
 
     try {
@@ -398,6 +406,10 @@ class LocalRunner {
    * Find an available port starting from desiredPort (never kills unknown host processes).
    */
   async getAvailablePort(desiredPort) {
+    const reservedActive = portRegistry.getAllReservedPorts();
+    for (const r of this.activeRunners.values()) {
+      if (r && r.port) reservedActive.add(Number(r.port));
+    }
     const isPortFree = (port) => new Promise((resolve) => {
       const tester = net.createServer()
         .once('error', () => resolve(false))
@@ -407,7 +419,6 @@ class LocalRunner {
         .listen(port, '0.0.0.0');
     });
 
-    const reservedActive = new Set(Array.from(this.activeRunners.values()).map(r => r && r.port).filter(Boolean));
     let port = Math.max(1024, parseInt(String(desiredPort || 3001), 10) || 3001);
     while (port < 65535) {
       if (port !== this.daemonPort() && !RESERVED_PORTS.has(port) && !reservedActive.has(port) && await isPortFree(port)) {

@@ -68,18 +68,25 @@ export function App() {
   const [importInitialTab, setImportInitialTab] = useState<ImportSourceTab>('wordpress');
   const [importTabTrigger, setImportTabTrigger] = useState(0);
   const [domainWizardTrigger, setDomainWizardTrigger] = useState(0);
+  const [domainWizardPreset, setDomainWizardPreset] = useState<{
+    serviceId?: string;
+    serviceName?: string;
+    targetPort?: number;
+    suggestedHostname?: string;
+  } | null>(null);
   const [createProjectTrigger, setCreateProjectTrigger] = useState(0);
   const [catalogInitialTab, setCatalogInitialTab] = useState<'catalogo' | 'instalados'>('catalogo');
   const [catalogTabTrigger, setCatalogTabTrigger] = useState(0);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   const [wsConnected, setWsConnected] = useState<boolean>(false);
-  const [toast, setToast] = useState<{ msg: string; kind: ToastKind } | null>(null);
+  const [toasts, setToasts] = useState<Array<{ id: number; msg: string; kind: ToastKind }>>([]);
   const [aiPulseLabel, setAiPulseLabel] = useState<string | null>(null);
   const [activeSyncCount, setActiveSyncCount] = useState<number>(0);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastIdRef = useRef(0);
+  const toastTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
   const aiPulseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncClientsByProjectRef = useRef<Map<string, number>>(new Map());
 
@@ -147,10 +154,23 @@ export function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [authenticated]);
 
+  const dismissToast = useCallback((id: number) => {
+    const t = toastTimersRef.current.get(id);
+    if (t) {
+      clearTimeout(t);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
   const showToast = useCallback((msg: string, kind: ToastKind = 'info') => {
-    setToast({ msg, kind });
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => setToast(null), kind === 'error' ? 5500 : 3800);
+    const id = ++toastIdRef.current;
+    setToasts((prev) => [...prev.slice(-2), { id, msg, kind }]);
+    const timer = setTimeout(() => {
+      toastTimersRef.current.delete(id);
+      setToasts((prev) => prev.filter((item) => item.id !== id));
+    }, kind === 'error' ? 5500 : 3800);
+    toastTimersRef.current.set(id, timer);
   }, []);
 
   const [projects, setProjects] = useState<Project[]>([]);
@@ -169,7 +189,8 @@ export function App() {
   }, [authenticated]);
 
   useEffect(() => () => {
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    for (const timer of toastTimersRef.current.values()) clearTimeout(timer);
+    toastTimersRef.current.clear();
     if (aiPulseTimerRef.current) clearTimeout(aiPulseTimerRef.current);
   }, []);
 
@@ -331,7 +352,8 @@ export function App() {
     };
   }, [authenticated, fetchProjects, showToast]);
 
-  const navigate = useCallback((view: AppView) => {
+  const navigate = useCallback((rawView: AppView | 'logs') => {
+    const view: AppView = rawView === 'logs' ? 'global_logs' : rawView;
     setActiveView(view);
     setActiveProjectId(null);
     const nextHash = toHash(view, null);
@@ -363,6 +385,18 @@ export function App() {
     if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
   }, []);
 
+  const openDomainWizardWithPreset = useCallback((preset?: {
+    serviceId?: string;
+    serviceName?: string;
+    targetPort?: number;
+    suggestedHostname?: string;
+  }) => {
+    setActiveProjectId(null);
+    setDomainWizardPreset(preset || null);
+    navigate('domains');
+    setDomainWizardTrigger((c) => c + 1);
+  }, [navigate]);
+
   const handleQuickAction = useCallback((action: 'new_project' | 'wordpress' | 'import' | 'domain') => {
     setActiveProjectId(null);
     if (action === 'new_project') {
@@ -373,10 +407,9 @@ export function App() {
     } else if (action === 'import') {
       openImport('coolify');
     } else if (action === 'domain') {
-      navigate('domains');
-      setDomainWizardTrigger((c) => c + 1);
+      openDomainWizardWithPreset();
     }
-  }, [navigate, openImport]);
+  }, [navigate, openImport, openDomainWizardWithPreset]);
 
   if (!authChecked) {
     return (
@@ -412,32 +445,39 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 selection:bg-slate-900 selection:text-white flex flex-col font-sans">
-      {toast && (
+      {toasts.length > 0 && (
         <div
-          role="status"
           aria-live="polite"
-          className={`fixed bottom-5 right-5 z-50 max-w-sm flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg bg-white border text-xs font-medium shadow-lg ${
-            toast.kind === 'error'
-              ? 'border-red-200 text-red-800'
-              : toast.kind === 'success'
-                ? 'border-emerald-200 text-emerald-900'
-                : 'border-slate-200 text-slate-900'
-          }`}
+          className="fixed bottom-5 right-5 z-50 flex flex-col gap-2 items-end pointer-events-none"
         >
-          <span
-            className={`w-2 h-2 rounded-full shrink-0 ${
-              toast.kind === 'error' ? 'bg-red-500' : toast.kind === 'success' ? 'bg-emerald-500' : 'bg-slate-900'
-            }`}
-          />
-          <span className="leading-snug">{toast.msg}</span>
-          <button
-            type="button"
-            onClick={() => setToast(null)}
-            aria-label="Cerrar aviso"
-            className="ml-1 p-0.5 text-slate-400 hover:text-slate-700 rounded cursor-pointer shrink-0"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
+          {toasts.map((item) => (
+            <div
+              key={item.id}
+              role="status"
+              className={`culkibo-modal-enter pointer-events-auto max-w-sm flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg bg-white border text-xs font-medium shadow-lg ${
+                item.kind === 'error'
+                  ? 'border-red-200 text-red-800'
+                  : item.kind === 'success'
+                    ? 'border-emerald-200 text-emerald-900'
+                    : 'border-slate-200 text-slate-900'
+              }`}
+            >
+              <span
+                className={`w-2 h-2 rounded-full shrink-0 ${
+                  item.kind === 'error' ? 'bg-red-500' : item.kind === 'success' ? 'bg-emerald-500' : 'bg-slate-900'
+                }`}
+              />
+              <span className="leading-snug">{item.msg}</span>
+              <button
+                type="button"
+                onClick={() => dismissToast(item.id)}
+                aria-label="Cerrar aviso"
+                className="ml-1 p-0.5 text-slate-400 hover:text-slate-700 rounded cursor-pointer shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
         </div>
       )}
 
@@ -500,7 +540,7 @@ export function App() {
                   }
                 }}
                 onOpenCatalogInstalled={() => openCatalog('instalados')}
-                onOpenDomains={() => navigate('domains')}
+                onOpenDomains={(preset) => openDomainWizardWithPreset(preset)}
                 onNotify={showToast}
               />
             )}
@@ -509,6 +549,8 @@ export function App() {
               <DomainManager
                 onNotify={showToast}
                 wizardTrigger={domainWizardTrigger}
+                wizardPreset={domainWizardPreset}
+                onClearWizardPreset={() => setDomainWizardPreset(null)}
               />
             )}
 

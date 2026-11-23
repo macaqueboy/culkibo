@@ -312,7 +312,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
   return (
     <div className="space-y-5 max-w-5xl mx-auto">
       <div>
-        <h1 className="text-xl font-semibold text-slate-900 tracking-tight">Ajustes</h1>
+        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Ajustes</h1>
         <p className="text-sm text-slate-500 mt-1">
           Acceso remoto, integraciones externas, alertas y mantenimiento del servidor.
         </p>

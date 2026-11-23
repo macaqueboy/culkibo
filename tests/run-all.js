@@ -18,6 +18,7 @@ const testCompetitorBenchmarks = require('./competitor-benchmarks.test');
 const testSecurityHardening = require('./security-hardening.test');
 const testImporters = require('./importers.test');
 const testMetricsAndBugs = require('./metrics-and-bugs.test');
+const testScaleAndWildcard = require('./scale-and-wildcard.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -60,6 +61,7 @@ async function runAll() {
     { name: 'Security Hardening (SSRF, Proxy Loopback, Symlinks, Redaction)', fn: testSecurityHardening },
     { name: 'WordPress Migrator & Universal Importer (Compose/Git/Platforms)', fn: testImporters },
     { name: 'Observability, Prometheus, Doctor & Bug Regressions', fn: testMetricsAndBugs },
+    { name: 'Scale, Multi-Wildcard SSL, Build Semaphore & Fast-Path', fn: testScaleAndWildcard },
     { name: 'Competitor Benchmarks & Parity Verification', fn: testCompetitorBenchmarks }
   ];
 

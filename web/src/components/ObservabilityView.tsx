@@ -50,11 +50,24 @@ interface SparklineCardProps {
   title: string;
   value: string;
   unit?: string;
-  subtitle: string;
+  detailLine: string;
+  footerLine: string;
   points: number[];
+  timestamps?: number[];
+  accent?: 'ink' | 'amber';
 }
 
-const SparklineCard: React.FC<SparklineCardProps> = ({ title, value, unit, subtitle, points }) => {
+const SparklineCard: React.FC<SparklineCardProps> = ({
+  title,
+  value,
+  unit,
+  detailLine,
+  footerLine,
+  points,
+  timestamps = [],
+  accent = 'ink',
+}) => {
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const width = 260;
   const height = 56;
   const padY = 6;
@@ -66,36 +79,79 @@ const SparklineCard: React.FC<SparklineCardProps> = ({ title, value, unit, subti
   const coords = values.map((v, i) => {
     const x = (i / Math.max(1, values.length - 1)) * width;
     const y = height - padY - ((v - minVal) / span) * (height - padY * 2);
-    return { x, y };
+    return { x, y, v };
   });
 
   const linePath = coords.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
   const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
 
+  const activePoint = hoverIdx !== null && coords[hoverIdx] ? coords[hoverIdx] : null;
+  const displayValue = activePoint
+    ? (activePoint.v < 10 ? activePoint.v.toFixed(2) : activePoint.v.toFixed(1))
+    : value;
+  const hoverTime = hoverIdx !== null && timestamps[hoverIdx]
+    ? new Date(timestamps[hoverIdx]).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : null;
+
+  const strokeColor = accent === 'amber' ? '#d97706' : '#18181b';
+  const fillColor = accent === 'amber' ? 'rgb(217 119 6 / 0.08)' : 'rgb(24 24 27 / 0.05)';
+
   return (
     <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-xs font-medium text-slate-500">{title}</span>
-        <span className="text-xs text-slate-400 tabular-nums">
-          máx {maxVal < 10 ? maxVal.toFixed(1) : Math.round(maxVal)}{unit ? ` ${unit}` : ''}
+        <span className="text-[11px] text-slate-400 tabular-nums">
+          {hoverTime ? hoverTime : `máx ${maxVal < 10 ? maxVal.toFixed(1) : Math.round(maxVal)}${unit ? ` ${unit}` : ''}`}
         </span>
       </div>
       <div className="mt-1 flex items-baseline gap-1.5">
-        <span className="text-xl font-semibold text-slate-900 tracking-tight tabular-nums">{value}</span>
+        <span className="text-2xl font-semibold text-slate-900 tracking-tight tabular-nums">{displayValue}</span>
         {unit && <span className="text-xs font-medium text-slate-500">{unit}</span>}
       </div>
+      <p className="text-[11px] text-slate-500 mt-0.5 truncate tabular-nums">{detailLine}</p>
       <div className="mt-3">
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          className="w-full h-14 overflow-visible"
+          className="w-full h-14 overflow-visible cursor-crosshair"
           role="img"
           aria-label={`Tendencia de ${title}`}
+          onMouseLeave={() => setHoverIdx(null)}
+          onMouseMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            if (!rect.width) return;
+            const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            const idx = Math.round(ratio * (coords.length - 1));
+            setHoverIdx(idx);
+          }}
         >
-          <path d={areaPath} fill="rgb(24 24 27 / 0.05)" />
-          <path d={linePath} fill="none" stroke="#18181b" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+          <path d={areaPath} fill={fillColor} />
+          <path
+            d={linePath}
+            fill="none"
+            stroke={strokeColor}
+            strokeWidth="1.6"
+            vectorEffect="non-scaling-stroke"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+          {activePoint && (
+            <>
+              <line
+                x1={activePoint.x}
+                y1={0}
+                x2={activePoint.x}
+                y2={height}
+                stroke="#cbd5e1"
+                strokeWidth="1"
+                strokeDasharray="2 2"
+                vectorEffect="non-scaling-stroke"
+              />
+              <circle cx={activePoint.x} cy={activePoint.y} r="3.2" fill={strokeColor} stroke="#ffffff" strokeWidth="1.5" />
+            </>
+          )}
         </svg>
       </div>
-      <p className="text-[11px] text-slate-500 mt-2 truncate tabular-nums">{subtitle}</p>
+      <p className="text-[11px] text-slate-400 mt-2 truncate tabular-nums">{footerLine}</p>
     </div>
   );
 };
@@ -175,7 +231,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   useEffect(() => {
     if (!autoRefresh) return;
     const timer = window.setInterval(() => {
-      loadSnapshot(false);
+      void loadSnapshot(false);
     }, 5000);
     return () => window.clearInterval(timer);
   }, [autoRefresh, loadSnapshot]);
@@ -220,15 +276,16 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   };
 
   const history: ObservabilityHistoryPoint[] = snapshot?.history || [];
+  const timestamps = history.map((h) => h.ts);
 
   return (
     <div className="space-y-6">
       {/* Cabecera */}
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold text-slate-900 tracking-tight">Métricas y salud</h1>
+          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Métricas y salud</h1>
           <p className="text-sm text-slate-500 mt-1">
-            Telemetría en vivo del plano de control, bucle de eventos, Caddy y diagnóstico automático en un clic.
+            Telemetría real del plano de control, bucle de eventos, Caddy y diagnóstico con corrección automática.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -256,7 +313,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
             type="button"
             onClick={() => {
               setRefreshing(true);
-              loadSnapshot(true);
+              void loadSnapshot(true);
             }}
             disabled={refreshing}
             className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
@@ -272,7 +329,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
           <span>{error}</span>
           <button
             type="button"
-            onClick={() => loadSnapshot(true)}
+            onClick={() => void loadSnapshot(true)}
             className="text-xs font-medium underline hover:no-underline cursor-pointer"
           >
             Reintentar
@@ -280,89 +337,56 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
         </div>
       )}
 
-      {/* Tira compacta de KPIs reales */}
-      <div className="bg-white border border-slate-200 rounded-xl grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200">
-        <div className="p-4">
-          <div className="text-xs font-medium text-slate-500">Latencia HTTP (p95)</div>
-          <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
-            {loading ? '—' : formatMs(snapshot?.http?.latencyMs?.p95)}
-          </div>
-          <div className="text-xs text-slate-500 mt-1 tabular-nums">
-            p50 {formatMs(snapshot?.http?.latencyMs?.p50)} · p99 {formatMs(snapshot?.http?.latencyMs?.p99)}
-          </div>
-        </div>
-        <div className="p-4">
-          <div className="text-xs font-medium text-slate-500">Tráfico del panel</div>
-          <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
-            {loading ? '—' : `${(snapshot?.http?.rps?.rps10s ?? 0).toFixed(1)} req/s`}
-          </div>
-          <div className="text-xs text-slate-500 mt-1 tabular-nums">
-            {snapshot
-              ? `${snapshot.http?.requestsTotal ?? 0} totales · ${snapshot.http?.status?.['5xx'] ?? 0} errores 5xx`
-              : 'Sin muestras aún'}
-          </div>
-        </div>
-        <div className="p-4">
-          <div className="text-xs font-medium text-slate-500">Huella del proceso</div>
-          <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
-            {loading ? '—' : `${snapshot?.process?.memoryMb ?? 0} MB`}
-          </div>
-          <div className="text-xs text-slate-500 mt-1 tabular-nums">
-            {snapshot
-              ? `Heap ${snapshot.process?.heapUsedMb ?? 0} MB · Activo ${formatUptime(snapshot.process?.uptimeSeconds ?? snapshot.uptimeSeconds ?? 0)}`
-              : 'Midiendo…'}
-          </div>
-        </div>
-        <div className="p-4">
-          <div className="text-xs font-medium text-slate-500">Bucle de eventos y arranque</div>
-          <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
-            {loading ? '—' : formatMs(snapshot?.eventLoop?.p95Ms)}
-          </div>
-          <div className="text-xs text-slate-500 mt-1 tabular-nums">
-            {snapshot
-              ? `${snapshot.bootMs != null ? `Arranque ${snapshot.bootMs} ms · ` : ''}${snapshot.process?.nodeVersion || 'Node'}`
-              : '—'}
-          </div>
-        </div>
-      </div>
-
-      {/* Gráficas sparkline de los últimos 5 minutos */}
+      {/* 4 tarjetas unificadas de métricas + sparklines interactivos (cero KPIs duplicados) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <SparklineCard
-          title="Peticiones por segundo"
-          value={(snapshot?.http?.rps?.rps10s ?? 0).toFixed(1)}
-          unit="req/s"
-          subtitle={`1 s: ${(snapshot?.http?.rps?.rps1s ?? 0).toFixed(1)} · 60 s: ${(snapshot?.http?.rps?.rps60s ?? 0).toFixed(2)}`}
-          points={history.map((h) => h.rps)}
-        />
-        <SparklineCard
-          title="Latencia HTTP p95"
-          value={snapshot?.http?.latencyMs?.p95 != null ? snapshot.http.latencyMs.p95.toFixed(1) : '0.0'}
+          title="Latencia HTTP (p95)"
+          value={loading ? '—' : (snapshot?.http?.latencyMs?.p95 != null ? (snapshot.http.latencyMs.p95 < 10 ? snapshot.http.latencyMs.p95.toFixed(2) : snapshot.http.latencyMs.p95.toFixed(1)) : '0.00')}
           unit="ms"
-          subtitle={`En curso: ${snapshot?.http?.inFlight ?? 0} · 4xx: ${snapshot?.http?.status?.['4xx'] ?? 0}`}
+          detailLine={`p50 ${formatMs(snapshot?.http?.latencyMs?.p50)} · p99 ${formatMs(snapshot?.http?.latencyMs?.p99)}`}
+          footerLine={`En curso: ${snapshot?.http?.inFlight ?? 0} · 4xx: ${snapshot?.http?.status?.['4xx'] ?? 0} · 5xx: ${snapshot?.http?.status?.['5xx'] ?? 0}`}
           points={history.map((h) => h.p95Ms)}
+          timestamps={timestamps}
+          accent="amber"
         />
         <SparklineCard
-          title="Memoria RSS"
-          value={String(snapshot?.process?.memoryMb ?? 0)}
+          title="Tráfico del panel"
+          value={loading ? '—' : (snapshot?.http?.rps?.rps10s ?? 0).toFixed(1)}
+          unit="req/s"
+          detailLine={`${snapshot?.http?.requestsTotal ?? 0} peticiones totales registradas`}
+          footerLine={`1 s: ${(snapshot?.http?.rps?.rps1s ?? 0).toFixed(1)} · 60 s: ${(snapshot?.http?.rps?.rps60s ?? 0).toFixed(2)} req/s`}
+          points={history.map((h) => h.rps)}
+          timestamps={timestamps}
+        />
+        <SparklineCard
+          title="Memoria RSS del proceso"
+          value={loading ? '—' : String(snapshot?.process?.memoryMb ?? 0)}
           unit="MB"
-          subtitle={
+          detailLine={`Heap ${snapshot?.process?.heapUsedMb ?? 0} MB · Activo ${formatUptime(snapshot?.process?.uptimeSeconds ?? snapshot?.uptimeSeconds ?? 0)}`}
+          footerLine={
             snapshot?.process
               ? `Host libre: ${snapshot.process.hostMemoryFreeMb ?? Math.max(0, (snapshot.process.hostMemoryTotalMb || 0) - (snapshot.process.hostMemoryUsedMb || 0))} / ${snapshot.process.hostMemoryTotalMb ?? 0} MB`
               : 'Midiendo memoria del host'
           }
           points={history.map((h) => h.rssMb)}
+          timestamps={timestamps}
         />
         <SparklineCard
-          title="Retardo Event Loop"
-          value={snapshot?.eventLoop?.p95Ms != null ? snapshot.eventLoop.p95Ms.toFixed(1) : '0.0'}
+          title="Bucle de eventos (p95)"
+          value={loading ? '—' : (snapshot?.eventLoop?.p95Ms != null ? snapshot.eventLoop.p95Ms.toFixed(1) : '0.0')}
           unit="ms"
-          subtitle={
+          detailLine={
+            snapshot
+              ? `${snapshot.bootMs != null ? `Arranque ${snapshot.bootMs} ms · ` : ''}${snapshot.process?.nodeVersion || 'Node.js'}`
+              : 'Midiendo arranque'
+          }
+          footerLine={
             snapshot?.eventLoop?.utilizationRatio != null
-              ? `Uso bucle: ${(snapshot.eventLoop.utilizationRatio * 100).toFixed(1)}%`
+              ? `Uso del bucle: ${(snapshot.eventLoop.utilizationRatio * 100).toFixed(1)}%`
               : 'Midiendo utilización'
           }
           points={history.map((h) => h.elLagMs)}
+          timestamps={timestamps}
         />
       </div>
 
@@ -397,7 +421,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
             )}
             <button
               type="button"
-              onClick={() => loadDoctor(true)}
+              onClick={() => void loadDoctor(true)}
               disabled={doctorRunning}
               className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
             >
@@ -430,7 +454,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                 {check.fixAction && check.fixLabel && (
                   <button
                     type="button"
-                    onClick={() => handleFix(check)}
+                    onClick={() => void handleFix(check)}
                     disabled={fixingAction !== null}
                     className="shrink-0 self-start sm:self-center px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-900 hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
                   >
@@ -449,7 +473,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
         <section className="lg:col-span-2 bg-white border border-slate-200 rounded-xl overflow-hidden">
           <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900">Rutas más activas</h2>
-            <span className="text-xs text-slate-500 font-mono">GET /metrics (Prometheus)</span>
+            <span className="text-xs text-slate-500 font-mono">GET /metrics</span>
           </div>
           {!snapshot || !snapshot.http?.topRoutes?.length ? (
             <div className="p-6 text-sm text-slate-500 text-center">Sin tráfico registrado todavía.</div>
@@ -484,7 +508,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
         <section className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
           <div>
             <h2 className="text-sm font-semibold text-slate-900">Plano de datos y tiempo real</h2>
-            <p className="text-xs text-slate-500 mt-0.5">Conexiones WebSocket, Live Sync y conmutación Caddy.</p>
+            <p className="text-xs text-slate-500 mt-0.5">WebSocket, Live Sync y conmutación atómica Caddy.</p>
           </div>
           <dl className="space-y-2.5 text-xs">
             <div className="flex items-center justify-between py-1.5 border-b border-slate-100">

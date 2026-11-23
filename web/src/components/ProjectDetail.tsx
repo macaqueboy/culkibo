@@ -29,8 +29,8 @@ import {
   Power,
   Rocket,
   ArrowLeft,
-  Boxes,
   Activity,
+  PauseCircle,
 } from 'lucide-react';
 import { api, type Project } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
@@ -122,6 +122,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
 
   const [prevProjectId, setPrevProjectId] = useState(projectId);
   const lastEnvJsonRef = useRef<string>('');
+  const reqIdRef = useRef(0);
+  const [togglingMaintenance, setTogglingMaintenance] = useState(false);
 
   if (prevProjectId !== projectId) {
     setPrevProjectId(projectId);
@@ -137,29 +139,33 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   }, []);
 
   const fetchProject = useCallback(async () => {
+    const myReq = ++reqIdRef.current;
     try {
       setLoadError(null);
       const found = await api.getProject(projectId);
+      if (myReq !== reqIdRef.current) return;
       if (found) {
         setProject(found);
         syncEnvState(found.envVars);
       }
     } catch (e: any) {
+      if (myReq !== reqIdRef.current) return;
       setLoadError(e?.message || 'No se pudo cargar el proyecto');
     }
   }, [projectId, syncEnvState]);
 
   useEffect(() => {
     let active = true;
+    const myReq = ++reqIdRef.current;
     api.getProject(projectId)
       .then((found) => {
-        if (!active || !found) return;
+        if (!active || myReq !== reqIdRef.current || !found) return;
         setProject(found);
         setLoadError(null);
         syncEnvState(found.envVars);
       })
       .catch((e: any) => {
-        if (active) setLoadError(e?.message || 'Proyecto no encontrado');
+        if (active && myReq === reqIdRef.current) setLoadError(e?.message || 'Proyecto no encontrado');
       });
     return () => { active = false; };
   }, [projectId, syncEnvState]);
@@ -433,123 +439,168 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     { id: 'config', label: 'Configuración', icon: Settings },
   ] as const;
 
+  const handleToggleMaintenance = async () => {
+    const nextEnabled = !project.maintenanceMode;
+    setTogglingMaintenance(true);
+    try {
+      const res = await api.toggleMaintenance(project.id, nextEnabled);
+      if (res.project) setProject(res.project);
+      else await fetchProject();
+      onNotify(
+        nextEnabled
+          ? 'Modo mantenimiento activado (<10 ms en Caddy): el tráfico público recibe 503.'
+          : 'Modo mantenimiento desactivado: tráfico restaurado en Caddy.',
+        nextEnabled ? 'info' : 'success'
+      );
+      onProjectUpdate?.();
+    } catch (e: any) {
+      onNotify(e?.message || 'No se pudo cambiar el modo mantenimiento', 'error');
+    } finally {
+      setTogglingMaintenance(false);
+    }
+  };
+
   const domainCount = (project.domains || []).length;
+  const monogramWords = (project.name || 'PR').replace(/[^a-zA-Z0-9\s-]/g, ' ').split(/[\s-]+/).filter(Boolean);
+  const monogram = monogramWords.length >= 2
+    ? `${monogramWords[0][0]}${monogramWords[1][0]}`.toUpperCase()
+    : (monogramWords[0] || 'PR').slice(0, 2).toUpperCase();
 
   return (
     <div className="space-y-5">
-      {/* Cabecera del proyecto */}
-      <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex items-start gap-3 min-w-0">
-            <button
-              type="button"
-              onClick={onBack}
-              aria-label="Volver a proyectos"
-              className="mt-0.5 p-2 rounded-lg border border-slate-200 text-slate-500 hover:text-slate-900 hover:bg-slate-50 transition-colors cursor-pointer shrink-0"
-              title="Volver a proyectos"
-            >
-              <ArrowLeft className="w-4 h-4" />
-            </button>
-            <div className="w-10 h-10 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
-              <Boxes className="w-5 h-5" />
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-lg font-semibold text-slate-900 tracking-tight truncate">{project.name}</h1>
-                <span
-                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${
-                    project.status === 'active'
+      {/* Cabecera limpia directamente sobre el lienzo */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="flex items-start gap-3 min-w-0">
+          <button
+            type="button"
+            onClick={onBack}
+            aria-label="Volver a proyectos"
+            className="mt-1 p-2 rounded-lg border border-slate-200 bg-white text-slate-500 hover:text-slate-900 hover:bg-slate-50 transition-colors cursor-pointer shrink-0"
+            title="Volver a proyectos"
+          >
+            <ArrowLeft className="w-4 h-4" />
+          </button>
+          <span
+            aria-hidden="true"
+            className="mt-0.5 w-10 h-10 rounded-lg bg-slate-900 text-white font-mono text-xs font-semibold flex items-center justify-center shrink-0"
+          >
+            {monogram}
+          </span>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="text-2xl font-semibold text-slate-900 tracking-tight truncate">{project.name}</h1>
+              <span
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${
+                  project.maintenanceMode
+                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                    : project.status === 'active'
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                       : 'bg-slate-100 text-slate-600 border-slate-200'
-                  }`}
-                >
-                  <span className={`w-1.5 h-1.5 rounded-full ${project.status === 'active' ? 'bg-emerald-500' : 'bg-slate-400'}`} />
-                  {project.status === 'active' ? 'Activo' : project.status === 'hibernated' ? 'Hibernado' : 'Detenido'}
+                }`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${
+                  project.maintenanceMode ? 'bg-amber-500' : project.status === 'active' ? 'bg-emerald-500' : 'bg-slate-400'
+                }`} />
+                {project.maintenanceMode ? 'Mantenimiento (503)' : project.status === 'active' ? 'Activo' : project.status === 'hibernated' ? 'Hibernado' : 'Detenido'}
+              </span>
+              {project.localRunning && project.localPort && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium bg-amber-50 text-amber-800 border border-amber-200 tabular-nums">
+                  <Zap className="w-3 h-3 text-amber-600" /> Local :{project.localPort}
                 </span>
-                {project.localRunning && project.localPort && (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium bg-amber-50 text-amber-800 border border-amber-200 tabular-nums">
-                    <Zap className="w-3 h-3 text-amber-600" /> Local :{project.localPort}
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-slate-500 mt-0.5">
-                {project.description || 'Sin descripción configurada.'}
-                {project.lastDeployedAt && (
-                  <span className="ml-2 text-slate-400 tabular-nums">
-                    · Último despliegue: {new Date(project.lastDeployedAt).toLocaleDateString('es-ES')}
-                  </span>
-                )}
-              </p>
+              )}
             </div>
+            <p className="text-xs text-slate-500 mt-1">
+              {project.description || 'Sin descripción configurada.'}
+              {project.lastDeployedAt && (
+                <span className="ml-2 text-slate-400 tabular-nums">
+                  · Último despliegue: {new Date(project.lastDeployedAt).toLocaleDateString('es-ES')}
+                </span>
+              )}
+            </p>
           </div>
+        </div>
 
-          <div className="flex items-center gap-2 flex-wrap shrink-0">
-            {project.localRunning && project.localPort ? (
-              <a
-                href={`http://${previewHost}:${project.localPort}`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 px-3 py-2 rounded-lg text-xs font-medium border border-amber-200 tabular-nums"
-              >
-                <Globe className="w-3.5 h-3.5 text-amber-600" /> Abrir :{project.localPort}
-              </a>
-            ) : (
+        <div className="flex items-center gap-2 flex-wrap shrink-0">
+          {project.localRunning && project.localPort ? (
+            <a
+              href={`http://${previewHost}:${project.localPort}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 px-3 py-2 rounded-lg text-xs font-medium border border-amber-200 tabular-nums"
+            >
+              <Globe className="w-3.5 h-3.5 text-amber-600" /> Abrir :{project.localPort}
+            </a>
+          ) : (
+            <button
+              type="button"
+              onClick={handleStart}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <Play className="w-3.5 h-3.5" /> Iniciar local
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => void handleToggleMaintenance()}
+            disabled={togglingMaintenance}
+            title="Activa o desactiva una página 503 atómica en Caddy en menos de 10 ms"
+            className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer disabled:opacity-50 ${
+              project.maintenanceMode
+                ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <PauseCircle className={`w-3.5 h-3.5 ${project.maintenanceMode ? 'text-amber-600' : 'text-slate-500'}`} />
+            {project.maintenanceMode ? 'Salir de mantenimiento' : 'Mantenimiento'}
+          </button>
+
+          {project.status === 'active' || project.localRunning ? (
+            <>
               <button
                 type="button"
-                onClick={handleStart}
+                onClick={handleStop}
                 disabled={loading}
-                className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
               >
-                <Play className="w-3.5 h-3.5" /> Iniciar local
+                <Square className="w-3 h-3 fill-red-600 text-red-600" /> Detener
               </button>
-            )}
-
-            {project.status === 'active' || project.localRunning ? (
-              <>
-                <button
-                  type="button"
-                  onClick={handleStop}
-                  disabled={loading}
-                  className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-                >
-                  <Square className="w-3 h-3 fill-red-600 text-red-600" /> Detener
-                </button>
-                <button
-                  type="button"
-                  onClick={handleHibernate}
-                  disabled={loading}
-                  className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-                >
-                  <Moon className="w-3.5 h-3.5 text-slate-500" /> Hibernar
-                </button>
-              </>
-            ) : (
               <button
                 type="button"
-                onClick={handleActivate}
+                onClick={handleHibernate}
                 disabled={loading}
                 className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
               >
-                <Power className="w-3.5 h-3.5 text-emerald-600" /> Activar
+                <Moon className="w-3.5 h-3.5 text-slate-500" /> Hibernar
               </button>
-            )}
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={handleActivate}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <Power className="w-3.5 h-3.5 text-emerald-600" /> Activar
+            </button>
+          )}
 
-            {project.domains && project.domains.length > 0 && (
-              <a
-                href={`https://${project.domains[0]}`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors"
-              >
-                <Globe className="w-3.5 h-3.5 text-slate-500" /> Ver web
-              </a>
-            )}
-          </div>
+          {project.domains && project.domains.length > 0 && (
+            <a
+              href={`https://${project.domains[0]}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors"
+            >
+              <Globe className="w-3.5 h-3.5 text-slate-500" /> Ver web
+            </a>
+          )}
         </div>
       </div>
 
       {/* Pestañas */}
-      <div className="flex border-b border-slate-200 gap-4 px-1 overflow-x-auto">
+      <div className="flex border-b border-slate-200 gap-4 px-1 overflow-x-auto no-scrollbar">
         {tabs.map((t) => (
           <button
             key={t.id}
@@ -817,7 +868,13 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
         )}
 
         {activeTab === 'databases' && (
-          <DatabasesPanel projectId={project.id} onNotify={onNotify} />
+          <DatabasesPanel
+            projectId={project.id}
+            linkedDatabaseIds={project.linkedDatabaseIds || []}
+            onProjectChanged={() => { void fetchProject(); }}
+            onOpenDeployments={() => setActiveTab('deployments')}
+            onNotify={onNotify}
+          />
         )}
 
         {activeTab === 'vars' && (
@@ -1121,6 +1178,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   e.preventDefault();
                   const formData = new FormData(e.currentTarget);
                   const wp = (formData.get('watchPaths') as string) || '';
+                  const memRaw = Number(formData.get('memoryMb'));
+                  const cpuRaw = String(formData.get('cpus') || '').trim();
                   const updates = {
                     name: formData.get('name'),
                     description: formData.get('description'),
@@ -1130,6 +1189,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     startCommand: formData.get('startCommand'),
                     baseDirectory: formData.get('baseDirectory'),
                     watchPaths: wp.split(',').map((s) => s.trim()).filter(Boolean),
+                    ...(Number.isFinite(memRaw) && memRaw >= 64 ? { memoryMb: memRaw } : {}),
+                    ...(cpuRaw ? { cpus: cpuRaw } : {}),
+                    autoRollback: formData.get('autoRollback') === 'on',
                   };
                   try {
                     await api.updateProject(projectId, updates);
@@ -1174,6 +1236,25 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">Comando de inicio</label>
                     <input name="startCommand" defaultValue={project.startCommand} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="npm start" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Límite de memoria (MB)</label>
+                    <input name="memoryMb" type="number" min={64} max={65536} defaultValue={project.memoryMb || 512} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono tabular-nums" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Límite de CPU (vCPU)</label>
+                    <input name="cpus" defaultValue={String(project.cpus ?? '1')} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono tabular-nums" placeholder="1.0" />
+                  </div>
+                  <div className="sm:col-span-2 pt-1">
+                    <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        name="autoRollback"
+                        defaultChecked={Boolean(project.autoRollback)}
+                        className="rounded border-slate-300 accent-slate-900"
+                      />
+                      <span>Reversión automática si el contenedor cae por OOM o entra en bucle de reinicios</span>
+                    </label>
                   </div>
                 </div>
                 <div className="flex justify-end pt-3 border-t border-slate-100">

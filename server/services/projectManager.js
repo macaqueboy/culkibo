@@ -20,7 +20,8 @@ class ProjectManager extends EventEmitter {
     this._batchingFlush = null;
     /** @type {Buffer | null} */
     this._serializedAll = null;
-    /** @type {Map<string, string>} */
+    this._version = 1;
+    /** @type {Map<string, { str: string, buf: Buffer, etag: string }>} */
     this._projectJsonCache = new Map();
     this.ensureDataDir();
     this.loadProjects();
@@ -108,6 +109,7 @@ class ProjectManager extends EventEmitter {
   /** @param {string | null} [changedId] */
   invalidateCache(changedId = null) {
     this._serializedAll = null;
+    this._version++;
     if (changedId) this._projectJsonCache.delete(changedId);
     else this._projectJsonCache.clear();
   }
@@ -244,9 +246,10 @@ class ProjectManager extends EventEmitter {
       const now = Date.now();
       if (now - this._lastBackupAt > 5000) {
         this._lastBackupAt = now;
-        fs.promises.copyFile(this.dataPath, `${this.dataPath}.bak`)
-          .then(() => fs.promises.chmod(`${this.dataPath}.bak`, 0o600).catch(() => {}))
-          .catch(() => {});
+        try {
+          await fs.promises.copyFile(this.dataPath, `${this.dataPath}.bak`);
+          await fs.promises.chmod(`${this.dataPath}.bak`, 0o600).catch(() => {});
+        } catch (e) {}
       }
     } catch (err) {
       console.error('Error flushing projects to disk:', err);
@@ -254,9 +257,6 @@ class ProjectManager extends EventEmitter {
         try { await fs.promises.unlink(tempPath); } catch (e) {}
       }
     }
-    // Sin `finally` con reentrada: la serialización la garantiza la cadena de
-    // flushToDisk(). Volver a llamarse a sí misma desde aquí era lo que hacía
-    // imposible saber cuándo había terminado de verdad una escritura.
   }
 
   getAll() {
@@ -275,18 +275,43 @@ class ProjectManager extends EventEmitter {
       for (const [id, proj] of this.projects.entries()) {
         let entry = this._projectJsonCache.get(id);
         if (entry === undefined) {
-          entry = JSON.stringify(proj);
+          const str = JSON.stringify(proj);
+          const buf = Buffer.from(str, 'utf8');
+          entry = { str, buf, etag: `W/"p-${id}-${this._version}-${buf.length}"` };
           this._projectJsonCache.set(id, entry);
         }
-        parts.push(entry);
+        parts.push(entry.str);
       }
       this._serializedAll = Buffer.from(`[${parts.join(',')}]`, 'utf8');
     }
     return this._serializedAll;
   }
 
+  getAllEtag() {
+    const buf = this.getAllSerialized();
+    return `W/"pa-${this._version}-${buf.length}"`;
+  }
+
   getById(id) {
     return this.projects.get(id);
+  }
+
+  /**
+   * Entrada JSON pre-serializada `{ str, buf, etag }` por proyecto (O(1) en lecturas repetidas).
+   * @param {string} id
+   * @returns {{ str: string, buf: Buffer, etag: string } | null}
+   */
+  getByIdSerializedEntry(id) {
+    const proj = this.projects.get(id);
+    if (!proj) return null;
+    let cached = this._projectJsonCache.get(id);
+    if (cached === undefined) {
+      const str = JSON.stringify(proj);
+      const buf = Buffer.from(str, 'utf8');
+      cached = { str, buf, etag: `W/"p-${id}-${this._version}-${buf.length}"` };
+      this._projectJsonCache.set(id, cached);
+    }
+    return cached;
   }
 
   /**
@@ -295,14 +320,8 @@ class ProjectManager extends EventEmitter {
    * @returns {string | null}
    */
   getByIdSerialized(id) {
-    const proj = this.projects.get(id);
-    if (!proj) return null;
-    let cached = this._projectJsonCache.get(id);
-    if (cached === undefined) {
-      cached = JSON.stringify(proj);
-      this._projectJsonCache.set(id, cached);
-    }
-    return cached;
+    const entry = this.getByIdSerializedEntry(id);
+    return entry ? entry.str : null;
   }
 
   /**
@@ -373,16 +392,16 @@ class ProjectManager extends EventEmitter {
     if (!project) throw new Error('Project not found');
     
     const wasActive = project.status === 'active';
-    const oldWatchPaths = JSON.stringify(project.watchPaths || []);
-    
+    const watchPathsChanged = wasActive && safeData.watchPaths !== undefined &&
+      JSON.stringify(project.watchPaths || []) !== JSON.stringify(safeData.watchPaths || []);
+
     Object.assign(project, safeData, { id, updatedAt: new Date().toISOString() });
     const updatedProject = new Project(project);
     this.projects.set(id, updatedProject);
     this.saveProjects(id);
 
-    const newWatchPaths = JSON.stringify(updatedProject.watchPaths || []);
-    if (wasActive && newWatchPaths !== oldWatchPaths) {
-      const projectDir = path.join(process.cwd(), 'projects', id);
+    if (watchPathsChanged) {
+      const projectDir = path.join(process.env.CULKIBO_DATA_DIR || process.cwd(), 'projects', id);
       if (!fs.existsSync(projectDir)) {
         fs.mkdirSync(projectDir, { recursive: true });
       }
@@ -396,9 +415,7 @@ class ProjectManager extends EventEmitter {
   delete(id) {
     const project = this.projects.get(id);
     if (project && project.status === 'active') {
-      // Detener el watcher directamente sin hacer un flush intermedio de hibernación
-      // que se sobrescribiría un microsegundo después al borrar el proyecto.
-      const projectDir = path.join(process.cwd(), 'projects', id);
+      const projectDir = path.join(process.env.CULKIBO_DATA_DIR || process.cwd(), 'projects', id);
       containerOrchestrator.stopWatching(projectDir);
     }
     const result = this.projects.delete(id);
@@ -410,7 +427,7 @@ class ProjectManager extends EventEmitter {
   activate(id) {
     const project = this.projects.get(id);
     if (!project) throw new Error('Project not found');
-    
+
     project.status = 'active';
     project.updatedAt = new Date().toISOString();
     if (project.resources && Array.isArray(project.resources)) {
@@ -419,14 +436,7 @@ class ProjectManager extends EventEmitter {
       });
     }
     this.projects.set(id, project);
-    this.flushToDisk();
-
-    // Start watcher
-    const projectDir = path.join(process.cwd(), 'projects', id);
-    if (!fs.existsSync(projectDir)) {
-      fs.mkdirSync(projectDir, { recursive: true });
-    }
-    containerOrchestrator.watchDirectory(projectDir, project.watchPaths || []);
+    this.flushToDisk(id);
 
     this.emit('project_update', project);
     return project;
@@ -445,10 +455,9 @@ class ProjectManager extends EventEmitter {
       });
     }
     this.projects.set(id, project);
-    this.flushToDisk();
+    this.flushToDisk(id);
 
-    // Stop watcher for this specific project
-    const projectDir = path.join(process.cwd(), 'projects', id);
+    const projectDir = path.join(process.env.CULKIBO_DATA_DIR || process.cwd(), 'projects', id);
     containerOrchestrator.stopWatching(projectDir);
 
     this.emit('project_update', project);
@@ -468,10 +477,10 @@ class ProjectManager extends EventEmitter {
       });
     }
     this.projects.set(id, project);
-    this.flushToDisk();
+    this.flushToDisk(id);
 
     // Stop watcher for this specific project
-    const projectDir = path.join(process.cwd(), 'projects', id);
+    const projectDir = path.join(process.env.CULKIBO_DATA_DIR || process.cwd(), 'projects', id);
     containerOrchestrator.stopWatching(projectDir);
 
     this.emit('project_update', project);

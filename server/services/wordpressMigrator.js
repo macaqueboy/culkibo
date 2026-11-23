@@ -113,8 +113,14 @@ function prepareSqlForDomain(sql, oldDomain, newDomain) {
   const cleanOrigin = `${parsedNew.protocol}//${parsedNew.host}${parsedNew.pathname.replace(/\/+$/, '')}`;
   const prefix = detectWpTablePrefix(sql);
   const escapedUrl = cleanOrigin.replace(/\\/g, '\\\\').replace(/'/g, "''");
-  const hasSerialized = /a:\d+:\{|s:\d+:"/.test(sql);
-  let output = sql;
+
+  // Eliminar sentencias `CREATE DATABASE` / `USE` de volcados cPanel/phpMyAdmin para no cambiar de esquema en MariaDB
+  let output = sql
+    .replace(/^\s*CREATE\s+DATABASE\b[^;\n]*;?\s*$/gim, '-- [Culkibo] CREATE DATABASE omitido')
+    .replace(/^\s*USE\s+`?[a-zA-Z0-9_$-]+`?\s*;?\s*$/gim, '-- [Culkibo] USE omitido');
+
+  const SERIALIZED_RE = /a:\d+:\{|s:\d+:"/;
+  const hasSerialized = SERIALIZED_RE.test(output);
 
   let directReplaced = false;
   const cleanOldHost = String(oldDomain || '')
@@ -124,10 +130,29 @@ function prepareSqlForDomain(sql, oldDomain, newDomain) {
     .toLowerCase();
   const cleanNewHost = parsedNew.host.toLowerCase();
 
-  if (cleanOldHost && cleanNewHost && cleanOldHost !== cleanNewHost && !hasSerialized) {
+  if (cleanOldHost && cleanNewHost && cleanOldHost !== cleanNewHost) {
     const escapedOld = cleanOldHost.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    output = output.replace(new RegExp(`https?://${escapedOld}`, 'gi'), cleanOrigin);
-    directReplaced = true;
+    // Límite de host estricto: evita corromper `viejo.com.es` cuando oldDomain es `viejo.com`
+    const urlRe = new RegExp(`https?://${escapedOld}(?=[/'"\\s\\\\;)]|$)`, 'gi');
+    if (!hasSerialized) {
+      const next = output.replace(urlRe, cleanOrigin);
+      if (next !== output) {
+        output = next;
+        directReplaced = true;
+      }
+    } else {
+      // Reescribir solo líneas sin datos PHP serializados (p. ej. wp_posts), preservando widgets/Elementor intactos
+      const lines = output.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        if (!SERIALIZED_RE.test(lines[i]) && urlRe.test(lines[i])) {
+          urlRe.lastIndex = 0;
+          lines[i] = lines[i].replace(urlRe, cleanOrigin);
+          directReplaced = true;
+        }
+        urlRe.lastIndex = 0;
+      }
+      output = lines.join('\n');
+    }
   }
 
   output += `\n\n-- Actualización automática de URL de destino (Culkibo)\n` +
@@ -161,10 +186,9 @@ class WordPressMigrator {
     };
 
     // P0-7: safeFetch valida CADA salto de redirección (corta SSRF por 302) y acota memoria.
-    const [homeRes, wpJsonRes, typesRes, dnsRes] = await Promise.allSettled([
+    // Seguimos primero la home para descubrir el origen real tras redirecciones (http->https, apex->www).
+    const [homeRes, dnsRes] = await Promise.allSettled([
       safeFetch(parsedUrl.toString(), { headers, maxRedirects: 4, maxBytes: MAX_HTML_BYTES, allowPrivate, timeoutMs }),
-      safeFetch(`${baseOrigin}/wp-json`, { headers: { ...headers, Accept: 'application/json' }, maxRedirects: 3, maxBytes: 512 * 1024, allowPrivate, timeoutMs: Math.min(timeoutMs, 5000) }),
-      safeFetch(`${baseOrigin}/wp-json/wp/v2/types`, { headers: { ...headers, Accept: 'application/json' }, maxRedirects: 3, maxBytes: 256 * 1024, allowPrivate, timeoutMs: Math.min(timeoutMs, 5000) }),
       dns.resolve4(parsedUrl.hostname).catch(() => [])
     ]);
 
@@ -174,6 +198,13 @@ class WordPressMigrator {
 
     const res = homeRes.value;
     const finalUrl = res.url || parsedUrl.toString();
+    let probeOrigin = baseOrigin;
+    try { probeOrigin = new URL(finalUrl).origin; } catch (e) {}
+
+    const [wpJsonRes, typesRes] = await Promise.allSettled([
+      safeFetch(`${probeOrigin}/wp-json`, { headers: { ...headers, Accept: 'application/json' }, maxRedirects: 3, maxBytes: 512 * 1024, allowPrivate, timeoutMs: Math.min(timeoutMs, 5000) }),
+      safeFetch(`${probeOrigin}/wp-json/wp/v2/types`, { headers: { ...headers, Accept: 'application/json' }, maxRedirects: 3, maxBytes: 256 * 1024, allowPrivate, timeoutMs: Math.min(timeoutMs, 5000) })
+    ]);
     const html = res.text();
     const resolvedIps = dnsRes.status === 'fulfilled' && Array.isArray(dnsRes.value) ? dnsRes.value : [];
 

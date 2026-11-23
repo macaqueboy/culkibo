@@ -2,8 +2,20 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const http = require('http');
-const https = require('https');
+
+/** Carga perezosa de http/https/dns: evita pagar ~0.6 MB RSS al importar solo `atomicWriteJsonSync` en arranque. */
+/** @type {typeof import('http') | null} */
+let _httpMod = null;
+/** @type {typeof import('https') | null} */
+let _httpsMod = null;
+function getHttpMod(isHttps) {
+  if (isHttps) {
+    if (!_httpsMod) _httpsMod = require('https');
+    return _httpsMod;
+  }
+  if (!_httpMod) _httpMod = require('http');
+  return _httpMod;
+}
 
 /** @type {any} */
 let _dnsPromises = null;
@@ -308,7 +320,7 @@ async function safeFetch(rawUrl, opts = {}) {
     const pinnedIp = addresses.find((a) => net.isIP(a) === 4) || addresses[0];
     const family = net.isIP(pinnedIp) === 6 ? 6 : 4;
     const isHttps = parsed.protocol === 'https:';
-    const mod = isHttps ? https : http;
+    const mod = getHttpMod(isHttps);
     const targetHostname = parsed.hostname.replace(/^\[|\]$/g, '');
 
     /** @type {{ status: number, headers: Record<string, any>, body: Buffer }} */

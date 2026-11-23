@@ -16,6 +16,8 @@ const DEFAULT_CONFIG = {
     deploy_failed: true,
     deploy_succeeded: false,
     rollback: true,
+    backup_failed: true,
+    production_unhealthy: true,
     ssl_issued: false,
     project_stopped: false
   },
@@ -124,6 +126,7 @@ class NotificationService extends EventEmitter {
         webhook: {
           enabled: c.channels.webhook.enabled,
           url: c.channels.webhook.url,
+          hasSecretHeader: Boolean(c.channels.webhook.secretHeader),
           configured: Boolean(c.channels.webhook.url)
         }
       }
@@ -132,8 +135,7 @@ class NotificationService extends EventEmitter {
 
   /**
    * Aplica cambios de configuración. Un secreto enviado enmascarado (o vacío)
-   * se interpreta como "no lo cambies", para que la UI pueda reenviar el
-   * objeto que leyó sin borrar las credenciales.
+   * se interpreta como "no lo cambies"; enviar `null` lo limpia explícitamente.
    */
   setConfig(patch = {}) {
     const isMasked = (v) => typeof v === 'string' && (v === '' || v.includes('••'));
@@ -146,7 +148,11 @@ class NotificationService extends EventEmitter {
     ];
     for (const [channel, field] of secretPaths) {
       const incoming = sanitized.channels?.[channel]?.[field];
-      if (isMasked(incoming)) delete sanitized.channels[channel][field];
+      if (incoming === null) {
+        sanitized.channels[channel][field] = '';
+      } else if (isMasked(incoming)) {
+        delete sanitized.channels[channel][field];
+      }
     }
     this.config = this.mergeConfig(this.config, sanitized);
     this.saveConfig();
@@ -186,23 +192,25 @@ class NotificationService extends EventEmitter {
     } = payload;
 
     try {
+      /** @type {string | null} */
+      let dedupeKey = null;
+      let dedupeNow = 0;
       if (!force) {
         if (!this.config.enabled) return { sent: false, reason: 'disabled' };
         if (this.config.events[event] === false) return { sent: false, reason: 'event_muted' };
 
-        const dedupeKey = `${event}:${projectId || ''}:${title}`;
-        const now = Date.now();
+        dedupeKey = `${event}:${projectId || ''}:${title}`;
+        dedupeNow = Date.now();
         const last = this.lastSentAt.get(dedupeKey) || 0;
-        if (now - last < this.dedupeWindowMs) {
+        if (dedupeNow - last < this.dedupeWindowMs) {
           return { sent: false, reason: 'deduplicated' };
         }
         if (this.lastSentAt.size > 500) {
           for (const [k, at] of this.lastSentAt) {
-            if (now - at >= this.dedupeWindowMs) this.lastSentAt.delete(k);
+            if (dedupeNow - at >= this.dedupeWindowMs) this.lastSentAt.delete(k);
           }
           if (this.lastSentAt.size > 500) this.lastSentAt.clear();
         }
-        this.lastSentAt.set(dedupeKey, now);
       }
 
       const channels = force
@@ -241,6 +249,10 @@ class NotificationService extends EventEmitter {
       this.emit('notification', entry);
 
       const okCount = Object.values(entry.results).filter(r => r === 'ok').length;
+      // Solo registrar ventana anti-tormenta cuando al menos un canal entregó la alerta.
+      if (okCount > 0 && dedupeKey) {
+        this.lastSentAt.set(dedupeKey, dedupeNow || Date.now());
+      }
       return { sent: okCount > 0, delivered: okCount, results: entry.results, id: entry.id };
     } catch (err) {
       // Una alerta jamás puede propagar un fallo al flujo que la originó.
@@ -274,7 +286,8 @@ class NotificationService extends EventEmitter {
       // y usar HTML con escape seguro en lugar de Markdown v1 con escapes v2.
       const esc = (s) => this.escapeHtml(s);
       const safeUrl = url ? `\n<a href="${esc(url)}">${esc(url)}</a>` : '';
-      const text = `<b>${esc(meta.label)}: ${esc(heading)}</b>\n${esc(message)}${safeUrl}`;
+      const rawText = `<b>${esc(meta.label)}: ${esc(heading.slice(0, 200))}</b>\n${esc(String(message).slice(0, 3600))}${safeUrl}`;
+      const text = rawText.slice(0, 4096);
       return this.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
         chat_id: chatId,
         text,
@@ -292,8 +305,8 @@ class NotificationService extends EventEmitter {
       return this.post(parsed.toString(), {
         username: 'Culkibo',
         embeds: [{
-          title: `${meta.emoji} ${heading}`,
-          description: message,
+          title: `${meta.emoji} ${heading}`.slice(0, 256),
+          description: String(message || '').slice(0, 4000),
           color: meta.color,
           url: url || undefined,
           footer: { text: 'Culkibo Orchestrator' },

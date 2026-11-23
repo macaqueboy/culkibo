@@ -188,7 +188,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
           <div className="flex items-center gap-2.5 flex-wrap">
-            <h1 className="text-xl font-semibold text-slate-900 tracking-tight">Agentes de IA (MCP)</h1>
+            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Agentes de IA (MCP)</h1>
             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
               MCP {mcpConfig?.protocol?.current || '2026-07-28'}
@@ -295,7 +295,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
 
           <div className="space-y-3">
             <div className="relative">
-              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 type="text"
                 value={toolSearch}

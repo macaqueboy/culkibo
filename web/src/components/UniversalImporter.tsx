@@ -19,6 +19,7 @@ import {
   type ComposeParseResult,
   type GitInspectResult,
   type PlatformParseResult,
+  type DomainWizardPreset,
 } from '../lib/api';
 import { WordPressMigrationWizard } from './WordPressMigrationWizard';
 import { CoolifyImport } from './CoolifyImport';
@@ -30,7 +31,7 @@ interface UniversalImporterProps {
   sourceTrigger?: number;
   onComplete: (createdProjectId?: string) => void;
   onOpenCatalogInstalled?: () => void;
-  onOpenDomains: () => void;
+  onOpenDomains: (preset?: DomainWizardPreset) => void;
   onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }
 
@@ -224,35 +225,37 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
   return (
     <div className="space-y-5 max-w-5xl mx-auto">
       <div>
-        <h1 className="text-xl font-semibold text-slate-900 tracking-tight">Importar y migrar</h1>
+        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Importar y migrar</h1>
         <p className="text-sm text-slate-500 mt-1">
-          Trae sitios WordPress, stacks Docker Compose, repositorios Git o proyectos de otras plataformas.
+          Trae sitios WordPress, stacks Docker Compose, repositorios Git o proyectos de otras plataformas sin fricción.
         </p>
       </div>
 
-      {/* Selector de origen */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        {cards.map((c) => {
-          const Icon = c.icon;
-          const active = source === c.id;
-          return (
-            <button
-              key={c.id}
-              type="button"
-              aria-pressed={active}
-              onClick={() => setSource(c.id)}
-              className={`p-3.5 rounded-xl border text-left transition-colors cursor-pointer space-y-1.5 ${
-                active
-                  ? 'bg-slate-900 text-white border-slate-900'
-                  : 'bg-white text-slate-900 border-slate-200 hover:border-slate-300'
-              }`}
-            >
-              <Icon className={`w-4 h-4 ${active ? 'text-white' : 'text-slate-600'}`} />
-              <div className="text-xs font-semibold leading-tight">{c.title}</div>
-              <div className={`text-[11px] leading-snug ${active ? 'text-slate-300' : 'text-slate-500'}`}>{c.subtitle}</div>
-            </button>
-          );
-        })}
+      {/* Selector de origen: pestañas limpias con subrayado (sin sobrecarga de tarjetas) */}
+      <div className="border-b border-slate-200 overflow-x-auto no-scrollbar">
+        <div role="tablist" aria-label="Origen de importación" className="flex items-center gap-1 -mb-px min-w-max">
+          {cards.map((c) => {
+            const Icon = c.icon;
+            const active = source === c.id;
+            return (
+              <button
+                key={c.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => setSource(c.id)}
+                className={`inline-flex items-center gap-2 px-3.5 py-2.5 text-sm font-medium border-b-2 transition-colors cursor-pointer whitespace-nowrap ${
+                  active
+                    ? 'border-slate-900 text-slate-900'
+                    : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'
+                }`}
+              >
+                <Icon className="w-4 h-4 shrink-0" />
+                <span>{c.title}</span>
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       {source === 'wordpress' && (

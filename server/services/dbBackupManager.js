@@ -1,12 +1,23 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 // Este módulo NO ejecuta procesos: sólo construye la especificación argv del
-// volcado (`buildDbDumpSpec`) para que la ejecute quien corresponda. El
-// `require('child_process')` que había aquí no se usaba y sólo servía para que
-// alguien cayera en la tentación de añadir un `exec()`.
+// volcado (`buildDbDumpSpec`) para que la ejecute quien corresponda.
 const projectManager = require('./projectManager');
 const domainManager = require('./domainManager');
-const { assertContainedPath } = require('./ssrfGuard');
+const { assertContainedPath, atomicWriteJsonSync } = require('./ssrfGuard');
+
+/** Rechaza valores con guion inicial para impedir inyección de flags en CLI (p. ej. `-o`, `--eval`). */
+function assertSafeCliArg(value, field) {
+  const s = String(value == null ? '' : value);
+  if (s.startsWith('-')) {
+    throw new Error(`${field} inválido: no puede empezar por guion (-)`);
+  }
+  if (/[\0\r\n]/.test(s)) {
+    throw new Error(`${field} inválido: contiene caracteres de control`);
+  }
+  return s;
+}
 
 class DbBackupManager {
   constructor() {
@@ -35,14 +46,18 @@ class DbBackupManager {
   buildDbDumpSpec(dbType, options = {}) {
     const { host = 'localhost', port, user = 'root', password = '', dbName = 'app', outputFile } = options;
     const engine = String(dbType || '').toLowerCase();
+    const safeHost = assertSafeCliArg(host, 'host');
+    const safeUser = assertSafeCliArg(user, 'user');
+    const safeDb = assertSafeCliArg(dbName, 'dbName');
+    const safeOut = assertSafeCliArg(outputFile || '', 'outputFile');
 
     switch (engine) {
       case 'postgresql':
       case 'postgres':
         return {
           program: 'pg_dump',
-          args: ['-h', String(host), '-p', String(port || 5432), '-U', String(user),
-                 '-d', String(dbName), '-F', 'c', '-b', '-f', String(outputFile)],
+          args: ['-h', safeHost, '-p', String(port || 5432), '-U', safeUser,
+                 '-d', safeDb, '-F', 'c', '-b', '-f', safeOut],
           env: password ? { PGPASSWORD: password } : {},
           secretInArgs: false
         };
@@ -51,18 +66,19 @@ class DbBackupManager {
       case 'mariadb':
         return {
           program: 'mysqldump',
-          args: ['-h', String(host), '-P', String(port || 3306), '-u', String(user),
-                 '--single-transaction', '--quick', `--result-file=${outputFile}`, String(dbName)],
+          args: ['-h', safeHost, '-P', String(port || 3306), '-u', safeUser,
+                 '--single-transaction', '--quick', `--result-file=${safeOut}`, safeDb],
           // MYSQL_PWD evita que la contraseña aparezca en la línea de comandos.
           env: password ? { MYSQL_PWD: password } : {},
           secretInArgs: false
         };
 
       case 'redis':
+      case 'valkey':
         return {
-          program: 'redis-cli',
-          args: ['-h', String(host), '-p', String(port || 6379), '--rdb', String(outputFile)],
-          env: password ? { REDISCLI_AUTH: password } : {},
+          program: engine === 'valkey' ? 'valkey-cli' : 'redis-cli',
+          args: ['-h', safeHost, '-p', String(port || 6379), '--rdb', safeOut],
+          env: password ? { REDISCLI_AUTH: password, ...(engine === 'valkey' ? { VALKEYCLI_AUTH: password } : {}) } : {},
           secretInArgs: false
         };
 
@@ -70,8 +86,8 @@ class DbBackupManager {
       case 'mongo':
         return {
           program: 'mongodump',
-          args: [`--host=${host}`, `--port=${port || 27017}`, `--username=${user}`,
-                 `--db=${dbName}`, `--archive=${outputFile}`, '--gzip',
+          args: [`--host=${safeHost}`, `--port=${port || 27017}`, `--username=${safeUser}`,
+                 `--db=${safeDb}`, `--archive=${safeOut}`, '--gzip',
                  ...(password ? [`--password=${password}`] : [])],
           env: {},
           // mongodump no ofrece variable de entorno para la contraseña; la
@@ -116,24 +132,26 @@ class DbBackupManager {
     const backupFileName = `backup_${project.id}_${timestamp}.json`;
     const backupFilePath = path.join(this.backupsDir, backupFileName);
 
-    const exportBundle = {
+    const bundleBody = {
       version: '1.0.0',
       exportedAt: new Date().toISOString(),
       source: 'Culkibo Orchestrator',
       project: project,
       domains: domains,
       volumes: project.volumes || [],
-      fileMounts: project.fileMounts || [],
-      checksum: `sha256_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
+      fileMounts: project.fileMounts || []
     };
+    const sha256 = crypto.createHash('sha256').update(JSON.stringify(bundleBody)).digest('hex');
+    const exportBundle = { ...bundleBody, checksum: `sha256:${sha256}` };
 
-    await fs.promises.writeFile(backupFilePath, JSON.stringify(exportBundle, null, 2), { encoding: 'utf8', mode: 0o600 });
+    atomicWriteJsonSync(backupFilePath, exportBundle, 0o600);
 
     return {
       success: true,
       backupFile: backupFileName,
       fullPath: backupFilePath,
       exportedAt: exportBundle.exportedAt,
+      checksum: exportBundle.checksum,
       projectId: project.id,
       projectName: project.name,
       resourcesCount: (project.resources || []).length,
@@ -169,6 +187,16 @@ class DbBackupManager {
       throw new Error(`Archivo de backup no encontrado: ${path.basename(filePath)}`);
     }
 
+    // Impedir escapes por symlink fuera de data/backups cuando no se permite ruta externa
+    if (!allowExternalPath) {
+      const realRoot = fs.realpathSync(this.backupsDir);
+      const realFile = fs.realpathSync(filePath);
+      const relReal = path.relative(realRoot, realFile);
+      if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+        throw new Error('Ruta de backup fuera del directorio permitido (symlink bloqueado)');
+      }
+    }
+
     const raw = await fs.promises.readFile(filePath, 'utf8');
     const bundle = JSON.parse(raw);
 
@@ -176,8 +204,17 @@ class DbBackupManager {
       throw new Error('Estructura de backup inválida o dañada');
     }
 
+    // Verificar checksum real sha256 si el backup lo trae en el nuevo formato `sha256:<hex>`
+    if (typeof bundle.checksum === 'string' && /^sha256:[a-f0-9]{64}$/.test(bundle.checksum)) {
+      const { checksum, ...bodyWithoutChecksum } = bundle;
+      const expected = `sha256:${crypto.createHash('sha256').update(JSON.stringify(bodyWithoutChecksum)).digest('hex')}`;
+      if (checksum !== expected) {
+        throw new Error('El checksum SHA-256 del archivo de backup no coincide (archivo modificado o corrupto)');
+      }
+    }
+
     // Comprobar si ya existe el ID, si existe asignar nuevo o actualizar
-    let targetProject = bundle.project;
+    let targetProject = { ...bundle.project };
     const existing = projectManager.getById(targetProject.id);
     if (existing) {
       targetProject.id = `restored_${Date.now().toString(36)}`;
@@ -186,15 +223,17 @@ class DbBackupManager {
 
     const restored = projectManager.create(targetProject);
 
-    // Restaurar dominios asociados si no existen
+    // Restaurar dominios asociados vinculados explícitamente a `restored.id`
     if (bundle.domains && Array.isArray(bundle.domains)) {
       for (const d of bundle.domains) {
         try {
           await domainManager.addDomain({
             hostname: d.hostname,
+            projectId: restored.id,
             targetPod: d.targetPod || 'citadel',
             targetPort: d.targetPort || restored.citadelPort,
-            cloudflareProxied: d.cloudflareProxied
+            cloudflareProxied: d.cloudflareProxied,
+            canonicalRedirect: d.canonicalRedirect || 'none'
           });
         } catch (e) {
           // Ignorar duplicados de dominio

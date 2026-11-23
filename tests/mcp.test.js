@@ -33,7 +33,10 @@ async function testMcp() {
   assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_get_remote_access'));
   assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_get_observability'));
   assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_system_doctor'));
-  assert.ok(toolsRes.result.tools.length >= 49, `Se esperaban >=49 herramientas MCP, hay ${toolsRes.result.tools.length}`);
+  assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_link_database'));
+  assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_toggle_maintenance'));
+  assert.ok(toolsRes.result.tools.some(t => t.name === 'culkibo_get_deploy_queue'));
+  assert.ok(toolsRes.result.tools.length >= 52, `Se esperaban >=52 herramientas MCP, hay ${toolsRes.result.tools.length}`);
   console.log(`  ✓ MCP tools/list passed (${toolsRes.result.tools.length} AI tools exposed)`);
 
   // 3. tools/call: culkibo_list_pods
@@ -143,7 +146,7 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 49, 'El catálogo debe tener 49 herramientas anotadas con paridad completa de escritura');
+  assert.strictEqual(tools.length, 52, 'El catálogo debe tener 52 herramientas anotadas con paridad completa de escritura');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -366,7 +369,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 49);
+    assert.strictEqual(list.result.tools.length, 52);
     console.log(`  ✓ tools/list sobre Streamable HTTP (${list.result.tools.length} herramientas)`);
 
     // 8. tools/call con salida estructurada.

@@ -85,8 +85,9 @@ async function runDoctor() {
   try {
     const ds = await dockerManager.checkDockerStatus(true);
     dockerAvail = Boolean(ds && ds.available);
+    const ver = ds ? (ds.serverVersion || ds.clientVersion || ds.version || '') : '';
     dockerDetail = dockerAvail
-      ? `Docker ${ds.version || ''} activo con soporte de contenedores y BuildKit.`
+      ? `Docker ${ver} activo con soporte de contenedores y BuildKit.`.replace(/\s+/g, ' ')
       : 'Docker no está en marcha. Puedes seguir usando proyectos locales y sincronización en vivo, pero despliegues a producción y catálogo requieren Docker.';
   } catch (e) {
     dockerDetail = e.message || dockerDetail;
@@ -290,7 +291,7 @@ async function applyFix(action) {
 
   if (action === 'prune_buildkit') {
     const deployManager = require('./deployManager');
-    const res = await deployManager.pruneBuildCache({ keepStorage: '2GB' });
+    const res = await deployManager.pruneBuildCache({ keepStorageGb: 2 });
     return {
       ok: true,
       action,

@@ -39,6 +39,18 @@ const AUTH_FAIL_WINDOW_MS = 60000;
 const AUTH_FAIL_MAX = 20;
 const AUTH_FAIL_MAP_CAP = 2000;
 const NO_BRUTE_FORCE = Object.freeze({ blocked: false, retryAfterSec: 0 });
+const OK_LOOPBACK = Object.freeze({ ok: true, method: 'loopback' });
+const OK_LOOPBACK_ORIGIN = Object.freeze({ ok: true, method: 'loopback_origin' });
+const OK_TOKEN = Object.freeze({ ok: true, method: 'token' });
+const OK_WS_TICKET = Object.freeze({ ok: true, method: 'ws_ticket' });
+const ERR_INVALID_TOKEN = Object.freeze({ ok: false, status: 401, error: 'Token inválido' });
+const ERR_INVALID_TICKET = Object.freeze({ ok: false, status: 401, error: 'Ticket WebSocket inválido o caducado' });
+const ERR_AUTH_REQUIRED = Object.freeze({
+  ok: false,
+  status: 401,
+  error: 'Autenticación requerida',
+  detail: 'Envía el token en la cabecera Authorization: Bearer <token>, o en X-Culkibo-Token. Lo encuentras en data/auth.json o en la variable CULKIBO_TOKEN.'
+});
 const TRUST_PROXY_UNIQUE_LOCAL = String(process.env.CULKIBO_TRUST_PROXY || 'loopback').toLowerCase().includes('uniquelocal');
 
 /** @param {string} ip */
@@ -351,28 +363,21 @@ function authorizeRequest(req) {
 
   const { token, ticket } = extractCredentials(req);
   if (ticket) {
-    if (consumeWsTicket(ticket, req)) return { ok: true, method: 'ws_ticket' };
-    return { ok: false, status: 401, error: 'Ticket WebSocket inválido o caducado' };
+    return consumeWsTicket(ticket, req) ? OK_WS_TICKET : ERR_INVALID_TICKET;
   }
   if (token) {
-    if (tokenMatches(token)) return { ok: true, method: 'token' };
-    return { ok: false, status: 401, error: 'Token inválido' };
+    return tokenMatches(token) ? OK_TOKEN : ERR_INVALID_TOKEN;
   }
 
   const requireToken = process.env.CULKIBO_REQUIRE_TOKEN === '1';
   if (!requireToken && isLoopback(req)) {
-    if (!origin) return { ok: true, method: 'loopback' };
+    if (!origin) return OK_LOOPBACK;
     if (allowedOrigins().has(origin)) {
-      return { ok: true, method: 'loopback_origin' };
+      return OK_LOOPBACK_ORIGIN;
     }
   }
 
-  return {
-    ok: false,
-    status: 401,
-    error: 'Autenticación requerida',
-    detail: 'Envía el token en la cabecera Authorization: Bearer <token>, o en X-Culkibo-Token. Lo encuentras en data/auth.json o en la variable CULKIBO_TOKEN.'
-  };
+  return ERR_AUTH_REQUIRED;
 }
 
 function authMiddleware(req, res, next) {

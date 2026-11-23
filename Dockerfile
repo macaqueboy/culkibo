@@ -10,8 +10,8 @@ RUN npm run build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 
-# tini (PID 1 limpio sin zombis) + git + docker-cli + ca-certificates (sin curl: healthcheck nativo Node)
-RUN apk add --no-cache tini git docker-cli ca-certificates
+# tini (PID 1 limpio sin zombis) + git + docker-cli + docker-cli-buildx + ca-certificates
+RUN apk add --no-cache tini git docker-cli docker-cli-buildx ca-certificates
 
 ENV NODE_ENV=production \
     PORT=3030 \

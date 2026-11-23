@@ -52,6 +52,8 @@ data/projects.json
 data/projects.json.bak
 data/projects.json.*.tmp
 data/domains.json
+data/ingress.json
+data/ingress.json.*.tmp
 data/deployments.json
 data/deployments.json.*.tmp
 data/services.json

@@ -247,7 +247,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
       {/* Cabecera */}
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold text-slate-900 tracking-tight">Catálogo de servicios</h1>
+          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Catálogo de servicios</h1>
           <p className="text-sm text-slate-500 mt-1 max-w-2xl">
             Servicios listos en un clic con versión fijada, límites de recursos, volumen persistente y secretos aleatorios.
           </p>

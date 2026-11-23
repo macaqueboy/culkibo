@@ -130,7 +130,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         id: 'nav-ai',
         group: 'Navegación',
         label: 'Ir a Agentes de IA (MCP)',
-        hint: '49 herramientas MCP y Live Sync',
+        hint: 'Herramientas MCP 2026-07-28 y Live Sync',
         keywords: 'ia mcp claude cursor codex agentes herramientas',
         icon: <Bot className="w-4 h-4 text-slate-500" />,
         onSelect: () => onNavigate('ai'),
@@ -139,10 +139,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         id: 'nav-logs',
         group: 'Navegación',
         label: 'Ir a Registros en directo',
-        hint: 'Stream WebSocket',
+        hint: 'Stream WebSocket en vivo',
         keywords: 'logs registros consola errores',
         icon: <Terminal className="w-4 h-4 text-slate-500" />,
-        onSelect: () => onNavigate('logs'),
+        onSelect: () => onNavigate('global_logs'),
       },
       {
         id: 'nav-settings',
@@ -207,6 +207,13 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   }, [items, query]);
 
   const safeIndex = Math.min(activeIndex, Math.max(0, filtered.length - 1));
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open || !listRef.current) return;
+    const el = listRef.current.querySelector<HTMLElement>(`[data-cmd-idx="${safeIndex}"]`);
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [open, safeIndex]);
 
   if (!open) return null;
 
@@ -236,7 +243,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         role="dialog"
         aria-modal="true"
         aria-label="Paleta de comandos"
-        className="w-full max-w-xl bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden"
+        className="culkibo-modal-enter w-full max-w-xl bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden"
       >
         <div className="flex items-center gap-2.5 px-4 py-3 border-b border-slate-200">
           <Search className="w-4 h-4 text-slate-400 shrink-0" />
@@ -272,7 +279,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
           </kbd>
         </div>
 
-        <div className="max-h-[55vh] overflow-y-auto py-2">
+        <div ref={listRef} className="max-h-[55vh] overflow-y-auto py-2">
           {filtered.length === 0 ? (
             <div className="px-4 py-8 text-center text-sm text-slate-500">
               No hay resultados para «{query}».
@@ -292,6 +299,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                     return (
                       <button
                         key={item.id}
+                        data-cmd-idx={globalIdx}
                         type="button"
                         onMouseEnter={() => setActiveIndex(globalIdx)}
                         onClick={() => runItem(item)}

@@ -110,17 +110,29 @@ class CloudflareService {
   loadConfig() {
     try {
       if (fs.existsSync(CONFIG_FILE)) {
-        return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+        const stored = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+        const envToken = process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN || '';
+        const token = stored.apiToken || envToken;
+        const isReal = Boolean(token && !this.isSimulatedToken(token));
+        return {
+          ...stored,
+          apiToken: token,
+          accountId: stored.accountId || process.env.CLOUDFLARE_ACCOUNT_ID || '',
+          isConfigured: isReal,
+          useMock: stored.useMock === true ? !isReal : !isReal
+        };
       }
     } catch (e) {
       console.error('[Cloudflare] Error reading config file:', e.message);
     }
+    const envToken = process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN || '';
+    const isReal = Boolean(envToken && !this.isSimulatedToken(envToken));
     return {
-      apiToken: process.env.CLOUDFLARE_API_TOKEN || '',
+      apiToken: envToken,
       accountId: process.env.CLOUDFLARE_ACCOUNT_ID || '',
       defaultZoneId: '',
-      isConfigured: false,
-      useMock: true
+      isConfigured: isReal,
+      useMock: !isReal
     };
   }
 
@@ -253,19 +265,28 @@ class CloudflareService {
     }
 
     try {
-      const res = await fetch(`${this.apiBase}/zones?status=active&per_page=50`, {
-        signal: AbortSignal.timeout(10000),
-        headers: {
-          Authorization: `Bearer ${this.config.apiToken}`,
-          'Content-Type': 'application/json'
+      /** @type {any[]} */
+      const allZones = [];
+      let page = 1;
+      let totalPages = 1;
+      while (page <= totalPages && page <= 10) {
+        const res = await fetch(`${this.apiBase}/zones?status=active&per_page=50&page=${page}`, {
+          signal: AbortSignal.timeout(10000),
+          headers: {
+            Authorization: `Bearer ${this.config.apiToken}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        /** @type {any} */
+        const data = await res.json();
+        if (!data.success) {
+          return { success: false, errors: data.errors, zones: allZones };
         }
-      });
-      /** @type {any} */
-      const data = await res.json();
-      if (data.success) {
-        return { success: true, zones: data.result, count: data.result.length, isMock: false };
+        if (Array.isArray(data.result)) allZones.push(...data.result);
+        totalPages = Number(data.result_info?.total_pages) || 1;
+        page++;
       }
-      return { success: false, errors: data.errors, zones: [] };
+      return { success: true, zones: allZones, count: allZones.length, isMock: false };
     } catch (err) {
       return { success: false, error: err.message, zones: [] };
     }
@@ -279,22 +300,74 @@ class CloudflareService {
 
     try {
       const safeZone = assertCfId(zoneId, 'Zone ID');
-      const res = await fetch(`${this.apiBase}/zones/${safeZone}/dns_records?per_page=100`, {
-        signal: AbortSignal.timeout(10000),
-        headers: {
-          Authorization: `Bearer ${this.config.apiToken}`,
-          'Content-Type': 'application/json'
+      /** @type {any[]} */
+      const allRecords = [];
+      let page = 1;
+      let totalPages = 1;
+      while (page <= totalPages && page <= 10) {
+        const res = await fetch(`${this.apiBase}/zones/${safeZone}/dns_records?per_page=100&page=${page}`, {
+          signal: AbortSignal.timeout(10000),
+          headers: {
+            Authorization: `Bearer ${this.config.apiToken}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        /** @type {any} */
+        const data = await res.json();
+        if (!data.success) {
+          return { success: false, errors: data.errors, records: allRecords };
         }
-      });
-      /** @type {any} */
-      const data = await res.json();
-      if (data.success) {
-        return { success: true, records: data.result, count: data.result.length, isMock: false };
+        if (Array.isArray(data.result)) allRecords.push(...data.result);
+        totalPages = Number(data.result_info?.total_pages) || 1;
+        page++;
       }
-      return { success: false, errors: data.errors, records: [] };
+      return { success: true, records: allRecords, count: allRecords.length, isMock: false };
     } catch (err) {
       return { success: false, error: err.message, records: [] };
     }
+  }
+
+  /**
+   * Crea o actualiza idempotentemente un registro DNS en Cloudflare.
+   * Si ya existe un registro con el mismo nombre y tipo, lo actualiza en lugar de fallar con error 81057.
+   */
+  async upsertDnsRecord(zoneId, record) {
+    const wantedType = String(record.type || 'A').toUpperCase();
+    const wantedName = String(record.name || '').trim().toLowerCase();
+    const listed = await this.listDnsRecords(zoneId);
+    if (listed.success && Array.isArray(listed.records)) {
+      const exact = listed.records.find(
+        (r) => String(r.type || '').toUpperCase() === wantedType && String(r.name || '').toLowerCase() === wantedName
+      );
+      if (exact && exact.id) {
+        const upd = await this.updateDnsRecord(zoneId, exact.id, {
+          type: wantedType,
+          name: wantedName,
+          content: record.content,
+          ttl: parseInt(String(record.ttl ?? 1), 10),
+          proxied: Boolean(record.proxied)
+        });
+        return { ...upd, action: upd.success ? 'updated' : 'failed' };
+      }
+      if (wantedType === 'A' || wantedType === 'AAAA') {
+        const conflictingCname = listed.records.find(
+          (r) => String(r.type || '').toUpperCase() === 'CNAME' && String(r.name || '').toLowerCase() === wantedName
+        );
+        if (conflictingCname) {
+          return {
+            success: false,
+            action: 'conflict',
+            error: `Ya existe un registro CNAME para ${wantedName} apuntando a ${conflictingCname.content}. Elimínalo o cámbialo en Cloudflare primero.`
+          };
+        }
+      }
+    }
+    const created = await this.createDnsRecord(zoneId, record);
+    return {
+      ...created,
+      action: created.success ? 'created' : 'failed',
+      error: created.error || (Array.isArray(created.errors) && created.errors[0]?.message) || undefined
+    };
   }
 
   async createDnsRecord(zoneId, record) {

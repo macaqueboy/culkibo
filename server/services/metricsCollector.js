@@ -17,6 +17,8 @@ const ELD_RESOLUTION_MS = 20;
 const PROM_BUCKETS_SEC = [0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
 const MAX_ROUTES = 32;
 const HISTORY_CAP = 60;
+const HOST_CPUS = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+const HOST_TOTAL_MEM_MB = Math.round(os.totalmem() / 1024 / 1024);
 
 /** Normaliza rutas dinámicas para evitar explosión de cardinalidad. */
 function canonicalizeRoute(rawPath) {
@@ -111,6 +113,7 @@ class MetricsCollector {
 
     // Caddy swap ring (populated by caddyManager without extra I/O)
     this.caddySwapRing = new Float64Array(64);
+    this.caddySwapScratch = new Float64Array(64);
     this.caddySwapCursor = 0;
     this.caddySwapCount = 0;
     this.caddySwapsTotal = 0;
@@ -195,13 +198,14 @@ class MetricsCollector {
       this.rpsCounts[slot]++;
     }
 
-    const key = this.routes.has(route)
-      ? route
-      : (this.routes.size < MAX_ROUTES ? route : '/api/other');
-    let entry = this.routes.get(key);
+    let entry = this.routes.get(route);
     if (!entry) {
-      entry = { count: 0, errors: 0, totalMs: 0, maxMs: 0 };
-      this.routes.set(key, entry);
+      const key = this.routes.size < MAX_ROUTES ? route : '/api/other';
+      entry = this.routes.get(key);
+      if (!entry) {
+        entry = { count: 0, errors: 0, totalMs: 0, maxMs: 0 };
+        this.routes.set(key, entry);
+      }
     }
     entry.count++;
     if (statusCode >= 400) entry.errors++;
@@ -290,7 +294,7 @@ class MetricsCollector {
       this.lastEluRatio = Number((delta.utilization || 0).toFixed(4));
     }
 
-    const totalMemMb = Math.round(os.totalmem() / 1024 / 1024);
+    const totalMemMb = HOST_TOTAL_MEM_MB;
     const freeMemMb = Math.round(os.freemem() / 1024 / 1024);
 
     const data = {
@@ -313,7 +317,7 @@ class MetricsCollector {
       hostMemoryTotalMb: totalMemMb,
       hostMemoryUsedMb: totalMemMb - freeMemMb,
       hostMemoryFreeMb: freeMemMb,
-      hostCpus: os.cpus().length,
+      hostCpus: HOST_CPUS,
       loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
       measured: true
     };
@@ -366,8 +370,7 @@ class MetricsCollector {
     };
 
     const caddyBase = this._caddyGetter() || { available: null, version: null, managedRoutes: null };
-    const caddySwapScratch = new Float64Array(64);
-    const caddyLatency = this._computePercentiles(this.caddySwapRing, this.caddySwapCount, caddySwapScratch);
+    const caddyLatency = this._computePercentiles(this.caddySwapRing, this.caddySwapCount, this.caddySwapScratch);
 
     const topRoutes = Array.from(this.routes.entries())
       .map(([route, s]) => ({

@@ -29,6 +29,33 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_migrate_coolify'
 ]);
 
+/** Enmascara secretos de proyecto (envVars, buildArgs, webhookSecret, credenciales de recursos) antes de exponerlos por MCP. */
+function redactProjectSecrets(project) {
+  if (!project || typeof project !== 'object') return project;
+  const maskMap = (obj) => {
+    if (!obj || typeof obj !== 'object') return {};
+    /** @type {Record<string, string>} */
+    const out = {};
+    for (const k of Object.keys(obj)) out[k] = '[oculto]';
+    return out;
+  };
+  return {
+    ...project,
+    webhookSecret: project.webhookSecret ? '[oculto]' : undefined,
+    envVars: maskMap(project.envVars),
+    envVarsKeys: Object.keys(project.envVars || {}),
+    buildArgs: maskMap(project.buildArgs),
+    buildArgsKeys: Object.keys(project.buildArgs || {}),
+    resources: Array.isArray(project.resources)
+      ? project.resources.map((r) => ({
+          ...r,
+          envVars: r && r.envVars ? maskMap(r.envVars) : undefined,
+          credentials: r && r.credentials ? maskMap(r.credentials) : undefined
+        }))
+      : []
+  };
+}
+
 /** Redacta recursivamente tokens, contraseñas y secretos antes de guardar o emitir auditoría MCP. */
 function redactForAudit(value, depth = 0) {
   if (depth > 5) return '[…]';
@@ -403,21 +430,16 @@ class McpServer extends EventEmitter {
           properties: {
             hostname: { type: 'string' },
             found: { type: 'boolean' },
-            matchedRoute: {
-              type: ['string', 'null']
-            },
+            matchedRoute: { type: ['string', 'null'] },
             isWildcard: { type: 'boolean' },
-            targetPod: {
-              type: ['string', 'null']
-            },
-            targetPort: {
-              type: ['number', 'null']
-            },
+            targetPod: { type: ['string', 'null'] },
+            targetPort: { type: ['number', 'null'] },
+            projectId: { type: ['string', 'null'] },
             cloudflareProxied: { type: 'boolean' },
-            tlsIssuer: {
-              type: ['string', 'null']
-            },
-            tlsActive: { type: 'boolean' },
+            dataPlane: { type: 'string' },
+            ingressAvailable: { type: 'boolean' },
+            ingressReason: { type: ['string', 'null'] },
+            tls: { type: 'object' },
             trafficSplit: { type: 'object' }
           }
         },
@@ -941,6 +963,45 @@ class McpServer extends EventEmitter {
           type: 'object',
           properties: {}
         }
+      },
+      {
+        name: 'culkibo_link_database',
+        title: 'Vincular o desvincular base de datos a proyecto',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        description: 'Vincula (action: "link") o desvincula (action: "unlink") una base de datos gestionada a un proyecto para conectar su red Docker aislada e inyectar DATABASE_URL/REDIS_URL/MONGODB_URI cifradas en tiempo de despliegue sin guardar contraseñas en claro en projects.json.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'ID del proyecto' },
+            databaseId: { type: 'string', description: 'ID de la base de datos gestionada' },
+            action: { type: 'string', enum: ['link', 'unlink'], description: 'link para vincular (default), unlink para desvincular' }
+          },
+          required: ['projectId', 'databaseId']
+        }
+      },
+      {
+        name: 'culkibo_toggle_maintenance',
+        title: 'Activar o desactivar modo mantenimiento (<10 ms)',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        description: 'Activa o desactiva el modo mantenimiento atómico en Caddy (HTTP 503 elegante con Retry-After) para todos los dominios de un proyecto sin detener su contenedor.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', description: 'ID del proyecto' },
+            enabled: { type: 'boolean', description: 'true para activar modo mantenimiento, false para volver a tráfico normal' }
+          },
+          required: ['projectId', 'enabled']
+        }
+      },
+      {
+        name: 'culkibo_get_deploy_queue',
+        title: 'Consultar cola de despliegues y concurrencia',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Muestra los builds Docker activos en paralelo, el límite global del semáforo de RAM/CPU y la cola de despliegues en espera.',
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
       }
     ];
     this._toolsByName = new Map(this._toolsCache.map((t) => [t.name, t]));
@@ -1051,22 +1112,14 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_list_projects':
           res = {
-            projects: projectManager.getAll().map((p) => ({
-              ...p,
-              webhookSecret: p.webhookSecret ? '[oculto]' : undefined,
-              envVarsKeys: Object.keys(p.envVars || {})
-            }))
+            projects: projectManager.getAll().map((p) => redactProjectSecrets(p))
           };
           break;
 
         case 'culkibo_get_project': {
           const p = projectManager.getById(args.projectId);
           if (!p) throw projectNotFoundError(args.projectId);
-          res = {
-            ...p,
-            webhookSecret: p.webhookSecret ? '[oculto]' : undefined,
-            envVarsKeys: Object.keys(p.envVars || {})
-          };
+          res = redactProjectSecrets(p);
           break;
         }
 
@@ -1080,8 +1133,9 @@ class McpServer extends EventEmitter {
           } else {
             project.envVars = { ...(project.envVars || {}), ...args.envVars };
           }
-          res = projectManager.update(args.projectId, { envVars: project.envVars, resources: project.resources });
+          const updated = projectManager.update(args.projectId, { envVars: project.envVars, resources: project.resources });
           await projectManager.flushToDisk();
+          res = redactProjectSecrets(updated);
           break;
         }
 
@@ -1489,6 +1543,51 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_system_doctor': {
           res = await systemDoctor.runDoctor();
+          break;
+        }
+
+        case 'culkibo_link_database': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw projectNotFoundError(args.projectId);
+          const db = databaseManager.get(args.databaseId);
+          const current = new Set(Array.isArray(project.linkedDatabaseIds) ? project.linkedDatabaseIds : []);
+          const action = args.action === 'unlink' ? 'unlink' : 'link';
+          if (action === 'link') current.add(db.id);
+          else current.delete(db.id);
+          const updated = projectManager.update(project.id, { linkedDatabaseIds: Array.from(current) });
+          await projectManager.flushToDisk();
+          res = {
+            success: true,
+            action,
+            projectId: project.id,
+            databaseId: db.id,
+            databaseName: db.name,
+            linkedDatabaseIds: updated.linkedDatabaseIds,
+            note: action === 'link'
+              ? 'Base de datos vinculada. Redespliega el proyecto para adjuntar la red aislada e inyectar la URL de conexión.'
+              : 'Base de datos desvinculada. Redespliega para aplicar los cambios.'
+          };
+          break;
+        }
+
+        case 'culkibo_toggle_maintenance': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw projectNotFoundError(args.projectId);
+          const enabled = Boolean(args.enabled);
+          projectManager.update(project.id, { maintenanceMode: enabled });
+          await projectManager.flushToDisk();
+          const ingress = await ingressManager.reconcile();
+          res = {
+            success: true,
+            projectId: project.id,
+            maintenanceMode: enabled,
+            ingress
+          };
+          break;
+        }
+
+        case 'culkibo_get_deploy_queue': {
+          res = deployManager.getQueueStatus();
           break;
         }
 

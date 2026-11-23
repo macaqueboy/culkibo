@@ -423,7 +423,59 @@ class GithubService {
     const pageNum = parseInt(String(page), 10) || 1;
     const limit = parseInt(String(perPage), 10) || 30;
 
-    // If searching on real GitHub, try Search API across all user's repos
+    // Si hay búsqueda en GitHub real, filtrar primero sobre /user/repos (incluye organizaciones y colaboraciones)
+    // y complementar con Search API solo cuando haya >100 repositorios accesibles.
+    if (search) {
+      try {
+        const allRes = await ghGet(`${this.apiBase}/user/repos`, {
+          headers: this.getHeaders(),
+          params: {
+            page: 1,
+            per_page: 100,
+            sort,
+            affiliation: 'owner,collaborator,organization_member'
+          },
+          timeout: 10000
+        });
+        const q = search.toLowerCase().trim();
+        const mapped = (allRes.data || [])
+          .map(r => ({
+            id: r.id,
+            name: r.name,
+            full_name: r.full_name,
+            owner: {
+              login: r.owner?.login || '',
+              avatar_url: r.owner?.avatar_url || ''
+            },
+            description: r.description || '',
+            private: Boolean(r.private),
+            html_url: r.html_url,
+            clone_url: r.clone_url,
+            default_branch: r.default_branch || 'main',
+            language: r.language || 'Code',
+            stars: r.stargazers_count || 0,
+            forks: r.forks_count || 0,
+            updated_at: r.updated_at
+          }))
+          .filter(r =>
+            r.name.toLowerCase().includes(q) ||
+            r.full_name.toLowerCase().includes(q) ||
+            (r.description && r.description.toLowerCase().includes(q)) ||
+            (r.language && r.language.toLowerCase().includes(q))
+          );
+        const startIdx = (pageNum - 1) * limit;
+        if (mapped.length > 0 || (allRes.data || []).length < 100) {
+          return {
+            repos: mapped.slice(startIdx, startIdx + limit),
+            total: mapped.length,
+            page: pageNum,
+            perPage: limit
+          };
+        }
+      } catch (e) {}
+    }
+
+    // Fallback a Search API si el usuario tiene >100 repositorios
     if (search && this.config.user?.login) {
       try {
         const q = `${search.trim()} user:${this.config.user.login} fork:true`;
@@ -736,7 +788,24 @@ class GithubService {
         };
       }
 
-      // 3. Check for package.json
+      // 3. Check for Dockerfile BEFORE package.json (coincide con la prioridad real de deployManager)
+      if (fileNames.includes('dockerfile')) {
+        return {
+          detected: true,
+          framework: 'Dockerfile',
+          language: 'Docker',
+          buildCommand: 'docker build -t app .',
+          startCommand: 'docker run -p 8080:8080 app',
+          port: 8080,
+          icon: '🐳',
+          baseDirectory: '/',
+          watchPaths: ['Dockerfile', 'src/**'],
+          envVars: {},
+          confidence: 'high'
+        };
+      }
+
+      // 4. Check for package.json
       if (fileNames.includes('package.json')) {
         try {
           const pkgRes = await ghGet(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/contents/package.json`, {
@@ -820,13 +889,14 @@ class GithubService {
 
           // Vite / React
           if (deps['vite'] || deps['react']) {
+            const usesPreview = Boolean(scripts['preview']);
             return {
               detected: true,
               framework: deps['vite'] ? 'React (Vite)' : 'React App',
               language: deps['typescript'] ? 'TypeScript' : 'JavaScript',
               buildCommand: scripts['build'] ? 'npm run build' : 'npm run build',
-              startCommand: scripts['preview'] ? 'npm run preview' : (scripts['dev'] ? 'npm run dev' : 'npm start'),
-              port: deps['vite'] ? 5173 : 3000,
+              startCommand: usesPreview ? 'npm run preview' : (scripts['dev'] ? 'npm run dev' : 'npm start'),
+              port: deps['vite'] ? (usesPreview ? 4173 : 5173) : 3000,
               icon: '⚡',
               baseDirectory: '/',
               watchPaths: ['src/**', 'public/**'],

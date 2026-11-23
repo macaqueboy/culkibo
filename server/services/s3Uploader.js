@@ -290,9 +290,9 @@ class S3Client {
   /**
    * @param {string} method
    * @param {string} key
-   * @param {{ query?: Record<string, any>, headers?: Record<string, any>, body?: any, expectStatus?: number[] }} [opts]
+   * @param {{ query?: Record<string, any>, headers?: Record<string, any>, body?: any, expectStatus?: number[], timeoutMs?: number }} [opts]
    */
-  async request(method, key, { query = {}, headers = {}, body = undefined, expectStatus = [200, 204] } = {}) {
+  async request(method, key, { query = {}, headers = {}, body = undefined, expectStatus = [200, 204], timeoutMs = undefined } = {}) {
     const { canonicalUri, url, host } = this.resolve(key);
     // Protección SSRF con resolución DNS: permite MinIO privado pero bloquea siempre metadatos cloud
     await assertSafeUrl(url, { allowPrivate: true, allowLoopback: true });
@@ -302,36 +302,37 @@ class S3Client {
     const baseHeaders = { host, ...headers };
     if (payload) baseHeaders['content-length'] = String(payload.length);
 
-    const signed = signRequest({
-      method,
-      canonicalUri,
-      query,
-      headers: baseHeaders,
-      payloadHash,
-      accessKeyId: this.accessKeyId,
-      secretAccessKey: this.secretAccessKey,
-      sessionToken: this.sessionToken,
-      region: this.region,
-      service: 's3'
-    });
-
     const qs = canonicalQueryString(query);
     const fullUrl = qs ? `${url}?${qs}` : url;
-
-    // `host` lo pone undici; enviarlo a mano lanza en Node.
-    const wire = { ...signed.headers, Authorization: signed.authorization };
-    delete wire.host;
+    const effectiveTimeout = timeoutMs !== undefined ? timeoutMs : this.timeoutMs;
 
     /** @type {any} */
     let lastError = null;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      // Re-firmar en cada intento para que el timestamp SigV4 nunca caduque en reintentos largos.
+      const signed = signRequest({
+        method,
+        canonicalUri,
+        query,
+        headers: baseHeaders,
+        payloadHash,
+        accessKeyId: this.accessKeyId,
+        secretAccessKey: this.secretAccessKey,
+        sessionToken: this.sessionToken,
+        region: this.region,
+        service: 's3'
+      });
+      // `host` lo pone undici; enviarlo a mano lanza en Node.
+      const wire = { ...signed.headers, Authorization: signed.authorization };
+      delete wire.host;
+
       try {
         const res = await fetch(fullUrl, {
           method,
           headers: wire,
           body: payload,
           redirect: 'manual',
-          signal: AbortSignal.timeout(this.timeoutMs)
+          signal: effectiveTimeout > 0 ? AbortSignal.timeout(effectiveTimeout) : undefined
         });
 
         if (expectStatus.includes(res.status)) {
@@ -368,7 +369,7 @@ class S3Client {
     });
     const etag = res.headers.get('etag');
     try { await res.body?.cancel?.(); } catch (e) {}
-    return { key, etag, size: Buffer.isBuffer(body) ? body.length : String(body).length };
+    return { key, etag, size: Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body), 'utf8') };
   }
 
   async deleteObject(key) {
@@ -526,9 +527,10 @@ class S3Client {
     }
   }
 
-  /** Descarga a disco en streaming, para restaurar desde remoto (con limpieza segura en error). */
+  /** Descarga a disco en streaming, para restaurar desde remoto (sin abortar descargas grandes ni deadlocks ENOSPC). */
   async downloadFile(key, destPath) {
-    const res = await this.request('GET', key, { expectStatus: [200] });
+    // Sin timeout corto de 120s sobre el cuerpo streaming: un dump de varios GB necesita margen (2 h máx).
+    const res = await this.request('GET', key, { expectStatus: [200], timeoutMs: 2 * 3600 * 1000 });
     await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
     if (!res.body) throw new Error('La respuesta S3 no contiene cuerpo descargable');
     const out = fs.createWriteStream(destPath, { mode: 0o600 });
@@ -542,17 +544,30 @@ class S3Client {
         if (streamErr) throw streamErr;
         const { done, value } = await reader.read();
         if (done) break;
+        if (streamErr) throw streamErr;
         bytes += value.length;
         if (!out.write(Buffer.from(value))) {
           await new Promise((resolve, reject) => {
-            const onDrain = () => { out.off('error', onErr); resolve(undefined); };
-            const onErr = (e) => { out.off('drain', onDrain); reject(e); };
+            if (streamErr) return reject(streamErr);
+            if (out.destroyed || out.errored) return reject(out.errored || new Error('Stream de destino cerrado'));
+            const cleanup = () => {
+              out.off('drain', onDrain);
+              out.off('error', onErr);
+              out.off('close', onClose);
+            };
+            const onDrain = () => { cleanup(); resolve(undefined); };
+            const onErr = (e) => { cleanup(); reject(e); };
+            const onClose = () => { cleanup(); reject(streamErr || new Error('Escritura interrumpida antes de drenar')); };
             out.once('drain', onDrain);
             out.once('error', onErr);
+            out.once('close', onClose);
           });
         }
       }
-      await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve(undefined))));
+      await new Promise((resolve, reject) => {
+        if (streamErr) return reject(streamErr);
+        out.end((err) => (err ? reject(err) : resolve(undefined)));
+      });
       if (streamErr) throw streamErr;
       return { key, destPath, sizeBytes: bytes };
     } catch (err) {

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { KeyRound, AlertCircle, ArrowRight, Eye, EyeOff, HelpCircle, Copy, Check } from 'lucide-react';
 import { api, setAuthToken } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
+import { CulkiboLogo } from './CulkiboLogo';
 
 interface AuthGateProps {
   tokenSource?: string;
@@ -52,11 +53,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ tokenSource = 'data/auth.jso
     <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
       <div className="w-full max-w-md bg-white rounded-xl border border-slate-200 shadow-lg p-7 space-y-6">
         <div className="flex items-center gap-3">
-          <svg width="36" height="36" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0">
-            <rect width="32" height="32" rx="8" fill="#18181B" />
-            <path d="M16 6.5L25 22.5H7L16 6.5Z" stroke="#FFFFFF" strokeWidth="2.2" strokeLinejoin="round" />
-            <circle cx="16" cy="17.5" r="3" fill="#FFFFFF" />
-          </svg>
+          <CulkiboLogo size={36} />
           <div>
             <h1 className="text-base font-semibold text-slate-900 tracking-tight">Entra a tu panel de Culkibo</h1>
             <p className="text-xs text-slate-500">El acceso remoto solicita la clave de control del servidor.</p>
@@ -69,7 +66,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ tokenSource = 'data/auth.jso
               Clave de acceso del servidor
             </label>
             <div className="relative">
-              <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+              <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 id="culkibo-token"
                 type={showToken ? 'text' : 'password'}
@@ -83,7 +80,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ tokenSource = 'data/auth.jso
                 type="button"
                 onClick={() => setShowToken((prev) => !prev)}
                 aria-label={showToken ? 'Ocultar clave' : 'Mostrar clave'}
-                className="absolute right-2.5 top-2 p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
                 title={showToken ? 'Ocultar clave' : 'Mostrar clave'}
               >
                 {showToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}

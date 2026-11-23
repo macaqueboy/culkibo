@@ -102,15 +102,30 @@ async function detectPublicIp() {
   if (_cachedPublicIp.ip && (now - _cachedPublicIp.at) < 300000) {
     return _cachedPublicIp.ip;
   }
-  try {
-    const response = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) });
-    /** @type {any} */
-    const data = await response.json();
-    if (data && typeof data.ip === 'string') {
-      _cachedPublicIp = { at: now, ip: data.ip };
-      return data.ip;
+  const providers = [
+    async () => {
+      const r = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(4000) });
+      /** @type {any} */ const d = await r.json();
+      return d && typeof d.ip === 'string' ? d.ip.trim() : null;
+    },
+    async () => {
+      const r = await fetch('https://ipv4.icanhazip.com', { signal: AbortSignal.timeout(4000) });
+      return (await r.text()).trim();
+    },
+    async () => {
+      const r = await fetch('https://ifconfig.me/ip', { signal: AbortSignal.timeout(4000) });
+      return (await r.text()).trim();
     }
-  } catch (e) {}
+  ];
+  for (const probe of providers) {
+    try {
+      const ip = await probe();
+      if (ip && /^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+        _cachedPublicIp = { at: now, ip };
+        return ip;
+      }
+    } catch (e) {}
+  }
   return _cachedPublicIp.ip || null;
 }
 
@@ -174,15 +189,16 @@ router.delete('/projects/:id', async (req, res) => {
     try { liveSyncEngine.resetSession(projectId); } catch (e) {}
 
     const attached = domainManager.listByProject(projectId);
-    for (const domain of attached) {
-      try { await domainManager.detachProject(domain.id); } catch (e) {}
+    if (attached.length > 0) {
+      domainManager.detachByProject(projectId);
     }
     projectManager.delete(projectId);
-    await projectManager.flushToDisk();
+    await projectManager.flushToDisk(projectId);
     try { deployManager.forget(projectId); } catch (e) {}
     try { githubService.forgetDeliveries(projectId); } catch (e) {}
-    const ingress = await ingressManager.removeProject(projectId);
-    if (attached.length > 0) await ingressManager.reconcile();
+    const ingress = attached.length > 0
+      ? await ingressManager.reconcile()
+      : await ingressManager.removeProject(projectId);
     res.json({ success: true, detachedDomains: attached.map(d => d.hostname), ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -192,9 +208,7 @@ router.delete('/projects/:id', async (req, res) => {
 router.post('/projects/:id/activate', async (req, res) => {
   try {
     const project = projectManager.activate(req.params.id);
-    // No se responde hasta que el cambio está en disco: si no, un cliente que
-    // lea inmediatamente después puede ver todavía el estado anterior.
-    await projectManager.flushToDisk();
+    await projectManager.flushToDisk(req.params.id);
     res.json(project);
   } catch (err) {
     res.status(404).json({ error: err.message });
@@ -206,14 +220,12 @@ router.post('/projects/:id/hibernate', async (req, res) => {
     let project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
-    // Stop live local HTTP server & free port
     try {
       await localRunner.stop(project.id, project.localPort);
     } catch(err) {
       console.error('[LocalRunner] Could not stop server on hibernate:', err.message);
     }
 
-    // Stop docker containers for resources if possible (sin matar puertos desconocidos del host, P1-14)
     try {
       if (project.resources && Array.isArray(project.resources)) {
         for (const r of project.resources) {
@@ -226,8 +238,9 @@ router.post('/projects/:id/hibernate', async (req, res) => {
     } catch(e) {}
 
     const updated = projectManager.hibernate(req.params.id);
-    await projectManager.flushToDisk();
-    const ingress = await ingressManager.removeProject(req.params.id);
+    await projectManager.flushToDisk(req.params.id);
+    // P1-1: syncProject conserva la ruta de producción en Caddy si sigue viva y la retira si no
+    const ingress = await ingressManager.syncProject(req.params.id);
     res.json({ ...updated, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -263,7 +276,7 @@ router.post('/projects/:id/start-local', async (req, res) => {
 
     const ingress = await ingressManager.syncProject(project.id);
 
-    await projectManager.flushToDisk();
+    await projectManager.flushToDisk(req.params.id);
     res.json({ ...project, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -294,8 +307,9 @@ const handleStopProject = async (req, res) => {
     } catch(e) {}
 
     const updated = projectManager.stop(req.params.id);
-    await projectManager.flushToDisk();
-    const ingress = await ingressManager.removeProject(req.params.id);
+    await projectManager.flushToDisk(req.params.id);
+    // P1-1: syncProject evita borrar la ruta de producción en Caddy al detener solo el servidor local
+    const ingress = await ingressManager.syncProject(req.params.id);
     res.json({ ...updated, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -855,15 +869,31 @@ router.get('/domains', (req, res) => {
   }
 });
 
+/** Sincroniza `project.domains[]` cuando cambia la vinculación de un dominio (fuente única de verdad). */
+function syncProjectDomainsList(projectId, hostname, action) {
+  if (!projectId || !hostname) return;
+  const proj = projectManager.getById(projectId);
+  if (!proj) return;
+  const current = Array.isArray(proj.domains) ? proj.domains : [];
+  const next = action === 'add'
+    ? Array.from(new Set([...current, hostname]))
+    : current.filter((d) => d !== hostname);
+  if (JSON.stringify(current) !== JSON.stringify(next)) {
+    projectManager.update(projectId, { domains: next });
+  }
+}
+
 router.post('/domains', async (req, res) => {
   try {
     const body = { ...(req.body || {}) };
-    // UX P0-1: si piden autoCreateDns sin serverIp explícita, detectar la IP pública real (nunca 127.0.0.1)
     if (body.autoCreateDns && (!body.serverIp || body.serverIp === '127.0.0.1')) {
       const detected = await detectPublicIp();
       if (detected) body.serverIp = detected;
     }
     const newDomain = await domainManager.addDomain(body);
+    if (newDomain.projectId) {
+      syncProjectDomainsList(newDomain.projectId, newDomain.hostname, 'add');
+    }
     const ingress = await ingressManager.reconcile();
     res.status(201).json({ ...newDomain, ingress });
   } catch (err) {
@@ -874,7 +904,9 @@ router.post('/domains', async (req, res) => {
 router.delete('/domains/:id', async (req, res) => {
   try {
     const removed = await domainManager.deleteDomain(req.params.id);
-    await ingressManager.removeDomain(req.params.id);
+    if (removed.projectId) {
+      syncProjectDomainsList(removed.projectId, removed.hostname, 'remove');
+    }
     const ingress = await ingressManager.reconcile();
     res.json({ success: true, removed, ingress });
   } catch (err) {
@@ -884,10 +916,17 @@ router.delete('/domains/:id', async (req, res) => {
 
 router.patch('/domains/:id', async (req, res) => {
   try {
-    if (!domainManager.getById(req.params.id)) {
+    const prev = domainManager.getById(req.params.id);
+    if (!prev) {
       return res.status(404).json({ error: 'Dominio no encontrado' });
     }
     const updated = await domainManager.updateDomain(req.params.id, req.body);
+    if (prev.projectId && (prev.projectId !== updated.projectId || prev.hostname !== updated.hostname)) {
+      syncProjectDomainsList(prev.projectId, prev.hostname, 'remove');
+    }
+    if (updated.projectId) {
+      syncProjectDomainsList(updated.projectId, updated.hostname, 'add');
+    }
     const ingress = await ingressManager.reconcile();
     res.json({ ...updated, ingress });
   } catch (err) {
@@ -905,12 +944,16 @@ router.post('/domains/:id/toggle-proxy', async (req, res) => {
   }
 });
 
-// --- VINCULACIÓN DOMINIO ↔ PROYECTO ---
-//
-// Una sola llamada: crea (o reutiliza) el registro del dominio, lo vincula al
-// proyecto y publica la ruta en Caddy. Antes eran tres pasos en sitios
-// distintos —añadir dominio, editar `project.domains` desde el panel y esperar
-// a que algo enrutase— y el tercero no existía.
+router.post('/domains/:id/diagnose', async (req, res) => {
+  try {
+    const expectedIp = (req.body && req.body.serverIp) || await detectPublicIp();
+    const report = await ingressManager.diagnoseDomain(req.params.id, { expectedIp });
+    res.json(report);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 router.post('/projects/:id/domains', async (req, res) => {
   try {
     const project = projectManager.getById(req.params.id);
@@ -924,7 +967,11 @@ router.post('/projects/:id/domains', async (req, res) => {
       if (domain.projectId && domain.projectId !== project.id) {
         return res.status(409).json({ error: `El dominio ${hostname} ya está vinculado a otro proyecto` });
       }
-      domain = await domainManager.attachProject(domain.id, project.id);
+      domain = await domainManager.updateDomain(domain.id, {
+        projectId: project.id,
+        ...(req.body.canonicalRedirect !== undefined ? { canonicalRedirect: req.body.canonicalRedirect } : {}),
+        ...(req.body.securityHeaders !== undefined ? { securityHeaders: Boolean(req.body.securityHeaders) } : {})
+      });
     } else {
       let effectiveIp = req.body.serverIp;
       if (req.body.autoCreateDns && (!effectiveIp || effectiveIp === '127.0.0.1')) {
@@ -939,6 +986,9 @@ router.post('/projects/:id/domains', async (req, res) => {
         cloudflareProxied: req.body.cloudflareProxied !== false,
         autoCreateDns: Boolean(req.body.autoCreateDns),
         serverIp: effectiveIp,
+        canonicalRedirect: req.body.canonicalRedirect || 'none',
+        securityHeaders: req.body.securityHeaders !== false,
+        customHeaders: req.body.customHeaders || null,
         routingMode: req.body.routingMode || 'cloudflare_proxy'
       });
     }
@@ -946,15 +996,16 @@ router.post('/projects/:id/domains', async (req, res) => {
     const domains = Array.from(new Set([...(project.domains || []), hostname]));
     const updatedProject = projectManager.update(project.id, { domains });
 
-    const ingress = await ingressManager.syncProject(project.id);
+    // Si hay redirección canónica (www ↔ apex), reconciliar para publicar también la ruta de redirección
+    const ingress = domain.canonicalRedirect && domain.canonicalRedirect !== 'none'
+      ? await ingressManager.reconcile()
+      : await ingressManager.syncProject(project.id);
     res.status(201).json({ domain, project: updatedProject, ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-// Desvincular: quita el hostname del proyecto, borra el registro del dominio y
-// retira la ruta. Las dos mitades caen juntas o no cae ninguna.
 router.delete('/projects/:id/domains/:domainId', async (req, res) => {
   try {
     const project = projectManager.getById(req.params.id);
@@ -973,9 +1024,7 @@ router.delete('/projects/:id/domains/:domainId', async (req, res) => {
     const domains = (project.domains || []).filter(d => d !== domain.hostname);
     const updatedProject = projectManager.update(project.id, { domains });
 
-    const ingress = await ingressManager.syncProject(project.id);
-    if (keep) await ingressManager.reconcile();
-
+    const ingress = await ingressManager.reconcile();
     res.json({ success: true, hostname: domain.hostname, kept: keep, project: updatedProject, ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -984,7 +1033,8 @@ router.delete('/projects/:id/domains/:domainId', async (req, res) => {
 
 router.post('/domains/verify-dns', async (req, res) => {
   try {
-    const result = await domainManager.verifyDns(req.body.hostname);
+    const expectedIp = (req.body && req.body.serverIp) || await detectPublicIp();
+    const result = await domainManager.verifyDns(req.body.hostname, { expectedIp });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1137,13 +1187,24 @@ router.post('/ssl/issue-ondemand-sslip', async (req, res) => {
   }
 });
 
-router.delete('/ssl/certificates/:id', (req, res) => {
+router.post('/ssl/certificates/upload', async (req, res) => {
+  try {
+    const result = sslManager.uploadCustomCertificate(req.body || {});
+    const ingress = await ingressManager.reconcile();
+    res.status(201).json({ ...result, ingress });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/ssl/certificates/:id', async (req, res) => {
   try {
     const result = sslManager.revokeCertificate(req.params.id);
-    if (!result || result.revoked === false) {
-      return res.status(404).json({ error: 'Certificado no encontrado' });
+    if (!result || result.success === false) {
+      return res.status(404).json({ error: result?.error || 'Certificado no encontrado' });
     }
-    res.json(result);
+    const ingress = await ingressManager.reconcile();
+    res.json({ ...result, ingress });
   } catch (err) {
     res.status(err.message && /no encontrado|not found/i.test(err.message) ? 404 : 500).json({ error: err.message });
   }
@@ -1659,17 +1720,11 @@ router.get('/ingress/ask', (req, res) => {
     return res.status(400).type('text/plain').send('parámetro domain inválido');
   }
 
-  // Permitir también el dominio del propio panel de Culkibo si está configurado.
-  if (ingressManager.panelDomain && domain === ingressManager.panelDomain) {
-    return res.status(200).type('text/plain').send('ok');
-  }
-
-  const route = domainManager.resolveRoute(domain);
-  if (!route) {
-    // 403, no 404: es una denegación deliberada, no un despiste.
+  if (!ingressManager.isHostnameAuthorizedForTls(domain)) {
     return res.status(403).type('text/plain').send(`dominio no configurado en Culkibo: ${domain}`);
   }
-  if (route.status === 'disabled') {
+  const route = domainManager.resolveRoute(domain);
+  if (route && route.status === 'disabled') {
     return res.status(403).type('text/plain').send(`dominio deshabilitado: ${domain}`);
   }
 
@@ -1678,7 +1733,7 @@ router.get('/ingress/ask', (req, res) => {
   if (now - lastLog > 60000) {
     if (_askLogThrottle.size > 500) _askLogThrottle.clear();
     _askLogThrottle.set(domain, now);
-    containerOrchestrator.addLog('INFO', 'edge', `[Edge:TLS] Certificado autorizado para ${domain} (regla: ${route.hostname})`);
+    containerOrchestrator.addLog('INFO', 'edge', `[Edge:TLS] Certificado autorizado para ${domain} (regla: ${route ? route.hostname : 'panel/redirección/wildcard'})`);
   }
   return res.status(200).type('text/plain').send('ok');
 });
@@ -1724,11 +1779,15 @@ router.post('/ingress/start', async (req, res) => {
     if (detection.available) {
       return res.json({ started: false, alreadyRunning: true, message: 'Caddy ya está en marcha.' });
     }
-    const result = await caddyManager.startWithDocker(req.body || {});
+    const cfStatus = cloudflareService.getConfigStatus();
+    const startOpts = {
+      ...(req.body || {}),
+      ...(!cfStatus.useMock && cloudflareService.config.apiToken ? { cfApiToken: cloudflareService.config.apiToken } : {})
+    };
+    const result = await caddyManager.startWithDocker(startOpts);
     if (!result.started) {
       return res.status(502).json({ ...result, message: `No se pudo levantar Caddy: ${result.error}` });
     }
-    // Espera corta a que la admin API responda antes de reconciliar.
     for (let i = 0; i < 10; i++) {
       const check = await caddyManager.detect({ force: true });
       if (check.available) break;
@@ -1741,13 +1800,37 @@ router.post('/ingress/start', async (req, res) => {
   }
 });
 
-// Handshake TLS suelto contra un dominio cualquiera, sin pasar por el registro.
+router.get('/ingress/capabilities', async (req, res) => {
+  try {
+    const caps = await caddyManager.probeCapabilities({ force: req.query.force === '1' });
+    res.json({
+      ...caps,
+      wildcardPolicies: ingressManager.listWildcardPolicies(),
+      acmeEmail: ingressManager.acmeEmail,
+      cloudflareConfigured: Boolean(!cloudflareService.getConfigStatus().useMock)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/ingress/acme-email', async (req, res) => {
+  try {
+    const email = ingressManager.setAcmeEmail(req.body?.email || null);
+    const ingress = await ingressManager.reconcile();
+    res.json({ acmeEmail: email, ingress });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 router.get('/ingress/tls', async (req, res) => {
   try {
     const hostname = String(req.query.hostname || '').trim();
     if (!hostname) return res.status(400).json({ error: 'Falta el parámetro hostname' });
     res.json(await ingressManager.probeTls(hostname, {
-      timeoutMs: Math.min(parseInt(req.query.timeout, 10) || 3000, 10000)
+      timeoutMs: Math.min(parseInt(req.query.timeout, 10) || 3000, 10000),
+      fresh: req.query.fresh === '1'
     }));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1890,24 +1973,47 @@ router.post('/webhooks/github', async (req, res) => {
       } catch (e) {}
     }
 
-    // Resolve target project
-    /** @type {any} */
-    let project = null;
+    const verifyHmac = (secretValue) => {
+      if (!signature || typeof signature !== 'string') {
+        return { ok: false, error: 'Cabecera x-hub-signature-256 ausente o inválida' };
+      }
+      const rawPayload = req.rawBody || Buffer.from(JSON.stringify(req.body));
+      const hmac = crypto.createHmac('sha256', secretValue);
+      hmac.update(rawPayload);
+      const expectedSignature = `sha256=${hmac.digest('hex')}`.toLowerCase();
+      const clientSignature = signature.trim().toLowerCase();
+      const sigBuffer = Buffer.from(clientSignature);
+      const expectedBuffer = Buffer.from(expectedSignature);
+      if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
+        return { ok: false, error: 'Firma de webhook inválida (HMAC SHA-256 mismatch)' };
+      }
+      return { ok: true };
+    };
+
+    // Resolver proyecto(s) destino — soporta monorepos con varios proyectos apuntando al mismo repo
+    /** @type {any[]} */
+    let matchedProjects = [];
     if (projectId) {
-      project = projectManager.getById(projectId);
-      if (!project) {
+      const found = projectManager.getById(projectId);
+      if (!found) {
+        // Verificar primero secreto global si existe para evitar enumeración de IDs sin firma válida
+        if (process.env.GITHUB_WEBHOOK_SECRET) {
+          const check = verifyHmac(process.env.GITHUB_WEBHOOK_SECRET);
+          if (!check.ok) return res.status(401).json({ error: check.error });
+        }
         return res.status(404).json({ error: `Proyecto con ID '${projectId}' no encontrado` });
       }
+      matchedProjects = [found];
     }
 
     const payloadRepo = bodyData?.repository;
-    if (!project && payloadRepo) {
+    if (matchedProjects.length === 0 && payloadRepo) {
       const allProjects = projectManager.getAll();
       const targetSlug = (payloadRepo.full_name || '').toLowerCase();
       const repoHtml = (payloadRepo.html_url || '').toLowerCase().replace(/\.git$/, '');
       const repoClone = (payloadRepo.clone_url || '').toLowerCase().replace(/\.git$/, '');
 
-      project = allProjects.find(p => {
+      matchedProjects = allProjects.filter(p => {
         if (p.githubOwner && p.githubRepo) {
           const pSlug = `${p.githubOwner}/${p.githubRepo}`.toLowerCase();
           if (pSlug === targetSlug) return true;
@@ -1922,22 +2028,17 @@ router.post('/webhooks/github', async (req, res) => {
       });
     }
 
-    // HMAC SHA-256 signature verification if project has secret or if signature is sent
-    const secret = project?.webhookSecret || process.env.GITHUB_WEBHOOK_SECRET;
-    if (secret) {
-      if (!signature || typeof signature !== 'string') {
-        return res.status(401).json({ error: 'Cabecera x-hub-signature-256 ausente o inválida' });
-      }
-      const rawPayload = req.rawBody || Buffer.from(JSON.stringify(req.body));
-      const hmac = crypto.createHmac('sha256', secret);
-      hmac.update(rawPayload);
-      const expectedSignature = `sha256=${hmac.digest('hex')}`.toLowerCase();
-      const clientSignature = signature.trim().toLowerCase();
+    const project = matchedProjects[0] || null;
 
-      const sigBuffer = Buffer.from(clientSignature);
-      const expectedBuffer = Buffer.from(expectedSignature);
-      if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
-        return res.status(401).json({ error: 'Firma de webhook inválida (HMAC SHA-256 mismatch)' });
+    // Verificación HMAC SHA-256 (acepta coincidencia con cualquiera de los proyectos vinculados o secreto global)
+    const secretsToCheck = Array.from(new Set(
+      [...matchedProjects.map(p => p?.webhookSecret), process.env.GITHUB_WEBHOOK_SECRET].filter(Boolean)
+    ));
+    if (secretsToCheck.length > 0) {
+      const anyValid = secretsToCheck.some(s => verifyHmac(s).ok);
+      if (!anyValid) {
+        const firstErr = verifyHmac(secretsToCheck[0]).error;
+        return res.status(401).json({ error: firstErr });
       }
     }
 
@@ -1968,13 +2069,14 @@ router.post('/webhooks/github', async (req, res) => {
 
       const ref = String(bodyData?.ref || '');
       const pushedBranch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref.replace(/^refs\/heads\//, '');
-      const configuredBranch = project.gitBranch || 'main';
 
       if (!pushedBranch) {
         return res.json({ success: true, deployed: false, reason: 'Push sin rama (ref vacío) ignorado' });
       }
 
-      if (pushedBranch !== configuredBranch) {
+      const branchProjects = matchedProjects.filter(p => (p.gitBranch || 'main') === pushedBranch);
+      if (branchProjects.length === 0) {
+        const configuredBranch = project.gitBranch || 'main';
         containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push ignorado en rama '${pushedBranch}'. El proyecto '${project.name}' está configurado para la rama '${configuredBranch}'.`, new Date(), project.id);
         return res.json({
           success: true,
@@ -1983,8 +2085,9 @@ router.post('/webhooks/github', async (req, res) => {
         });
       }
 
-      if (project.autoDeploy === false) {
-        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push recibido pero el auto-despliegue está deshabilitado para '${project.name}'.`, new Date(), project.id);
+      const eligibleProjects = branchProjects.filter(p => p.autoDeploy !== false);
+      if (eligibleProjects.length === 0) {
+        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push recibido pero el auto-despliegue está deshabilitado para '${branchProjects[0].name}'.`, new Date(), branchProjects[0].id);
         return res.json({
           success: true,
           deployed: false,
@@ -1996,115 +2099,117 @@ router.post('/webhooks/github', async (req, res) => {
       const shortSha = commitSha.substring(0, 7);
       const commitMsg = bodyData?.head_commit?.message || 'Push automático desde GitHub';
       const author = bodyData?.head_commit?.author?.name || bodyData?.pusher?.name || 'GitHub';
-      const repoName = payloadRepo?.full_name || project.gitRepo || project.name;
       const now = new Date().toISOString();
+      const dockerProbe = await deployManager.detectDocker();
 
-      // Idempotencia. GitHub reentrega: por reintento automático cuando la
-      // respuesta tarda, y a mano desde «Redeliver». Sin esta puerta, un push
-      // arranca dos builds del mismo commit y la segunda choca con el bloqueo
-      // del proyecto, dejando un «fallido» en el historial que no lo es.
-      const claim = githubService.claimDelivery(project.id, {
-        deliveryId: req.headers['x-github-delivery'] || null,
-        commitSha
-      });
-      if (!claim.fresh) {
-        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] ${claim.reason} (${shortSha}); no se relanza el despliegue.`, new Date(), project.id);
+      /** @type {any[]} */
+      const dispatched = [];
+      let allDuplicates = true;
+      /** @type {string | null} */
+      let lastDupReason = null;
+
+      for (const target of eligibleProjects) {
+        const repoName = payloadRepo?.full_name || target.gitRepo || target.name;
+        const claim = githubService.claimDelivery(target.id, {
+          deliveryId: req.headers['x-github-delivery'] || null,
+          commitSha
+        });
+        if (!claim.fresh) {
+          lastDupReason = claim.reason;
+          containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] ${claim.reason} (${shortSha}); no se relanza el despliegue.`, new Date(), target.id);
+          continue;
+        }
+        allDuplicates = false;
+
+        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push recibido en ${repoName} (${pushedBranch}) por ${author}: "${commitMsg.trim()}" (${shortSha})`, new Date(), target.id);
+        containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Iniciando despliegue automatizado para ${target.name}...`, new Date(), target.id);
+
+        /** @type {{ dispatched: boolean, queued: boolean, reason: string | null }} */
+        let pipeline = { dispatched: false, queued: false, reason: null };
+        if (!target.gitRepo) {
+          pipeline.reason = 'El proyecto no tiene repositorio configurado';
+        } else if (!dockerProbe.available) {
+          pipeline.reason = dockerProbe.reason;
+        } else {
+          try {
+            const started = deployManager.enqueue(target, {
+              commit: /^[0-9a-f]{7,40}$/i.test(commitSha) ? commitSha : null,
+              version: `gh-${shortSha}`,
+              trigger: 'webhook'
+            });
+            pipeline = { dispatched: started.started, queued: started.queued, reason: null };
+          } catch (err) {
+            pipeline.reason = err.message;
+          }
+        }
+
+        if (pipeline.reason) {
+          containerOrchestrator.addLog('WARN', 'citadel', `[Citadel:Deploy] No se lanza la construcción de imagen: ${pipeline.reason}.`, new Date(), target.id);
+        } else if (pipeline.queued) {
+          containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Ya hay un despliegue en curso; ${shortSha} queda en cola y se construirá al terminar.`, new Date(), target.id);
+        }
+
+        const lastCommit = {
+          sha: shortSha,
+          message: commitMsg.trim(),
+          author,
+          timestamp: now
+        };
+        projectManager.update(target.id, {
+          lastDeployedAt: now,
+          lastCommit
+        });
+
+        containerOrchestrator.emit('github_deploy', {
+          projectId: target.id,
+          projectName: target.name,
+          branch: pushedBranch,
+          commit: shortSha,
+          author,
+          message: commitMsg.trim(),
+          timestamp: now
+        });
+
+        containerOrchestrator.addLog(
+          'SUCCESS',
+          'citadel',
+          pipeline.dispatched || pipeline.queued
+            ? `[GitHub:Webhook] Despliegue en curso para ${target.name} (${shortSha}); sigue el progreso en la pestaña Despliegues.`
+            : `[GitHub:Webhook] Despliegue completado para ${target.name} (${shortSha})`,
+          new Date(),
+          target.id
+        );
+
+        dispatched.push({
+          projectId: target.id,
+          pipeline: pipeline.dispatched ? 'building' : pipeline.queued ? 'queued' : 'registro',
+          pipelineReason: pipeline.reason
+        });
+      }
+
+      if (allDuplicates) {
         return res.json({
           success: true,
           deployed: false,
           duplicate: true,
-          projectId: project.id,
+          projectId: eligibleProjects[0].id,
           commit: shortSha,
-          reason: claim.reason
+          reason: lastDupReason || 'Entrega duplicada'
         });
       }
 
-      containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] 🚀 Push recibido en ${repoName} (${pushedBranch}) por ${author}: "${commitMsg.trim()}" (${shortSha})`, new Date(), project.id);
-      containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Iniciando despliegue automatizado para ${project.name}...`, new Date(), project.id);
-
-      // --- Construcción real ------------------------------------------------
-      //
-      // Hasta aquí el webhook solo anotaba el push. Ahora dispara el mismo
-      // camino que el botón «Desplegar»: traer el commit exacto que GitHub
-      // acaba de anunciar, construir la imagen, verificar salud y conmutar la
-      // ruta. NO se espera al resultado: una build dura minutos y GitHub corta
-      // la entrega a los 10 s. El progreso va por WebSocket (`deploy_event`) y
-      // queda en el historial del proyecto.
-      /** @type {{ dispatched: boolean, queued: boolean, reason: string | null }} */
-      let pipeline = { dispatched: false, queued: false, reason: null };
-      const dockerProbe = await deployManager.detectDocker();
-      if (!project.gitRepo) {
-        pipeline.reason = 'El proyecto no tiene repositorio configurado';
-      } else if (!dockerProbe.available) {
-        pipeline.reason = dockerProbe.reason;
-      } else {
-        try {
-          const started = deployManager.enqueue(project, {
-            // El SHA del payload, no «la punta de la rama»: entre el push y el
-            // build puede haber entrado otro commit, y desplegar uno distinto
-            // del que se anunció hace que el historial mienta.
-            commit: /^[0-9a-f]{7,40}$/i.test(commitSha) ? commitSha : null,
-            version: `gh-${shortSha}`,
-            trigger: 'webhook'
-          });
-          pipeline = { dispatched: started.started, queued: started.queued, reason: null };
-        } catch (err) {
-          pipeline.reason = err.message;
-        }
-      }
-
-      if (pipeline.reason) {
-        containerOrchestrator.addLog('WARN', 'citadel', `[Citadel:Deploy] No se lanza la construcción de imagen: ${pipeline.reason}.`, new Date(), project.id);
-      } else if (pipeline.queued) {
-        containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Ya hay un despliegue en curso; ${shortSha} queda en cola y se construirá al terminar.`, new Date(), project.id);
-      }
-
-      // Update project record
-      const lastCommit = {
-        sha: shortSha,
-        message: commitMsg.trim(),
-        author,
-        timestamp: now
-      };
-      projectManager.update(project.id, {
-        lastDeployedAt: now,
-        lastCommit
-      });
-
-      // Emit real-time webhook deploy event for WebSocket broadcast
-      containerOrchestrator.emit('github_deploy', {
-        projectId: project.id,
-        projectName: project.name,
-        branch: pushedBranch,
-        commit: shortSha,
-        author,
-        message: commitMsg.trim(),
-        timestamp: now
-      });
-
-      // El mensaje dice la verdad en cada caso: con pipeline real la build
-      // sigue corriendo cuando esta respuesta ya ha salido hacia GitHub.
-      containerOrchestrator.addLog(
-        'SUCCESS',
-        'citadel',
-        pipeline.dispatched || pipeline.queued
-          ? `[GitHub:Webhook] ✅ Despliegue en curso para ${project.name} (${shortSha}); sigue el progreso en la pestaña Despliegues.`
-          : `[GitHub:Webhook] ✅ Despliegue completado para ${project.name} (${shortSha})`,
-        new Date(),
-        project.id
-      );
-
+      const primary = dispatched[0];
       return res.json({
         success: true,
         deployed: true,
-        projectId: project.id,
+        projectId: primary.projectId,
+        matchedProjects: dispatched.length,
+        dispatched,
         branch: pushedBranch,
         commit: shortSha,
         deployedAt: now,
-        // Qué pasó de verdad, para que el que integre el webhook no tenga que
-        // adivinarlo: `building` significa que hay una imagen construyéndose.
-        pipeline: pipeline.dispatched ? 'building' : pipeline.queued ? 'queued' : 'registro',
-        pipelineReason: pipeline.reason
+        pipeline: primary.pipeline,
+        pipelineReason: primary.pipelineReason
       });
     }
 
@@ -2360,13 +2465,82 @@ router.post('/projects/:id/sync/promote', async (req, res) => {
   }
 });
 
-// --- WILDCARD TLS NATIVO VÍA CADDY + CLOUDFLARE DNS-01 ---
+// --- WILDCARD TLS NATIVO PERSISTIDO (MÚLTIPLES DOMINIOS COMODÍN) VÍA CADDY + CLOUDFLARE DNS-01 ---
+router.get('/ingress/wildcard-dns01', (_req, res) => {
+  res.json({ policies: ingressManager.listWildcardPolicies() });
+});
+
 router.post('/ingress/wildcard-dns01', async (req, res) => {
   try {
-    const { domain, tokenEnv } = req.body || {};
+    const { domain, tokenEnv, includeApex } = req.body || {};
     if (!domain) return res.status(400).json({ error: 'Indica el dominio raíz (p. ej. midominio.com)' });
-    const result = await caddyManager.configureWildcardDns01(domain, { tokenEnv: tokenEnv || 'CF_API_TOKEN' });
+    const result = await ingressManager.addWildcardPolicy(domain, {
+      tokenEnv: tokenEnv || 'CF_API_TOKEN',
+      includeApex: includeApex !== false
+    });
     res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/ingress/wildcard-dns01/:domain', async (req, res) => {
+  try {
+    const result = await ingressManager.removeWildcardPolicy(req.params.domain);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- COLA GLOBAL DE DESPLIEGUES, ENLACE PROYECTO<->BD Y MODO MANTENIMIENTO ---
+router.get('/deploy/queue', (_req, res) => {
+  res.json(deployManager.getQueueStatus());
+});
+
+router.post('/projects/:id/databases/:dbId/link', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const db = databaseManager.get(req.params.dbId);
+    const nextIds = Array.from(new Set([...(Array.isArray(project.linkedDatabaseIds) ? project.linkedDatabaseIds : []), db.id]));
+    const updated = projectManager.update(project.id, { linkedDatabaseIds: nextIds });
+    await projectManager.flushToDisk();
+    res.json({
+      success: true,
+      project: updated,
+      database: db,
+      note: 'Base de datos vinculada: al redesplegar se adjuntará su red Docker aislada y se inyectará la URL de conexión sin guardar contraseñas en disco.'
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/projects/:id/databases/:dbId/link', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const nextIds = (Array.isArray(project.linkedDatabaseIds) ? project.linkedDatabaseIds : []).filter((x) => x !== req.params.dbId);
+    const updated = projectManager.update(project.id, { linkedDatabaseIds: nextIds });
+    await projectManager.flushToDisk();
+    res.json({ success: true, project: updated });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/projects/:id/maintenance', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const enabled = req.body && typeof req.body.enabled === 'boolean'
+      ? req.body.enabled
+      : !project.maintenanceMode;
+    const updated = projectManager.update(project.id, { maintenanceMode: enabled });
+    await projectManager.flushToDisk();
+    const ingress = await ingressManager.reconcile();
+    res.json({ success: true, maintenanceMode: enabled, project: updated, ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

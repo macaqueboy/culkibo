@@ -409,19 +409,22 @@ class ContainerOrchestrator extends EventEmitter {
         this.debounceTimers.delete(targetDir);
       }
       if (this.watchers.has(targetDir)) {
-        try { await this.watchers.get(targetDir).close(); } catch(e) {}
+        const w = this.watchers.get(targetDir);
+        // Borrar ANTES del await para no eliminar un watcher nuevo registrado concurrentemente.
         this.watchers.delete(targetDir);
+        try { await w.close(); } catch(e) {}
       }
     } else {
       for (const timer of this.debounceTimers.values()) clearTimeout(timer);
       this.debounceTimers.clear();
+      const snapshot = Array.from(this.watchers.values());
+      this.watchers.clear();
+      this.watchedDirectory = null;
       const closePromises = [];
-      for (const watcher of this.watchers.values()) {
+      for (const watcher of snapshot) {
         try { closePromises.push(watcher.close()); } catch(e) {}
       }
       await Promise.all(closePromises).catch(() => {});
-      this.watchers.clear();
-      this.watchedDirectory = null;
     }
     
     if (this.watchers.size === 0) this.pods.forge.fileWatchersActive = 0;
@@ -515,8 +518,8 @@ class ContainerOrchestrator extends EventEmitter {
   startMetricsCollection() {
     if (this.metricsTimer) clearInterval(this.metricsTimer);
     this.metricsTimer = setInterval(() => {
-      // Cero trabajo en reposo si no hay ningún cliente WS conectado ni listeners externos
-      if (this.connectionCounter() === 0 && this.listenerCount('metrics') === 0) return;
+      // Cero CPU en reposo cuando no hay clientes WebSocket conectados.
+      if (this.connectionCounter() === 0) return;
 
       const local = this.getLocalProcessStats();
 
@@ -524,15 +527,13 @@ class ContainerOrchestrator extends EventEmitter {
       this.pods.forge.localPorts = local.ports;
       this.pods.forge.status = local.count > 0 ? 'running' : 'idle';
 
-      if (this.connectionCounter() > 0) {
-        this.emit('metrics', {
-          forge: this.pods.forge,
-          citadel: this.pods.citadel,
-          daemon: this.getDaemonMetrics(),
-          localProcesses: local,
-          trafficAllocation: this.trafficAllocation
-        });
-      }
+      this.emit('metrics', {
+        forge: this.pods.forge,
+        citadel: this.pods.citadel,
+        daemon: this.getDaemonMetrics(),
+        localProcesses: local,
+        trafficAllocation: this.trafficAllocation
+      });
     }, 3000);
 
     // CRITICAL: Unref the timer so it doesn't prevent clean test/process exit

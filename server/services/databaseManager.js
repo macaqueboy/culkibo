@@ -12,6 +12,16 @@ const execFilePromise = util.promisify(execFile);
 const dbBackupManager = require('./dbBackupManager');
 const { S3Client, redactKey } = require('./s3Uploader');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
+const portRegistry = require('./portRegistry');
+
+/** @type {any} */
+let _notificationService = null;
+function getNotificationService() {
+  if (!_notificationService) {
+    try { _notificationService = require('./notificationService'); } catch (e) {}
+  }
+  return _notificationService;
+}
 
 /**
  * Bases de datos gestionadas: aprovisionamiento en un clic, copias programadas,
@@ -425,10 +435,29 @@ class DatabaseManager extends EventEmitter {
     this.schedulerTimer = null;
     /** @type {Set<string>} */
     this.runningBackups = new Set();
+    /** @type {Map<string, Promise<any>>} Mutex por ID de BD para serializar operaciones destructivas */
+    this._opLocks = new Map();
     /** @type {any} */
     this.dockerChecked = null;
     this.ensureDirs();
     this.load();
+    portRegistry.registerProvider('databaseManager', () =>
+      this.state.databases
+        .filter((d) => d && d.exposure && d.exposure.enabled && d.exposure.hostPort)
+        .map((d) => Number(d.exposure.hostPort))
+    );
+  }
+
+  /** Serializa operaciones de ciclo de vida/exposición/restauración sobre la misma BD. */
+  async withLock(id, fn) {
+    while (this._opLocks.has(id)) {
+      try { await this._opLocks.get(id); } catch (e) {}
+    }
+    const task = Promise.resolve().then(fn).finally(() => {
+      if (this._opLocks.get(id) === task) this._opLocks.delete(id);
+    });
+    this._opLocks.set(id, task);
+    return task;
   }
 
   ensureDirs() {
@@ -626,9 +655,17 @@ class DatabaseManager extends EventEmitter {
       await this.docker(['network', 'inspect', name], { timeout: 10000 });
       return { name, created: false };
     } catch (e) {
-      await this.docker(['network', 'create', '--driver', 'bridge', '--label', 'culkibo.managed=true',
-        '--label', `culkibo.project=${projectId}`, name], { timeout: 20000 });
-      return { name, created: true };
+      try {
+        await this.docker(['network', 'create', '--driver', 'bridge', '--label', 'culkibo.managed=true',
+          '--label', `culkibo.project=${projectId}`, name], { timeout: 20000 });
+        return { name, created: true };
+      } catch (createErr) {
+        // Dos aprovisionamientos concurrentes en el mismo proyecto: idempotente si ya la creó el otro.
+        if (/already exists/i.test(String(createErr && createErr.message))) {
+          return { name, created: false };
+        }
+        throw createErr;
+      }
     }
   }
 
@@ -833,6 +870,9 @@ class DatabaseManager extends EventEmitter {
       (d) => d.id !== id && d.exposure && d.exposure.enabled && d.exposure.hostPort === port
     );
     if (taken) throw new Error(`El puerto ${port} ya lo usa otra base de datos gestionada`);
+    if (portRegistry.isProtectedPort(port, 'databaseManager')) {
+      throw new Error(`El puerto ${port} ya está reservado por otro servicio de Culkibo`);
+    }
 
     // P1-11: comprobar disponibilidad real del puerto antes de destruir el contenedor vivo
     const prevExposure = record.exposure ? { ...record.exposure } : { enabled: false, bindAddress: '127.0.0.1', hostPort: null };
@@ -958,30 +998,36 @@ class DatabaseManager extends EventEmitter {
   }
 
   async start(id) {
-    const record = this.mustGet(id);
-    await this.docker(['start', record.containerName], { timeout: 60000 });
-    record.status = 'running';
-    record.updatedAt = new Date().toISOString();
-    this.save();
-    return this.toPublic(record);
+    return this.withLock(id, async () => {
+      const record = this.mustGet(id);
+      await this.docker(['start', record.containerName], { timeout: 60000 });
+      record.status = 'running';
+      record.updatedAt = new Date().toISOString();
+      this.save();
+      return this.toPublic(record);
+    });
   }
 
   async stop(id) {
-    const record = this.mustGet(id);
-    await this.docker(['stop', record.containerName], { timeout: 90000 });
-    record.status = 'stopped';
-    record.updatedAt = new Date().toISOString();
-    this.save();
-    return this.toPublic(record);
+    return this.withLock(id, async () => {
+      const record = this.mustGet(id);
+      await this.docker(['stop', record.containerName], { timeout: 90000 });
+      record.status = 'stopped';
+      record.updatedAt = new Date().toISOString();
+      this.save();
+      return this.toPublic(record);
+    });
   }
 
   async restart(id) {
-    const record = this.mustGet(id);
-    await this.docker(['restart', record.containerName], { timeout: 120000 });
-    record.status = 'running';
-    record.updatedAt = new Date().toISOString();
-    this.save();
-    return this.toPublic(record);
+    return this.withLock(id, async () => {
+      const record = this.mustGet(id);
+      await this.docker(['restart', record.containerName], { timeout: 120000 });
+      record.status = 'running';
+      record.updatedAt = new Date().toISOString();
+      this.save();
+      return this.toPublic(record);
+    });
   }
 
   /**
@@ -989,20 +1035,22 @@ class DatabaseManager extends EventEmitter {
    * un clic de más no puede destruir los datos de producción de nadie.
    */
   async remove(id, { deleteVolume = false, deleteBackups = false } = {}) {
-    const record = this.mustGet(id);
-    if (await this.isDockerAvailable()) {
-      try { await this.docker(['rm', '-f', record.containerName], { timeout: 90000 }); } catch (e) {}
-      if (deleteVolume) {
-        try { await this.docker(['volume', 'rm', record.volumeName], { timeout: 30000 }); } catch (e) {}
+    return this.withLock(id, async () => {
+      const record = this.mustGet(id);
+      if (await this.isDockerAvailable()) {
+        try { await this.docker(['rm', '-f', record.containerName], { timeout: 90000 }); } catch (e) {}
+        if (deleteVolume) {
+          try { await this.docker(['volume', 'rm', record.volumeName], { timeout: 30000 }); } catch (e) {}
+        }
       }
-    }
-    if (deleteBackups) {
-      try { fs.rmSync(path.join(BACKUPS_ROOT, record.id), { recursive: true, force: true }); } catch (e) {}
-    }
-    this.state.databases = this.state.databases.filter((d) => d.id !== id);
-    this.save();
-    this.emit('database_deleted', { id, volumeDeleted: deleteVolume });
-    return { success: true, id, volumeDeleted: deleteVolume, backupsDeleted: deleteBackups };
+      if (deleteBackups) {
+        try { fs.rmSync(path.join(BACKUPS_ROOT, record.id), { recursive: true, force: true }); } catch (e) {}
+      }
+      this.state.databases = this.state.databases.filter((d) => d.id !== id);
+      this.save();
+      this.emit('database_deleted', { id, volumeDeleted: deleteVolume });
+      return { success: true, id, volumeDeleted: deleteVolume, backupsDeleted: deleteBackups };
+    });
   }
 
   async refreshHealth(id) {
@@ -1287,6 +1335,16 @@ class DatabaseManager extends EventEmitter {
       record.lastError = this.redactMessage(err.message, password);
       this.save();
       this.emit('backup_failed', { databaseId: id, error: record.lastError });
+      const ns = getNotificationService();
+      if (ns && typeof ns.notify === 'function') {
+        Promise.resolve(ns.notify({
+          event: 'backup_failed',
+          level: 'error',
+          title: `Copia fallida: ${record.name}`,
+          message: `No se pudo completar la copia (${trigger}) de ${record.name} (${record.engine}): ${record.lastError}`,
+          projectId: record.projectId
+        })).catch(() => {});
+      }
       throw new Error(`Copia fallida: ${record.lastError}`);
     } finally {
       try {
@@ -1721,6 +1779,10 @@ class DatabaseManager extends EventEmitter {
     const next = record.schedule.enabled ? this.nextCronRun(expr) : null;
     record.schedule.nextRunAt = next ? next.toISOString() : null;
     this.save();
+    // Si se activa una programación después del arranque, garantizar que el planificador esté despierto.
+    if (record.schedule.enabled && !this.schedulerTimer) {
+      this.startScheduler({ catchUp: false });
+    }
     return this.toPublic(record);
   }
 

@@ -439,13 +439,60 @@ export interface PodsData {
   activeConnections: number;
 }
 
+export interface DomainWizardPreset {
+  serviceId?: string;
+  serviceName?: string;
+  targetPort?: number;
+  suggestedHostname?: string;
+}
+
+export interface IngressCapabilities {
+  available: boolean;
+  version: string | null;
+  hasCloudflareDnsPlugin: boolean | null;
+  hasCfTokenEnv: boolean;
+  containerized: boolean;
+  containerName: string;
+  wildcardPolicies: Array<{
+    rootDomain: string;
+    subjects: string[];
+    tokenEnv: string;
+    includeApex: boolean;
+    enabled?: boolean;
+    addedAt?: string;
+  }>;
+  acmeEmail: string | null;
+  cloudflareConfigured: boolean;
+}
+
+export interface DomainDiagnosisCheck {
+  id: string;
+  title: string;
+  status: 'ok' | 'warn' | 'fail';
+  detail: string;
+}
+
+export interface DomainDiagnosisReport {
+  hostname: string;
+  overall: 'ok' | 'warn' | 'fail';
+  checks: DomainDiagnosisCheck[];
+  dns?: any;
+  tls?: TlsProbe;
+  route?: IngressRoute | null;
+  upstreamReachable?: boolean | null;
+  capabilities?: Partial<IngressCapabilities>;
+  checkedAt?: string;
+}
+
 export interface DomainItem {
   id: string;
   hostname: string;
   isWildcard: boolean;
   /** Proyecto dueño del dominio, o null si va directo a un pod. */
   projectId: string | null;
-  targetPod: 'forge' | 'citadel';
+  serviceId?: string | null;
+  serviceName?: string | null;
+  targetPod: 'forge' | 'citadel' | 'service';
   targetPort: number;
   status: string;
   cloudflareProxied: boolean;
@@ -454,6 +501,9 @@ export interface DomainItem {
   sslCertId: string | null;
   sslProvider: string | null;
   routingMode: string;
+  canonicalRedirect?: 'none' | 'www_to_apex' | 'apex_to_www';
+  securityHeaders?: boolean;
+  customHeaders?: Record<string, string>;
   createdAt: string;
   lastCheckedAt: string;
   migrationSource?: string;
@@ -687,6 +737,13 @@ export interface Project {
   githubRepo?: string;
   localRunning?: boolean;
   localPort?: number;
+  containerPort?: number;
+  healthPath?: string;
+  memoryMb?: number;
+  cpus?: string | number;
+  linkedDatabaseIds?: string[];
+  maintenanceMode?: boolean;
+  autoRollback?: boolean;
 }
 
 // --- Despliegue a producción ---
@@ -697,8 +754,8 @@ export interface Project {
  * del backend no rompa la compilación del panel.
  */
 export type DeployStatus_ =
-  | 'pendiente' | 'sincronizando' | 'construyendo' | 'arrancando'
-  | 'verificando' | 'promocionando' | 'drenando' | 'activo' | 'fallido';
+  | 'pendiente' | 'en_cola' | 'sincronizando' | 'construyendo' | 'arrancando'
+  | 'verificando' | 'promocionando' | 'drenando' | 'activo' | 'fallido' | 'cancelado';
 
 export interface DeployGitInfo {
   branch: string | null;
@@ -1065,11 +1122,16 @@ export const api = {
     hostname: string;
     targetPod: string;
     targetPort: number;
+    projectId?: string | null;
+    serviceId?: string | null;
+    serviceName?: string | null;
     cloudflareZoneId?: string | null;
     cloudflareProxied?: boolean;
     autoCreateDns?: boolean;
     serverIp?: string | null;
-  }): Promise<DomainItem> {
+    canonicalRedirect?: 'none' | 'www_to_apex' | 'apex_to_www';
+    securityHeaders?: boolean;
+  }): Promise<DomainItem & { ingress?: IngressOutcome }> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/domains`, {
         method: 'POST',
@@ -1080,9 +1142,9 @@ export const api = {
     );
   },
 
-  async updateDomain(id: string, updates: Partial<DomainItem>): Promise<DomainItem> {
+  async updateDomain(id: string, updates: Partial<DomainItem>): Promise<DomainItem & { ingress?: IngressOutcome }> {
     return jsonOrThrow(
-      await apiFetch(`${API_BASE}/domains/${id}`, {
+      await apiFetch(`${API_BASE}/domains/${encodeURIComponent(id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates)
@@ -1170,6 +1232,8 @@ export const api = {
     cloudflareProxied?: boolean;
     autoCreateDns?: boolean;
     serverIp?: string | null;
+    canonicalRedirect?: 'none' | 'www_to_apex' | 'apex_to_www';
+    securityHeaders?: boolean;
   }): Promise<{ domain: DomainItem; project: Project; ingress: IngressOutcome }> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/projects/${projectId}/domains`, {
@@ -1705,15 +1769,107 @@ export const api = {
     );
   },
 
-  async configureWildcardDns01(domain: string, tokenEnv = 'CF_API_TOKEN'): Promise<any> {
+  async configureWildcardDns01(domain: string, tokenEnv = 'CF_API_TOKEN', includeApex = true): Promise<any> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/ingress/wildcard-dns01`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domain, tokenEnv })
+        body: JSON.stringify({ domain, tokenEnv, includeApex })
       }),
       'No se pudo configurar el certificado wildcard DNS-01 en Caddy'
     );
+  },
+
+  async listWildcardPolicies(): Promise<{ policies: Array<{ rootDomain: string; subjects: string[]; tokenEnv: string; includeApex: boolean; addedAt?: string }> }> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/ingress/wildcard-dns01`), 'No se pudieron leer las políticas wildcard');
+  },
+
+  async removeWildcardPolicy(domain: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/wildcard-dns01/${encodeURIComponent(domain)}`, { method: 'DELETE' }),
+      'No se pudo eliminar la política wildcard'
+    );
+  },
+
+  async getIngressCapabilities(force = false): Promise<IngressCapabilities> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/capabilities${force ? '?force=1' : ''}`),
+      'No se pudieron comprobar las capacidades de Caddy'
+    );
+  },
+
+  async setAcmeEmail(email: string | null): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/acme-email`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      }),
+      'No se pudo actualizar el correo ACME'
+    );
+  },
+
+  async diagnoseDomain(id: string): Promise<DomainDiagnosisReport> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains/${encodeURIComponent(id)}/diagnose`, { method: 'POST' }),
+      'No se pudo ejecutar el diagnóstico del dominio'
+    );
+  },
+
+  async uploadCustomCertificate(payload: { domain: string; certPem: string; keyPem: string; provider?: string }): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ssl/certificates/upload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo subir el certificado SSL'
+    );
+  },
+
+  async deleteCertificate(id: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ssl/certificates/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'No se pudo revocar el certificado SSL'
+    );
+  },
+
+  async linkProjectDatabase(projectId: string, databaseId: string): Promise<{ success: boolean; project: Project; note?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(databaseId)}/link`, {
+        method: 'POST'
+      }),
+      'No se pudo vincular la base de datos al proyecto'
+    );
+  },
+
+  async unlinkProjectDatabase(projectId: string, databaseId: string): Promise<{ success: boolean; project: Project }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(databaseId)}/link`, {
+        method: 'DELETE'
+      }),
+      'No se pudo desvincular la base de datos'
+    );
+  },
+
+  async toggleMaintenance(projectId: string, enabled: boolean): Promise<{ success: boolean; maintenanceMode: boolean; project: Project; ingress?: IngressOutcome }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/maintenance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      }),
+      'No se pudo cambiar el modo mantenimiento'
+    );
+  },
+
+  async getDeployQueue(): Promise<{
+    maxConcurrentBuilds: number;
+    activeBuilds: number;
+    queuedBuilds: Array<{ position: number; projectId: string; deploymentId: string; waitingMs: number }>;
+    inFlightProjects: string[];
+  }> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/deploy/queue`), 'No se pudo consultar la cola de despliegues');
   },
 
   async getSyncSummary(): Promise<any> {

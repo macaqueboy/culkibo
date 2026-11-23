@@ -54,6 +54,23 @@ class Project {
     this.memoryMb = data.memoryMb || null;
     this.cpus = data.cpus || null;
     this.buildArgs = data.buildArgs || {};
+    // Enlaces declarativos a bases de datos gestionadas (solo IDs; los secretos
+    // nunca se persisten en texto plano en projects.json) y dependencias internas.
+    this.linkedDatabaseIds = Array.isArray(data.linkedDatabaseIds)
+      ? Array.from(new Set(data.linkedDatabaseIds.filter((x) => typeof x === 'string' && x.trim())))
+      : [];
+    this.dependencies = Array.isArray(data.dependencies) ? data.dependencies : [];
+    // Modo mantenimiento atómico (<10 ms en Caddy), auto-rollback ante crash-loop/OOM
+    // y vistas previas HTTPS automáticas por Pull Request.
+    this.maintenanceMode = Boolean(data.maintenanceMode);
+    this.autoRollback = data.autoRollback !== undefined ? Boolean(data.autoRollback) : true;
+    this.previewDeployments = data.previewDeployments && typeof data.previewDeployments === 'object'
+      ? {
+          enabled: Boolean(data.previewDeployments.enabled),
+          baseDomain: String(data.previewDeployments.baseDomain || '').trim().toLowerCase(),
+          maxPreviews: Math.min(20, Math.max(1, Number(data.previewDeployments.maxPreviews) || 5))
+        }
+      : { enabled: false, baseDomain: '', maxPreviews: 5 };
   }
 }
 

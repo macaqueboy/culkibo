@@ -35,6 +35,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
   const [forgePort, setForgePort] = useState(3000);
   const [startCommand, setStartCommand] = useState('npm start');
   const [buildCommand, setBuildCommand] = useState('');
+  const [deployOnCreate, setDeployOnCreate] = useState(false);
   const [loading, setLoading] = useState(false);
 
   // Estado GitHub
@@ -62,6 +63,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
     setForgePort(3000);
     setStartCommand('npm start');
     setBuildCommand('');
+    setDeployOnCreate(false);
     setSelectedRepo(null);
     setDetectedStack(null);
     setRepoSearch('');
@@ -255,6 +257,9 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
       const created = await api.createProject(projectPayload);
       if (created && created.id) {
         await api.activateProject(created.id);
+        if (deployOnCreate && projectPayload.gitRepo) {
+          void api.startDeploy(created.id).catch(() => {});
+        }
       }
       onSuccess(created?.id);
       resetForm();
@@ -337,8 +342,14 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
                 type="text"
                 value={publicGitUrl}
                 onChange={(e) => {
-                  setPublicGitUrl(e.target.value);
+                  const val = e.target.value;
+                  setPublicGitUrl(val);
                   if (inspectedUrl) setInspectedUrl(null);
+                  const cleaned = val.trim().replace(/\/+$/, '').replace(/\.git$/i, '');
+                  const lastSeg = cleaned.split(/[/:]/).filter(Boolean).pop();
+                  if (lastSeg && !name && cleaned.includes('/')) {
+                    setName(lastSeg);
+                  }
                 }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
@@ -743,7 +754,19 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
       </div>
 
       {/* Pie del modal */}
-      <div className="px-5 py-3.5 border-t border-slate-200 bg-slate-50/70 flex justify-end gap-2">
+      <div className="px-5 py-3.5 border-t border-slate-200 bg-slate-50/70 flex flex-wrap items-center justify-between gap-2">
+        {tab !== 'manual' ? (
+          <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={deployOnCreate}
+              onChange={(e) => setDeployOnCreate(e.target.checked)}
+              className="rounded border-slate-300 accent-slate-900"
+            />
+            <span>Desplegar al crear</span>
+          </label>
+        ) : <span />}
+        <div className="flex items-center gap-2 ml-auto">
         <button
           type="button"
           onClick={handleClose}
@@ -763,12 +786,15 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
               <RefreshCw className="w-3.5 h-3.5 animate-spin" />
               {tab === 'github' ? 'Importando…' : 'Creando…'}
             </>
+          ) : deployOnCreate && tab !== 'manual' ? (
+            'Crear y desplegar'
           ) : tab === 'github' ? (
             'Importar proyecto'
           ) : (
             'Crear proyecto'
           )}
         </button>
+        </div>
       </div>
     </Modal>
   );

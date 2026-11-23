@@ -37,18 +37,49 @@ export const Modal: React.FC<ModalProps> = ({
   useEffect(() => {
     if (!open) return;
     const prevOverflow = document.body.style.overflow;
+    const prevFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     document.body.style.overflow = 'hidden';
+
+    const focusableSelector =
+      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+    // Enfocar el primer control interactivo si el foco no está ya dentro del modal
+    const raf = window.requestAnimationFrame(() => {
+      const panel = panelRef.current;
+      if (panel && !panel.contains(document.activeElement)) {
+        const first = panel.querySelector<HTMLElement>(focusableSelector);
+        (first || panel).focus();
+      }
+    });
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !closeDisabled) {
         e.stopPropagation();
         onClose();
+        return;
+      }
+      if (e.key === 'Tab' && panelRef.current) {
+        const nodes = Array.from(panelRef.current.querySelectorAll<HTMLElement>(focusableSelector));
+        if (nodes.length === 0) return;
+        const first = nodes[0];
+        const last = nodes[nodes.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => {
+      window.cancelAnimationFrame(raf);
       document.body.style.overflow = prevOverflow;
       window.removeEventListener('keydown', onKeyDown);
+      if (prevFocused && typeof prevFocused.focus === 'function') {
+        prevFocused.focus();
+      }
     };
   }, [open, closeDisabled, onClose]);
 
@@ -63,11 +94,12 @@ export const Modal: React.FC<ModalProps> = ({
     >
       <div
         ref={panelRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby={!hideHeader && title ? titleId : undefined}
         aria-label={hideHeader || !title ? (ariaLabel || 'Diálogo') : undefined}
-        className={`w-full ${maxWidthClass} bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden flex flex-col max-h-[90vh]`}
+        className={`culkibo-modal-enter w-full ${maxWidthClass} bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden flex flex-col max-h-[90vh] focus:outline-none`}
       >
         {!hideHeader && title && (
           <div className="px-5 py-4 border-b border-slate-200 flex items-start justify-between gap-4 shrink-0">

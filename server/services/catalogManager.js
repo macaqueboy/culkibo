@@ -6,6 +6,7 @@ const EventEmitter = require('events');
 
 const { atomicWriteJsonSync } = require('./ssrfGuard');
 const { TEMPLATES, CATEGORIES, validateCatalog } = require('./catalog/templates');
+const portRegistry = require('./portRegistry');
 
 // Carga perezosa: GET /api/catalog solo necesita las plantillas y nunca debe
 // arrastrar databaseManager/domainManager/ingressManager en el arranque en frío.
@@ -236,6 +237,9 @@ class CatalogManager extends EventEmitter {
     this._catalogSerializedCache = null;
     this.ensureDirs();
     this.load();
+    portRegistry.registerProvider('catalogManager', () =>
+      this.state.installations.map((i) => i && i.hostPort).filter(Boolean)
+    );
   }
 
   ensureDirs() {
@@ -388,15 +392,16 @@ class CatalogManager extends EventEmitter {
     });
   }
 
-  async allocatePort() {
-    const reserved = this.reservedPorts();
-    for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
-      if (reserved.has(port) || this.pendingPorts.has(port)) continue;
-      this.pendingPorts.add(port);
-      if (await this.portIsFree(port)) return port;
-      this.pendingPorts.delete(port);
-    }
-    throw new Error(`No queda ningún puerto libre entre ${PORT_RANGE_START} y ${PORT_RANGE_END}`);
+  async allocatePort(owner = `cat_${Date.now()}`) {
+    const port = await portRegistry.allocate({
+      kind: 'catalog',
+      owner,
+      start: PORT_RANGE_START,
+      end: PORT_RANGE_END,
+      extraExcluded: this.pendingPorts
+    });
+    this.pendingPorts.add(port);
+    return port;
   }
 
   // -------------------------------------------------------------------------
@@ -458,7 +463,7 @@ class CatalogManager extends EventEmitter {
     }
 
     const id = `svc_${tpl.id}_${crypto.randomBytes(4).toString('hex')}`;
-    const hostPort = await this.allocatePort();
+    const hostPort = await this.allocatePort(id);
 
     /** @type {any} */
     let record;
@@ -506,6 +511,7 @@ class CatalogManager extends EventEmitter {
       this.state.installations.push(record);
     } finally {
       this.pendingPorts.delete(hostPort);
+      portRegistry.release(hostPort, id);
     }
     this.setProgress(record, 'validar', `Preparando la instalación de ${tpl.name}`);
 
@@ -880,6 +886,9 @@ class CatalogManager extends EventEmitter {
     record.status = 'running';
     record.updatedAt = new Date().toISOString();
     this.save();
+    if (record.domainId) {
+      try { await getIngressManager().reconcile(); } catch (e) {}
+    }
     return this.toPublic(record);
   }
 
@@ -890,6 +899,9 @@ class CatalogManager extends EventEmitter {
       throw err;
     }
     const record = this.mustGet(id);
+    if (record.domainId) {
+      try { await require('./caddyManager').removeRoute(record.id); } catch (e) {}
+    }
     await this.docker(['stop', record.containerName], { timeout: 90000 });
     for (const car of record.sidecars) {
       try { await this.docker(['stop', car.containerName], { timeout: 90000 }); } catch (e) {}

@@ -71,7 +71,12 @@ function parseEnvText(envText) {
     if (eq <= 0) continue;
     const key = cleaned.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    const val = unquote(cleaned.slice(eq + 1).trim());
+    let rawVal = cleaned.slice(eq + 1).trim();
+    // Eliminar comentarios `# ...` al final de valores sin comillas (convención .env)
+    if (rawVal && !rawVal.startsWith('"') && !rawVal.startsWith("'")) {
+      rawVal = rawVal.replace(/\s+#.*$/, '').trim();
+    }
+    const val = unquote(rawVal);
     envVars[key] = val;
   }
 
@@ -124,6 +129,7 @@ function parseDockerCompose(yamlText) {
   let currentService = null;
   /** @type {string | null} */
   let currentSection = null;
+  let dependsOnIndent = -1;
 
   for (const rawLine of lines) {
     const line = stripYamlComment(rawLine);
@@ -184,6 +190,7 @@ function parseDockerCompose(yamlText) {
       const key = m[1];
       const rest = m[2].trim();
       currentSection = key;
+      dependsOnIndent = -1;
 
       if (key === 'image' && rest) currentService.image = unquote(rest);
       else if (key === 'restart' && rest) currentService.restart = unquote(rest);
@@ -207,8 +214,12 @@ function parseDockerCompose(yamlText) {
           const dep = unquote(trimmed.slice(1).trim());
           if (dep) currentService.dependsOn.push(dep);
         } else {
-          const dm = trimmed.match(/^([a-zA-Z0-9_.-]+)\s*:/);
-          if (dm) currentService.dependsOn.push(dm[1]);
+          // Forma larga: solo capturar claves al primer nivel bajo `depends_on:` (ignorar `condition:`, `restart:`)
+          if (dependsOnIndent === -1) dependsOnIndent = indent;
+          if (indent === dependsOnIndent) {
+            const dm = trimmed.match(/^([a-zA-Z0-9_.-]+)\s*:/);
+            if (dm) currentService.dependsOn.push(dm[1]);
+          }
         }
       } else if (currentSection === 'environment') {
         const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -517,10 +528,17 @@ class UniversalImporter {
       verifiedPublic: false
     };
 
-    // Autodetección en vivo para repos públicos de GitHub y GitLab (sin token obligatorio).
+    // Autodetección en vivo para repos públicos (y privados si hay PAT de GitHub conectado).
     if (provider === 'github' && owner && repo) {
       try {
+        /** @type {Record<string, string>} */
         const ghHeaders = { 'User-Agent': 'Culkibo-Importer/1.0', Accept: 'application/vnd.github.v3+json' };
+        try {
+          const gh = require('./githubService');
+          if (gh && gh.config && gh.config.token && !gh.isMockToken(gh.config.token)) {
+            ghHeaders.Authorization = `Bearer ${gh.config.token}`;
+          }
+        } catch (e) {}
         const metaRes = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
           headers: ghHeaders,
           signal: AbortSignal.timeout(6000)
@@ -667,6 +685,7 @@ class UniversalImporter {
       }
       if (project.domains.length > 0) {
         projectManager.update(project.id, { domains: project.domains });
+        try { await require('./ingressManager').reconcile(); } catch (e) {}
       }
     }
 

@@ -15,13 +15,13 @@ import {
   Server,
   XCircle,
 } from 'lucide-react';
-import { api, type WordPressAnalysis, type ServiceInstallation } from '../lib/api';
+import { api, type WordPressAnalysis, type ServiceInstallation, type DomainWizardPreset } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 
 interface WordPressMigrationWizardProps {
   onComplete: () => void;
   onOpenCatalogInstalled?: () => void;
-  onOpenDomains?: () => void;
+  onOpenDomains?: (preset?: DomainWizardPreset) => void;
   onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }
 
@@ -242,7 +242,7 @@ export const WordPressMigrationWizard: React.FC<WordPressMigrationWizardProps> =
               </label>
               <div className="flex flex-col sm:flex-row gap-2">
                 <div className="relative flex-1">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     type="text"
                     value={sourceUrl}
@@ -561,6 +561,9 @@ export const WordPressMigrationWizard: React.FC<WordPressMigrationWizardProps> =
               </div>
             ) : (
               <div className="space-y-3 p-4 rounded-xl bg-slate-50 border border-slate-200">
+                <div className="p-3 rounded-lg bg-white border border-slate-200 text-[11px] text-slate-600 leading-relaxed">
+                  <strong className="text-slate-900">Importante sobre imágenes y archivos:</strong> el archivo <code className="font-mono">.sql</code> importa entradas, páginas, usuarios, pedidos y ajustes de MariaDB. Si quieres trasladar también las imágenes de <code className="font-mono">wp-content/uploads</code> y plugins en un solo paso, usa la <strong>Opción A</strong> (hasta 512 MB ya preconfigurados).
+                </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                   <div>
                     <label className="block font-medium text-slate-700 mb-1">Dominio antiguo (para reescribir URLs)</label>
@@ -619,7 +622,18 @@ export const WordPressMigrationWizard: React.FC<WordPressMigrationWizardProps> =
               {onOpenDomains && (
                 <button
                   type="button"
-                  onClick={onOpenDomains}
+                  onClick={() =>
+                    onOpenDomains(
+                      installation
+                        ? {
+                            serviceId: installation.id,
+                            serviceName: installation.name,
+                            targetPort: installation.hostPort || undefined,
+                            suggestedHostname: oldDomain.trim() || analysis?.hostname || undefined,
+                          }
+                        : undefined
+                    )
+                  }
                   className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
                 >
                   <Globe className="w-3.5 h-3.5" />

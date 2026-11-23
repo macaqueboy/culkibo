@@ -186,6 +186,8 @@ class LiveSyncClient extends EventEmitter {
             for (const [k, v] of Object.entries(this.initialLocalTree.files)) {
               this.lastSentHashes.set(k, v);
             }
+            // Retener solo el digest y liberar el mapa completo si ya estamos sincronizados
+            this.initialLocalTree = { rootDigest: this.initialLocalTree.rootDigest, fileCount: this.initialLocalTree.fileCount, files: {} };
           }
           this.emit('ready', msg);
           finishConnect(null, msg);
@@ -412,13 +414,15 @@ class LiveSyncClient extends EventEmitter {
     });
   }
 
-  /** Reconciliación completa basada en árbol de Merkle (auto-curación de deriva). */
+  /** Reconciliación completa basada en árbol de Merkle con troceado automático (soporta >500 ficheros y repos grandes). */
   async reconcileFull(serverFilesMap = null) {
     if (!serverFilesMap && this.initialInSync && this.initialLocalTree) {
       this.initialInSync = false;
-      return { reconciled: true, changed: 0, rootDigest: this.initialLocalTree.rootDigest };
+      const digest = this.initialLocalTree.rootDigest;
+      this.initialLocalTree = null;
+      return { reconciled: true, changed: 0, rootDigest: digest };
     }
-    const localTree = this.initialLocalTree && !serverFilesMap
+    const localTree = this.initialLocalTree && !serverFilesMap && Object.keys(this.initialLocalTree.files || {}).length > 0
       ? this.initialLocalTree
       : computeMerkleTree(this.sourceDir);
     this.initialLocalTree = null;
@@ -446,8 +450,34 @@ class LiveSyncClient extends EventEmitter {
     }
 
     if (files.length === 0) return { reconciled: true, changed: 0, rootDigest: localTree.rootDigest };
-    const ack = await this.sendFrame(files);
-    return { reconciled: true, changed: files.length, rootDigest: localTree.rootDigest, ack };
+
+    // Trocear en lotes <= 250 ficheros y <= 8 MiB por Commit Frame para jamás exceder MAX_FILES_PER_FRAME ni maxPayload
+    const CHUNK_MAX_FILES = 250;
+    const CHUNK_MAX_BYTES = 8 * 1024 * 1024;
+    /** @type {any} */
+    let lastAck = null;
+    let framesSent = 0;
+    /** @type {typeof files} */
+    let batch = [];
+    let batchBytes = 0;
+
+    for (const f of files) {
+      const fSize = f.buffer ? f.buffer.length : 0;
+      if (batch.length > 0 && (batch.length >= CHUNK_MAX_FILES || batchBytes + fSize > CHUNK_MAX_BYTES)) {
+        lastAck = await this.sendFrame(batch);
+        framesSent++;
+        batch = [];
+        batchBytes = 0;
+      }
+      batch.push(f);
+      batchBytes += fSize;
+    }
+    if (batch.length > 0) {
+      lastAck = await this.sendFrame(batch);
+      framesSent++;
+    }
+
+    return { reconciled: true, changed: files.length, framesSent, rootDigest: localTree.rootDigest, ack: lastAck };
   }
 
   async stop() {

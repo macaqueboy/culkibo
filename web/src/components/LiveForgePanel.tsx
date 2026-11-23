@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Zap,
   ShieldCheck,
@@ -45,6 +45,7 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
   const [busyAction, setBusyAction] = useState<'verify' | 'rollback' | 'promote' | null>(null);
   const [cmdMode, setCmdMode] = useState<'local' | 'remote'>('local');
   const [copiedCmd, setCopiedCmd] = useState(false);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -57,6 +58,14 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
       setLoading(false);
     }
   }, [projectId]);
+
+  const scheduleLoadStatus = useCallback(() => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = setTimeout(() => {
+      refreshTimerRef.current = null;
+      void loadStatus();
+    }, 250);
+  }, [loadStatus]);
 
   useEffect(() => {
     let active = true;
@@ -84,11 +93,11 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
         },
         ...prev,
       ].slice(0, 25));
-      void loadStatus();
+      scheduleLoadStatus();
     });
     const offRollback = liveEvents.onSyncRollback((ev) => {
       if (ev.projectId !== projectId) return;
-      void loadStatus();
+      scheduleLoadStatus();
     });
     const offClient = liveEvents.onSyncClient((ev) => {
       if (ev.projectId !== projectId) return;
@@ -96,11 +105,15 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
     });
     return () => {
       active = false;
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
       offApplied();
       offRollback();
       offClient();
     };
-  }, [projectId, loadStatus]);
+  }, [projectId, scheduleLoadStatus]);
 
   const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.port === '5173' ? '127.0.0.1:3030' : window.location.host;

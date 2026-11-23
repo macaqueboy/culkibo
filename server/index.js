@@ -96,6 +96,10 @@ function getService(name) {
     case 'caddyManager':
       svc = require('./services/caddyManager');
       break;
+    case 'localRunner':
+      svc = require('./services/localRunner');
+      containerOrchestrator.registerLocalRunner(svc);
+      break;
     case 'mcpServer':
       svc = require('./services/mcpServer');
       svc.on('mcp_call', (data) => broadcast('mcp_call', data));
@@ -225,6 +229,9 @@ metricsCollector.setCaddyGetter(() => {
   };
 });
 
+const WS_TEXT_OPTS = { binary: false };
+const WS_MAX_BUFFERED_BYTES = 1024 * 1024;
+
 /** @param {string} type @param {any} data */
 function broadcast(type, data) {
   if (clients.size === 0) return;
@@ -233,7 +240,9 @@ function broadcast(type, data) {
   const payload = Buffer.from(JSON.stringify({ type, data, timestamp: new Date().toISOString() }), 'utf8');
   for (const client of clients) {
     if (client.readyState === 1) {
-      client.send(payload, { binary: false }, (err) => {
+      // Backpressure: no encolar sobre pestañas lentas/colgadas (>1 MB pendiente)
+      if (client.bufferedAmount > WS_MAX_BUFFERED_BYTES) continue;
+      client.send(payload, WS_TEXT_OPTS, (err) => {
         if (err) clients.delete(client);
       });
     } else if (client.readyState === 2 || client.readyState === 3) {
@@ -324,7 +333,12 @@ function decodeBinarySyncFrame(buf) {
     if (!Number.isInteger(byteLen) || byteLen < 0 || offset + byteLen > buf.length) {
       throw new Error(`Longitud binaria inválida para ${f.path}`);
     }
-    const contentBuf = buf.subarray(offset, offset + byteLen);
+    const rawSlice = buf.subarray(offset, offset + byteLen);
+    // Desacoplar del slab ArrayBuffer del frame WS si el slab padre supera 2x el fichero
+    // (evita que un fichero de 4 KB retenga 16 MB de RAM en fileCache o patchHistory).
+    const contentBuf = (byteLen > 0 && rawSlice.buffer.byteLength > byteLen * 2)
+      ? Buffer.from(rawSlice)
+      : rawSlice;
     offset += byteLen;
     return {
       path: f.path,
@@ -592,38 +606,326 @@ const EMPTY_SYNC_SUMMARY_BUF = Buffer.from(JSON.stringify({
   sessions: []
 }), 'utf8');
 
-function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, t0Ns) {
+const ERR_BODY_TOO_LARGE_BUF = Buffer.from('{"error":"El cuerpo supera el límite permitido (1 MB)"}', 'utf8');
+const ERR_BAD_JSON_BUF = Buffer.from('{"error":"JSON malformado en el cuerpo de la petición"}', 'utf8');
+const ERR_PROJECT_NOT_FOUND_BUF = Buffer.from('{"error":"Proyecto no encontrado"}', 'utf8');
+const ASK_OK_BUF = Buffer.from('ok', 'utf8');
+const ASK_FORBIDDEN_LOCAL_BUF = Buffer.from('acceso restringido al plano de datos local', 'utf8');
+const ASK_MISSING_DOMAIN_BUF = Buffer.from('falta el parámetro domain', 'utf8');
+const ASK_INVALID_DOMAIN_BUF = Buffer.from('parámetro domain inválido', 'utf8');
+const MANAGEMENT_HOSTS_FAST = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '']);
+
+/** @type {typeof import('zlib') | null} */
+let _zlib = null;
+function getZlib() {
+  if (!_zlib) _zlib = require('zlib');
+  return _zlib;
+}
+
+/** Caché WeakMap por Buffer fuente: auto-GC cuando el Buffer rota, cero fugas de RAM. */
+/** @type {WeakMap<Buffer, { etag: string, br?: Buffer, zstd?: Buffer, gzip?: Buffer }>} */
+const compressedApiCache = new WeakMap();
+
+function pickApiEncoding(req) {
+  const ae = req.headers['accept-encoding'];
+  if (!ae || typeof ae !== 'string') return null;
+  if (ae.includes('br')) return 'br';
+  if (ae.includes('zstd')) {
+    const z = getZlib();
+    if (typeof z.zstdCompressSync === 'function') return 'zstd';
+  }
+  if (ae.includes('gzip')) return 'gzip';
+  return null;
+}
+
+function getCompressedEntry(buf, encoding) {
+  let entry = compressedApiCache.get(buf);
+  if (!entry) {
+    const etag = `"${crypto.createHash('sha1').update(buf).digest('base64url').slice(0, 16)}"`;
+    entry = { etag };
+    compressedApiCache.set(buf, entry);
+  }
+  if (!encoding || buf.length < 1024) return { etag: entry.etag, body: buf, encoding: null };
+  if (encoding === 'br') {
+    if (!entry.br) {
+      const z = getZlib();
+      const c = z.brotliCompressSync(buf, {
+        params: {
+          [z.constants.BROTLI_PARAM_MODE]: z.constants.BROTLI_MODE_TEXT,
+          [z.constants.BROTLI_PARAM_QUALITY]: 4
+        }
+      });
+      entry.br = c.length < buf.length ? c : buf;
+    }
+    return { etag: entry.etag, body: entry.br, encoding: entry.br === buf ? null : 'br' };
+  }
+  if (encoding === 'zstd') {
+    if (!entry.zstd) {
+      const z = getZlib();
+      if (typeof z.zstdCompressSync === 'function') {
+        const c = z.zstdCompressSync(buf);
+        entry.zstd = c.length < buf.length ? c : buf;
+      } else {
+        entry.zstd = buf;
+      }
+    }
+    return { etag: entry.etag, body: entry.zstd, encoding: entry.zstd === buf ? null : 'zstd' };
+  }
+  if (encoding === 'gzip') {
+    if (!entry.gzip) {
+      const z = getZlib();
+      const c = z.gzipSync(buf, { level: 6 });
+      entry.gzip = c.length < buf.length ? c : buf;
+    }
+    return { etag: entry.etag, body: entry.gzip, encoding: entry.gzip === buf ? null : 'gzip' };
+  }
+  return { etag: entry.etag, body: buf, encoding: null };
+}
+
+/**
+ * @param {any} req
+ * @param {any} res
+ * @param {number} statusCode
+ * @param {string} contentType
+ * @param {Buffer} buf
+ * @param {string} canonicalRoute
+ * @param {number} t0Ms
+ * @param {{ cacheControl?: string, etag?: string | null, compress?: boolean, csp?: boolean }} [opts]
+ */
+function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, t0Ms, opts = {}) {
+  const allowCompress = Boolean(opts.compress) && statusCode === 200 && buf.length >= 1024;
+  const wantEtag = Boolean(opts.etag) || allowCompress;
+
+  let body = buf;
+  /** @type {string | null} */
+  let contentEncoding = null;
+  /** @type {string | null} */
+  let etag = typeof opts.etag === 'string' ? opts.etag : null;
+
+  if (wantEtag && statusCode === 200) {
+    const enc = allowCompress ? pickApiEncoding(req) : null;
+    const comp = getCompressedEntry(buf, enc);
+    if (!etag) etag = comp.etag;
+    body = comp.body;
+    contentEncoding = comp.encoding;
+  }
+
   /** @type {Record<string, string | number>} */
   const headers = {
-    'Content-Type': contentType,
-    'Content-Length': buf.length,
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
     'Cross-Origin-Opener-Policy': 'same-origin',
-    'Cache-Control': 'no-store'
+    'Cache-Control': opts.cacheControl || 'no-store'
   };
+  if (opts.csp) {
+    headers['Content-Security-Policy'] = SPA_CSP;
+  }
   const origin = req.headers.origin;
+  let vary = '';
   if (origin && isOriginAllowed(origin, req)) {
     headers['Access-Control-Allow-Origin'] = origin;
-    headers['Vary'] = 'Origin';
+    vary = 'Origin';
+  }
+  if (allowCompress) {
+    vary = vary ? `${vary}, Accept-Encoding` : 'Accept-Encoding';
+  }
+  if (vary) headers['Vary'] = vary;
+
+  const proto = req.headers['x-forwarded-proto'];
+  if ((req.socket && req.socket.encrypted) || (proto && String(proto).startsWith('https'))) {
+    headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
+  }
+
+  if (etag && opts.cacheControl && opts.cacheControl !== 'no-store') {
+    headers['ETag'] = etag;
+    const inm = req.headers['if-none-match'];
+    if (inm && String(inm).trim() === etag) {
+      res.writeHead(304, headers);
+      res.end();
+      metricsCollector.recordFastPath(req.method, canonicalRoute, 304, performance.now() - t0Ms);
+      return;
+    }
+  }
+
+  headers['Content-Type'] = contentType;
+  headers['Content-Length'] = body.length;
+  if (contentEncoding) headers['Content-Encoding'] = contentEncoding;
+
+  res.writeHead(statusCode, headers);
+  res.end(req.method === 'HEAD' ? undefined : body);
+  metricsCollector.recordFastPath(req.method, canonicalRoute, statusCode, performance.now() - t0Ms);
+}
+
+// ---------------------------------------------------------------------------
+// Fast-Path estático en RAM con pre-compresión Brotli/Gzip (evita cargar Express al navegar el panel)
+// ---------------------------------------------------------------------------
+const STATIC_MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.txt': 'text/plain; charset=utf-8'
+};
+
+/** @type {Map<string, { mime: string, etag: string, immutable: boolean, isHtml: boolean, raw: Buffer, br: Buffer | null, gz: Buffer | null }> | null} */
+let staticAssetCache = null;
+let staticDistChecked = false;
+let staticDistExists = false;
+
+function ensureStaticCache() {
+  if (staticDistChecked) return staticDistExists;
+  staticDistChecked = true;
+  const distDir = path.join(__dirname, '..', 'web', 'dist');
+  if (!fs.existsSync(distDir) || !fs.existsSync(path.join(distDir, 'index.html'))) {
+    staticDistExists = false;
+    return false;
+  }
+  const cache = new Map();
+  let totalBytes = 0;
+  const MAX_STATIC_CACHE_BYTES = 12 * 1024 * 1024;
+
+  const walk = (dir, prefix) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      const urlRel = prefix ? `${prefix}/${entry.name}` : `/${entry.name}`;
+      if (entry.isDirectory()) {
+        walk(full, urlRel);
+      } else if (entry.isFile()) {
+        if (entry.name.endsWith('.br') || entry.name.endsWith('.gz')) continue;
+        const ext = path.extname(entry.name).toLowerCase();
+        const mime = STATIC_MIME[ext] || 'application/octet-stream';
+        const raw = fs.readFileSync(full);
+        if (totalBytes + raw.length > MAX_STATIC_CACHE_BYTES) continue;
+        /** @type {Buffer | null} */
+        let br = null;
+        /** @type {Buffer | null} */
+        let gz = null;
+        try { if (fs.existsSync(`${full}.br`)) br = fs.readFileSync(`${full}.br`); } catch (e) {}
+        try { if (fs.existsSync(`${full}.gz`)) gz = fs.readFileSync(`${full}.gz`); } catch (e) {}
+        totalBytes += raw.length + (br ? br.length : 0) + (gz ? gz.length : 0);
+        const etag = `"${crypto.createHash('sha1').update(raw).digest('base64url').slice(0, 16)}"`;
+        cache.set(urlRel, {
+          mime,
+          etag,
+          immutable: urlRel.startsWith('/assets/'),
+          isHtml: ext === '.html',
+          raw,
+          br,
+          gz
+        });
+      }
+    }
+  };
+  try {
+    walk(distDir, '');
+    staticAssetCache = cache;
+    staticDistExists = cache.has('/index.html');
+  } catch (e) {
+    staticAssetCache = null;
+    staticDistExists = false;
+  }
+  return staticDistExists;
+}
+
+function tryServeStaticFastPath(req, res, pathname) {
+  if (!ensureStaticCache() || !staticAssetCache) return false;
+  if (pathname.startsWith('/api') || pathname === '/ws' || pathname === '/ws/sync' || pathname === '/health' || pathname === '/metrics') {
+    return false;
+  }
+
+  // Comprobación 421 plano de control vs plano de datos antes de servir el panel SPA
+  const forwarded = req.headers['x-forwarded-host'] || req.headers['x-culkibo-host'];
+  const host = extractHostnameClean(forwarded || req.headers.host || '');
+  const activePanelDomain = (loadedServices.ingressManager?.panelDomain || cachedPanelDomain || '').toLowerCase();
+  const isPanelOrLocal = (activePanelDomain && host === activePanelDomain) || (MANAGEMENT_HOSTS_FAST.has(host) && !forwarded);
+  if (!isPanelOrLocal) {
+    const dm = getService('domainManager');
+    if (dm.resolveRoute(host)) {
+      // Dejar que Express sirva la respuesta 421 detallada o gestionarla allí sin duplicar código
+      return false;
+    }
+  }
+
+  const t0 = performance.now();
+  containerOrchestrator.recordRequest();
+
+  let asset = staticAssetCache.get(pathname);
+  if (!asset) {
+    // Petición de fichero estático inexistente (con extensión) -> 404; rutas SPA -> index.html
+    if (pathname.startsWith('/assets/') || /\.[a-z0-9]{1,8}$/i.test(pathname)) {
+      sendFastBuffer(req, res, 404, 'text/plain; charset=utf-8', Buffer.from('Not Found', 'utf8'), '/static', t0);
+      return true;
+    }
+    asset = staticAssetCache.get('/index.html');
+  }
+  if (!asset) return false;
+
+  const ae = String(req.headers['accept-encoding'] || '');
+  /** @type {Buffer} */
+  let body = asset.raw;
+  /** @type {string | null} */
+  let encoding = null;
+  if (asset.br && ae.includes('br')) {
+    body = asset.br;
+    encoding = 'br';
+  } else if (asset.gz && ae.includes('gzip')) {
+    body = asset.gz;
+    encoding = 'gzip';
+  }
+
+  /** @type {Record<string, string | number>} */
+  const headers = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cache-Control': asset.immutable ? 'public, max-age=31536000, immutable' : 'no-cache, no-store, must-revalidate',
+    'Vary': 'Accept-Encoding'
+  };
+  if (asset.isHtml) {
+    headers['Content-Security-Policy'] = SPA_CSP;
+  } else {
+    headers['ETag'] = asset.etag;
+    const inm = req.headers['if-none-match'];
+    if (inm && String(inm).trim() === asset.etag) {
+      res.writeHead(304, headers);
+      res.end();
+      metricsCollector.recordFastPath(req.method, '/static', 304, performance.now() - t0);
+      return true;
+    }
   }
   const proto = req.headers['x-forwarded-proto'];
   if ((req.socket && req.socket.encrypted) || (proto && String(proto).startsWith('https'))) {
     headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
   }
-  res.writeHead(statusCode, headers);
-  res.end(req.method === 'HEAD' ? undefined : buf);
-  metricsCollector.recordFastPath(req.method, canonicalRoute, statusCode, Number(process.hrtime.bigint() - t0Ns) / 1e6);
+  headers['Content-Type'] = asset.mime;
+  headers['Content-Length'] = body.length;
+  if (encoding) headers['Content-Encoding'] = encoding;
+
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : body);
+  metricsCollector.recordFastPath(req.method, '/static', 200, performance.now() - t0);
+  return true;
 }
 
-function sendFastAuthError(req, res, decision, canonicalRoute, t0Ns) {
+function sendFastAuthError(req, res, decision, canonicalRoute, t0Ms) {
   const body = Buffer.from(JSON.stringify({
     error: decision.error,
     ...(decision.detail ? { detail: decision.detail } : {})
   }), 'utf8');
-  sendFastBuffer(req, res, decision.status || 401, 'application/json; charset=utf-8', body, canonicalRoute, t0Ns);
+  sendFastBuffer(req, res, decision.status || 401, 'application/json; charset=utf-8', body, canonicalRoute, t0Ms);
 }
 
 function tryHandleFastPath(req, res) {
@@ -636,7 +938,7 @@ function tryHandleFastPath(req, res) {
   // Fast-path nativo para POST /api/projects (evita bloquear el event loop cargando
   // Express y 18 servicios auxiliares en la primera alta concurrente).
   if (method === 'POST' && pathname === '/api/projects') {
-    const t0 = process.hrtime.bigint();
+    const t0 = performance.now();
     containerOrchestrator.recordRequest();
 
     const bf = checkAuthBruteForce(req);
@@ -658,7 +960,7 @@ function tryHandleFastPath(req, res) {
     const limitBytes = 1 * 1024 * 1024;
     const declaredLen = Number(req.headers['content-length'] || 0);
     if (declaredLen > limitBytes) {
-      sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', Buffer.from('{"error":"El cuerpo supera el límite permitido (1 MB)"}', 'utf8'), pathname, t0);
+      sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', ERR_BODY_TOO_LARGE_BUF, pathname, t0);
       return true;
     }
 
@@ -672,7 +974,7 @@ function tryHandleFastPath(req, res) {
       total += chunk.length;
       if (total > limitBytes) {
         aborted = true;
-        sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', Buffer.from('{"error":"El cuerpo supera el límite permitido (1 MB)"}', 'utf8'), pathname, t0);
+        sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', ERR_BODY_TOO_LARGE_BUF, pathname, t0);
         req.resume();
         return;
       }
@@ -686,7 +988,7 @@ function tryHandleFastPath(req, res) {
         try {
           body = JSON.parse(Buffer.concat(chunks, total).toString('utf8'));
         } catch (e) {
-          sendFastBuffer(req, res, 400, 'application/json; charset=utf-8', Buffer.from('{"error":"JSON malformado en el cuerpo de la petición"}', 'utf8'), pathname, t0);
+          sendFastBuffer(req, res, 400, 'application/json; charset=utf-8', ERR_BAD_JSON_BUF, pathname, t0);
           return;
         }
       }
@@ -718,14 +1020,88 @@ function tryHandleFastPath(req, res) {
 
   if (method !== 'GET' && method !== 'HEAD') return false;
 
+  // Fast-path estático para el panel web pre-comprimido (cero carga de Express al abrir el dashboard)
+  if (!pathname.startsWith('/api') && pathname !== '/health' && pathname !== '/metrics' && pathname !== '/ws' && pathname !== '/ws/sync') {
+    if (tryServeStaticFastPath(req, res, pathname)) return true;
+    return false;
+  }
+
   if (pathname === '/health' || pathname === '/api/health') {
-    const t0 = process.hrtime.bigint();
+    const t0 = performance.now();
     containerOrchestrator.recordRequest();
     sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', getHealthBuffer(), pathname, t0);
     return true;
   }
 
+  // Fast-path público: sesión del panel (/api/auth/session)
+  if (pathname === '/api/auth/session') {
+    const t0 = performance.now();
+    containerOrchestrator.recordRequest();
+    if (req.headers.origin && !isOriginAllowed(req.headers.origin, req)) {
+      sendFastAuthError(req, res, { status: 403, error: 'Origen no permitido' }, pathname, t0);
+      return true;
+    }
+    const decision = authorizeRequest(req);
+    const st = authStatus();
+    const body = Buffer.from(JSON.stringify({
+      authenticated: decision.ok,
+      method: decision.method || null,
+      requireTokenAlways: st.requireTokenAlways,
+      tokenConfigured: st.tokenConfigured,
+      tokenSource: st.tokenSource
+    }), 'utf8');
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', body, pathname, t0);
+    return true;
+  }
+
+  // Fast-path público local: autorización On-Demand TLS de Caddy (/api/ingress/ask)
+  if (pathname === '/api/ingress/ask') {
+    const t0 = performance.now();
+    containerOrchestrator.recordRequest();
+    const remoteIp = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+    const { isPrivateIp } = require('./services/ssrfGuard');
+    const isLocalOrPrivate = remoteIp === '127.0.0.1' || remoteIp === '::1' || isPrivateIp(remoteIp);
+    if (!isLocalOrPrivate && process.env.NODE_ENV !== 'test') {
+      sendFastBuffer(req, res, 403, 'text/plain; charset=utf-8', ASK_FORBIDDEN_LOCAL_BUF, pathname, t0);
+      return true;
+    }
+    const params = new URLSearchParams(queryStr);
+    const domain = String(params.get('domain') || '').trim().toLowerCase();
+    if (!domain) {
+      sendFastBuffer(req, res, 400, 'text/plain; charset=utf-8', ASK_MISSING_DOMAIN_BUF, pathname, t0);
+      return true;
+    }
+    if (!/^[a-z0-9.-]{1,253}$/.test(domain)) {
+      sendFastBuffer(req, res, 400, 'text/plain; charset=utf-8', ASK_INVALID_DOMAIN_BUF, pathname, t0);
+      return true;
+    }
+    const im = getService('ingressManager');
+    if (!im.isHostnameAuthorizedForTls(domain)) {
+      sendFastBuffer(req, res, 403, 'text/plain; charset=utf-8', Buffer.from(`dominio no configurado en Culkibo: ${domain}`, 'utf8'), pathname, t0);
+      return true;
+    }
+    const dm = getService('domainManager');
+    const route = dm.resolveRoute(domain);
+    if (route && route.status === 'disabled') {
+      sendFastBuffer(req, res, 403, 'text/plain; charset=utf-8', Buffer.from(`dominio deshabilitado: ${domain}`, 'utf8'), pathname, t0);
+      return true;
+    }
+    sendFastBuffer(req, res, 200, 'text/plain; charset=utf-8', ASK_OK_BUF, pathname, t0);
+    return true;
+  }
+
+  // Comprobar si es GET /api/projects/:id (un solo segmento, distinto de 'active')
+  /** @type {string | null} */
+  let projectByIdMatch = null;
+  if (pathname.startsWith('/api/projects/') && pathname.indexOf('/', 14) === -1) {
+    const seg = pathname.slice(14);
+    if (seg && seg !== 'active') {
+      try { projectByIdMatch = decodeURIComponent(seg); } catch (e) { projectByIdMatch = seg; }
+    }
+  }
+
   if (
+    !projectByIdMatch &&
     pathname !== '/metrics' &&
     pathname !== '/api/metrics' &&
     pathname !== '/api/observability/snapshot' &&
@@ -733,6 +1109,7 @@ function tryHandleFastPath(req, res) {
     pathname !== '/api/projects' &&
     pathname !== '/api/catalog' &&
     pathname !== '/api/domains' &&
+    pathname !== '/api/logs' &&
     pathname !== '/api/system/status' &&
     pathname !== '/api/sync/summary'
   ) {
@@ -744,13 +1121,13 @@ function tryHandleFastPath(req, res) {
     return false;
   }
 
-  const t0 = process.hrtime.bigint();
+  const t0 = performance.now();
   containerOrchestrator.recordRequest();
 
   const bf = checkAuthBruteForce(req);
   if (bf.blocked) {
     res.setHeader('Retry-After', String(bf.retryAfterSec));
-    sendFastAuthError(req, res, { status: 429, error: 'Demasiados intentos de autenticación fallidos.' }, pathname, t0);
+    sendFastAuthError(req, res, { status: 429, error: 'Demasiados intentos de autenticación fallidos.' }, projectByIdMatch ? '/api/projects/:id' : pathname, t0);
     return true;
   }
 
@@ -759,47 +1136,84 @@ function tryHandleFastPath(req, res) {
     if (decision.status === 401 && (req.headers.authorization || req.headers['x-culkibo-token'])) {
       recordAuthFailure(req);
     }
-    sendFastAuthError(req, res, decision, pathname, t0);
+    sendFastAuthError(req, res, decision, projectByIdMatch ? '/api/projects/:id' : pathname, t0);
     return true;
   }
 
   const fresh = queryStr.includes('fresh=1');
 
+  if (projectByIdMatch) {
+    const entry = projectManager.getByIdSerializedEntry(projectByIdMatch);
+    if (!entry) {
+      sendFastBuffer(req, res, 404, 'application/json; charset=utf-8', ERR_PROJECT_NOT_FOUND_BUF, '/api/projects/:id', t0);
+      return true;
+    }
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', entry.buf, '/api/projects/:id', t0, {
+      cacheControl: 'private, no-cache',
+      etag: entry.etag,
+      compress: true
+    });
+    return true;
+  }
+
   if (pathname === '/metrics') {
-    sendFastBuffer(req, res, 200, 'text/plain; version=0.0.4; charset=utf-8', metricsCollector.getPrometheusBuffer(fresh), pathname, t0);
+    sendFastBuffer(req, res, 200, 'text/plain; version=0.0.4; charset=utf-8', metricsCollector.getPrometheusBuffer(fresh), pathname, t0, { compress: true });
     return true;
   }
   if (pathname === '/api/metrics' || pathname === '/api/observability/snapshot') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', metricsCollector.getSnapshotBuffer(fresh), pathname, t0);
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', metricsCollector.getSnapshotBuffer(fresh), pathname, t0, { compress: true });
     return true;
   }
   if (pathname === '/api/pods') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', containerOrchestrator.getPodsSerialized(), pathname, t0);
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', containerOrchestrator.getPodsSerialized(), pathname, t0, { compress: true });
     return true;
   }
   if (pathname === '/api/projects') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', projectManager.getAllSerialized(), pathname, t0);
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', projectManager.getAllSerialized(), pathname, t0, {
+      cacheControl: 'private, no-cache',
+      etag: projectManager.getAllEtag(),
+      compress: true
+    });
     return true;
   }
   if (pathname === '/api/catalog') {
     const cm = getService('catalogManager');
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', cm.getCatalogSerialized(), pathname, t0);
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', cm.getCatalogSerialized(), pathname, t0, {
+      cacheControl: 'private, no-cache',
+      compress: true
+    });
     return true;
   }
   if (pathname === '/api/domains') {
     const dm = getService('domainManager');
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', dm.getAllWrappedSerialized(), pathname, t0);
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', dm.getAllWrappedSerialized(), pathname, t0, {
+      cacheControl: 'private, no-cache',
+      etag: typeof dm.getEtag === 'function' ? dm.getEtag() : null,
+      compress: true
+    });
+    return true;
+  }
+  if (pathname === '/api/logs') {
+    const params = queryStr ? new URLSearchParams(queryStr) : null;
+    const logs = containerOrchestrator.getLogs({
+      pod: params?.get('pod') || null,
+      level: params?.get('level') || null,
+      limit: params?.get('limit') ? parseInt(String(params.get('limit')), 10) : 100,
+      search: params?.get('search') || '',
+      projectId: params?.get('projectId') || null
+    });
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', Buffer.from(JSON.stringify({ logs }), 'utf8'), pathname, t0, { compress: true });
     return true;
   }
   if (pathname === '/api/system/status') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', getSystemStatusBuffer(), pathname, t0);
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', getSystemStatusBuffer(), pathname, t0, { compress: true });
     return true;
   }
   if (pathname === '/api/sync/summary') {
     const buf = loadedServices.liveSyncEngine
       ? Buffer.from(JSON.stringify(loadedServices.liveSyncEngine.getGlobalSummary()), 'utf8')
       : EMPTY_SYNC_SUMMARY_BUF;
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', buf, pathname, t0);
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', buf, pathname, t0, { compress: true });
     return true;
   }
 
@@ -1303,21 +1717,22 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
         }
 
         if (reconcileIngress) {
+          // `ingressManager.bootstrap()` ya incluye las rutas de despliegues (si existe data/deployments.json)
+          // sin arrastrar `deployManager` ni `repoSync` en arranques limpios.
           try {
             getService('ingressManager').bootstrap({ port }).catch((err) => {
               console.warn('[Edge:Ingress] La reconciliación de arranque falló:', err.message);
             });
           } catch (e) {}
-          try {
-            getService('deployManager').reconcileRoutes()
-              .then((result) => {
-                if (result.applied && result.applied.length > 0) {
-                  console.log(`[Culkibo] Rutas de ingress repuestas: ${result.applied.join(', ')}`);
-                }
-              })
-              .catch(() => {});
-          } catch (e) {}
         }
+
+        // Limpieza periódica no intrusiva de sesiones Live Sync inactivas (cada 5 min, unref'd)
+        const syncSweep = setInterval(() => {
+          if (loadedServices.liveSyncEngine && typeof loadedServices.liveSyncEngine.evictIdleSessions === 'function') {
+            loadedServices.liveSyncEngine.evictIdleSessions();
+          }
+        }, 5 * 60 * 1000);
+        if (syncSweep.unref) syncSweep.unref();
       });
 
       resolve(server);
