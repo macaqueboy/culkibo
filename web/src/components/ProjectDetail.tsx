@@ -1,65 +1,153 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Settings, Activity, Globe, Variable, Play, Square, Moon, Trash2, ShieldAlert, Database, Server, Copy, Eye, EyeOff, Plus, Search, Upload, Save, CheckCircle2, Box, Cpu, Webhook, GitBranch, Check, RefreshCw, Zap, Power, Rocket } from 'lucide-react';
+import {
+  Settings,
+  LayoutGrid,
+  ScrollText,
+  Globe,
+  Variable,
+  Play,
+  Square,
+  Moon,
+  Trash2,
+  ShieldAlert,
+  Database,
+  Server,
+  Copy,
+  Eye,
+  EyeOff,
+  Plus,
+  Search,
+  Upload,
+  Save,
+  CheckCircle2,
+  Box,
+  Cpu,
+  Webhook,
+  Check,
+  RefreshCw,
+  Zap,
+  Power,
+  Rocket,
+  ArrowLeft,
+  Boxes,
+  Activity,
+} from 'lucide-react';
 import { api, type Project } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
+import { copyToClipboard } from '../lib/clipboard';
 import { LiveLogs } from './LiveLogs';
 import { DomainManager } from './DomainManager';
 import { DatabasesPanel } from './DatabasesPanel';
 import { DeploymentsPanel } from './DeploymentsPanel';
 import { LiveForgePanel } from './LiveForgePanel';
+import { Modal } from './Modal';
 
 interface ProjectDetailProps {
   projectId: string;
   onBack: () => void;
-  onNotify: (msg: string) => void;
+  onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
   onProjectUpdate?: () => void;
   onOpenCatalog?: () => void;
   incomingLog?: any;
 }
 
-export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack, onNotify, onProjectUpdate, onOpenCatalog, incomingLog }) => {
+type EnvRow = { key: string; value: string; id: string };
+
+function envObjectToRows(envVars?: Record<string, string>): EnvRow[] {
+  return Object.entries(envVars || {}).map(([k, v], i) => ({
+    key: k,
+    value: String(v ?? ''),
+    id: `row_${i}_${k}`,
+  }));
+}
+
+function envRowsToText(rows: EnvRow[]): string {
+  return rows
+    .filter((r) => r.key.trim())
+    .map((r) => `${r.key.trim()}=${r.value}`)
+    .join('\n');
+}
+
+function parseRawEnv(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const lines = raw.replace(/\r\n?/g, '\n').split('\n');
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const key = match[1];
+    let val = match[2];
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+export const ProjectDetail: React.FC<ProjectDetailProps> = ({
+  projectId,
+  onBack,
+  onNotify,
+  onProjectUpdate,
+  onOpenCatalog,
+  incomingLog,
+}) => {
   const [project, setProject] = useState<Project | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'general' | 'live' | 'deployments' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config'>('general');
   const [loading, setLoading] = useState(false);
   const [simulatingWebhook, setSimulatingWebhook] = useState(false);
 
-  // Webhook state
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [copiedSecret, setCopiedSecret] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
 
-  // Vars state
   const [envMode, setEnvMode] = useState<'table' | 'raw'>('table');
   const [envText, setEnvText] = useState('');
-  const [envRows, setEnvRows] = useState<{ key: string, value: string, id: string }[]>([]);
+  const [envRows, setEnvRows] = useState<EnvRow[]>([]);
   const [showValues, setShowValues] = useState<Record<string, boolean>>({});
   const [searchVar, setSearchVar] = useState('');
   const envFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Storage inline forms (real persistence via api.updateProject)
   const [showVolumeForm, setShowVolumeForm] = useState(false);
   const [volForm, setVolForm] = useState({ name: '', mount_path: '/data', host_path: '' });
   const [showMountForm, setShowMountForm] = useState(false);
   const [mountForm, setMountForm] = useState({ mount_path: '/etc/app/config.json', content: '', chmod: '644' });
 
-  // Borrado del proyecto: escalón 3 de confirmación (escribir el nombre).
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [confirmDeleteName, setConfirmDeleteName] = useState('');
   const [deleting, setDeleting] = useState(false);
 
+  const [prevProjectId, setPrevProjectId] = useState(projectId);
+  const lastEnvJsonRef = useRef<string>('');
+
+  if (prevProjectId !== projectId) {
+    setPrevProjectId(projectId);
+    setProject(null);
+    setLoadError(null);
+  }
+
+  const syncEnvState = useCallback((envVars?: Record<string, string>) => {
+    const rows = envObjectToRows(envVars);
+    lastEnvJsonRef.current = JSON.stringify(envVars || {});
+    setEnvRows(rows);
+    setEnvText(envRowsToText(rows));
+  }, []);
+
   const fetchProject = useCallback(async () => {
     try {
+      setLoadError(null);
       const found = await api.getProject(projectId);
       if (found) {
         setProject(found);
-        const text = Object.entries(found.envVars || {}).map(([k, v]) => `${k}=${v}`).join('\n');
-        setEnvText(text);
-        setEnvRows(Object.entries(found.envVars || {}).map(([k, v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
+        syncEnvState(found.envVars);
       }
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      setLoadError(e?.message || 'No se pudo cargar el proyecto');
     }
-  }, [projectId]);
+  }, [projectId, syncEnvState]);
 
   useEffect(() => {
     let active = true;
@@ -67,24 +155,40 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
       .then((found) => {
         if (!active || !found) return;
         setProject(found);
-        const text = Object.entries(found.envVars || {}).map(([k, v]) => `${k}=${v}`).join('\n');
-        setEnvText(text);
-        setEnvRows(Object.entries(found.envVars || {}).map(([k, v], i) => ({ key: k, value: v as string, id: `row_${i}_${k}` })));
+        setLoadError(null);
+        syncEnvState(found.envVars);
       })
-      .catch((e) => console.error(e));
+      .catch((e: any) => {
+        if (active) setLoadError(e?.message || 'Proyecto no encontrado');
+      });
     return () => { active = false; };
-  }, [projectId]);
+  }, [projectId, syncEnvState]);
 
-  // Suscripción ligera a cambios del proyecto sin disparar un GET en cada línea de log.
   useEffect(() => {
     return liveEvents.onProjectChange((ev) => {
-      if (ev.action === 'update' && ev.project && ev.project.id === projectId) {
-        setProject(ev.project);
+      const updated = ev.project;
+      if (ev.action === 'update' && updated && updated.id === projectId) {
+        setProject(updated);
+        const nextEnv = JSON.stringify(updated.envVars || {});
+        if (lastEnvJsonRef.current !== nextEnv) {
+          syncEnvState(updated.envVars);
+        }
       } else if (ev.action === 'deleted' && ev.id === projectId) {
         onBack();
       }
     });
-  }, [projectId, onBack]);
+  }, [projectId, onBack, syncEnvState]);
+
+  const switchEnvMode = (nextMode: 'table' | 'raw') => {
+    if (nextMode === envMode) return;
+    if (nextMode === 'raw') {
+      setEnvText(envRowsToText(envRows));
+    } else {
+      const parsed = parseRawEnv(envText);
+      setEnvRows(envObjectToRows(parsed));
+    }
+    setEnvMode(nextMode);
+  };
 
   const handleImportEnvFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -93,8 +197,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
     reader.onload = () => {
       const content = String(reader.result || '');
       setEnvText(content);
+      setEnvRows(envObjectToRows(parseRawEnv(content)));
       setEnvMode('raw');
-      onNotify(`Archivo ${file.name} cargado. Pulsa «Guardar Variables» para aplicarlo.`);
+      onNotify(`Archivo ${file.name} cargado. Pulsa «Guardar variables» para aplicarlo.`, 'info');
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -109,16 +214,16 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
         {
           name: volForm.name.trim(),
           mount_path: volForm.mount_path.trim(),
-          host_path: volForm.host_path.trim() || undefined
-        }
+          host_path: volForm.host_path.trim() || undefined,
+        },
       ];
       await api.updateProject(projectId, { volumes: nextVolumes });
       setVolForm({ name: '', mount_path: '/data', host_path: '' });
       setShowVolumeForm(false);
-      onNotify('Volumen persistente guardado');
+      onNotify('Volumen persistente guardado', 'success');
       void fetchProject();
-    } catch {
-      onNotify('Error al añadir volumen');
+    } catch (err: any) {
+      onNotify(err?.message || 'Error al añadir volumen', 'error');
     }
   };
 
@@ -127,10 +232,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
     const nextVolumes = (project.volumes || []).filter((_, i) => i !== index);
     try {
       await api.updateProject(projectId, { volumes: nextVolumes });
-      onNotify('Volumen eliminado');
+      onNotify('Volumen eliminado', 'info');
       void fetchProject();
-    } catch {
-      onNotify('Error al eliminar volumen');
+    } catch (err: any) {
+      onNotify(err?.message || 'Error al eliminar volumen', 'error');
     }
   };
 
@@ -143,16 +248,16 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
         {
           mount_path: mountForm.mount_path.trim(),
           content: mountForm.content,
-          chmod: mountForm.chmod.trim() || '644'
-        }
+          chmod: mountForm.chmod.trim() || '644',
+        },
       ];
       await api.updateProject(projectId, { fileMounts: nextMounts });
       setMountForm({ mount_path: '/etc/app/config.json', content: '', chmod: '644' });
       setShowMountForm(false);
-      onNotify('Archivo montado guardado');
+      onNotify('Archivo montado guardado', 'success');
       void fetchProject();
-    } catch {
-      onNotify('Error al añadir archivo montado');
+    } catch (err: any) {
+      onNotify(err?.message || 'Error al añadir archivo montado', 'error');
     }
   };
 
@@ -161,10 +266,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
     const nextMounts = (project.fileMounts || []).filter((_, i) => i !== index);
     try {
       await api.updateProject(projectId, { fileMounts: nextMounts });
-      onNotify('Archivo montado eliminado');
+      onNotify('Archivo montado eliminado', 'info');
       void fetchProject();
-    } catch {
-      onNotify('Error al eliminar archivo montado');
+    } catch (err: any) {
+      onNotify(err?.message || 'Error al eliminar archivo montado', 'error');
     }
   };
 
@@ -172,54 +277,56 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
     if (!project) return;
     setSimulatingWebhook(true);
     try {
-      const shortSha = Math.random().toString(36).substring(2, 9);
-      const res = await fetch(`/api/webhooks/github?projectId=${project.id}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-github-event': 'push'
-        },
-        body: JSON.stringify({
-          ref: `refs/heads/${project.gitBranch || 'main'}`,
-          after: `${shortSha}1234567890`,
-          head_commit: {
-            id: `${shortSha}1234567890`,
-            message: `test: actualización en tiempo real (${shortSha})`,
-            author: { name: project.lastCommit?.author || 'Culkibo Webhook Test' }
-          },
-          repository: {
-            full_name: project.gitRepo || `${project.githubOwner || 'user'}/${project.githubRepo || project.name}`,
-            html_url: project.gitRepo || 'https://github.com/user/repo'
-          }
-        })
-      });
-      const data = await res.json();
-      if (res.ok && data.deployed) {
-        onNotify(`Despliegue simulado con éxito (${shortSha})`);
-        void fetchProject();
-      } else {
-        onNotify(`Webhook recibido: ${data.reason || data.error || 'OK'}`);
-      }
+      const res = await api.testProjectWebhook(project.id);
+      onNotify(res.message || 'Prueba de webhook ejecutada correctamente', 'success');
+      void fetchProject();
     } catch (e: any) {
-      onNotify(`Error al simular webhook: ${e.message}`);
+      onNotify(e?.message || 'Error al probar el webhook', 'error');
     } finally {
       setSimulatingWebhook(false);
     }
   };
 
-  if (!project) return <div className="p-8 text-center text-slate-500">Cargando proyecto...</div>;
+  if (loadError) {
+    return (
+      <div className="bg-white border border-slate-200 rounded-xl p-8 max-w-lg mx-auto text-center space-y-4">
+        <h2 className="text-base font-semibold text-slate-900">No se pudo cargar el proyecto</h2>
+        <p className="text-xs text-slate-500">{loadError}</p>
+        <div className="flex items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={onBack}
+            className="px-3.5 py-2 rounded-lg text-xs font-medium border border-slate-200 text-slate-700 hover:bg-slate-50 cursor-pointer"
+          >
+            Volver a proyectos
+          </button>
+          <button
+            type="button"
+            onClick={() => void fetchProject()}
+            className="px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-900 text-white hover:bg-slate-800 cursor-pointer"
+          >
+            Reintentar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!project) {
+    return <div className="p-10 text-center text-xs text-slate-500">Cargando proyecto…</div>;
+  }
+
+  const previewHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
 
   const handleStop = async () => {
     setLoading(true);
     try {
-      setProject(prev => prev ? { ...prev, status: 'stopped', localRunning: false } : null);
       await api.stopProject(projectId);
       await fetchProject();
-      onNotify('Proyecto detenido: procesos finalizados y puerto liberado');
+      onNotify('Proyecto detenido y puerto liberado', 'info');
       onProjectUpdate?.();
     } catch (e: any) {
-      console.error(e);
-      onNotify('Error al detener proyecto: ' + (e.message || ''));
+      onNotify(e?.message || 'Error al detener el proyecto', 'error');
       await fetchProject();
     } finally {
       setLoading(false);
@@ -229,14 +336,12 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
   const handleHibernate = async () => {
     setLoading(true);
     try {
-      setProject(prev => prev ? { ...prev, status: 'hibernated', localRunning: false } : null);
       await api.hibernateProject(projectId);
       await fetchProject();
-      onNotify('Proyecto hibernado correctamente');
+      onNotify('Proyecto hibernado correctamente', 'info');
       onProjectUpdate?.();
     } catch (e: any) {
-      console.error(e);
-      onNotify('Error al hibernar proyecto');
+      onNotify(e?.message || 'Error al hibernar el proyecto', 'error');
       await fetchProject();
     } finally {
       setLoading(false);
@@ -246,38 +351,27 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
   const handleStart = async () => {
     setLoading(true);
     try {
-      setProject(prev => prev ? { ...prev, status: 'active', localRunning: true } : null);
       await api.startLocal(projectId);
       await fetchProject();
-      onNotify('Proyecto iniciado en local');
+      onNotify('Proyecto iniciado en local', 'success');
       onProjectUpdate?.();
     } catch (e: any) {
-      console.error(e);
-      onNotify('Error al iniciar en local');
+      onNotify(e?.message || 'Error al iniciar en local', 'error');
       await fetchProject();
     } finally {
       setLoading(false);
     }
   };
 
-  const handleAction = async (action: 'activate' | 'hibernate') => {
+  const handleActivate = async () => {
     setLoading(true);
     try {
-      if (action === 'activate') {
-        setProject(prev => prev ? { ...prev, status: 'active' } : null);
-        await api.activateProject(projectId);
-        onNotify('Entorno activado');
-      }
-      if (action === 'hibernate') {
-        setProject(prev => prev ? { ...prev, status: 'hibernated', localRunning: false } : null);
-        await api.hibernateProject(projectId);
-        onNotify('Proyecto hibernado');
-      }
+      await api.activateProject(projectId);
       await fetchProject();
+      onNotify('Proyecto marcado como activo', 'success');
       onProjectUpdate?.();
-    } catch (e) {
-      console.error(e);
-      onNotify('Error al ejecutar acción');
+    } catch (e: any) {
+      onNotify(e?.message || 'Error al activar el proyecto', 'error');
       await fetchProject();
     } finally {
       setLoading(false);
@@ -285,505 +379,413 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
   };
 
   const handleSaveEnvRaw = async () => {
-    const newVars: Record<string, string> = {};
-    let currentKey: string | null = null;
-    let currentValue: string[] = [];
-
-    envText.split('\n').forEach(line => {
-      const match = line.match(/^([a-zA-Z_][a-zA-Z0-9_]*)=(.*)$/);
-      if (match) {
-        if (currentKey) {
-          newVars[currentKey] = currentValue.join('\n');
-        }
-        currentKey = match[1];
-        currentValue = [match[2]];
-      } else if (currentKey) {
-        currentValue.push(line);
-      }
-    });
-    if (currentKey) {
-      newVars[currentKey] = currentValue.join('\n');
-    }
-
+    const newVars = parseRawEnv(envText);
     try {
       await api.updateProject(projectId, { envVars: newVars });
-      onNotify('Variables actualizadas correctamente');
-      fetchProject();
-    } catch {
-      onNotify('Error al guardar variables');
+      onNotify('Variables de entorno guardadas', 'success');
+      await fetchProject();
+    } catch (e: any) {
+      onNotify(e?.message || 'Error al guardar variables', 'error');
     }
   };
 
   const handleSaveEnvTable = async () => {
     const newVars: Record<string, string> = {};
     for (const r of envRows) {
-      if (r.key.trim()) {
-        newVars[r.key.trim()] = r.value;
-      }
+      if (r.key.trim()) newVars[r.key.trim()] = r.value;
     }
     try {
       await api.updateProject(projectId, { envVars: newVars });
-      onNotify('Variables actualizadas correctamente');
-      fetchProject();
-    } catch {
-      onNotify('Error al guardar variables');
+      onNotify('Variables de entorno guardadas', 'success');
+      await fetchProject();
+    } catch (e: any) {
+      onNotify(e?.message || 'Error al guardar variables', 'error');
     }
   };
 
-  /**
-   * Borrado del proyecto: el escalón más alto de confirmación.
-   *
-   * Los tres escalones que usa Culkibo, y por qué son tres y no uno:
-   *   1. Reversible (detener, reanudar) -> interruptor optimista con deshacer,
-   *      sin diálogo. Un diálogo para algo que se deshace en un clic solo
-   *      enseña a pulsar «Aceptar» sin leer.
-   *   2. Recuperable pero con consecuencias (revertir) -> diálogo que dice a QUÉ
-   *      commit se vuelve. Confirmar sin saber el destino no es confirmar.
-   *   3. Destruye datos (esto) -> escribir el nombre del recurso, con la lista
-   *      de lo que se pierde delante. El tecleo no está para molestar: obliga a
-   *      mirar el nombre, que es justo lo que falla cuando alguien borra el
-   *      proyecto equivocado por tener dos pestañas abiertas.
-   */
   const handleDelete = async () => {
-    if (confirmDeleteName.trim() !== project?.name) return;
+    if (confirmDeleteName.trim() !== project.name) return;
     setDeleting(true);
     try {
       await api.deleteProject(projectId);
-      onNotify('Proyecto eliminado');
+      onNotify('Proyecto eliminado', 'info');
       onBack();
     } catch (e: any) {
-      onNotify('Error al eliminar el proyecto: ' + (e?.message || ''));
+      onNotify(e?.message || 'Error al eliminar el proyecto', 'error');
       setDeleting(false);
     }
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    onNotify('Copiado al portapapeles');
+  const copyValue = async (text: string, message = 'Copiado al portapapeles') => {
+    const ok = await copyToClipboard(text);
+    onNotify(ok ? message : 'No se pudo copiar al portapapeles', ok ? 'success' : 'error');
   };
 
   const tabs = [
-    { id: 'general', label: 'General', icon: Activity },
+    { id: 'general', label: 'General', icon: LayoutGrid },
     { id: 'live', label: 'En vivo', icon: Zap },
     { id: 'deployments', label: 'Despliegues', icon: Rocket },
-    { id: 'logs', label: 'Logs', icon: Activity },
+    { id: 'logs', label: 'Registros', icon: ScrollText },
     { id: 'domains', label: 'Dominios', icon: Globe },
     { id: 'databases', label: 'Bases de datos', icon: Database },
     { id: 'storage', label: 'Almacenamiento', icon: Box },
     { id: 'vars', label: 'Variables', icon: Variable },
-    { id: 'config', label: 'Configuración', icon: Settings }
-  ];
+    { id: 'config', label: 'Configuración', icon: Settings },
+  ] as const;
+
+  const domainCount = (project.domains || []).length;
 
   return (
-    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
-      <div className="flex flex-col md:flex-row md:items-center gap-4 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-        <div className="flex items-center gap-4">
-          <button onClick={onBack} className="text-slate-400 hover:text-slate-900 transition-colors p-2 -ml-2 rounded-xl hover:bg-slate-50">&larr; Volver</button>
-          <div className="text-4xl bg-slate-50 w-16 h-16 rounded-2xl flex items-center justify-center border border-slate-100 shadow-sm">{project.icon}</div>
-          <div>
-            <div className="flex items-center gap-2.5 flex-wrap">
-              <h2 className="text-2xl font-bold text-slate-900">{project.name}</h2>
-              <span
-                className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold ${
-                  project.status === 'active'
-                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/80'
-                    : project.status === 'hibernated'
-                    ? 'bg-sky-50 text-sky-700 border border-sky-200/80'
-                    : 'bg-slate-100 text-slate-600 border border-slate-200'
-                }`}
-              >
-                {project.status === 'active' ? (
-                  <>
-                    <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
-                    </span>
-                    Activo
-                  </>
-                ) : project.status === 'hibernated' ? (
-                  <>
-                    <span className="w-2 h-2 rounded-full bg-sky-400" />
-                    Hibernado
-                  </>
-                ) : (
-                  <>
-                    <span className="w-2 h-2 rounded-full bg-slate-400" />
-                    Detenido
-                  </>
-                )}
-              </span>
-
-              {project.localRunning && (
-                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold bg-amber-50 text-amber-700 border border-amber-200/80 shadow-2xs">
-                  <Zap className="w-3.5 h-3.5 fill-amber-500 text-amber-600" />
-                  <span>Local :{project.localPort}</span>
-                </span>
-              )}
-
-              <button onClick={() => setActiveTab('config')} className="text-slate-400 hover:text-slate-900 transition-colors">
-                <Settings className="w-5 h-5" />
-              </button>
+    <div className="space-y-5">
+      {/* Cabecera del proyecto */}
+      <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-start gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={onBack}
+              aria-label="Volver a proyectos"
+              className="mt-0.5 p-2 rounded-lg border border-slate-200 text-slate-500 hover:text-slate-900 hover:bg-slate-50 transition-colors cursor-pointer shrink-0"
+              title="Volver a proyectos"
+            >
+              <ArrowLeft className="w-4 h-4" />
+            </button>
+            <div className="w-10 h-10 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+              <Boxes className="w-5 h-5" />
             </div>
-            <p className="text-sm text-slate-500 mt-0.5">{project.description || 'Sin descripción'}</p>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="text-lg font-semibold text-slate-900 tracking-tight truncate">{project.name}</h1>
+                <span
+                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${
+                    project.status === 'active'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-slate-100 text-slate-600 border-slate-200'
+                  }`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${project.status === 'active' ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                  {project.status === 'active' ? 'Activo' : project.status === 'hibernated' ? 'Hibernado' : 'Detenido'}
+                </span>
+                {project.localRunning && project.localPort && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium bg-amber-50 text-amber-800 border border-amber-200 tabular-nums">
+                    <Zap className="w-3 h-3 text-amber-600" /> Local :{project.localPort}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {project.description || 'Sin descripción configurada.'}
+                {project.lastDeployedAt && (
+                  <span className="ml-2 text-slate-400 tabular-nums">
+                    · Último despliegue: {new Date(project.lastDeployedAt).toLocaleDateString('es-ES')}
+                  </span>
+                )}
+              </p>
+            </div>
           </div>
-        </div>
 
-        <div className="md:ml-auto flex items-center gap-2.5 flex-wrap">
-          {project.status === 'active' || project.localRunning ? (
-            <>
-              {!project.localRunning && (
-                <button
-                  onClick={handleStart}
-                  disabled={loading}
-                  className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2.5 rounded-xl text-sm font-semibold transition-all shadow-sm active:scale-[0.98] cursor-pointer disabled:opacity-50"
-                  title="Iniciar en entorno local"
-                >
-                  <Play className="w-4 h-4 fill-current" /> Iniciar en Local
-                </button>
-              )}
-
-              {project.localRunning && project.localPort && (
-                <a
-                  href={`http://localhost:${project.localPort}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center gap-2 bg-amber-50 hover:bg-amber-100 text-amber-800 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all border border-amber-200/80 shadow-2xs cursor-pointer"
-                  title={`Abrir entorno local en http://localhost:${project.localPort}`}
-                >
-                  <Globe className="w-4 h-4 text-amber-600" /> Abrir Local (:{project.localPort})
-                </a>
-              )}
-
-              <button
-                onClick={handleStop}
-                disabled={loading}
-                className="flex items-center gap-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all shadow-2xs active:scale-[0.98] cursor-pointer disabled:opacity-50"
-                title="Detener proyecto y liberar puertos"
+          <div className="flex items-center gap-2 flex-wrap shrink-0">
+            {project.localRunning && project.localPort ? (
+              <a
+                href={`http://${previewHost}:${project.localPort}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 px-3 py-2 rounded-lg text-xs font-medium border border-amber-200 tabular-nums"
               >
-                <Square className="w-4 h-4 fill-rose-600 text-rose-600" /> Detener
-              </button>
-
+                <Globe className="w-3.5 h-3.5 text-amber-600" /> Abrir :{project.localPort}
+              </a>
+            ) : (
               <button
-                onClick={handleHibernate}
-                disabled={loading}
-                className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all cursor-pointer disabled:opacity-50"
-                title="Hibernar proyecto (reposo completo)"
-              >
-                <Moon className="w-4 h-4 text-slate-600" /> Hibernar
-              </button>
-            </>
-          ) : (
-            <>
-              <button
+                type="button"
                 onClick={handleStart}
                 disabled={loading}
-                className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-5 py-2.5 rounded-xl text-sm font-semibold transition-all shadow-sm active:scale-[0.98] cursor-pointer disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
               >
-                <Play className="w-4 h-4 fill-current" /> Iniciar en Local
+                <Play className="w-3.5 h-3.5" /> Iniciar local
               </button>
-              <button
-                onClick={() => handleAction('activate')}
-                disabled={loading}
-                className="flex items-center gap-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/80 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all cursor-pointer disabled:opacity-50"
-                title="Activar en producción"
-              >
-                <Power className="w-4 h-4 text-emerald-600" /> Activar
-              </button>
-            </>
-          )}
+            )}
 
-          {project.domains && project.domains.length > 0 && (
-            <a
-              href={`https://${project.domains[0]}`}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-2 bg-blue-50 hover:bg-blue-100 text-blue-700 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
-            >
-              <Globe className="w-4 h-4" /> Ver Web
-            </a>
-          )}
+            {project.status === 'active' || project.localRunning ? (
+              <>
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  disabled={loading}
+                  className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  <Square className="w-3 h-3 fill-red-600 text-red-600" /> Detener
+                </button>
+                <button
+                  type="button"
+                  onClick={handleHibernate}
+                  disabled={loading}
+                  className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  <Moon className="w-3.5 h-3.5 text-slate-500" /> Hibernar
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={handleActivate}
+                disabled={loading}
+                className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <Power className="w-3.5 h-3.5 text-emerald-600" /> Activar
+              </button>
+            )}
+
+            {project.domains && project.domains.length > 0 && (
+              <a
+                href={`https://${project.domains[0]}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors"
+              >
+                <Globe className="w-3.5 h-3.5 text-slate-500" /> Ver web
+              </a>
+            )}
+          </div>
         </div>
       </div>
-      
-      {/* Status Indicator Banner */}
-      {project.status === 'active' ? (
-        project.localRunning ? (
-          <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 px-4 py-3 rounded-xl flex items-center justify-between shadow-2xs">
-            <span className="text-xs sm:text-sm font-medium flex items-center gap-2.5">
-              <span className="relative flex h-2.5 w-2.5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
-              </span>
-              <span>Ejecutándose en local — <strong>http://localhost:{project.localPort}</strong> y activo en producción</span>
-            </span>
-            <a
-              href={`http://localhost:${project.localPort}`}
-              target="_blank"
-              rel="noreferrer"
-              className="text-xs font-semibold text-emerald-700 hover:text-emerald-900 underline ml-2"
-            >
-              Abrir aplicación &rarr;
-            </a>
-          </div>
-        ) : (
-          <div className="bg-emerald-50/70 border border-emerald-200 text-emerald-900 px-4 py-3 rounded-xl flex items-center justify-between shadow-2xs">
-            <span className="text-xs sm:text-sm font-medium flex items-center gap-2.5">
-              <span className="relative flex h-2.5 w-2.5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
-              </span>
-              <span>Producción activa — Enrutado por Citadel (:8080) / Ingress Edge</span>
-            </span>
-            {project.localPort ? (
-              <span className="text-xs font-mono text-slate-500 bg-white/80 border border-emerald-200 px-2 py-0.5 rounded">
-                Puerto local :{project.localPort} (inactivo)
-              </span>
-            ) : null}
-          </div>
-        )
-      ) : project.status === 'hibernated' ? (
-        <div className="bg-sky-50/80 border border-sky-200 text-sky-900 px-4 py-3 rounded-xl flex items-center justify-between shadow-2xs">
-          <span className="text-xs sm:text-sm font-medium flex items-center gap-2.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-sky-400" />
-            <span>Proyecto en estado hibernado — Recursos en reposo y puertos liberados.</span>
-          </span>
-          {project.localPort && (
-            <span className="text-xs font-mono text-sky-600 bg-white/80 border border-sky-200 px-2 py-0.5 rounded">
-              Puerto :{project.localPort} (liberado)
-            </span>
-          )}
-        </div>
-      ) : (
-        <div className="bg-slate-100/90 border border-slate-200 text-slate-700 px-4 py-3 rounded-xl flex items-center justify-between shadow-2xs">
-          <span className="text-xs sm:text-sm font-medium flex items-center gap-2.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-400" />
-            <span>Proyecto detenido — Sin procesos locales en ejecución ni puertos en uso.</span>
-          </span>
-          {project.localPort && (
-            <span className="text-xs font-mono text-slate-400 bg-white border border-slate-200 px-2 py-0.5 rounded">
-              Puerto :{project.localPort} (inactivo)
-            </span>
-          )}
-        </div>
-      )}
 
-      <div className="flex border-b border-slate-200 gap-6 px-2 overflow-x-auto">
-        {tabs.map(t => (
-          <button key={t.id} onClick={() => setActiveTab(t.id as any)} className={`flex items-center gap-2 pb-4 text-sm font-medium border-b-2 transition-all whitespace-nowrap cursor-pointer shrink-0 ${activeTab === t.id ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-800'}`}>
-            <t.icon className={`w-4 h-4 ${activeTab === t.id ? 'text-slate-900' : 'text-slate-400'}`} />
+      {/* Pestañas */}
+      <div className="flex border-b border-slate-200 gap-4 px-1 overflow-x-auto">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setActiveTab(t.id)}
+            className={`flex items-center gap-1.5 pb-3 text-xs font-medium border-b-2 transition-colors whitespace-nowrap cursor-pointer shrink-0 ${
+              activeTab === t.id
+                ? 'border-slate-900 text-slate-900'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <t.icon className={`w-3.5 h-3.5 ${activeTab === t.id ? 'text-slate-900' : 'text-slate-400'}`} />
             {t.label}
           </button>
         ))}
       </div>
 
-      <div className="py-2">
+      <div className="pt-1">
         {activeTab === 'live' && (
           <LiveForgePanel projectId={project.id} projectName={project.name} onNotify={onNotify} />
         )}
 
         {activeTab === 'general' && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 space-y-6">
-              {/* Resources Section */}
-              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50/50 gap-2 flex-wrap">
-                  <h3 className="font-semibold text-slate-900 flex items-center gap-2">
-                    <Box className="w-5 h-5 text-indigo-500" />
-                    Recursos y Contenedores
-                  </h3>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+            <div className="lg:col-span-2 space-y-5">
+              <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                <div className="px-5 py-3.5 border-b border-slate-200 flex justify-between items-center bg-slate-50/70 gap-2 flex-wrap">
+                  <h2 className="font-semibold text-sm text-slate-900 flex items-center gap-2">
+                    <Box className="w-4 h-4 text-slate-600" />
+                    Recursos y entornos
+                  </h2>
                   <div className="flex items-center gap-2">
-                    <button type="button" onClick={() => setActiveTab('databases')} className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('databases')}
+                      className="text-xs font-medium text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1 cursor-pointer"
+                    >
                       <Database className="w-3.5 h-3.5" /> Añadir BD
                     </button>
                     {onOpenCatalog && (
-                      <button type="button" onClick={onOpenCatalog} className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer">
-                        <Plus className="w-3.5 h-3.5" /> Catálogo 1 clic
+                      <button
+                        type="button"
+                        onClick={onOpenCatalog}
+                        className="text-xs font-medium text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1 cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Catálogo
                       </button>
                     )}
                   </div>
                 </div>
-                <div className="p-6">
+                <div className="p-5 space-y-3">
                   {project.resources && project.resources.length > 0 ? (
-                    <div className="space-y-4">
-                      {project.resources.map((res: any) => {
-                        const isResActive = project.status === 'active' && (project.localRunning || res.status === 'running' || res.status === 'active');
-                        const isResHibernated = project.status === 'hibernated' || res.status === 'hibernated';
-                        return (
-                          <div key={res.id} className="flex items-center justify-between p-4 rounded-xl border border-slate-200 hover:border-slate-300 transition-colors bg-white">
-                            <div className="flex items-center gap-4">
-                              <div className="w-10 h-10 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
-                                {res.type === 'database' ? <Database className="w-5 h-5" /> : <Server className="w-5 h-5" />}
-                              </div>
-                              <div>
-                                <div className="font-medium text-slate-900">{res.name}</div>
-                                <div className="text-xs text-slate-500 flex items-center gap-2">
-                                  <span className="uppercase tracking-wider">{res.type}</span> &bull; {res.image || 'sandbox-isolated'}
-                                </div>
-                              </div>
+                    project.resources.map((res: any) => {
+                      const isResActive = project.status === 'active' && (project.localRunning || res.status === 'running' || res.status === 'active');
+                      return (
+                        <div key={res.id} className="flex items-center justify-between p-3.5 rounded-xl border border-slate-200 bg-white gap-3 flex-wrap">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-600 shrink-0">
+                              {res.type === 'database' ? <Database className="w-4 h-4" /> : <Server className="w-4 h-4" />}
                             </div>
-                            <div className="flex items-center gap-4 text-sm">
-                              {project.localRunning && res.localPort && (
-                                <a href={`http://localhost:${res.localPort}`} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 bg-blue-50 text-blue-700 hover:bg-blue-100 px-2.5 py-1 rounded-md text-xs font-medium border border-blue-200 transition-colors">
-                                  <Globe className="w-3 h-3" /> Abrir (:{res.localPort})
-                                </a>
-                              )}
-                              <span className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border ${
-                                isResActive
-                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
-                                  : isResHibernated
-                                  ? 'bg-sky-50 text-sky-700 border-sky-100'
-                                  : 'bg-slate-100 text-slate-600 border-slate-200'
-                              }`}>
-                                <span className={`w-1.5 h-1.5 rounded-full ${
-                                  isResActive
-                                    ? 'bg-emerald-500 animate-pulse'
-                                    : isResHibernated
-                                    ? 'bg-sky-400'
-                                    : 'bg-slate-400'
-                                }`} />
-                                {isResActive ? 'Activo' : isResHibernated ? 'Hibernado' : 'Detenido'}
-                              </span>
-                              <span className="text-slate-400 font-mono text-xs">{Array.isArray(res.ports) ? res.ports.join(', ') : (res.ports || res.port || '-')}</span>
+                            <div className="min-w-0">
+                              <div className="text-sm font-medium text-slate-900 truncate">{res.name}</div>
+                              <div className="text-xs text-slate-500">
+                                {res.type} · <span className="font-mono">{res.image || 'proceso local'}</span>
+                              </div>
                             </div>
                           </div>
-                        );
-                      })}
-                    </div>
+                          <div className="flex items-center gap-3 text-xs">
+                            {project.localRunning && res.localPort && (
+                              <a
+                                href={`http://${previewHost}:${res.localPort}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1 bg-slate-100 text-slate-700 hover:bg-slate-200 px-2.5 py-1 rounded-md font-mono"
+                              >
+                                <Globe className="w-3 h-3" /> :{res.localPort}
+                              </a>
+                            )}
+                            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-medium border ${
+                              isResActive
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : 'bg-slate-100 text-slate-600 border-slate-200'
+                            }`}>
+                              <span className={`w-1.5 h-1.5 rounded-full ${isResActive ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                              {isResActive ? 'Activo' : 'Detenido'}
+                            </span>
+                            <span className="text-slate-400 font-mono tabular-nums">
+                              {Array.isArray(res.ports) ? res.ports.join(', ') : (res.ports || res.port || '—')}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })
                   ) : (
-                    <div className="space-y-4">
-                      {/* Default Pods */}
-                      <div className="flex items-center justify-between p-4 rounded-xl border border-slate-200 hover:border-slate-300 transition-colors bg-white">
-                        <div className="flex items-center gap-4">
-                          <div className="w-10 h-10 rounded-lg bg-blue-50 flex items-center justify-center text-blue-600">
-                            <Cpu className="w-5 h-5" />
+                    <>
+                      <div className="flex items-center justify-between p-3.5 rounded-xl border border-slate-200 bg-white gap-3">
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-600">
+                            <Cpu className="w-4 h-4" />
                           </div>
                           <div>
-                            <div className="font-medium text-slate-900">Entorno de Desarrollo</div>
-                            <div className="text-xs text-slate-500">Node.js / Hot Reloading</div>
+                            <div className="text-sm font-medium text-slate-900">Entorno de desarrollo</div>
+                            <div className="text-xs text-slate-500">Vista previa local y sincronización en vivo</div>
                           </div>
                         </div>
-                        <div className="flex items-center gap-4 text-sm">
-                          <span className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border ${
-                            project.status === 'active' && project.localRunning
-                              ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
-                              : project.status === 'hibernated'
-                              ? 'bg-sky-50 text-sky-700 border-sky-100'
+                        <div className="flex items-center gap-3 text-xs">
+                          <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-medium border ${
+                            project.localRunning
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                               : 'bg-slate-100 text-slate-600 border-slate-200'
                           }`}>
-                            <span className={`w-1.5 h-1.5 rounded-full ${
-                              project.status === 'active' && project.localRunning
-                                ? 'bg-emerald-500 animate-pulse'
-                                : project.status === 'hibernated'
-                                ? 'bg-sky-400'
-                                : 'bg-slate-400'
-                            }`} />
-                            {project.status === 'active' && project.localRunning ? 'Activo' : project.status === 'hibernated' ? 'Hibernado' : 'Detenido'}
+                            <span className={`w-1.5 h-1.5 rounded-full ${project.localRunning ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                            {project.localRunning ? 'En ejecución' : 'Detenido'}
                           </span>
-                          <span className="text-slate-400 font-mono text-xs">:{project.forgePort}</span>
+                          <span className="text-slate-400 font-mono tabular-nums">:{project.localPort || project.forgePort}</span>
                         </div>
                       </div>
-                      <div className="flex items-center justify-between p-4 rounded-xl border border-slate-200 hover:border-slate-300 transition-colors bg-white">
-                        <div className="flex items-center gap-4">
-                          <div className="w-10 h-10 rounded-lg bg-emerald-50 flex items-center justify-center text-emerald-600">
-                            <Server className="w-5 h-5" />
+
+                      <div className="flex items-center justify-between p-3.5 rounded-xl border border-slate-200 bg-white gap-3">
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-600">
+                            <Server className="w-4 h-4" />
                           </div>
                           <div>
-                            <div className="font-medium text-slate-900">Entorno de Producción</div>
-                            <div className="text-xs text-slate-500">Dockerizado / Optimizado</div>
+                            <div className="text-sm font-medium text-slate-900">Entorno de producción</div>
+                            <div className="text-xs text-slate-500">Contenedor Docker aislado detrás de Caddy</div>
                           </div>
                         </div>
-                        <div className="flex items-center gap-4 text-sm">
-                          <span className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border ${
-                            project.status === 'active'
-                              ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
-                              : project.status === 'hibernated'
-                              ? 'bg-sky-50 text-sky-700 border-sky-100'
+                        <div className="flex items-center gap-3 text-xs">
+                          <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-medium border ${
+                            project.lastDeployedAt && project.status === 'active'
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                               : 'bg-slate-100 text-slate-600 border-slate-200'
                           }`}>
-                            <span className={`w-1.5 h-1.5 rounded-full ${
-                              project.status === 'active'
-                                ? 'bg-emerald-500'
-                                : project.status === 'hibernated'
-                                ? 'bg-sky-400'
-                                : 'bg-slate-400'
-                            }`} />
-                            {project.status === 'active' ? 'Activo' : project.status === 'hibernated' ? 'Hibernado' : 'Detenido'}
+                            <span className={`w-1.5 h-1.5 rounded-full ${project.lastDeployedAt && project.status === 'active' ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                            {project.lastDeployedAt
+                              ? (project.status === 'active' ? 'Desplegado' : 'Detenido')
+                              : 'Sin desplegar'}
                           </span>
-                          <span className="text-slate-400 font-mono text-xs">:{project.citadelPort}</span>
+                          <span className="text-slate-400 font-mono tabular-nums">:{project.citadelPort}</span>
                         </div>
                       </div>
-                    </div>
+                    </>
                   )}
                 </div>
               </div>
             </div>
 
-            <div className="space-y-6">
-              {/* Traffic Split */}
-              <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                <h3 className="font-semibold text-slate-900 mb-6 flex items-center gap-2">
-                  <Activity className="w-5 h-5 text-blue-500" /> Control de Tráfico
-                </h3>
-                <div className="space-y-5">
+            <div className="space-y-5">
+              <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
+                <h2 className="font-semibold text-sm text-slate-900 flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-slate-600" /> Reparto de tráfico
+                </h2>
+                <div className="space-y-3 text-xs">
                   <div>
-                    <div className="flex justify-between text-sm mb-2">
-                      <span className="text-slate-600 font-medium">Entorno de Desarrollo</span>
-                      <span className="font-bold text-slate-900">{project.trafficSplit?.forge || 0}%</span>
+                    <div className="flex justify-between mb-1.5">
+                      <span className="text-slate-600">Desarrollo</span>
+                      <span className="font-mono font-semibold text-slate-900 tabular-nums">{project.trafficSplit?.forge || 0}%</span>
                     </div>
-                    <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
-                      <div className="bg-blue-500 h-2.5 rounded-full" style={{ width: `${project.trafficSplit?.forge || 0}%` }}></div>
+                    <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+                      <div className="bg-slate-900 h-2 rounded-full" style={{ width: `${project.trafficSplit?.forge || 0}%` }} />
                     </div>
                   </div>
                   <div>
-                    <div className="flex justify-between text-sm mb-2">
-                      <span className="text-slate-600 font-medium">Entorno de Producción</span>
-                      <span className="font-bold text-slate-900">{project.trafficSplit?.citadel || 0}%</span>
+                    <div className="flex justify-between mb-1.5">
+                      <span className="text-slate-600">Producción</span>
+                      <span className="font-mono font-semibold text-slate-900 tabular-nums">{project.trafficSplit?.citadel || 0}%</span>
                     </div>
-                    <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
-                      <div className="bg-emerald-500 h-2.5 rounded-full" style={{ width: `${project.trafficSplit?.citadel || 0}%` }}></div>
+                    <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+                      <div className="bg-emerald-500 h-2 rounded-full" style={{ width: `${project.trafficSplit?.citadel || 0}%` }} />
                     </div>
                   </div>
-                  <div className="pt-4 border-t border-slate-100 space-y-2">
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('deployments')}
-                      className="w-full py-2.5 bg-slate-900 text-white rounded-xl text-sm font-semibold hover:bg-slate-800 transition-colors shadow-sm cursor-pointer"
-                    >
-                      Publicar a Producción →
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('live')}
-                      className="w-full py-2 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
-                    >
-                      Abrir Live Sync (The Forge)
-                    </button>
-                  </div>
+                </div>
+                <div className="pt-3 border-t border-slate-100 space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('deployments')}
+                    className="w-full py-2 bg-slate-900 text-white rounded-lg text-xs font-medium hover:bg-slate-800 transition-colors cursor-pointer"
+                  >
+                    Publicar a producción →
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('live')}
+                    className="w-full py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+                  >
+                    Abrir sincronización en vivo
+                  </button>
                 </div>
               </div>
 
-              {/* Quick Access */}
-              <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                <h3 className="font-semibold text-slate-900 mb-4 flex items-center gap-2">
-                  <Globe className="w-5 h-5 text-slate-400" /> Dominios y Acceso
-                </h3>
-                <div className="space-y-3">
-                  {project.domains && project.domains.length > 0 ? (
-                    project.domains.map((d: any) => (
-                      <div key={d} className="flex items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-xl">
-                        <span className="text-sm font-medium text-slate-700 truncate">{d}</span>
-                        <div className="flex items-center gap-1">
-                          <button onClick={() => copyToClipboard(d)} className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-white rounded-md transition-colors"><Copy className="w-4 h-4" /></button>
-                          <a href={`https://${d}`} target="_blank" rel="noreferrer" className="p-1.5 text-blue-500 hover:text-blue-700 hover:bg-blue-50 rounded-md transition-colors"><Globe className="w-4 h-4" /></a>
+              <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="font-semibold text-sm text-slate-900 flex items-center gap-2">
+                    <Globe className="w-4 h-4 text-slate-500" /> Dominios
+                  </h2>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('domains')}
+                    className="text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
+                  >
+                    Gestionar →
+                  </button>
+                </div>
+                {project.domains && project.domains.length > 0 ? (
+                  <div className="space-y-2">
+                    {project.domains.map((d: string) => (
+                      <div key={d} className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-lg gap-2">
+                        <span className="text-xs font-mono text-slate-700 truncate">{d}</span>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            aria-label={`Copiar ${d}`}
+                            onClick={() => void copyValue(d)}
+                            className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                          <a
+                            href={`https://${d}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            aria-label={`Abrir ${d}`}
+                            className="p-1 text-slate-500 hover:text-slate-900 rounded"
+                          >
+                            <Globe className="w-3.5 h-3.5" />
+                          </a>
                         </div>
                       </div>
-                    ))
-                  ) : (
-                    <div className="text-sm text-slate-500 p-4 bg-slate-50 border border-slate-100 rounded-xl text-center">
-                      No hay dominios configurados.
-                    </div>
-                  )}
-                </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-slate-500 p-4 bg-slate-50 border border-slate-200 rounded-lg text-center">
+                    Sin dominios vinculados todavía.
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -799,22 +801,18 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
         )}
 
         {activeTab === 'logs' && (
-          <div className="h-[650px]">
+          <div className="h-[620px]">
             <LiveLogs incomingLog={incomingLog} projectId={project.id} />
           </div>
         )}
 
         {activeTab === 'domains' && (
-          <DomainManager 
-            onNotify={onNotify} 
-            projectId={project.id} 
+          <DomainManager
+            onNotify={onNotify}
+            projectId={project.id}
             projectDomains={project.domains || []}
-            // Vincular y desvincular ya son una sola llamada al servidor
-            // (registro del dominio + ruta en Caddy), así que aquí solo queda
-            // refrescar. Antes el panel escribía `project.domains` por su
-            // cuenta y nadie publicaba la ruta.
-            onDomainAddedToProject={() => fetchProject()}
-            onDomainRemovedFromProject={() => fetchProject()}
+            onDomainAddedToProject={() => { void fetchProject(); }}
+            onDomainRemovedFromProject={() => { void fetchProject(); }}
           />
         )}
 
@@ -823,107 +821,149 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
         )}
 
         {activeTab === 'vars' && (
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div className="p-6 border-b border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-50/50">
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+            <div className="p-5 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-50/70">
               <div>
-                <h3 className="font-semibold text-slate-900 text-lg flex items-center gap-2">
-                  <Variable className="w-5 h-5 text-indigo-500" /> Variables de Entorno
-                </h3>
-                <p className="text-sm text-slate-500 mt-1">Configura las variables secretas y de entorno para tus contenedores.</p>
+                <h2 className="font-semibold text-slate-900 text-base flex items-center gap-2">
+                  <Variable className="w-4 h-4 text-slate-600" /> Variables de entorno
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Secretos y configuración inyectados en el entorno de ejecución y despliegue.
+                </p>
               </div>
-              <div className="flex items-center bg-slate-200/50 p-1 rounded-xl">
-                <button onClick={() => setEnvMode('table')} className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${envMode === 'table' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}>Tabla Visual</button>
-                <button onClick={() => setEnvMode('raw')} className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${envMode === 'raw' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}>.env Crudo</button>
+              <div className="flex items-center bg-slate-200/70 p-0.5 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => switchEnvMode('table')}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                    envMode === 'table' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Tabla visual
+                </button>
+                <button
+                  type="button"
+                  onClick={() => switchEnvMode('raw')}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                    envMode === 'raw' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Archivo .env
+                </button>
               </div>
             </div>
 
-            <div className="p-6">
+            <div className="p-5">
               {envMode === 'table' ? (
                 <div className="space-y-4">
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
                     <div className="relative flex-1">
                       <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                       <input
                         type="text"
-                        placeholder="Buscar variable..."
+                        placeholder="Filtrar por nombre de variable…"
                         value={searchVar}
-                        onChange={e => setSearchVar(e.target.value)}
-                        className="w-full pl-9 pr-4 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
+                        onChange={(e) => setSearchVar(e.target.value)}
+                        className="w-full pl-9 pr-3 py-2 border border-slate-200 rounded-lg text-sm"
                       />
                     </div>
-                    <button onClick={() => setEnvRows([{ key: '', value: '', id: `new_${Date.now()}` }, ...envRows])} className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-sm font-medium shadow-sm transition-all">
-                      <Plus className="w-4 h-4" /> Añadir Variable
+                    <button
+                      type="button"
+                      onClick={() => setEnvRows([{ key: '', value: '', id: `new_${Date.now()}` }, ...envRows])}
+                      className="inline-flex items-center justify-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-medium cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> Añadir variable
                     </button>
                   </div>
-                  
+
                   <div className="border border-slate-200 rounded-xl overflow-hidden">
- <div className="grid grid-cols-[1fr_2fr_auto] gap-4 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
-                      <div>Clave (KEY)</div>
-                      <div>Valor (VALUE)</div>
-                      <div className="w-24 text-center">Acciones</div>
+                    <div className="grid grid-cols-[1fr_1.8fr_auto] gap-3 bg-slate-50 px-3 py-2.5 border-b border-slate-200 text-xs font-medium text-slate-500">
+                      <div>Clave</div>
+                      <div>Valor</div>
+                      <div className="w-20 text-center">Acciones</div>
                     </div>
-                    <div className="divide-y divide-slate-100 max-h-[500px] overflow-y-auto">
-                      {envRows.filter(r => r.key.toLowerCase().includes(searchVar.toLowerCase()) || searchVar === '').length === 0 && (
-                        <div className="p-8 text-center text-slate-500 text-sm">No se encontraron variables.</div>
+                    <div className="divide-y divide-slate-100 max-h-[460px] overflow-y-auto">
+                      {envRows.filter((r) => !searchVar || r.key.toLowerCase().includes(searchVar.toLowerCase())).length === 0 && (
+                        <div className="p-8 text-center text-slate-500 text-xs">No hay variables que coincidan.</div>
                       )}
-                      {envRows.filter(r => r.key.toLowerCase().includes(searchVar.toLowerCase()) || searchVar === '').map((row) => (
-                        <div key={row.id} className="grid grid-cols-[1fr_2fr_auto] gap-4 p-3 items-center hover:bg-slate-50/50 transition-colors group">
-                          <input
-                            type="text"
-                            value={row.key}
-                            onChange={e => {
-                              const newRows = [...envRows];
-                              const idx = newRows.findIndex(r => r.id === row.id);
-                              newRows[idx].key = e.target.value;
-                              setEnvRows(newRows);
-                            }}
-                            placeholder="API_KEY"
-                            className="w-full px-3 py-1.5 border border-transparent hover:border-slate-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 rounded-lg text-sm font-mono transition-all bg-transparent focus:bg-white"
-                          />
-                          <div className="relative flex items-center">
+                      {envRows
+                        .filter((r) => !searchVar || r.key.toLowerCase().includes(searchVar.toLowerCase()))
+                        .map((row) => (
+                          <div key={row.id} className="grid grid-cols-[1fr_1.8fr_auto] gap-3 p-2.5 items-center hover:bg-slate-50/70 group">
                             <input
-                              type={showValues[row.id] ? 'text' : 'password'}
-                              value={row.value}
-                              onChange={e => {
-                                const newRows = [...envRows];
-                                const idx = newRows.findIndex(r => r.id === row.id);
-                                newRows[idx].value = e.target.value;
-                                setEnvRows(newRows);
+                              type="text"
+                              value={row.key}
+                              onChange={(e) => {
+                                setEnvRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, key: e.target.value } : r)));
                               }}
-                              placeholder="valor_secreto_123"
-                              className="w-full pl-3 pr-10 py-1.5 border border-transparent hover:border-slate-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 rounded-lg text-sm font-mono transition-all bg-transparent focus:bg-white"
+                              placeholder="API_KEY"
+                              className="w-full px-2.5 py-1.5 border border-transparent hover:border-slate-200 rounded-lg text-xs font-mono bg-transparent focus:bg-white"
                             />
-                            <button
-                              onClick={() => setShowValues(prev => ({ ...prev, [row.id]: !prev[row.id] }))}
-                              className="absolute right-2 p-1 text-slate-400 hover:text-slate-600 rounded"
-                            >
-                              {showValues[row.id] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                            </button>
+                            <div className="relative flex items-center">
+                              <input
+                                type={showValues[row.id] ? 'text' : 'password'}
+                                value={row.value}
+                                onChange={(e) => {
+                                  setEnvRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, value: e.target.value } : r)));
+                                }}
+                                placeholder="valor"
+                                className="w-full pl-2.5 pr-9 py-1.5 border border-transparent hover:border-slate-200 rounded-lg text-xs font-mono bg-transparent focus:bg-white"
+                              />
+                              <button
+                                type="button"
+                                aria-label={showValues[row.id] ? 'Ocultar valor' : 'Mostrar valor'}
+                                onClick={() => setShowValues((prev) => ({ ...prev, [row.id]: !prev[row.id] }))}
+                                className="absolute right-2 p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
+                              >
+                                {showValues[row.id] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                              </button>
+                            </div>
+                            <div className="flex items-center justify-center gap-1 w-20 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 transition-opacity">
+                              <button
+                                type="button"
+                                aria-label="Copiar valor"
+                                onClick={() => void copyValue(row.value)}
+                                className="p-1.5 text-slate-400 hover:text-slate-900 hover:bg-slate-100 rounded cursor-pointer"
+                                title="Copiar valor"
+                              >
+                                <Copy className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                aria-label="Eliminar variable"
+                                onClick={() => setEnvRows((prev) => prev.filter((r) => r.id !== row.id))}
+                                className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded cursor-pointer"
+                                title="Eliminar"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                           </div>
-                          <div className="flex items-center justify-center gap-1 w-24 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <button onClick={() => copyToClipboard(row.value)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Copiar valor"><Copy className="w-4 h-4" /></button>
-                            <button onClick={() => setEnvRows(envRows.filter(r => r.id !== row.id))} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors" title="Eliminar"><Trash2 className="w-4 h-4" /></button>
-                          </div>
-                        </div>
-                      ))}
+                        ))}
                     </div>
                   </div>
-                  <div className="flex justify-end pt-4">
-                    <button onClick={handleSaveEnvTable} className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2 rounded-xl text-sm font-medium shadow-sm transition-all">
-                      <Save className="w-4 h-4" /> Guardar Cambios
+                  <div className="flex justify-end pt-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveEnvTable()}
+                      className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg text-xs font-medium cursor-pointer"
+                    >
+                      <Save className="w-3.5 h-3.5" /> Guardar variables
                     </button>
                   </div>
                 </div>
               ) : (
                 <div className="space-y-4">
-                  <div className="flex justify-between items-center text-sm text-slate-500">
-                    <p>Pega el contenido de tu archivo <code className="bg-slate-100 px-1 rounded text-slate-700">.env</code> aquí.</p>
+                  <div className="flex flex-wrap justify-between items-center gap-2 text-xs text-slate-500">
+                    <p>
+                      Pega líneas <code className="bg-slate-100 px-1 rounded text-slate-700 font-mono">CLAVE=valor</code>. Los comentarios con <code className="font-mono">#</code> se ignoran al guardar.
+                    </p>
                     <div>
                       <input ref={envFileInputRef} type="file" accept=".env,.txt" onChange={handleImportEnvFile} className="hidden" />
                       <button
                         type="button"
                         onClick={() => envFileInputRef.current?.click()}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium transition-colors cursor-pointer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium cursor-pointer"
                       >
                         <Upload className="w-3.5 h-3.5" /> Importar archivo .env
                       </button>
@@ -931,14 +971,18 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                   </div>
                   <textarea
                     value={envText}
-                    onChange={e => setEnvText(e.target.value)}
-                    className="w-full h-[400px] p-4 bg-slate-50 text-slate-900 border border-slate-200 rounded-xl font-mono text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 resize-none shadow-inner"
-                    placeholder="PORT=3000&#10;DATABASE_URL=postgres://user:pass@localhost:5432/db"
-                    spellCheck="false"
+                    onChange={(e) => setEnvText(e.target.value)}
+                    className="w-full h-[360px] p-3.5 bg-slate-50 text-slate-900 border border-slate-200 rounded-xl font-mono text-xs leading-relaxed resize-y"
+                    placeholder={'PORT=3000\nDATABASE_URL=postgres://user:pass@host:5432/db'}
+                    spellCheck={false}
                   />
-                  <div className="flex justify-end pt-4">
-                    <button onClick={handleSaveEnvRaw} className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2 rounded-xl text-sm font-medium shadow-sm transition-all">
-                      <CheckCircle2 className="w-4 h-4" /> Guardar Variables
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveEnvRaw()}
+                      className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg text-xs font-medium cursor-pointer"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5" /> Guardar variables
                     </button>
                   </div>
                 </div>
@@ -948,276 +992,284 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
         )}
 
         {activeTab === 'storage' && (
-          <div className="space-y-6">
-            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-              <div className="flex justify-between items-center mb-2">
-                <h3 className="font-bold text-slate-900 flex items-center gap-2 text-lg"><Database className="w-5 h-5"/> Volúmenes Persistentes</h3>
+          <div className="space-y-5">
+            <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
+              <div className="flex justify-between items-center">
+                <h2 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
+                  <Database className="w-4 h-4 text-slate-600" /> Volúmenes persistentes
+                </h2>
                 <button
                   type="button"
                   onClick={() => setShowVolumeForm((prev) => !prev)}
-                  className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer"
+                  className="text-xs font-medium text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg flex items-center gap-1 cursor-pointer"
                 >
-                  <Plus className="w-3.5 h-3.5" /> {showVolumeForm ? 'Cerrar' : 'Añadir Volumen'}
+                  <Plus className="w-3.5 h-3.5" /> {showVolumeForm ? 'Cerrar' : 'Añadir volumen'}
                 </button>
               </div>
 
               {showVolumeForm && (
-                <form onSubmit={handleAddVolume} className="p-4 rounded-xl bg-slate-50 border border-slate-200 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
-                  <input required value={volForm.name} onChange={(e) => setVolForm({ ...volForm, name: e.target.value })} placeholder="Nombre (ej. uploads)" className="px-3 py-2 bg-white border border-slate-300 rounded-lg" />
-                  <input required value={volForm.mount_path} onChange={(e) => setVolForm({ ...volForm, mount_path: e.target.value })} placeholder="Ruta contenedor (/data)" className="px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
+                <form onSubmit={handleAddVolume} className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+                  <input required value={volForm.name} onChange={(e) => setVolForm({ ...volForm, name: e.target.value })} placeholder="Nombre (ej. uploads)" className="px-3 py-2 bg-white border border-slate-200 rounded-lg" />
+                  <input required value={volForm.mount_path} onChange={(e) => setVolForm({ ...volForm, mount_path: e.target.value })} placeholder="Ruta contenedor (/data)" className="px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
                   <div className="flex gap-2">
-                    <input value={volForm.host_path} onChange={(e) => setVolForm({ ...volForm, host_path: e.target.value })} placeholder="Ruta host (opcional)" className="flex-1 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
-                    <button type="submit" className="px-3 py-2 rounded-lg bg-slate-900 text-white font-semibold cursor-pointer">Guardar</button>
+                    <input value={volForm.host_path} onChange={(e) => setVolForm({ ...volForm, host_path: e.target.value })} placeholder="Ruta host (opcional)" className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
+                    <button type="submit" className="px-3 py-2 rounded-lg bg-slate-900 text-white font-medium cursor-pointer">Guardar</button>
                   </div>
                 </form>
               )}
 
-              <div className="border border-slate-200 rounded-xl overflow-hidden">
-                <div className="grid grid-cols-[1.5fr_1fr_1fr_auto] gap-4 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
-                  <div>Nombre</div>
-                  <div>Ruta Contenedor (Mount)</div>
-                  <div>Ruta Host</div>
-                  <div />
-                </div>
-                <div className="divide-y divide-slate-100">
-                  {(!project.volumes || project.volumes.length === 0) && (
-                    <div className="p-8 text-center text-slate-500 text-sm">No hay volúmenes configurados.</div>
-                  )}
-                  {project.volumes?.map((vol, i) => (
-                    <div key={i} className="grid grid-cols-[1.5fr_1fr_1fr_auto] gap-4 p-3 items-center text-sm">
-                      <div className="font-medium text-slate-700">{vol.name || `Volumen ${i + 1}`}</div>
-                      <div className="font-mono text-slate-500">{vol.mount_path || vol.mountPath || '/data'}</div>
-                      <div className="font-mono text-slate-500">{vol.host_path || vol.hostPath || '-'}</div>
-                      <button type="button" onClick={() => void handleRemoveVolume(i)} className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer" title="Eliminar volumen">
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
+              <div className="border border-slate-200 rounded-xl overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-500">
+                      <th className="py-2.5 px-4">Nombre</th>
+                      <th className="py-2.5 px-4">Ruta contenedor</th>
+                      <th className="py-2.5 px-4">Ruta host</th>
+                      <th className="py-2.5 px-4 w-12" />
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-xs">
+                    {(!project.volumes || project.volumes.length === 0) ? (
+                      <tr><td colSpan={4} className="p-6 text-center text-slate-500">No hay volúmenes configurados.</td></tr>
+                    ) : (
+                      project.volumes.map((vol, i) => (
+                        <tr key={i}>
+                          <td className="py-2.5 px-4 font-medium text-slate-700">{vol.name || `Volumen ${i + 1}`}</td>
+                          <td className="py-2.5 px-4 font-mono text-slate-500">{vol.mount_path || vol.mountPath || '/data'}</td>
+                          <td className="py-2.5 px-4 font-mono text-slate-500">{vol.host_path || vol.hostPath || '—'}</td>
+                          <td className="py-2.5 px-4 text-right">
+                            <button type="button" aria-label="Eliminar volumen" onClick={() => void handleRemoveVolume(i)} className="p-1 text-slate-400 hover:text-red-600 cursor-pointer">
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
 
-            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-              <div className="flex justify-between items-center mb-2">
-                <h3 className="font-bold text-slate-900 flex items-center gap-2 text-lg"><Box className="w-5 h-5"/> Archivos Montados (File Mounts)</h3>
+            <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
+              <div className="flex justify-between items-center">
+                <h2 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
+                  <Box className="w-4 h-4 text-slate-600" /> Archivos montados
+                </h2>
                 <button
                   type="button"
                   onClick={() => setShowMountForm((prev) => !prev)}
-                  className="text-xs font-semibold text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs flex items-center gap-1 cursor-pointer"
+                  className="text-xs font-medium text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-3 py-1.5 rounded-lg flex items-center gap-1 cursor-pointer"
                 >
-                  <Plus className="w-3.5 h-3.5" /> {showMountForm ? 'Cerrar' : 'Montar Archivo'}
+                  <Plus className="w-3.5 h-3.5" /> {showMountForm ? 'Cerrar' : 'Montar archivo'}
                 </button>
               </div>
 
               {showMountForm && (
-                <form onSubmit={handleAddFileMount} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs">
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <input required value={mountForm.mount_path} onChange={(e) => setMountForm({ ...mountForm, mount_path: e.target.value })} placeholder="Ruta de montaje (/etc/app/config.json)" className="sm:col-span-2 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
-                    <input value={mountForm.chmod} onChange={(e) => setMountForm({ ...mountForm, chmod: e.target.value })} placeholder="chmod (644)" className="px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono" />
+                <form onSubmit={handleAddFileMount} className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    <input required value={mountForm.mount_path} onChange={(e) => setMountForm({ ...mountForm, mount_path: e.target.value })} placeholder="Ruta de montaje (/etc/app/config.json)" className="sm:col-span-2 px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
+                    <input value={mountForm.chmod} onChange={(e) => setMountForm({ ...mountForm, chmod: e.target.value })} placeholder="Permisos (644)" className="px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
                   </div>
-                  <textarea value={mountForm.content} onChange={(e) => setMountForm({ ...mountForm, content: e.target.value })} rows={3} placeholder="Contenido del archivo (opcional)" className="w-full p-2.5 bg-white border border-slate-300 rounded-lg font-mono" />
+                  <textarea value={mountForm.content} onChange={(e) => setMountForm({ ...mountForm, content: e.target.value })} rows={3} placeholder="Contenido del archivo (opcional)" className="w-full p-2.5 bg-white border border-slate-200 rounded-lg font-mono" />
                   <div className="flex justify-end">
-                    <button type="submit" className="px-4 py-2 rounded-lg bg-slate-900 text-white font-semibold cursor-pointer">Guardar archivo montado</button>
+                    <button type="submit" className="px-3.5 py-2 rounded-lg bg-slate-900 text-white font-medium cursor-pointer">Guardar archivo</button>
                   </div>
                 </form>
               )}
 
-              <div className="border border-slate-200 rounded-xl overflow-hidden">
-                <div className="grid grid-cols-[2fr_1fr_auto] gap-4 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
-                  <div>Ruta de Montaje</div>
-                  <div>Permisos</div>
-                  <div />
-                </div>
-                <div className="divide-y divide-slate-100">
-                  {(!project.fileMounts || project.fileMounts.length === 0) && (
-                    <div className="p-8 text-center text-slate-500 text-sm">No hay archivos montados.</div>
-                  )}
-                  {project.fileMounts?.map((fm, i) => (
-                    <div key={i} className="grid grid-cols-[2fr_1fr_auto] gap-4 p-3 items-center text-sm">
-                      <div className="font-mono text-slate-700">{fm.mountPath || fm.mount_path || '/etc/config.json'}</div>
-                      <div className="font-mono text-slate-500 text-xs bg-slate-100 px-2 py-1 rounded inline-block w-max">
-                        chmod {fm.chmod || '644'}
-                      </div>
-                      <button type="button" onClick={() => void handleRemoveFileMount(i)} className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer" title="Eliminar archivo montado">
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
+              <div className="border border-slate-200 rounded-xl overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-500">
+                      <th className="py-2.5 px-4">Ruta de montaje</th>
+                      <th className="py-2.5 px-4">Permisos</th>
+                      <th className="py-2.5 px-4 w-12" />
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-xs">
+                    {(!project.fileMounts || project.fileMounts.length === 0) ? (
+                      <tr><td colSpan={3} className="p-6 text-center text-slate-500">No hay archivos montados.</td></tr>
+                    ) : (
+                      project.fileMounts.map((fm, i) => (
+                        <tr key={i}>
+                          <td className="py-2.5 px-4 font-mono text-slate-700">{fm.mountPath || fm.mount_path || '/etc/config.json'}</td>
+                          <td className="py-2.5 px-4 font-mono text-slate-500">chmod {fm.chmod || '644'}</td>
+                          <td className="py-2.5 px-4 text-right">
+                            <button type="button" aria-label="Eliminar archivo montado" onClick={() => void handleRemoveFileMount(i)} className="p-1 text-slate-400 hover:text-red-600 cursor-pointer">
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>
         )}
 
         {activeTab === 'config' && (
-          <div className="space-y-6">
-            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-              <h3 className="font-bold text-slate-900 flex items-center gap-2 text-lg"><Settings className="w-5 h-5"/> Configuración del Proyecto</h3>
-              <form onSubmit={async (e) => {
-                e.preventDefault();
-                const formData = new FormData(e.currentTarget);
-                const wp = formData.get('watchPaths') as string || '';
-                const updates = {
-                  name: formData.get('name'),
-                  description: formData.get('description'),
-                  icon: formData.get('icon'),
-                  gitRepo: formData.get('gitRepo'),
-                  gitBranch: formData.get('gitBranch'),
-                  buildCommand: formData.get('buildCommand'),
-                  startCommand: formData.get('startCommand'),
-                  baseDirectory: formData.get('baseDirectory'),
-                  watchPaths: wp.split(',').map(s => s.trim()).filter(Boolean)
-                };
-                try {
-                  await api.updateProject(projectId, updates);
-                  onNotify('Configuración guardada correctamente');
-                  fetchProject();
-                } catch {
-                  onNotify('Error al guardar configuración');
-                }
-              }} className="space-y-4">
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Nombre</label>
-                    <input name="name" defaultValue={project.name} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" />
+          <div className="space-y-5">
+            <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
+              <h2 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
+                <Settings className="w-4 h-4 text-slate-600" /> Configuración del proyecto
+              </h2>
+              <form
+                key={project.id}
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const formData = new FormData(e.currentTarget);
+                  const wp = (formData.get('watchPaths') as string) || '';
+                  const updates = {
+                    name: formData.get('name'),
+                    description: formData.get('description'),
+                    gitRepo: formData.get('gitRepo'),
+                    gitBranch: formData.get('gitBranch'),
+                    buildCommand: formData.get('buildCommand'),
+                    startCommand: formData.get('startCommand'),
+                    baseDirectory: formData.get('baseDirectory'),
+                    watchPaths: wp.split(',').map((s) => s.trim()).filter(Boolean),
+                  };
+                  try {
+                    await api.updateProject(projectId, updates);
+                    onNotify('Configuración guardada correctamente', 'success');
+                    await fetchProject();
+                    onProjectUpdate?.();
+                  } catch (err: any) {
+                    onNotify(err?.message || 'Error al guardar configuración', 'error');
+                  }
+                }}
+                className="space-y-4"
+              >
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="sm:col-span-2">
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Nombre</label>
+                    <input name="name" defaultValue={project.name} required className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" />
                   </div>
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Icono (Emoji)</label>
-                    <input name="icon" defaultValue={project.icon} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Descripción</label>
+                  <div className="sm:col-span-2">
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Descripción</label>
                     <textarea name="description" defaultValue={project.description} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" rows={2} />
                   </div>
-                  <div className="col-span-2">
-                    <h4 className="font-medium text-slate-900 mt-4 mb-2">Repositorio Git</h4>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">URL del repositorio Git</label>
+                    <input name="gitRepo" defaultValue={project.gitRepo} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="https://github.com/usuario/repo" />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">URL del Repositorio</label>
-                    <input name="gitRepo" defaultValue={project.gitRepo} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" placeholder="https://github.com/..." />
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Rama</label>
+                    <input name="gitBranch" defaultValue={project.gitBranch} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="main" />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Rama (Branch)</label>
-                    <input name="gitBranch" defaultValue={project.gitBranch} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" placeholder="main" />
-                  </div>
-                  <div className="col-span-2">
-                    <h4 className="font-medium text-slate-900 mt-4 mb-2">Pipeline y Despliegue</h4>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Directorio base</label>
+                    <input name="baseDirectory" defaultValue={project.baseDirectory} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="/" />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Directorio Base</label>
-                    <input name="baseDirectory" defaultValue={project.baseDirectory} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" placeholder="/" />
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Rutas vigiladas</label>
+                    <input name="watchPaths" defaultValue={(project.watchPaths || []).join(', ')} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="src/**, public/**" />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Rutas Vigiladas (Watch Paths)</label>
-                    <input name="watchPaths" defaultValue={(project.watchPaths || []).join(', ')} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" placeholder="src/**, backend/src/**" />
-                    <p className="text-xs text-slate-500 mt-1">Vital para el motor de hot-sync. Separadas por comas.</p>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Comando de compilación</label>
+                    <input name="buildCommand" defaultValue={project.buildCommand} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="npm run build" />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Comando Build</label>
-                    <input name="buildCommand" defaultValue={project.buildCommand} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" placeholder="npm run build" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Comando Start</label>
-                    <input name="startCommand" defaultValue={project.startCommand} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" placeholder="npm start" />
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Comando de inicio</label>
+                    <input name="startCommand" defaultValue={project.startCommand} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="npm start" />
                   </div>
                 </div>
-                <div className="flex justify-end pt-4 border-t border-slate-100">
-                  <button type="submit" className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium shadow-sm transition-colors flex items-center gap-2">
-                    <Save className="w-4 h-4" /> Guardar Configuración
+                <div className="flex justify-end pt-3 border-t border-slate-100">
+                  <button
+                    type="submit"
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Save className="w-3.5 h-3.5" /> Guardar configuración
                   </button>
                 </div>
               </form>
             </div>
 
-            {/* Webhook de GitHub para Despliegue Automático */}
-            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-5">
+            {/* Webhook de GitHub */}
+            <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
-                  <div className="p-2.5 bg-blue-50 text-blue-600 rounded-xl border border-blue-100 flex items-center justify-center">
-                    <Webhook className="w-5 h-5" />
+                  <div className="w-9 h-9 bg-slate-100 text-slate-700 rounded-lg border border-slate-200 flex items-center justify-center shrink-0">
+                    <Webhook className="w-4 h-4" />
                   </div>
                   <div>
-                    <h3 className="font-bold text-slate-900 text-lg">
-                      Webhook de GitHub para Despliegue Automático
-                    </h3>
-                    <p className="text-sm text-slate-500">
-                      Sincroniza y despliega automáticamente tu aplicación en tiempo real en cada <code className="text-xs bg-slate-100 px-1 py-0.5 rounded font-mono">git push</code>
+                    <h2 className="font-semibold text-slate-900 text-sm">Webhook de GitHub</h2>
+                    <p className="text-xs text-slate-500">
+                      Despliega automáticamente al recibir un <code className="bg-slate-100 px-1 rounded font-mono">git push</code> en la rama configurada.
                     </p>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const nextState = project.autoDeploy === false ? true : false;
-                      try {
-                        await api.updateProject(projectId, { autoDeploy: nextState });
-                        onNotify(`Auto-despliegue ${nextState ? 'activado' : 'desactivado'}`);
-                        fetchProject();
-                      } catch {
-                        onNotify('Error al actualizar estado');
-                      }
-                    }}
-                    className={`px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 transition-colors ${project.autoDeploy !== false ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100' : 'bg-slate-100 text-slate-600 border border-slate-200 hover:bg-slate-200'}`}
-                  >
-                    <span className={`w-2 h-2 rounded-full ${project.autoDeploy !== false ? 'bg-emerald-500' : 'bg-slate-400'}`} />
-                    {project.autoDeploy !== false ? 'Auto-Deploy Activo' : 'Auto-Deploy Desactivado'}
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const nextState = project.autoDeploy === false;
+                    try {
+                      await api.updateProject(projectId, { autoDeploy: nextState });
+                      onNotify(`Despliegue automático ${nextState ? 'activado' : 'desactivado'}`, 'success');
+                      await fetchProject();
+                    } catch (err: any) {
+                      onNotify(err?.message || 'Error al actualizar estado', 'error');
+                    }
+                  }}
+                  className={`px-3 py-1.5 rounded-full text-xs font-medium inline-flex items-center gap-1.5 border cursor-pointer ${
+                    project.autoDeploy !== false
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-slate-100 text-slate-600 border-slate-200'
+                  }`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${project.autoDeploy !== false ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                  {project.autoDeploy !== false ? 'Activo' : 'Desactivado'}
+                </button>
               </div>
 
-              <div className="space-y-4">
+              <div className="space-y-3.5">
                 <div>
- <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                    URL del Webhook (Payload URL)
-                  </label>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Payload URL</label>
                   <div className="flex gap-2">
                     <input
                       type="text"
                       readOnly
                       value={`${window.location.origin}/api/webhooks/github?projectId=${project.id}`}
-                      className="flex-1 px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-700 select-all"
+                      className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 select-all"
                     />
                     <button
                       type="button"
                       onClick={() => {
-                        const url = `${window.location.origin}/api/webhooks/github?projectId=${project.id}`;
-                        navigator.clipboard.writeText(url);
+                        void copyValue(`${window.location.origin}/api/webhooks/github?projectId=${project.id}`, 'URL del webhook copiada');
                         setCopiedUrl(true);
-                        setTimeout(() => setCopiedUrl(false), 2000);
-                        onNotify('URL del Webhook copiada al portapapeles');
+                        window.setTimeout(() => setCopiedUrl(false), 2000);
                       }}
-                      className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-xl text-xs flex items-center gap-1.5 transition-colors"
+                      className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-lg text-xs inline-flex items-center gap-1.5 cursor-pointer shrink-0"
                     >
-                      {copiedUrl ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
-                      {copiedUrl ? '¡Copiado!' : 'Copiar URL'}
+                      {copiedUrl ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copiedUrl ? 'Copiado' : 'Copiar'}
                     </button>
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex justify-between items-center mb-1.5">
- <label className="block text-xs font-semibold text-slate-700">
-                      Secreto del Webhook (Secret)
-                    </label>
+                  <div className="flex justify-between items-center mb-1">
+                    <label className="block text-xs font-medium text-slate-700">Secreto HMAC</label>
                     <button
                       type="button"
                       onClick={async () => {
                         const newSecret = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                          .map(b => b.toString(16).padStart(2, '0'))
+                          .map((b) => b.toString(16).padStart(2, '0'))
                           .join('');
                         try {
                           await api.updateProject(projectId, { webhookSecret: newSecret });
-                          onNotify('Nuevo secreto de webhook generado y guardado');
-                          fetchProject();
-                        } catch {
-                          onNotify('Error al regenerar secreto');
+                          onNotify('Secreto de webhook regenerado', 'success');
+                          await fetchProject();
+                        } catch (err: any) {
+                          onNotify(err?.message || 'Error al regenerar secreto', 'error');
                         }
                       }}
-                      className="text-xs text-blue-600 hover:text-blue-800 font-medium flex items-center gap-1 hover:underline"
+                      className="text-xs text-slate-600 hover:text-slate-900 font-medium inline-flex items-center gap-1 underline cursor-pointer"
                     >
-                      <RefreshCw className="w-3 h-3" /> Regenerar secreto
+                      <RefreshCw className="w-3 h-3" /> Regenerar
                     </button>
                   </div>
                   <div className="flex gap-2">
@@ -1225,177 +1277,157 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({ projectId, onBack,
                       <input
                         type={showSecret ? 'text' : 'password'}
                         readOnly
-                        value={project.webhookSecret || 'culkibo_default_webhook_secret'}
-                        className="w-full px-3.5 py-2.5 pr-10 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-700 select-all"
+                        value={project.webhookSecret || ''}
+                        placeholder="Genera un secreto para firmar las entregas"
+                        className="w-full px-3 py-2 pr-9 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700"
                       />
                       <button
                         type="button"
+                        aria-label={showSecret ? 'Ocultar secreto' : 'Mostrar secreto'}
                         onClick={() => setShowSecret(!showSecret)}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                        title={showSecret ? 'Ocultar secreto' : 'Mostrar secreto'}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
                       >
-                        {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        {showSecret ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                       </button>
                     </div>
                     <button
                       type="button"
+                      disabled={!project.webhookSecret}
                       onClick={() => {
-                        const sec = project.webhookSecret || 'culkibo_default_webhook_secret';
-                        navigator.clipboard.writeText(sec);
+                        if (!project.webhookSecret) return;
+                        void copyValue(project.webhookSecret, 'Secreto copiado');
                         setCopiedSecret(true);
-                        setTimeout(() => setCopiedSecret(false), 2000);
-                        onNotify('Secreto de Webhook copiado al portapapeles');
+                        window.setTimeout(() => setCopiedSecret(false), 2000);
                       }}
-                      className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-xl text-xs flex items-center gap-1.5 transition-colors"
+                      className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-lg text-xs inline-flex items-center gap-1.5 disabled:opacity-40 cursor-pointer shrink-0"
                     >
-                      {copiedSecret ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
-                      {copiedSecret ? '¡Copiado!' : 'Copiar Secreto'}
+                      {copiedSecret ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copiedSecret ? 'Copiado' : 'Copiar'}
                     </button>
                   </div>
                 </div>
 
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3.5 bg-slate-50 rounded-xl border border-slate-200/80 gap-3">
-                  <div>
-                    <div className="text-xs font-semibold text-slate-800">
-                      Rama monitoreada para despliegue
-                    </div>
-                    <div className="text-xs text-slate-500 mt-0.5">
-                      Solo los pushes a esta rama dispararán el pipeline automatizado en tiempo real.
-                    </div>
-                  </div>
-                  <span className="px-2.5 py-1 bg-white border border-slate-300 rounded-lg text-xs font-mono font-semibold text-slate-800 flex items-center gap-1">
-                    <GitBranch className="w-3.5 h-3.5 text-blue-600" />
-                    {project.gitBranch || 'main'}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-200 gap-2 text-xs">
+                  <span className="text-slate-600">
+                    Rama vigilada: <strong className="font-mono text-slate-900">{project.gitBranch || 'main'}</strong>
                   </span>
+                  <button
+                    type="button"
+                    onClick={() => void handleSimulatePush()}
+                    disabled={simulatingWebhook}
+                    className="px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 font-medium rounded-lg text-xs inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer self-start sm:self-auto"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${simulatingWebhook ? 'animate-spin' : ''}`} />
+                    {simulatingWebhook ? 'Probando…' : 'Probar webhook'}
+                  </button>
                 </div>
 
                 {project.lastCommit && (
-                  <div className="p-3.5 bg-emerald-50/80 border border-emerald-200 rounded-xl text-xs space-y-1">
-                    <div className="font-semibold text-emerald-900 flex items-center gap-1.5">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                      Último push desplegado automáticamente
+                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-xs space-y-1">
+                    <div className="font-medium text-emerald-900 flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                      Última entrega procesada
                     </div>
-                    <div className="text-slate-700 text-xs">
-                      <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-emerald-200 text-emerald-800 font-semibold mr-1.5">
+                    <div className="text-slate-700">
+                      <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-emerald-200 text-emerald-800 mr-1.5">
                         {project.lastCommit.sha}
                       </span>
                       {project.lastCommit.message}
                     </div>
                     <div className="text-[11px] text-slate-500">
-                      Por <strong>{project.lastCommit.author}</strong> &bull; {new Date(project.lastCommit.timestamp).toLocaleString('es-ES')}
+                      {project.lastCommit.author} · {new Date(project.lastCommit.timestamp).toLocaleString('es-ES')}
                     </div>
                   </div>
                 )}
 
-                <div className="p-4 bg-blue-50/50 border border-blue-100 rounded-xl text-xs text-slate-600 space-y-1.5">
-                  <div className="font-semibold text-slate-900">Instrucciones de configuración en GitHub:</div>
-                  <ol className="list-decimal list-inside space-y-1 text-slate-600">
-                    <li>Abre tu repositorio en GitHub y ve a <strong>Settings &gt; Webhooks &gt; Add webhook</strong>.</li>
-                    <li>Pega la <strong>URL del Webhook</strong> copiada arriba en el campo <strong>Payload URL</strong>.</li>
-                    <li>Selecciona <strong>Content type:</strong> <code>application/json</code>.</li>
-                    <li>Pega el <strong>Secreto</strong> en el campo <strong>Secret</strong>.</li>
-                    <li>En eventos, deja seleccionado <strong>Just the push event</strong> y haz clic en <strong>Add webhook</strong>.</li>
-                  </ol>
-                  {window.location.hostname === 'localhost' && (
-                    <div className="mt-2 p-2.5 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-[11px]">
-                      <strong>💡 Nota de entorno local:</strong> Para recibir webhooks reales directamente desde GitHub a este equipo, utiliza un túnel público (como Cloudflare Tunnel o ngrok) y reemplaza <code>{window.location.origin}</code> por la URL pública del túnel.
-                    </div>
-                  )}
-                </div>
-
-                {/* Test simulation button */}
-                <div className="flex justify-end pt-1">
-                  <button
-                    type="button"
-                    onClick={handleSimulatePush}
-                    disabled={simulatingWebhook}
-                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${simulatingWebhook ? 'animate-spin text-blue-600' : ''}`} />
-                    {simulatingWebhook ? 'Simulando push...' : 'Probar Webhook (Simular Push)'}
-                  </button>
-                </div>
+                {window.location.hostname === 'localhost' && (
+                  <p className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3 leading-relaxed">
+                    En entornos locales, para recibir webhooks reales de GitHub publica el panel mediante un dominio HTTPS o un túnel de Cloudflare en Ajustes.
+                  </p>
+                )}
               </div>
             </div>
 
-            <div className="bg-white p-6 rounded-2xl border border-red-200 shadow-sm space-y-4">
-              <h3 className="font-bold text-red-600 flex items-center gap-2 text-lg"><ShieldAlert className="w-5 h-5"/> Zona de Peligro</h3>
-              <p className="text-sm text-slate-600 max-w-2xl">Al eliminar este proyecto, se detendrán todos los contenedores asociados, se eliminarán las variables de entorno y los datos en volúmenes. Esta acción no se puede deshacer.</p>
-              <div className="pt-2">
-                <button
-                  onClick={() => { setConfirmDeleteName(''); setShowDeleteDialog(true); }}
-                  className="px-5 py-2.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl text-sm font-bold flex items-center gap-2 transition-colors"
-                >
-                  <Trash2 className="w-4 h-4" /> Eliminar proyecto definitivamente
-                </button>
-              </div>
+            {/* Zona de peligro */}
+            <div className="bg-white p-5 rounded-xl border border-red-200 space-y-3">
+              <h2 className="font-semibold text-red-700 flex items-center gap-2 text-base">
+                <ShieldAlert className="w-4 h-4" /> Zona de peligro
+              </h2>
+              <p className="text-xs text-slate-600 max-w-2xl leading-relaxed">
+                Eliminar este proyecto detendrá todos sus contenedores, retirará sus rutas públicas y eliminará sus variables y volúmenes. Esta acción no se puede deshacer.
+              </p>
+              <button
+                type="button"
+                onClick={() => { setConfirmDeleteName(''); setShowDeleteDialog(true); }}
+                className="px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" /> Eliminar proyecto
+              </button>
             </div>
           </div>
         )}
       </div>
 
-      {showDeleteDialog && (
-        <div className="fixed inset-0 bg-slate-900/30 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-2xl w-full max-w-lg shadow-xl p-6 space-y-4">
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-xl bg-red-50 border border-red-100 flex items-center justify-center shrink-0">
-                <ShieldAlert className="w-5 h-5 text-red-600" />
-              </div>
-              <div className="min-w-0">
-                <h3 className="font-bold text-slate-900">Eliminar «{project.name}»</h3>
-                <p className="text-sm text-slate-500 mt-0.5">Esta acción no se puede deshacer.</p>
-              </div>
-            </div>
+      {/* Modal de borrado definitivo */}
+      <Modal
+        open={showDeleteDialog}
+        onClose={() => !deleting && setShowDeleteDialog(false)}
+        title={`Eliminar «${project.name}»`}
+        subtitle="Esta acción es irreversible."
+        maxWidthClass="max-w-lg"
+        closeDisabled={deleting}
+      >
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void handleDelete();
+          }}
+          className="p-5 space-y-4"
+        >
+          <ul className="text-xs text-slate-700 space-y-1.5 bg-slate-50 border border-slate-200 rounded-xl p-4 leading-relaxed">
+            <li>· Se detienen y eliminan los contenedores de desarrollo y producción.</li>
+            <li>· Se eliminan las <strong>{Object.keys(project.envVars || {}).length}</strong> variables de entorno.</li>
+            <li>· Se borran los volúmenes persistentes configurados.</li>
+            <li>
+              · Se desvinculan <strong>{domainCount}</strong> {domainCount === 1 ? 'dominio' : 'dominios'} y se retiran sus rutas públicas
+              {domainCount > 0 && <span className="text-slate-500"> ({(project.domains || []).join(', ')})</span>}.
+            </li>
+            <li>· Se descarta el historial de despliegues.</li>
+          </ul>
 
-            {/* Las consecuencias, enumeradas. «Es irreversible» no informa de
-                nada: lo que hay que saber es QUÉ deja de existir. */}
-            <ul className="text-sm text-slate-700 space-y-1.5 bg-slate-50 border border-slate-200 rounded-xl p-4">
-              <li>· Se detienen y eliminan los contenedores del proyecto, en desarrollo y en producción.</li>
-              <li>· Se pierden las <strong>{Object.keys(project.envVars || {}).length}</strong> variables de entorno y sus valores.</li>
-              <li>· Se borran los volúmenes del proyecto y los datos que contengan.</li>
-              <li>
-                · Se desvinculan{' '}
-                <strong>{(project.domains || []).length}</strong> dominio(s) y se retiran sus rutas públicas
-                {(project.domains || []).length > 0 && (
-                  <span className="text-slate-500"> ({(project.domains || []).join(', ')})</span>
-                )}
-                .
-              </li>
-              <li>· Se descarta el historial de despliegues, con él la posibilidad de revertir.</li>
-            </ul>
+          <label className="block text-xs">
+            <span className="text-slate-600">
+              Escribe <strong className="font-mono text-slate-900">{project.name}</strong> para confirmar:
+            </span>
+            <input
+              autoFocus
+              type="text"
+              value={confirmDeleteName}
+              onChange={(e) => setConfirmDeleteName(e.target.value)}
+              placeholder={project.name}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 mt-1.5 text-slate-900 font-mono text-sm"
+            />
+          </label>
 
-            <label className="block text-sm">
-              <span className="text-slate-600">
-                Escribe <strong className="font-mono text-slate-900">{project.name}</strong> para confirmar
-              </span>
-              <input
-                autoFocus
-                type="text"
-                value={confirmDeleteName}
-                onChange={(e) => setConfirmDeleteName(e.target.value)}
-                placeholder={project.name}
-                className="w-full border border-slate-200 rounded-lg px-3 py-2 mt-1.5 text-slate-800 font-mono text-sm"
-              />
-            </label>
-
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setShowDeleteDialog(false)}
-                className="text-sm font-medium text-slate-600 border border-slate-200 px-4 py-2 rounded-lg hover:bg-slate-50"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={handleDelete}
-                disabled={deleting || confirmDeleteName.trim() !== project.name}
-                className="inline-flex items-center gap-2 text-sm font-semibold bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                <Trash2 className="w-4 h-4" /> Eliminar proyecto
-              </button>
-            </div>
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              type="button"
+              onClick={() => setShowDeleteDialog(false)}
+              disabled={deleting}
+              className="text-xs font-medium text-slate-600 border border-slate-200 px-3.5 py-2 rounded-lg hover:bg-slate-50 cursor-pointer"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={deleting || confirmDeleteName.trim() !== project.name}
+              className="inline-flex items-center gap-1.5 text-xs font-medium bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" /> {deleting ? 'Eliminando…' : 'Eliminar proyecto'}
+            </button>
           </div>
-        </div>
-      )}
+        </form>
+      </Modal>
     </div>
   );
 };

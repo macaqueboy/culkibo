@@ -1,33 +1,21 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { atomicWriteJsonSync } = require('../services/ssrfGuard');
 
 const AUTH_FILE = path.join(__dirname, '..', '..', 'data', 'auth.json');
 
 /**
  * Autenticación del plano de control.
  *
- * El problema que resuelve: el daemon exponía toda su API con `cors('*')` y sin
- * credencial alguna. Dos consecuencias, y la segunda es la grave:
+ * Dos capas obligatorias:
+ *  - Origen: corta peticiones cross-origin desde pestañas maliciosas.
+ *  - Token: protege cualquier acceso remoto (VPS, reverse proxy, CI, MCP).
  *
- *  1. En un VPS, cualquiera que alcance el puerto controla tus despliegues.
- *  2. En tu propia máquina, CUALQUIER web que visites puede pedirle cosas a
- *     `localhost:3030` desde tu navegador. No hace falta que te expongas a
- *     internet: basta con abrir una pestaña.
- *
- * Por eso hay dos capas, y hacen falta las dos:
- *
- *  - **Origen**: una petición de navegador llega con cabecera `Origin`. Si no
- *    está en la lista permitida, se rechaza. Esto corta el caso 2, que no se
- *    arregla con un token — el navegador de la víctima lo enviaría igual si
- *    estuviera en una cookie, y aquí ni siquiera hace falta.
- *  - **Token**: para todo lo que no es navegador — CI, agentes MCP, curl. Corta
- *    el caso 1.
- *
- * Compatibilidad: desde loopback y sin cabecera `Origin` (curl local, los
- * tests, el CLI) se deja pasar sin token, salvo que se exija explícitamente con
- * CULKIBO_REQUIRE_TOKEN=1. Así instalar y probar en local sigue siendo
- * inmediato, y exponer el daemon sigue siendo seguro.
+ * Incluye:
+ *  - Verificación de TODOS los saltos en X-Forwarded-For / Forwarded (corta spoofing leftmost).
+ *  - Protección anti fuerza bruta integrada en el propio authMiddleware (LRU acotado).
+ *  - Tickets WebSocket efímeros de un solo uso (30 s) + rotación atómica de token.
  */
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost']);
@@ -38,6 +26,34 @@ let cachedToken = null;
 let cachedTokenBuf = null;
 /** @type {Set<string>} */
 const dynamicOrigins = new Set();
+
+// Tickets WebSocket de un solo uso (30 s TTL, acotados a 200 entradas)
+/** @type {Map<string, { expiresAt: number, ip: string }>} */
+const wsTickets = new Map();
+const WS_TICKET_TTL_MS = 30000;
+
+// Rate-limiter global de fallos de autenticación (LRU acotado, nunca clear() masivo)
+/** @type {Map<string, { count: number, resetAt: number }>} */
+const authFailMap = new Map();
+const AUTH_FAIL_WINDOW_MS = 60000;
+const AUTH_FAIL_MAX = 20;
+const AUTH_FAIL_MAP_CAP = 2000;
+const NO_BRUTE_FORCE = Object.freeze({ blocked: false, retryAfterSec: 0 });
+const TRUST_PROXY_UNIQUE_LOCAL = String(process.env.CULKIBO_TRUST_PROXY || 'loopback').toLowerCase().includes('uniquelocal');
+
+/** @param {string} ip */
+function isPrivateProxyPeer(ip) {
+  const clean = String(ip || '').replace(/^::ffff:/, '');
+  if (LOOPBACK.has(clean)) return true;
+  if (!TRUST_PROXY_UNIQUE_LOCAL) return false;
+  if (clean.startsWith('10.') || clean.startsWith('192.168.')) return true;
+  const m = clean.match(/^172\.(\d+)\./);
+  if (m) {
+    const second = Number(m[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  return false;
+}
 
 /** Permite registrar un origen adicional en caliente (p. ej. dominio propio del panel). */
 function addAllowedOrigin(origin) {
@@ -75,12 +91,24 @@ function resolveToken() {
   cachedToken = crypto.randomBytes(32).toString('hex');
   cachedTokenBuf = Buffer.from(cachedToken, 'utf8');
   try {
-    fs.mkdirSync(path.dirname(AUTH_FILE), { recursive: true });
-    fs.writeFileSync(AUTH_FILE, JSON.stringify({ token: cachedToken, createdAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+    atomicWriteJsonSync(AUTH_FILE, { token: cachedToken, createdAt: new Date().toISOString() }, 0o600);
   } catch (e) {
     console.warn('[Auth] No se pudo guardar el token en disco; será distinto en cada arranque:', e.message);
   }
   return cachedToken;
+}
+
+/** Rota el token maestro de forma atómica (si no viene fijado por variable de entorno). */
+function rotateToken() {
+  if (process.env.CULKIBO_TOKEN) {
+    throw new Error('El token está fijado por la variable de entorno CULKIBO_TOKEN. Cámbiala y reinicia el servicio.');
+  }
+  const nextToken = crypto.randomBytes(32).toString('hex');
+  atomicWriteJsonSync(AUTH_FILE, { token: nextToken, rotatedAt: new Date().toISOString() }, 0o600);
+  cachedToken = nextToken;
+  cachedTokenBuf = Buffer.from(nextToken, 'utf8');
+  wsTickets.clear();
+  return { token: nextToken, rotatedAt: new Date().toISOString(), tokenSource: 'data/auth.json' };
 }
 
 /** @type {string | null} */
@@ -103,7 +131,6 @@ function allowedOrigins() {
     ...dynamicOrigins,
     `http://localhost:${port}`,
     `http://127.0.0.1:${port}`,
-    // Servidor de desarrollo de Vite
     'http://localhost:5173',
     'http://127.0.0.1:5173'
   ]);
@@ -127,7 +154,7 @@ function isOriginAllowed(origin, req = null) {
       if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') return false;
       const originHost = parsedOrigin.host.toLowerCase();
       const peerAddr = req.socket?.remoteAddress || '';
-      const trustFwd = LOOPBACK.has(peerAddr);
+      const trustFwd = isPrivateProxyPeer(peerAddr);
       const rawHost = (trustFwd && req.headers['x-forwarded-host'])
         ? req.headers['x-forwarded-host']
         : req.headers.host;
@@ -153,33 +180,87 @@ function tokenMatches(provided) {
   }
 }
 
-function extractToken(req) {
-  const header = req.headers.authorization || '';
-  if (header.toLowerCase().startsWith('bearer ')) return header.slice(7).trim();
-  if (req.headers['x-culkibo-token']) return String(req.headers['x-culkibo-token']).trim();
-
-  // Para upgrades de WebSocket desde el navegador (donde `new WebSocket()` no
-  // permite cabeceras personalizadas): aceptamos subprotocolo `culkibo-token.<tok>`
-  // o query `?token=` exclusivamente en peticiones Upgrade.
-  if (req.headers.upgrade && String(req.headers.upgrade).toLowerCase() === 'websocket') {
-    const proto = String(req.headers['sec-websocket-protocol'] || '');
-    for (const part of proto.split(',').map(s => s.trim())) {
-      if (part.startsWith('culkibo-token.')) return part.slice('culkibo-token.'.length).trim();
-    }
-    try {
-      const parsed = new URL(req.url || '/', 'http://localhost');
-      const qTok = parsed.searchParams.get('token');
-      if (qTok) return qTok.trim();
-    } catch (e) {}
+/** Extrae IP efectiva del cliente para buckets de rate-limiting y tickets WS. */
+function clientIp(req) {
+  const peer = String(req?.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  if (isPrivateProxyPeer(peer) && req?.headers?.['x-forwarded-for']) {
+    const hops = String(req.headers['x-forwarded-for']).split(',').map(s => s.trim()).filter(Boolean);
+    if (hops.length > 0) return hops[hops.length - 1].replace(/^::ffff:/, '');
   }
-  return null;
+  return peer || String(req?.ip || 'local').replace(/^::ffff:/, '');
+}
+
+/** Emite un ticket WebSocket efímero (30 s, un solo uso) ligado a la IP del cliente. */
+function createWsTicket(req) {
+  const now = Date.now();
+  if (wsTickets.size > 200) {
+    for (const [k, v] of wsTickets.entries()) {
+      if (v.expiresAt <= now) wsTickets.delete(k);
+    }
+    if (wsTickets.size > 200) {
+      const oldest = wsTickets.keys().next().value;
+      if (oldest) wsTickets.delete(oldest);
+    }
+  }
+  const ticket = crypto.randomBytes(24).toString('base64url');
+  wsTickets.set(ticket, { expiresAt: now + WS_TICKET_TTL_MS, ip: clientIp(req) });
+  return { ticket, expiresInMs: WS_TICKET_TTL_MS };
+}
+
+/** Consume un ticket WebSocket efímero (un solo uso). */
+function consumeWsTicket(ticket, req) {
+  if (!ticket) return false;
+  const entry = wsTickets.get(ticket);
+  if (!entry) return false;
+  wsTickets.delete(ticket);
+  if (entry.expiresAt < Date.now()) return false;
+  const ip = clientIp(req);
+  if (entry.ip && ip && entry.ip !== ip && !LOOPBACK.has(entry.ip) && !LOOPBACK.has(ip)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Extrae token o ticket efímero de la petición (sin asignaciones innecesarias en /ws).
+ * @returns {{ token: string | null, ticket: string | null }}
+ */
+function extractCredentials(req) {
+  const header = req.headers.authorization;
+  if (header && header.length > 7 && header.slice(0, 7).toLowerCase() === 'bearer ') {
+    return { token: header.slice(7).trim(), ticket: null };
+  }
+  const xTok = req.headers['x-culkibo-token'];
+  if (xTok) return { token: String(xTok).trim(), ticket: null };
+
+  const upgrade = req.headers.upgrade;
+  if (upgrade && String(upgrade).toLowerCase() === 'websocket') {
+    const proto = req.headers['sec-websocket-protocol'];
+    if (proto) {
+      const parts = String(proto).split(',');
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i].trim();
+        if (part.startsWith('culkibo-ticket.')) {
+          return { token: null, ticket: part.slice('culkibo-ticket.'.length).trim() };
+        }
+        if (part.startsWith('culkibo-token.')) {
+          return { token: part.slice('culkibo-token.'.length).trim(), ticket: null };
+        }
+      }
+    }
+  }
+  return { token: null, ticket: null };
+}
+
+function extractToken(req) {
+  return extractCredentials(req).token;
 }
 
 /**
  * Comprueba si la petición procede realmente de loopback local.
- * Protege tanto HTTP como upgrades WebSocket crudos detrás de Caddy/Nginx:
- * si hay cabeceras `X-Forwarded-For` / `Forwarded`, el origen real debe ser
- * también loopback; de lo contrario se exige token obligatorio.
+ * P0-1: Exige que TODOS los saltos de `X-Forwarded-For` y TODOS los parámetros
+ * `for=` de `Forwarded` pertenezcan a `LOOPBACK`, impidiendo el spoofing del
+ * primer salto detrás de Caddy/Nginx/Cloudflare.
  */
 function isLoopback(req) {
   const peer = req.socket?.remoteAddress || '';
@@ -187,15 +268,15 @@ function isLoopback(req) {
 
   const xff = req.headers && req.headers['x-forwarded-for'];
   if (xff) {
-    const first = String(xff).split(',')[0].trim().replace(/^::ffff:/, '');
-    return LOOPBACK.has(first);
+    const hops = String(xff).split(',').map((s) => s.trim().replace(/^::ffff:/, '')).filter(Boolean);
+    if (hops.length === 0 || hops.some((ip) => !LOOPBACK.has(ip))) return false;
   }
 
   const fwd = req.headers && req.headers.forwarded;
   if (fwd) {
-    const m = String(fwd).match(/for=(?:"?\[?)([^;\s,"\]]+)/i);
-    if (!m) return false;
-    return LOOPBACK.has(m[1].replace(/^::ffff:/, ''));
+    const matches = Array.from(String(fwd).matchAll(/for=(?:"?\[?)([^;\s,"\]]+)/gi));
+    if (matches.length === 0) return false;
+    if (matches.some((m) => !LOOPBACK.has(m[1].trim().replace(/^::ffff:/, '')))) return false;
   }
 
   if (peer) return true;
@@ -203,20 +284,53 @@ function isLoopback(req) {
   return LOOPBACK.has(ip);
 }
 
-/**
- * Rutas que no pueden exigir token porque las llama un tercero que no lo tiene.
- * El webhook de GitHub se autentica por su propia firma HMAC, que ya se verifica.
- */
+/** Rutas públicas (autenticadas por su propio mecanismo o consulta de estado/sesión). */
 const PUBLIC_PATHS = new Set([
   '/health',
   '/api/health',
   '/api/auth/session',
+  '/api/auth/verify',
   '/api/webhooks/github',
   '/api/ingress/ask'
 ]);
 
 function isPublicPath(reqPath) {
   return PUBLIC_PATHS.has(reqPath);
+}
+
+function checkAuthBruteForce(req) {
+  if (authFailMap.size === 0) return NO_BRUTE_FORCE;
+  const ip = clientIp(req);
+  const now = Date.now();
+  const entry = authFailMap.get(ip);
+  if (entry && entry.resetAt > now && entry.count >= AUTH_FAIL_MAX) {
+    const retryAfterSec = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+    return { blocked: true, retryAfterSec };
+  }
+  return NO_BRUTE_FORCE;
+}
+
+function recordAuthFailure(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  let entry = authFailMap.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    // Evicción LRU acotada: un flood de IPs falsas jamás limpia bloqueos activos
+    if (authFailMap.size >= AUTH_FAIL_MAP_CAP) {
+      const oldestKey = authFailMap.keys().next().value;
+      if (oldestKey) authFailMap.delete(oldestKey);
+    }
+    entry = { count: 1, resetAt: now + AUTH_FAIL_WINDOW_MS };
+  } else {
+    entry.count++;
+    // Refresca posición LRU
+    authFailMap.delete(ip);
+  }
+  authFailMap.set(ip, entry);
+}
+
+function resetAuthRateLimit() {
+  authFailMap.clear();
 }
 
 /**
@@ -235,18 +349,19 @@ function authorizeRequest(req) {
     };
   }
 
-  const provided = extractToken(req);
-  if (provided) {
-    if (tokenMatches(provided)) return { ok: true, method: 'token' };
+  const { token, ticket } = extractCredentials(req);
+  if (ticket) {
+    if (consumeWsTicket(ticket, req)) return { ok: true, method: 'ws_ticket' };
+    return { ok: false, status: 401, error: 'Ticket WebSocket inválido o caducado' };
+  }
+  if (token) {
+    if (tokenMatches(token)) return { ok: true, method: 'token' };
     return { ok: false, status: 401, error: 'Token inválido' };
   }
 
   const requireToken = process.env.CULKIBO_REQUIRE_TOKEN === '1';
   if (!requireToken && isLoopback(req)) {
-    // Sin cabecera Origin (curl local, CLI, tests) -> permitido en loopback.
     if (!origin) return { ok: true, method: 'loopback' };
-    // Con cabecera Origin en loopback sin token: exigir lista blanca explícita
-    // (evita DNS rebinding donde attacker.example resuelve a 127.0.0.1).
     if (allowedOrigins().has(origin)) {
       return { ok: true, method: 'loopback_origin' };
     }
@@ -261,22 +376,47 @@ function authorizeRequest(req) {
 }
 
 function authMiddleware(req, res, next) {
-  const fullPath = (req.originalUrl || req.url || '').split('?')[0];
+  const rawUrl = req.originalUrl || req.url || '';
+  const qIdx = rawUrl.indexOf('?');
+  const fullPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+
+  // Validación de Origin incluso en rutas auth públicas (corta CSRF/cross-origin)
+  if ((fullPath === '/api/auth/verify' || fullPath === '/api/auth/session') && req.headers.origin) {
+    if (!isOriginAllowed(req.headers.origin, req)) {
+      return res.status(403).json({
+        error: 'Origen no permitido',
+        detail: `El origen ${req.headers.origin} no está autorizado.`
+      });
+    }
+  }
+
   if (isPublicPath(fullPath)) return next();
+
+  const bf = checkAuthBruteForce(req);
+  if (bf.blocked) {
+    res.setHeader('Retry-After', String(bf.retryAfterSec));
+    return res.status(429).json({
+      error: 'Demasiados intentos de autenticación fallidos. Espera un minuto antes de reintentar.'
+    });
+  }
 
   const decision = authorizeRequest(req);
   if (decision.ok) return next();
+
+  if (decision.status === 401 && extractToken(req)) {
+    recordAuthFailure(req);
+  }
   return res.status(decision.status || 401).json({
     error: decision.error,
     ...(decision.detail ? { detail: decision.detail } : {})
   });
 }
 
-/** Configuración de CORS derivada de la misma lista de orígenes. */
-function corsOptions() {
+/** Configuración de CORS derivada de la misma lista de orígenes (acepta req opcional). */
+function corsOptions(req = null) {
   return {
     origin(origin, callback) {
-      if (isOriginAllowed(origin)) return callback(null, true);
+      if (isOriginAllowed(origin, req)) return callback(null, true);
       callback(null, false);
     },
     credentials: false,
@@ -285,6 +425,11 @@ function corsOptions() {
       'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name'
     ]
   };
+}
+
+/** Delegado CORS dinámico por petición para pasar `req` a `isOriginAllowed(origin, req)`. */
+function corsDelegate(req, callback) {
+  callback(null, corsOptions(req));
 }
 
 /** Resumen para el arranque y para /api/system/status. Nunca devuelve el token. */
@@ -301,10 +446,18 @@ module.exports = {
   authMiddleware,
   authorizeRequest,
   corsOptions,
+  corsDelegate,
   resolveToken,
+  rotateToken,
+  createWsTicket,
+  consumeWsTicket,
   authStatus,
   isOriginAllowed,
   addAllowedOrigin,
   tokenMatches,
-  isLoopback
+  isLoopback,
+  isPrivateProxyPeer,
+  checkAuthBruteForce,
+  recordAuthFailure,
+  resetAuthRateLimit
 };

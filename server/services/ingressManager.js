@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const tls = require('tls');
 const dns = require('dns').promises;
 
@@ -6,7 +8,9 @@ const domainManager = require('./domainManager');
 const projectManager = require('./projectManager');
 const localRunner = require('./localRunner');
 const containerOrchestrator = require('./containerOrchestrator');
-const { isPrivateIp, isMetadataIp } = require('./ssrfGuard');
+const { isPrivateIp, isMetadataIp, atomicWriteJsonSync } = require('./ssrfGuard');
+
+const INGRESS_CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'ingress.json');
 
 /** @type {any} */
 let _deployManager = null;
@@ -59,8 +63,35 @@ class IngressManager {
     this.serverReadyTtlMs = 15000;
     /** Caché de sondeos TLS de 30 s por hostname para evitar bloquear el panel. */
     this._tlsCache = new Map();
-    /** Dominio propio opcional para exponer el panel de Culkibo con HTTPS vía Caddy. */
-    this.panelDomain = process.env.CULKIBO_PANEL_DOMAIN || null;
+    /** Dominio propio opcional para exponer el panel de Culkibo con HTTPS vía Caddy (persistido). */
+    this.panelDomain = this._loadPanelDomain();
+  }
+
+  _loadPanelDomain() {
+    try {
+      if (fs.existsSync(INGRESS_CONFIG_FILE)) {
+        const cfg = JSON.parse(fs.readFileSync(INGRESS_CONFIG_FILE, 'utf8'));
+        if (cfg && typeof cfg.panelDomain === 'string' && cfg.panelDomain.trim()) {
+          return cfg.panelDomain.trim().toLowerCase();
+        }
+      }
+    } catch (e) {}
+    return process.env.CULKIBO_PANEL_DOMAIN ? String(process.env.CULKIBO_PANEL_DOMAIN).trim().toLowerCase() : null;
+  }
+
+  /** Persiste el dominio propio del panel en `data/ingress.json` para sobrevivir reinicios (P1-18). */
+  setPanelDomain(hostname) {
+    const clean = hostname ? String(hostname).trim().toLowerCase() : null;
+    this.panelDomain = clean || null;
+    try {
+      atomicWriteJsonSync(INGRESS_CONFIG_FILE, {
+        panelDomain: this.panelDomain,
+        updatedAt: new Date().toISOString()
+      }, 0o600);
+    } catch (e) {
+      console.warn('[IngressManager] No se pudo persistir panelDomain:', e.message);
+    }
+    return this.panelDomain;
   }
 
   /**
@@ -118,7 +149,8 @@ class IngressManager {
     if (!project) return null;
     const dm = getDeployManager();
     const prod = dm && dm.store && dm.store[project.id] && dm.store[project.id].current;
-    if (prod && prod.upstream) return prod.upstream;
+    // P1-7: solo usar el despliegue de producción cuando está realmente activo (no detenido).
+    if (prod && prod.upstream && prod.status !== 'detenido' && prod.status !== 'stopped') return prod.upstream;
     const livePort = localRunner.isRunning(project.id) ? localRunner.getPort(project.id) : null;
     const port = livePort || (project.localRunning ? project.localPort : null);
     if (!port) return null;
@@ -153,8 +185,10 @@ class IngressManager {
       projectId: domain.id,
       hostnames: [domain.hostname],
       upstreams: [`127.0.0.1:${port}`],
-      kind: 'pod',
-      label: domain.targetPod === 'citadel' ? 'Producción' : 'Desarrollo'
+      kind: domain.targetPod === 'service' ? 'service' : 'pod',
+      label: domain.targetPod === 'service'
+        ? (domain.serviceName || 'Servicio')
+        : (domain.targetPod === 'citadel' ? 'Producción' : 'Desarrollo')
     };
   }
 
@@ -220,7 +254,7 @@ class IngressManager {
       for (const [projectId, state] of Object.entries(dm.store)) {
         if (includedProjectIds.has(projectId)) continue;
         const cur = state && state.current;
-        if (cur && cur.upstream && Array.isArray(cur.hostnames) && cur.hostnames.length > 0) {
+        if (cur && cur.upstream && cur.status !== 'detenido' && cur.status !== 'stopped' && Array.isArray(cur.hostnames) && cur.hostnames.length > 0) {
           specs.push({
             projectId,
             hostnames: cur.hostnames,
@@ -234,10 +268,11 @@ class IngressManager {
 
     // Ruta opcional del propio panel de Culkibo (Acceso Remoto con HTTPS).
     if (this.panelDomain) {
+      const panelUpstream = process.env.CULKIBO_PANEL_UPSTREAM || `127.0.0.1:${this.daemonPort}`;
       specs.push({
         projectId: 'culkibo_panel',
         hostnames: [this.panelDomain],
-        upstreams: [`127.0.0.1:${this.daemonPort}`],
+        upstreams: [panelUpstream],
         kind: 'panel',
         label: 'Panel Culkibo'
       });
@@ -513,13 +548,17 @@ class IngressManager {
       const list = await fn(hostname);
       return Array.isArray(list) && list.length ? list[0] : null;
     };
-    const race = (p) => Promise.race([
-      p,
-      new Promise((_, reject) => {
-        const t = setTimeout(() => reject(new Error('Tiempo de espera agotado en la resolución DNS')), timeoutMs);
-        if (t.unref) t.unref();
-      })
-    ]);
+    const race = (p) => {
+      /** @type {ReturnType<typeof setTimeout> | null} */
+      let t = null;
+      return Promise.race([
+        p,
+        new Promise((_, reject) => {
+          t = setTimeout(() => reject(new Error('Tiempo de espera agotado en la resolución DNS')), timeoutMs);
+          if (t.unref) t.unref();
+        })
+      ]).finally(() => { if (t) clearTimeout(t); });
+    };
 
     try {
       return { address: await race(attempt(dns.resolve4)), family: 4 };
@@ -636,7 +675,10 @@ class IngressManager {
         liveRoutes = await caddyManager.listRoutes();
       } catch (err) {
         routesError = err.message;
+        this.serverReadyAt = 0;
       }
+    } else {
+      this.serverReadyAt = 0;
     }
 
     const liveIds = liveRoutes.map(r => r['@id']);
@@ -682,7 +724,7 @@ class IngressManager {
       })),
       skipped: state.skipped,
       drift,
-      inSync: detection.available && drift.missing.length === 0 && drift.unexpected.length === 0,
+      inSync: detection.available && !routesError && drift.missing.length === 0 && drift.unexpected.length === 0,
       lastReconcile: this.lastReconcile,
       tlsProbed: Boolean(probe),
       tls: tlsProbes,

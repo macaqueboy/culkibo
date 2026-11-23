@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
-const { assertSafeUrl, atomicWriteJsonSync } = require('./ssrfGuard');
+const { assertSafeUrl, safeFetch, atomicWriteJsonSync } = require('./ssrfGuard');
 
 const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'notifications.json');
 const TELEGRAM_TOKEN_RE = /^\d{5,15}:[A-Za-z0-9_-]{20,80}$/;
@@ -15,6 +15,7 @@ const DEFAULT_CONFIG = {
     service_down: true,
     deploy_failed: true,
     deploy_succeeded: false,
+    rollback: true,
     ssl_issued: false,
     project_stopped: false
   },
@@ -29,6 +30,7 @@ const DEFAULT_CONFIG = {
 const LEVEL_META = {
   error: { emoji: '🔴', color: 0xdc2626, label: 'Error' },
   warn: { emoji: '🟠', color: 0xf59e0b, label: 'Aviso' },
+  warning: { emoji: '🟠', color: 0xf59e0b, label: 'Aviso' },
   success: { emoji: '🟢', color: 0x059669, label: 'Correcto' },
   info: { emoji: '🔵', color: 0x2563eb, label: 'Información' }
 };
@@ -264,14 +266,19 @@ class NotificationService extends EventEmitter {
 
     if (name === 'telegram') {
       const { botToken, chatId } = this.config.channels.telegram;
-      if (!TELEGRAM_TOKEN_RE.test(String(botToken || '').trim())) {
+      const cleanToken = String(botToken || '').trim();
+      if (!TELEGRAM_TOKEN_RE.test(cleanToken)) {
         throw new Error('Formato de botToken de Telegram inválido');
       }
-      const text = `${meta.emoji} *${this.escapeMarkdown(heading)}*\n${this.escapeMarkdown(message)}${url ? `\n${url}` : ''}`;
-      return this.post(`https://api.telegram.org/bot${encodeURIComponent(String(botToken).trim())}/sendMessage`, {
+      // P1-6: no aplicar encodeURIComponent al token (convertía ':' en '%3A' y daba 404 en Telegram)
+      // y usar HTML con escape seguro en lugar de Markdown v1 con escapes v2.
+      const esc = (s) => this.escapeHtml(s);
+      const safeUrl = url ? `\n<a href="${esc(url)}">${esc(url)}</a>` : '';
+      const text = `<b>${esc(meta.label)}: ${esc(heading)}</b>\n${esc(message)}${safeUrl}`;
+      return this.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
         chat_id: chatId,
         text,
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
         disable_web_page_preview: true
       });
     }
@@ -323,22 +330,29 @@ class NotificationService extends EventEmitter {
     throw new Error(`Canal desconocido: ${name}`);
   }
 
+  escapeHtml(text) {
+    return String(text == null ? '' : text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   escapeMarkdown(text) {
     return String(text == null ? '' : text).replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
   }
 
   async post(url, body, extraHeaders = {}) {
-    await assertSafeUrl(url, { requireHttps: true });
-    const res = await fetch(url, {
+    const res = await safeFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...extraHeaders },
       body: JSON.stringify(body),
-      redirect: 'error',
-      signal: AbortSignal.timeout(8000)
+      requireHttps: true,
+      maxRedirects: 0,
+      timeoutMs: 8000
     });
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
-      throw new Error(`HTTP ${res.status} ${detail.slice(0, 200)}`);
+      throw new Error(`HTTP ${res.status} ${res.text().slice(0, 200)}`);
     }
     return true;
   }

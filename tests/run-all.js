@@ -17,6 +17,7 @@ const testLiveSync = require('./live-sync.test');
 const testCompetitorBenchmarks = require('./competitor-benchmarks.test');
 const testSecurityHardening = require('./security-hardening.test');
 const testImporters = require('./importers.test');
+const testMetricsAndBugs = require('./metrics-and-bugs.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -58,6 +59,7 @@ async function runAll() {
     { name: 'Live Sync Engine (Commit Frames, Merkle, Rollback <10ms, WS)', fn: testLiveSync },
     { name: 'Security Hardening (SSRF, Proxy Loopback, Symlinks, Redaction)', fn: testSecurityHardening },
     { name: 'WordPress Migrator & Universal Importer (Compose/Git/Platforms)', fn: testImporters },
+    { name: 'Observability, Prometheus, Doctor & Bug Regressions', fn: testMetricsAndBugs },
     { name: 'Competitor Benchmarks & Parity Verification', fn: testCompetitorBenchmarks }
   ];
 

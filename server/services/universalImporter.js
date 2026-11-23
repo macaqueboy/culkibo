@@ -211,12 +211,14 @@ function parseDockerCompose(yamlText) {
           if (dm) currentService.dependsOn.push(dm[1]);
         }
       } else if (currentSection === 'environment') {
+        const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
         if (trimmed.startsWith('-')) {
           const item = unquote(trimmed.slice(1).trim());
           const eq = item.indexOf('=');
           if (eq > 0) {
-            currentService.envVars[item.slice(0, eq).trim()] = unquote(item.slice(eq + 1));
-          } else if (item) {
+            const k = item.slice(0, eq).trim();
+            if (k && !UNSAFE_KEYS.has(k)) currentService.envVars[k] = unquote(item.slice(eq + 1));
+          } else if (item && !UNSAFE_KEYS.has(item)) {
             currentService.envVars[item] = '';
           }
         } else {
@@ -224,7 +226,7 @@ function parseDockerCompose(yamlText) {
           if (eq > 0) {
             const k = trimmed.slice(0, eq).trim();
             const v = unquote(trimmed.slice(eq + 1).trim());
-            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) currentService.envVars[k] = v;
+            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) && !UNSAFE_KEYS.has(k)) currentService.envVars[k] = v;
           }
         }
       }
@@ -242,22 +244,33 @@ function parseDockerCompose(yamlText) {
     svc.dbEngine = db ? db.engine : null;
     svc.dbLabel = db ? db.label : null;
 
-    // Extraer puerto interno principal
+    // Extraer puerto interno principal y revisar exposición 0.0.0.0 antes del break (P1-22)
     /** @type {number | null} */
     let containerPort = null;
     for (const p of svc.ports) {
       const clean = String(p).replace(/\/(tcp|udp)$/i, '');
       const parts = clean.split(':');
-      const last = parseInt(parts[parts.length - 1], 10);
-      if (Number.isInteger(last) && last > 0 && last < 65536) {
-        containerPort = last;
-        break;
-      }
       if (parts.length === 2 && !parts[0].startsWith('127.0.0.1')) {
         svc.warnings.push(`El puerto ${p} se expondría en 0.0.0.0; en Culkibo se aislará tras Caddy.`);
+      } else if (parts.length === 3 && parts[0] === '0.0.0.0') {
+        svc.warnings.push(`El puerto ${p} se expondría en 0.0.0.0; en Culkibo se aislará tras Caddy.`);
+      }
+      if (containerPort === null) {
+        const last = parseInt(parts[parts.length - 1], 10);
+        if (Number.isInteger(last) && last > 0 && last < 65536) {
+          containerPort = last;
+        }
       }
     }
     svc.containerPort = containerPort;
+
+    // Aviso de seguridad si el compose monta el socket de Docker o la raíz del host
+    for (const vol of svc.volumes || []) {
+      const vStr = String(vol || '');
+      if (vStr.includes('/var/run/docker.sock') || vStr.startsWith('/:')) {
+        svc.warnings.push(`Montaje privilegiado detectado (${vStr}): revisa si este servicio realmente necesita acceso al host.`);
+      }
+    }
 
     if (svc.image && (/:latest$/i.test(svc.image) || !svc.image.includes(':'))) {
       svc.warnings.push(`La imagen «${svc.image}» no tiene versión fijada (evita :latest en producción).`);

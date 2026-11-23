@@ -669,6 +669,7 @@ build_app() {
       || die "Falló la instalación de dependencias del panel"
     if as_service_user env -C "$INSTALL_DIR" npm run build >/dev/null 2>&1; then
       ok "Panel compilado en web/dist"
+      rm -rf "$INSTALL_DIR/web/node_modules" 2>/dev/null || true
     else
       warn "El panel no compiló. El daemon y la API funcionarán; la interfaz no se servirá."
       warn "Reintenta con: sudo -u $RUN_USER npm --prefix $INSTALL_DIR run build"
@@ -716,10 +717,11 @@ install_systemd_unit() {
   cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=Culkibo — orquestador cloud autohospedado
-Documentation=https://github.com/pablo-developer/culkibo
+Documentation=https://github.com/macaqueboy/culkibo
 After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+Wants=network-online.target docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -730,25 +732,26 @@ EnvironmentFile=$ENV_FILE
 ExecStart=/usr/bin/env node $INSTALL_DIR/server/index.js
 Restart=always
 RestartSec=5
-# Sin esto, un fallo de arranque en bucle reintenta para siempre a 5 s y llena
-# el registro. Cinco intentos en un minuto y systemd se rinde y lo dice.
-StartLimitBurst=5
-StartLimitIntervalSec=60
+TimeoutStopSec=30
+UMask=0027
 
 # El daemon supervisa procesos hijo y sockets: el límite por defecto de 1024
 # descriptores se agota con una veintena de proyectos vigilados.
 LimitNOFILE=65536
 
-# Endurecimiento. No convierte a un miembro del grupo docker en inofensivo
-# —nada lo hace—, pero sí impide que un fallo del propio daemon escriba en el
-# sistema o escale privilegios por su cuenta.
+# Endurecimiento del servicio systemd
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=$INSTALL_DIR
 ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
 RestrictSUIDSGID=true
 
 # El token no aparece en el registro del sistema, así que el registro se puede
@@ -814,8 +817,15 @@ start_data_plane() {
     # (caddyManager.startWithDocker), y el instalador no puede quedarse
     # desincronizado con el producto. En Linux se usa red de host, que es lo
     # único que permite a Caddy alcanzar los destinos en 127.0.0.1.
+    local auth_hdr=""
+    local tok=""
+    tok="$(read_token 2>/dev/null || true)"
+    if [ -n "$tok" ]; then
+      auth_hdr="Authorization: Bearer $tok"
+    fi
     if curl -fsS --max-time 60 -X POST \
          -H 'Content-Type: application/json' \
+         ${auth_hdr:+-H "$auth_hdr"} \
          -d '{"network":"host"}' \
          "http://127.0.0.1:$PORT/api/ingress/start" >/dev/null 2>&1; then
       ok "Caddy levantado con red de host (puertos 80 y 443)"
@@ -826,9 +836,8 @@ start_data_plane() {
 
   # --- Cortafuegos ---------------------------------------------------------
   if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    # Idempotente: ufw no duplica una regla que ya existe.
-    ufw allow 80/tcp  >/dev/null 2>&1 || true
-    ufw allow 443/tcp >/dev/null 2>&1 || true
+    ufw allow 80/tcp  comment 'culkibo' >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment 'culkibo' >/dev/null 2>&1 || true
     ok "UFW: abiertos 80 y 443 (HTTP y HTTPS)"
     if [ "$BIND_ADDR" != "0.0.0.0" ]; then
       info "El puerto $PORT NO se ha abierto a propósito: el plano de control no debe estar en internet."

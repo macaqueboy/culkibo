@@ -151,13 +151,13 @@ class ProjectManager extends EventEmitter {
       this.saveDebounceTimer = null;
     }
 
-    // Group Commit (fase 1): si no hay escritura activa, agrupa en el mismo
-    // turno del bucle de eventos (2 ms) todas las mutaciones que llegan juntas
-    // en una ráfaga concurrente en UNA sola escritura atómica a disco.
+    // Group Commit (fase 1): agrupa en el mismo turno del bucle de eventos
+    // (`setImmediate`, sin el tick de 15.6 ms de Windows) todas las mutaciones
+    // concurrentes en UNA sola escritura atómica a disco.
     if (!this._inFlightFlush) {
       if (!this._batchingFlush) {
         this._batchingFlush = new Promise((resolve) => {
-          setTimeout(() => {
+          setImmediate(() => {
             this._batchingFlush = null;
             const p = this.writeSnapshot().finally(() => {
               if (this._inFlightFlush === p) this._inFlightFlush = null;
@@ -165,7 +165,7 @@ class ProjectManager extends EventEmitter {
             this._inFlightFlush = p;
             this.flushChain = p;
             resolve(p);
-          }, 2);
+          });
         });
         this.flushChain = this._batchingFlush;
       }

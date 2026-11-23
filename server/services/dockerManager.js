@@ -131,34 +131,15 @@ class DockerManager {
     const status = await this.checkDockerStatus();
 
     if (!status.available) {
-      // Retornar contenedores simulados según el proyecto o entorno
-      return [
-        {
-          id: 'culkibo-forge-dev',
-          names: ['/culkibo_dev_forge'],
-          image: 'node:22-alpine',
-          status: 'Up (Hot-Reloading activo)',
-          state: 'running',
-          ports: '0.0.0.0:3001->3001/tcp',
-          mode: 'sandbox',
-          created: new Date().toISOString()
-        },
-        {
-          id: 'culkibo-citadel-prod',
-          names: ['/culkibo_prod_citadel'],
-          image: 'culkibo/citadel:v1.0.0',
-          status: 'Up (Inmutable)',
-          state: 'running',
-          ports: '0.0.0.0:8080->8080/tcp',
-          mode: 'sandbox',
-          created: new Date().toISOString()
-        }
-      ];
+      return [];
     }
 
     try {
       const args = ['ps'];
       if (all) args.push('-a');
+      if (projectId && /^[a-zA-Z0-9_.-]{1,80}$/.test(String(projectId))) {
+        args.push('--filter', `label=com.culkibo.project=${projectId}`);
+      }
       args.push('--format', '{{json .}}');
       const { stdout } = await this.docker(args, { timeout: 5000 });
       const lines = stdout.trim().split('\n').filter(Boolean);
@@ -193,11 +174,9 @@ class DockerManager {
     if (!status.available) {
       return {
         id: containerId,
-        cpuPercent: '1.2%',
-        memoryUsage: '142MiB / 2GiB',
-        memoryPercent: '6.9%',
-        netIO: '12.4kB / 8.2kB',
-        mode: 'sandbox_simulation'
+        available: false,
+        mode: 'degraded',
+        error: 'Docker no está disponible en este host'
       };
     }
 
@@ -272,7 +251,8 @@ class DockerManager {
       const { stdout, stderr } = await this.docker(['logs', '--tail', String(tail), ref], { timeout: 5000 });
       return {
         containerId,
-        output: stdout || stderr
+        // P1-23: unir stdout y stderr para no perder errores cuando stdout no está vacío
+        output: [stdout, stderr].filter(Boolean).join('\n')
       };
     } catch (err) {
       return { containerId, error: err.message };

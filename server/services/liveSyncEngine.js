@@ -90,7 +90,7 @@ function percentile(values, p) {
  * @param {string} baseDir
  * @param {string} relPath
  * @param {{ realBase?: string | null, verifiedDirs?: Set<string> }} [ctx]
- * @returns {{ rel: string, abs: string }}
+ * @returns {{ rel: string, abs: string, stat: import('fs').Stats | null }}
  */
 function resolveSafeFilePath(baseDir, relPath, ctx = {}) {
   if (typeof relPath !== 'string' || !relPath.trim()) {
@@ -167,7 +167,10 @@ function resolveSafeFilePath(baseDir, relPath, ctx = {}) {
     }
   }
 
-  // Comprueba también el propio fichero hoja (impide leer o sobrescribir symlinks externos).
+  // Comprueba también el propio fichero hoja (impide leer o sobrescribir symlinks externos)
+  // y devuelve su `lstat` para reutilizar `mtimeMs`/`size` sin syscalls extra.
+  /** @type {import('fs').Stats | null} */
+  let leafStat = null;
   try {
     const st = fs.lstatSync(resolvedTarget);
     if (st.isSymbolicLink()) {
@@ -175,11 +178,12 @@ function resolveSafeFilePath(baseDir, relPath, ctx = {}) {
       /** @type {any} */ (err).code = 'PATH_TRAVERSAL_BLOCKED';
       throw err;
     }
+    leafStat = st;
   } catch (e) {
     if (e && e.code !== 'ENOENT') throw e;
   }
 
-  return { rel: cleanRel, abs: resolvedTarget };
+  return { rel: cleanRel, abs: resolvedTarget, stat: leafStat };
 }
 
 /**
@@ -209,11 +213,13 @@ let tempSeq = 0;
 
 /**
  * Escritura atómica en disco: temporal en el mismo directorio + rename (POSIX),
- * o escritura directa en Windows NTFS para evitar bloqueos síncronos del AV.
+ * o escritura directa con `fstatSync` en Windows NTFS para evitar bloqueos del AV
+ * y capturar el nuevo `(mtimeMs, size)` en una sola apertura de descriptor.
  *
  * @param {string} absPath
  * @param {Buffer} buffer
  * @param {Set<string> | null} [ensuredDirs]
+ * @returns {{ mtimeMs: number, size: number } | null}
  */
 function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
   const dir = path.dirname(absPath);
@@ -222,8 +228,14 @@ function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
     if (ensuredDirs) ensuredDirs.add(dir);
   }
   if (process.platform === 'win32') {
-    fs.writeFileSync(absPath, buffer);
-    return;
+    const fd = fs.openSync(absPath, 'w');
+    try {
+      if (buffer.length > 0) fs.writeSync(fd, buffer, 0, buffer.length, 0);
+      const st = fs.fstatSync(fd);
+      return { mtimeMs: st.mtimeMs, size: st.size };
+    } finally {
+      fs.closeSync(fd);
+    }
   }
   const tempPath = `${absPath}.culkibo-sync-${process.pid}-${++tempSeq}.tmp`;
   fs.writeFileSync(tempPath, buffer);
@@ -241,6 +253,12 @@ function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
     }
     fs.copyFileSync(tempPath, absPath);
     try { fs.unlinkSync(tempPath); } catch (e) {}
+  }
+  try {
+    const st = fs.statSync(absPath);
+    return { mtimeMs: st.mtimeMs, size: st.size };
+  } catch (e) {
+    return null;
   }
 }
 
@@ -385,6 +403,11 @@ function computePercentiles(samples) {
 
 const MAX_PATCH_HISTORY_BYTES = 32 * 1024 * 1024; // 32 MiB por sesión
 const MAX_RECENT_FRAMES = 25;
+const MAX_SESSION_CACHE_BYTES = 16 * 1024 * 1024;
+const MAX_SESSION_CACHE_ENTRIES = 500;
+const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.resolve(process.env.CULKIBO_DATA_DIR)
+  : path.resolve(__dirname, '..', '..');
 
 class LiveSyncEngine extends EventEmitter {
   constructor() {
@@ -413,7 +436,7 @@ class LiveSyncEngine extends EventEmitter {
       /** @type {any} */ (err).code = 'INVALID_PROJECT_ID';
       throw err;
     }
-    return path.join(process.cwd(), 'projects', cleanId);
+    return path.join(ROOT_BASE_DIR, 'projects', cleanId);
   }
 
   /** Registra un directorio objetivo explícito (usado por proyectos locales y tests). */
@@ -443,7 +466,9 @@ class LiveSyncEngine extends EventEmitter {
         latencySamples: /** @type {number[]} */ ([]),
         patchHistory: /** @type {any[]} */ ([]),
         patchHistoryBytes: 0,
-        recentFrames: /** @type {any[]} */ ([])
+        recentFrames: /** @type {any[]} */ ([]),
+        fileCache: /** @type {Map<string, { buf: Buffer, mtimeMs: number, size: number }>} */ (new Map()),
+        fileCacheBytes: 0
       };
       this.sessions.set(projectId, s);
     }
@@ -488,13 +513,18 @@ class LiveSyncEngine extends EventEmitter {
       throw new Error(`El commit frame supera el máximo permitido (${MAX_FILES_PER_FRAME} ficheros)`);
     }
 
-    const realBase = fs.existsSync(baseDir) ? fs.realpathSync(baseDir) : null;
-    const pathCtx = { realBase, verifiedDirs: new Set() };
+    /** @type {string | null} */
+    let realBase = null;
+    try { realBase = fs.realpathSync(baseDir); } catch (e) { realBase = null; }
+    const resolvedBase = path.resolve(baseDir);
+    const verifiedDirs = new Set();
+    if (realBase) verifiedDirs.add(resolvedBase);
+    const pathCtx = { realBase, verifiedDirs };
 
-    /** @type {Array<{ rel: string, abs: string, op: 'upsert' | 'delete', buffer: Buffer | null, hash: string | null }>} */
+    /** @type {Array<{ rel: string, abs: string, op: 'upsert' | 'delete', buffer: Buffer | null, hash: string | null, stat: import('fs').Stats | null }>} */
     const prepared = [];
     for (const item of frame.files) {
-      const { rel, abs } = resolveSafeFilePath(baseDir, item.path, pathCtx);
+      const { rel, abs, stat } = resolveSafeFilePath(baseDir, item.path, pathCtx);
       const op = item.op === 'delete' ? 'delete' : 'upsert';
       if (op === 'upsert') {
         const buffer = Buffer.isBuffer(item.buffer)
@@ -512,12 +542,13 @@ class LiveSyncEngine extends EventEmitter {
           }
           verifiedHash = computedHash;
         }
-        prepared.push({ rel, abs, op, buffer, hash: verifiedHash });
+        prepared.push({ rel, abs, op, buffer, hash: verifiedHash, stat });
       } else {
-        prepared.push({ rel, abs, op, buffer: null, hash: null });
+        prepared.push({ rel, abs, op, buffer: null, hash: null, stat });
       }
     }
 
+    const prevLastSeq = session.lastSeq;
     let reconcileRequired = false;
     const seq = typeof frame.seq === 'number' && Number.isInteger(frame.seq) && frame.seq > 0
       ? frame.seq
@@ -526,7 +557,6 @@ class LiveSyncEngine extends EventEmitter {
       reconcileRequired = true;
       session.driftDetected = true;
     }
-    if (seq > session.lastSeq) session.lastSeq = seq;
 
     const ensuredDirs = new Set();
     if (!realBase && !fs.existsSync(baseDir)) {
@@ -543,53 +573,108 @@ class LiveSyncEngine extends EventEmitter {
     let bytesWritten = 0;
     /** @type {string[]} */
     const changedPaths = [];
+    const cache = session.fileCache;
 
-    for (const entry of prepared) {
-      let existed = false;
-      /** @type {Buffer | null} */
-      let prevBuffer = null;
-      try {
-        prevBuffer = fs.readFileSync(entry.abs);
-        existed = true;
-      } catch (e) {
-        if (!e || (e.code !== 'ENOENT' && e.code !== 'EISDIR')) {
-          throw e;
+    try {
+      for (const entry of prepared) {
+        let existed = Boolean(entry.stat);
+        /** @type {Buffer | null} */
+        let prevBuffer = null;
+        if (entry.stat && entry.stat.isFile()) {
+          const cached = cache.get(entry.abs);
+          if (cached && cached.mtimeMs === entry.stat.mtimeMs && cached.size === entry.stat.size) {
+            prevBuffer = cached.buf;
+          } else {
+            try {
+              prevBuffer = fs.readFileSync(entry.abs);
+            } catch (e) {
+              if (!e || (e.code !== 'ENOENT' && e.code !== 'EISDIR')) throw e;
+              existed = false;
+            }
+          }
+        }
+
+        if (entry.op === 'upsert' && entry.buffer !== null) {
+          if (prevBuffer && prevBuffer.length === entry.buffer.length && prevBuffer.equals(entry.buffer)) {
+            dedupSkipped++;
+            continue;
+          }
+          undoEntries.push({ rel: entry.rel, abs: entry.abs, existed, prevBuffer });
+          if (prevBuffer) undoBytes += prevBuffer.length;
+          const postStat = writeFileAtomic(entry.abs, entry.buffer, ensuredDirs);
+          if (postStat) {
+            // Actualiza caché de sesión y caché Merkle (evita readFileSync en la siguiente edición o verifySync)
+            const prevCached = cache.get(entry.abs);
+            if (prevCached) session.fileCacheBytes = Math.max(0, session.fileCacheBytes - prevCached.buf.length);
+            if (entry.buffer.length <= 512 * 1024) {
+              if (cache.size >= MAX_SESSION_CACHE_ENTRIES || session.fileCacheBytes + entry.buffer.length > MAX_SESSION_CACHE_BYTES) {
+                cache.clear();
+                session.fileCacheBytes = 0;
+              }
+              cache.set(entry.abs, { buf: entry.buffer, mtimeMs: postStat.mtimeMs, size: postStat.size });
+              session.fileCacheBytes += entry.buffer.length;
+            } else {
+              cache.delete(entry.abs);
+            }
+            if (entry.hash) {
+              if (merkleFileCache.size >= MAX_MERKLE_CACHE_ENTRIES) merkleFileCache.clear();
+              merkleFileCache.set(entry.abs, { mtimeMs: postStat.mtimeMs, size: postStat.size, hash: entry.hash });
+            } else {
+              merkleFileCache.delete(entry.abs);
+            }
+          } else {
+            cache.delete(entry.abs);
+            merkleFileCache.delete(entry.abs);
+          }
+          written++;
+          bytesWritten += entry.buffer.length;
+          changedPaths.push(entry.rel);
+        } else if (entry.op === 'delete') {
+          if (!existed) {
+            dedupSkipped++;
+            continue;
+          }
+          undoEntries.push({ rel: entry.rel, abs: entry.abs, existed: true, prevBuffer });
+          if (prevBuffer) undoBytes += prevBuffer.length;
+          fs.unlinkSync(entry.abs);
+          const prevCached = cache.get(entry.abs);
+          if (prevCached) {
+            session.fileCacheBytes = Math.max(0, session.fileCacheBytes - prevCached.buf.length);
+            cache.delete(entry.abs);
+          }
+          merkleFileCache.delete(entry.abs);
+          deleted++;
+          changedPaths.push(entry.rel);
         }
       }
-
-      if (entry.op === 'upsert' && entry.buffer !== null) {
-        if (prevBuffer && prevBuffer.length === entry.buffer.length && prevBuffer.equals(entry.buffer)) {
-          dedupSkipped++;
-          continue;
-        }
-        undoEntries.push({ rel: entry.rel, abs: entry.abs, existed, prevBuffer });
-        if (prevBuffer) undoBytes += prevBuffer.length;
-        writeFileAtomic(entry.abs, entry.buffer, ensuredDirs);
-        merkleFileCache.delete(entry.abs);
-        written++;
-        bytesWritten += entry.buffer.length;
-        changedPaths.push(entry.rel);
-      } else if (entry.op === 'delete') {
-        if (!existed) {
-          dedupSkipped++;
-          continue;
-        }
-        undoEntries.push({ rel: entry.rel, abs: entry.abs, existed: true, prevBuffer });
-        if (prevBuffer) undoBytes += prevBuffer.length;
-        fs.unlinkSync(entry.abs);
-        merkleFileCache.delete(entry.abs);
-        deleted++;
-        changedPaths.push(entry.rel);
+    } catch (writeErr) {
+      // Atomicidad real: si falla a mitad de trama, revertir lo escrito y restaurar lastSeq (P1-16)
+      for (let i = undoEntries.length - 1; i >= 0; i--) {
+        const u = undoEntries[i];
+        try {
+          if (u.existed && u.prevBuffer !== null) {
+            writeFileAtomic(u.abs, u.prevBuffer, ensuredDirs);
+          } else if (fs.existsSync(u.abs)) {
+            fs.unlinkSync(u.abs);
+          }
+          cache.delete(u.abs);
+          merkleFileCache.delete(u.abs);
+        } catch (e) {}
       }
+      session.lastSeq = prevLastSeq;
+      throw writeErr;
     }
 
+    if (seq > session.lastSeq) session.lastSeq = seq;
+
     const classification = classifyChanges(changedPaths.length > 0 ? changedPaths : prepared.map(p => p.rel));
+    const appliedAt = new Date().toISOString();
 
     if (undoEntries.length > 0) {
       const patch = {
         patchId: `patch_${seq}_${Date.now()}`,
         seq,
-        appliedAt: new Date().toISOString(),
+        appliedAt,
         files: changedPaths,
         classification: classification.path,
         byteSize: undoBytes,
@@ -607,7 +692,6 @@ class LiveSyncEngine extends EventEmitter {
     }
 
     const applyMs = Number((Number(process.hrtime.bigint() - startedNs) / 1e6).toFixed(2));
-    const appliedAt = new Date().toISOString();
     session.framesApplied++;
     session.filesWritten += written;
     session.filesDeleted += deleted;
@@ -624,6 +708,7 @@ class LiveSyncEngine extends EventEmitter {
 
     session.recentFrames.unshift({
       seq,
+      at: appliedAt,
       appliedAt,
       written,
       deleted,
@@ -693,6 +778,7 @@ class LiveSyncEngine extends EventEmitter {
         } else if (fs.existsSync(entry.abs)) {
           fs.unlinkSync(entry.abs);
         }
+        if (session.fileCache) session.fileCache.delete(entry.abs);
         merkleFileCache.delete(entry.abs);
         restoredFiles.push(entry.rel);
       }

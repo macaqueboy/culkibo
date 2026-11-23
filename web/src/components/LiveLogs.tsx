@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useDeferredValue, useMemo } from 'react';
-import { Play, Pause, Trash2, Download, Search, Terminal, Sparkles, Check } from 'lucide-react';
+import { Play, Pause, Trash2, Download, Search, Terminal, Copy, Check } from 'lucide-react';
 import type { LogEntry } from '../lib/api';
 import { api } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
+import { copyToClipboard } from '../lib/clipboard';
 
 interface LiveLogsProps {
   incomingLog?: LogEntry | null;
@@ -14,13 +15,20 @@ const TIME_FORMATTER = new Intl.DateTimeFormat('es-ES', {
   hour12: false,
   hour: '2-digit',
   minute: '2-digit',
-  second: '2-digit'
+  second: '2-digit',
 });
 
 function formatLogTime(ts: string): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return '--:--:--';
   return TIME_FORMATTER.format(d);
+}
+
+function formatPodLabel(pod: string): string {
+  if (pod === 'forge') return 'Des';
+  if (pod === 'citadel') return 'Prod';
+  if (pod === 'edge') return 'Caddy';
+  return pod || 'Sistema';
 }
 
 export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) => {
@@ -30,6 +38,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
   const [searchQuery, setSearchQuery] = useState<string>('');
   const deferredSearch = useDeferredValue(searchQuery);
   const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [pausedBuffered, setPausedBuffered] = useState<number>(0);
   const [copiedAi, setCopiedAi] = useState<boolean>(false);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const isPausedRef = useRef<boolean>(false);
@@ -53,8 +62,11 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
   }, [projectId]);
 
   const enqueueLog = (entry: LogEntry) => {
-    if (isPausedRef.current) return;
-    if (projectId && entry.projectId && entry.projectId !== 'global' && entry.projectId !== projectId) {
+    if (projectId && entry.projectId !== projectId) {
+      return;
+    }
+    if (isPausedRef.current) {
+      setPausedBuffered((c) => c + 1);
       return;
     }
     pendingRef.current.unshift(entry);
@@ -98,9 +110,16 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
     });
   }, [logs, selectedPod, selectedLevel, deferredSearch]);
 
+  const handleTogglePause = () => {
+    setIsPaused((prev) => {
+      if (prev) setPausedBuffered(0);
+      return !prev;
+    });
+  };
+
   const handleDownload = () => {
     const text = filteredLogs
-      .map((l) => `[${l.timestamp}] [${l.level}] [${l.pod === 'forge' ? 'Desarrollo' : l.pod === 'citadel' ? 'Producción' : l.pod === 'edge' ? 'Enrutador' : l.pod}] ${l.message}`)
+      .map((l) => `[${l.timestamp}] [${l.level}] [${formatPodLabel(l.pod)}] ${l.message}`)
       .join('\n');
     const blob = new Blob([text], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -111,65 +130,67 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
     URL.revokeObjectURL(url);
   };
 
-  const handleCopyForAi = () => {
+  const handleCopyForAi = async () => {
     const problemLines = filteredLogs
       .filter((l) => l.level === 'ERROR' || l.level === 'WARN')
       .slice(0, 30);
     const sample = problemLines.length > 0 ? problemLines : filteredLogs.slice(0, 30);
     const body = sample
-      .map((l) => `[${formatLogTime(l.timestamp)}] [${l.level}] [${l.pod}] ${l.message}`)
+      .map((l) => `[${formatLogTime(l.timestamp)}] [${l.level}] [${formatPodLabel(l.pod)}] ${l.message}`)
       .join('\n');
     const prompt = [
-      `Estoy depurando ${projectId ? `el proyecto "${projectId}"` : 'mi servidor'} en Culkibo.`,
+      `Estoy depurando ${projectId ? `el proyecto "${projectId}"` : 'el servidor'} en Culkibo.`,
       problemLines.length > 0
         ? 'Estos son los últimos errores y avisos registrados:'
         : 'Estos son los últimos eventos registrados:',
       '```log',
       body || '(sin líneas)',
       '```',
-      'Explícame qué está fallando y qué cambio concreto debo aplicar.'
+      'Explícame qué está fallando y qué cambio concreto debo aplicar.',
     ].join('\n');
-    navigator.clipboard.writeText(prompt);
-    setCopiedAi(true);
-    setTimeout(() => setCopiedAi(false), 2200);
+    const ok = await copyToClipboard(prompt);
+    if (ok) {
+      setCopiedAi(true);
+      window.setTimeout(() => setCopiedAi(false), 2200);
+    }
   };
 
   const getLevelBadge = (level: string) => {
     switch (level) {
       case 'ERROR':
-        return 'text-rose-700 bg-rose-50 border-rose-200';
+        return 'text-red-700 bg-red-50 border-red-200';
       case 'WARN':
-        return 'text-amber-700 bg-amber-50 border-amber-200';
+        return 'text-amber-800 bg-amber-50 border-amber-200';
       case 'HOT_SYNC':
-        return 'text-blue-700 bg-blue-50 border-blue-200';
+        return 'text-slate-800 bg-slate-100 border-slate-200';
       case 'SUCCESS':
         return 'text-emerald-700 bg-emerald-50 border-emerald-200';
-      case 'INFO':
-        return 'text-slate-700 bg-slate-100 border-slate-200';
       default:
         return 'text-slate-600 bg-slate-100 border-slate-200';
     }
   };
 
   return (
-    <div className="flex flex-col h-full space-y-4">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-xl bg-white border border-slate-200 shadow-sm">
+    <div className="flex flex-col h-full space-y-3">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 p-2.5 rounded-xl bg-white border border-slate-200">
         <div className="flex flex-wrap items-center gap-2">
           <select
+            aria-label="Filtrar por origen"
             value={selectedPod}
             onChange={(e) => setSelectedPod(e.target.value)}
-            className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 focus:outline-none cursor-pointer shadow-2xs hover:bg-slate-50 transition-colors"
+            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
           >
-            <option value="all">Todos los entornos</option>
+            <option value="all">Todos los orígenes</option>
             <option value="forge">Desarrollo (Live Sync)</option>
             <option value="citadel">Producción</option>
             <option value="edge">Enrutador (Caddy)</option>
           </select>
 
           <select
+            aria-label="Filtrar por nivel"
             value={selectedLevel}
             onChange={(e) => setSelectedLevel(e.target.value)}
-            className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 focus:outline-none cursor-pointer shadow-2xs hover:bg-slate-50 transition-colors"
+            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
           >
             <option value="all">Todos los niveles</option>
             <option value="info">INFO</option>
@@ -180,84 +201,86 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
           </select>
 
           <div className="relative">
-            <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-2" />
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" />
             <input
               type="text"
-              placeholder="Buscar en registros..."
+              placeholder="Buscar en registros…"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-9 pr-3 py-1.5 bg-white border border-slate-200 rounded-lg text-sm text-slate-800 placeholder-slate-400 focus:outline-none w-56 sm:w-64 shadow-2xs"
+              className="pl-8 pr-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-slate-800 placeholder-slate-400 w-52 sm:w-60"
             />
           </div>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <button
             type="button"
-            onClick={handleCopyForAi}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 transition-colors cursor-pointer"
-            title="Copia los últimos errores listos para pegar en tu agente de IA"
+            onClick={() => void handleCopyForAi()}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 transition-colors cursor-pointer"
+            title="Copia los últimos errores listos para pegar en un agente de IA"
           >
-            {copiedAi ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Sparkles className="w-3.5 h-3.5 text-blue-600" />}
-            <span>{copiedAi ? 'Copiado para tu IA' : 'Copiar errores para mi IA'}</span>
+            {copiedAi ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-slate-500" />}
+            <span>{copiedAi ? 'Copiado para IA' : 'Copiar errores para IA'}</span>
           </button>
 
           <button
             type="button"
-            onClick={() => setIsPaused(!isPaused)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+            onClick={handleTogglePause}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer tabular-nums ${
               isPaused
-                ? 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'
+                ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
                 : 'bg-white text-slate-700 hover:bg-slate-50 border-slate-200'
             }`}
           >
             {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-            <span>{isPaused ? 'Reanudar' : 'Pausar'}</span>
+            <span>{isPaused ? (pausedBuffered > 0 ? `Reanudar (+${pausedBuffered})` : 'Reanudar') : 'Pausar'}</span>
           </button>
 
           <button
             type="button"
             onClick={() => setLogs([])}
+            aria-label="Limpiar vista de registros"
             className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
             title="Limpiar vista"
           >
-            <Trash2 className="w-4 h-4" />
+            <Trash2 className="w-3.5 h-3.5" />
           </button>
 
           <button
             type="button"
             onClick={handleDownload}
-            className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+            aria-label="Descargar archivo de registros"
+            className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-slate-900 transition-colors cursor-pointer"
             title="Descargar archivo .log"
           >
-            <Download className="w-4 h-4" />
+            <Download className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      <div className="flex-1 rounded-xl bg-white border border-slate-200 shadow-sm flex flex-col overflow-hidden">
+      <div className="flex-1 rounded-xl bg-white border border-slate-200 flex flex-col overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 border-b border-slate-200">
           <div className="flex items-center gap-2">
             <Terminal className="w-4 h-4 text-slate-500" />
-            <span className="text-sm font-semibold text-slate-700">
-              Registros en tiempo real
-            </span>
+            <span className="text-xs font-semibold text-slate-800">Registros en tiempo real</span>
           </div>
 
-          <div className="flex items-center gap-3 text-xs font-medium text-slate-500">
-            <span className="tabular-nums">{filteredLogs.length} eventos</span>
+          <div className="flex items-center gap-3 text-xs text-slate-500">
+            <span className="tabular-nums">
+              {filteredLogs.length} {filteredLogs.length === 1 ? 'evento' : 'eventos'}
+            </span>
             {!isPaused && (
-              <span className="flex items-center gap-1.5 text-emerald-600">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="flex items-center gap-1.5 text-emerald-700 font-medium">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                 En vivo
               </span>
             )}
           </div>
         </div>
 
-        <div className="flex-1 p-3 overflow-y-auto bg-white font-mono text-[13px] leading-relaxed">
+        <div className="flex-1 p-3 overflow-y-auto bg-white font-mono text-xs leading-relaxed">
           {filteredLogs.length === 0 ? (
-            <div className="flex h-full items-center justify-center text-slate-400 font-sans text-sm">
+            <div className="flex h-full items-center justify-center text-slate-400 font-sans text-xs">
               Todavía no hay registros que coincidan con este filtro.
             </div>
           ) : (
@@ -265,18 +288,16 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               {filteredLogs.map((log) => (
                 <div
                   key={log.id}
-                  className="flex items-start gap-3 hover:bg-slate-50/80 px-2 py-1 rounded transition-colors group"
+                  className="flex items-start gap-2.5 hover:bg-slate-50 px-2 py-1 rounded transition-colors"
                 >
-                  <span className="text-slate-400 shrink-0 select-none w-20 tabular-nums">{formatLogTime(log.timestamp)}</span>
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold border shrink-0 w-16 text-center ${getLevelBadge(log.level)}`}>
+                  <span className="text-slate-400 shrink-0 select-none w-16 tabular-nums">{formatLogTime(log.timestamp)}</span>
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border shrink-0 w-16 text-center ${getLevelBadge(log.level)}`}>
                     {log.level}
                   </span>
-                  <span className="text-slate-500 shrink-0 font-medium w-24 truncate" title={log.pod}>
-                    [{log.pod === 'forge' ? 'Dev' : log.pod === 'citadel' ? 'Prod' : log.pod === 'edge' ? 'Router' : log.pod}]
+                  <span className="text-slate-500 shrink-0 font-medium w-16 truncate" title={log.pod}>
+                    [{formatPodLabel(log.pod)}]
                   </span>
-                  <span className="break-all text-slate-800">
-                    {log.message}
-                  </span>
+                  <span className="break-all text-slate-800">{log.message}</span>
                 </div>
               ))}
               <div ref={terminalEndRef} />

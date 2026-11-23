@@ -1,30 +1,36 @@
-const axios = require('axios');
 const projectManager = require('./projectManager');
 const domainManager = require('./domainManager');
 const localRunner = require('./localRunner');
-const { assertSafeUrl } = require('./ssrfGuard');
+const { assertSafeUrl, safeFetch } = require('./ssrfGuard');
 
 class CoolifyMigrator {
   async fetchFromApi(apiUrl, apiToken, endpoint) {
     try {
       const { url: safeBase } = await assertSafeUrl(apiUrl, { blockSearchAndHash: true });
       const url = `${safeBase.origin}${safeBase.pathname.replace(/\/+$/, '')}${endpoint}`;
-      const response = await axios.get(url, {
+      const response = await safeFetch(url, {
+        method: 'GET',
         headers: {
           'Authorization': `Bearer ${apiToken}`,
           'Accept': 'application/json'
         },
         maxRedirects: 0,
-        maxContentLength: 20 * 1024 * 1024,
-        timeout: 30000 // Aumentado a 30s para APIs lentas
+        maxBytes: 20 * 1024 * 1024,
+        timeoutMs: 30000
       });
-      return response.data || [];
+      if (!response.ok) {
+        const httpErr = new Error(`Coolify respondió HTTP ${response.status}`);
+        /** @type {any} */ (httpErr).status = response.status;
+        throw httpErr;
+      }
+      const rawText = response.text().trim();
+      return rawText ? JSON.parse(rawText) : [];
     } catch (err) {
       if (err && /SSRF|inválida|protocolo|metadatos|privada/i.test(String(err.message || ''))) {
         throw err;
       }
       console.error(`Coolify fetch error on ${endpoint}:`, err.message);
-      if (endpoint === '/api/v1/applications' && (!err.response || err.response.status >= 500)) {
+      if (endpoint === '/api/v1/applications' && (!err.status || err.status >= 500)) {
         throw new Error('No se pudo conectar a la API de Coolify. Verifica URL y Token.');
       }
       return [];
@@ -378,6 +384,10 @@ class CoolifyMigrator {
             results.errors.push(`Error guardando proyecto ${key}: ${e.message}`);
         }
     }
+
+    try {
+      await projectManager.flushToDisk();
+    } catch (e) {}
 
     return results;
   }

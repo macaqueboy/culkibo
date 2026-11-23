@@ -2,7 +2,7 @@ const dns = require('dns').promises;
 const net = require('net');
 const catalogManager = require('./catalogManager');
 const databaseManager = require('./databaseManager');
-const { assertSafeUrl } = require('./ssrfGuard');
+const { assertSafeUrl, safeFetch } = require('./ssrfGuard');
 
 /**
  * Asistente real de análisis y migración de sitios WordPress hacia Culkibo.
@@ -100,24 +100,33 @@ function prepareSqlForDomain(sql, oldDomain, newDomain) {
   const cleanNew = normalizeOriginUrl(newDomain);
   if (!cleanNew) return { sql, tablePrefix: detectWpTablePrefix(sql), urlsUpdated: false, serializedWarning: false };
 
+  // P1-24: validación estricta de URL y escape de '\' antes de '\'' (MariaDB default mode)
+  let parsedNew;
+  try {
+    parsedNew = new URL(cleanNew);
+  } catch (e) {
+    throw new Error(`Dominio de destino inválido: ${newDomain}`);
+  }
+  if ((parsedNew.protocol !== 'https:' && parsedNew.protocol !== 'http:') || /['"\\;\r\n\0]/.test(cleanNew)) {
+    throw new Error(`Dominio de destino contiene caracteres no permitidos: ${newDomain}`);
+  }
+  const cleanOrigin = `${parsedNew.protocol}//${parsedNew.host}${parsedNew.pathname.replace(/\/+$/, '')}`;
   const prefix = detectWpTablePrefix(sql);
-  const escapedUrl = cleanNew.replace(/'/g, "''");
+  const escapedUrl = cleanOrigin.replace(/\\/g, '\\\\').replace(/'/g, "''");
   const hasSerialized = /a:\d+:\{|s:\d+:"/.test(sql);
   let output = sql;
 
-  // Si conocemos el dominio viejo y no hay referencias serializadas del host,
-  // reemplazamos URLs directas; en cualquier caso fijamos `siteurl` y `home`.
   let directReplaced = false;
   const cleanOldHost = String(oldDomain || '')
     .trim()
     .replace(/^https?:\/\//i, '')
     .replace(/\/.*$/, '')
     .toLowerCase();
-  const cleanNewHost = cleanNew.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase();
+  const cleanNewHost = parsedNew.host.toLowerCase();
 
   if (cleanOldHost && cleanNewHost && cleanOldHost !== cleanNewHost && !hasSerialized) {
     const escapedOld = cleanOldHost.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    output = output.replace(new RegExp(`https?://${escapedOld}`, 'gi'), cleanNew);
+    output = output.replace(new RegExp(`https?://${escapedOld}`, 'gi'), cleanOrigin);
     directReplaced = true;
   }
 
@@ -151,11 +160,11 @@ class WordPressMigrator {
       'Accept': 'text/html,application/json;q=0.9,*/*;q=0.8'
     };
 
-    // Lanzar en paralelo: portada HTML, /wp-json, /wp-json/wp/v2/types y DNS A.
+    // P0-7: safeFetch valida CADA salto de redirección (corta SSRF por 302) y acota memoria.
     const [homeRes, wpJsonRes, typesRes, dnsRes] = await Promise.allSettled([
-      fetch(parsedUrl.toString(), { headers, redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) }),
-      fetch(`${baseOrigin}/wp-json`, { headers: { ...headers, Accept: 'application/json' }, redirect: 'follow', signal: AbortSignal.timeout(Math.min(timeoutMs, 5000)) }),
-      fetch(`${baseOrigin}/wp-json/wp/v2/types`, { headers: { ...headers, Accept: 'application/json' }, redirect: 'follow', signal: AbortSignal.timeout(Math.min(timeoutMs, 5000)) }),
+      safeFetch(parsedUrl.toString(), { headers, maxRedirects: 4, maxBytes: MAX_HTML_BYTES, allowPrivate, timeoutMs }),
+      safeFetch(`${baseOrigin}/wp-json`, { headers: { ...headers, Accept: 'application/json' }, maxRedirects: 3, maxBytes: 512 * 1024, allowPrivate, timeoutMs: Math.min(timeoutMs, 5000) }),
+      safeFetch(`${baseOrigin}/wp-json/wp/v2/types`, { headers: { ...headers, Accept: 'application/json' }, maxRedirects: 3, maxBytes: 256 * 1024, allowPrivate, timeoutMs: Math.min(timeoutMs, 5000) }),
       dns.resolve4(parsedUrl.hostname).catch(() => [])
     ]);
 
@@ -165,16 +174,14 @@ class WordPressMigrator {
 
     const res = homeRes.value;
     const finalUrl = res.url || parsedUrl.toString();
-    const html = await readBoundedText(res, MAX_HTML_BYTES);
+    const html = res.text();
     const resolvedIps = dnsRes.status === 'fulfilled' && Array.isArray(dnsRes.value) ? dnsRes.value : [];
 
-    // Parseo de /wp-json si está expuesto.
     /** @type {any} */
     let wpJson = null;
     if (wpJsonRes.status === 'fulfilled' && wpJsonRes.value.ok) {
       try {
-        const text = await readBoundedText(wpJsonRes.value, 512 * 1024);
-        const parsed = JSON.parse(text);
+        const parsed = wpJsonRes.value.json();
         if (parsed && typeof parsed === 'object') wpJson = parsed;
       } catch (e) {}
     }
@@ -183,14 +190,12 @@ class WordPressMigrator {
     let postTypes = [];
     if (typesRes.status === 'fulfilled' && typesRes.value.ok) {
       try {
-        const text = await readBoundedText(typesRes.value, 256 * 1024);
-        const parsed = JSON.parse(text);
+        const parsed = typesRes.value.json();
         if (parsed && typeof parsed === 'object') postTypes = Object.keys(parsed);
       } catch (e) {}
     }
 
-    // Detectar señales reales de WordPress.
-    const linkHeader = res.headers.get('link') || '';
+    const linkHeader = String(res.headers.link || '');
     const hasWpContent = /\/wp-content\//i.test(html);
     const hasWpIncludes = /\/wp-includes\//i.test(html);
     const generatorMatch = html.match(/<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)["']/i)
@@ -236,8 +241,17 @@ class WordPressMigrator {
       || (titleMatch ? titleMatch[1].trim().replace(/\s+/g, ' ') : parsedUrl.hostname);
     const siteDescription = (wpJson && typeof wpJson.description === 'string') ? wpJson.description.trim() : '';
 
+    const getHeader = (name) => {
+      if (!res.headers) return null;
+      const val = typeof (/** @type {any} */ (res.headers)).get === 'function'
+        ? (/** @type {any} */ (res.headers)).get(name)
+        : res.headers[name.toLowerCase()];
+      if (Array.isArray(val)) return val[0] || null;
+      return typeof val === 'string' ? val : null;
+    };
+
     const usesHttps = finalUrl.startsWith('https://');
-    const usesCloudflare = Boolean(res.headers.get('cf-ray')) || resolvedIps.some(isCloudflareIp);
+    const usesCloudflare = Boolean(getHeader('cf-ray')) || resolvedIps.some(isCloudflareIp);
     const estimatedRamMb = hasWooCommerce ? 1536 : 1024;
 
     const migrationPlan = [
@@ -269,7 +283,7 @@ class WordPressMigrator {
       postTypes,
       usesHttps,
       usesCloudflare,
-      serverHeader: res.headers.get('server') || null,
+      serverHeader: getHeader('server'),
       resolvedIps,
       estimatedRamMb,
       suggestedSlug: slugifySiteName(siteName || parsedUrl.hostname),

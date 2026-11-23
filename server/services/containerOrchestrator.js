@@ -2,6 +2,7 @@ const { EventEmitter } = require('events');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const metricsCollector = require('./metricsCollector');
 
 /** @type {any} */
 let _chokidar = null;
@@ -232,10 +233,25 @@ class ContainerOrchestrator extends EventEmitter {
     };
   }
 
-  // Switch Traffic Instantly between The Forge and The Citadel
-  async switchTraffic({ forgePercent = 0, citadelPercent = 100 }) {
+  /**
+   * Switch Traffic Instantly between The Forge and The Citadel
+   * @param {{ forgePercent?: number | string, citadelPercent?: number | string }} [opts]
+   */
+  async switchTraffic({ forgePercent, citadelPercent } = {}) {
     const startTime = performance.now();
-    const forge = Math.max(0, Math.min(100, parseInt(String(forgePercent), 10)));
+    /** @type {number} */
+    let forge;
+    if (forgePercent !== undefined && forgePercent !== null && forgePercent !== '') {
+      forge = Number(forgePercent);
+    } else if (citadelPercent !== undefined && citadelPercent !== null && citadelPercent !== '') {
+      forge = 100 - Number(citadelPercent);
+    } else {
+      throw new Error('Debes indicar forgePercent o citadelPercent entre 0 y 100');
+    }
+    if (!Number.isFinite(forge)) {
+      throw new Error('El porcentaje de tráfico debe ser un número válido entre 0 y 100');
+    }
+    forge = Math.max(0, Math.min(100, Math.round(forge)));
     const citadel = 100 - forge;
 
     this.trafficAllocation = { forge, citadel };
@@ -460,48 +476,32 @@ class ContainerOrchestrator extends EventEmitter {
   }
 
   /**
-   * Métricas reales del proceso del daemon.
-   *
-   * Esto sí se puede medir, así que se mide. El uso de CPU se calcula como
-   * porcentaje sobre el intervalo transcurrido, no acumulado desde el arranque,
-   * que es lo que la gente espera ver.
+   * Métricas reales del proceso del daemon (comparte caché de 250 ms con `metricsCollector`).
    */
   getDaemonMetrics() {
-    const now = Date.now();
-    if (this._metricsCache && (now - this._metricsCache.at) < 250) {
-      return this._metricsCache.data;
-    }
-    const cpu = process.cpuUsage();
-    const mem = process.memoryUsage();
-
-    /** @type {number | null} */
-    let cpuPercent = null;
-    if (this.lastCpuSample) {
-      const elapsedMs = now - this.lastCpuSample.at;
-      const usedMicros = (cpu.user - this.lastCpuSample.user) + (cpu.system - this.lastCpuSample.system);
-      if (elapsedMs > 0) {
-        cpuPercent = +((usedMicros / 1000 / elapsedMs) * 100).toFixed(1);
-      }
-    }
-    this.lastCpuSample = { at: now, user: cpu.user, system: cpu.system };
-
-    const data = {
-      cpuPercent,
-      memoryMb: Math.round(mem.rss / 1024 / 1024),
-      heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
-      uptimeSeconds: Math.round(process.uptime()),
+    const proc = metricsCollector.sampleProcess();
+    return {
+      cpuPercent: proc.cpuPercent,
+      memoryMb: proc.memoryMb,
+      heapUsedMb: proc.heapUsedMb,
+      uptimeSeconds: proc.uptimeSeconds,
       measured: true
     };
-    this._metricsCache = { at: now, data };
-    return data;
   }
 
-  /** Procesos que el runner local tiene realmente en marcha. */
+  /** Registra localRunner cuando se carga (evita arrastrarlo a memoria en reposo). */
+  registerLocalRunner(runner) {
+    if (runner) this._localRunner = runner;
+  }
+
+  /** Procesos que el runner local tiene realmente en marcha (sin require() en reposo). */
   getLocalProcessStats() {
+    if (!this._localRunner || !this._localRunner.activeRunners) {
+      return { count: 0, ports: [], types: {} };
+    }
     try {
-      // require diferido cacheado: localRunner ya nos importa a nosotros.
-      if (!this._localRunner) this._localRunner = require('./localRunner');
       const runners = Array.from(this._localRunner.activeRunners.values());
+      if (runners.length === 0) return { count: 0, ports: [], types: {} };
       return {
         count: runners.length,
         ports: runners.map(r => r.port).filter(Boolean),
@@ -512,33 +512,27 @@ class ContainerOrchestrator extends EventEmitter {
     }
   }
 
-  /**
-   * Antes esto era `startMetricsSimulation()` y rellenaba CPU, memoria y
-   * latencia de ambos pods con `Math.random()` cada 3 segundos. Un panel que
-   * inventa sus propias métricas es peor que uno vacío: parece que funciona.
-   *
-   * Ahora solo se publica lo que se puede medir. The Forge y The Citadel no
-   * existen todavía como contenedores, así que sus métricas son null y
-   * `provisioned` dice la verdad.
-   */
   startMetricsCollection() {
     if (this.metricsTimer) clearInterval(this.metricsTimer);
     this.metricsTimer = setInterval(() => {
+      // Cero trabajo en reposo si no hay ningún cliente WS conectado ni listeners externos
+      if (this.connectionCounter() === 0 && this.listenerCount('metrics') === 0) return;
+
       const local = this.getLocalProcessStats();
 
-      // The Forge refleja lo que el daemon gestiona de verdad hoy: los procesos
-      // locales en marcha y los watchers activos.
       this.pods.forge.localProcesses = local.count;
       this.pods.forge.localPorts = local.ports;
       this.pods.forge.status = local.count > 0 ? 'running' : 'idle';
 
-      this.emit('metrics', {
-        forge: this.pods.forge,
-        citadel: this.pods.citadel,
-        daemon: this.getDaemonMetrics(),
-        localProcesses: local,
-        trafficAllocation: this.trafficAllocation
-      });
+      if (this.connectionCounter() > 0) {
+        this.emit('metrics', {
+          forge: this.pods.forge,
+          citadel: this.pods.citadel,
+          daemon: this.getDaemonMetrics(),
+          localProcesses: local,
+          trafficAllocation: this.trafficAllocation
+        });
+      }
     }, 3000);
 
     // CRITICAL: Unref the timer so it doesn't prevent clean test/process exit

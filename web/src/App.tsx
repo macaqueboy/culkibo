@@ -1,14 +1,17 @@
 import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
+import { X } from 'lucide-react';
 import { Header, type AppView } from './components/Header';
 import { ProjectList } from './components/ProjectList';
 import { AuthGate } from './components/AuthGate';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { api, getAuthToken, type Project } from './lib/api';
+import { CommandPalette } from './components/CommandPalette';
+import { api, getAuthToken, setUnauthorizedHandler, type Project } from './lib/api';
 import { deployStream } from './lib/deployStream';
 import { liveEvents } from './lib/liveEvents';
 import type { ImportSourceTab } from './components/UniversalImporter';
 
 const ProjectDetail = lazy(() => import('./components/ProjectDetail').then((m) => ({ default: m.ProjectDetail })));
+const ObservabilityView = lazy(() => import('./components/ObservabilityView').then((m) => ({ default: m.ObservabilityView })));
 const UniversalImporter = lazy(() => import('./components/UniversalImporter').then((m) => ({ default: m.UniversalImporter })));
 const DomainManager = lazy(() => import('./components/DomainManager').then((m) => ({ default: m.DomainManager })));
 const ServiceCatalog = lazy(() => import('./components/ServiceCatalog').then((m) => ({ default: m.ServiceCatalog })));
@@ -16,21 +19,59 @@ const AiAgentHub = lazy(() => import('./components/AiAgentHub').then((m) => ({ d
 const LiveLogs = lazy(() => import('./components/LiveLogs').then((m) => ({ default: m.LiveLogs })));
 const SettingsView = lazy(() => import('./components/SettingsView').then((m) => ({ default: m.SettingsView })));
 
-type ToastKind = 'info' | 'success' | 'error';
+export type ToastKind = 'info' | 'success' | 'error';
+
+const VALID_VIEWS: ReadonlySet<AppView> = new Set([
+  'projects',
+  'metrics',
+  'import',
+  'domains',
+  'catalog',
+  'ai',
+  'global_logs',
+  'settings',
+]);
+
+function parseHashRoute(): { view: AppView; projectId: string | null } {
+  const raw = window.location.hash.replace(/^#\/?/, '').trim();
+  if (!raw) return { view: 'projects', projectId: null };
+  const parts = raw.split('/').filter(Boolean);
+  if (parts[0] === 'projects' && parts[1]) {
+    return { view: 'projects', projectId: decodeURIComponent(parts[1]) };
+  }
+  const alias = parts[0] === 'logs' ? 'global_logs' : parts[0];
+  if (VALID_VIEWS.has(alias as AppView)) {
+    return { view: alias as AppView, projectId: null };
+  }
+  return { view: 'projects', projectId: null };
+}
+
+function toHash(view: AppView, projectId: string | null): string {
+  if (projectId) return `#/projects/${encodeURIComponent(projectId)}`;
+  if (view === 'global_logs') return '#/logs';
+  return `#/${view}`;
+}
 
 const ViewFallback = () => (
   <div className="py-16 text-center text-sm text-slate-500">Cargando vista…</div>
 );
 
 export function App() {
+  const initialRoute = parseHashRoute();
   const [authChecked, setAuthChecked] = useState(false);
-  const [authenticated, setAuthenticated] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [sessionOffline, setSessionOffline] = useState(false);
   const [tokenSource, setTokenSource] = useState('data/auth.json');
-  const [activeView, setActiveView] = useState<AppView>('projects');
+
+  const [activeView, setActiveView] = useState<AppView>(initialRoute.view);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(initialRoute.projectId);
   const [importInitialTab, setImportInitialTab] = useState<ImportSourceTab>('wordpress');
-  const [domainWizardAutoOpen, setDomainWizardAutoOpen] = useState(false);
+  const [importTabTrigger, setImportTabTrigger] = useState(0);
+  const [domainWizardTrigger, setDomainWizardTrigger] = useState(0);
   const [createProjectTrigger, setCreateProjectTrigger] = useState(0);
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [catalogInitialTab, setCatalogInitialTab] = useState<'catalogo' | 'instalados'>('catalogo');
+  const [catalogTabTrigger, setCatalogTabTrigger] = useState(0);
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [toast, setToast] = useState<{ msg: string; kind: ToastKind } | null>(null);
@@ -42,33 +83,88 @@ export function App() {
   const aiPulseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncClientsByProjectRef = useRef<Map<string, number>>(new Map());
 
-  useEffect(() => {
+  const checkSession = useCallback(() => {
+    setSessionOffline(false);
     api.getAuthSession()
       .then((s) => {
-        setAuthenticated(s.authenticated);
+        setAuthenticated(Boolean(s.authenticated));
         setTokenSource(s.tokenSource || 'data/auth.json');
       })
       .catch(() => {
-        setAuthenticated(true);
+        setAuthenticated(false);
+        setSessionOffline(true);
       })
       .finally(() => setAuthChecked(true));
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    api.getAuthSession()
+      .then((s) => {
+        if (!active) return;
+        setSessionOffline(false);
+        setAuthenticated(Boolean(s.authenticated));
+        setTokenSource(s.tokenSource || 'data/auth.json');
+      })
+      .catch(() => {
+        if (!active) return;
+        setAuthenticated(false);
+        setSessionOffline(true);
+      })
+      .finally(() => {
+        if (active) setAuthChecked(true);
+      });
+    setUnauthorizedHandler(() => {
+      setAuthenticated(false);
+    });
+    return () => {
+      active = false;
+      setUnauthorizedHandler(null);
+    };
+  }, []);
+
+  // Sincroniza cambios de hash (atrás/adelante del navegador)
+  useEffect(() => {
+    const onHashChange = () => {
+      const parsed = parseHashRoute();
+      setActiveView(parsed.view);
+      setActiveProjectId(parsed.projectId);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  // Atajo global Cmd+K / Ctrl+K para la paleta de comandos
+  useEffect(() => {
+    if (!authenticated) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setPaletteOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [authenticated]);
+
   const showToast = useCallback((msg: string, kind: ToastKind = 'info') => {
     setToast({ msg, kind });
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => setToast(null), 3800);
+    toastTimerRef.current = setTimeout(() => setToast(null), kind === 'error' ? 5500 : 3800);
   }, []);
 
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
 
   const fetchProjects = useCallback(async () => {
     if (!authenticated) return;
     try {
       const data = await api.getProjects();
       setProjects(data);
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+    } finally {
+      setProjectsLoaded(true);
     }
   }, [authenticated]);
 
@@ -83,25 +179,52 @@ export function App() {
     api.getProjects()
       .then((data) => { if (active) setProjects(data); })
       .catch((e) => console.error(e));
+    api.getSyncSummary()
+      .then((summary) => {
+        if (!active || !summary) return;
+        const map = new Map<string, number>();
+        let total = 0;
+        if (Array.isArray(summary.sessions)) {
+          for (const s of summary.sessions) {
+            if (s.projectId && s.connectedClients > 0) {
+              map.set(s.projectId, s.connectedClients);
+              total += s.connectedClients;
+            }
+          }
+        } else if (typeof summary.totalConnectedClients === 'number') {
+          total = summary.totalConnectedClients;
+        }
+        syncClientsByProjectRef.current = map;
+        setActiveSyncCount(total);
+      })
+      .catch(() => {});
     return () => { active = false; };
   }, [authenticated]);
 
   useEffect(() => {
     if (!authenticated) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.port === '5173' ? 'localhost:3030' : window.location.host;
+    const host = window.location.port === '5173' ? '127.0.0.1:3030' : window.location.host;
     const wsUrl = `${protocol}//${host}/ws`;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = 0;
     let disposed = false;
 
-    const connectWs = () => {
+    const connectWs = async () => {
       if (disposed) return;
       try {
+        let protocols: string[] | undefined;
         const storedToken = getAuthToken();
-        const ws = storedToken
-          ? new WebSocket(wsUrl, [`culkibo-token.${storedToken}`])
-          : new WebSocket(wsUrl);
+        if (storedToken) {
+          try {
+            const { ticket } = await api.getWsTicket();
+            if (ticket) protocols = [`culkibo-ticket.${ticket}`];
+          } catch {
+            protocols = [`culkibo-token.${storedToken}`];
+          }
+        }
+        if (disposed) return;
+        const ws = protocols ? new WebSocket(wsUrl, protocols) : new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
@@ -115,7 +238,6 @@ export function App() {
             const { type, data } = parsed;
 
             if (type === 'log') {
-              // Sin useState en App: el bus entrega logs directo a LiveLogs con 0 re-renders globales.
               liveEvents.emitLog(data);
             } else if (type === 'deploy_log') {
               deployStream.emitLog(data);
@@ -183,7 +305,7 @@ export function App() {
           if (disposed) return;
           const backoff = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
           reconnectAttempts++;
-          reconnectTimer = setTimeout(connectWs, backoff);
+          reconnectTimer = setTimeout(() => { void connectWs(); }, backoff);
         };
 
         ws.onerror = () => ws.close();
@@ -191,11 +313,11 @@ export function App() {
         if (disposed) return;
         const backoff = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
         reconnectAttempts++;
-        reconnectTimer = setTimeout(connectWs, backoff);
+        reconnectTimer = setTimeout(() => { void connectWs(); }, backoff);
       }
     };
 
-    connectWs();
+    void connectWs();
 
     return () => {
       disposed = true;
@@ -209,39 +331,52 @@ export function App() {
     };
   }, [authenticated, fetchProjects, showToast]);
 
-  const navigate = (view: AppView) => {
-    setDomainWizardAutoOpen(false);
+  const navigate = useCallback((view: AppView) => {
     setActiveView(view);
     setActiveProjectId(null);
-  };
+    const nextHash = toHash(view, null);
+    if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
+  }, []);
 
-  const handleQuickAction = (action: 'new_project' | 'wordpress' | 'import' | 'domain') => {
+  const selectProject = useCallback((id: string | null) => {
+    setActiveProjectId(id);
+    if (id) setActiveView('projects');
+    const nextHash = toHash('projects', id);
+    if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
+  }, []);
+
+  const openImport = useCallback((source: ImportSourceTab = 'wordpress') => {
+    setActiveProjectId(null);
+    setImportInitialTab(source);
+    setImportTabTrigger((c) => c + 1);
+    setActiveView('import');
+    const nextHash = toHash('import', null);
+    if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
+  }, []);
+
+  const openCatalog = useCallback((tab: 'catalogo' | 'instalados' = 'catalogo') => {
+    setActiveProjectId(null);
+    setCatalogInitialTab(tab);
+    setCatalogTabTrigger((c) => c + 1);
+    setActiveView('catalog');
+    const nextHash = toHash('catalog', null);
+    if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
+  }, []);
+
+  const handleQuickAction = useCallback((action: 'new_project' | 'wordpress' | 'import' | 'domain') => {
     setActiveProjectId(null);
     if (action === 'new_project') {
-      setActiveView('projects');
+      navigate('projects');
       setCreateProjectTrigger((c) => c + 1);
     } else if (action === 'wordpress') {
-      setImportInitialTab('wordpress');
-      setActiveView('import');
+      openImport('wordpress');
     } else if (action === 'import') {
-      setImportInitialTab('coolify');
-      setActiveView('import');
+      openImport('coolify');
     } else if (action === 'domain') {
-      setDomainWizardAutoOpen(true);
-      setActiveView('domains');
+      navigate('domains');
+      setDomainWizardTrigger((c) => c + 1);
     }
-  };
-
-  const getBreadcrumb = () => {
-    if (activeView === 'projects') return 'Tus Proyectos';
-    if (activeView === 'import') return 'Importar y Migrar';
-    if (activeView === 'domains') return 'Dominios y HTTPS';
-    if (activeView === 'catalog') return 'Catálogo 1 clic';
-    if (activeView === 'ai') return 'Agentes IA en directo';
-    if (activeView === 'global_logs') return 'Actividad en vivo';
-    if (activeView === 'settings') return 'Ajustes';
-    return '';
-  };
+  }, [navigate, openImport]);
 
   if (!authChecked) {
     return (
@@ -251,28 +386,58 @@ export function App() {
     );
   }
 
+  if (sessionOffline) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl shadow-sm p-6 text-center space-y-4">
+          <h1 className="text-base font-semibold text-slate-900">No se pudo conectar con Culkibo</h1>
+          <p className="text-xs text-slate-500 leading-relaxed">
+            El servidor del plano de control no responde en este momento. Comprueba que el servicio esté activo y vuelve a intentarlo.
+          </p>
+          <button
+            type="button"
+            onClick={checkSession}
+            className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium transition-colors cursor-pointer"
+          >
+            Reintentar conexión
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (!authenticated) {
     return <AuthGate tokenSource={tokenSource} onAuthenticated={() => setAuthenticated(true)} />;
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 selection:bg-blue-100 selection:text-blue-900 flex flex-col font-sans">
+    <div className="min-h-screen bg-slate-50 text-slate-900 selection:bg-slate-900 selection:text-white flex flex-col font-sans">
       {toast && (
         <div
-          className={`fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-white border text-xs font-medium shadow-xl ${
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-5 right-5 z-50 max-w-sm flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg bg-white border text-xs font-medium shadow-lg ${
             toast.kind === 'error'
-              ? 'border-rose-200 text-rose-800'
+              ? 'border-red-200 text-red-800'
               : toast.kind === 'success'
                 ? 'border-emerald-200 text-emerald-900'
                 : 'border-slate-200 text-slate-900'
           }`}
         >
           <span
-            className={`w-2 h-2 rounded-full ${
-              toast.kind === 'error' ? 'bg-rose-500' : toast.kind === 'success' ? 'bg-emerald-500' : 'bg-blue-600'
+            className={`w-2 h-2 rounded-full shrink-0 ${
+              toast.kind === 'error' ? 'bg-red-500' : toast.kind === 'success' ? 'bg-emerald-500' : 'bg-slate-900'
             }`}
           />
-          <span>{toast.msg}</span>
+          <span className="leading-snug">{toast.msg}</span>
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            aria-label="Cerrar aviso"
+            className="ml-1 p-0.5 text-slate-400 hover:text-slate-700 rounded cursor-pointer shrink-0"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 
@@ -280,29 +445,30 @@ export function App() {
         activeView={activeView}
         setActiveView={navigate}
         wsConnected={wsConnected}
-        breadcrumb={activeProjectId ? undefined : getBreadcrumb()}
         activeProjectId={activeProjectId}
-        setActiveProjectId={setActiveProjectId}
+        setActiveProjectId={(id) => selectProject(id)}
         projects={projects}
         onQuickAction={handleQuickAction}
+        onOpenPalette={() => setPaletteOpen(true)}
         aiPulseLabel={aiPulseLabel}
         activeSyncCount={activeSyncCount}
       />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <ErrorBoundary>
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-7">
+        <ErrorBoundary key={`${activeView}:${activeProjectId || ''}`}>
           <Suspense fallback={<ViewFallback />}>
             {activeView === 'projects' && !activeProjectId && (
               <ProjectList
                 projects={projects}
+                projectsLoading={!projectsLoaded}
                 onRefreshProjects={fetchProjects}
-                onSelectProject={setActiveProjectId}
-                onImportCoolify={() => { setImportInitialTab('coolify'); navigate('import'); }}
-                onOpenWordPress={() => { setImportInitialTab('wordpress'); navigate('import'); }}
-                onOpenCatalog={() => navigate('catalog')}
-                onOpenDomains={() => navigate('domains')}
+                onSelectProject={(id) => selectProject(id)}
+                onImportCoolify={() => openImport('coolify')}
+                onOpenWordPress={() => openImport('wordpress')}
+                onOpenCatalog={() => openCatalog('catalogo')}
+                onOpenDomains={() => handleQuickAction('domain')}
                 onOpenAi={() => navigate('ai')}
-                onNotify={(m) => showToast(m)}
+                onNotify={showToast}
                 externalCreateTrigger={createProjectTrigger}
               />
             )}
@@ -310,68 +476,90 @@ export function App() {
             {activeProjectId && (
               <ProjectDetail
                 projectId={activeProjectId}
-                onBack={() => { setActiveProjectId(null); void fetchProjects(); }}
-                onNotify={(m) => showToast(m)}
+                onBack={() => { selectProject(null); void fetchProjects(); }}
+                onNotify={showToast}
                 onProjectUpdate={fetchProjects}
-                onOpenCatalog={() => navigate('catalog')}
+                onOpenCatalog={() => openCatalog('catalogo')}
               />
+            )}
+
+            {activeView === 'metrics' && !activeProjectId && (
+              <ObservabilityView onNotify={showToast} />
             )}
 
             {activeView === 'import' && !activeProjectId && (
               <UniversalImporter
                 initialSource={importInitialTab}
+                sourceTrigger={importTabTrigger}
                 onComplete={(createdId) => {
                   void fetchProjects();
                   if (createdId) {
-                    setActiveView('projects');
-                    setActiveProjectId(createdId);
+                    selectProject(createdId);
                   } else {
                     navigate('projects');
                   }
                 }}
+                onOpenCatalogInstalled={() => openCatalog('instalados')}
                 onOpenDomains={() => navigate('domains')}
-                onNotify={(m) => showToast(m)}
+                onNotify={showToast}
               />
             )}
 
             {activeView === 'domains' && !activeProjectId && (
               <DomainManager
-                onNotify={(m) => showToast(m)}
-                autoOpenWizard={domainWizardAutoOpen}
+                onNotify={showToast}
+                wizardTrigger={domainWizardTrigger}
               />
             )}
 
             {activeView === 'catalog' && !activeProjectId && (
-              <ServiceCatalog onNotify={(m) => showToast(m)} />
+              <ServiceCatalog
+                onNotify={showToast}
+                initialTab={catalogInitialTab}
+                tabTrigger={catalogTabTrigger}
+              />
             )}
 
             {activeView === 'ai' && !activeProjectId && (
-              <AiAgentHub onNotify={(m) => showToast(m)} />
+              <AiAgentHub onNotify={showToast} />
             )}
 
             {activeView === 'global_logs' && !activeProjectId && (
-              <div className="h-[75vh] bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className="h-[75vh]">
                 <LiveLogs />
               </div>
             )}
 
             {activeView === 'settings' && !activeProjectId && (
-              <SettingsView onNotify={(m) => showToast(m)} />
+              <SettingsView onNotify={showToast} onOpenMetrics={() => navigate('metrics')} />
             )}
           </Suspense>
         </ErrorBoundary>
       </main>
 
-      <footer className="border-t border-slate-200 py-6 bg-white mt-auto">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-3">
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        projects={projects}
+        onNavigate={(v) => navigate(v as AppView)}
+        onSelectProject={(id) => selectProject(id)}
+        onQuickCreateProject={() => handleQuickAction('new_project')}
+        onQuickConnectDomain={() => handleQuickAction('domain')}
+        onQuickImport={(src) => openImport(src || 'wordpress')}
+      />
+
+      <footer className="border-t border-slate-200 py-4 bg-white mt-auto">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-2">
           <div className="flex items-center gap-2">
-            <span className="font-bold text-slate-800">Culkibo v1.0.0</span>
+            <span className="font-semibold text-slate-800">Culkibo v1.0.0</span>
             <span>·</span>
-            <span>Orquestador cloud autohospedado · Apache-2.0</span>
+            <span>Apache-2.0</span>
           </div>
-          <div className="flex items-center gap-4 text-slate-500">
-            <span>Caddy zero-downtime</span>
-            <span>Live Sync Binario &amp; Merkle</span>
+          <div className="flex items-center gap-3 text-slate-400">
+            <span>Caddy</span>
+            <span>·</span>
+            <span>Live Sync</span>
+            <span>·</span>
             <span>MCP 2026-07-28</span>
           </div>
         </div>

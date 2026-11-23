@@ -9,11 +9,15 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:3030',
+        target: 'http://127.0.0.1:3030',
+        changeOrigin: true
+      },
+      '/metrics': {
+        target: 'http://127.0.0.1:3030',
         changeOrigin: true
       },
       '/ws': {
-        target: 'ws://localhost:3030',
+        target: 'ws://127.0.0.1:3030',
         ws: true
       }
     }
@@ -24,10 +28,10 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) {
+          if (/[/\\]node_modules[/\\]react(?:-dom)?[/\\]/.test(id)) {
             return 'vendor';
           }
-          if (id.includes('node_modules/lucide-react')) {
+          if (/[/\\]node_modules[/\\]lucide-react[/\\]/.test(id)) {
             return 'ui';
           }
         }

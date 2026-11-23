@@ -56,9 +56,15 @@ program
     if (options.watch) {
       process.env.CULKIBO_WATCH_DIR = options.watch === true ? process.cwd() : options.watch;
     }
-    const { startServer } = require('../server/index');
+    const { startServer, shutdown } = require('../server/index');
+    const bindHost = process.env.CULKIBO_BIND || process.env.HOST || process.env.CULKIBO_HOST || '127.0.0.1';
     try {
-      await startServer(parseInt(options.port, 10) || 3030, '0.0.0.0');
+      await startServer(parseInt(options.port, 10) || 3030, bindHost);
+      for (const sig of ['SIGINT', 'SIGTERM']) {
+        process.once(sig, () => {
+          shutdown(sig).finally(() => process.exit(0));
+        });
+      }
     } catch (err) {
       console.error(`\x1b[31m❌ No se pudo iniciar el demonio de Culkibo:\x1b[0m`, err.message);
       process.exit(1);
@@ -285,6 +291,7 @@ domainCmd
       console.log(`✨ Dominio ${res.hostname} añadido con éxito.`);
     } catch (err) {
       console.error(`❌ Error al añadir dominio: ${err.message}`);
+      process.exitCode = 1;
     }
   });
 
@@ -313,6 +320,7 @@ domainCmd
       console.log(`✨ Dominio ${updated.hostname}: ${updated.cloudflareProxied ? 'Proxy Cloudflare Activado (Nube Naranja ☁️)' : 'Solo DNS (Nube Gris ☁️)'}`);
     } catch (err) {
       console.error(`❌ Error al alternar proxy: ${err.message}`);
+      process.exitCode = 1;
     }
   });
 
@@ -331,6 +339,7 @@ domainCmd
       console.log(`✨ Dominio ${match.hostname} eliminado con éxito.`);
     } catch (err) {
       console.error(`❌ Error al eliminar dominio: ${err.message}`);
+      process.exitCode = 1;
     }
   });
 
@@ -346,6 +355,7 @@ program
       console.log(`   Recursos: ${res.resourcesCount} | Dominios: ${res.domainsCount}`);
     } catch (err) {
       console.error(`❌ Error al exportar respaldo:`, err.message);
+      process.exitCode = 1;
     }
   });
 
@@ -359,6 +369,7 @@ program
       console.log(`\x1b[32m✅ Proyecto restaurado con éxito:\x1b[0m ${res.restoredName} (ID: ${res.restoredProjectId})`);
     } catch (err) {
       console.error(`❌ Error al restaurar proyecto:`, err.message);
+      process.exitCode = 1;
     }
   });
 
@@ -427,7 +438,7 @@ program
   .option('-u, --url <wsUrl>', 'URL del WebSocket del daemon', process.env.CULKIBO_SYNC_URL || 'ws://127.0.0.1:3030/ws/sync')
   .option('-t, --token <token>', 'Token de autenticación (CULKIBO_TOKEN)', process.env.CULKIBO_TOKEN || '')
   .option('-q, --quiescence <ms>', 'Ventana de agrupación de ráfagas en ms', '12')
-  .option('--reconcile', 'Sincronizar todo el árbol inicial al conectar', true)
+  .option('--no-reconcile', 'Omitir la reconciliación Merkle inicial al conectar')
   .action(async (projectId, directorio = process.cwd(), options) => {
     const client = new svc.LiveSyncClient({
       projectId,
@@ -442,6 +453,9 @@ program
     });
     client.on('sync_error', (err) => {
       console.error(`❌ [Forge] ${err.message}`);
+    });
+    client.on('error', (err) => {
+      console.error(`❌ [Forge:Watcher] ${err.message}`);
     });
 
     const stopSync = async () => {
@@ -572,6 +586,13 @@ program
           error: { code: -32700, message: `Error de parseo: ${err.message}` }
         }) + '\n');
       }
+    });
+
+    // P0-6: garantizar escritura atómica en disco al cerrar stdin del transporte MCP stdio
+    rl.on('close', () => {
+      Promise.resolve(svc.projectManager.flushToDisk()).catch(() => {}).finally(() => {
+        process.exit(0);
+      });
     });
   });
 

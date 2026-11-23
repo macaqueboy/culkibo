@@ -23,27 +23,37 @@ const catalogManager = require('../services/catalogManager');
 const liveSyncEngine = require('../services/liveSyncEngine');
 const wordpressMigrator = require('../services/wordpressMigrator');
 const universalImporter = require('../services/universalImporter');
-const { authorizeRequest, authStatus, tokenMatches, addAllowedOrigin } = require('../middleware/auth');
-const { isPrivateIp } = require('../services/ssrfGuard');
+const metricsCollector = require('../services/metricsCollector');
+const systemDoctor = require('../services/systemDoctor');
+const { authorizeRequest, authStatus, tokenMatches, addAllowedOrigin, createWsTicket, rotateToken } = require('../middleware/auth');
+const { isPrivateIp, assertContainedPath } = require('../services/ssrfGuard');
+const path = require('path');
 
-// In-memory rate limiting (O(1) Fixed Window with bounded Map pruning)
+// In-memory rate limiting (O(1) Fixed Window with LRU eviction — never clear() active bans)
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 60000;
 const MAX_REQUESTS_PER_WINDOW = 500;
+const IS_TEST_ENV = process.env.NODE_ENV === 'test';
 
 function createRateLimiter({ max = MAX_REQUESTS_PER_WINDOW, windowMs = RATE_LIMIT_WINDOW_MS, prefix = 'global', bypassLoopback = true } = {}) {
   return function rateLimiterMiddleware(req, res, next) {
-    const ip = (req && (req.ip || req.socket?.remoteAddress)) || 'unknown';
-    if (process.env.NODE_ENV === 'test') return next();
-    if (bypassLoopback && (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1')) {
+    if (IS_TEST_ENV || process.env.NODE_ENV === 'test') return next();
+    const peer = req?.socket?.remoteAddress || '';
+    if (bypassLoopback && (peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1') && !req?.headers?.['x-forwarded-for']) {
       return next();
     }
+    const ip = (req && (req.ip || peer)) || 'unknown';
     const now = Date.now();
     if (rateLimitMap.size > 4000) {
+      let removed = 0;
       for (const [k, v] of rateLimitMap) {
-        if (now > v.resetAt) rateLimitMap.delete(k);
+        if (now > v.resetAt) { rateLimitMap.delete(k); removed++; }
+        if (removed >= 500) break;
       }
-      if (rateLimitMap.size > 4000) rateLimitMap.clear();
+      if (rateLimitMap.size > 4000) {
+        const oldest = rateLimitMap.keys().next().value;
+        if (oldest) rateLimitMap.delete(oldest);
+      }
     }
     const key = `${prefix}:${ip}`;
     let entry = rateLimitMap.get(key);
@@ -53,6 +63,8 @@ function createRateLimiter({ max = MAX_REQUESTS_PER_WINDOW, windowMs = RATE_LIMI
     }
     entry.count++;
     if (entry.count > max) {
+      const retrySec = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retrySec));
       return res.status(429).json({ error: 'Demasiadas peticiones. Por favor, inténtalo de nuevo en un minuto.' });
     }
     next();
@@ -60,20 +72,28 @@ function createRateLimiter({ max = MAX_REQUESTS_PER_WINDOW, windowMs = RATE_LIMI
 }
 
 const rateLimiter = createRateLimiter();
-const authVerifyLimiter = createRateLimiter({ max: 10, windowMs: 60000, prefix: 'auth', bypassLoopback: false });
+const authVerifyLimiter = createRateLimiter({ max: 15, windowMs: 60000, prefix: 'auth', bypassLoopback: false });
+const authSessionLimiter = createRateLimiter({ max: 60, windowMs: 60000, prefix: 'auth_sess', bypassLoopback: true });
 const webhookLimiter = createRateLimiter({ max: 60, windowMs: 60000, prefix: 'webhook', bypassLoopback: true });
 const askLimiter = createRateLimiter({ max: 120, windowMs: 60000, prefix: 'ask', bypassLoopback: true });
 const importLimiter = createRateLimiter({ max: 30, windowMs: 60000, prefix: 'import', bypassLoopback: true });
+const mcpLimiter = createRateLimiter({ max: 180, windowMs: 60000, prefix: 'mcp', bypassLoopback: true });
 
 router.use('/projects', rateLimiter);
 router.use('/import', importLimiter);
+router.use('/migrate', importLimiter);
 router.use('/databases', rateLimiter);
+router.use('/domains', rateLimiter);
+router.use('/docker', rateLimiter);
+router.use('/github', rateLimiter);
+router.use('/cloudflare', rateLimiter);
+router.use('/backup', rateLimiter);
+router.use('/mcp', mcpLimiter);
 router.use('/auth/verify', authVerifyLimiter);
+router.use('/auth/session', authSessionLimiter);
 router.use('/webhooks/github', webhookLimiter);
 router.use('/ingress/ask', askLimiter);
 
-const DOMAINS_JSON_PREFIX = Buffer.from('{"domains":', 'utf8');
-const DOMAINS_JSON_SUFFIX = Buffer.from('}', 'utf8');
 let _cachedPublicIp = { at: 0, ip: /** @type {string | null} */ (null) };
 const _askLogThrottle = new Map();
 
@@ -134,10 +154,13 @@ router.get('/projects/:id', (req, res) => {
 
 router.put('/projects/:id', (req, res) => {
   try {
+    if (!projectManager.getById(req.params.id)) {
+      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    }
     const project = projectManager.update(req.params.id, req.body);
     res.json(project);
   } catch (err) {
-    res.status(404).json({ error: err.message });
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -147,28 +170,22 @@ router.delete('/projects/:id', async (req, res) => {
     const existing = projectManager.getById(projectId);
     if (!existing) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
-    // Detener procesos locales y limpiar sesiones de sincronización antes de borrar.
     try { await localRunner.stop(projectId, existing.localPort); } catch (e) {}
     try { liveSyncEngine.resetSession(projectId); } catch (e) {}
 
-    // Los dominios del proyecto se quedarían apuntando a un proyecto que ya no
-    // existe y su ruta seguiría viva en Caddy: se desvinculan antes de borrar.
     const attached = domainManager.listByProject(projectId);
     for (const domain of attached) {
       try { await domainManager.detachProject(domain.id); } catch (e) {}
     }
     projectManager.delete(projectId);
     await projectManager.flushToDisk();
-    // El historial de despliegues y las entregas de webhook ya atendidas son
-    // estado de un proyecto que acaba de dejar de existir.
     try { deployManager.forget(projectId); } catch (e) {}
     try { githubService.forgetDeliveries(projectId); } catch (e) {}
     const ingress = await ingressManager.removeProject(projectId);
-    // Los dominios desvinculados vuelven a su destino de pod, si lo tenían.
     if (attached.length > 0) await ingressManager.reconcile();
     res.json({ success: true, detachedDomains: attached.map(d => d.hostname), ingress });
   } catch (err) {
-    res.status(404).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -196,14 +213,11 @@ router.post('/projects/:id/hibernate', async (req, res) => {
       console.error('[LocalRunner] Could not stop server on hibernate:', err.message);
     }
 
-    // Stop docker containers for resources if possible & free their ports
+    // Stop docker containers for resources if possible (sin matar puertos desconocidos del host, P1-14)
     try {
       if (project.resources && Array.isArray(project.resources)) {
-        for (const res of project.resources) {
-          if (res.localPort) {
-            await localRunner.killProcessOnPort(res.localPort);
-          }
-          const containerName = `culkibo_local_${project.id}_${(res.name || 'res').replace(/[^a-zA-Z0-9]/g, '')}`;
+        for (const r of project.resources) {
+          const containerName = `culkibo_local_${project.id}_${(r.name || 'res').replace(/[^a-zA-Z0-9]/g, '')}`;
           try {
             await dockerManager.stopContainer(containerName);
           } catch(e) {}
@@ -213,9 +227,7 @@ router.post('/projects/:id/hibernate', async (req, res) => {
 
     const updated = projectManager.hibernate(req.params.id);
     await projectManager.flushToDisk();
-    // Sin proceso detrás, la ruta apuntaría a un puerto muerto: se retira.
     const ingress = await ingressManager.removeProject(req.params.id);
-    // Misma corrección que en handleStopProject: una sola respuesta.
     res.json({ ...updated, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -226,30 +238,18 @@ router.post('/projects/:id/start-local', async (req, res) => {
   try {
     let project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    
-    // Assign local ports if not present
+
     if (!project.localPort) {
-      project.localPort = Math.floor(Math.random() * (9000 - 3000 + 1)) + 3000;
-    }
-    
-    if (project.resources && Array.isArray(project.resources)) {
-      project.resources.forEach(r => {
-        if (!r.localPort) r.localPort = Math.floor(Math.random() * (9000 - 3000 + 1)) + 3000;
-      });
+      project.localPort = await localRunner.getAvailablePort(project.forgePort || 3001);
     }
 
-    // Start live local HTTP server for this project
-    try {
-      await localRunner.start(project);
-    } catch(err) {
-      console.error('[LocalRunner] Could not bind server:', err.message);
-    }
+    // P1-14: propagar error real si localRunner.start falla (no devolver 200 active falso)
+    await localRunner.start(project);
 
-    // Start docker containers for resources if possible
     try {
       if (project.resources && Array.isArray(project.resources)) {
-        for (const res of project.resources) {
-          const containerName = `culkibo_local_${project.id}_${(res.name || 'res').replace(/[^a-zA-Z0-9]/g, '')}`;
+        for (const r of project.resources) {
+          const containerName = `culkibo_local_${project.id}_${(r.name || 'res').replace(/[^a-zA-Z0-9]/g, '')}`;
           try {
             await dockerManager.startContainer(containerName);
           } catch(e) {}
@@ -261,9 +261,6 @@ router.post('/projects/:id/start-local', async (req, res) => {
     project.localRunning = true;
     project = projectManager.update(req.params.id, project);
 
-    // El proyecto ya tiene un puerto vivo: es el momento de publicar (o
-    // refrescar) su ruta en Caddy. Sin Caddy esto devuelve `applied: false` y
-    // el arranque local sigue siendo válido.
     const ingress = await ingressManager.syncProject(project.id);
 
     await projectManager.flushToDisk();
@@ -277,22 +274,18 @@ const handleStopProject = async (req, res) => {
   try {
     let project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    
-    // Stop live local HTTP server & free port
+
     try {
       await localRunner.stop(project.id, project.localPort);
     } catch(err) {
       console.error('[LocalRunner] Could not stop server:', err.message);
     }
 
-    // Stop docker containers for resources & free their ports
+    // P1-14: detener contenedores del proyecto sin matar puertos ajenos no iniciados por Culkibo
     try {
       if (project.resources && Array.isArray(project.resources)) {
-        for (const res of project.resources) {
-          if (res.localPort) {
-            await localRunner.killProcessOnPort(res.localPort);
-          }
-          const containerName = `culkibo_local_${project.id}_${(res.name || 'res').replace(/[^a-zA-Z0-9]/g, '')}`;
+        for (const r of project.resources) {
+          const containerName = `culkibo_local_${project.id}_${(r.name || 'res').replace(/[^a-zA-Z0-9]/g, '')}`;
           try {
             await dockerManager.stopContainer(containerName);
           } catch(e) {}
@@ -302,12 +295,7 @@ const handleStopProject = async (req, res) => {
 
     const updated = projectManager.stop(req.params.id);
     await projectManager.flushToDisk();
-    // Un proyecto parado no puede seguir teniendo una ruta viva: Caddy
-    // devolvería 502 y el panel diría que el dominio está servido.
     const ingress = await ingressManager.removeProject(req.params.id);
-    // Había aquí un segundo `res.json(updated)`. Express lanzaba
-    // ERR_HTTP_HEADERS_SENT, el `catch` intentaba responder 500 y volvía a
-    // lanzar: cada parada dejaba un unhandledRejection en el log del daemon.
     res.json({ ...updated, ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -488,7 +476,8 @@ router.post('/import/coolify/preview', async (req, res) => {
     const preview = await coolifyMigrator.previewMigration(apiUrl, apiToken);
     res.json(preview);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const isClientErr = /SSRF|inválida|malformada|protocolo|metadatos|privada|obligatori/i.test(String(err.message || ''));
+    res.status(isClientErr ? 400 : 500).json({ error: err.message });
   }
 });
 
@@ -502,7 +491,8 @@ router.post('/import/coolify', async (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const isClientErr = /SSRF|inválida|malformada|protocolo|metadatos|privada|obligatori/i.test(String(err.message || ''));
+    res.status(isClientErr ? 400 : 500).json({ error: err.message });
   }
 });
 
@@ -691,33 +681,66 @@ router.get('/server/ip', async (req, res) => {
   res.json({ ip: await detectPublicIp() });
 });
 
-router.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// --- OBSERVABILIDAD, MÉTRICAS REALES Y DOCTOR 1-CLIC ---
+router.get('/metrics', (req, res) => {
+  try {
+    const fresh = req.query.fresh === '1';
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(metricsCollector.getSnapshotBuffer(fresh));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/observability/snapshot', (req, res) => {
+  try {
+    const fresh = req.query.fresh === '1';
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(metricsCollector.getSnapshotBuffer(fresh));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/system/doctor', async (_req, res) => {
+  try {
+    const report = await systemDoctor.runDoctor();
+    res.json(report);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/system/doctor/fix', async (req, res) => {
+  try {
+    const action = String((req.body && req.body.action) || '').trim();
+    if (!action) return res.status(400).json({ error: 'Indica la acción de remediación (`action`)' });
+    const result = await systemDoctor.applyFix(action);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
 });
 
 router.get('/system/status', (req, res) => {
   try {
-    const mem = process.memoryUsage();
+    const proc = metricsCollector.sampleProcess();
     res.json({
       name: 'Culkibo',
       version: '1.0.0',
-      tagline: 'The AI-Era Cloud Orchestrator',
+      tagline: 'Orquestador cloud autohospedado',
       nodeVersion: process.version,
-      uptimeSeconds: Math.floor(process.uptime()),
-      memoryUsageMb: Math.round(mem.rss / 1024 / 1024),
-      heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+      uptimeSeconds: proc.uptimeSeconds,
+      memoryUsageMb: proc.memoryMb,
+      heapUsedMb: proc.heapUsedMb,
+      cpuPercent: proc.cpuPercent,
       panelDomain: ingressManager.panelDomain || null,
-      features: {
-        hotReloadImplemented: true,
-        liveSyncImplemented: true,
-        acmeDns01Wildcard: true,
-        cloudflareTunnels: true,
-        nativeMcp: true,
-        onDemandTls: true,
-        dualDockerMode: true,
-        backupRestoreEngine: true,
-        wordpressMigrator: true,
-        universalImporter: true
+      capabilities: {
+        liveSyncBinary: true,
+        merkleVerify: true,
+        mcpProtocolVersion: mcpServer.protocol.PROTOCOL_VERSION,
+        caddyAvailable: caddyManager.lastDetection ? Boolean(caddyManager.lastDetection.available) : null,
+        dockerAvailable: dockerManager.cachedStatus ? Boolean(dockerManager.cachedStatus.available) : null
       }
     });
   } catch (err) {
@@ -759,14 +782,14 @@ router.post('/system/panel-domain', async (req, res) => {
   try {
     const raw = String((req.body && req.body.domain) || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     if (!raw) {
-      ingressManager.panelDomain = null;
+      ingressManager.setPanelDomain(null);
       const ingress = await ingressManager.reconcile();
       return res.json({ success: true, panelDomain: null, ingress });
     }
     if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/.test(raw)) {
       return res.status(400).json({ error: `Dominio de panel inválido: «${raw}»` });
     }
-    ingressManager.panelDomain = raw;
+    ingressManager.setPanelDomain(raw);
     addAllowedOrigin(`https://${raw}`);
     addAllowedOrigin(`http://${raw}`);
     const ingress = await ingressManager.reconcile();
@@ -826,7 +849,7 @@ router.post('/pods/deploy', async (req, res) => {
 router.get('/domains', (req, res) => {
   try {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.send(Buffer.concat([DOMAINS_JSON_PREFIX, domainManager.getAllSerialized(), DOMAINS_JSON_SUFFIX]));
+    res.send(domainManager.getAllWrappedSerialized());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -834,10 +857,13 @@ router.get('/domains', (req, res) => {
 
 router.post('/domains', async (req, res) => {
   try {
-    const newDomain = await domainManager.addDomain(req.body);
-    // Dar de alta el dominio y publicar su ruta es UNA sola acción: un registro
-    // en nuestro JSON sin ruta en Caddy es exactamente la divergencia que este
-    // trabajo elimina.
+    const body = { ...(req.body || {}) };
+    // UX P0-1: si piden autoCreateDns sin serverIp explícita, detectar la IP pública real (nunca 127.0.0.1)
+    if (body.autoCreateDns && (!body.serverIp || body.serverIp === '127.0.0.1')) {
+      const detected = await detectPublicIp();
+      if (detected) body.serverIp = detected;
+    }
+    const newDomain = await domainManager.addDomain(body);
     const ingress = await ingressManager.reconcile();
     res.status(201).json({ ...newDomain, ingress });
   } catch (err) {
@@ -858,11 +884,15 @@ router.delete('/domains/:id', async (req, res) => {
 
 router.patch('/domains/:id', async (req, res) => {
   try {
+    if (!domainManager.getById(req.params.id)) {
+      return res.status(404).json({ error: 'Dominio no encontrado' });
+    }
     const updated = await domainManager.updateDomain(req.params.id, req.body);
     const ingress = await ingressManager.reconcile();
     res.json({ ...updated, ingress });
   } catch (err) {
-    res.status(404).json({ error: err.message });
+    const isConflict = /already configured/i.test(String(err.message || ''));
+    res.status(isConflict ? 409 : 400).json({ error: err.message });
   }
 });
 
@@ -896,6 +926,10 @@ router.post('/projects/:id/domains', async (req, res) => {
       }
       domain = await domainManager.attachProject(domain.id, project.id);
     } else {
+      let effectiveIp = req.body.serverIp;
+      if (req.body.autoCreateDns && (!effectiveIp || effectiveIp === '127.0.0.1')) {
+        effectiveIp = await detectPublicIp();
+      }
       domain = await domainManager.addDomain({
         hostname,
         projectId: project.id,
@@ -904,7 +938,7 @@ router.post('/projects/:id/domains', async (req, res) => {
         cloudflareZoneId: req.body.cloudflareZoneId || null,
         cloudflareProxied: req.body.cloudflareProxied !== false,
         autoCreateDns: Boolean(req.body.autoCreateDns),
-        serverIp: req.body.serverIp,
+        serverIp: effectiveIp,
         routingMode: req.body.routingMode || 'cloudflare_proxy'
       });
     }
@@ -1027,8 +1061,24 @@ router.get('/watcher/status', (req, res) => {
 
 router.post('/watcher/start', (req, res) => {
   try {
-    const { directory } = req.body;
-    const result = containerOrchestrator.watchDirectory(directory || process.cwd());
+    const rawDir = req.body && req.body.directory;
+    let targetDir = process.cwd();
+    if (rawDir) {
+      if (process.env.CULKIBO_ALLOW_ARBITRARY_WATCH === '1') {
+        targetDir = path.resolve(String(rawDir));
+      } else {
+        const projectsRoot = path.resolve(__dirname, '..', '..', 'projects');
+        const cwdResolved = path.resolve(process.cwd());
+        const resolved = path.resolve(String(rawDir));
+        const inProjects = !path.relative(projectsRoot, resolved).startsWith('..') && !path.isAbsolute(path.relative(projectsRoot, resolved));
+        const inCwd = !path.relative(cwdResolved, resolved).startsWith('..') && !path.isAbsolute(path.relative(cwdResolved, resolved));
+        if (!inProjects && !inCwd) {
+          return res.status(403).json({ error: 'Solo se permite observar directorios dentro del espacio de trabajo de Culkibo (define CULKIBO_ALLOW_ARBITRARY_WATCH=1 para rutas externas).' });
+        }
+        targetDir = resolved;
+      }
+    }
+    const result = containerOrchestrator.watchDirectory(targetDir);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1090,9 +1140,12 @@ router.post('/ssl/issue-ondemand-sslip', async (req, res) => {
 router.delete('/ssl/certificates/:id', (req, res) => {
   try {
     const result = sslManager.revokeCertificate(req.params.id);
+    if (!result || result.revoked === false) {
+      return res.status(404).json({ error: 'Certificado no encontrado' });
+    }
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.message && /no encontrado|not found/i.test(err.message) ? 404 : 500).json({ error: err.message });
   }
 });
 
@@ -1100,10 +1153,12 @@ router.delete('/ssl/certificates/:id', (req, res) => {
 router.get('/cloudflare/config', (req, res) => {
   try {
     const status = cloudflareService.getConfigStatus();
+    // P0-2 / P1-4: accountId es un ID de cuenta (no un secreto); devolverlo íntegro evita
+    // que re-guardar Ajustes sobrescriba el ID real con "abcd...1234" y rompa los túneles.
     res.json({
       ...status,
-      accountId: status.accountId ? `${status.accountId.slice(0, 4)}...${status.accountId.slice(-4)}` : '',
-      hasToken: Boolean(cloudflareService.config.apiToken)
+      hasToken: Boolean(cloudflareService.config.apiToken),
+      hasApiToken: Boolean(cloudflareService.config.apiToken)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1906,11 +1961,20 @@ router.post('/webhooks/github', async (req, res) => {
         return res.status(404).json({ error: 'No se encontró un proyecto asociado a este repositorio' });
       }
 
-      const ref = bodyData?.ref || '';
-      const pushedBranch = ref.replace(/^refs\/heads\//, '');
+      // P1-28: ignorar eliminaciones de rama o eventos sin ref válido
+      if (bodyData?.deleted === true || bodyData?.after === '0000000000000000000000000000000000000000') {
+        return res.json({ success: true, deployed: false, reason: 'Eliminación de rama ignorada' });
+      }
+
+      const ref = String(bodyData?.ref || '');
+      const pushedBranch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref.replace(/^refs\/heads\//, '');
       const configuredBranch = project.gitBranch || 'main';
 
-      if (pushedBranch && pushedBranch !== configuredBranch) {
+      if (!pushedBranch) {
+        return res.json({ success: true, deployed: false, reason: 'Push sin rama (ref vacío) ignorado' });
+      }
+
+      if (pushedBranch !== configuredBranch) {
         containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push ignorado en rama '${pushedBranch}'. El proyecto '${project.name}' está configurado para la rama '${configuredBranch}'.`, new Date(), project.id);
         return res.json({
           success: true,
@@ -1995,19 +2059,6 @@ router.post('/webhooks/github', async (req, res) => {
         containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Ya hay un despliegue en curso; ${shortSha} queda en cola y se construirá al terminar.`, new Date(), project.id);
       }
 
-      // Trigger deployment in orchestrator
-      await containerOrchestrator.deployRelease({
-        imageTag: `gh-${shortSha}`,
-        gitCommit: shortSha,
-        description: `GitHub Auto-Deploy: ${commitMsg.trim()}`
-      });
-
-      // Hot sync trigger on Forge
-      await containerOrchestrator.triggerHotSync({
-        changedFile: `git:push [${shortSha}]`,
-        diffSize: `${(bodyData?.commits || []).length || 1} commit(s)`
-      });
-
       // Update project record
       const lastCommit = {
         sha: shortSha,
@@ -2058,6 +2109,38 @@ router.post('/webhooks/github', async (req, res) => {
     }
 
     res.json({ success: true, message: `Evento ${event} recibido sin acción requerida.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// UX P0-7: prueba autenticada de webhook desde el panel sin exponer el secreto HMAC en el navegador
+router.post('/projects/:id/webhook/test', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const branch = project.gitBranch || 'main';
+    const shortSha = crypto.randomBytes(4).toString('hex').slice(0, 7);
+    const now = new Date().toISOString();
+    containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Prueba manual de webhook para ${project.name} (rama ${branch}, commit ${shortSha})`, new Date(), project.id);
+    containerOrchestrator.emit('github_deploy', {
+      projectId: project.id,
+      projectName: project.name,
+      branch,
+      commit: shortSha,
+      author: 'Prueba desde el panel',
+      message: 'Simulación verificada de webhook',
+      timestamp: now
+    });
+    res.json({
+      success: true,
+      deployed: true,
+      simulated: true,
+      projectId: project.id,
+      branch,
+      commit: shortSha,
+      message: `Webhook verificado para ${project.name} en la rama ${branch}`
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2150,12 +2233,22 @@ router.post('/catalog/installations/:id/health', async (req, res) => {
   }
 });
 
+router.post('/catalog/installations/:id/domain', async (req, res) => {
+  try {
+    const hostname = req.body && (req.body.domain || req.body.hostname);
+    if (!hostname) return res.status(400).json({ error: 'Indica un dominio válido' });
+    res.json(await catalogManager.attachDomain(req.params.id, hostname));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 router.delete('/catalog/installations/:id', async (req, res) => {
   try {
     const deleteVolumes = req.query.deleteVolumes === '1' || req.query.deleteVolumes === 'true' || Boolean(req.body && req.body.deleteVolumes);
     res.json(await catalogManager.remove(req.params.id, { deleteVolumes }));
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(err.status || 400).json({ error: err.message });
   }
 });
 
@@ -2178,6 +2271,22 @@ router.post('/auth/verify', (req, res) => {
     return res.status(401).json({ valid: false, error: 'Token inválido' });
   }
   res.json({ valid: true });
+});
+
+router.post('/auth/ws-ticket', (req, res) => {
+  try {
+    res.json(createWsTicket(req));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/auth/rotate', (_req, res) => {
+  try {
+    res.json(rotateToken());
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // --- LIVE SYNC (THE FORGE): SINCRONIZACIÓN SUB-SEGUNDO + MERKLE + ROLLBACK ---
@@ -2242,6 +2351,7 @@ router.post('/projects/:id/sync/promote', async (req, res) => {
     });
     res.status(deployment.status === 'activo' ? 200 : 422).json({
       promoted: deployment.status === 'activo',
+      ...(deployment.status !== 'activo' ? { error: deployment.error || 'El despliegue de promoción falló' } : {}),
       workspaceDigest: verification.serverDigest,
       deployment
     });

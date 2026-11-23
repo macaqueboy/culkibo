@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
-  Bot,
   Play,
   Copy,
   Check,
@@ -12,15 +11,17 @@ import {
   XCircle,
   Search,
   Radio,
-  AlertTriangle
+  AlertTriangle,
+  Loader2,
 } from 'lucide-react';
 import type { McpAuditEntry, RemoteAccessInfo } from '../lib/api';
 import { api } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
+import { copyToClipboard } from '../lib/clipboard';
 
 type ClientTab = 'cursor' | 'claude' | 'vscode' | 'cli';
 
-export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onNotify }) => {
+export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void }> = ({ onNotify }) => {
   const [tools, setTools] = useState<any[]>([]);
   const [auditLog, setAuditLog] = useState<McpAuditEntry[]>([]);
   const [mcpConfig, setMcpConfig] = useState<any>(null);
@@ -34,7 +35,6 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
   const [toolResult, setToolResult] = useState<any>(null);
   const [executing, setExecuting] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [livePulse, setLivePulse] = useState(false);
 
   const loadMcpData = async () => {
     try {
@@ -42,7 +42,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
         api.getMcpTools(),
         api.getMcpAudit(),
         api.getMcpConfig(),
-        api.getRemoteAccess().catch(() => null)
+        api.getRemoteAccess().catch(() => null),
       ]);
       setTools(toolsRes.tools || []);
       setAuditLog(auditRes.auditLog || []);
@@ -59,7 +59,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
       api.getMcpTools(),
       api.getMcpAudit(),
       api.getMcpConfig(),
-      api.getRemoteAccess().catch(() => null)
+      api.getRemoteAccess().catch(() => null),
     ])
       .then(([toolsRes, auditRes, cfgRes, remRes]) => {
         if (!active) return;
@@ -72,8 +72,6 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
 
     const offMcp = liveEvents.onMcpCall((entry) => {
       setAuditLog((prev) => [entry, ...prev].slice(0, 60));
-      setLivePulse(true);
-      setTimeout(() => setLivePulse(false), 1800);
     });
     return () => {
       active = false;
@@ -89,6 +87,17 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
       String(t.description || '').toLowerCase().includes(q)
     );
   }, [tools, toolSearch]);
+
+  // P1-17: si el filtro oculta la herramienta activa, usar la primera visible
+  const effectiveToolName = useMemo(() => {
+    if (filteredTools.some((t) => t.name === selectedTool)) return selectedTool;
+    return filteredTools[0]?.name || selectedTool;
+  }, [filteredTools, selectedTool]);
+
+  const currentToolSpec = useMemo(
+    () => tools.find((t) => t.name === effectiveToolName) || null,
+    [tools, effectiveToolName]
+  );
 
   const handleSelectTool = (toolName: string) => {
     setSelectedTool(toolName);
@@ -117,7 +126,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
     setExecuting(true);
     setToolResult(null);
     try {
-      const res = await api.callMcpModern(selectedTool, parsedArgs);
+      const res = await api.callMcpModern(effectiveToolName, parsedArgs);
       setToolResult(res);
     } catch (err: any) {
       setToolResult({ error: err?.message || 'Error ejecutando la herramienta' });
@@ -126,11 +135,16 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
     }
   };
 
-  const copyText = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
+  const copyText = async (text: string, key: string) => {
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    if (!ok) {
+      onNotify?.('No se pudo copiar al portapapeles', 'error');
+      return;
+    }
     setCopiedKey(key);
-    setTimeout(() => setCopiedKey(null), 2000);
-    onNotify?.('Configuración copiada al portapapeles');
+    window.setTimeout(() => setCopiedKey(null), 2000);
+    onNotify?.('Configuración copiada al portapapeles', 'success');
   };
 
   const activeConfigs = connectionScope === 'remote' && remoteInfo?.clientConfigs
@@ -140,87 +154,87 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
   const snippetByTab: Record<ClientTab, { title: string; subtitle: string; code: string }> = {
     cursor: {
       title: 'Cursor / Windsurf / Antigravity (Streamable HTTP)',
-      subtitle: 'Pégalo en la configuración MCP de tu editor (soporta protocolo MCP 2026-07-28):',
-      code: JSON.stringify(activeConfigs?.cursorOrWindsurf || {}, null, 2)
+      subtitle: 'Pégalo en la configuración MCP de tu editor (protocolo MCP 2026-07-28):',
+      code: activeConfigs ? JSON.stringify(activeConfigs.cursorOrWindsurf || {}, null, 2) : 'Cargando configuración…',
     },
     claude: {
       title: 'Claude Desktop (claude_desktop_config.json)',
-      subtitle: 'Abre Ajustes → Desarrollador → Editar configuración y pega este bloque:',
-      code: JSON.stringify(activeConfigs?.claudeDesktop || {}, null, 2)
+      subtitle: connectionScope === 'remote'
+        ? 'Usa este bloque con mcp-remote para conectar Claude Desktop a tu servidor remoto:'
+        : 'Abre Ajustes → Desarrollador → Editar configuración y pega este bloque:',
+      code: activeConfigs ? JSON.stringify(activeConfigs.claudeDesktop || {}, null, 2) : 'Cargando configuración…',
     },
     vscode: {
       title: 'VS Code / GitHub Copilot (.vscode/mcp.json)',
       subtitle: 'Crea o edita .vscode/mcp.json en tu workspace:',
-      code: JSON.stringify(activeConfigs?.vscodeCopilot || {}, null, 2)
+      code: activeConfigs ? JSON.stringify(activeConfigs.vscodeCopilot || {}, null, 2) : 'Cargando configuración…',
     },
     cli: {
-      title: 'Claude Code CLI (1 solo comando)',
-      subtitle: 'Ejecútalo en tu terminal para registrar Culkibo al instante:',
-      code: activeConfigs?.claudeCodeCli || `claude mcp add --transport http culkibo ${window.location.origin}/api/mcp`
-    }
+      title: 'Claude Code CLI',
+      subtitle: 'Ejecútalo en tu terminal para registrar Culkibo:',
+      code: activeConfigs?.claudeCodeCli || `claude mcp add --transport http culkibo ${window.location.origin}/api/mcp`,
+    },
   };
 
   const currentSnippet = snippetByTab[clientTab];
+  const schemaProps = currentToolSpec?.inputSchema?.properties
+    ? Object.entries(currentToolSpec.inputSchema.properties)
+    : [];
+  const requiredProps = new Set<string>(currentToolSpec?.inputSchema?.required || []);
 
   return (
-    <div className="space-y-6 max-w-6xl mx-auto">
-      {/* Banner principal */}
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div className="flex items-center gap-3.5">
-          <div className={`p-3 rounded-xl border transition-colors ${
-            livePulse ? 'bg-blue-100 border-blue-300 text-blue-700' : 'bg-blue-50 border-blue-100 text-blue-600'
-          }`}>
-            <Bot className="w-6 h-6" />
+    <div className="space-y-5">
+      {/* Cabecera fuera de tarjeta */}
+      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <h1 className="text-xl font-semibold text-slate-900 tracking-tight">Agentes de IA (MCP)</h1>
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+              MCP {mcpConfig?.protocol?.current || '2026-07-28'}
+            </span>
           </div>
-          <div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-xl font-bold text-slate-900 tracking-tight">Enlace en directo con tu Agente IA</h1>
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                <span className={`w-2 h-2 rounded-full bg-emerald-500 ${livePulse ? 'animate-ping' : ''}`} />
-                MCP {mcpConfig?.protocol?.current || '2026-07-28'} listo
-              </span>
-            </div>
-            <p className="text-sm text-slate-500 mt-0.5">
-              Conecta Claude, Cursor, Windsurf, VS Code o Antigravity para que desplieguen, gestionen dominios, analicen WordPress y depuren en directo.
-            </p>
-          </div>
+          <p className="text-sm text-slate-500 mt-1">
+            Conecta Claude, Cursor, Windsurf, VS Code o Antigravity para operar despliegues, dominios, bases de datos y diagnóstico en directo.
+          </p>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
-          <span className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-100 text-slate-700 border border-slate-200 tabular-nums">
-            {tools.length} herramientas
+          <span className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white text-slate-700 border border-slate-200 tabular-nums">
+            {tools.length} {tools.length === 1 ? 'herramienta' : 'herramientas'}
           </span>
           <button
             type="button"
+            aria-label="Actualizar herramientas y auditoría"
             onClick={() => void loadMcpData()}
-            className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-600 cursor-pointer"
-            title="Refrescar"
+            className="p-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 cursor-pointer"
+            title="Actualizar"
           >
-            <RefreshCw className="w-4 h-4" />
+            <RefreshCw className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* 1. Conexión en 1 clic */}
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-4">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        {/* 1. Conexión rápida */}
+        <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
           <div className="flex items-center justify-between gap-2 flex-wrap">
-            <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-              <Zap className="w-4 h-4 text-blue-600" />
-              1. Conecta tu agente en 1 clic
+            <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+              <Zap className="w-4 h-4 text-slate-600" />
+              1. Conecta tu agente
             </h2>
             <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-[11px]">
               <button
                 type="button"
                 onClick={() => setConnectionScope('local')}
-                className={`px-2.5 py-1 rounded-md font-semibold cursor-pointer ${connectionScope === 'local' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600'}`}
+                className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${connectionScope === 'local' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600'}`}
               >
                 Local
               </button>
               <button
                 type="button"
                 onClick={() => setConnectionScope('remote')}
-                className={`px-2.5 py-1 rounded-md font-semibold cursor-pointer ${connectionScope === 'remote' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600'}`}
+                className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${connectionScope === 'remote' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600'}`}
               >
                 Remoto (VPS)
               </button>
@@ -232,13 +246,13 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
               { id: 'cursor', label: 'Cursor / Windsurf' },
               { id: 'claude', label: 'Claude Desktop' },
               { id: 'vscode', label: 'VS Code / Copilot' },
-              { id: 'cli', label: 'Claude Code CLI' }
+              { id: 'cli', label: 'Claude Code CLI' },
             ] as const).map((tab) => (
               <button
                 key={tab.id}
                 type="button"
                 onClick={() => setClientTab(tab.id)}
-                className={`px-3 py-1.5 rounded-lg font-medium border cursor-pointer ${
+                className={`px-2.5 py-1.5 rounded-lg font-medium border cursor-pointer transition-colors ${
                   clientTab === tab.id
                     ? 'bg-slate-900 text-white border-slate-900'
                     : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
@@ -251,11 +265,12 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
 
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-semibold text-slate-800">{currentSnippet.title}</span>
+              <span className="text-xs font-medium text-slate-800">{currentSnippet.title}</span>
               <button
                 type="button"
-                onClick={() => copyText(currentSnippet.code, clientTab)}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-700 border border-slate-200 cursor-pointer"
+                disabled={!activeConfigs}
+                onClick={() => void copyText(currentSnippet.code, clientTab)}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-700 border border-slate-200 cursor-pointer disabled:opacity-40"
               >
                 {copiedKey === clientTab ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>{copiedKey === clientTab ? 'Copiado' : 'Copiar'}</span>
@@ -268,14 +283,14 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
           </div>
         </div>
 
-        {/* 2. Probador interactivo MCP 2026-07-28 */}
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-4">
+        {/* 2. Probador interactivo */}
+        <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-              <Terminal className="w-4 h-4 text-blue-600" />
-              2. Probar herramientas en vivo (POST /api/mcp)
+            <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+              <Terminal className="w-4 h-4 text-slate-600" />
+              2. Probar herramienta en vivo
             </h2>
-            <span className="text-[11px] font-mono text-slate-400">2026-07-28</span>
+            <span className="text-[11px] font-mono text-slate-400">POST /api/mcp</span>
           </div>
 
           <div className="space-y-3">
@@ -285,35 +300,57 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
                 type="text"
                 value={toolSearch}
                 onChange={(e) => setToolSearch(e.target.value)}
-                placeholder="Filtrar herramientas (ej. wordpress, domain, deploy…)"
-                className="w-full pl-8 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:bg-white focus:outline-none"
+                placeholder="Filtrar herramientas (ej. doctor, metrics, wordpress, domain…)"
+                className="w-full pl-8 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-xs"
               />
             </div>
 
             <select
-              value={selectedTool}
+              aria-label="Seleccionar herramienta MCP"
+              value={effectiveToolName}
               onChange={(e) => handleSelectTool(e.target.value)}
-              className="w-full px-3 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono text-slate-800"
+              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
             >
               {filteredTools.map((t) => (
                 <option key={t.name} value={t.name}>
-                  {t.name} — {String(t.description || '').slice(0, 62)}
+                  {t.name}
                 </option>
               ))}
             </select>
 
+            {currentToolSpec && (
+              <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-1.5">
+                <p className="text-slate-700 leading-relaxed">{currentToolSpec.description}</p>
+                {schemaProps.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {schemaProps.map(([paramName, schema]: [string, any]) => (
+                      <span
+                        key={paramName}
+                        title={schema?.description || ''}
+                        className="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-600"
+                      >
+                        {paramName}
+                        {requiredProps.has(paramName) ? '*' : ''}
+                        {schema?.type ? `: ${schema.type}` : ''}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">Argumentos (JSON)</label>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Argumentos (JSON)</label>
               <textarea
                 value={toolArgs}
                 onChange={(e) => setToolArgs(e.target.value)}
                 rows={3}
-                className="w-full p-3 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono text-slate-800"
+                className="w-full p-3 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
               />
             </div>
 
             {jsonError && (
-              <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-700 flex items-center gap-1.5">
+              <div role="alert" className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 flex items-center gap-1.5">
                 <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                 <span>{jsonError}</span>
               </div>
@@ -321,12 +358,12 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
 
             <button
               type="button"
-              onClick={handleExecuteTool}
-              disabled={executing}
-              className="w-full py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              onClick={() => void handleExecuteTool()}
+              disabled={executing || !effectiveToolName}
+              className="w-full py-2 px-4 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium text-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
             >
-              <Play className={`w-3.5 h-3.5 ${executing ? 'animate-spin' : ''}`} />
-              <span>{executing ? 'Ejecutando…' : 'Ejecutar ahora'}</span>
+              {executing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+              <span>{executing ? 'Ejecutando…' : 'Ejecutar herramienta'}</span>
             </button>
 
             {toolResult && (
@@ -338,47 +375,49 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
         </div>
       </div>
 
-      {/* 3. Feed en directo de llamadas del Agente IA */}
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+      {/* 3. Registro de auditoría en tiempo real */}
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-2">
-            <Radio className={`w-4 h-4 ${livePulse ? 'text-blue-600 animate-ping' : 'text-emerald-600'}`} />
-            <h2 className="text-sm font-bold text-slate-900">Actividad del agente en tiempo real</h2>
+            <Radio className="w-4 h-4 text-emerald-600" />
+            <h2 className="text-xs font-semibold text-slate-900">Actividad del agente en directo</h2>
           </div>
-          <div className="flex items-center gap-2 text-xs text-slate-500">
+          <div className="flex items-center gap-1.5 text-xs text-slate-500 tabular-nums">
             <Shield className="w-3.5 h-3.5 text-slate-400" />
-            <span>Secretos redactados automáticamente · {auditLog.length} llamadas</span>
+            <span>
+              Secretos redactados · {auditLog.length} {auditLog.length === 1 ? 'llamada' : 'llamadas'}
+            </span>
           </div>
         </div>
 
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-xs">
             <thead>
-              <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold text-slate-600">
-                <th className="py-3 px-4">Hora</th>
-                <th className="py-3 px-4">Herramienta</th>
-                <th className="py-3 px-4">Agente</th>
-                <th className="py-3 px-4">Latencia</th>
-                <th className="py-3 px-4">Estado</th>
-                <th className="py-3 px-4">Resumen</th>
+              <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-medium text-slate-500">
+                <th className="py-2.5 px-4">Hora</th>
+                <th className="py-2.5 px-4">Herramienta</th>
+                <th className="py-2.5 px-4">Agente</th>
+                <th className="py-2.5 px-4">Latencia</th>
+                <th className="py-2.5 px-4">Estado</th>
+                <th className="py-2.5 px-4">Resumen</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {auditLog.map((log) => (
                 <tr key={log.id} className="hover:bg-slate-50/70">
-                  <td className="py-2.5 px-4 text-slate-500 font-mono tabular-nums">
+                  <td className="py-2.5 px-4 text-slate-500 font-mono tabular-nums whitespace-nowrap">
                     {new Date(log.timestamp).toLocaleTimeString('es-ES')}
                   </td>
-                  <td className="py-2.5 px-4 font-mono font-semibold text-blue-700">{log.toolName}</td>
-                  <td className="py-2.5 px-4 text-slate-600">{log.agent || 'MCP'}</td>
-                  <td className="py-2.5 px-4 text-emerald-700 font-mono font-semibold tabular-nums">{log.durationMs} ms</td>
-                  <td className="py-2.5 px-4">
+                  <td className="py-2.5 px-4 font-mono font-medium text-slate-900 whitespace-nowrap">{log.toolName}</td>
+                  <td className="py-2.5 px-4 text-slate-600 whitespace-nowrap">{log.agent || 'MCP'}</td>
+                  <td className="py-2.5 px-4 text-emerald-700 font-mono font-medium tabular-nums whitespace-nowrap">{log.durationMs} ms</td>
+                  <td className="py-2.5 px-4 whitespace-nowrap">
                     {log.success !== false ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
                         <CheckCircle2 className="w-3 h-3" /> OK
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-rose-50 text-rose-700 border border-rose-200">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-red-50 text-red-700 border border-red-200">
                         <XCircle className="w-3 h-3" /> Error
                       </span>
                     )}
@@ -391,7 +430,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string) => void }> = ({ onN
               {auditLog.length === 0 && (
                 <tr>
                   <td colSpan={6} className="py-8 text-center text-slate-500">
-                    Aún no hay llamadas registradas. Conecta tu agente arriba o prueba una herramienta en vivo.
+                    Todavía no hay llamadas registradas. Conecta tu agente arriba o ejecuta una herramienta de prueba.
                   </td>
                 </tr>
               )}

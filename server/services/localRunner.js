@@ -6,7 +6,25 @@ const fs = require('fs');
 const http = require('http');
 const { assertContainedPath, isPrivateIp, isMetadataIp } = require('./ssrfGuard');
 
-const PROJECTS_ROOT = path.resolve(process.cwd(), 'projects');
+const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.resolve(process.env.CULKIBO_DATA_DIR)
+  : path.resolve(__dirname, '..', '..');
+const PROJECTS_ROOT = path.resolve(ROOT_BASE_DIR, 'projects');
+
+const OFFLINE_PAGE_CSS = `
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fafafa;color:#18181b;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;padding:24px;}
+  .card{max-width:560px;width:100%;background:#fff;border:1px solid #e4e4e7;border-radius:12px;padding:28px;box-shadow:0 1px 3px rgba(24,24,27,.06);}
+  h1{margin:0 0 6px;font-size:18px;font-weight:600;color:#18181b;}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:3px 10px;border-radius:999px;border:1px solid #e4e4e7;background:#f4f4f5;color:#3f3f46;}
+  .pill.warn{background:#fffbeb;border-color:#fde68a;color:#92400e;}
+  .pill.ok{background:#ecfdf5;border-color:#a7f3d0;color:#065f46;}
+  p{font-size:14px;color:#52525b;line-height:1.55;margin:14px 0;}
+  code{background:#f4f4f5;border:1px solid #e4e4e7;border-radius:6px;padding:1px 6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#18181b;}
+  pre{background:#fafafa;border:1px solid #e4e4e7;border-radius:8px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#27272a;overflow:auto;max-height:240px;white-space:pre-wrap;margin:14px 0;}
+  .btn{display:inline-block;text-decoration:none;background:#18181b;color:#fff;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:600;}
+  .btn:hover{background:#27272a;}
+  .foot{margin-top:18px;padding-top:14px;border-top:1px solid #f4f4f5;display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#71717a;}
+`;
 
 /** Puertos reservados del sistema/infraestructura que `killProcessOnPort` JAMÁS debe matar. */
 const RESERVED_PORTS = new Set([22, 53, 80, 443, 2019, 2375, 2376, 3306, 5432, 6379, 27017]);
@@ -386,19 +404,18 @@ class LocalRunner {
         .once('listening', () => {
           tester.once('close', () => resolve(true)).close();
         })
-        .listen(port);
+        .listen(port, '0.0.0.0');
     });
 
     const reservedActive = new Set(Array.from(this.activeRunners.values()).map(r => r && r.port).filter(Boolean));
     let port = Math.max(1024, parseInt(String(desiredPort || 3001), 10) || 3001);
     while (port < 65535) {
-      // Saltar el puerto del daemon, puertos reservados y otros proyectos activos.
       if (port !== this.daemonPort() && !RESERVED_PORTS.has(port) && !reservedActive.has(port) && await isPortFree(port)) {
         return port;
       }
       port++;
     }
-    return Math.floor(Math.random() * (9000 - 3100 + 1)) + 3100;
+    throw new Error('No se encontró ningún puerto libre disponible en el host');
   }
 
   /**
@@ -407,11 +424,9 @@ class LocalRunner {
   async start(project) {
     if (!project || !project.id) throw new Error('Proyecto inválido');
 
-    // Two concurrent POST /start-local for the same project used to race through
-    // getAvailablePort() and spawn two processes on the same port. Serialise them.
-    const inFlight = this.startLocks.get(project.id);
-    if (inFlight) {
-      try { await inFlight; } catch (e) {}
+    // P1-13: bucle `while` (no `if`) para serializar >=3 llamadas concurrentes
+    while (this.startLocks.has(project.id)) {
+      try { await this.startLocks.get(project.id); } catch (e) {}
     }
 
     const task = this._startInternal(project).finally(() => {
@@ -662,9 +677,19 @@ class LocalRunner {
     } else if (scripts['start']) {
       cmd = 'npm';
       args = ['run', 'start', '--', '-p', String(port)];
-    } else if (pkg.main && fs.existsSync(path.join(projectDir, pkg.main))) {
-      cmd = 'node';
-      args = [pkg.main];
+    } else if (pkg.main) {
+      // P1-13: confinar pkg.main al directorio del proyecto (impide ../../escape.js)
+      /** @type {string | null} */
+      let safeMain = null;
+      try {
+        safeMain = assertContainedPath(projectDir, String(pkg.main));
+      } catch (e) {
+        safeMain = null;
+      }
+      if (safeMain && fs.existsSync(safeMain)) {
+        cmd = 'node';
+        args = [path.relative(projectDir, safeMain)];
+      }
     }
 
     console.log(`[LocalRunner] Starting real process for ${project.name}: ${cmd} ${args.join(' ')} on port ${port} (cwd: ${projectDir})`);
@@ -738,7 +763,7 @@ class LocalRunner {
           projectName: project.name,
           url: `http://localhost:${port}`
         });
-        await this.startCrashDiagnosticsServer(project, projectDir, port, details);
+        await this.startCrashDiagnosticsServer(project, projectDir, port, details, generation);
       }
     });
 
@@ -758,8 +783,14 @@ class LocalRunner {
   /**
    * Diagnostic fallback server shown when a development process fails on boot
    */
-  async startCrashDiagnosticsServer(project, projectDir, port, errorDetails) {
+  async startCrashDiagnosticsServer(project, projectDir, port, errorDetails, generation = null) {
+    if (generation !== null && this.isStale(project.id, generation)) {
+      return { port, success: false, stale: true };
+    }
     await this.killProcessOnPort(port);
+    if (generation !== null && this.isStale(project.id, generation)) {
+      return { port, success: false, stale: true };
+    }
 
     const server = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -767,31 +798,16 @@ class LocalRunner {
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <title>Aviso de Ejecución — ${escapeHtml(project.name)}</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>Aviso de ejecución — ${escapeHtml(project.name)}</title>
+  <style>${OFFLINE_PAGE_CSS}</style>
 </head>
-<body class="bg-slate-50 min-h-screen flex items-center justify-center font-sans p-4">
-  <div class="max-w-xl w-full bg-white p-8 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-    <div class="flex items-center gap-3">
-      <div class="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center text-2xl font-bold">
-        ⚠️
-      </div>
-      <div>
-        <h1 class="text-xl font-bold text-slate-900">${escapeHtml(project.name)}</h1>
-        <span class="text-xs text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full font-semibold">
-          Error en el servidor de desarrollo (: ${port})
-        </span>
-      </div>
-    </div>
-    <p class="text-sm text-slate-600">El proceso local se detuvo con el siguiente mensaje de diagnóstico:</p>
-    <pre class="bg-slate-900 text-slate-100 p-4 rounded-xl text-xs font-mono overflow-x-auto max-h-56 whitespace-pre-wrap">${escapeHtml(errorDetails || 'Sin detalles de error reportados')}</pre>
-    <div class="space-y-2 pt-2">
-      <div class="flex gap-3">
-        <a href="http://localhost:3030" class="flex-1 text-center px-4 py-2.5 bg-slate-900 text-white rounded-xl text-xs font-semibold hover:bg-slate-800 transition-colors">
-          Volver a Culkibo
-        </a>
-      </div>
-    </div>
+<body>
+  <div class="card">
+    <h1>${escapeHtml(project.name)}</h1>
+    <span class="pill warn">Error en el servidor de desarrollo (:${port})</span>
+    <p>El proceso local se detuvo con el siguiente diagnóstico:</p>
+    <pre>${escapeHtml(errorDetails || 'Sin detalles de error reportados')}</pre>
+    <a href="http://localhost:${this.daemonPort()}" class="btn">Volver a Culkibo</a>
   </div>
 </body>
 </html>`);
@@ -799,6 +815,10 @@ class LocalRunner {
 
     return new Promise((resolve) => {
       server.listen(port, '0.0.0.0', () => {
+        if (generation !== null && this.isStale(project.id, generation)) {
+          try { server.close(); } catch (e) {}
+          return resolve({ port, success: false, stale: true });
+        }
         this.activeRunners.set(project.id, {
           type: 'crash_diagnostics',
           server,
@@ -900,6 +920,11 @@ class LocalRunner {
       try {
         reqPath = decodeURIComponent(reqPath);
       } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('400 Bad Request');
+      }
+      // P1-13: bloquear bytes nulos (%00) que lanzarían ERR_INVALID_ARG_VALUE en fs.existsSync
+      if (reqPath.includes('\0')) {
         res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end('400 Bad Request');
       }
@@ -1317,31 +1342,42 @@ class LocalRunner {
    */
   async prepareProject(project) {
     if (!project || !project.id) return;
+    if (this.cloningLocks.has(project.id)) return this.cloningLocks.get(project.id);
     const projectDir = this.resolveProjectDir(project.id);
     if (fs.existsSync(projectDir)) return; // Already present
 
     const gitUrl = project.gitRepo || (project.resources && project.resources.find(r => r.gitRepo)?.gitRepo);
     if (!gitUrl) return;
 
-    console.log(`[LocalRunner] Auto-preparing project ${project.name} in background...`);
     const cloneUrl = this.normalizeGitUrl(gitUrl);
     if (!cloneUrl) return;
-    try {
-      this.cleanDirectory(projectDir);
-      await this.gitClone(cloneUrl, projectDir, { timeout: 180000 });
+    /** @type {Promise<void> | null} */
+    let task = null;
+    task = (async () => {
+      console.log(`[LocalRunner] Auto-preparing project ${project.name} in background...`);
+      try {
+        this.cleanDirectory(projectDir);
+        await this.gitClone(cloneUrl, projectDir, { timeout: 180000 });
 
-      const resolved = this.resolveRunnableDirectory(projectDir, project.baseDirectory);
-      if (resolved.type === 'node') {
-        await this.npmInstall(resolved.path, { timeout: 180000 });
+        const resolved = this.resolveRunnableDirectory(projectDir, project.baseDirectory);
+        if (resolved.type === 'node') {
+          await this.npmInstall(resolved.path, { timeout: 180000 });
+        }
+        console.log(`[LocalRunner] Auto-preparation complete for ${project.name}`);
+      } catch (e) {
+        console.warn(`[LocalRunner] Auto-preparation warning for ${project.name}:`, e.message);
+      } finally {
+        if (this.cloningLocks.get(project.id) === task) {
+          this.cloningLocks.delete(project.id);
+        }
       }
-      console.log(`[LocalRunner] Auto-preparation complete for ${project.name}`);
-    } catch(e) {
-      console.warn(`[LocalRunner] Auto-preparation warning for ${project.name}:`, e.message);
-    }
+    })();
+    this.cloningLocks.set(project.id, task);
+    return task;
   }
 
   /**
-   * Fallback sandbox server for apps without local code
+   * Fallback sandbox server for apps without local code (100% offline CSS)
    */
   async startFallbackServer(project, projectDir, port) {
     const server = http.createServer((req, res) => {
@@ -1350,24 +1386,17 @@ class LocalRunner {
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <title>${escapeHtml(project.name)} — Servidor Local (: ${port})</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>${escapeHtml(project.name)} — Servidor local (:${port})</title>
+  <style>${OFFLINE_PAGE_CSS}</style>
 </head>
-<body class="bg-slate-50 min-h-screen flex flex-col items-center justify-center font-sans p-4">
-  <div class="max-w-xl w-full bg-white p-8 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-    <div class="flex items-center gap-3">
-      <div class="text-3xl">${escapeHtml(project.icon || '🚀')}</div>
-      <div>
-        <h1 class="text-xl font-bold text-slate-900">${escapeHtml(project.name)}</h1>
-        <span class="inline-flex items-center gap-1.5 text-xs text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full font-semibold border border-emerald-200">
-          ● Ejecutándose en local :${port}
-        </span>
-      </div>
-    </div>
-    <p class="text-sm text-slate-600">Este proyecto no contiene archivos en el directorio local de Culkibo. Puedes clonar su repositorio o añadir código en <code class="bg-slate-100 px-2 py-0.5 rounded text-blue-700 font-mono">${escapeHtml(projectDir)}</code>.</p>
-    <div class="pt-2 border-t border-slate-100 flex justify-between items-center text-xs text-slate-400">
+<body>
+  <div class="card">
+    <h1>${escapeHtml(project.name)}</h1>
+    <span class="pill ok">Ejecutándose en local :${port}</span>
+    <p>Este proyecto todavía no tiene código en el directorio local de Culkibo. Clona su repositorio o añade archivos en <code>${escapeHtml(projectDir)}</code>.</p>
+    <div class="foot">
       <span>Culkibo v1.0.0 Local Runner</span>
-      <a href="http://localhost:3030" class="text-blue-600 hover:underline">Volver a Culkibo &rarr;</a>
+      <a href="http://localhost:${this.daemonPort()}" style="color:#18181b;font-weight:600;text-decoration:none;">Volver a Culkibo &rarr;</a>
     </div>
   </div>
 </body>
@@ -1460,4 +1489,11 @@ class LocalRunner {
   }
 }
 
-module.exports = new LocalRunner();
+const localRunnerInstance = new LocalRunner();
+try {
+  const co = require('./containerOrchestrator');
+  if (co && typeof co.registerLocalRunner === 'function') {
+    co.registerLocalRunner(localRunnerInstance);
+  }
+} catch (e) {}
+module.exports = localRunnerInstance;

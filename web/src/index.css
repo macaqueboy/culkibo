@@ -1,25 +1,8 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
- * Paleta: se conservan los nombres de clase `slate-*` y se redefinen sus
- * valores.
- *
- * Motivo, medido en OKLCH sobre el CSS que estas empresas sirven en producción
- * (escalón de borde):
- *
- *   Vercel  gray-300  #e6e6e6   croma 0.0000
- *   Linear  border    #e9e8ea   croma 0.0029
- *   zinc-200          #e4e4e7   croma 0.0040
- *   Stripe  gray100   #ebeef1   croma 0.0052
- *   slate-200         #e2e8f0   croma 0.0126   <-- 2-4x mas cromatico
- *
- * A ese nivel de croma el tinte azul no da caracter: es el rasgo que delata una
- * interfaz de plantilla. El rediseno de Linear de 2026 se movio explicitamente
- * "de tonos azulados frios hacia grises mas calidos".
- *
- * Los valores de abajo son la rampa `zinc` (croma ~0.004, tono 286, casi
- * identico al 308 de Linear). Cambiar aqui reescribe las 1075 utilidades
- * `slate-*` del codigo sin tocar ni una clase.
+ * Paleta neutra cálida (rampa zinc, croma ~0.004) bajo los nombres de clase
+ * `slate-*`, inspirada en Linear, Vercel y Stripe.
  * ------------------------------------------------------------------------- */
 @theme {
   --color-slate-50:  #fafafa;
@@ -34,13 +17,7 @@
   --color-slate-900: #18181b;
   --color-slate-950: #09090b;
 
-  /* Sombras.
-   * Las de Tailwind por defecto van a 10%+10% de alfa (y 25% en 2xl): entre 2 y
-   * 5 veces mas pesadas que cualquier referencia premium. Las de abajo siguen
-   * el patron comun a Linear, Vercel y Stripe: un anillo translucido de 1px que
-   * dibuja el borde, mas una o dos capas difusas al 4-8%, y el color de la
-   * sombra tenido hacia el tono de la superficie en lugar de negro puro
-   * (Stripe usa rgb(64 68 82 / 8%), no #000). */
+  /* Sombras: anillo translúcido de 1px + capas difusas muy sutiles. */
   --shadow-2xs: 0 1px 1px 0 rgb(24 24 27 / 0.04);
   --shadow-xs:  0 0 0 1px rgb(24 24 27 / 0.04), 0 1px 1px 0 rgb(24 24 27 / 0.04);
   --shadow-sm:  0 0 0 1px rgb(24 24 27 / 0.04), 0 1px 3px -1px rgb(24 24 27 / 0.06);
@@ -53,20 +30,30 @@
 :root {
   font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   color-scheme: light;
-
-  /* En pantallas de alta densidad un borde puede medir medio pixel real. Es el
-   * truco que usa Linear para que las lineas no se vean gruesas en un portatil. */
-  --border-hairline: 1px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-@media only screen and ((min-device-pixel-ratio: 2) or (min-resolution: 192dpi)) {
-  :root { --border-hairline: 0.5px; }
-}
-
-/* Foco neutro, nunca azul, y via box-shadow para que respete el radio. */
+/* Foco neutro consistente, nunca azul, respetando el radio del componente. */
 :focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px #ffffff, 0 0 0 4px rgb(24 24 27 / 0.40);
+  box-shadow: 0 0 0 2px #ffffff, 0 0 0 4px rgb(24 24 27 / 0.35);
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: #18181b;
+  box-shadow: 0 0 0 3px rgb(24 24 27 / 0.10);
+}
+
+h1, h2, h3 {
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
 }
 
 code, pre, .font-mono {
@@ -75,15 +62,13 @@ code, pre, .font-mono {
 
 body {
   background-color: #fafafa;
-  /* Nunca #000 ni casi-negro azulado. Stripe usa #414552 para texto primario y
-   * mide 9.55:1 sobre blanco: sobra contraste y se lee mucho menos duro. */
   color: #18181b;
   min-height: 100vh;
   margin: 0;
   overflow-x: hidden;
 }
 
-/* Barras de desplazamiento en la misma rampa neutra */
+/* Barras de desplazamiento neutras */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

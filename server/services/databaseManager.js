@@ -737,6 +737,8 @@ class DatabaseManager extends EventEmitter {
       '--cpus', String(cpus),
       '--pids-limit', '512',
       '--security-opt', 'no-new-privileges',
+      '--log-opt', 'max-size=10m',
+      '--log-opt', 'max-file=3',
       '--health-cmd', engine.health({ username, dbName }),
       '--health-interval', '10s',
       '--health-timeout', '5s',
@@ -832,9 +834,38 @@ class DatabaseManager extends EventEmitter {
     );
     if (taken) throw new Error(`El puerto ${port} ya lo usa otra base de datos gestionada`);
 
+    // P1-11: comprobar disponibilidad real del puerto antes de destruir el contenedor vivo
+    const prevExposure = record.exposure ? { ...record.exposure } : { enabled: false, bindAddress: '127.0.0.1', hostPort: null };
+    const prevStatus = record.status;
+    const isSamePort = prevExposure.enabled && prevExposure.hostPort === port && prevExposure.bindAddress === bind;
+    if (!isSamePort) {
+      const portFree = await new Promise((resolve) => {
+        const probe = net.createServer()
+          .once('error', () => resolve(false))
+          .once('listening', () => probe.once('close', () => resolve(true)).close())
+          .listen(port, bind);
+      });
+      if (!portFree) {
+        throw new Error(`El puerto ${bind}:${port} ya está ocupado en el host`);
+      }
+    }
+
     record.exposure = { enabled: true, bindAddress: bind, hostPort: port };
-    await this.recreateContainer(record);
-    this.save();
+    try {
+      await this.recreateContainer(record);
+      this.save();
+    } catch (err) {
+      // Restaurar metadatos previos e intentar recuperar contenedor anterior para evitar pérdida de servicio
+      record.exposure = prevExposure;
+      record.status = 'error';
+      record.lastError = err.message;
+      try {
+        await this.recreateContainer(record);
+        record.status = prevStatus || 'running';
+      } catch (e2) {}
+      this.save();
+      throw err;
+    }
 
     return {
       ...this.toPublic(record),
@@ -878,6 +909,8 @@ class DatabaseManager extends EventEmitter {
       '--cpus', String(record.cpus),
       '--pids-limit', '512',
       '--security-opt', 'no-new-privileges',
+      '--log-opt', 'max-size=10m',
+      '--log-opt', 'max-file=3',
       '--health-cmd', engine.health({ username: record.username, dbName: record.dbName }),
       '--health-interval', '10s',
       '--health-timeout', '5s',
@@ -885,7 +918,8 @@ class DatabaseManager extends EventEmitter {
       '--health-start-period', '40s',
       '--label', 'culkibo.managed=true',
       '--label', `culkibo.project=${record.projectId}`,
-      '--label', `culkibo.database=${record.id}`
+      '--label', `culkibo.database=${record.id}`,
+      '--label', `culkibo.engine=${record.engine}`
     ];
 
     if (record.exposure && record.exposure.enabled) {
@@ -1209,9 +1243,6 @@ class DatabaseManager extends EventEmitter {
       );
 
       await this.docker(['cp', `${record.containerName}:${containerPath}`, localPath], { timeout: 3600 * 1000 });
-      try {
-        await this.docker(['exec', record.containerName, 'rm', '-f', containerPath], { timeout: 30000 });
-      } catch (e) {}
 
       // mongodump ya sale comprimido con --gzip; el resto no.
       let finalPath = localPath;
@@ -1258,6 +1289,9 @@ class DatabaseManager extends EventEmitter {
       this.emit('backup_failed', { databaseId: id, error: record.lastError });
       throw new Error(`Copia fallida: ${record.lastError}`);
     } finally {
+      try {
+        await this.docker(['exec', record.containerName, 'rm', '-f', containerPath], { timeout: 30000 });
+      } catch (e) {}
       if (configInContainer) {
         try {
           await this.docker(['exec', record.containerName, 'rm', '-f', configInContainer], { timeout: 15000 });
@@ -1332,6 +1366,14 @@ class DatabaseManager extends EventEmitter {
         archivePath = path.join(dir, entry.fileName);
         await s3.downloadFile(entry.remote.key, archivePath);
         downloaded = true;
+        // P1-12: verificar integridad sha256 también al descargar desde S3
+        if (entry.sha256) {
+          const actual = await this.sha256File(archivePath);
+          if (actual !== entry.sha256) {
+            try { fs.unlinkSync(archivePath); } catch (e) {}
+            throw new Error('La copia descargada de S3 no coincide con su sha256: descarga corrupta, no se restaura');
+          }
+        }
       } else {
         throw new Error('La copia no está ni en disco ni en el bucket');
       }
@@ -1345,19 +1387,18 @@ class DatabaseManager extends EventEmitter {
       throw new Error('Indique backupId o remoteKey');
     }
 
-    // Descomprimir a un fichero plano que la herramienta sepa leer.
+    // Descomprimir dentro del try/finally para no filtrar temporales si falla gunzip (P1-12).
     /** @type {string} */
     let plainPath = archivePath;
     let madeTemp = false;
-    if (archivePath.endsWith('.gz') && !archivePath.endsWith('.archive.gz')) {
-      plainPath = path.join(TMP_DIR, `restore_${record.id}_${crypto.randomBytes(5).toString('hex')}`);
-      await this.gunzipFile(archivePath, plainPath);
-      madeTemp = true;
-    }
-
     const inContainer = `/tmp/culkibo_restore_${crypto.randomBytes(6).toString('hex')}`;
 
     try {
+      if (archivePath.endsWith('.gz') && !archivePath.endsWith('.archive.gz')) {
+        plainPath = path.join(TMP_DIR, `restore_${record.id}_${crypto.randomBytes(5).toString('hex')}`);
+        madeTemp = true;
+        await this.gunzipFile(archivePath, plainPath);
+      }
       // Redis/Valkey no se restauran "en caliente": hay que parar el servidor,
       // sustituir el RDB y arrancar.
       //
@@ -1386,6 +1427,7 @@ class DatabaseManager extends EventEmitter {
         await this.docker(['start', record.containerName], { timeout: 90000 });
         record.status = 'running';
         this.save();
+        this.emit('restore_completed', { databaseId: id, method: 'rdb-replace', downloaded });
         return { success: true, databaseId: id, method: 'rdb-replace', downloaded };
       }
 
@@ -1579,8 +1621,15 @@ class DatabaseManager extends EventEmitter {
       const allowed = new Set();
 
       for (const token of field.split(',')) {
-        const [rangePart, stepPart] = token.split('/');
-        const step = stepPart === undefined ? 1 : parseInt(stepPart, 10);
+        const slashParts = token.split('/');
+        if (slashParts.length > 2) {
+          throw new Error(`Token cron inválido en ${name}: ${token}`);
+        }
+        const [rangePart, stepPart] = slashParts;
+        if (stepPart !== undefined && !/^\d+$/.test(stepPart)) {
+          throw new Error(`Paso inválido en el campo ${name}: ${token}`);
+        }
+        const step = stepPart === undefined ? 1 : Number(stepPart);
         if (!Number.isInteger(step) || step < 1) {
           throw new Error(`Paso inválido en el campo ${name}: ${token}`);
         }
@@ -1590,10 +1639,16 @@ class DatabaseManager extends EventEmitter {
         if (rangePart === '*') {
           lo = min; hi = max;
         } else if (rangePart.includes('-')) {
-          const [a, b] = rangePart.split('-').map((n) => parseInt(n, 10));
-          lo = a; hi = b;
+          const bounds = rangePart.split('-');
+          if (bounds.length !== 2 || !/^\d+$/.test(bounds[0]) || !/^\d+$/.test(bounds[1])) {
+            throw new Error(`Rango inválido en el campo ${name}: ${token}`);
+          }
+          lo = Number(bounds[0]); hi = Number(bounds[1]);
         } else {
-          lo = parseInt(rangePart, 10);
+          if (!/^\d+$/.test(rangePart)) {
+            throw new Error(`Valor inválido en el campo ${name}: ${token}`);
+          }
+          lo = Number(rangePart);
           hi = stepPart === undefined ? lo : max;
         }
 
@@ -1699,7 +1754,11 @@ class DatabaseManager extends EventEmitter {
         const due = new Date(record.schedule.nextRunAt).getTime();
         const age = Date.now() - due;
         if (age > 0 && age < MAX_CATCH_UP_MS) {
-          console.log(`[Databases] Copia perdida de ${record.name} (${record.schedule.nextRunAt}); recuperando`);
+          // P1-12: avanzar nextRunAt ANTES de lanzar catch-up para evitar doble ejecución con el primer tick
+          const next = this.nextCronRun(record.schedule.cron);
+          record.schedule.nextRunAt = next ? next.toISOString() : null;
+          this.save();
+          console.log(`[Databases] Copia perdida de ${record.name}; recuperando`);
           this.runBackup(record.id, { trigger: 'catch-up' }).catch((e) =>
             console.error(`[Databases] Recuperación fallida: ${e.message}`)
           );

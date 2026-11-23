@@ -17,13 +17,16 @@ const liveSyncEngine = require('./liveSyncEngine');
 const coolifyMigrator = require('./coolifyMigrator');
 const wordpressMigrator = require('./wordpressMigrator');
 const universalImporter = require('./universalImporter');
+const metricsCollector = require('./metricsCollector');
+const systemDoctor = require('./systemDoctor');
 
 const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars)/i;
 const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_database_credentials',
   'culkibo_github_connect',
   'culkibo_create_database',
-  'culkibo_set_project_env'
+  'culkibo_set_project_env',
+  'culkibo_migrate_coolify'
 ]);
 
 /** Redacta recursivamente tokens, contraseñas y secretos antes de guardar o emitir auditoría MCP. */
@@ -916,6 +919,28 @@ class McpServer extends EventEmitter {
             serverUrl: { type: 'string', description: 'URL base del servidor Culkibo (opcional)' }
           }
         }
+      },
+      {
+        name: 'culkibo_get_observability',
+        title: 'Consultar telemetría y latencia real en vivo',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Devuelve métricas reales medidas en tiempo de ejecución: latencia HTTP (p50/p95/p99), RPS, event-loop lag, RAM/heap, WebSockets, Live Sync y estado de Caddy.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            fresh: { type: 'boolean', description: 'Forzar muestreo sin caché de 250 ms (opcional)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_system_doctor',
+        title: 'Ejecutar diagnóstico completo del sistema',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        description: 'Ejecuta el diagnóstico integral del servidor (Node, Docker, Caddy, disco/RAM, postura de seguridad, dominios, copias de seguridad y residuos temporales) con recomendaciones concretas.',
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
       }
     ];
     this._toolsByName = new Map(this._toolsCache.map((t) => [t.name, t]));
@@ -1001,6 +1026,7 @@ class McpServer extends EventEmitter {
             forgePort: args.forgePort,
             citadelPort: args.citadelPort
           });
+          await projectManager.flushToDisk();
           break;
 
         case 'culkibo_add_resource': {
@@ -1019,17 +1045,30 @@ class McpServer extends EventEmitter {
           project.resources = project.resources || [];
           project.resources.push(resource);
           res = projectManager.update(args.projectId, { resources: project.resources });
+          await projectManager.flushToDisk();
           break;
         }
 
         case 'culkibo_list_projects':
-          res = { projects: projectManager.getAll() };
+          res = {
+            projects: projectManager.getAll().map((p) => ({
+              ...p,
+              webhookSecret: p.webhookSecret ? '[oculto]' : undefined,
+              envVarsKeys: Object.keys(p.envVars || {})
+            }))
+          };
           break;
 
-        case 'culkibo_get_project':
-          res = projectManager.getById(args.projectId);
-          if (!res) throw projectNotFoundError(args.projectId);
+        case 'culkibo_get_project': {
+          const p = projectManager.getById(args.projectId);
+          if (!p) throw projectNotFoundError(args.projectId);
+          res = {
+            ...p,
+            webhookSecret: p.webhookSecret ? '[oculto]' : undefined,
+            envVarsKeys: Object.keys(p.envVars || {})
+          };
           break;
+        }
 
         case 'culkibo_set_project_env': {
           const project = projectManager.getById(args.projectId);
@@ -1042,6 +1081,7 @@ class McpServer extends EventEmitter {
             project.envVars = { ...(project.envVars || {}), ...args.envVars };
           }
           res = projectManager.update(args.projectId, { envVars: project.envVars, resources: project.resources });
+          await projectManager.flushToDisk();
           break;
         }
 
@@ -1135,7 +1175,21 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_manage_watcher':
           if (args.action === 'start') {
-            res = containerOrchestrator.watchDirectory(args.directory || process.cwd());
+            let watchDir = process.cwd();
+            if (args.directory) {
+              const resolved = path.resolve(String(args.directory));
+              if (process.env.CULKIBO_ALLOW_ARBITRARY_WATCH !== '1') {
+                const projectsRoot = path.resolve(__dirname, '..', '..', 'projects');
+                const cwdRoot = path.resolve(process.cwd());
+                const inProjects = !path.relative(projectsRoot, resolved).startsWith('..') && !path.isAbsolute(path.relative(projectsRoot, resolved));
+                const inCwd = !path.relative(cwdRoot, resolved).startsWith('..') && !path.isAbsolute(path.relative(cwdRoot, resolved));
+                if (!inProjects && !inCwd) {
+                  throw new Error('Solo se permite observar directorios dentro del espacio de trabajo de Culkibo');
+                }
+              }
+              watchDir = resolved;
+            }
+            res = containerOrchestrator.watchDirectory(watchDir);
           } else if (args.action === 'stop') {
             res = await containerOrchestrator.stopWatching();
           } else {
@@ -1410,6 +1464,7 @@ class McpServer extends EventEmitter {
               yamlText: args.yamlText,
               projectName: args.projectName || ''
             });
+            await projectManager.flushToDisk();
           } else {
             res = universalImporter.parseDockerCompose(args.yamlText);
           }
@@ -1424,6 +1479,16 @@ class McpServer extends EventEmitter {
             cloudflare: cloudflareService.getConfigStatus(),
             clientConfigs: this.getClientConfigs(base)
           };
+          break;
+        }
+
+        case 'culkibo_get_observability': {
+          res = metricsCollector.getSnapshot(Boolean(args.fresh));
+          break;
+        }
+
+        case 'culkibo_system_doctor': {
+          res = await systemDoctor.runDoctor();
           break;
         }
 

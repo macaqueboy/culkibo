@@ -6,8 +6,11 @@ const path = require('path');
 
 const caddyManager = require('./caddyManager');
 const repoSync = require('./repoSync');
-const { atomicWriteJsonSync } = require('./ssrfGuard');
+const { atomicWriteJsonSync, assertContainedPath } = require('./ssrfGuard');
 
+const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.resolve(process.env.CULKIBO_DATA_DIR)
+  : path.resolve(__dirname, '..', '..');
 const TMP_ENV_DIR = path.join(__dirname, '..', '..', 'data', '.tmp');
 
 /** Variables del host que un proyecto jamás puede sobreescribir al invocar herramientas del host. */
@@ -201,6 +204,10 @@ class DeployManager extends EventEmitter {
     this.pending = new Map();
     /** projectId -> Promise del drenaje en curso (las pruebas lo esperan). */
     this.drains = new Map();
+    /** projectId -> { timer, resolve } para cancelar drenajes pendientes tras rollback/stop/shutdown (P0-3). */
+    this._drainTimers = new Map();
+    /** Puertos reservados en vuelo entre findFreePort() y docker run (P1-8). */
+    this._pendingPorts = new Set();
     /** @type {any} */
     this.dockerProbe = null;
     this.dockerProbeAt = 0;
@@ -253,18 +260,40 @@ class DeployManager extends EventEmitter {
     return this.getState(projectId).history.find(d => d.id === deploymentId) || null;
   }
 
+  cancelDrain(projectId) {
+    const entry = this._drainTimers.get(projectId);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    this._drainTimers.delete(projectId);
+    entry.resolve(true); // true = cancelado
+  }
+
+  cancelAllDrains() {
+    for (const pid of Array.from(this._drainTimers.keys())) {
+      this.cancelDrain(pid);
+    }
+  }
+
   /**
-   * Olvida todo lo que sabemos de un proyecto borrado.
-   *
-   * Sin esto, `deployments.json` acumula el historial de proyectos que ya no
-   * existen y `reconcileRoutes()` reponía al arrancar rutas de Caddy hacia
-   * contenedores de proyectos eliminados.
+   * Olvida todo lo que sabemos de un proyecto borrado y retira sus contenedores
+   * de producción en segundo plano para no dejarlos huérfanos (P1-9).
    */
   forget(projectId) {
-    const had = Boolean(this.store[projectId]);
+    this.cancelDrain(projectId);
+    const prevState = this.store[projectId];
+    const had = Boolean(prevState);
     delete this.store[projectId];
     this.pending.delete(projectId);
-    if (had) this.saveStore();
+    if (had) {
+      this.saveStore();
+      const names = [prevState.current?.containerName, prevState.previous?.containerName].filter(Boolean);
+      if (names.length > 0) {
+        Promise.allSettled([
+          caddyManager.removeRoute(projectId).catch(() => {}),
+          ...names.map((n) => this.runDocker(['rm', '-f', n], { timeoutMs: 20000 }).catch(() => {}))
+        ]).catch(() => {});
+      }
+    }
     return { removed: had };
   }
 
@@ -754,7 +783,8 @@ class DeployManager extends EventEmitter {
       return `wget -q -O /dev/null ${url} || exit 1`; // busybox wget, presente en alpine
     }
     if (strategy.stack === 'python') {
-      return `python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('${url}').status < 500 else 1)"`;
+      // P1-31: capturar HTTPError para que APIs que devuelven 401/404 en '/' se consideren sanas (< 500)
+      return `python -c "import urllib.request,urllib.error,sys\ntry:\n r=urllib.request.urlopen('${url}')\n sys.exit(0 if r.status<500 else 1)\nexcept urllib.error.HTTPError as e:\n sys.exit(0 if e.code<500 else 1)"`;
     }
     return `node -e "fetch('${url}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"`;
   }
@@ -872,6 +902,8 @@ class DeployManager extends EventEmitter {
       '--cpus', String(cpus),
       '--pids-limit', String(pidsLimit),
       '--security-opt', 'no-new-privileges',
+      '--cap-drop', 'ALL',
+      ...(Number(containerPort) < 1024 ? ['--cap-add', 'NET_BIND_SERVICE'] : []),
       // Sin esto el log JSON de un contenedor hablador llena el disco del VPS.
       '--log-opt', 'max-size=10m',
       '--log-opt', 'max-file=3'
@@ -954,21 +986,28 @@ class DeployManager extends EventEmitter {
     return { dial: `${containerName}:${containerPort}`, mode: 'network' };
   }
 
-  /** Puerto libre en el host para publicar el contenedor nuevo. */
+  /** Puerto libre en el host para publicar el contenedor nuevo (respeta puertos de current/previous y en vuelo, P1-8). */
   async findFreePort(start = 40000) {
     const net = require('net');
+    const reserved = new Set(this._pendingPorts);
+    for (const st of Object.values(this.store)) {
+      if (st && st.current && st.current.hostPort) reserved.add(Number(st.current.hostPort));
+      if (st && st.previous && st.previous.hostPort) reserved.add(Number(st.previous.hostPort));
+    }
     const isFree = (port) => new Promise((resolve) => {
       const tester = net.createServer()
         .once('error', () => resolve(false))
         .once('listening', () => tester.once('close', () => resolve(true)).close())
         .listen(port, '127.0.0.1');
     });
-    // Arranque aleatorio dentro del rango efímero alto para que dos despliegues
-    // concurrentes de proyectos distintos no se peleen por el mismo número.
     let port = start + Math.floor(Math.random() * 5000);
     for (let i = 0; i < 500; i++, port++) {
       if (port > 65000) port = start;
-      if (await isFree(port)) return port;
+      if (reserved.has(port)) continue;
+      if (await isFree(port)) {
+        this._pendingPorts.add(port);
+        return port;
+      }
     }
     throw new Error('No se ha encontrado ningún puerto libre en el host');
   }
@@ -1187,8 +1226,12 @@ class DeployManager extends EventEmitter {
       error: null,
       logLines: []
     };
-    // No se persiste: solo sirve para redactar la salida en vivo.
-    Object.defineProperty(deployment, '__secrets', { value: Object.values(envVars), enumerable: false });
+    // No se persiste: solo sirve para redactar la salida en vivo (incluye envVars + buildArgs, P1-31).
+    const allSecretValues = [
+      ...Object.values(envVars),
+      ...Object.values(project.buildArgs || {})
+    ];
+    Object.defineProperty(deployment, '__secrets', { value: allSecretValues, enumerable: false });
 
     state.history.unshift(deployment);
     if (state.history.length > 20) state.history.pop();
@@ -1212,7 +1255,15 @@ class DeployManager extends EventEmitter {
         return finish('fallido', docker.reason);
       }
 
-      const contextDir = options.contextDir || path.join(process.cwd(), 'projects', project.id);
+      const rootContextDir = options.contextDir || path.join(ROOT_BASE_DIR, 'projects', project.id);
+      let contextDir = rootContextDir;
+      if (!options.contextDir && project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
+        try {
+          contextDir = assertContainedPath(rootContextDir, String(project.baseDirectory).replace(/^\/+/, ''));
+        } catch (e) {
+          this.log(deployment, 'WARN', `baseDirectory inválido ignorado (${project.baseDirectory}): ${e.message}`);
+        }
+      }
 
       // --- 0.5. Código fuente ---------------------------------------------
       //
@@ -1304,41 +1355,42 @@ class DeployManager extends EventEmitter {
       const hostPort = await this.findFreePort();
       deployment.hostPort = hostPort;
 
-      // Los valores de las variables del contenedor viajan en un `--env-file`
-      // temporal 0600 (eliminado al instante), jamás mezclados con `process.env`
-      // del CLI de Docker en el host ni expuestos en `ps`.
       /** @type {string | null} */
       let envFile = null;
-      if (envNames.length > 0) {
-        fs.mkdirSync(TMP_ENV_DIR, { recursive: true });
-        envFile = path.join(TMP_ENV_DIR, `depenv_${crypto.randomBytes(8).toString('hex')}`);
-        const lines = envNames.map(k => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n]+/g, ' ')}`);
-        fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
-      }
-
-      const runArgs = this.runArgs({
-        containerName: deployment.containerName,
-        imageTag: deployment.imageTag,
-        hostPort,
-        containerPort: strategy.containerPort,
-        envNames: envFile ? [] : envNames,
-        envFile,
-        network: opts.network,
-        memoryMb: sanitizePort(project.memoryMb, opts.memoryMb),
-        cpus: /^[0-9]+(\.[0-9]+)?$/.test(String(project.cpus || '')) ? String(project.cpus) : opts.cpus,
-        pidsLimit: opts.pidsLimit,
-        healthCmd: strategy.injectHealthcheck ? this.healthCommandFor(strategy) : null,
-        labels: {
-          'com.culkibo.project': safeSlug(project.id),
-          'com.culkibo.deployment': deployment.id,
-          'com.culkibo.version': version
-        }
-      });
-
       let run;
       try {
+        if (envNames.length > 0) {
+          fs.mkdirSync(TMP_ENV_DIR, { recursive: true, mode: 0o700 });
+          envFile = path.join(TMP_ENV_DIR, `depenv_${crypto.randomBytes(8).toString('hex')}`);
+          const lines = envNames.map(k => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n]+/g, ' ')}`);
+          fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+        }
+
+        const rawMem = Number(project.memoryMb);
+        const safeMemMb = Number.isInteger(rawMem) && rawMem >= 32 && rawMem <= 65536 ? rawMem : opts.memoryMb;
+
+        const runArgs = this.runArgs({
+          containerName: deployment.containerName,
+          imageTag: deployment.imageTag,
+          hostPort,
+          containerPort: strategy.containerPort,
+          envNames: envFile ? [] : envNames,
+          envFile,
+          network: opts.network,
+          memoryMb: safeMemMb,
+          cpus: /^[0-9]+(\.[0-9]+)?$/.test(String(project.cpus || '')) ? String(project.cpus) : opts.cpus,
+          pidsLimit: opts.pidsLimit,
+          healthCmd: strategy.injectHealthcheck ? this.healthCommandFor(strategy) : null,
+          labels: {
+            'com.culkibo.project': safeSlug(project.id),
+            'com.culkibo.deployment': deployment.id,
+            'com.culkibo.version': version
+          }
+        });
+
         run = await this.runDocker(runArgs, { timeoutMs: 60000 });
       } finally {
+        this._pendingPorts.delete(hostPort);
         if (envFile) {
           try { fs.unlinkSync(envFile); } catch (e) {}
         }
@@ -1465,7 +1517,7 @@ class DeployManager extends EventEmitter {
 
   /** Ejecuta el constructor elegido y transmite su salida como eventos de log. */
   async runBuild(deployment, { strategy, contextDir, project, opts, envVars }) {
-    const secrets = Object.values(envVars);
+    const secrets = [...Object.values(envVars), ...Object.values(project.buildArgs || {})];
     const onLine = (line) => this.log(deployment, 'INFO', line);
 
     if (strategy.builder === 'railpack' || strategy.builder === 'nixpacks') {
@@ -1504,8 +1556,12 @@ class DeployManager extends EventEmitter {
       const genDir = path.join(contextDir, '.culkibo');
       fs.mkdirSync(genDir, { recursive: true });
       fs.writeFileSync(path.join(genDir, 'Dockerfile'), text, 'utf8');
+      const genIgnore = path.join(genDir, 'Dockerfile.dockerignore');
       if (!fs.existsSync(path.join(contextDir, '.dockerignore'))) {
-        fs.writeFileSync(path.join(genDir, 'Dockerfile.dockerignore'), this.defaultDockerignore(), 'utf8');
+        fs.writeFileSync(genIgnore, this.defaultDockerignore(), 'utf8');
+      } else if (fs.existsSync(genIgnore)) {
+        // P1-31: eliminar .dockerignore autogenerado obsoleto si el usuario añadió uno propio
+        try { fs.unlinkSync(genIgnore); } catch (e) {}
       }
       dockerfile = path.join('.culkibo', 'Dockerfile');
       this.log(deployment, 'INFO', `Dockerfile generado en .culkibo/Dockerfile (stack: ${strategy.stack}, BuildKit cache mounts activos)`);
@@ -1598,10 +1654,30 @@ class DeployManager extends EventEmitter {
    * durante la recarga de configuración.
    */
   async drainAndRetire(deployment, retiring, opts) {
-    this.setStatus(deployment, 'drenando');
+    // P0-3: cancelar cualquier drenaje previo del proyecto, usar un timer cancelable y unref'd,
+    // y re-verificar `state.current` tras despertar para jamás matar el contenedor vivo tras rollback.
+    const projectId = deployment.projectId;
+    this.cancelDrain(projectId);
     this.log(deployment, 'INFO', `Drenando ${retiring.containerName} durante ${Math.round(opts.drainTimeoutMs / 1000)} s antes de detenerlo`);
 
-    await new Promise(r => setTimeout(r, opts.drainTimeoutMs));
+    const cancelled = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this._drainTimers.get(projectId)?.timer === timer) {
+          this._drainTimers.delete(projectId);
+        }
+        resolve(false);
+      }, opts.drainTimeoutMs);
+      if (timer.unref) timer.unref();
+      this._drainTimers.set(projectId, { timer, resolve });
+    });
+
+    if (cancelled) return;
+
+    const latestState = this.store[projectId];
+    if (!latestState || (latestState.current && latestState.current.containerName === retiring.containerName)) {
+      this.log(deployment, 'INFO', `Drenaje omitido para ${retiring.containerName}: sigue siendo la versión activa`);
+      return;
+    }
 
     const stop = await this.runDocker(
       ['stop', '--time', String(opts.stopGraceSeconds), retiring.containerName],
@@ -1613,26 +1689,20 @@ class DeployManager extends EventEmitter {
       this.log(deployment, 'WARN', `No se pudo detener ${retiring.containerName}: ${stop.stderr.trim()}`);
     }
 
-    await this.pruneOldReleases(deployment.projectId, opts.keepReleases);
-    this.setStatus(deployment, 'activo');
+    await this.pruneOldReleases(projectId, opts.keepReleases);
     this.saveStore();
   }
 
-  /**
-   * Borra los contenedores de generaciones más viejas que las que se conservan.
-   *
-   * Se identifican por la etiqueta `com.culkibo.project`, no por un nombre
-   * construido a mano, así que no puede borrarse nada que no sea nuestro.
-   */
   async pruneOldReleases(projectId, keep = DEFAULTS.keepReleases) {
     const state = this.getState(projectId);
     const alive = new Set([state.current, state.previous].filter(Boolean).map(r => r.containerName));
+    const aliveImages = new Set([state.current, state.previous].filter(Boolean).map(r => r.imageTag));
 
     const list = await this.runDocker(
       ['ps', '-a', '--filter', `label=com.culkibo.project=${safeSlug(projectId)}`, '--format', '{{.Names}}'],
       { timeoutMs: 10000 }
     );
-    if (list.code !== 0) return { removed: [] };
+    if (list.code !== 0) return { removed: [], removedImages: [] };
 
     /** @type {string[]} */
     const removed = [];
@@ -1641,7 +1711,27 @@ class DeployManager extends EventEmitter {
       const res = await this.runDocker(['rm', '-f', name], { timeoutMs: 20000 });
       if (res.code === 0) removed.push(name);
     }
-    return { removed, keep };
+
+    // Podar imágenes Docker antiguas del proyecto conservando las más recientes (`keep`) y las vivas
+    /** @type {string[]} */
+    const removedImages = [];
+    const keepTags = new Set(aliveImages);
+    const historyImgs = (state.history || []).map((h) => h.imageTag).filter(Boolean);
+    for (const tag of historyImgs.slice(0, Math.max(2, Number(keep) || 2))) keepTags.add(tag);
+
+    const imgList = await this.runDocker(
+      ['images', '--filter', `label=com.culkibo.project=${safeSlug(projectId)}`, '--format', '{{.Repository}}:{{.Tag}}'],
+      { timeoutMs: 10000 }
+    );
+    if (imgList.code === 0) {
+      for (const tag of (imgList.stdout || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
+        if (!tag || tag.includes('<none>') || keepTags.has(tag)) continue;
+        const rmi = await this.runDocker(['rmi', tag], { timeoutMs: 20000 });
+        if (rmi.code === 0) removedImages.push(tag);
+      }
+    }
+
+    return { removed, removedImages, keep };
   }
 
   /** @param {string} containerName @param {Set<string> | null} [protectedNames] */
@@ -1686,6 +1776,7 @@ class DeployManager extends EventEmitter {
     }
     const task = this._rollback(projectId, options).finally(() => {
       if (this.locks.get(projectId) === task) this.locks.delete(projectId);
+      this.drainPending(projectId);
     });
     this.locks.set(projectId, task);
     return task;
@@ -1784,8 +1875,11 @@ class DeployManager extends EventEmitter {
         this.log(record, 'WARN', 'Sin dominios asignados: no hay ninguna ruta que conmutar');
       }
 
+      // P0-3: cancelar drenaje previo antes de promocionar de nuevo `target`
+      this.cancelDrain(projectId);
       // Se intercambian: la que estaba sirviendo pasa a ser «la anterior», así
       // que un segundo rollback vuelve hacia delante.
+      target.status = 'activo';
       state.current = target;
       state.previous = current || null;
       this.saveStore();
@@ -1934,7 +2028,13 @@ class DeployManager extends EventEmitter {
     /** @type {any[]} */
     const specs = [];
     for (const [projectId, state] of Object.entries(this.store)) {
-      if (state.current && state.current.upstream && (state.current.hostnames || []).length > 0) {
+      if (
+        state.current &&
+        state.current.upstream &&
+        state.current.status !== 'detenido' &&
+        state.current.status !== 'stopped' &&
+        (state.current.hostnames || []).length > 0
+      ) {
         specs.push({ projectId, hostnames: state.current.hostnames, upstreams: [state.current.upstream] });
       }
     }
@@ -1966,13 +2066,20 @@ class DeployManager extends EventEmitter {
       throw new Error('Hay un despliegue en curso para este proyecto; espera a que termine antes de detenerlo');
     }
     const task = (async () => {
+      this.cancelDrain(projectId);
       const state = this.getState(projectId);
       if (!state.current) return { stopped: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
       try { await caddyManager.removeRoute(projectId); } catch (e) {}
       const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000 });
+      if (res.code === 0) {
+        // P1-7: marcar estado detenido para que reconcileRoutes() / ingressManager no re-publiquen 502s
+        state.current.status = 'detenido';
+        this.saveStore();
+      }
       return { stopped: res.code === 0, containerName: state.current.containerName, error: res.code === 0 ? null : res.stderr.trim() };
     })().finally(() => {
       if (this.locks.get(projectId) === task) this.locks.delete(projectId);
+      this.drainPending(projectId);
     });
     this.locks.set(projectId, task);
     return task;
@@ -2038,9 +2145,12 @@ class DeployManager extends EventEmitter {
         }
       }
 
+      target.status = 'activo';
+      this.saveStore();
       return { started: true, routeRestored: true, containerName: target.containerName, error: null };
     })().finally(() => {
       if (this.locks.get(projectId) === task) this.locks.delete(projectId);
+      this.drainPending(projectId);
     });
     this.locks.set(projectId, task);
     return task;

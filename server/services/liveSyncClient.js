@@ -56,6 +56,11 @@ class LiveSyncClient extends EventEmitter {
     this.binaryFramesSupported = false;
     /** @type {ReturnType<typeof setTimeout> | null} */
     this.coalesceTimer = null;
+    /** @type {ReturnType<typeof setImmediate> | null} */
+    this._imm = null;
+    this.lastFlushAt = 0;
+    /** @type {string | null} */
+    this.lastFlushedRel = null;
     this.batchStartAt = 0;
     /** @type {ReturnType<typeof setInterval> | null} */
     this.pingTimer = null;
@@ -76,18 +81,9 @@ class LiveSyncClient extends EventEmitter {
         this.nativeWatcher = fs.watch(this.sourceDir, { recursive: true }, (_eventType, filename) => {
           if (!filename) return;
           const rel = String(filename).split(path.sep).join('/');
-          if (IGNORED_SEGMENT_RE.test(rel) || path.basename(rel).includes('.culkibo-sync-')) return;
-          const abs = path.join(this.sourceDir, rel);
-          try {
-            const st = fs.statSync(abs);
-            if (st.isFile()) this.enqueue(abs, 'upsert');
-          } catch (e) {
-            if (e && e.code === 'ENOENT') {
-              this.enqueue(abs, 'delete');
-            } else {
-              this.enqueue(abs, 'upsert');
-            }
-          }
+          if (!rel || IGNORED_SEGMENT_RE.test(rel) || rel.includes('.culkibo-sync-')) return;
+          // Sin fs.statSync en el camino caliente: flushNow resuelve ENOENT/EISDIR al leer.
+          this._enqueueRel(rel, 'upsert');
         });
         this.nativeWatcher.on('error', (err) => this.emit('error', err));
       } else {
@@ -122,14 +118,34 @@ class LiveSyncClient extends EventEmitter {
       const ws = new WebSocket(this.wsUrl, { headers, perMessageDeflate: false });
       this.ws = ws;
 
-      const onOpenError = (err) => {
-        reject(err);
+      let handshakeDone = false;
+      const handshakeTimer = setTimeout(() => {
+        if (!handshakeDone) {
+          handshakeDone = true;
+          try { ws.terminate(); } catch (e) {}
+          reject(new Error('Tiempo de espera agotado esperando hello_ack de sincronización en vivo'));
+        }
+      }, 10000);
+      if (handshakeTimer.unref) handshakeTimer.unref();
+
+      const finishConnect = (err, val) => {
+        if (handshakeDone) return;
+        handshakeDone = true;
+        clearTimeout(handshakeTimer);
+        if (err) reject(err);
+        else resolve(val);
       };
-      ws.once('error', onOpenError);
+
+      // Listener permanente de errores para evitar crash por 'error' tras 'open' (P1-15)
+      ws.on('error', (err) => {
+        if (!handshakeDone) {
+          finishConnect(err, null);
+        } else {
+          this.emit('sync_error', err);
+        }
+      });
 
       ws.once('open', () => {
-        ws.off('error', onOpenError);
-        this.connected = true;
         if (ws._socket && typeof ws._socket.setNoDelay === 'function') {
           ws._socket.setNoDelay(true);
         }
@@ -161,6 +177,7 @@ class LiveSyncClient extends EventEmitter {
         }
 
         if (msg.type === 'hello_ack') {
+          this.connected = true;
           this.seq = msg.lastSeq || 0;
           this.initialInSync = Boolean(msg.inSync);
           this.binaryFramesSupported = Boolean(msg.binaryFramesSupported);
@@ -171,7 +188,7 @@ class LiveSyncClient extends EventEmitter {
             }
           }
           this.emit('ready', msg);
-          resolve(msg);
+          finishConnect(null, msg);
           return;
         }
 
@@ -198,8 +215,8 @@ class LiveSyncClient extends EventEmitter {
             const waiter = this.inflight.get(msg.seq);
             this.inflight.delete(msg.seq);
             waiter && waiter.reject(err);
-          } else if (!this.connected) {
-            reject(err);
+          } else if (!handshakeDone) {
+            finishConnect(err, null);
           } else {
             this.emit('sync_error', err);
           }
@@ -208,6 +225,9 @@ class LiveSyncClient extends EventEmitter {
 
       ws.on('close', () => {
         this.connected = false;
+        if (!handshakeDone) {
+          finishConnect(new Error('Conexión cerrada antes de completar hello_ack'), null);
+        }
         if (this.pingTimer) {
           clearInterval(this.pingTimer);
           this.pingTimer = null;
@@ -225,22 +245,72 @@ class LiveSyncClient extends EventEmitter {
   enqueue(absPath, op) {
     const rel = path.relative(this.sourceDir, absPath).split(path.sep).join('/');
     if (!rel || rel.startsWith('..') || IGNORED_SEGMENT_RE.test(rel)) return;
+    this._enqueueRel(rel, op);
+  }
+
+  /**
+   * Coalescencia adaptativa en dos fases (drenaje IOCP/FSEvents vía `setImmediate`):
+   * - Una edición individual sale tras el drenaje de eventos del SO (`~0.01 ms`,
+   *   evitando el tick de 15.6 ms de `setTimeout` en Windows).
+   * - En cuanto llegan >=2 archivos (ráfaga de agente IA), escala a `quiescenceMs`
+   *   (tope 50 ms) para compactar toda la ráfaga en 1 único Commit Frame atómico.
+   * @param {string} rel
+   * @param {'upsert' | 'delete'} op
+   */
+  _enqueueRel(rel, op) {
     if (this.pending.size === 0) this.batchStartAt = Date.now();
     this.pending.set(rel, op);
 
-    if (this.coalesceTimer) clearTimeout(this.coalesceTimer);
-    // Quiescencia adaptativa: una edición individual sale casi al instante (<=4ms);
-    // en cuanto entran >=2 archivos (ráfaga IA), amplía a `quiescenceMs` (tope 50ms)
-    // para compactar toda la ráfaga en 1 único Commit Frame.
-    const elapsed = Date.now() - this.batchStartAt;
-    const delay = elapsed >= 50
-      ? 0
-      : (this.pending.size === 1 ? Math.min(this.quiescenceMs, 4) : this.quiescenceMs);
+    if (this.coalesceTimer) {
+      clearTimeout(this.coalesceTimer);
+      this.coalesceTimer = null;
+    }
+    if (this._imm) {
+      clearImmediate(this._imm);
+      this._imm = null;
+    }
 
+    const now = Date.now();
+    const elapsed = now - this.batchStartAt;
+
+    if (elapsed >= 50) {
+      this._imm = setImmediate(() => {
+        this._imm = null;
+        this.lastFlushAt = Date.now();
+        this.flushNow().catch((err) => this.emit('sync_error', err));
+      });
+      return;
+    }
+
+    // Fase 1: 1 archivo aislado (o nueva edición del mismo archivo) -> setImmediate (~0.01 ms)
+    if (this.pending.size === 1 && (rel === this.lastFlushedRel || (now - this.lastFlushAt) > 30)) {
+      this._imm = setImmediate(() => {
+        this._imm = null;
+        if (this.pending.size === 0) return;
+        if (this.pending.size === 1) {
+          this.lastFlushAt = Date.now();
+          this.lastFlushedRel = rel;
+          this.flushNow().catch((err) => this.emit('sync_error', err));
+        } else {
+          // Llegó una ráfaga multi-fichero en el mismo poll del SO -> compactar en 1 Commit Frame
+          this.lastFlushedRel = null;
+          this.coalesceTimer = setTimeout(() => {
+            this.coalesceTimer = null;
+            this.lastFlushAt = Date.now();
+            this.flushNow().catch((err) => this.emit('sync_error', err));
+          }, this.quiescenceMs);
+        }
+      });
+      return;
+    }
+
+    // Fase 2: ráfaga multi-fichero -> ventana de quiescencia para 1 Commit Frame atómico
+    this.lastFlushedRel = null;
     this.coalesceTimer = setTimeout(() => {
       this.coalesceTimer = null;
+      this.lastFlushAt = Date.now();
       this.flushNow().catch((err) => this.emit('sync_error', err));
-    }, delay);
+    }, this.quiescenceMs);
   }
 
   /** Envía inmediatamente todos los ficheros acumulados como un Commit Frame atómico. */
@@ -264,7 +334,13 @@ class LiveSyncClient extends EventEmitter {
           if (this.lastSentHashes.get(rel) === h) continue;
           this.lastSentHashes.set(rel, h);
           files.push({ path: rel, op: 'upsert', buffer: buf, sha256: h });
-        } catch (e) {}
+        } catch (e) {
+          if (e && e.code === 'ENOENT') {
+            this.lastSentHashes.delete(rel);
+            files.push({ path: rel, op: 'delete' });
+          }
+          // Ignorar EISDIR / EPERM transitorios de directorio
+        }
       }
     }
 
@@ -379,6 +455,10 @@ class LiveSyncClient extends EventEmitter {
     if (this.coalesceTimer) {
       clearTimeout(this.coalesceTimer);
       this.coalesceTimer = null;
+    }
+    if (this._imm) {
+      clearImmediate(this._imm);
+      this._imm = null;
     }
     if (this.pingTimer) {
       clearInterval(this.pingTimer);

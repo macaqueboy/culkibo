@@ -131,12 +131,26 @@ class CloudflareService {
   }
 
   saveConfig(newConfig) {
-    this.config = { ...this.config, ...newConfig };
+    if (!newConfig || typeof newConfig !== 'object') return this.config;
+    const ALLOWED_KEYS = ['apiToken', 'accountId', 'defaultZoneId', 'useMock'];
+    const filtered = {};
+    for (const k of ALLOWED_KEYS) {
+      if (newConfig[k] === undefined) continue;
+      // P1-4: no sobrescribir nunca apiToken ni accountId con valores enmascarados ('...' o '••')
+      if ((k === 'apiToken' || k === 'accountId') && typeof newConfig[k] === 'string') {
+        const v = newConfig[k].trim();
+        if (v.includes('...') || v.includes('••')) continue;
+        filtered[k] = v;
+      } else {
+        filtered[k] = newConfig[k];
+      }
+    }
+    this.config = { ...this.config, ...filtered };
     this.config.isConfigured = Boolean(this.config.apiToken);
     if (this.isSimulatedToken(this.config.apiToken)) {
       this.config.useMock = true;
-    } else if (newConfig.useMock !== undefined) {
-      this.config.useMock = Boolean(newConfig.useMock);
+    } else if (filtered.useMock !== undefined) {
+      this.config.useMock = Boolean(filtered.useMock);
     } else {
       // Un token real recién configurado desactiva el modo simulado automáticamente.
       this.config.useMock = false;
@@ -151,6 +165,8 @@ class CloudflareService {
     const isMock = Boolean(this.config.useMock || !token || this.isSimulatedToken(token));
     return {
       isConfigured: Boolean(token && !this.isSimulatedToken(token)),
+      hasToken: Boolean(token),
+      hasApiToken: Boolean(token),
       useMock: isMock,
       accountId: this.config.accountId || '',
       defaultZoneId: this.config.defaultZoneId || '',
@@ -159,18 +175,19 @@ class CloudflareService {
   }
 
   async findZoneForDomain(domain) {
-    if (!domain) return this.mockZones[0].id;
-    const clean = domain.replace(/^\*\./, '').toLowerCase();
-    const parts = clean.split('.');
-    const rootDomain = parts.length > 2 ? parts.slice(-2).join('.') : clean;
+    if (!domain) return null;
+    const clean = String(domain).replace(/^\*\./, '').trim().toLowerCase();
+    if (!clean) return null;
 
     const zonesRes = await this.listZones();
-    if (zonesRes.success && zonesRes.zones?.length) {
-      const match = zonesRes.zones.find(z => z.name === rootDomain || z.name === clean);
-      if (match) return match.id;
-      return zonesRes.zones[0].id;
+    if (zonesRes.success && Array.isArray(zonesRes.zones) && zonesRes.zones.length) {
+      // P1-4: coincidencia por sufijo más largo (soporta .co.uk, .com.es, etc.) y jamás fallback a zones[0]
+      const match = zonesRes.zones
+        .filter((z) => z && z.name && (clean === z.name.toLowerCase() || clean.endsWith(`.${z.name.toLowerCase()}`)))
+        .sort((a, b) => b.name.length - a.name.length)[0];
+      return match ? match.id : null;
     }
-    return this.mockZones[0].id;
+    return null;
   }
 
   async verifyToken(apiToken = null) {

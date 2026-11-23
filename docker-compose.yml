@@ -3,12 +3,25 @@ services:
     image: caddy:2.11-alpine
     container_name: culkibo-caddy
     restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     command:
       - sh
       - -c
       - |
         printf '{\n  admin 0.0.0.0:2019 {\n    origins caddy:2019 localhost:2019 127.0.0.1:2019\n  }\n}\n' > /tmp/Caddyfile
         exec caddy run --config /tmp/Caddyfile --adapter caddyfile
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     ports:
       - "80:80"
       - "443:443"
@@ -25,13 +38,21 @@ services:
       dockerfile: Dockerfile
     container_name: culkibo-daemon
     restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
     depends_on:
-      - caddy
+      caddy:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       PORT: "3030"
       HOST: "0.0.0.0"
       CULKIBO_CADDY_ADMIN: "http://caddy:2019"
+      CULKIBO_CADDY_CONTAINERIZED: "1"
+      CULKIBO_ASK_ENDPOINT: "http://culkibo:3030/api/ingress/ask"
+      CULKIBO_PANEL_UPSTREAM: "culkibo:3030"
+      CULKIBO_TRUST_PROXY: "loopback, uniquelocal"
       # Opcional: define CULKIBO_TOKEN o deja que se genere en data/auth.json
       CULKIBO_TOKEN: "${CULKIBO_TOKEN:-}"
     ports:

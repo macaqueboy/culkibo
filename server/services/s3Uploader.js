@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { isMetadataIp } = require('./ssrfGuard');
+const { isMetadataIp, assertSafeUrl } = require('./ssrfGuard');
 
 /**
  * Cliente S3 mínimo: SigV4 firmado a mano sobre `node:crypto` y el `fetch`
@@ -294,6 +294,8 @@ class S3Client {
    */
   async request(method, key, { query = {}, headers = {}, body = undefined, expectStatus = [200, 204] } = {}) {
     const { canonicalUri, url, host } = this.resolve(key);
+    // Protección SSRF con resolución DNS: permite MinIO privado pero bloquea siempre metadatos cloud
+    await assertSafeUrl(url, { allowPrivate: true, allowLoopback: true });
     const payload = body === undefined || body === null ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(body);
     const payloadHash = payload ? sha256Hex(payload) : EMPTY_SHA256;
 
@@ -364,16 +366,20 @@ class S3Client {
       body,
       expectStatus: [200]
     });
-    return { key, etag: res.headers.get('etag'), size: Buffer.isBuffer(body) ? body.length : String(body).length };
+    const etag = res.headers.get('etag');
+    try { await res.body?.cancel?.(); } catch (e) {}
+    return { key, etag, size: Buffer.isBuffer(body) ? body.length : String(body).length };
   }
 
   async deleteObject(key) {
-    await this.request('DELETE', key, { expectStatus: [200, 204, 404] });
+    const res = await this.request('DELETE', key, { expectStatus: [200, 204, 404] });
+    try { await res.body?.cancel?.(); } catch (e) {}
     return { key, deleted: true };
   }
 
   async headObject(key) {
     const res = await this.request('HEAD', key, { expectStatus: [200, 404] });
+    try { await res.body?.cancel?.(); } catch (e) {}
     if (res.status === 404) return null;
     return {
       key,
@@ -407,6 +413,7 @@ class S3Client {
       expectStatus: [200]
     });
     const etag = res.headers.get('etag');
+    try { await res.body?.cancel?.(); } catch (e) {}
     if (!etag) throw new Error(`La parte ${partNumber} no devolvió ETag`);
     return { partNumber, etag };
   }
@@ -444,7 +451,8 @@ class S3Client {
 
   async abortMultipartUpload(key, uploadId) {
     try {
-      await this.request('DELETE', key, { query: { uploadId }, expectStatus: [200, 204, 404] });
+      const res = await this.request('DELETE', key, { query: { uploadId }, expectStatus: [200, 204, 404] });
+      try { await res.body?.cancel?.(); } catch (e) {}
     } catch (e) {
       // Abortar es limpieza: si falla, el ciclo de vida del bucket lo recogerá.
     }
@@ -494,10 +502,17 @@ class S3Client {
       let uploaded = 0;
       for (let i = 0; i < partCount; i++) {
         const length = Math.min(partSize, total - i * partSize);
-        const buf = Buffer.allocUnsafe(length);
-        await handle.read(buf, 0, length, i * partSize);
-        parts.push(await this.uploadPart(key, uploadId, i + 1, buf));
-        uploaded += length;
+        // P0-9: Buffer.alloc (cero fugas de heap) + bucle de lectura completo ante lecturas parciales.
+        const buf = Buffer.alloc(length);
+        let totalRead = 0;
+        while (totalRead < length) {
+          const { bytesRead } = await handle.read(buf, totalRead, length - totalRead, i * partSize + totalRead);
+          if (bytesRead <= 0) break;
+          totalRead += bytesRead;
+        }
+        const chunk = totalRead === length ? buf : buf.subarray(0, totalRead);
+        parts.push(await this.uploadPart(key, uploadId, i + 1, chunk));
+        uploaded += totalRead;
         if (onProgress) onProgress({ uploaded, total, part: i + 1, parts: partCount });
       }
       await handle.close();
@@ -530,8 +545,10 @@ class S3Client {
         bytes += value.length;
         if (!out.write(Buffer.from(value))) {
           await new Promise((resolve, reject) => {
-            out.once('drain', resolve);
-            out.once('error', reject);
+            const onDrain = () => { out.off('error', onErr); resolve(undefined); };
+            const onErr = (e) => { out.off('drain', onDrain); reject(e); };
+            out.once('drain', onDrain);
+            out.once('error', onErr);
           });
         }
       }

@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const http = require('http');
 const https = require('https');
+const metricsCollector = require('./metricsCollector');
 
 /**
  * Cliente del plano de datos: Caddy.
@@ -35,13 +36,38 @@ class CaddyManager {
     this.lastDetection = null;
     this.detectionAt = 0;
     this.detectionTtlMs = 15000;
-    this.httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 60000 });
-    this.httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 60000 });
+    this.lastKnownRouteCount = null;
+    /** @type {Map<string, string>} */
+    this._appliedRouteJson = new Map();
+    /** @type {{ url: string, dialHost: string, originHeader: string, hostHeader: string, port: number, isHttps: boolean } | null} */
+    this._parsedAdmin = null;
+    this.httpAgent = new http.Agent(/** @type {any} */ ({ keepAlive: true, noDelay: true, maxSockets: 8, keepAliveMsecs: 60000 }));
+    this.httpsAgent = new https.Agent(/** @type {any} */ ({ keepAlive: true, noDelay: true, maxSockets: 8, keepAliveMsecs: 60000 }));
+  }
+
+  _getAdminTarget() {
+    if (this._parsedAdmin && this._parsedAdmin.url === this.adminUrl) {
+      return this._parsedAdmin;
+    }
+    const parsed = new URL(this.adminUrl);
+    const isHttps = parsed.protocol === 'https:';
+    const port = parsed.port ? Number(parsed.port) : (isHttps ? 443 : 80);
+    // Evita DNS/Happy-Eyeballs ::1 vs 127.0.0.1 en Windows cuando adminUrl usa localhost
+    const dialHost = parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname;
+    this._parsedAdmin = {
+      url: this.adminUrl,
+      dialHost,
+      originHeader: this.adminUrl.replace(/\/+$/, ''),
+      hostHeader: parsed.host,
+      port,
+      isHttps
+    };
+    return this._parsedAdmin;
   }
 
   /**
    * Petición HTTP persistente contra la Admin API de Caddy con keep-alive real,
-   * `TCP_NODELAY` y drenaje garantizado del cuerpo (evita la fuga de sockets de undici).
+   * `TCP_NODELAY` a nivel de agente y drenaje garantizado del cuerpo.
    *
    * @param {string} method
    * @param {string} reqPath
@@ -50,27 +76,32 @@ class CaddyManager {
    */
   adminRequest(method, reqPath, { headers = {}, body = null, timeoutMs = 10000, readBody = true } = {}) {
     return new Promise((resolve, reject) => {
-      const target = new URL(reqPath, this.adminUrl);
-      const isHttps = target.protocol === 'https:';
+      const admin = this._getAdminTarget();
       const payloadBuf = body != null ? Buffer.from(body, 'utf8') : null;
+      /** @type {Record<string, string>} */
       const reqHeaders = {
-        ...this.adminHeaders(),
-        ...headers,
-        ...(payloadBuf ? { 'Content-Length': String(payloadBuf.length) } : {})
+        Host: admin.hostHeader,
+        Origin: admin.originHeader,
+        ...headers
       };
+      if (payloadBuf) reqHeaders['Content-Length'] = String(payloadBuf.length);
 
-      const req = (isHttps ? https : http).request(
+      const req = (admin.isHttps ? https : http).request(
         {
-          hostname: target.hostname,
-          port: target.port || (isHttps ? 443 : 80),
-          path: `${target.pathname}${target.search}`,
+          hostname: admin.dialHost,
+          port: admin.port,
+          path: reqPath.startsWith('/') ? reqPath : `/${reqPath}`,
           method,
           headers: reqHeaders,
-          agent: isHttps ? this.httpsAgent : this.httpAgent
+          agent: admin.isHttps ? this.httpsAgent : this.httpAgent
         },
         (res) => {
           const status = res.statusCode || 0;
           const ok = status >= 200 && status < 300;
+          res.once('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
           if (!readBody && ok) {
             res.resume();
             res.once('end', () => {
@@ -87,16 +118,8 @@ class CaddyManager {
             const text = chunks.length ? Buffer.concat(chunks).toString('utf8') : '';
             resolve({ status, ok, headers: res.headers, text });
           });
-          res.once('error', (err) => {
-            clearTimeout(timer);
-            reject(err);
-          });
         }
       );
-
-      req.on('socket', (sock) => {
-        if (typeof sock.setNoDelay === 'function') sock.setNoDelay(true);
-      });
 
       const timer = setTimeout(() => {
         req.destroy(new Error(`Timeout (${timeoutMs} ms) en ${method} ${reqPath}`));
@@ -182,7 +205,9 @@ class CaddyManager {
 
   async getWithEtag(reqPath) {
     const res = await this.adminRequest('GET', reqPath, { timeoutMs: 5000, readBody: true });
-    if (res.status === 404) return { found: false, value: null, etag: null };
+    if (res.status === 404 || (res.status === 400 && /invalid traversal path/i.test(res.text || ''))) {
+      return { found: false, value: null, etag: null };
+    }
     if (!res.ok) throw new Error(`GET ${reqPath} devolvió ${res.status}: ${res.text}`);
     const etag = res.headers.etag || null;
     return { found: true, value: res.text ? JSON.parse(res.text) : null, etag };
@@ -299,9 +324,11 @@ class CaddyManager {
       issuers: [{ module: 'acme' }]
     });
 
-    const adminHost = this.adminUrl.replace(/^https?:\/\//, '');
-    const isLoopbackAdmin = /^(localhost|127\.0\.0\.1|\[::1\]):/i.test(adminHost);
-    const adminPort = (adminHost.split(':')[1] || '2019').replace(/[^0-9]/g, '') || '2019';
+    const adminTarget = this._getAdminTarget();
+    const adminHost = adminTarget.hostHeader;
+    const isContainerizedCaddy = process.env.CULKIBO_CADDY_CONTAINERIZED === '1';
+    const isLoopbackAdmin = !isContainerizedCaddy && /^(localhost|127\.0\.0\.1|\[::1\]):/i.test(adminHost);
+    const adminPort = String(adminTarget.port || 2019);
 
     return {
       admin: isLoopbackAdmin
@@ -350,6 +377,8 @@ class CaddyManager {
       readBody: false
     });
     if (!res.ok) throw new Error(`No se pudo cargar la configuración base: ${res.status} ${res.text}`);
+    this._appliedRouteJson.clear();
+    this.lastKnownRouteCount = 0;
     return config;
   }
 
@@ -429,18 +458,46 @@ class CaddyManager {
    * conmutación en caliente (p50 en unos pocos milisegundos).
    */
   async upsertRoute(spec) {
-    await this.requireAvailable();
+    const t0 = process.hrtime.bigint();
     const route = this.buildRoute(spec);
     const id = route['@id'];
+    const routeJson = JSON.stringify(route);
 
-    // Fast path: 1 solo roundtrip HTTP keep-alive cuando la ruta ya existe.
-    const fastRes = await this.adminRequest('PATCH', `/id/${id}`, {
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(route),
-      timeoutMs: 10000,
-      readBody: false
-    });
+    // Caché de digest idempotente: evita recargas innecesarias cuando la ruta es idéntica.
+    if (this._appliedRouteJson.get(id) === routeJson) {
+      metricsCollector.recordCaddySwap(0, true);
+      return { created: false, unchanged: true, id, route };
+    }
+
+    // Fast path directo: 1 único roundtrip HTTP keep-alive sin `requireAvailable()` previo.
+    let fastRes;
+    try {
+      fastRes = await this.adminRequest('PATCH', `/id/${id}`, {
+        headers: { 'Content-Type': 'application/json' },
+        body: routeJson,
+        timeoutMs: 10000,
+        readBody: false
+      });
+    } catch (netErr) {
+      this._appliedRouteJson.delete(id);
+      this.lastDetection = { available: false, adminUrl: this.adminUrl, reason: netErr.message };
+      this.detectionAt = Date.now();
+      const err = new Error(`Caddy no responde en ${this.adminUrl}: ${netErr.message}`);
+      /** @type {any} */ (err).code = 'CADDY_UNAVAILABLE';
+      throw err;
+    }
+
     if (fastRes.ok) {
+      this._appliedRouteJson.set(id, routeJson);
+      const prev = this.lastDetection;
+      this.lastDetection = {
+        available: true,
+        adminUrl: this.adminUrl,
+        version: (prev && 'version' in prev ? prev.version : null) || null,
+        reason: null
+      };
+      this.detectionAt = Date.now();
+      metricsCollector.recordCaddySwap(Number(process.hrtime.bigint() - t0) / 1e6, false);
       return { created: false, id, route };
     }
     if (fastRes.status !== 404 && fastRes.status !== 400) {
@@ -451,7 +508,7 @@ class CaddyManager {
 
     // Si el fast-path indicó que no existe, vamos directo a POST /routes (sin GET /id redundante).
     const routesPath = '/config/apps/http/servers/culkibo/routes';
-    return this.mutate(async () => {
+    const result = await this.mutate(async () => {
       const current = await this.getWithEtag(routesPath);
       const list = Array.isArray(current.value) ? current.value : [];
       if (list.some((r) => r && r['@id'] === id)) {
@@ -464,6 +521,10 @@ class CaddyManager {
       await this.write('POST', routesPath, route, { etag: current.etag });
       return { created: true, id, route };
     });
+    this._appliedRouteJson.set(id, routeJson);
+    this.lastKnownRouteCount = this._appliedRouteJson.size;
+    metricsCollector.recordCaddySwap(Number(process.hrtime.bigint() - t0) / 1e6, false);
+    return result;
   }
 
   /**
@@ -506,23 +567,40 @@ class CaddyManager {
     });
   }
 
-  /** Elimina la ruta de un proyecto. Idempotente. */
+  /** Elimina la ruta de un proyecto en 1 RTT. Idempotente. */
   async removeRoute(projectId) {
-    await this.requireAvailable();
     const id = this.routeId(projectId);
-    return this.mutate(async () => {
-      const existing = await this.getWithEtag(`/id/${id}`);
-      if (!existing.found) return { removed: false, id };
-      await this.write('DELETE', `/id/${id}`, undefined, { etag: existing.etag });
+    this._appliedRouteJson.delete(id);
+    let res;
+    try {
+      res = await this.adminRequest('DELETE', `/id/${id}`, { timeoutMs: 10000, readBody: true });
+    } catch (netErr) {
+      this.lastDetection = { available: false, adminUrl: this.adminUrl, reason: netErr.message };
+      this.detectionAt = Date.now();
+      const err = new Error(`Caddy no responde en ${this.adminUrl}: ${netErr.message}`);
+      /** @type {any} */ (err).code = 'CADDY_UNAVAILABLE';
+      throw err;
+    }
+    if (res.ok) {
+      this.lastKnownRouteCount = this._appliedRouteJson.size;
       return { removed: true, id };
-    });
+    }
+    if (res.status === 404 || /unknown object ID/i.test(res.text)) {
+      return { removed: false, id };
+    }
+    throw new Error(`DELETE /id/${id} devolvió ${res.status}: ${res.text}`);
   }
 
   /** Rutas que gestiona Culkibo, ignorando las que haya puesto otro. */
   async listRoutes() {
     const routes = await this.get('/config/apps/http/servers/culkibo/routes');
-    if (!Array.isArray(routes)) return [];
-    return routes.filter(r => typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX));
+    if (!Array.isArray(routes)) {
+      this.lastKnownRouteCount = 0;
+      return [];
+    }
+    const managed = routes.filter(r => typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX));
+    this.lastKnownRouteCount = managed.length;
+    return managed;
   }
 
   /**
@@ -548,10 +626,16 @@ class CaddyManager {
 
       const nextRoutes = [...foreign, ...desiredRoutes];
       if (JSON.stringify(existingAll) === JSON.stringify(nextRoutes)) {
+        this._appliedRouteJson.clear();
+        for (const r of desiredRoutes) this._appliedRouteJson.set(r['@id'], JSON.stringify(r));
+        this.lastKnownRouteCount = desiredRoutes.length;
         return { applied, removed, unchanged: true };
       }
 
       await this.write(current.found ? 'PATCH' : 'PUT', routesPath, nextRoutes, { etag: current.etag });
+      this._appliedRouteJson.clear();
+      for (const r of desiredRoutes) this._appliedRouteJson.set(r['@id'], JSON.stringify(r));
+      this.lastKnownRouteCount = desiredRoutes.length;
       return { applied, removed, unchanged: false };
     });
   }
@@ -562,13 +646,15 @@ class CaddyManager {
 
   /**
    * Levanta Caddy en un contenedor (con validación estricta anti inyección de flags).
+   * Soporta `network: 'host'` en Linux y puente con `CADDY_ADMIN=0.0.0.0:2019` en Desktop.
    */
-  async startWithDocker({ image = 'caddy:2-alpine', containerName = 'culkibo-caddy', httpPort = 80, httpsPort = 443, adminPort = 2019 } = {}) {
+  async startWithDocker({ image = 'caddy:2-alpine', containerName = 'culkibo-caddy', httpPort = 80, httpsPort = 443, adminPort = 2019, network = null } = {}) {
     const cleanImage = String(image || 'caddy:2-alpine').trim();
     const cleanName = String(containerName || 'culkibo-caddy').trim();
     const pHttp = Number(httpPort);
     const pHttps = Number(httpsPort);
     const pAdmin = Number(adminPort);
+    const useHostNet = network === 'host' && process.platform === 'linux';
 
     if (
       cleanImage.startsWith('-') ||
@@ -587,16 +673,24 @@ class CaddyManager {
       }
     }
 
-    const args = [
-      'run', '-d', '--name', cleanName, '--restart', 'unless-stopped',
-      '-p', `${pHttp}:80`,
-      '-p', `${pHttps}:443`,
-      '-p', `127.0.0.1:${pAdmin}:2019`,
+    const args = ['run', '-d', '--name', cleanName, '--restart', 'unless-stopped'];
+    if (useHostNet) {
+      args.push('--network', 'host', '-e', `CADDY_ADMIN=127.0.0.1:${pAdmin}`);
+    } else {
+      args.push(
+        '-p', `${pHttp}:80`,
+        '-p', `${pHttps}:443`,
+        '-p', `127.0.0.1:${pAdmin}:2019`,
+        '--add-host', 'host.docker.internal:host-gateway',
+        '-e', 'CADDY_ADMIN=0.0.0.0:2019'
+      );
+    }
+    args.push(
       '-v', 'culkibo_caddy_data:/data',
       '-v', 'culkibo_caddy_config:/config',
       cleanImage,
       'caddy', 'run', '--config', '/dev/null', '--adapter', 'caddyfile'
-    ];
+    );
 
     return new Promise((resolve) => {
       const child = spawn('docker', args, { shell: false, windowsHide: true });

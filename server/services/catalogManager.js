@@ -4,11 +4,29 @@ const net = require('net');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 
-const databaseManager = require('./databaseManager');
-const domainManager = require('./domainManager');
-const ingressManager = require('./ingressManager');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
 const { TEMPLATES, CATEGORIES, validateCatalog } = require('./catalog/templates');
+
+// Carga perezosa: GET /api/catalog solo necesita las plantillas y nunca debe
+// arrastrar databaseManager/domainManager/ingressManager en el arranque en frío.
+/** @type {any} */
+let _dbManager = null;
+function getDbManager() {
+  if (!_dbManager) _dbManager = require('./databaseManager');
+  return _dbManager;
+}
+/** @type {any} */
+let _domainManager = null;
+function getDomainManager() {
+  if (!_domainManager) _domainManager = require('./domainManager');
+  return _domainManager;
+}
+/** @type {any} */
+let _ingressManager = null;
+function getIngressManager() {
+  if (!_ingressManager) _ingressManager = require('./ingressManager');
+  return _ingressManager;
+}
 
 const CATEGORY_MAP = new Map(CATEGORIES.map((c) => [c.id, c.label]));
 const CATEGORIES_WITH_COUNT = CATEGORIES.map((c) => ({
@@ -168,7 +186,7 @@ function resolvePlaceholders(value, context) {
   return String(value).replace(/\{\{([a-zA-Z0-9_.]+)\}\}/g, (full, expr) => {
     const parts = expr.split('.');
 
-    if (expr === 'domain') return context.domain || '';
+    if (expr === 'domain') return context.domain || (context.hostPort ? `127.0.0.1:${context.hostPort}` : 'localhost');
     if (expr === 'url') return context.url || '';
     if (expr === 'install.id') return context.installId;
 
@@ -334,11 +352,11 @@ class CatalogManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   docker(args, options) {
-    return databaseManager.docker(args, options);
+    return getDbManager().docker(args, options);
   }
 
   isDockerAvailable(force) {
-    return databaseManager.isDockerAvailable(force);
+    return getDbManager().isDockerAvailable(force);
   }
 
   // -------------------------------------------------------------------------
@@ -400,7 +418,13 @@ class CatalogManager extends EventEmitter {
     record.updatedAt = record.progress.updatedAt;
     if (persist) this.save();
     else this._catalogSerializedCache = null;
-    this.emit('service_progress', { id: record.id, name: record.name, ...record.progress });
+    this.emit('service_progress', {
+      id: record.id,
+      name: record.name,
+      status: record.status,
+      ...record.progress,
+      progress: record.progress
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -428,7 +452,7 @@ class CatalogManager extends EventEmitter {
       if (!DOMAIN_RE.test(domain)) {
         throw new Error(`Dominio inválido: «${domain}». Usa un nombre completo, por ejemplo n8n.midominio.com`);
       }
-      if (domainManager.getByHostname(domain)) {
+      if (getDomainManager().getByHostname(domain)) {
         throw new Error(`El dominio ${domain} ya está configurado en Culkibo`);
       }
     }
@@ -436,55 +460,56 @@ class CatalogManager extends EventEmitter {
     const id = `svc_${tpl.id}_${crypto.randomBytes(4).toString('hex')}`;
     const hostPort = await this.allocatePort();
 
-    const secrets = {};
-    for (const [key, spec] of Object.entries(tpl.secrets || {})) {
-      secrets[key] = generateSecret(spec);
-    }
-
     /** @type {any} */
-    const record = {
-      id,
-      templateId: tpl.id,
-      name: String(opts.name || tpl.name).slice(0, 80),
-      templateName: tpl.name,
-      category: tpl.category,
-      image: tpl.app.image,
-      domain,
-      url: domain ? `https://${domain}` : `http://127.0.0.1:${hostPort}`,
-      domainId: null,
-      hostPort,
-      appPort: tpl.app.port,
-      containerName: this.containerName(id, 'app'),
-      networkName: this.networkName(id),
-      volumes: Object.fromEntries((tpl.app.volumes || []).map((v) => [v.name, this.volumeName(id, v.name)])),
-      sidecars: (tpl.sidecars || []).map((c) => ({
-        name: c.name,
-        image: c.image,
-        containerName: this.containerName(id, c.name),
-        volumes: Object.fromEntries((c.volumes || []).map((v) => [v.name, this.volumeName(id, `${c.name}_${v.name}`)]))
-      })),
-      databaseId: null,
-      secretsEnc: Object.fromEntries(
-        Object.entries(secrets).map(([k, v]) => [k, encryptSecret(v, this.cryptoKey)])
-      ),
-      memoryMb: tpl.app.memoryMb,
-      cpus: tpl.app.cpus,
-      status: 'installing',
-      health: 'unknown',
-      lastError: null,
-      progress: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+    let record;
+    const secrets = {};
+    try {
+      for (const [key, spec] of Object.entries(tpl.secrets || {})) {
+        secrets[key] = generateSecret(spec);
+      }
 
-    this.state.installations.push(record);
-    this.pendingPorts.delete(hostPort);
+      record = {
+        id,
+        templateId: tpl.id,
+        name: String(opts.name || tpl.name).slice(0, 80),
+        templateName: tpl.name,
+        category: tpl.category,
+        image: tpl.app.image,
+        domain,
+        url: domain ? `https://${domain}` : `http://127.0.0.1:${hostPort}`,
+        domainId: null,
+        hostPort,
+        appPort: tpl.app.port,
+        containerName: this.containerName(id, 'app'),
+        networkName: this.networkName(id),
+        volumes: Object.fromEntries((tpl.app.volumes || []).map((v) => [v.name, this.volumeName(id, v.name)])),
+        sidecars: (tpl.sidecars || []).map((c) => ({
+          name: c.name,
+          image: c.image,
+          containerName: this.containerName(id, c.name),
+          volumes: Object.fromEntries((c.volumes || []).map((v) => [v.name, this.volumeName(id, `${c.name}_${v.name}`)]))
+        })),
+        databaseId: null,
+        secretsEnc: Object.fromEntries(
+          Object.entries(secrets).map(([k, v]) => [k, encryptSecret(v, this.cryptoKey)])
+        ),
+        memoryMb: tpl.app.memoryMb,
+        cpus: tpl.app.cpus,
+        status: 'installing',
+        health: 'unknown',
+        lastError: null,
+        progress: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      this.state.installations.push(record);
+    } finally {
+      this.pendingPorts.delete(hostPort);
+    }
     this.setProgress(record, 'validar', `Preparando la instalación de ${tpl.name}`);
 
     this.inFlight.add(id);
-    // Sin `await`: el llamante recibe el registro y sigue el progreso por
-    // WebSocket. El `catch` está aquí y no en el llamante porque si no, un
-    // fallo de instalación sería un unhandledRejection.
     this.runInstall(record, tpl, secrets)
       .catch((err) => {
         record.status = 'error';
@@ -492,7 +517,7 @@ class CatalogManager extends EventEmitter {
         const redactBag = { ...secrets };
         if (record.databaseId) {
           try {
-            const dbCreds = databaseManager.getCredentials(record.databaseId);
+            const dbCreds = getDbManager().getCredentials(record.databaseId);
             if (dbCreds && dbCreds.password) redactBag.__db_password = dbCreds.password;
           } catch (e) {}
         }
@@ -507,13 +532,18 @@ class CatalogManager extends EventEmitter {
     return this.toPublic(record);
   }
 
-  /** Quita cualquier secreto de un mensaje antes de guardarlo o enseñarlo. */
-  redact(message, secrets) {
+  /**
+   * Quita cualquier secreto de un mensaje antes de guardarlo o enseñarlo.
+   * @param {string} message
+   * @param {Record<string, any>} secrets
+   * @param {number | null} [maxLength]
+   */
+  redact(message, secrets, maxLength = 600) {
     let out = String(message || '');
     for (const value of Object.values(secrets || {})) {
       if (value && String(value).length >= 8) out = out.split(String(value)).join('«oculto»');
     }
-    return out.slice(0, 600);
+    return maxLength === null || maxLength === Infinity ? out : out.slice(0, maxLength);
   }
 
   async runInstall(record, tpl, secrets) {
@@ -524,6 +554,7 @@ class CatalogManager extends EventEmitter {
     // red plana, un contenedor comprometido ve las bases de datos de todos los
     // demás servicios del host.
     this.setProgress(record, 'red', 'Creando la red aislada de la instalación');
+    const databaseManager = getDbManager();
     await databaseManager.ensureNetwork(record.id);
 
     // --- 2. Base de datos gestionada ---------------------------------------
@@ -545,9 +576,6 @@ class CatalogManager extends EventEmitter {
       this.save();
 
       const creds = databaseManager.getCredentials(provisioned.id);
-      // El host es el alias corto de la red (`postgres`, `mysql`, `valkey`),
-      // que `databaseManager` asigna con `--network-alias`. Es más estable que
-      // el nombre del contenedor y hace legibles las variables de entorno.
       const alias = tpl.database.engine;
       dbContext = {
         host: alias,
@@ -566,6 +594,7 @@ class CatalogManager extends EventEmitter {
     const context = {
       installId: record.id,
       domain: record.domain,
+      hostPort: record.hostPort,
       url: record.url,
       secrets,
       db: dbContext,
@@ -627,23 +656,18 @@ class CatalogManager extends EventEmitter {
     // --- 6. Dominio ---------------------------------------------------------
     if (record.domain) {
       this.setProgress(record, 'dominio', `Publicando ${record.domain} con HTTPS`);
-      const created = await domainManager.addDomain({
+      const dm = getDomainManager();
+      const created = await dm.addDomain({
         hostname: record.domain,
-        // `targetPod: 'service'` es lo que hace que `ingressManager` sepa que
-        // detrás no hay un pod sino un servicio del catálogo, y etiquete la
-        // ruta con su nombre en vez de con «Desarrollo».
         targetPod: 'service',
         targetPort: record.hostPort,
         cloudflareProxied: false,
         routingMode: 'direct_dns'
       });
       record.domainId = created.id;
-      await domainManager.updateDomain(created.id, { serviceId: record.id, serviceName: record.name });
+      await dm.updateDomain(created.id, { serviceId: record.id, serviceName: record.name });
       this.save();
-      // Reconciliar publica la ruta en Caddy. Nunca lanza: si no hay plano de
-      // datos, el servicio queda instalado y accesible en bucle local, y el
-      // panel lo dice.
-      const ingress = await ingressManager.reconcile();
+      const ingress = await getIngressManager().reconcile();
       record.ingress = {
         applied: Boolean(ingress && ingress.applied),
         reason: ingress && ingress.reason ? ingress.reason : null
@@ -840,11 +864,14 @@ class CatalogManager extends EventEmitter {
   }
 
   async start(id) {
+    if (this.inFlight.has(id)) {
+      const err = new Error('El servicio todavía se está instalando');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
     const record = this.mustGet(id);
-    // Los auxiliares primero: la aplicación suele morir si su ClickHouse o su
-    // base de datos todavía no están escuchando.
     if (record.databaseId) {
-      try { await databaseManager.start(record.databaseId); } catch (e) {}
+      try { await getDbManager().start(record.databaseId); } catch (e) {}
     }
     for (const car of record.sidecars) {
       await this.docker(['start', car.containerName], { timeout: 60000 });
@@ -857,6 +884,11 @@ class CatalogManager extends EventEmitter {
   }
 
   async stop(id) {
+    if (this.inFlight.has(id)) {
+      const err = new Error('No puedes detener un servicio mientras se está instalando');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
     const record = this.mustGet(id);
     await this.docker(['stop', record.containerName], { timeout: 90000 });
     for (const car of record.sidecars) {
@@ -881,30 +913,69 @@ class CatalogManager extends EventEmitter {
       ['logs', '--tail', String(count), record.containerName],
       { timeout: 20000 }
     );
-    // Docker manda a stderr todo lo que el proceso escribió en su stderr, que
-    // en la mayoría de estas imágenes es el registro entero. Se unen los dos.
     const secrets = this.decryptSecrets(record);
     if (record.databaseId) {
       try {
-        const dbCreds = databaseManager.getCredentials(record.databaseId);
+        const dbCreds = getDbManager().getCredentials(record.databaseId);
         if (dbCreds && dbCreds.password) secrets.__db_password = dbCreds.password;
       } catch (e) {}
     }
+    // P1-1: sin truncado a 600 caracteres para que el operador reciba todas las líneas solicitadas.
     return {
       id: record.id,
       containerName: record.containerName,
-      output: this.redact(`${stdout}${stderr}`, secrets)
+      output: this.redact(`${stdout}${stderr}`, secrets, null)
     };
   }
 
-  /**
-   * Desinstala.
-   *
-   * Los volúmenes NO se borran por defecto, y tampoco la base de datos. Borrar
-   * datos sin que se pidan explícitamente es la clase de comportamiento que
-   * hace que nadie vuelva a instalar tu software.
-   */
+  /** Conecta o actualiza un dominio HTTPS sobre un servicio ya instalado (p. ej. WordPress). */
+  async attachDomain(id, rawHostname) {
+    const record = this.mustGet(id);
+    const domain = String(rawHostname || '').trim().toLowerCase();
+    if (!domain || !DOMAIN_RE.test(domain)) {
+      throw new Error(`Dominio inválido: «${domain}». Usa un nombre completo, por ejemplo miweb.com`);
+    }
+    const domainManager = getDomainManager();
+    const existing = domainManager.getByHostname(domain);
+    if (existing && existing.serviceId !== record.id) {
+      throw new Error(`El dominio ${domain} ya está en uso en Culkibo`);
+    }
+    if (record.domainId && record.domain !== domain) {
+      try { await domainManager.deleteDomain(record.domainId); } catch (e) {}
+    }
+    const created = existing || await domainManager.addDomain({
+      hostname: domain,
+      targetPod: 'service',
+      targetPort: record.hostPort,
+      cloudflareProxied: false,
+      routingMode: 'direct_dns'
+    });
+    await domainManager.updateDomain(created.id, {
+      targetPod: 'service',
+      targetPort: record.hostPort,
+      serviceId: record.id,
+      serviceName: record.name
+    });
+    record.domain = domain;
+    record.domainId = created.id;
+    record.url = `https://${domain}`;
+    record.updatedAt = new Date().toISOString();
+    this.save();
+    const ingress = await getIngressManager().reconcile().catch((e) => ({ applied: false, reason: e.message }));
+    record.ingress = {
+      applied: Boolean(ingress && ingress.applied),
+      reason: ingress && ingress.reason ? ingress.reason : null
+    };
+    this.save();
+    return this.toPublic(record);
+  }
+
   async remove(id, { deleteVolumes = false } = {}) {
+    if (this.inFlight.has(id)) {
+      const err = new Error('El servicio se está instalando ahora mismo; espera a que termine antes de eliminarlo');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
     const record = this.mustGet(id);
     const removed = {
       containers: /** @type {string[]} */ ([]),
@@ -925,7 +996,7 @@ class CatalogManager extends EventEmitter {
 
     if (record.databaseId) {
       try {
-        await databaseManager.remove(record.databaseId, { deleteVolume: deleteVolumes, deleteBackups: deleteVolumes });
+        await getDbManager().remove(record.databaseId, { deleteVolume: deleteVolumes, deleteBackups: deleteVolumes });
         removed.database = record.databaseId;
       } catch (e) {}
     }
@@ -944,8 +1015,6 @@ class CatalogManager extends EventEmitter {
       try { fs.rmSync(path.join(FILES_ROOT, record.id), { recursive: true, force: true }); } catch (e) {}
     }
 
-    // La red se va siempre: sin contenedores dentro no sirve de nada y dejarla
-    // acumula una interfaz bridge por instalación borrada.
     if (await this.isDockerAvailable()) {
       try {
         await this.docker(['network', 'rm', record.networkName], { timeout: 20000 });
@@ -955,10 +1024,10 @@ class CatalogManager extends EventEmitter {
 
     if (record.domainId) {
       try {
-        await domainManager.deleteDomain(record.domainId);
+        await getDomainManager().deleteDomain(record.domainId);
         removed.domain = record.domain;
       } catch (e) {}
-      try { await ingressManager.reconcile(); } catch (e) {}
+      try { await getIngressManager().reconcile(); } catch (e) {}
     }
 
     this.state.installations = this.state.installations.filter((i) => i.id !== id);
@@ -1036,7 +1105,7 @@ class CatalogManager extends EventEmitter {
     /** @type {any} */
     const out = { id: record.id, name: record.name, secrets: this.decryptSecrets(record), database: null };
     if (record.databaseId) {
-      try { out.database = databaseManager.getCredentials(record.databaseId); } catch (e) {}
+      try { out.database = getDbManager().getCredentials(record.databaseId); } catch (e) {}
     }
     return out;
   }

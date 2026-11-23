@@ -1,7 +1,42 @@
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
+
+/**
+ * Petición GET nativa a la API de GitHub sin dependencia externa `axios`.
+ * @param {string} baseUrl
+ * @param {{ headers?: Record<string, string>, params?: Record<string, any> | null, timeout?: number }} [opts]
+ * @returns {Promise<{ status: number, data: any }>}
+ */
+async function ghGet(baseUrl, { headers = {}, params = null, timeout = 10000 } = {}) {
+  let finalUrl = baseUrl;
+  if (params && typeof params === 'object') {
+    const u = new URL(baseUrl);
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
+    }
+    finalUrl = u.toString();
+  }
+  const res = await fetch(finalUrl, {
+    method: 'GET',
+    headers,
+    signal: AbortSignal.timeout(timeout)
+  });
+  const text = await res.text();
+  /** @type {any} */
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (e) {
+    data = text;
+  }
+  if (!res.ok) {
+    const err = new Error((data && data.message) || `GitHub HTTP ${res.status}`);
+    /** @type {any} */ (err).response = { status: res.status, data };
+    throw err;
+  }
+  return { status: res.status, data };
+}
 
 const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'github.json');
 const GH_SEGMENT_RE = /^[A-Za-z0-9_.-]{1,100}$/;
@@ -269,7 +304,7 @@ class GithubService {
     }
 
     try {
-      const res = await axios.get(`${this.apiBase}/user`, {
+      const res = await ghGet(`${this.apiBase}/user`, {
         headers: {
           Authorization: `Bearer ${cleanToken}`,
           'User-Agent': 'Culkibo-Cloud/1.0.0',
@@ -392,7 +427,7 @@ class GithubService {
     if (search && this.config.user?.login) {
       try {
         const q = `${search.trim()} user:${this.config.user.login} fork:true`;
-        const searchRes = await axios.get(`${this.apiBase}/search/repositories`, {
+        const searchRes = await ghGet(`${this.apiBase}/search/repositories`, {
           headers: this.getHeaders(),
           params: {
             q,
@@ -435,7 +470,7 @@ class GithubService {
     }
 
     try {
-      const res = await axios.get(`${this.apiBase}/user/repos`, {
+      const res = await ghGet(`${this.apiBase}/user/repos`, {
         headers: this.getHeaders(),
         params: {
           page: pageNum,
@@ -498,7 +533,7 @@ class GithubService {
     try {
       const safeOwner = assertGhSegment(owner, 'Propietario');
       const safeRepo = assertGhSegment(repo, 'Repositorio');
-      const res = await axios.get(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/branches`, {
+      const res = await ghGet(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/branches`, {
         headers: this.getHeaders(),
         params: { per_page: 100 },
         timeout: 10000
@@ -676,7 +711,7 @@ class GithubService {
       const safeOwner = assertGhSegment(owner, 'Propietario');
       const safeRepo = assertGhSegment(repo, 'Repositorio');
       // 1. Check root directory contents
-      const contentsRes = await axios.get(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/contents`, {
+      const contentsRes = await ghGet(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/contents`, {
         headers: this.getHeaders(),
         params: { ref: branch },
         timeout: 10000
@@ -704,7 +739,7 @@ class GithubService {
       // 3. Check for package.json
       if (fileNames.includes('package.json')) {
         try {
-          const pkgRes = await axios.get(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/contents/package.json`, {
+          const pkgRes = await ghGet(`${this.apiBase}/repos/${safeOwner}/${safeRepo}/contents/package.json`, {
             headers: this.getHeaders(),
             params: { ref: branch },
             timeout: 10000

@@ -2,6 +2,11 @@ const API_BASE = '/api';
 const TOKEN_STORAGE_KEY = 'culkibo_control_token';
 
 let _cachedToken: string | null | undefined;
+let _unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  _unauthorizedHandler = handler;
+}
 
 export function getAuthToken(): string | null {
   if (_cachedToken !== undefined) return _cachedToken;
@@ -32,24 +37,32 @@ export function clearAuthToken(): void {
   }
 }
 
-export function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const token = getAuthToken();
   const headers = new Headers(init.headers || {});
   if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`);
   }
-  return window.fetch(input, { ...init, headers });
+  const res = await window.fetch(input, { ...init, headers });
+  if (res.status === 401 && _unauthorizedHandler) {
+    const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (!urlStr.includes('/auth/session') && !urlStr.includes('/auth/verify')) {
+      clearAuthToken();
+      _unauthorizedHandler();
+    }
+  }
+  return res;
 }
 
 /**
  * El backend devuelve `{ error }` con el motivo en español en cada fallo. Sin
  * esto, un 400 se convertía en un objeto raro asignado al estado y la interfaz
  * mostraba "undefined" en lugar de "Publicar en 0.0.0.0 expone la base de
- * datos...". Los avisos de seguridad sólo sirven si llegan a verse.
+ * datos...". Los avisos de seguridad solo sirven si llegan a verse.
  */
 async function jsonOrThrow(res: Response, fallback: string) {
   const body = await res.json().catch(() => null);
-  if (!res.ok) throw new Error((body && body.error) || fallback);
+  if (!res.ok) throw new Error((body && (body.error || body.message)) || `${fallback} (HTTP ${res.status})`);
   return body;
 }
 
@@ -791,46 +804,180 @@ export interface DeployLogEvent {
   message: string;
 }
 
+export interface ObservabilityHistoryPoint {
+  ts: number;
+  rps: number;
+  p50Ms: number;
+  p95Ms: number;
+  rssMb: number;
+  heapMb: number;
+  elLagMs: number;
+  cpuPercent: number;
+}
+
+export interface ObservabilitySnapshot {
+  timestamp: string;
+  uptimeSeconds: number;
+  bootMs: number | null;
+  process: {
+    pid: number;
+    nodeVersion: string;
+    platform: string;
+    arch: string;
+    uptimeSeconds: number;
+    cpuPercent: number | null;
+    memoryMb: number;
+    heapUsedMb: number;
+    heapTotalMb: number;
+    hostMemoryTotalMb: number;
+    hostMemoryUsedMb: number;
+    hostMemoryFreeMb?: number;
+    hostCpus: number;
+    loadAvg: number[];
+    measured: boolean;
+  };
+  eventLoop: {
+    resolutionMs: number;
+    samples: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+    p99Ms: number | null;
+    maxMs: number | null;
+    utilizationRatio: number | null;
+  };
+  http: {
+    requestsTotal: number;
+    inFlight: number;
+    rps: {
+      rps1s: number;
+      rps10s: number;
+      rps60s: number;
+    };
+    status: {
+      '2xx': number;
+      '3xx': number;
+      '4xx': number;
+      '5xx': number;
+    };
+    methods: Record<string, number>;
+    latencyMs: {
+      samples: number;
+      min: number | null;
+      mean: number | null;
+      p50: number | null;
+      p95: number | null;
+      p99: number | null;
+      max: number | null;
+    };
+    topRoutes: Array<{ route: string; count: number; errors: number; avgMs: number; maxMs?: number }>;
+  };
+  websocket: {
+    telemetryClients: number;
+    syncClients: number;
+    sseClients: number;
+    connectionsTotal: number;
+    broadcastsTotal: number;
+  };
+  liveSync: {
+    loaded: boolean;
+    activeSessions: number;
+    connectedClients: number;
+    framesApplied: number;
+    filesWritten: number;
+    dedupSkipped: number;
+    bytesSynced: number;
+    rollbacksCount: number;
+    applyLatencyMs: { samples: number; p50: number | null; p95: number | null; p99: number | null };
+  };
+  caddy: {
+    available: boolean | null;
+    version: string | null;
+    managedRoutes: number | null;
+    swapsTotal: number;
+    noopSkips: number;
+    swapLatencyMs: { samples: number; p50: number | null; p95: number | null; p99: number | null; max?: number | null };
+  };
+  history: ObservabilityHistoryPoint[];
+}
+
+export interface DoctorCheck {
+  id: string;
+  name: string;
+  status: 'ok' | 'warn' | 'fail';
+  summary: string;
+  detail: string;
+  fixAction: string | null;
+  fixLabel: string | null;
+}
+
+export interface SystemDoctorReport {
+  overall: 'ok' | 'warn' | 'fail';
+  durationMs: number;
+  timestamp: string;
+  summary: { ok: number; warn: number; fail: number };
+  checks: DoctorCheck[];
+}
+
 export const api = {
   async getProjects(): Promise<Project[]> {
-    const res = await apiFetch(`${API_BASE}/projects`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/projects`), 'No se pudieron cargar los proyectos');
   },
   async getProject(id: string): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/projects/${id}`), 'No se pudo cargar el proyecto');
   },
   async createProject(data: any): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+      'No se pudo crear el proyecto'
+    );
   },
   async updateProject(id: string, data: any): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+      'No se pudo actualizar el proyecto'
+    );
   },
   async deleteProject(id: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}`, { method: 'DELETE' });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}`, { method: 'DELETE' }),
+      'No se pudo eliminar el proyecto'
+    );
   },
   async activateProject(id: string): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}/activate`, { method: 'POST' });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}/activate`, { method: 'POST' }),
+      'No se pudo activar el proyecto'
+    );
   },
   async hibernateProject(id: string): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}/hibernate`, { method: 'POST' });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}/hibernate`, { method: 'POST' }),
+      'No se pudo hibernar el proyecto'
+    );
   },
   async startLocal(id: string): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}/start-local`, { method: 'POST' });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}/start-local`, { method: 'POST' }),
+      'No se pudo iniciar la vista previa local'
+    );
   },
   async stopLocal(id: string): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}/stop-local`, { method: 'POST' });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}/stop-local`, { method: 'POST' }),
+      'No se pudo detener la vista previa local'
+    );
   },
   async stopProject(id: string): Promise<Project> {
-    const res = await apiFetch(`${API_BASE}/projects/${id}/stop`, { method: 'POST' });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}/stop`, { method: 'POST' }),
+      'No se pudo detener el proyecto'
+    );
+  },
+  async testProjectWebhook(id: string): Promise<{ success: boolean; message?: string; delivery?: any }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${id}/webhook/test`, { method: 'POST' }),
+      'No se pudo probar el webhook del proyecto'
+    );
   },
   async previewCoolify(apiUrl: string, apiToken: string): Promise<any> {
     const res = await apiFetch(`${API_BASE}/import/coolify/preview`, {
@@ -874,40 +1021,44 @@ export const api = {
     return res.json();
   },
   async getPods(): Promise<PodsData> {
-    const res = await apiFetch(`${API_BASE}/pods`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/pods`), 'No se pudo consultar el estado de los pods');
   },
 
   async triggerHotSync(changedFile = 'src/app.ts'): Promise<{ success: boolean; syncDurationMs: number; reloadsTotal: number }> {
-    const res = await apiFetch(`${API_BASE}/pods/hot-sync`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ changedFile })
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/pods/hot-sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ changedFile })
+      }),
+      'No se pudo ejecutar la sincronización'
+    );
   },
 
   async switchTraffic(forgePercent: number, citadelPercent: number): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/pods/switch-traffic`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ forgePercent, citadelPercent })
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/pods/switch-traffic`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forgePercent, citadelPercent })
+      }),
+      'No se pudo cambiar el tráfico'
+    );
   },
 
   async deployRelease(imageTag: string, description: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/pods/deploy`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageTag, description })
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/pods/deploy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageTag, description })
+      }),
+      'No se pudo desplegar la versión'
+    );
   },
 
   async getDomains(): Promise<{ domains: DomainItem[] }> {
-    const res = await apiFetch(`${API_BASE}/domains`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/domains`), 'No se pudieron cargar los dominios');
   },
 
   async addDomain(payload: {
@@ -917,81 +1068,81 @@ export const api = {
     cloudflareZoneId?: string | null;
     cloudflareProxied?: boolean;
     autoCreateDns?: boolean;
+    serverIp?: string | null;
   }): Promise<DomainItem> {
-    const res = await apiFetch(`${API_BASE}/domains`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to add domain');
-    }
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo añadir el dominio'
+    );
   },
 
   async updateDomain(id: string, updates: Partial<DomainItem>): Promise<DomainItem> {
-    const res = await apiFetch(`${API_BASE}/domains/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to update domain');
-    }
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates)
+      }),
+      'No se pudo actualizar el dominio'
+    );
   },
 
   async toggleDomainProxy(id: string): Promise<DomainItem> {
-    const res = await apiFetch(`${API_BASE}/domains/${id}/toggle-proxy`, {
-      method: 'POST'
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to toggle proxy');
-    }
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains/${id}/toggle-proxy`, { method: 'POST' }),
+      'No se pudo cambiar el estado del proxy'
+    );
   },
 
   async deleteDomain(id: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/domains/${id}`, { method: 'DELETE' });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains/${id}`, { method: 'DELETE' }),
+      'No se pudo eliminar el dominio'
+    );
   },
 
   async verifyDns(hostname: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/domains/verify-dns`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hostname })
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains/verify-dns`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hostname })
+      }),
+      'No se pudo comprobar el DNS'
+    );
   },
 
   async getWatcherStatus(): Promise<{ isWatching: boolean; directory: string | null; fileWatchersActive: number }> {
-    const res = await apiFetch(`${API_BASE}/watcher/status`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/watcher/status`), 'No se pudo consultar el observador');
   },
 
   async startWatcher(directory?: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/watcher/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ directory })
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/watcher/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ directory })
+      }),
+      'No se pudo iniciar el observador'
+    );
   },
 
   async stopWatcher(): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/watcher/stop`, {
-      method: 'POST'
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/watcher/stop`, { method: 'POST' }),
+      'No se pudo detener el observador'
+    );
   },
 
   async getIngressResolution(hostname: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/ingress/resolve?hostname=${encodeURIComponent(hostname)}`);
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/resolve?hostname=${encodeURIComponent(hostname)}`),
+      'No se pudo simular el enrutado'
+    );
   },
 
   /** Estado real del plano de datos, con handshakes TLS de verdad. */
@@ -999,19 +1150,15 @@ export const api = {
     const qs = new URLSearchParams();
     if (opts.probe === false) qs.set('probe', '0');
     if (opts.force) qs.set('force', '1');
-    const res = await apiFetch(`${API_BASE}/ingress/status?${qs.toString()}`);
-    if (!res.ok) throw new Error((await res.json()).error || 'No se pudo consultar el ingress');
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/ingress/status?${qs.toString()}`), 'No se pudo consultar Caddy');
   },
 
   async reconcileIngress(): Promise<IngressOutcome> {
-    const res = await apiFetch(`${API_BASE}/ingress/reconcile`, { method: 'POST' });
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/ingress/reconcile`, { method: 'POST' }), 'No se pudieron reconciliar las rutas');
   },
 
   async startIngress(): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/ingress/start`, { method: 'POST' });
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/ingress/start`, { method: 'POST' }), 'No se pudo iniciar Caddy');
   },
 
   /** Vincula un dominio a un proyecto: crea el registro Y publica la ruta. */
@@ -1022,33 +1169,29 @@ export const api = {
     cloudflareZoneId?: string | null;
     cloudflareProxied?: boolean;
     autoCreateDns?: boolean;
+    serverIp?: string | null;
   }): Promise<{ domain: DomainItem; project: Project; ingress: IngressOutcome }> {
-    const res = await apiFetch(`${API_BASE}/projects/${projectId}/domains`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'No se pudo vincular el dominio');
-    }
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/domains`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo vincular el dominio'
+    );
   },
 
   /** Desvincula un dominio: borra el registro Y retira la ruta. */
   async detachDomainFromProject(projectId: string, domainId: string, keepDomain = false): Promise<any> {
     const qs = keepDomain ? '?keepDomain=1' : '';
-    const res = await apiFetch(`${API_BASE}/projects/${projectId}/domains/${domainId}${qs}`, { method: 'DELETE' });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'No se pudo desvincular el dominio');
-    }
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/domains/${domainId}${qs}`, { method: 'DELETE' }),
+      'No se pudo desvincular el dominio'
+    );
   },
 
   async getCertificates(): Promise<{ certificates: SslCertificate[] }> {
-    const res = await apiFetch(`${API_BASE}/ssl/certificates`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/ssl/certificates`), 'No se pudieron cargar los certificados');
   },
 
   /**
@@ -1075,17 +1218,18 @@ export const api = {
   },
 
   async getCloudflareConfig(): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/cloudflare/config`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/cloudflare/config`), 'No se pudo leer la configuración de Cloudflare');
   },
 
   async saveCloudflareConfig(payload: { apiToken?: string; accountId?: string; useMock?: boolean }): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/cloudflare/config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cloudflare/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }),
+      'No se pudo guardar la configuración de Cloudflare'
+    );
   },
 
   async verifyCloudflareToken(apiToken?: string): Promise<any> {
@@ -1098,27 +1242,26 @@ export const api = {
   },
 
   async getCloudflareZones(): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/cloudflare/zones`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/cloudflare/zones`), 'No se pudieron obtener las zonas de Cloudflare');
   },
 
   async getCloudflareRecords(zoneId: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/cloudflare/zones/${zoneId}/dns-records`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/cloudflare/zones/${zoneId}/dns-records`), 'No se pudieron cargar los registros DNS');
   },
 
   async getCloudflareTunnels(): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/cloudflare/tunnels`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/cloudflare/tunnels`), 'No se pudieron listar los túneles');
   },
 
   async createCloudflareTunnel(name: string): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/cloudflare/tunnels`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name })
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cloudflare/tunnels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      }),
+      'No se pudo crear el túnel'
+    );
   },
 
   async getLogs(params: { pod?: string; level?: string; limit?: number; search?: string; projectId?: string } = {}): Promise<{ logs: LogEntry[] }> {
@@ -1128,47 +1271,43 @@ export const api = {
     if (params.limit) qs.set('limit', String(params.limit));
     if (params.search) qs.set('search', params.search);
     if (params.projectId) qs.set('projectId', params.projectId);
-    const res = await apiFetch(`${API_BASE}/logs?${qs.toString()}`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/logs?${qs.toString()}`), 'No se pudieron cargar los registros');
   },
 
   async getMcpTools(): Promise<{ tools: any[] }> {
-    const res = await apiFetch(`${API_BASE}/mcp/tools`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/mcp/tools`), 'No se pudieron cargar las herramientas MCP');
   },
 
   async executeMcpTool(name: string, args: any = {}): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/mcp/message`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: Date.now(),
-        method: 'tools/call',
-        params: { name, arguments: args }
-      })
-    });
-    return res.json();
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/mcp/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: Date.now(),
+          method: 'tools/call',
+          params: { name, arguments: args }
+        })
+      }),
+      'Error al ejecutar la herramienta MCP'
+    );
   },
 
   async getMcpAudit(): Promise<{ auditLog: McpAuditEntry[] }> {
-    const res = await apiFetch(`${API_BASE}/mcp/audit`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/mcp/audit`), 'No se pudo cargar la auditoría MCP');
   },
 
   async getMcpConfig(): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/mcp/config`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/mcp/config`), 'No se pudo cargar la configuración MCP');
   },
 
   async getSystemStatus(): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/system/status`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/system/status`), 'No se pudo consultar el estado del sistema');
   },
 
   async getGitHubStatus(): Promise<GitHubStatus> {
-    const res = await apiFetch(`${API_BASE}/github/status`);
-    return res.json();
+    return jsonOrThrow(await apiFetch(`${API_BASE}/github/status`), 'No se pudo consultar el estado de GitHub');
   },
 
   async connectGitHub(token: string): Promise<{ success: boolean; user: GitHubUser }> {
@@ -1461,6 +1600,17 @@ export const api = {
     );
   },
 
+  async attachCatalogDomain(id: string, domain: string): Promise<{ installation: ServiceInstallation; ingress: IngressOutcome }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/domain`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain })
+      }),
+      'No se pudo conectar el dominio al servicio'
+    );
+  },
+
   // --- Autenticación del plano de control ---
 
   async getAuthSession(): Promise<AuthSession> {
@@ -1475,6 +1625,48 @@ export const api = {
         body: JSON.stringify({ token })
       }),
       'Token inválido'
+    );
+  },
+
+  async getWsTicket(): Promise<{ ticket: string; expiresInMs: number }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/ws-ticket`, { method: 'POST' }),
+      'No se pudo generar un ticket de conexión en tiempo real'
+    );
+  },
+
+  async rotateAuthToken(): Promise<{ rotated: boolean; token: string; message?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/rotate`, { method: 'POST' }),
+      'No se pudo rotar el token de acceso'
+    );
+  },
+
+  // --- Observabilidad y Diagnóstico (Doctor) ---
+
+  async getObservabilitySnapshot(fresh = false): Promise<ObservabilitySnapshot> {
+    const qs = fresh ? '?fresh=1' : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/snapshot${qs}`),
+      'No se pudieron obtener las métricas del servidor'
+    );
+  },
+
+  async getSystemDoctor(): Promise<SystemDoctorReport> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/doctor`),
+      'No se pudo ejecutar el diagnóstico del sistema'
+    );
+  },
+
+  async runDoctorFix(action: string): Promise<{ ok: boolean; action: string; message: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/doctor/fix`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action })
+      }),
+      'No se pudo aplicar la corrección'
     );
   },
 
@@ -1697,29 +1889,32 @@ export const api = {
   },
 
   async callMcpModern(toolName: string, args: Record<string, unknown> = {}): Promise<any> {
-    const res = await apiFetch(`${API_BASE}/mcp`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'MCP-Protocol-Version': '2026-07-28',
-        'Mcp-Method': 'tools/call',
-        'Mcp-Name': toolName
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: Date.now(),
-        method: 'tools/call',
-        params: {
-          name: toolName,
-          arguments: args,
-          _meta: {
-            'modelcontextprotocol.io/protocolVersion': '2026-07-28',
-            'modelcontextprotocol.io/clientInfo': { name: 'culkibo-dashboard', version: '1.0.0' }
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'MCP-Protocol-Version': '2026-07-28',
+          'Mcp-Method': 'tools/call',
+          'Mcp-Name': toolName
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: Date.now(),
+          method: 'tools/call',
+          params: {
+            name: toolName,
+            arguments: args,
+            _meta: {
+              'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+              'io.modelcontextprotocol/clientCapabilities': {},
+              'io.modelcontextprotocol/clientInfo': { name: 'culkibo-dashboard', version: '1.0.0' }
+            }
           }
-        }
-      })
-    });
-    return res.json();
+        })
+      }),
+      'Error al invocar la herramienta MCP'
+    );
   }
 };

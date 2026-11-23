@@ -106,7 +106,11 @@ class DbBackupManager {
       throw new Error(`Proyecto ${projectId} no encontrado`);
     }
 
-    const domains = domainManager.listDomains().filter(d => d.targetPort === project.citadelPort || d.targetPort === project.forgePort);
+    // P1-27: asociar dominios reales por projectId o project.domains (no por puerto genérico 3001/8080)
+    const projHosts = new Set((project.domains || []).map((h) => String(h).toLowerCase()));
+    const domains = domainManager.listDomains().filter(
+      (d) => d.projectId === project.id || projHosts.has(String(d.hostname || '').toLowerCase())
+    );
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const backupFileName = `backup_${project.id}_${timestamp}.json`;
@@ -198,6 +202,9 @@ class DbBackupManager {
       }
     }
 
+    // P0-6: garantizar escritura atómica en disco antes de devolver éxito (CLI restore)
+    await projectManager.flushToDisk();
+
     return {
       success: true,
       restoredProjectId: restored.id,
@@ -216,14 +223,18 @@ class DbBackupManager {
 
     for (const file of files) {
       if (file.endsWith('.json')) {
-        const filePath = path.join(this.backupsDir, file);
-        const stats = await fs.promises.stat(filePath);
-        backups.push({
-          fileName: file,
-          sizeBytes: stats.size,
-          createdAt: stats.birthtime,
-          modifiedAt: stats.mtime
-        });
+        try {
+          const filePath = path.join(this.backupsDir, file);
+          const stats = await fs.promises.stat(filePath);
+          backups.push({
+            fileName: file,
+            sizeBytes: stats.size,
+            createdAt: stats.birthtime,
+            modifiedAt: stats.mtime
+          });
+        } catch (e) {
+          // Ignorar ficheros eliminados concurrentemente durante el listado
+        }
       }
     }
 

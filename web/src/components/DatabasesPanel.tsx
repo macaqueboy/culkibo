@@ -1,27 +1,52 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Database, Plus, Play, Square, RefreshCw, Trash2, Eye, EyeOff, Copy, Check,
-  ShieldAlert, Clock, CloudUpload, History, Lock, Globe, AlertTriangle, Server
+  Database,
+  Plus,
+  Play,
+  Square,
+  RefreshCw,
+  Trash2,
+  Eye,
+  EyeOff,
+  Copy,
+  Check,
+  ShieldAlert,
+  Clock,
+  CloudUpload,
+  History,
+  Lock,
+  Globe,
+  AlertTriangle,
+  Server,
 } from 'lucide-react';
-import { api, type ManagedDatabase, type DbEngine, type DbBackup, type DbCredentials, type DbStorageConfig } from '../lib/api';
+import {
+  api,
+  type ManagedDatabase,
+  type DbEngine,
+  type DbBackup,
+  type DbCredentials,
+  type DbStorageConfig,
+} from '../lib/api';
+import { copyToClipboard } from '../lib/clipboard';
+import { Modal } from './Modal';
 
 interface Props {
   projectId: string;
-  onNotify: (msg: string) => void;
+  onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }
 
 const HEALTH_STYLE: Record<string, { dot: string; label: string }> = {
   healthy: { dot: 'bg-emerald-500', label: 'Saludable' },
   starting: { dot: 'bg-amber-500 animate-pulse', label: 'Arrancando' },
   unhealthy: { dot: 'bg-red-500', label: 'Con fallos' },
-  unknown: { dot: 'bg-slate-300', label: 'Desconocido' }
+  unknown: { dot: 'bg-slate-300', label: 'Desconocido' },
 };
 
 const CRON_PRESETS = [
   { value: '0 * * * *', label: 'Cada hora' },
   { value: '0 3 * * *', label: 'Cada día a las 03:00' },
   { value: '0 4 * * 0', label: 'Cada domingo a las 04:00' },
-  { value: '0 5 1 * *', label: 'El día 1 de cada mes a las 05:00' }
+  { value: '0 5 1 * *', label: 'El día 1 de cada mes a las 05:00' },
 ];
 
 function formatBytes(n: number): string {
@@ -48,11 +73,21 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
   const [creds, setCreds] = useState<Record<string, DbCredentials>>({});
   const [backups, setBackups] = useState<Record<string, DbBackup[]>>({});
   const [copied, setCopied] = useState<string | null>(null);
-  const [confirmDestroyId, setConfirmDestroyId] = useState<string | null>(null);
+
+  // Confirmaciones destructivas en Modal (P0-11)
+  const [confirmRestore, setConfirmRestore] = useState<{ db: ManagedDatabase; backup: DbBackup } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ db: ManagedDatabase; destroyData: boolean } | null>(null);
+  const [confirmDisconnectS3, setConfirmDisconnectS3] = useState(false);
+
   const [storage, setStorage] = useState<DbStorageConfig>({ configured: false });
   const [showStorageForm, setShowStorageForm] = useState(false);
   const [storageForm, setStorageForm] = useState({
-    endpoint: '', region: 'auto', bucket: '', accessKeyId: '', secretAccessKey: '', prefix: 'culkibo/'
+    endpoint: '',
+    region: 'auto',
+    bucket: '',
+    accessKeyId: '',
+    secretAccessKey: '',
+    prefix: 'culkibo/',
   });
 
   const load = useCallback(async () => {
@@ -61,7 +96,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
         api.getDatabases(projectId),
         api.getDbEngines(),
         api.getDbDockerStatus(),
-        api.getDbStorage()
+        api.getDbStorage(),
       ]);
       setDatabases(dbs.databases);
       setEngines(eng.engines);
@@ -69,7 +104,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
       setDockerReason(status.reason);
       setStorage(store);
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos');
+      onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos', 'error');
     }
   }, [projectId, onNotify]);
 
@@ -79,7 +114,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
       api.getDatabases(projectId),
       api.getDbEngines(),
       api.getDbDockerStatus(),
-      api.getDbStorage()
+      api.getDbStorage(),
     ])
       .then(([dbs, eng, status, store]) => {
         if (!active) return;
@@ -91,13 +126,11 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
       })
       .catch((err) => {
         if (!active) return;
-        onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos');
+        onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos', 'error');
       });
     return () => { active = false; };
   }, [projectId, onNotify]);
 
-  // Mientras algo esté arrancando conviene refrescar: la sonda de salud tarda
-  // decenas de segundos y el usuario no debería tener que recargar a mano.
   useEffect(() => {
     if (!databases.some((d) => d.health === 'starting' || d.health === 'unknown')) return;
     const t = setInterval(async () => {
@@ -115,7 +148,7 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     try {
       await fn();
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'Ha ocurrido un error');
+      onNotify(err instanceof Error ? err.message : 'Ha ocurrido un error', 'error');
     } finally {
       setBusy(null);
     }
@@ -125,20 +158,21 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     setCreating(engine.engine);
     try {
       const created = await api.createDatabase({ projectId, engine: engine.engine, name: engine.label });
-      onNotify(`${engine.label} aprovisionado. Guarda o inyecta la cadena de conexión desde «Gestionar».`);
+      onNotify(`${engine.label} aprovisionado. Inyecta la cadena de conexión desde «Gestionar».`, 'success');
       await load();
       setExpanded(created.id);
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'Error al aprovisionar');
+      onNotify(err instanceof Error ? err.message : 'Error al aprovisionar', 'error');
     } finally {
       setCreating(null);
     }
   };
 
-  const copy = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
+  const copy = async (text: string, key: string) => {
+    const ok = await copyToClipboard(text);
+    if (!ok) return;
     setCopied(key);
-    setTimeout(() => setCopied(null), 1800);
+    window.setTimeout(() => setCopied(null), 1800);
   };
 
   const toggleCredentials = (db: ManagedDatabase) => guard(`creds-${db.id}`, async () => {
@@ -156,8 +190,11 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
   });
 
   const handleExpose = (db: ManagedDatabase, enabled: boolean) => guard(`exp-${db.id}`, async () => {
-    const res = await api.setDatabaseExposure(db.id, { enabled, hostPort: db.port });
-    if (res.warning) onNotify(res.warning);
+    const payload = enabled
+      ? { enabled: true, ...(db.exposure.hostPort ? { hostPort: db.exposure.hostPort } : {}) }
+      : { enabled: false };
+    const res = await api.setDatabaseExposure(db.id, payload);
+    if (res.warning) onNotify(res.warning, 'info');
     await load();
   });
 
@@ -168,60 +205,71 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
     const key = db.engine === 'valkey' || db.engine === 'redis' ? 'REDIS_URL' : 'DATABASE_URL';
     const nextEnv = { ...(project.envVars || {}), [key]: c.internalConnectionString };
     await api.updateProject(projectId, { envVars: nextEnv });
-    onNotify(`Variable ${key} inyectada en las variables del proyecto`);
+    onNotify(`Variable ${key} inyectada en el proyecto`, 'success');
   });
 
+  const openStorageEditor = () => {
+    if (!showStorageForm && storage.configured) {
+      setStorageForm({
+        endpoint: storage.endpoint || '',
+        region: storage.region || 'auto',
+        bucket: storage.bucket || '',
+        prefix: storage.prefix || 'culkibo/',
+        accessKeyId: '',
+        secretAccessKey: '',
+      });
+    }
+    setShowStorageForm((v) => !v);
+  };
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       {dockerOk === false && (
-        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex items-start gap-3">
-          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-          <div className="text-sm">
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
+          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <div className="text-xs">
             <p className="font-semibold text-amber-900">Docker no está disponible</p>
-            <p className="text-amber-800">{dockerReason || 'Las bases de datos gestionadas necesitan un daemon de Docker activo.'}</p>
+            <p className="text-amber-800 mt-0.5">
+              {dockerReason || 'Las bases de datos gestionadas necesitan Docker en marcha.'}
+            </p>
           </div>
         </div>
       )}
 
-      {/* ---------------------------------------------------------------- */}
-      {/* Aprovisionar                                                      */}
-      {/* ---------------------------------------------------------------- */}
-      <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-        <div className="flex justify-between items-center mb-1">
-          <h3 className="font-bold text-slate-900 flex items-center gap-2 text-lg">
-            <Database className="w-5 h-5" /> Aprovisionar base de datos
-          </h3>
-        </div>
-        <p className="text-sm text-slate-500 mb-4">
-          Un clic y listo: contraseña generada, volumen persistente, red privada del proyecto, límites de
-          recursos y sonda de salud. <strong className="text-slate-700">Nunca se publica ningún puerto.</strong>
+      {/* Aprovisionar */}
+      <div className="bg-white p-5 rounded-xl border border-slate-200">
+        <h3 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
+          <Database className="w-4 h-4 text-slate-600" /> Aprovisionar base de datos
+        </h3>
+        <p className="text-xs text-slate-500 mt-1 mb-4">
+          Contraseña aleatoria cifrada, volumen persistente, red privada del proyecto, límites de recursos y sonda de salud.{' '}
+          <strong className="text-slate-700 font-medium">Sin puertos expuestos por defecto.</strong>
         </p>
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
           {engines.map((e) => (
             <button
               key={e.engine}
+              type="button"
               disabled={dockerOk === false || creating !== null}
-              onClick={() => handleCreate(e)}
-              className="text-left border border-slate-200 rounded-xl p-4 hover:border-slate-900 hover:shadow-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-white"
+              onClick={() => void handleCreate(e)}
+              className="text-left border border-slate-200 rounded-xl p-3.5 hover:border-slate-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed bg-white cursor-pointer"
             >
               <div className="flex items-center justify-between">
-                <span className="font-semibold text-slate-900">{e.label}</span>
+                <span className="font-semibold text-sm text-slate-900">{e.label}</span>
                 {creating === e.engine
-                  ? <RefreshCw className="w-4 h-4 text-slate-400 animate-spin" />
-                  : <Plus className="w-4 h-4 text-slate-400" />}
+                  ? <RefreshCw className="w-3.5 h-3.5 text-slate-500 animate-spin" />
+                  : <Plus className="w-3.5 h-3.5 text-slate-400" />}
               </div>
-              <div className="font-mono text-xs text-slate-500 mt-1">{e.image}</div>
-              <div className="text-[11px] text-slate-400 mt-1">{e.licence}</div>
+              <div className="font-mono text-xs text-slate-500 mt-1 truncate">{e.image}</div>
+              <div className="text-[11px] text-slate-400 mt-0.5">{e.licence}</div>
             </button>
           ))}
         </div>
       </div>
 
-      {/* ---------------------------------------------------------------- */}
-      {/* Listado                                                           */}
-      {/* ---------------------------------------------------------------- */}
+      {/* Listado */}
       {databases.length === 0 && (
-        <div className="bg-white p-10 rounded-2xl border border-slate-200 shadow-sm text-center text-slate-500 text-sm">
+        <div className="bg-white p-8 rounded-xl border border-slate-200 text-center text-slate-500 text-xs">
           Este proyecto todavía no tiene bases de datos gestionadas.
         </div>
       )}
@@ -230,54 +278,58 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
         const health = HEALTH_STYLE[db.health] || HEALTH_STYLE.unknown;
         const open = expanded === db.id;
         return (
-          <div key={db.id} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div className="p-6 flex flex-col md:flex-row md:items-center gap-4">
+          <div key={db.id} className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+            <div className="p-5 flex flex-col md:flex-row md:items-center gap-4">
               <div className="flex items-center gap-3 flex-1 min-w-0">
-                <div className="w-11 h-11 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-center shrink-0">
-                  <Database className="w-5 h-5 text-slate-600" />
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center shrink-0">
+                  <Database className="w-4 h-4 text-slate-600" />
                 </div>
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-slate-900 truncate">{db.name}</span>
-                    <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md">{db.engineLabel}</span>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-semibold text-sm text-slate-900 truncate">{db.name}</span>
+                    <span className="text-[11px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded">{db.engineLabel}</span>
                   </div>
-                  <div className="flex items-center gap-3 text-xs text-slate-500 mt-1">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 mt-1 tabular-nums">
                     <span className="flex items-center gap-1.5">
-                      <span className={`w-2 h-2 rounded-full ${health.dot}`} /> {health.label}
+                      <span className={`w-1.5 h-1.5 rounded-full ${health.dot}`} /> {health.label}
                     </span>
-                    <span className="font-mono truncate">{db.containerName}</span>
-                    <span>{db.memoryMb} MB &bull; {db.cpus} vCPU</span>
+                    <span className="font-mono truncate max-w-[200px]">{db.containerName}</span>
+                    <span>{db.memoryMb} MB · {db.cpus} vCPU</span>
                   </div>
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center gap-2 flex-wrap shrink-0">
                 {db.exposure.enabled ? (
-                  <span className={`text-xs px-2 py-1 rounded-md flex items-center gap-1 ${
+                  <span className={`text-xs px-2 py-1 rounded-md font-mono flex items-center gap-1 tabular-nums ${
                     db.exposure.bindAddress === '0.0.0.0'
                       ? 'bg-red-50 text-red-700 border border-red-200'
-                      : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+                      : 'bg-amber-50 text-amber-800 border border-amber-200'
+                  }`}>
                     <Globe className="w-3 h-3" /> {db.exposure.bindAddress}:{db.exposure.hostPort}
                   </span>
                 ) : (
                   <span className="text-xs px-2 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
-                    <Lock className="w-3 h-3" /> Sólo red privada
+                    <Lock className="w-3 h-3" /> Solo red privada
                   </span>
                 )}
                 <button
-                  onClick={() => guard(`ctl-${db.id}`, async () => {
+                  type="button"
+                  onClick={() => void guard(`ctl-${db.id}`, async () => {
                     await api.controlDatabase(db.id, db.status === 'running' ? 'stop' : 'start');
                     await load();
                   })}
                   disabled={busy === `ctl-${db.id}`}
-                  className="p-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 disabled:opacity-50"
+                  aria-label={db.status === 'running' ? 'Detener base de datos' : 'Iniciar base de datos'}
+                  className="p-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 disabled:opacity-50 cursor-pointer"
                   title={db.status === 'running' ? 'Detener' : 'Iniciar'}
                 >
-                  {db.status === 'running' ? <Square className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                  {db.status === 'running' ? <Square className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
                 </button>
                 <button
-                  onClick={() => { setExpanded(open ? null : db.id); if (!open) loadBackups(db); }}
-                  className="text-sm font-medium text-slate-600 hover:text-slate-900 border border-slate-200 px-3 py-1.5 rounded-lg"
+                  type="button"
+                  onClick={() => { setExpanded(open ? null : db.id); if (!open) void loadBackups(db); }}
+                  className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-3 py-1.5 rounded-lg cursor-pointer"
                 >
                   {open ? 'Cerrar' : 'Gestionar'}
                 </button>
@@ -285,89 +337,92 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
             </div>
 
             {open && (
-              <div className="border-t border-slate-100 bg-slate-50/60 p-6 space-y-6">
-                {/* ---- Conexión --------------------------------------- */}
+              <div className="border-t border-slate-200 bg-slate-50/60 p-5 space-y-5">
+                {/* Conexión */}
                 <section>
-                  <h4 className="font-semibold text-slate-800 text-sm mb-2 flex items-center gap-2">
-                    <Server className="w-4 h-4" /> Conexión
+                  <h4 className="font-semibold text-slate-800 text-xs mb-1.5 flex items-center gap-1.5">
+                    <Server className="w-3.5 h-3.5 text-slate-500" /> Conexión interna
                   </h4>
                   <p className="text-xs text-slate-500 mb-2">
-                    Las aplicaciones del proyecto llegan por el nombre del contenedor dentro de la red
-                    <span className="font-mono"> {db.networkName}</span>. La contraseña no aparece en ningún
-                    listado; hay que pedirla aquí.
+                    Accesible por nombre de contenedor en la red <code className="font-mono">{db.networkName}</code>. La contraseña solo se descifra al pedirla.
                   </p>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                     <code className="flex-1 bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono text-slate-700 overflow-x-auto whitespace-nowrap">
                       {creds[db.id] ? creds[db.id].internalConnectionString : db.connectionTemplate}
                     </code>
-                    <button
-                      onClick={() => toggleCredentials(db)}
-                      disabled={busy === `creds-${db.id}`}
-                      className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 disabled:opacity-50"
-                      title={creds[db.id] ? 'Ocultar credenciales' : 'Mostrar credenciales'}
-                    >
-                      {creds[db.id] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                    {creds[db.id] && (
+                    <div className="flex items-center gap-1.5 shrink-0">
                       <button
-                        onClick={() => copy(creds[db.id].internalConnectionString, `conn-${db.id}`)}
-                        className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer"
-                        title="Copiar"
+                        type="button"
+                        onClick={() => void toggleCredentials(db)}
+                        disabled={busy === `creds-${db.id}`}
+                        aria-label={creds[db.id] ? 'Ocultar credenciales' : 'Mostrar credenciales'}
+                        className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 disabled:opacity-50 cursor-pointer"
+                        title={creds[db.id] ? 'Ocultar credenciales' : 'Mostrar credenciales'}
                       >
-                        {copied === `conn-${db.id}` ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
+                        {creds[db.id] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                       </button>
-                    )}
-                    <button
-                      onClick={() => handleInjectEnv(db)}
-                      disabled={busy === `inj-${db.id}`}
-                      className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shrink-0 cursor-pointer disabled:opacity-50"
-                      title="Guarda automáticamente la cadena de conexión en las variables de entorno del proyecto"
-                    >
-                      {busy === `inj-${db.id}` ? 'Inyectando…' : `Inyectar ${db.engine === 'valkey' ? 'REDIS_URL' : 'DATABASE_URL'}`}
-                    </button>
+                      {creds[db.id] && (
+                        <button
+                          type="button"
+                          onClick={() => void copy(creds[db.id].internalConnectionString, `conn-${db.id}`)}
+                          aria-label="Copiar cadena de conexión"
+                          className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer"
+                          title="Copiar"
+                        >
+                          {copied === `conn-${db.id}` ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void handleInjectEnv(db)}
+                        disabled={busy === `inj-${db.id}`}
+                        className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium shrink-0 cursor-pointer disabled:opacity-50"
+                      >
+                        {busy === `inj-${db.id}` ? 'Inyectando…' : `Inyectar ${db.engine === 'valkey' || db.engine === 'redis' ? 'REDIS_URL' : 'DATABASE_URL'}`}
+                      </button>
+                    </div>
                   </div>
                 </section>
 
-                {/* ---- Exposición ------------------------------------- */}
+                {/* Exposición */}
                 <section>
-                  <h4 className="font-semibold text-slate-800 text-sm mb-2 flex items-center gap-2">
-                    <ShieldAlert className="w-4 h-4" /> Acceso desde fuera
+                  <h4 className="font-semibold text-slate-800 text-xs mb-1.5 flex items-center gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 text-slate-500" /> Acceso local desde el host
                   </h4>
-                  <div className="bg-white border border-slate-200 rounded-xl p-4 flex items-start justify-between gap-4">
+                  <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Publicar el puerto expone la base de datos en el host. Culkibo enlaza en
-                      <span className="font-mono"> 127.0.0.1</span>, nunca en todas las interfaces:
-                      las reglas que escribe Docker se evalúan <strong>antes</strong> que UFW, así que un
-                      puerto abierto a 0.0.0.0 queda accesible aunque el cortafuegos diga lo contrario.
-                      Para acceso remoto, usa un túnel SSH.
+                      Culkibo publica solo en <code className="font-mono">127.0.0.1</code> para que las reglas de Docker no omitan el cortafuegos del servidor. Para acceso externo usa un túnel SSH.
                     </p>
                     <button
-                      onClick={() => handleExpose(db, !db.exposure.enabled)}
+                      type="button"
+                      onClick={() => void handleExpose(db, !db.exposure.enabled)}
                       disabled={busy === `exp-${db.id}`}
-                      className={`shrink-0 text-sm font-medium px-3 py-1.5 rounded-lg border disabled:opacity-50 ${
+                      className={`shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border disabled:opacity-50 cursor-pointer ${
                         db.exposure.enabled
                           ? 'border-slate-200 text-slate-700 bg-white hover:bg-slate-50'
-                          : 'border-slate-900 bg-slate-900 text-white hover:bg-slate-800'}`}
+                          : 'border-slate-900 bg-slate-900 text-white hover:bg-slate-800'
+                      }`}
                     >
-                      {db.exposure.enabled ? 'Dejar de publicar' : `Publicar en 127.0.0.1:${db.port}`}
+                      {db.exposure.enabled ? 'Dejar de publicar' : 'Publicar en 127.0.0.1'}
                     </button>
                   </div>
                 </section>
 
-                {/* ---- Copias programadas ----------------------------- */}
+                {/* Copias programadas */}
                 <section>
-                  <h4 className="font-semibold text-slate-800 text-sm mb-2 flex items-center gap-2">
-                    <Clock className="w-4 h-4" /> Copias programadas
+                  <h4 className="font-semibold text-slate-800 text-xs mb-1.5 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-slate-500" /> Copias programadas
                   </h4>
                   <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-                    <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-2.5">
                       <select
+                        aria-label="Frecuencia de copias"
                         value={db.schedule.cron}
-                        onChange={(e) => guard(`sch-${db.id}`, async () => {
+                        onChange={(e) => void guard(`sch-${db.id}`, async () => {
                           await api.setDatabaseSchedule(db.id, { enabled: db.schedule.enabled, cron: e.target.value });
                           await load();
                         })}
-                        className="text-sm border border-slate-200 rounded-lg px-3 py-1.5 bg-white text-slate-700"
+                        className="text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 bg-white text-slate-700"
                       >
                         {CRON_PRESETS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
                         {!CRON_PRESETS.some((p) => p.value === db.schedule.cron) && (
@@ -375,21 +430,23 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
                         )}
                       </select>
                       <button
-                        onClick={() => guard(`sch-${db.id}`, async () => {
+                        type="button"
+                        onClick={() => void guard(`sch-${db.id}`, async () => {
                           await api.setDatabaseSchedule(db.id, { enabled: !db.schedule.enabled, cron: db.schedule.cron });
                           await load();
                         })}
                         disabled={busy === `sch-${db.id}`}
-                        className={`text-sm font-medium px-3 py-1.5 rounded-lg border disabled:opacity-50 ${
+                        className={`text-xs font-medium px-3 py-1.5 rounded-lg border disabled:opacity-50 cursor-pointer ${
                           db.schedule.enabled
                             ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                            : 'border-slate-200 bg-white text-slate-600'}`}
+                            : 'border-slate-200 bg-white text-slate-600'
+                        }`}
                       >
                         {db.schedule.enabled ? 'Programación activa' : 'Programación desactivada'}
                       </button>
-                      <span className="text-xs text-slate-500">
+                      <span className="text-xs text-slate-500 tabular-nums">
                         Próxima: <strong className="text-slate-700">{formatDate(db.schedule.nextRunAt)}</strong>
-                        {' '}&bull; Última: {formatDate(db.schedule.lastRunAt)}
+                        {' '}· Última: {formatDate(db.schedule.lastRunAt)}
                         {db.schedule.lastStatus === 'error' && <span className="text-red-600"> (falló)</span>}
                       </span>
                     </div>
@@ -403,134 +460,114 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
                             min={0}
                             max={k === 'daily' ? 365 : 260}
                             defaultValue={db.retention[k]}
-                            onBlur={(e) => guard(`ret-${db.id}`, async () => {
-                              const next = { ...db.retention, [k]: parseInt(e.target.value, 10) || 0 };
-                              await api.setDatabaseRetention(db.id, next);
-                              await load();
-                            })}
-                            className="w-16 border border-slate-200 rounded-lg px-2 py-1 text-slate-700"
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10) || 0;
+                              if (parsed === db.retention[k]) return;
+                              void guard(`ret-${db.id}`, async () => {
+                                await api.setDatabaseRetention(db.id, { ...db.retention, [k]: parsed });
+                                await load();
+                              });
+                            }}
+                            className="w-16 border border-slate-200 rounded-lg px-2 py-1 text-slate-700 font-mono tabular-nums"
                           />
                           {k === 'daily' ? 'diarias' : 'semanales'}
                         </label>
                       ))}
-                      <span className="text-xs text-slate-400">
-                        El resto se poda automáticamente tras cada copia, en disco y en el bucket.
-                      </span>
                     </div>
                   </div>
                 </section>
 
-                {/* ---- Historial -------------------------------------- */}
+                {/* Historial de copias */}
                 <section>
                   <div className="flex items-center justify-between mb-2">
-                    <h4 className="font-semibold text-slate-800 text-sm flex items-center gap-2">
-                      <History className="w-4 h-4" /> Copias ({db.backupsCount})
+                    <h4 className="font-semibold text-slate-800 text-xs flex items-center gap-1.5 tabular-nums">
+                      <History className="w-3.5 h-3.5 text-slate-500" /> Copias ({db.backupsCount})
                     </h4>
                     <button
-                      onClick={() => guard(`run-${db.id}`, async () => {
+                      type="button"
+                      onClick={() => void guard(`run-${db.id}`, async () => {
                         await api.runDatabaseBackup(db.id);
-                        onNotify('Copia completada');
+                        onNotify('Copia de seguridad completada', 'success');
                         await load();
                         setBackups({ ...backups, [db.id]: (await api.getDatabaseBackups(db.id)).backups });
                       })}
                       disabled={busy === `run-${db.id}`}
-                      className="text-sm font-medium bg-slate-900 text-white px-3 py-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1.5"
+                      className="text-xs font-medium bg-slate-900 text-white px-3 py-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
                     >
                       {busy === `run-${db.id}`
-                        ? <><RefreshCw className="w-4 h-4 animate-spin" /> Copiando…</>
-                        : <><CloudUpload className="w-4 h-4" /> Copiar ahora</>}
+                        ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Copiando…</>
+                        : <><CloudUpload className="w-3.5 h-3.5" /> Copiar ahora</>}
                     </button>
                   </div>
-                  <div className="border border-slate-200 rounded-xl overflow-hidden bg-white">
-                    <div className="grid grid-cols-[1.4fr_0.6fr_0.7fr_0.7fr_auto] gap-3 bg-slate-50 p-3 border-b border-slate-200 text-xs font-semibold text-slate-500">
-                      <div>Fecha</div><div>Tamaño</div><div>Origen</div><div>Destino</div><div />
-                    </div>
-                    <div className="divide-y divide-slate-100">
-                      {(backups[db.id] || []).length === 0 && (
-                        <div className="p-6 text-center text-slate-500 text-sm">Todavía no hay copias.</div>
-                      )}
-                      {(backups[db.id] || []).map((b) => (
-                        <div key={b.id} className="grid grid-cols-[1.4fr_0.6fr_0.7fr_0.7fr_auto] gap-3 p-3 items-center text-sm">
-                          <div className="text-slate-700">{formatDate(b.createdAt)}</div>
-                          <div className="text-slate-500">{formatBytes(b.sizeBytes)}</div>
-                          <div className="text-slate-500 text-xs">
-                            {b.trigger === 'scheduled' ? 'Programada' : b.trigger === 'catch-up' ? 'Recuperada' : 'Manual'}
-                          </div>
-                          <div className="text-xs">
-                            {b.localAvailable && <span className="text-slate-500">Disco</span>}
-                            {b.localAvailable && b.remoteAvailable && <span className="text-slate-300"> / </span>}
-                            {b.remoteAvailable && <span className="text-emerald-600">Bucket</span>}
-                          </div>
-                          <button
-                            onClick={() => guard(`res-${db.id}`, async () => {
-                              await api.restoreDatabase(db.id, { backupId: b.id });
-                              onNotify('Restauración completada');
-                              await load();
-                            })}
-                            disabled={busy === `res-${db.id}`}
-                            className="text-xs font-medium text-slate-600 hover:text-slate-900 border border-slate-200 px-2.5 py-1 rounded-lg disabled:opacity-50"
-                          >
-                            Restaurar
-                          </button>
-                        </div>
-                      ))}
-                    </div>
+                  <div className="border border-slate-200 rounded-xl overflow-x-auto bg-white">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-medium text-slate-500">
+                          <th className="py-2.5 px-3.5">Fecha</th>
+                          <th className="py-2.5 px-3">Tamaño</th>
+                          <th className="py-2.5 px-3">Origen</th>
+                          <th className="py-2.5 px-3">Destino</th>
+                          <th className="py-2.5 px-3.5 text-right">Acción</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 text-xs">
+                        {(backups[db.id] || []).length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="p-6 text-center text-slate-500">Todavía no hay copias.</td>
+                          </tr>
+                        ) : (
+                          (backups[db.id] || []).map((b) => (
+                            <tr key={b.id}>
+                              <td className="py-2.5 px-3.5 text-slate-700 tabular-nums whitespace-nowrap">{formatDate(b.createdAt)}</td>
+                              <td className="py-2.5 px-3 text-slate-500 font-mono tabular-nums whitespace-nowrap">{formatBytes(b.sizeBytes)}</td>
+                              <td className="py-2.5 px-3 text-slate-500 whitespace-nowrap">
+                                {b.trigger === 'scheduled' ? 'Programada' : b.trigger === 'catch-up' ? 'Recuperada' : 'Manual'}
+                              </td>
+                              <td className="py-2.5 px-3 whitespace-nowrap">
+                                {b.localAvailable && <span className="text-slate-600">Disco</span>}
+                                {b.localAvailable && b.remoteAvailable && <span className="text-slate-300"> / </span>}
+                                {b.remoteAvailable && <span className="text-emerald-700">Bucket</span>}
+                              </td>
+                              <td className="py-2.5 px-3.5 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmRestore({ db, backup: b })}
+                                  disabled={busy === `res-${db.id}`}
+                                  className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-2.5 py-1 rounded-lg disabled:opacity-50 cursor-pointer"
+                                >
+                                  Restaurar
+                                </button>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
                   </div>
                 </section>
 
-                {/* ---- Eliminar --------------------------------------- */}
-                <section className="pt-2 border-t border-slate-200">
-                  <div className="flex items-center justify-between gap-4">
-                    <p className="text-xs text-slate-500">
-                      Al eliminar se borra el contenedor. El volumen con los datos se conserva salvo que se
-                      indique lo contrario.
-                    </p>
-                    <div className="flex gap-2 shrink-0">
-                      <button
-                        onClick={() => guard(`del-${db.id}`, async () => {
-                          await api.deleteDatabase(db.id, { deleteVolume: false });
-                          onNotify('Base de datos eliminada; el volumen se ha conservado');
-                          await load();
-                        })}
-                        disabled={busy === `del-${db.id}`}
-                        className="text-sm font-medium text-slate-700 border border-slate-200 px-3 py-1.5 rounded-lg hover:bg-white disabled:opacity-50"
-                      >
-                        Eliminar y conservar datos
-                      </button>
-                      {confirmDestroyId === db.id ? (
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => guard(`del-${db.id}`, async () => {
-                              setConfirmDestroyId(null);
-                              await api.deleteDatabase(db.id, { deleteVolume: true, deleteBackups: true });
-                              onNotify('Base de datos y volumen eliminados');
-                              await load();
-                            })}
-                            disabled={busy === `del-${db.id}`}
-                            className="text-xs font-semibold text-white bg-red-600 hover:bg-red-700 px-3 py-1.5 rounded-lg cursor-pointer"
-                          >
-                            Sí, borrar datos para siempre
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDestroyId(null)}
-                            className="text-xs font-medium text-slate-600 border border-slate-200 bg-white px-2.5 py-1.5 rounded-lg cursor-pointer"
-                          >
-                            Cancelar
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => setConfirmDestroyId(db.id)}
-                          disabled={busy === `del-${db.id}`}
-                          className="text-sm font-medium text-red-700 border border-red-200 bg-red-50 px-3 py-1.5 rounded-lg hover:bg-red-100 disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <Trash2 className="w-4 h-4" /> Eliminar y borrar datos
-                        </button>
-                      )}
-                    </div>
+                {/* Eliminar */}
+                <section className="pt-3 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <p className="text-xs text-slate-500">
+                    Puedes eliminar solo el contenedor conservando el volumen, o destruir también los datos y copias.
+                  </p>
+                  <div className="flex flex-wrap gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDelete({ db, destroyData: false })}
+                      disabled={busy === `del-${db.id}`}
+                      className="text-xs font-medium text-slate-700 border border-slate-200 bg-white px-3 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                    >
+                      Eliminar contenedor
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDelete({ db, destroyData: true })}
+                      disabled={busy === `del-${db.id}`}
+                      className="text-xs font-medium text-red-700 border border-red-200 bg-red-50 px-3 py-1.5 rounded-lg hover:bg-red-100 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Eliminar y borrar datos
+                    </button>
                   </div>
                 </section>
               </div>
@@ -539,50 +576,58 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
         );
       })}
 
-      {/* ---------------------------------------------------------------- */}
-      {/* Almacenamiento remoto                                             */}
-      {/* ---------------------------------------------------------------- */}
-      <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+      {/* Almacenamiento remoto S3 / R2 */}
+      <div className="bg-white p-5 rounded-xl border border-slate-200">
         <div className="flex justify-between items-center mb-1">
-          <h3 className="font-bold text-slate-900 flex items-center gap-2 text-lg">
-            <CloudUpload className="w-5 h-5" /> Copias fuera del servidor (S3 / R2)
+          <h3 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
+            <CloudUpload className="w-4 h-4 text-slate-600" /> Copias externas (S3 / R2)
           </h3>
           <button
-            onClick={() => setShowStorageForm(!showStorageForm)}
-            className="text-sm font-medium text-slate-600 hover:text-slate-900 border border-slate-200 px-3 py-1.5 rounded-lg"
+            type="button"
+            onClick={openStorageEditor}
+            className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-3 py-1.5 rounded-lg cursor-pointer"
           >
             {showStorageForm ? 'Cancelar' : storage.configured ? 'Cambiar' : 'Configurar'}
           </button>
         </div>
-        <p className="text-sm text-slate-500 mb-4">
-          Compatible con Cloudflare R2, MinIO, Backblaze B2 y AWS S3. La clave secreta se guarda cifrada y
-          no vuelve a mostrarse.
+        <p className="text-xs text-slate-500 mb-4">
+          Compatible con Cloudflare R2, MinIO, Backblaze B2 y AWS S3. La clave secreta se cifra en disco.
         </p>
 
         {storage.configured && !showStorageForm && (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-            <div><div className="text-xs text-slate-400">Endpoint</div><div className="font-mono text-xs text-slate-700 truncate">{storage.endpoint}</div></div>
-            <div><div className="text-xs text-slate-400">Bucket</div><div className="text-slate-700">{storage.bucket}</div></div>
-            <div><div className="text-xs text-slate-400">Región</div><div className="text-slate-700">{storage.region}</div></div>
-            <div><div className="text-xs text-slate-400">Clave de acceso</div><div className="font-mono text-xs text-slate-700">{storage.accessKeyId}</div></div>
-            <div className="col-span-2 md:col-span-4 flex gap-2 pt-2">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+            <div>
+              <div className="text-slate-400">Endpoint</div>
+              <div className="font-mono text-slate-700 truncate mt-0.5">{storage.endpoint}</div>
+            </div>
+            <div>
+              <div className="text-slate-400">Bucket</div>
+              <div className="text-slate-700 mt-0.5">{storage.bucket}</div>
+            </div>
+            <div>
+              <div className="text-slate-400">Región</div>
+              <div className="text-slate-700 mt-0.5">{storage.region}</div>
+            </div>
+            <div>
+              <div className="text-slate-400">Clave de acceso</div>
+              <div className="font-mono text-slate-700 mt-0.5">{storage.accessKeyId}</div>
+            </div>
+            <div className="col-span-2 md:col-span-4 flex gap-2 pt-1">
               <button
-                onClick={() => guard('s3test', async () => {
+                type="button"
+                onClick={() => void guard('s3test', async () => {
                   const r = await api.testDbStorage();
-                  onNotify(`Conexión correcta con ${r.bucket}`);
+                  onNotify(`Conexión correcta con ${r.bucket}`, 'success');
                 })}
                 disabled={busy === 's3test'}
-                className="text-sm font-medium bg-slate-900 text-white px-3 py-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-50"
+                className="text-xs font-medium bg-slate-900 text-white px-3 py-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
               >
                 Probar conexión
               </button>
               <button
-                onClick={() => guard('s3clear', async () => {
-                  await api.setDbStorage(null);
-                  onNotify('Almacenamiento remoto desconectado');
-                  await load();
-                })}
-                className="text-sm font-medium text-slate-600 border border-slate-200 px-3 py-1.5 rounded-lg hover:bg-slate-50"
+                type="button"
+                onClick={() => setConfirmDisconnectS3(true)}
+                className="text-xs font-medium text-slate-600 border border-slate-200 px-3 py-1.5 rounded-lg hover:bg-slate-50 cursor-pointer"
               >
                 Desconectar
               </button>
@@ -591,8 +636,8 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
         )}
 
         {!storage.configured && !showStorageForm && (
-          <div className="text-sm text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-4">
-            Sin configurar. Las copias se guardan sólo en este servidor: si el disco falla, se pierden con él.
+          <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3.5">
+            Sin configurar. Las copias se guardan solo en el disco local de este servidor.
           </div>
         )}
 
@@ -601,9 +646,9 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
             className="grid grid-cols-1 md:grid-cols-2 gap-3"
             onSubmit={(e) => {
               e.preventDefault();
-              guard('s3save', async () => {
+              void guard('s3save', async () => {
                 await api.setDbStorage(storageForm);
-                onNotify('Almacenamiento remoto guardado');
+                onNotify('Almacenamiento remoto guardado', 'success');
                 setShowStorageForm(false);
                 await load();
               });
@@ -615,32 +660,172 @@ export const DatabasesPanel: React.FC<Props> = ({ projectId, onNotify }) => {
               ['region', 'Región', 'auto (R2) o eu-west-1'],
               ['prefix', 'Prefijo', 'culkibo/'],
               ['accessKeyId', 'Clave de acceso', ''],
-              ['secretAccessKey', 'Clave secreta', '']
+              ['secretAccessKey', 'Clave secreta', ''],
             ] as const).map(([field, label, placeholder]) => (
-              <label key={field} className="text-sm">
-                <span className="text-xs text-slate-500">{label}</span>
+              <label key={field} className="block">
+                <span className="text-xs font-medium text-slate-600">{label}</span>
                 <input
                   type={field === 'secretAccessKey' ? 'password' : 'text'}
                   required={field !== 'prefix'}
                   value={storageForm[field]}
                   placeholder={placeholder}
                   onChange={(e) => setStorageForm({ ...storageForm, [field]: e.target.value })}
-                  className="w-full border border-slate-200 rounded-lg px-3 py-2 mt-1 text-slate-700 font-mono text-xs"
+                  className="w-full border border-slate-200 rounded-lg px-3 py-2 mt-1 text-slate-800 font-mono text-xs bg-white"
                 />
               </label>
             ))}
-            <div className="md:col-span-2">
+            <div className="md:col-span-2 flex justify-end">
               <button
                 type="submit"
                 disabled={busy === 's3save'}
-                className="text-sm font-medium bg-slate-900 text-white px-4 py-2 rounded-lg hover:bg-slate-800 disabled:opacity-50"
+                className="text-xs font-medium bg-slate-900 text-white px-4 py-2 rounded-lg hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
               >
-                Guardar
+                Guardar configuración
               </button>
             </div>
           </form>
         )}
       </div>
+
+      {/* Modal: Confirmar restauración */}
+      <Modal
+        open={Boolean(confirmRestore)}
+        onClose={() => setConfirmRestore(null)}
+        title="Restaurar copia de seguridad"
+        subtitle="Esta operación sobrescribirá los datos actuales de la base de datos."
+        maxWidthClass="max-w-md"
+      >
+        {confirmRestore && (
+          <div className="p-5 space-y-4">
+            <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 space-y-1">
+              <div className="font-semibold">{confirmRestore.db.name} ({confirmRestore.db.engineLabel})</div>
+              <div>
+                Copia del <strong>{formatDate(confirmRestore.backup.createdAt)}</strong> ({formatBytes(confirmRestore.backup.sizeBytes)})
+              </div>
+              <div className="text-amber-800">
+                Los cambios posteriores a esa fecha se perderán al restaurar el volcado.
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmRestore(null)}
+                className="px-3.5 py-2 text-xs font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = confirmRestore;
+                  setConfirmRestore(null);
+                  void guard(`res-${target.db.id}`, async () => {
+                    await api.restoreDatabase(target.db.id, { backupId: target.backup.id });
+                    onNotify('Restauración completada', 'success');
+                    await load();
+                  });
+                }}
+                className="px-4 py-2 text-xs font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg cursor-pointer"
+              >
+                Sí, restaurar ahora
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Modal: Confirmar eliminación */}
+      <Modal
+        open={Boolean(confirmDelete)}
+        onClose={() => setConfirmDelete(null)}
+        title={confirmDelete?.destroyData ? 'Eliminar base de datos y datos' : 'Eliminar contenedor de base de datos'}
+        subtitle={
+          confirmDelete?.destroyData
+            ? 'Esta acción borrará permanentemente el contenedor, el volumen y las copias locales.'
+            : 'Se eliminará el contenedor pero se conservará el volumen persistente en disco.'
+        }
+        maxWidthClass="max-w-md"
+      >
+        {confirmDelete && (
+          <div className="p-5 space-y-4">
+            <div className={`p-3.5 rounded-xl border text-xs ${confirmDelete.destroyData ? 'bg-red-50 border-red-200 text-red-900' : 'bg-slate-50 border-slate-200 text-slate-700'}`}>
+              Base de datos: <strong>{confirmDelete.db.name}</strong> (<code className="font-mono">{confirmDelete.db.containerName}</code>)
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmDelete(null)}
+                className="px-3.5 py-2 text-xs font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = confirmDelete;
+                  setConfirmDelete(null);
+                  void guard(`del-${target.db.id}`, async () => {
+                    await api.deleteDatabase(target.db.id, {
+                      deleteVolume: target.destroyData,
+                      deleteBackups: target.destroyData,
+                    });
+                    onNotify(
+                      target.destroyData
+                        ? 'Base de datos y datos eliminados'
+                        : 'Contenedor eliminado; volumen conservado',
+                      'info'
+                    );
+                    await load();
+                  });
+                }}
+                className={`px-4 py-2 text-xs font-medium text-white rounded-lg cursor-pointer ${
+                  confirmDelete.destroyData ? 'bg-red-600 hover:bg-red-700' : 'bg-slate-900 hover:bg-slate-800'
+                }`}
+              >
+                {confirmDelete.destroyData ? 'Eliminar permanentemente' : 'Eliminar contenedor'}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Modal: Desconectar S3 */}
+      <Modal
+        open={confirmDisconnectS3}
+        onClose={() => setConfirmDisconnectS3(false)}
+        title="Desconectar almacenamiento S3 / R2"
+        subtitle="Las futuras copias solo se guardarán localmente hasta que vuelvas a configurarlo."
+        maxWidthClass="max-w-md"
+      >
+        <div className="p-5 space-y-4">
+          <p className="text-xs text-slate-600">
+            Los archivos que ya subiste al bucket <code className="font-mono">{storage.bucket}</code> no se borran.
+          </p>
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setConfirmDisconnectS3(false)}
+              className="px-3.5 py-2 text-xs font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+            >
+              Cancelar
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmDisconnectS3(false);
+                void guard('s3clear', async () => {
+                  await api.setDbStorage(null);
+                  onNotify('Almacenamiento remoto desconectado', 'info');
+                  await load();
+                });
+              }}
+              className="px-4 py-2 text-xs font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg cursor-pointer"
+            >
+              Desconectar
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 };

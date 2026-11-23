@@ -1,13 +1,66 @@
-const dns = require('dns').promises;
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
+
+/** @type {any} */
+let _dnsPromises = null;
+function getDnsPromises() {
+  if (!_dnsPromises) _dnsPromises = require('dns').promises;
+  return _dnsPromises;
+}
 
 /**
- * Guardia compartida contra SSRF + utilidades de escritura atómica segura.
- * Sin dependencias externas (solo módulos nativos de Node.js).
+ * Guardia compartida contra SSRF + cliente `safeFetch` con pinning de IP
+ * (corta DNS rebinding TOCTOU y redirecciones maliciosas) + utilidades de
+ * escritura atómica segura. Sin dependencias externas.
  */
+
+/**
+ * Extrae una dirección IPv4 desde representaciones IPv4-mapped IPv6, tanto en
+ * formato decimal (`::ffff:169.254.169.254`) como en formato hexadecimal
+ * normalizado por WHATWG URL en Node.js (`::ffff:a9fe:a9fe`), y también NAT64
+ * (`64:ff9b::a9fe:a9fe`) o 6to4 (`2002:a9fe:a9fe::`).
+ * @param {string} cleanLower
+ * @returns {string | null}
+ */
+function extractEmbeddedIPv4(cleanLower) {
+  // Expandir brevemente notación ::ffff:
+  if (cleanLower.startsWith('::ffff:')) {
+    const rest = cleanLower.slice(7);
+    if (net.isIPv4(rest)) return rest;
+    const hexMatch = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+    }
+  }
+  // Forma expandida 0:0:0:0:0:ffff:xxxx:yyyy
+  const expandedMapped = cleanLower.match(/^(?:0+:){5}ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (expandedMapped) {
+    const hi = parseInt(expandedMapped[1], 16);
+    const lo = parseInt(expandedMapped[2], 16);
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+  }
+  // NAT64 well-known prefix 64:ff9b::/96
+  const nat64Hex = cleanLower.match(/^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (nat64Hex) {
+    const hi = parseInt(nat64Hex[1], 16);
+    const lo = parseInt(nat64Hex[2], 16);
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+  }
+  // 6to4 prefix 2002:xxxx:yyyy::/48
+  const sixToFour = cleanLower.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/);
+  if (sixToFour) {
+    const hi = parseInt(sixToFour[1], 16);
+    const lo = parseInt(sixToFour[2], 16);
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+  }
+  return null;
+}
 
 /**
  * Devuelve true si una IPv4 pertenece a un rango privado, loopback, link-local,
@@ -32,12 +85,15 @@ function isPrivateIPv4(ip) {
 }
 
 /**
- * Devuelve true si una IP (IPv4 o IPv6) apunta a metadatos cloud (AWS/GCP/Azure/ECS).
+ * Devuelve true si una IP (IPv4 o IPv6, incluyendo ::ffff: hex/decimal) apunta
+ * a metadatos cloud (AWS/GCP/Azure/ECS/Alibaba).
  * @param {string} ip
  */
 function isMetadataIp(ip) {
   const clean = String(ip || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
-  if (clean.startsWith('::ffff:')) return isMetadataIp(clean.slice(7));
+  if (!clean) return false;
+  const embedded = extractEmbeddedIPv4(clean);
+  if (embedded) return isMetadataIp(embedded);
   if (clean.startsWith('169.254.')) return true;
   if (clean === 'fd00:ec2::254' || clean.startsWith('fd00:ec2::')) return true;
   if (clean === '100.100.100.200') return true; // Alibaba Cloud metadata
@@ -51,13 +107,13 @@ function isMetadataIp(ip) {
 function isPrivateIp(ip) {
   const clean = String(ip || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
   if (!clean) return true;
-  if (clean.startsWith('::ffff:')) {
-    return isPrivateIPv4(clean.slice(7));
-  }
+  const embedded = extractEmbeddedIPv4(clean);
+  if (embedded) return isPrivateIPv4(embedded);
   const kind = net.isIP(clean);
   if (kind === 4) return isPrivateIPv4(clean);
   if (kind === 6) {
     if (clean === '::' || clean === '::1') return true;
+    if (/^(?:0+:){7}0*[01]$/.test(clean)) return true; // forma expandida :: o ::1
     if (clean.startsWith('fc') || clean.startsWith('fd')) return true; // ULA fc00::/7
     if (/^fe[89ab]/.test(clean)) return true; // link-local fe80::/10
     if (clean.startsWith('ff')) return true;  // multicast
@@ -67,8 +123,26 @@ function isPrivateIp(ip) {
 }
 
 /**
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} timeoutMs
+ * @param {string} label
+ * @returns {Promise<T>}
+ */
+function withTimeout(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} excedió el tiempo límite (${timeoutMs} ms)`)), timeoutMs);
+    if (timer.unref) timer.unref();
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+/**
  * Valida una URL antes de hacer peticiones salientes desde el servidor.
- * Resuelve DNS y bloquea rangos privados/metadatos para cortar SSRF y DNS rebinding básico.
+ * Resuelve DNS (con timeout de 5 s) y bloquea rangos privados/metadatos.
  *
  * @param {string} rawUrl
  * @param {{
@@ -78,7 +152,8 @@ function isPrivateIp(ip) {
  *   allowLoopback?: boolean,
  *   allowCredentials?: boolean,
  *   allowedHosts?: string[] | null,
- *   blockSearchAndHash?: boolean
+ *   blockSearchAndHash?: boolean,
+ *   dnsTimeoutMs?: number
  * }} [options]
  * @returns {Promise<{ url: URL, addresses: string[] }>}
  */
@@ -90,7 +165,8 @@ async function assertSafeUrl(rawUrl, options = {}) {
     allowLoopback = false,
     allowCredentials = false,
     allowedHosts = null,
-    blockSearchAndHash = false
+    blockSearchAndHash = false,
+    dnsTimeoutMs = 5000
   } = options;
   const effectiveProtocols = requireHttps ? ['https:'] : allowedProtocols;
 
@@ -137,19 +213,27 @@ async function assertSafeUrl(rawUrl, options = {}) {
   } else if (host === 'localhost' || host.endsWith('.localhost')) {
     addresses = ['127.0.0.1'];
   } else {
+    const dns = getDnsPromises();
     try {
-      const [v4, v6] = await Promise.all([
-        dns.resolve4(host).catch(() => []),
-        dns.resolve6(host).catch(() => [])
-      ]);
+      const [v4, v6] = await withTimeout(
+        Promise.all([
+          dns.resolve4(host).catch(() => []),
+          dns.resolve6(host).catch(() => [])
+        ]),
+        dnsTimeoutMs,
+        `Resolución DNS de ${host}`
+      );
       addresses = [...v4, ...v6];
     } catch (e) {
       addresses = [];
     }
     if (addresses.length === 0) {
-      // Fallback a dns.lookup si el resolver del host (p. ej. /etc/hosts) es necesario
       try {
-        const looked = await dns.lookup(host, { all: true });
+        const looked = await withTimeout(
+          dns.lookup(host, { all: true }),
+          dnsTimeoutMs,
+          `Resolución DNS de ${host}`
+        );
         addresses = looked.map((r) => r.address);
       } catch (e) {
         throw new Error(`No se pudo resolver el dominio: ${host}`);
@@ -162,7 +246,9 @@ async function assertSafeUrl(rawUrl, options = {}) {
       throw new Error(`Destino bloqueado (IP de metadatos cloud): ${addr}`);
     }
     if (!allowPrivate) {
-      const isLoop = addr === '127.0.0.1' || addr === '::1' || addr.startsWith('127.') || addr === '::ffff:127.0.0.1';
+      const embedded = extractEmbeddedIPv4(addr.toLowerCase());
+      const normAddr = embedded || addr.toLowerCase();
+      const isLoop = normAddr === '127.0.0.1' || normAddr === '::1' || normAddr.startsWith('127.');
       if (isLoop && allowLoopback) continue;
       if (isPrivateIp(addr)) {
         throw new Error(`Destino bloqueado por protección SSRF (IP privada/local): ${addr}`);
@@ -171,6 +257,147 @@ async function assertSafeUrl(rawUrl, options = {}) {
   }
 
   return { url: parsed, addresses };
+}
+
+/**
+ * Cliente HTTP/HTTPS sin dependencias con validación SSRF en cada salto de
+ * redirección y pinning de IP (evita DNS rebinding TOCTOU), SNI correcto para
+ * HTTPS y límite de tamaño de respuesta.
+ *
+ * @param {string} rawUrl
+ * @param {{
+ *   method?: string,
+ *   headers?: Record<string, string>,
+ *   body?: string | Buffer | null,
+ *   timeoutMs?: number,
+ *   maxRedirects?: number,
+ *   maxBytes?: number,
+ *   allowPrivate?: boolean,
+ *   allowLoopback?: boolean,
+ *   requireHttps?: boolean,
+ *   allowedHosts?: string[] | null
+ * }} [opts]
+ * @returns {Promise<{ ok: boolean, status: number, url: string, headers: Record<string, string | string[] | undefined>, body: Buffer, text: () => string, json: () => any }>}
+ */
+async function safeFetch(rawUrl, opts = {}) {
+  const {
+    method = 'GET',
+    headers = {},
+    body = null,
+    timeoutMs = 10000,
+    maxRedirects = 3,
+    maxBytes = 10 * 1024 * 1024,
+    allowPrivate = false,
+    allowLoopback = false,
+    requireHttps = false,
+    allowedHosts = null
+  } = opts;
+
+  let currentUrl = rawUrl;
+  let currentMethod = String(method || 'GET').toUpperCase();
+  let currentBody = body;
+
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const { url: parsed, addresses } = await assertSafeUrl(currentUrl, {
+      allowPrivate,
+      allowLoopback,
+      requireHttps,
+      allowedHosts
+    });
+
+    const pinnedIp = addresses.find((a) => net.isIP(a) === 4) || addresses[0];
+    const family = net.isIP(pinnedIp) === 6 ? 6 : 4;
+    const isHttps = parsed.protocol === 'https:';
+    const mod = isHttps ? https : http;
+    const targetHostname = parsed.hostname.replace(/^\[|\]$/g, '');
+
+    /** @type {{ status: number, headers: Record<string, any>, body: Buffer }} */
+    const resObj = await new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (err, val) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      const reqHeaders = { ...headers };
+      if (currentBody != null && !reqHeaders['Content-Length'] && !reqHeaders['content-length']) {
+        reqHeaders['Content-Length'] = String(Buffer.byteLength(currentBody));
+      }
+
+      const reqOpts = {
+        protocol: parsed.protocol,
+        hostname: targetHostname,
+        port: parsed.port ? Number(parsed.port) : (isHttps ? 443 : 80),
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        method: currentMethod,
+        headers: reqHeaders,
+        timeout: timeoutMs,
+        ...(isHttps ? { servername: net.isIP(targetHostname) ? undefined : targetHostname } : {}),
+        lookup: (_host, _opts, cb) => {
+          if (typeof _opts === 'function') return _opts(null, pinnedIp, family);
+          if (_opts && _opts.all) return cb(null, [{ address: pinnedIp, family }]);
+          return cb(null, pinnedIp, family);
+        }
+      };
+
+      const req = mod.request(reqOpts, (res) => {
+        const status = res.statusCode || 0;
+        // Si es redirección, drenar cuerpo sin acumular
+        if (status >= 300 && status < 400 && res.headers.location) {
+          res.resume();
+          return done(null, { status, headers: res.headers, body: Buffer.alloc(0) });
+        }
+        /** @type {Buffer[]} */
+        const chunks = [];
+        let total = 0;
+        res.on('data', (chunk) => {
+          total += chunk.length;
+          if (total > maxBytes) {
+            req.destroy(new Error(`Respuesta demasiado grande (> ${maxBytes} bytes)`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => done(null, { status, headers: res.headers, body: Buffer.concat(chunks, total) }));
+        res.on('error', (err) => done(err, null));
+      });
+
+      req.on('timeout', () => req.destroy(new Error(`Tiempo de espera agotado (${timeoutMs} ms)`)));
+      req.on('error', (err) => done(err, null));
+      if (currentBody != null && currentMethod !== 'GET' && currentMethod !== 'HEAD') {
+        req.write(currentBody);
+      }
+      req.end();
+    });
+
+    if (resObj.status >= 300 && resObj.status < 400 && resObj.headers.location) {
+      if (hop === maxRedirects) {
+        throw new Error(`Demasiadas redirecciones (> ${maxRedirects})`);
+      }
+      const nextUrl = new URL(String(resObj.headers.location), parsed).toString();
+      currentUrl = nextUrl;
+      if (resObj.status === 301 || resObj.status === 302 || resObj.status === 303) {
+        currentMethod = 'GET';
+        currentBody = null;
+      }
+      continue;
+    }
+
+    const buf = resObj.body;
+    return {
+      ok: resObj.status >= 200 && resObj.status < 300,
+      status: resObj.status,
+      url: parsed.toString(),
+      headers: resObj.headers,
+      body: buf,
+      text: () => buf.toString('utf8'),
+      json: () => JSON.parse(buf.toString('utf8'))
+    };
+  }
+
+  throw new Error('Demasiadas redirecciones');
 }
 
 /**
@@ -221,10 +448,12 @@ function assertContainedPath(baseRoot, childSegment) {
 }
 
 module.exports = {
+  extractEmbeddedIPv4,
   isPrivateIPv4,
   isPrivateIp,
   isMetadataIp,
   assertSafeUrl,
+  safeFetch,
   atomicWriteJsonSync,
   assertContainedPath
 };

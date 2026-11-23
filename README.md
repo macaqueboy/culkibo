@@ -2,12 +2,12 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Node.js >=20](https://img.shields.io/badge/Node.js-%E2%89%A520-339933.svg)](package.json)
-[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28%20(47%20tools)-6366f1.svg)](#conectar-agentes-de-ia-mcp-2026-07-28)
+[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28%20(49%20tools)-18181b.svg)](#conectar-agentes-de-ia-mcp-2026-07-28)
 
 **Orquestador cloud autohospedado, open-source y diseñado para la era de los agentes de IA.**  
-Alternativa rápida, auditable y fácil de usar frente a Coolify y Dokploy: Live Sync binario sub-20 ms (*The Forge*), despliegues inmutables sin cortes con Caddy (*The Citadel*), migrador guiado de **WordPress** e **Importador Universal** (Coolify, Docker Compose, cualquier URL Git, Vercel, Netlify, Railway, Render, Dokploy), asistente de **Dominios y Wildcard SSL** en 3 pasos, enlace en directo con **Agentes IA (`47` herramientas MCP `2026-07-28`)**, catálogo de **14 servicios en 1 clic** y **cero construcción de comandos de shell**.
+Alternativa ultrarrápida, auditable y fácil de usar frente a Coolify y Dokploy: Live Sync binario sub-20 ms (*The Forge*), despliegues inmutables sin cortes con Caddy (*The Citadel*), **observabilidad en vivo + Prometheus `/metrics` + System Doctor en 1 clic**, paleta global `Cmd+K`, migrador guiado de **WordPress** e **Importador Universal** (Coolify, Docker Compose, cualquier URL Git, Vercel, Netlify, Railway, Render, Dokploy), asistente de **Dominios y Wildcard SSL** en 3 pasos, enlace en directo con **Agentes IA (`49` herramientas MCP `2026-07-28`)**, catálogo de **14 servicios en 1 clic** y **cero construcción de comandos de shell**.
 
-**Apache-2.0 · 7 dependencias de runtime · 19 suites + live-server + estrés + benchmarks reproducibles**
+**Apache-2.0 · 6 dependencias de runtime · 20 suites + live-server + estrés + benchmarks reproducibles**
 
 ---
 
@@ -17,8 +17,8 @@ El ciclo habitual de desarrollo con agentes de IA (Claude Code, Cursor, Windsurf
 
 ```text
 Tradicional: editar → commit → push → webhook → build Docker (1–4 min) → esperar → ver
-Culkibo:     guardar fichero → Commit Frame binario (/ws/sync) → vivo en 15,8 ms (p50)
-             promocionar → BuildKit con caché → healthcheck → conmutación Caddy en 4,6 ms (p50)
+Culkibo:     guardar fichero → Commit Frame binario (/ws/sync) → vivo en ~8,5 ms (p50)
+             promocionar → BuildKit con caché → healthcheck → conmutación Caddy en ~7–10 ms (p50)
 ```
 
 Dos planos coordinados sobre el mismo dominio:
@@ -32,18 +32,20 @@ Dos planos coordinados sobre el mismo dominio:
 
 Cada número de esta tabla procede de código real ejecutado contra **Caddy v2.11.9 real** y el daemon real de Culkibo — cero `setTimeout` simulados, cero constantes escritas a mano. Puedes reproducirlos en tu propia máquina con `npm run bench:all` y validarlos como aserciones con `npm run test:bench`.
 
-| Dimensión | Culkibo v1.0.0 (medido) | Coolify / Dokploy / Competidores | Cómo reproducirlo |
+| Dimensión | Culkibo v1.0.0 (medido en Node 24 · Win x64) | Coolify / Dokploy / Competidores | Cómo reproducirlo |
 |---|---:|---|---|
-| **Conmutación de ruta HTTP** (Caddy admin API) | **p50 4,6 ms · p95 5,6 ms · máx 9,1 ms · 0 HTTP 5xx** | Traefik file throttle 2.000 ms / HTTP poll 5.000 ms (**435×–1.087× más lento**) | `npm run bench` |
-| **Live Sync binario E2E** (disco → `/ws/sync` → HTTP vivo) | **p50 15,8 ms · p95 19,1 ms** (`apply` servidor **1,71 ms**) | Coolify ~4 min · Vercel ~42 s · Dokploy ~30 s | `npm run bench:sync` |
-| **Ráfaga IA (15 ficheros simultáneos)** | **1 solo Commit Frame en 89,8 ms** | 15 eventos sueltos o builds encadenados | `npm run bench:sync` |
-| **Rollback de parche en memoria** | **p50 0,65 ms · p95 3,89 ms** | Rebuild completo o reinicio de contenedor | `npm run bench:sync` |
-| **Arranque en frío y RAM en reposo** | **452,9 ms · 71 MB RSS · 0% CPU** (cabe en VPS 512 MB) | Coolify ≥ 2.048 MB (falla en VPS 1 GB) · Dokploy ~600–900 MB | `npm run bench:control` |
-| **Concurrencia plano de control (400 req)** | **3.293 req/s · p50 4,48 ms · p95 11,44 ms · 0 fallos** | PHP/Laravel + Postgres + Redis + Horizon | `npm run bench:control` |
-| **WebSocket fan-out (40 clientes)** | **40/40 clientes listos en 21,8 ms** | Polling / Pusher / Soketi extra | `npm run bench:control` |
-| **Dependencias de runtime** | **7** (`express`, `ws`, `axios`, `chokidar`, `commander`, `cors`, `dotenv`) | Cientos de paquetes PHP/Composer o monorepo Next.js | `package.json` |
+| **Conmutación de ruta HTTP** (Caddy v2.11.9 admin API) | **p50 7,0–9,6 ms · p95 11,9–12,7 ms · 0 HTTP 5xx** | Traefik file throttle 2.000 ms / HTTP poll 5.000 ms (**208×–714× más lento**) | `npm run bench` |
+| **Live Sync binario E2E** (disco → `/ws/sync` → HTTP vivo) | **p50 7,3–25,3 ms** (`apply` servidor **0,74–3,5 ms**) | Coolify ~4 min · Vercel ~42 s · Dokploy ~30 s | `npm run bench:sync` |
+| **Ráfaga IA (15 ficheros simultáneos)** | **1 solo Commit Frame atómico (~101–236 ms)** | 15 eventos sueltos o builds encadenados | `npm run bench:sync` |
+| **Rollback de parche en memoria** | **p50 0,65–1,98 ms · p95 4,27 ms** | Rebuild completo o reinicio de contenedor | `npm run bench:sync` |
+| **Arranque en frío y RAM en reposo** | **115–284 ms · 49–62 MB RSS · 0% CPU** (cabe en VPS 512 MB) | Coolify ≥ 2.048 MB (falla en VPS 1 GB) · Dokploy ~600–900 MB | `npm run bench:control` |
+| **Concurrencia plano de control (200–400 req)** | **1.781–3.508 req/s · p95 9,4–19,0 ms · 0 fallos** | PHP/Laravel + Postgres + Redis + Horizon | `npm run bench:control` |
+| **Estrés mixto (100 req: GET + POST concurrentes)** | **100/100 éxito · 87–92 ms media · 0 fallos** | Sin fast-path O(1) nativo | `node tests/stress.test.js` |
+| **WebSocket fan-out (40 clientes)** | **40/40 clientes listos · 0 caídas bajo churn** | Polling / Pusher / Soketi extra | `npm run bench:control` |
+| **Dependencias de runtime** | **6** (`express`, `ws`, `chokidar`, `commander`, `cors`, `dotenv`) | Cientos de paquetes PHP/Composer o monorepo Next.js | `package.json` |
 | **Construcción de comandos de shell** | **0** (verificado en CI por escáner estático) | 21 avisos críticos RCE en Coolify · 34 en Dokploy | `node tests/shell-safety.test.js` |
-| **Superficie MCP (`2026-07-28`)** | **47 herramientas anotadas (26 mutadoras)** | Coolify: 3 mutadoras · Dokploy: sin MCP nativo | `POST /api/mcp` (`tools/list`) |
+| **Superficie MCP (`2026-07-28`)** | **49 herramientas anotadas (26 mutadoras)** | Coolify: 3 mutadoras · Dokploy: sin MCP nativo | `POST /api/mcp` (`tools/list`) |
+| **Observabilidad y Doctor en 1 clic** | **Prometheus `/metrics` + p50/p95/p99 + Event Loop + 8 checks** | Requiere stack Prometheus/Grafana externo | `GET /metrics` · `#/metrics` |
 
 ---
 
@@ -60,9 +62,10 @@ Cada número de esta tabla procede de código real ejecutado contra **Caddy v2.1
 | Bases de datos gestionadas (6 motores: PG, MySQL, MariaDB, Redis, Valkey, Mongo) | ✅ | ✅ | ✅ | Parcial |
 | Backups programados (cron) + S3 / Cloudflare R2 / MinIO + retención GFS | ✅ | ✅ | ✅ | Manual |
 | Catálogo 1-clic con redes aisladas y secretos AES-256-GCM (14 plantillas) | ✅ | ✅ | ✅ | ✅ |
-| Hub en directo de Agentes IA + MCP `2026-07-28` (47 herramientas, 26 mutadoras) | ✅ | Parcial (3) | ❌ | ❌ |
-| Cero `exec`/`sh -c` + protección SSRF + archivos `0600` atómicos verificados en CI | ✅ | ❌ | ❌ | Parcial |
-| Consumo en VPS de 512 MB / 1 GB RAM | ✅ (~71 MB) | ❌ (≥ 2 GB) | Ajustado | ✅ |
+| Hub en directo de Agentes IA + MCP `2026-07-28` (49 herramientas, 26 mutadoras) | ✅ | Parcial (3) | ❌ | ❌ |
+| Observabilidad nativa (Prometheus `/metrics`, p50/p95/p99, Event Loop, Doctor 1-clic) | ✅ | Externa | Básica | ❌ |
+| Cero `exec`/`sh -c` + protección SSRF IPv4/IPv6 + tickets WS de un solo uso + `0600` | ✅ | ❌ | ❌ | Parcial |
+| Consumo en VPS de 512 MB / 1 GB RAM | ✅ (~49–62 MB) | ❌ (≥ 2 GB) | Ajustado | ✅ |
 | **Multi-servidor / cluster Swarm-K8s** | 🚧 Roadmap (1 VPS hoy) | ✅ | ✅ | Swarm |
 
 > **Honestidad radical:** Culkibo hoy gestiona un único host (VPS o máquina local). La orquestación multi-servidor está en el roadmap; todo lo marcado con ✅ está implementado, probado en CI y verificable en este repositorio.
@@ -148,7 +151,7 @@ node bin/culkibo.js mcp                                 # servidor MCP por stdio
 
 ## Conectar agentes de IA (MCP `2026-07-28`)
 
-Culkibo expone **47 herramientas anotadas** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), incluyendo 26 herramientas de escritura: desplegar a producción, hacer rollback, aprovisionar bases de datos, disparar copias S3/R2, instalar/desinstalar del catálogo, analizar webs WordPress, importar stacks Docker Compose, consultar acceso remoto, verificar árboles Merkle de Live Sync, revertir parches en <4 ms, promocionar Forge → Citadel y migrar desde Coolify.
+Culkibo expone **49 herramientas anotadas** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), incluyendo 26 herramientas de escritura: desplegar a producción, hacer rollback, aprovisionar bases de datos, disparar copias S3/R2, instalar/desinstalar del catálogo, analizar webs WordPress, importar stacks Docker Compose, consultar acceso remoto, inspeccionar métricas y diagnóstico (`culkibo_get_metrics`, `culkibo_system_doctor`), verificar árboles Merkle de Live Sync, revertir parches en <4 ms, promocionar Forge → Citadel y migrar desde Coolify.
 
 ### Claude Desktop (stdio)
 
@@ -192,17 +195,18 @@ curl -s http://localhost:3030/api/mcp \
 npm run typecheck             # TypeScript checkJs en todo el servidor (0 errores)
 npm --prefix web run lint     # oxlint React 19 + Compiler rules (0 warnings, 0 errors)
 npm run web:build             # compilación Vite + TypeScript del panel web
-npm test                      # 19 suites + live-server + websocket-stress + stress
+npm test                      # 20 suites + live-server + websocket-stress + stress
 npm run test:bench            # aserciones estrictas de benchmarks y paridad competitiva
 npm run bench:all             # reporte completo de los 3 benchmarks reales
 ```
 
-### Cobertura de las 19 suites (`tests/run-all.js`)
+### Cobertura de las 20 suites (`tests/run-all.js`)
 
 | Suite | Qué verifica |
 |---|---|
 | `shell-safety.test.js` | 0 construcción de comandos de shell en `server/`, `bin/`, `scripts/`, `bench/` |
 | `security-hardening.test.js` | C1–C6, H1–H9: SSRF (metadata/RFC1918/S3/webhooks), proxy loopback spoofing, symlinks, PAT scoping, redacción MCP |
+| `metrics-and-bugs.test.js` | XFF leftmost spoof, IPv6-mapped hex SSRF, tickets WS de un solo uso, rate-limit auth, Prometheus `/metrics`, Doctor 8 checks y regresiones profundas |
 | `importers.test.js` | Migrador WordPress en vivo + reescritura SQL segura + Docker Compose + Vercel/Netlify/Railway/Render/Dokploy + Git URLs |
 | `live-sync.test.js` | Path traversal, Commit Frames binarios, SHA-256 dedup, Merkle Tree, rollback <4 ms, auth WS `/ws/sync`, E2E real |
 | `competitor-benchmarks.test.js` | Aserciones reales de RAM, arranque, concurrencia, Live Sync, Caddy cutover 0×5xx, MCP y catálogo |
@@ -210,7 +214,7 @@ npm run bench:all             # reporte completo de los 3 benchmarks reales
 | `deploy.test.js` | BuildKit, detección de stacks, secretos fuera de argv, cutover con drenaje, rollback real Docker |
 | `database.test.js` | 6 motores, AES-256-GCM, lista blanca, AWS SigV4 byte a byte, multipart S3/R2, cron, retención GFS |
 | `catalog.test.js` | 14 plantillas en 8 categorías (incluye WordPress), imágenes fijadas, secretos, puertos `42000-42999`, proyección segura |
-| `mcp.test.js` | 47 herramientas anotadas, JSON-RPC 2.0, Streamable HTTP `2026-07-28`, `server/discover`, SSE y errores |
+| `mcp.test.js` | 49 herramientas anotadas, JSON-RPC 2.0, Streamable HTTP `2026-07-28`, `server/discover`, SSE y errores |
 | `ssl.test.js` | Registro X.509 real, purga de PEMs fabricados, TLS bajo demanda delegado a Caddy |
 | `domain.test.js` | Rutas exactas, comodines con frontera de etiqueta, anti-duplicados, proxy Cloudflare |
 | `cloudflare.test.js` | Zonas, registros DNS, TXT ACME DNS-01 y túneles |
@@ -234,6 +238,8 @@ server/
   middleware/auth.js               Auth por Origen + Token en tiempo constante (HTTP y WS)
   routes/api.js                    API REST completa
   services/
+    metricsCollector.js            Telemetría O(1) (Float64Array, Event Loop, Prometheus /metrics)
+    systemDoctor.js                Diagnóstico real de 8 comprobaciones + 3 correcciones en 1 clic
     liveSyncEngine.js              Motor Live Sync: Commit Frames, Merkle Tree, rollback <15 ms
     liveSyncClient.js              Watcher nativo/Chokidar + cliente WS persistente para The Forge
     deployManager.js               Pipeline de producción Docker BuildKit + healthcheck + rollback
@@ -241,12 +247,12 @@ server/
     ingressManager.js              Reconciliador declarativo de rutas, canarios y sondas TLS
     databaseManager.js             6 motores gestionados, redes aisladas, cron y retención GFS
     s3Uploader.js                  Cliente S3/R2/MinIO con firma AWS SigV4 nativa (0 dependencias)
-    ssrfGuard.js                   Protección SSRF, contención de rutas y escritura atómica 0600
+    ssrfGuard.js                   Protección SSRF IPv4/IPv6, contención de rutas y escritura atómica 0600
     wordpressMigrator.js           Análisis en vivo, provisión MariaDB e importación SQL segura
     universalImporter.js           Importador Docker Compose, cualquier Git, Vercel/Netlify/Railway/Render/Dokploy
     catalogManager.js              Gestor de servicios 1-clic con secretos cifrados AES-256-GCM
     catalog/templates.js           14 plantillas auditadas en 8 categorías (incluye WordPress 6.7)
-    mcpServer.js                   Servidor MCP 2026-07-28 (47 herramientas anotadas)
+    mcpServer.js                   Servidor MCP 2026-07-28 (49 herramientas anotadas)
     mcpStreamableHttp.js           Transporte Streamable HTTP 2026-07-28
     projectManager.js              Persistencia atómica con Group Commit y caché serializada
     localRunner.js                 Ejecución local sin shell y GIT_ASKPASS limitado a github.com

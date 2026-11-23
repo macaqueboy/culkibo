@@ -1,9 +1,26 @@
 const fs = require('fs');
 const path = require('path');
-const dns = require('dns').promises;
-const sslManager = require('./sslManager');
-const cloudflareService = require('./cloudflareService');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
+
+/** Carga perezosa: evita arrastrar dns/ssl/cloudflare en el arranque en frío. */
+/** @type {any} */
+let _dns = null;
+function getDns() {
+  if (!_dns) _dns = require('dns').promises;
+  return _dns;
+}
+/** @type {any} */
+let _sslManager = null;
+function getSslManager() {
+  if (!_sslManager) _sslManager = require('./sslManager');
+  return _sslManager;
+}
+/** @type {any} */
+let _cloudflareService = null;
+function getCloudflareService() {
+  if (!_cloudflareService) _cloudflareService = require('./cloudflareService');
+  return _cloudflareService;
+}
 
 const DOMAINS_FILE = path.join(__dirname, '..', '..', 'data', 'domains.json');
 const DOMAIN_REGEX = /^(?:\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
@@ -42,7 +59,7 @@ class DomainManager {
     this._exactIndex = new Map();
     /** @type {any[]} */
     this._wildcards = [];
-    /** @type {{ sslVersion: number, buffer: Buffer } | null} */
+    /** @type {{ sslVersion: number, buffer: Buffer, wrappedBuffer: Buffer } | null} */
     this._serializedCache = null;
     this.rebuildIndex();
   }
@@ -141,6 +158,7 @@ class DomainManager {
 
   listDomains() {
     // Una sola pasada de verificación sobre el registro SSL en vez de O(D × C).
+    const sslManager = getSslManager();
     const certs = sslManager.listCertificates();
     const now = Date.now();
     return this.domains.map(d => {
@@ -148,16 +166,6 @@ class DomainManager {
       return {
         ...d,
         projectId: d.projectId || null,
-        // `certClaim`, no `certInfo`: esto es lo que NUESTRO registro afirma,
-        // no lo que un navegador recibe. El dato verificado sale del handshake
-        // TLS real que hace ingressManager y se publica en /api/ingress/status.
-        // Se renombró a propósito para que ningún consumidor pueda volver a
-        // confundir una afirmación propia con una comprobación.
-        //
-        // `issuer` y `expiresAt` pueden ser `null`: una entrada delegada
-        // (TLS bajo demanda de Caddy) no tiene emisor ni caducidad que
-        // podamos afirmar, y desde que se eliminó la emisión falsa el
-        // registro ya no se los inventa.
         certClaim: cert ? {
           verified: false,
           managedBy: cert.managedBy || null,
@@ -178,18 +186,36 @@ class DomainManager {
    * @returns {Buffer}
    */
   getAllSerialized() {
+    const sslManager = getSslManager();
     const sslVer = sslManager.version || 0;
-    // Sólo usar caché cuando no hay certificados `on_disk` cuya existencia
-    // en disco deba comprobarse con `statSync` en cada lectura.
     const hasOnDisk = sslManager.registry.some(c => c && c.managedBy !== sslManager.MANAGED_BY_CADDY);
     if (!hasOnDisk && this._serializedCache && this._serializedCache.sslVersion === sslVer) {
       return this._serializedCache.buffer;
     }
-    const buf = Buffer.from(JSON.stringify(this.listDomains()), 'utf8');
+    const jsonStr = JSON.stringify(this.listDomains());
+    const buf = Buffer.from(jsonStr, 'utf8');
     if (!hasOnDisk) {
-      this._serializedCache = { sslVersion: sslVer, buffer: buf };
+      const wrappedBuffer = Buffer.from(`{"domains":${jsonStr}}`, 'utf8');
+      this._serializedCache = { sslVersion: sslVer, buffer: buf, wrappedBuffer };
     }
     return buf;
+  }
+
+  /** Buffer JSON pre-serializado con envoltorio `{"domains":[...]}` sin `Buffer.concat`. */
+  getAllWrappedSerialized() {
+    const sslManager = getSslManager();
+    const sslVer = sslManager.version || 0;
+    const hasOnDisk = sslManager.registry.some(c => c && c.managedBy !== sslManager.MANAGED_BY_CADDY);
+    if (!hasOnDisk && this._serializedCache && this._serializedCache.sslVersion === sslVer) {
+      return this._serializedCache.wrappedBuffer;
+    }
+    const jsonStr = JSON.stringify(this.listDomains());
+    const buf = Buffer.from(jsonStr, 'utf8');
+    const wrappedBuffer = Buffer.from(`{"domains":${jsonStr}}`, 'utf8');
+    if (!hasOnDisk) {
+      this._serializedCache = { sslVersion: sslVer, buffer: buf, wrappedBuffer };
+    }
+    return wrappedBuffer;
   }
 
   getByHostname(hostname) {
@@ -256,6 +282,7 @@ class DomainManager {
     }
 
     // Si piden autoCreateDns sin zoneId explícito, intentar resolver la zona en Cloudflare automáticamente.
+    const cloudflareService = getCloudflareService();
     let resolvedZoneId = cloudflareZoneId || null;
     if (autoCreateDns && !resolvedZoneId) {
       try {
@@ -272,7 +299,7 @@ class DomainManager {
     }
 
     const domainId = `dom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const cert = sslManager.getCertificateByDomain(cleanHost);
+    const cert = getSslManager().getCertificateByDomain(cleanHost);
 
     const newDomain = {
       id: domainId,
@@ -297,17 +324,22 @@ class DomainManager {
 
     // If Cloudflare Zone is specified and autoCreateDns is requested, create record in Cloudflare
     if (resolvedZoneId && autoCreateDns) {
-      try {
-        const recordName = isWildcard ? cleanHost : cleanHost;
-        await cloudflareService.createDnsRecord(resolvedZoneId, {
-          type: 'A',
-          name: recordName,
-          content: serverIp,
-          proxied: cloudflareProxied,
-          ttl: 1
-        });
-      } catch (err) {
-        console.warn('[DomainManager] Auto DNS creation failed:', err.message);
+      const effectiveIp = String(serverIp || '').trim();
+      if (!effectiveIp || effectiveIp === '127.0.0.1' || effectiveIp === '::1') {
+        console.warn('[DomainManager] Auto DNS omitido: se requiere una IP pública real del servidor (no 127.0.0.1).');
+      } else {
+        try {
+          const recordName = isWildcard ? cleanHost : cleanHost;
+          await cloudflareService.createDnsRecord(resolvedZoneId, {
+            type: 'A',
+            name: recordName,
+            content: effectiveIp,
+            proxied: cloudflareProxied,
+            ttl: 1
+          });
+        } catch (err) {
+          console.warn('[DomainManager] Auto DNS creation failed:', err.message);
+        }
       }
     }
 
@@ -386,6 +418,7 @@ class DomainManager {
 
     const start = performance.now();
     try {
+      const dns = getDns();
       const [aRes, cnameRes] = await Promise.allSettled([
         withTimeout(dns.resolve4(clean), 4000),
         withTimeout(dns.resolveCname(clean), 4000)
