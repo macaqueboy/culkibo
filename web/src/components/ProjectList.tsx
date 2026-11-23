@@ -172,9 +172,13 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   const handleStartLocal = async (id: string) => {
     try {
       setStartingLocalId(id);
-      await api.startLocal(id);
+      const res: any = await api.startLocal(id);
       fetchProjects();
-      onNotify?.('Proyecto iniciado en local', 'success');
+      const port = res?.localPort || res?.port;
+      onNotify?.(
+        port ? `Iniciado en http://${previewHost}:${port}` : 'Proyecto iniciado en local',
+        'success'
+      );
     } catch (err: any) {
       onNotify?.(err?.message || 'Error al iniciar en local', 'error');
       fetchProjects();
@@ -506,15 +510,30 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                 {/* Señal 4: Barra de acción limpia sin botones anidados */}
                 <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
                   {p.localRunning ? (
-                    <button
-                      type="button"
-                      onClick={() => void handleStopLocal(p.id)}
-                      disabled={stoppingLocalId === p.id}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg cursor-pointer disabled:opacity-50"
-                    >
-                      <Square className="w-3 h-3 fill-red-600 text-red-600" />
-                      <span>{stoppingLocalId === p.id ? 'Parando…' : 'Detener local'}</span>
-                    </button>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {p.localPort && (
+                        <a
+                          href={`http://${previewHost}:${p.localPort}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          title={`Abrir vista previa local en http://${previewHost}:${p.localPort}`}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors font-mono tabular-nums"
+                        >
+                          <Zap className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                          <span>Abrir :{p.localPort}</span>
+                          <ExternalLink className="w-3 h-3 text-amber-600/80 shrink-0" />
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void handleStopLocal(p.id)}
+                        disabled={stoppingLocalId === p.id}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg cursor-pointer disabled:opacity-50"
+                      >
+                        <Square className="w-3 h-3 fill-red-600 text-red-600" />
+                        <span>{stoppingLocalId === p.id ? 'Parando…' : 'Detener'}</span>
+                      </button>
+                    </div>
                   ) : (
                     <button
                       type="button"
