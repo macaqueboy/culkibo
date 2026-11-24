@@ -3,6 +3,22 @@ const domainManager = require('./domainManager');
 const localRunner = require('./localRunner');
 const { assertSafeUrl, safeFetch } = require('./ssrfGuard');
 
+const COOLIFY_SENSITIVE_META_RE = /(password|passwd|secret|token|private_key|api_key|apikey|credential|environment_variables|docker_compose_raw)/i;
+
+/** Elimina secretos de `rawMeta` antes de persistir recursos migrados en `projects.json`. */
+function sanitizeCoolifyMeta(obj, depth = 0) {
+  if (obj === null || obj === undefined || typeof obj !== 'object') return obj;
+  if (depth > 3) return undefined;
+  if (Array.isArray(obj)) return obj.slice(0, 50).map((item) => sanitizeCoolifyMeta(item, depth + 1));
+  /** @type {Record<string, any>} */
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (COOLIFY_SENSITIVE_META_RE.test(k)) continue;
+    out[k] = sanitizeCoolifyMeta(v, depth + 1);
+  }
+  return out;
+}
+
 class CoolifyMigrator {
   async fetchFromApi(apiUrl, apiToken, endpoint) {
     try {
@@ -47,53 +63,67 @@ class CoolifyMigrator {
   async fetchListWithDetails(apiUrl, apiToken, endpoint, detailEndpointPrefix) {
     const list = await this.fetchFromApi(apiUrl, apiToken, endpoint);
     if (!Array.isArray(list)) return [];
-    
-    const results = [];
-    for (const item of list) {
-      try {
-        const safeUuid = encodeURIComponent(String(item.uuid || ''));
-        const details = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}`);
-        const envs = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/envs`);
-        const storages = await this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/storages`);
-        
-        // fetchFromApi returns [] on error. If it's an array, it means it failed (or is unexpectedly an array).
-        const detailsObj = Array.isArray(details) ? {} : (details || {});
-        
-        const fullItem = { ...item, ...detailsObj };
-        
-        // If envs is valid array, use it, otherwise fallback to item's envs
-        fullItem.environment_variables = (Array.isArray(envs) && envs.length > 0) ? envs : (fullItem.environment_variables || []);
-        
-        // Extract persistent storages and file storages from Coolify v4 /storages endpoint
-        if (storages && typeof storages === 'object') {
-          const persistent = Array.isArray(storages.persistent_storages) ? storages.persistent_storages : [];
-          const files = Array.isArray(storages.file_storages) ? storages.file_storages : [];
-          fullItem.persistent_storages = persistent;
-          fullItem.file_storages = files;
-          fullItem.local_persistent_volumes = persistent.map(s => ({
-            name: s.name,
-            mount_path: s.mount_path,
-            host_path: s.host_path || null
-          }));
-          fullItem.persistent_volumes = fullItem.local_persistent_volumes;
-          fullItem.volumes = fullItem.local_persistent_volumes;
-          fullItem.local_file_volumes = files.map(f => ({
-            fs_path: f.fs_path || null,
-            mount_path: f.mount_path,
-            content: f.content || ''
-          }));
-          fullItem.file_volumes = fullItem.local_file_volumes;
-        } else {
-          fullItem.local_persistent_volumes = fullItem.local_persistent_volumes || fullItem.persistent_volumes || fullItem.volumes || [];
-          fullItem.local_file_volumes = fullItem.local_file_volumes || fullItem.file_volumes || [];
+
+    const results = new Array(list.length);
+    const CONCURRENCY = 3;
+    let cursor = 0;
+
+    const worker = async () => {
+      while (cursor < list.length) {
+        const idx = cursor++;
+        const item = list[idx];
+        try {
+          const safeUuid = encodeURIComponent(String(item.uuid || ''));
+          const [details, envs, storages] = await Promise.all([
+            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}`),
+            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/envs`).catch((e) => {
+              if (e && (e.status === 401 || e.status === 403)) return { _authWarning: e.message };
+              return [];
+            }),
+            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/storages`).catch(() => null)
+          ]);
+
+          const detailsObj = Array.isArray(details) ? {} : (details || {});
+          const fullItem = { ...item, ...detailsObj };
+          if (envs && typeof envs === 'object' && !Array.isArray(envs) && envs._authWarning) {
+            fullItem._warnings = [...(fullItem._warnings || []), `Sin permiso para leer variables: ${envs._authWarning}`];
+          }
+          fullItem.environment_variables = (Array.isArray(envs) && envs.length > 0) ? envs : (fullItem.environment_variables || []);
+
+          if (storages && typeof storages === 'object') {
+            const persistent = Array.isArray(storages.persistent_storages) ? storages.persistent_storages : [];
+            const files = Array.isArray(storages.file_storages) ? storages.file_storages : [];
+            fullItem.persistent_storages = persistent;
+            fullItem.file_storages = files;
+            fullItem.local_persistent_volumes = persistent.map(s => ({
+              name: s.name,
+              mount_path: s.mount_path,
+              host_path: s.host_path || null
+            }));
+            fullItem.persistent_volumes = fullItem.local_persistent_volumes;
+            fullItem.volumes = fullItem.local_persistent_volumes;
+            fullItem.local_file_volumes = files.map(f => ({
+              fs_path: f.fs_path || null,
+              mount_path: f.mount_path,
+              content: f.content || ''
+            }));
+            fullItem.file_volumes = fullItem.local_file_volumes;
+          } else {
+            fullItem.local_persistent_volumes = fullItem.local_persistent_volumes || fullItem.persistent_volumes || fullItem.volumes || [];
+            fullItem.local_file_volumes = fullItem.local_file_volumes || fullItem.file_volumes || [];
+          }
+
+          results[idx] = fullItem;
+        } catch (err) {
+          if (err && (err.status === 401 || err.status === 403)) throw err;
+          results[idx] = item;
         }
-        
-        results.push(fullItem);
-      } catch (err) {
-        results.push(item);
       }
-    }
-    return results;
+    };
+
+    const workers = Array.from({ length: Math.min(CONCURRENCY, list.length) }, () => worker());
+    await Promise.all(workers);
+    return results.filter(Boolean);
   }
 
   async fetchApplications(apiUrl, apiToken) {
@@ -369,7 +399,7 @@ class CoolifyMigrator {
             gitDetails: gitDetails,
             ports: app.ports_exposes || app.ports_mappings || app.port || '',
             status: this.normalizeCoolifyStatus(app.status),
-            rawMeta: app
+            rawMeta: sanitizeCoolifyMeta(app)
         });
 
         for (const host of hosts) {
@@ -417,7 +447,7 @@ class CoolifyMigrator {
             resourceLimits: common.resourceLimits,
             healthCheck: common.healthCheck,
             networkConfig: common.networkConfig,
-            rawMeta: db
+            rawMeta: sanitizeCoolifyMeta(db)
         });
         results.importedDbs++;
       } catch (e) {
@@ -452,7 +482,7 @@ class CoolifyMigrator {
             resourceLimits: common.resourceLimits,
             healthCheck: common.healthCheck,
             networkConfig: common.networkConfig,
-            rawMeta: svc
+            rawMeta: sanitizeCoolifyMeta(svc)
         });
         for (const host of uniqueSvcHosts) {
           proj.pendingHosts.push(host);

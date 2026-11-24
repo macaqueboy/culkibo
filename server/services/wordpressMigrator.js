@@ -1,9 +1,13 @@
 const dns = require('dns').promises;
 const net = require('net');
+const util = require('util');
 const zlib = require('zlib');
+const gunzipAsync = util.promisify(zlib.gunzip);
 const catalogManager = require('./catalogManager');
 const databaseManager = require('./databaseManager');
 const { assertSafeUrl, safeFetch } = require('./ssrfGuard');
+
+const DANGEROUS_MYSQL_META_RE = /^\s*(?:\\!|\\\.|system\b|source\b|tee\b|pager\b|edit\b)/i;
 
 /**
  * Asistente real de análisis y migración de sitios WordPress hacia Culkibo.
@@ -79,11 +83,21 @@ function isCloudflareIp(ip) {
 
 /**
  * Detecta prefijo de tablas WordPress en un volcado SQL (por defecto `wp_`).
+ * Prioriza tablas `*options` que contengan `option_name` (evita falsos positivos con otras tablas `*options`).
  */
 function detectWpTablePrefix(sql) {
-  const m = sql.match(/(?:CREATE\s+TABLE|INSERT\s+INTO)\s+(?:IF\s+NOT\s+EXISTS\s+)?`?([a-zA-Z0-9_]+)options`?/i);
-  if (m && /^[a-zA-Z0-9_]{1,24}$/.test(m[1])) return m[1];
-  return 'wp_';
+  const re = /(?:CREATE\s+TABLE|INSERT\s+INTO)\s+(?:IF\s+NOT\s+EXISTS\s+)?`?([a-zA-Z0-9_]+)options`?/gi;
+  /** @type {string | null} */
+  let fallback = null;
+  let m;
+  while ((m = re.exec(sql)) !== null) {
+    const candidate = m[1];
+    if (!/^[a-zA-Z0-9_]{1,24}$/.test(candidate)) continue;
+    if (!fallback) fallback = candidate;
+    const windowSlice = sql.slice(m.index, m.index + 600);
+    if (/\boption_name\b/i.test(windowSlice)) return candidate;
+  }
+  return fallback || 'wp_';
 }
 
 function normalizeOriginUrl(domainOrUrl) {
@@ -127,7 +141,7 @@ function prepareSqlForDomain(sql, oldDomain, newDomain) {
     .replace(/^\s*CREATE\s+DATABASE\b[^;\n]*;?\s*$/gim, '-- [Culkibo] CREATE DATABASE omitido')
     .replace(/^\s*USE\s+`?[a-zA-Z0-9_$-]+`?\s*;?\s*$/gim, '-- [Culkibo] USE omitido');
 
-  const SERIALIZED_RE = /a:\d+:\{|s:\d+:"|O:\d+:"/;
+  const SERIALIZED_RE = /a:\d+:\{|s:\d+:\\?"|O:\d+:\\?"/;
   const hasSerialized = SERIALIZED_RE.test(output);
 
   let directReplaced = false;
@@ -410,10 +424,10 @@ class WordPressMigrator {
 
     let rawSql = typeof sqlContent === 'string' ? sqlContent : '';
     if (Buffer.isBuffer(sqlBuffer) && sqlBuffer.length > 0) {
-      // Soportar archivos .sql.gz subidos directamente
+      // Soportar archivos .sql.gz subidos directamente (descompresión asíncrona con límite estricto anti zip-bomb)
       const isGzip = sqlBuffer.length >= 2 && sqlBuffer[0] === 0x1f && sqlBuffer[1] === 0x8b;
       if (isGzip) {
-        const inflated = zlib.gunzipSync(sqlBuffer, { maxOutputLength: MAX_SQL_BYTES + 1024 });
+        const inflated = await gunzipAsync(sqlBuffer, { maxOutputLength: MAX_SQL_BYTES + 1024 });
         if (inflated.length > MAX_SQL_BYTES) {
           throw new Error('El volcado .sql.gz descomprimido supera el límite de 50 MB');
         }
@@ -432,6 +446,13 @@ class WordPressMigrator {
     if (Buffer.byteLength(rawSql, 'utf8') > MAX_SQL_BYTES) {
       throw new Error('El volcado SQL supera el límite de 50 MB para importación directa; usa All-in-One WP Migration o restauración por CLI');
     }
+    // Bloquear metacomandos de cliente MariaDB/MySQL (\\!, system, source, pager, tee, edit) antes de pasar por stdin
+    const rawLines = rawSql.split(/\r?\n/);
+    for (let i = 0; i < rawLines.length; i++) {
+      if (DANGEROUS_MYSQL_META_RE.test(rawLines[i])) {
+        throw new Error(`El volcado SQL contiene un metacomando de cliente bloqueado por seguridad en la línea ${i + 1}`);
+      }
+    }
 
     const dbRecord = databaseManager.mustGet(record.databaseId);
     const targetUrl = newDomain || record.url;
@@ -441,8 +462,8 @@ class WordPressMigrator {
       throw new Error('Docker no está disponible en este host para importar el volcado SQL');
     }
 
-    // Sin shell interpolado: el SQL entra por stdin al proceso `mariadb` dentro del contenedor.
-    const argv = ['exec', '-i', dbRecord.containerName, 'sh', '-c', 'MYSQL_PWD="$CULKIBO_MYSQL_PWD" exec "$@"', 'culkibo', 'mariadb', '-u', 'root', dbRecord.dbName];
+    // Sin shell interpolado: el SQL entra por stdin a `mariadb --sandbox` dentro del contenedor.
+    const argv = ['exec', '-i', dbRecord.containerName, 'sh', '-c', 'MYSQL_PWD="$CULKIBO_MYSQL_PWD" exec "$@"', 'culkibo', 'mariadb', '--sandbox', '-u', 'root', dbRecord.dbName];
     await databaseManager.docker(argv, {
       input: Buffer.from(prepared.sql, 'utf8'),
       timeout: 300000

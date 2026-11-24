@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const crypto = require('crypto');
-const { atomicWriteJsonSync } = require('./ssrfGuard');
+const { atomicWriteJsonSync, loadJsonWithBackupSync } = require('./ssrfGuard');
 
 const CERTS_DIR = path.join(__dirname, '..', '..', 'data', 'certs');
 const REGISTRY_FILE = path.join(CERTS_DIR, 'registry.json');
@@ -100,13 +100,15 @@ class SslManager {
 
   loadRegistry() {
     let stored = [];
-    try {
-      if (fs.existsSync(REGISTRY_FILE)) {
-        const parsed = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
-        if (Array.isArray(parsed)) stored = parsed;
-      }
-    } catch (e) {
-      console.error('[SSL] Error loading cert registry:', e.message);
+    const loaded = loadJsonWithBackupSync(REGISTRY_FILE, {
+      validate: (parsed) => Array.isArray(parsed)
+    });
+    if (loaded.ok && Array.isArray(loaded.data)) {
+      stored = loaded.data;
+    } else if (loaded.corrupt) {
+      this._corruptReadOnly = true;
+      console.error(`[SSL] registry.json corrupto; archivado en ${loaded.quarantinePath}.`);
+      return [];
     }
 
     // Sin semillas. Las dos que había («*.culkibo.dev» y «*.127-0-0-1.sslip.io»)
@@ -343,10 +345,13 @@ class SslManager {
       if (c.domain === clean || c.rootDomain === clean) return true;
       if (c.sans && c.sans.includes(clean)) return true;
       if (typeof c.domain === 'string' && c.domain.startsWith('*.')) {
-        // Same boundary-dot rule as DomainManager.resolveRoute: a wildcard cert
-        // for *.culkibo.dev must not be reported as covering evilculkibo.dev.
+        // RFC 6125 single-label wildcard check (never matches multi-level a.b.root or unrelated apex unless in SANs)
         const wildcardRoot = c.domain.slice(2);
-        if (clean === wildcardRoot || clean.endsWith(`.${wildcardRoot}`)) return true;
+        const suffix = `.${wildcardRoot}`;
+        if (clean.endsWith(suffix)) {
+          const left = clean.slice(0, clean.length - suffix.length);
+          if (left && !left.includes('.')) return true;
+        }
       }
       return false;
     }) || undefined;
@@ -463,21 +468,25 @@ class SslManager {
    * corresponde criptográficamente a la clave pública del certificado.
    */
   uploadCustomCertificate({ domain = '', certPem = '', keyPem = '', provider = 'custom_pem' } = {}) {
-    const cleanCert = String(certPem || '').trim();
-    const cleanKey = String(keyPem || '').trim();
-    if (!cleanCert.includes('-----BEGIN CERTIFICATE-----')) {
+    const cleanCertRaw = String(certPem || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim();
+    const cleanKey = String(keyPem || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim();
+    const pemBlocks = cleanCertRaw.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
+    if (pemBlocks.length === 0) {
       throw new Error('El certificado debe estar en formato PEM (-----BEGIN CERTIFICATE-----)');
     }
     if (!cleanKey.includes('-----BEGIN') || !cleanKey.includes('PRIVATE KEY-----')) {
       throw new Error('La clave privada debe estar en formato PEM (-----BEGIN ... PRIVATE KEY-----)');
     }
 
-    /** @type {crypto.X509Certificate} */
-    let x509;
-    try {
-      x509 = new crypto.X509Certificate(cleanCert);
-    } catch (err) {
-      throw new Error(`Certificado X.509 inválido: ${err.message}`);
+    // Validar TODOS los bloques X.509 de la cadena (evita que un intermedio truncado rompa Caddy)
+    /** @type {Array<{ pem: string, x509: crypto.X509Certificate }>} */
+    const parsedChain = [];
+    for (let i = 0; i < pemBlocks.length; i++) {
+      try {
+        parsedChain.push({ pem: pemBlocks[i].trim(), x509: new crypto.X509Certificate(pemBlocks[i]) });
+      } catch (err) {
+        throw new Error(`Bloque X.509 #${i + 1} de la cadena PEM inválido: ${err.message}`);
+      }
     }
 
     /** @type {crypto.KeyObject} */
@@ -489,23 +498,38 @@ class SslManager {
     }
 
     const derivedPubDer = crypto.createPublicKey(privKey).export({ type: 'spki', format: 'der' });
-    const certPubDer = x509.publicKey.export({ type: 'spki', format: 'der' });
-    if (!derivedPubDer.equals(certPubDer)) {
+    // Localizar el certificado hoja que coincide con la clave privada (reordena automáticamente si se pegó invertido)
+    const leafIdx = parsedChain.findIndex((item) => item.x509.publicKey.export({ type: 'spki', format: 'der' }).equals(derivedPubDer));
+    if (leafIdx < 0) {
       throw new Error('La clave privada no coincide con la clave pública del certificado X.509');
     }
+    const orderedChain = leafIdx === 0
+      ? parsedChain
+      : [parsedChain[leafIdx], ...parsedChain.filter((_, i) => i !== leafIdx)];
+    const x509 = orderedChain[0].x509;
+    const cleanCert = orderedChain.map((c) => c.pem).join('\n');
 
     const notAfter = new Date(x509.validTo);
     const notBefore = new Date(x509.validFrom);
     if (!Number.isNaN(notAfter.getTime()) && notAfter.getTime() <= Date.now()) {
       throw new Error(`El certificado X.509 ya está caducado (expiró el ${notAfter.toISOString().slice(0, 10)})`);
     }
+    if (!Number.isNaN(notBefore.getTime()) && notBefore.getTime() > Date.now() + 5 * 60 * 1000) {
+      throw new Error(`El certificado X.509 todavía no es válido (inicia el ${notBefore.toISOString().slice(0, 10)})`);
+    }
 
+    // Filtrar estrictamente SANs de tipo DNS: (ignorar IP Address:, URI:, email: — Dokku #8833)
     const sans = x509.subjectAltName
-      ? x509.subjectAltName.split(/,\s*/).map((s) => s.replace(/^DNS:/i, '').trim().toLowerCase()).filter(Boolean)
+      ? x509.subjectAltName
+          .split(/,\s*/)
+          .filter((s) => /^DNS:/i.test(s))
+          .map((s) => s.replace(/^DNS:/i, '').trim().toLowerCase())
+          .filter(Boolean)
       : [];
-    const subjectCnMatch = String(x509.subject || '').match(/CN=([^\n,]+)/);
-    const subjectCn = subjectCnMatch ? subjectCnMatch[1].trim().toLowerCase() : '';
-    const explicitDomain = String(domain || '').trim().toLowerCase();
+    const subjectLines = String(x509.subject || '').split(/\r?\n/);
+    const subjectCnLine = subjectLines.find((l) => /^CN=/i.test(l.trim()));
+    const subjectCn = subjectCnLine ? subjectCnLine.trim().slice(3).trim().toLowerCase() : '';
+    const explicitDomain = String(domain || '').trim().toLowerCase().replace(/\.+$/, '');
     const detectedDomain = explicitDomain || sans[0] || subjectCn;
     if (!detectedDomain) {
       throw new Error('No se pudo determinar el dominio del certificado (indícalo explícitamente)');
@@ -544,7 +568,9 @@ class SslManager {
     fs.writeFileSync(certPath, `${cleanCert}\n`, { mode: 0o600 });
     fs.writeFileSync(keyPath, `${cleanKey}\n`, { mode: 0o600 });
 
-    const issuerMatch = String(x509.issuer || '').match(/(?:O|CN)=([^\n,]+)/);
+    const issuerLines = String(x509.issuer || '').split(/\r?\n/);
+    const issuerLine = issuerLines.find((l) => /^O=/i.test(l.trim())) || issuerLines.find((l) => /^CN=/i.test(l.trim()));
+    const issuerName = issuerLine ? issuerLine.trim().replace(/^(?:O|CN)=/i, '').trim() : 'Personalizado';
     const record = {
       id: `cert_custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       domain: detectedDomain,
@@ -553,7 +579,7 @@ class SslManager {
       provider: provider || 'custom_pem',
       managedBy: 'on_disk',
       sans: sans.length > 0 ? sans : [detectedDomain],
-      issuer: issuerMatch ? issuerMatch[1].trim() : 'Personalizado',
+      issuer: issuerName,
       issuedAt: Number.isNaN(notBefore.getTime()) ? null : notBefore.toISOString(),
       expiresAt: Number.isNaN(notAfter.getTime()) ? null : notAfter.toISOString(),
       fingerprint: x509.fingerprint256 || null,
@@ -565,18 +591,26 @@ class SslManager {
       registeredAt: new Date().toISOString()
     };
 
-    // Reemplazar certificados PEM previos del mismo dominio (evita duplicados acumulados en disco y en Caddy)
+    // Reemplazar certificados PEM previos del mismo dominio (conserva lista para borrado diferido tras reconcile si se desea)
     const replaced = this.registry.filter((c) => c.managedBy === 'on_disk' && c.domain === detectedDomain);
-    for (const old of replaced) {
-      this.deleteFabricatedFiles(old);
-    }
     this.registry = [record, ...this.registry.filter((c) => !(c.managedBy === 'on_disk' && c.domain === detectedDomain))];
     this.saveRegistry();
     return {
       success: true,
       replacedCount: replaced.length,
+      replacedEntries: replaced,
       cert: this.listCertificates().find((c) => c.id === record.id) || record
     };
+  }
+
+  /** Elimina de disco los certificados antiguos una vez que Caddy ya reconcilió el nuevo. */
+  cleanupReplacedEntries(entries) {
+    if (!Array.isArray(entries)) return;
+    for (const old of entries) {
+      if (old && old.certPath) {
+        try { this.deleteFabricatedFiles(old); } catch (e) {}
+      }
+    }
   }
 
   /**

@@ -1,4 +1,5 @@
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -19,8 +20,17 @@ const CLOUDFLARE_CIDRS = [
   '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
   '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
   '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
-  '127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '::1/128', 'fc00::/7'
+  '127.0.0.1/32', '::1/128'
 ];
+
+/** Resuelve rangos de proxy de confianza sin confiar en RFC1918/ULA por defecto (evita bypass de IP Allowlist por contenedores vecinos). */
+function resolveTrustedProxyCidrs() {
+  const extra = String(process.env.CULKIBO_TRUSTED_PROXIES || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return extra.length > 0 ? Array.from(new Set([...CLOUDFLARE_CIDRS, ...extra])) : CLOUDFLARE_CIDRS;
+}
 
 const MAINTENANCE_HTML = [
   '<!doctype html><html lang="es"><head><meta charset="utf-8">',
@@ -439,13 +449,27 @@ class CaddyManager {
     const validCerts = Array.isArray(customCertFiles)
       ? customCertFiles.filter((c) => c && c.certificate && c.key)
       : [];
-    if (validCerts.length > 0) {
+    /** @type {Set<string>} */
+    const automatedWildcardSubjects = new Set();
+    for (const pol of policies) {
+      if (Array.isArray(pol.subjects)) {
+        for (const s of pol.subjects) {
+          if (s) automatedWildcardSubjects.add(s);
+        }
+      }
+    }
+    if (validCerts.length > 0 || automatedWildcardSubjects.size > 0) {
       tlsApp.certificates = {
-        load_files: validCerts.map((c) => ({
-          certificate: c.certificate,
-          key: c.key,
-          ...(c.tags ? { tags: c.tags } : {})
-        }))
+        ...(automatedWildcardSubjects.size > 0 ? { automate: Array.from(automatedWildcardSubjects) } : {}),
+        ...(validCerts.length > 0
+          ? {
+              load_files: validCerts.map((c) => ({
+                certificate: c.certificate,
+                key: c.key,
+                ...(c.tags ? { tags: c.tags } : {})
+              }))
+            }
+          : {})
       };
     }
 
@@ -500,14 +524,31 @@ class CaddyManager {
     /** @type {any[]} */
     const initialRoutes = [];
     if (enableCompression) {
-      // Ruta no-terminal de servidor para comprimir con Zstd + Gzip todas las apps
-      // sin alterar `route.handle[0] === reverse_proxy` de las rutas por proyecto.
+      // Ruta no-terminal de servidor para comprimir con Zstd + Gzip sin romper SSE (`text/event-stream`) ni streaming IA (Caddy #7905).
       initialRoutes.push({
         '@id': 'sys_encode',
+        match: [{ not: [{ header: { Accept: ['*text/event-stream*'] } }] }],
         handle: [{
           handler: 'encode',
           encodings: { zstd: {}, gzip: {} },
-          prefer: ['zstd', 'gzip']
+          prefer: ['zstd', 'gzip'],
+          minimum_length: 1024,
+          match: {
+            headers: {
+              'Content-Type': [
+                'text/html*',
+                'text/css*',
+                'text/plain*',
+                'text/javascript*',
+                'text/xml*',
+                'application/json*',
+                'application/javascript*',
+                'application/xml*',
+                'application/xhtml+xml*',
+                'image/svg+xml*'
+              ]
+            }
+          }
         }]
       });
     }
@@ -520,7 +561,7 @@ class CaddyManager {
       idle_timeout: 60000000000,
       trusted_proxies: {
         source: 'static',
-        ranges: CLOUDFLARE_CIDRS
+        ranges: resolveTrustedProxyCidrs()
       },
       client_ip_headers: ['CF-Connecting-IP', 'X-Forwarded-For'],
       ...(automaticHttps
@@ -629,7 +670,8 @@ class CaddyManager {
    *   basicAuth?: { enabled?: boolean, realm?: string, accounts?: Array<{ username: string, passwordHash: string }> } | null,
    *   ipAllowlist?: string[] | null,
    *   maxBodySizeMb?: number | null,
-   *   rateLimit?: { enabled?: boolean, requests?: number, windowSeconds?: number } | null
+   *   rateLimit?: { enabled?: boolean, requests?: number, windowSeconds?: number } | null,
+   *   flushInterval?: number | null
    * }} spec
    */
   buildRoute(spec) {
@@ -647,7 +689,8 @@ class CaddyManager {
       basicAuth = null,
       ipAllowlist = null,
       maxBodySizeMb = null,
-      rateLimit = null
+      rateLimit = null,
+      flushInterval = null
     } = spec;
 
     if (!Array.isArray(hostnames) || hostnames.length === 0) {
@@ -692,17 +735,22 @@ class CaddyManager {
       throw new Error('Una ruta necesita al menos un destino');
     }
 
+    const isStreamingRoute = projectId === 'culkibo_panel' || flushInterval === -1;
     /** @type {any} */
     const handler = {
       handler: 'reverse_proxy',
       upstreams: upstreams.map(u => ({ dial: String(u) })),
       stream_close_delay: 5000000000, // 5 s, en nanosegundos
+      ...(isStreamingRoute ? { flush_interval: -1 } : {}),
       transport: {
         protocol: 'http',
         keep_alive: {
-          max_idle_conns_per_host: 64
+          max_idle_conns_per_host: 64,
+          idle_timeout: 120000000000,
+          probe_interval: 30000000000
         },
-        dial_timeout: 5000000000
+        dial_timeout: 5000000000,
+        ...(!isStreamingRoute ? { response_header_timeout: 60000000000 } : {})
       }
     };
 
@@ -776,11 +824,40 @@ class CaddyManager {
       chain.push({ handler: 'request_body', max_size: Math.round(maxMb * 1024 * 1024) });
     }
 
-    // 2. HTTP Basic Auth nativo de Caddy v2.11 con bcrypt + hash_cache en memoria
+    // 2. Rate limiting por dominio ANTES de Basic Auth (protege CPU bcrypt y usa IP real de visitante tras Cloudflare)
+    if (
+      rateLimit &&
+      rateLimit.enabled &&
+      this._capabilitiesCache &&
+      this._capabilitiesCache.data &&
+      this._capabilitiesCache.data.hasRateLimitPlugin === true
+    ) {
+      const maxEvents = Math.min(100000, Math.max(1, Math.round(Number(rateLimit.requests) || 120)));
+      const winSec = Math.min(3600, Math.max(1, Math.round(Number(rateLimit.windowSeconds) || 60)));
+      const zoneName = `culkibo_rl_${this.routeId(projectId).replace(/[^a-zA-Z0-9_]/g, '_')}`;
+      chain.push({
+        handler: 'rate_limit',
+        rate_limits: {
+          [zoneName]: {
+            key: '{http.vars.client_ip}',
+            max_events: maxEvents,
+            window: winSec * 1e9
+          }
+        }
+      });
+    }
+
+    // 3. HTTP Basic Auth nativo de Caddy v2.11 con bcrypt + hash_cache y deduplicación por username (Caddy #8315)
     if (basicAuth && basicAuth.enabled && Array.isArray(basicAuth.accounts) && basicAuth.accounts.length > 0) {
-      const validAccounts = basicAuth.accounts
-        .filter((a) => a && typeof a.username === 'string' && a.username.trim() && typeof a.passwordHash === 'string' && a.passwordHash.startsWith('$2'))
-        .map((a) => ({ username: a.username.trim(), password: a.passwordHash }));
+      /** @type {Map<string, { username: string, password: string }>} */
+      const dedupAccounts = new Map();
+      for (const a of basicAuth.accounts) {
+        if (a && typeof a.username === 'string' && a.username.trim() && typeof a.passwordHash === 'string' && a.passwordHash.startsWith('$2')) {
+          const uname = a.username.trim();
+          dedupAccounts.set(uname, { username: uname, password: a.passwordHash });
+        }
+      }
+      const validAccounts = Array.from(dedupAccounts.values());
       if (validAccounts.length > 0) {
         chain.push({
           handler: 'authentication',
@@ -794,28 +871,6 @@ class CaddyManager {
           }
         });
       }
-    }
-
-    // 3. Rate limiting por dominio (solo si el binario de Caddy incluye caddy-ratelimit)
-    if (
-      rateLimit &&
-      rateLimit.enabled &&
-      this._capabilitiesCache &&
-      this._capabilitiesCache.data &&
-      this._capabilitiesCache.data.hasRateLimitPlugin === true
-    ) {
-      const maxEvents = Math.min(100000, Math.max(1, Math.round(Number(rateLimit.requests) || 120)));
-      const winSec = Math.min(3600, Math.max(1, Math.round(Number(rateLimit.windowSeconds) || 60)));
-      chain.push({
-        handler: 'rate_limit',
-        rate_limits: {
-          culkibo_edge_limit: {
-            key: '{http.request.remote.host}',
-            max_events: maxEvents,
-            window: winSec * 1e9
-          }
-        }
-      });
     }
 
     chain.push(handler);
@@ -1305,19 +1360,27 @@ class CaddyManager {
 
     /** @type {string | null} */
     let envFile = null;
-    const effectiveCfToken = cfApiToken || process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN || '';
-    if (effectiveCfToken && !String(effectiveCfToken).includes('\n')) {
+    const effectiveCfToken = String(cfApiToken || process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN || '').trim();
+    if (effectiveCfToken && !/[\r\n\0]/.test(effectiveCfToken)) {
       const tmpDir = path.join(__dirname, '..', '..', 'data', '.tmp');
       try {
         fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
-        envFile = path.join(tmpDir, `caddy-env-${Date.now()}.env`);
+        envFile = path.join(tmpDir, `caddy-env-${crypto.randomBytes(8).toString('hex')}.env`);
         fs.writeFileSync(envFile, `CF_API_TOKEN=${effectiveCfToken}\n`, { mode: 0o600 });
       } catch (e) {
         envFile = null;
       }
     }
 
-    const args = ['run', '-d', '--name', cleanName, '--restart', 'unless-stopped', '--label', 'culkibo.managed=true'];
+    const args = [
+      'run', '-d',
+      '--name', cleanName,
+      '--restart', 'unless-stopped',
+      '--log-driver', 'json-file',
+      '--log-opt', 'max-size=10m',
+      '--log-opt', 'max-file=3',
+      '--label', 'culkibo.managed=true'
+    ];
     if (envFile) {
       args.push('--env-file', envFile);
     }

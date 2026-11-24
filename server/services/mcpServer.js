@@ -55,11 +55,16 @@ function redactProjectSecrets(project) {
     buildArgs: maskMap(project.buildArgs),
     buildArgsKeys: Object.keys(project.buildArgs || {}),
     resources: Array.isArray(project.resources)
-      ? project.resources.map((r) => ({
-          ...r,
-          envVars: r && r.envVars ? maskMap(r.envVars) : undefined,
-          credentials: r && r.credentials ? maskMap(r.credentials) : undefined
-        }))
+      ? project.resources.map((r) => {
+          if (!r || typeof r !== 'object') return r;
+          const { rawMeta: _dropRawMeta, ...rest } = r;
+          return {
+            ...rest,
+            envVars: r.envVars ? maskMap(r.envVars) : undefined,
+            previewEnvVars: r.previewEnvVars ? maskMap(r.previewEnvVars) : undefined,
+            credentials: r.credentials ? maskMap(r.credentials) : undefined
+          };
+        })
       : []
   };
 }
@@ -129,6 +134,7 @@ const ERROR_CODES = {
 
 // Métodos que sirve el transporte moderno. Cualquier otro es 404 + -32601.
 const MODERN_METHODS = [
+  'ping',
   'server/discover',
   'tools/list',
   'tools/call',
@@ -1372,11 +1378,20 @@ class McpServer extends EventEmitter {
     const clientInfo = context.clientInfo || null;
     const tool = this.getToolByName(toolName);
     try {
+      if (context.signal && context.signal.aborted) {
+        throw new McpToolError('CANCELLED', 'La invocación de herramienta fue cancelada por el cliente.', { retryable: true });
+      }
       if (!tool) {
         throw new McpToolError('UNKNOWN_TOOL', `Esta instalación de Culkibo no expone ninguna herramienta llamada '${toolName}'.`, {
           retryable: false,
           remediation: 'Llama a tools/list para ver el catálogo vigente y usa uno de esos nombres.',
           details: { requested: toolName }
+        });
+      }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        throw new McpToolError('INVALID_ARGUMENTS', 'Los argumentos de la herramienta deben ser un objeto JSON plano.', {
+          retryable: true,
+          remediation: 'Envía un objeto JSON (por ejemplo `{}` si la herramienta no requiere parámetros).'
         });
       }
       validateToolArguments(tool, args);
@@ -2118,12 +2133,29 @@ class McpServer extends EventEmitter {
           if (args.action === 'list') {
             res = { projectId: project.id, crons: cronManager.list(project.id) };
           } else if (args.action === 'create') {
+            const rawMode = String(args.mode || args.kind || 'exec').toLowerCase();
+            const mode = rawMode === 'http' ? 'http' : 'exec';
+            let httpPath = args.httpPath;
+            if (!httpPath && typeof args.url === 'string' && args.url.trim()) {
+              const trimmedUrl = args.url.trim();
+              if (trimmedUrl.startsWith('/')) {
+                httpPath = trimmedUrl;
+              } else {
+                try {
+                  const u = new URL(trimmedUrl);
+                  httpPath = `${u.pathname}${u.search}`;
+                } catch (e) {
+                  httpPath = trimmedUrl;
+                }
+              }
+            }
             res = cronManager.create(project.id, {
               name: args.name,
               schedule: args.schedule,
-              kind: args.kind || 'exec',
+              mode,
               command: args.command,
-              url: args.url,
+              httpPath: httpPath || '/',
+              httpMethod: args.httpMethod || 'POST',
               enabled: args.enabled !== false
             });
           } else if (args.action === 'toggle') {
@@ -2170,9 +2202,15 @@ class McpServer extends EventEmitter {
 
       const durationMs = performance.now() - start;
       this.logCall(toolName, args, res, true, durationMs, transport, clientInfo);
+      try { require('./telemetryService').recordFeatureUsage(`mcp:${toolName}`, true); } catch (e) {}
 
+      const MAX_MCP_TEXT_BYTES = 256 * 1024;
+      let serialized = JSON.stringify(res, null, 2);
+      if (serialized && Buffer.byteLength(serialized, 'utf8') > MAX_MCP_TEXT_BYTES) {
+        serialized = `${serialized.slice(0, MAX_MCP_TEXT_BYTES - 128)}\n... [salida MCP truncada a 256 KB]`;
+      }
       const result = {
-        content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
+        content: [{ type: 'text', text: serialized }],
         isError: false
       };
       if (res !== null && typeof res === 'object') result.structuredContent = res;
@@ -2181,6 +2219,18 @@ class McpServer extends EventEmitter {
       const durationMs = performance.now() - start;
       const envelope = this.describeToolFailure(toolName, tool, err, durationMs);
       this.logCall(toolName, args, { error: envelope.code, message: envelope.message }, false, durationMs, transport, clientInfo);
+      try {
+        const ts = require('./telemetryService');
+        ts.recordFeatureUsage(`mcp:${toolName}`, false);
+        ts.captureOperationFailure({
+          operation: 'mcp_tool',
+          stage: 'execute',
+          kind: toolName,
+          errorCode: envelope.code,
+          message: envelope.message,
+          durationMs: Math.round(durationMs)
+        });
+      } catch (e) {}
       return {
         isError: true,
         content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
@@ -2358,12 +2408,24 @@ class McpServer extends EventEmitter {
   // funciones nuevas: lo nuevo vive en `handleModernRpc`.
   // -------------------------------------------------------------------------
   async handleJsonRpc(request) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || typeof request.method !== 'string') {
+      return { jsonrpc: '2.0', id: null, error: { code: ERROR_CODES.INVALID_REQUEST, message: 'Invalid JSON-RPC request' } };
+    }
     const { id, method, params } = request;
+    const safeId = id === undefined ? null : id;
+
+    if (id === undefined && method.startsWith('notifications/')) {
+      return null;
+    }
+
+    if (method === 'ping') {
+      return { jsonrpc: '2.0', id: safeId, result: {} };
+    }
 
     if (method === 'initialize') {
       return {
         jsonrpc: '2.0',
-        id,
+        id: safeId,
         result: {
           protocolVersion: LEGACY_PROTOCOL_VERSION,
           capabilities: { tools: {}, resources: {}, prompts: {} },
@@ -2376,7 +2438,7 @@ class McpServer extends EventEmitter {
     if (method === 'tools/list') {
       return {
         jsonrpc: '2.0',
-        id,
+        id: safeId,
         result: {
           tools: this.getToolsDefinition()
         }
@@ -2385,11 +2447,11 @@ class McpServer extends EventEmitter {
 
     if (method === 'tools/call') {
       const toolName = params?.name;
-      const args = params?.arguments || {};
+      const args = params?.arguments === undefined ? {} : params.arguments;
       const toolResult = await this.executeTool(toolName, args, { transport: `MCP ${LEGACY_PROTOCOL_VERSION} (deprecado)` });
       return {
         jsonrpc: '2.0',
-        id,
+        id: safeId,
         result: toolResult
       };
     }
@@ -2469,6 +2531,9 @@ class McpServer extends EventEmitter {
    * @param {{ transport?: string, clientInfo?: any, isCancelled?: () => boolean, signal?: AbortSignal, onProgress?: (msg: string) => void }} context
    */
   async handleModernRpc(request, context = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || typeof request.method !== 'string') {
+      return { jsonrpc: '2.0', id: null, error: { code: ERROR_CODES.INVALID_REQUEST, message: 'Invalid JSON-RPC request' } };
+    }
     const { id, method, params } = request;
     const transport = context.transport || `MCP ${PROTOCOL_VERSION}`;
     const clientInfo = context.clientInfo || params?._meta?.[META_CLIENT_INFO] || null;
@@ -2483,6 +2548,10 @@ class McpServer extends EventEmitter {
       }
     });
 
+    if (method === 'ping') {
+      return ok({});
+    }
+
     if (method === 'server/discover') {
       return ok(this.getDiscoverResult());
     }
@@ -2493,7 +2562,7 @@ class McpServer extends EventEmitter {
 
     if (method === 'tools/call') {
       const toolName = params?.name;
-      const args = params?.arguments || {};
+      const args = params?.arguments === undefined ? {} : params.arguments;
       const toolResult = await this.executeTool(toolName, args, {
         transport,
         clientInfo,

@@ -63,18 +63,58 @@ function sanitizeHeaders(raw) {
 }
 
 function redactOutput(text, project) {
+  // Redactar ANTES de truncar para evitar cortes a mitad de un secreto (Dokploy/Coolify)
   let out = String(text || '');
-  if (out.length > MAX_OUTPUT_BYTES) {
-    out = out.slice(0, MAX_OUTPUT_BYTES) + '\n... [salida truncada]';
-  }
+  /** @type {Set<string>} */
+  const secrets = new Set();
   const envVars = (project && project.envVars) || {};
   for (const val of Object.values(envVars)) {
     const s = String(val || '');
-    if (s.length >= 8 && out.includes(s)) {
-      out = out.split(s).join('[REDACTED]');
+    if (s.length >= 6) secrets.add(s);
+  }
+  try {
+    const dm = getDeployManager();
+    if (dm && typeof dm._secretValuesForProject === 'function' && project) {
+      for (const s of dm._secretValuesForProject(project)) {
+        if (s && s.length >= 6) secrets.add(s);
+      }
     }
+  } catch (e) {}
+  for (const s of secrets) {
+    if (out.includes(s)) out = out.split(s).join('[REDACTED]');
+  }
+  if (out.length > MAX_OUTPUT_BYTES) {
+    const head = out.slice(0, Math.floor(MAX_OUTPUT_BYTES * 0.6));
+    const tail = out.slice(-Math.floor(MAX_OUTPUT_BYTES * 0.35));
+    out = `${head}\n... [salida truncada] ...\n${tail}`;
   }
   return out;
+}
+
+/** Lee el cuerpo de una respuesta HTTP acotado en bytes (evita OOM en cron HTTP). */
+async function readBoundedText(res, maxBytes = 32 * 1024) {
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    return (await res.text().catch(() => '')).slice(0, maxBytes);
+  }
+  const reader = res.body.getReader();
+  /** @type {Uint8Array[]} */
+  const chunks = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        const remaining = maxBytes - total;
+        chunks.push(value.byteLength > remaining ? value.subarray(0, remaining) : value);
+        total += Math.min(value.byteLength, remaining);
+      }
+    }
+    if (total >= maxBytes) {
+      try { await reader.cancel(); } catch (e) {}
+    }
+  } catch (e) {}
+  return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString('utf8');
 }
 
 class CronManager extends EventEmitter {
@@ -323,13 +363,14 @@ class CronManager extends EventEmitter {
       }
 
       if (job.mode === 'http') {
-        const isContainerized = process.env.CULKIBO_CADDY_CONTAINERIZED === '1' || fs.existsSync('/.dockerenv');
+        const isContainerized = fs.existsSync('/.dockerenv');
         const targetHost = isContainerized && current.containerName
           ? `${current.containerName}:${current.containerPort || 3000}`
           : `127.0.0.1:${current.hostPort}`;
         const url = `http://${targetHost}${job.httpPath}`;
         const res = await fetch(url, {
           method: job.httpMethod || 'POST',
+          redirect: 'manual',
           headers: {
             'User-Agent': 'Culkibo-Cron/1.0',
             'X-Culkibo-Cron-Id': job.id,
@@ -337,7 +378,7 @@ class CronManager extends EventEmitter {
           },
           signal: AbortSignal.timeout(job.timeoutMs)
         });
-        const text = await res.text().catch(() => '');
+        const text = await readBoundedText(res, 32 * 1024);
         runRecord.httpStatus = res.status;
         runRecord.output = redactOutput(text, project);
         if (res.status >= 200 && res.status < 400) {

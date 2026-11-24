@@ -45,7 +45,7 @@ async function ensureDaemon({ quiet = false } = {}) {
   }
 
   if (!quiet) console.log(`ℹ No hay daemon en ${BASE_URL}; arrancando uno para las pruebas...\n`);
-  const { startServer, server } = require('../../server/index');
+  const { startServer, server, shutdown } = require('../../server/index');
   // Sin reponer rutas de ingress: las pruebas comparten un Caddy real y
   // `caddy.test.js` cuenta rutas absolutas. Un daemon que añadiese las de los
   // despliegues de esta máquina rompería esa suite en cuanto hubiera uno.
@@ -56,16 +56,22 @@ async function ensureDaemon({ quiet = false } = {}) {
   }
   if (!(await isUp())) throw new Error('El daemon no respondió a /health tras arrancar');
 
-  return () => new Promise((resolve) => {
+  return async () => {
     try {
-      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
-      server.close(() => resolve());
-      const t = setTimeout(resolve, 1500);
-      if (t.unref) t.unref();
+      if (typeof shutdown === 'function') {
+        await shutdown('TEST_DONE');
+        return;
+      }
+      await new Promise((resolve) => {
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+        server.close(() => resolve());
+        const t = setTimeout(resolve, 1500);
+        if (t.unref) t.unref();
+      });
     } catch (e) {
-      resolve();
+      // ignorar errores de cierre en pruebas
     }
-  });
+  };
 }
 
 module.exports = { ensureDaemon, isUp, BASE_URL, PORT };

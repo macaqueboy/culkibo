@@ -321,8 +321,8 @@ do_uninstall() {
     # Se borra el código y se conservan los datos. Así «desinstalar y volver a
     # instalar» recupera los proyectos, que es lo que la gente espera.
     if [ -d "$INSTALL_DIR" ]; then
-      find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name data ! -name projects -exec rm -rf {} + 2>/dev/null || true
-      ok "Código eliminado. Se conservan $DATA_DIR y $INSTALL_DIR/projects"
+      find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name data ! -name projects ! -name .env -exec rm -rf {} + 2>/dev/null || true
+      ok "Código eliminado. Se conservan $DATA_DIR, $INSTALL_DIR/projects y .env"
     fi
   fi
 
@@ -529,15 +529,15 @@ install_docker() {
   # `docker compose` v2.
   info "Instalando Docker Engine desde el repositorio oficial"
   install -d -m 0755 /etc/apt/keyrings
-  local distro_id
-  distro_id=$(. /etc/os-release && echo "${ID:-debian}")
-  case "$distro_id" in ubuntu) distro_id=ubuntu ;; *) distro_id=debian ;; esac
+  local distro_id distro_codename
+  distro_id=$(. /etc/os-release && case "${ID:-} ${ID_LIKE:-}" in *ubuntu*) echo ubuntu ;; *) echo debian ;; esac)
+  distro_codename=$(. /etc/os-release && if [ "$distro_id" = "ubuntu" ]; then echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-noble}}"; else echo "${DEBIAN_CODENAME:-${VERSION_CODENAME:-bookworm}}"; fi)
 
   curl -fsSL "https://download.docker.com/linux/$distro_id/gpg" \
     | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
   chmod 0644 /etc/apt/keyrings/docker.gpg
   printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/%s %s stable\n' \
-    "$(dpkg --print-architecture)" "$distro_id" "$(. /etc/os-release && echo "${VERSION_CODENAME:-bookworm}")" \
+    "$(dpkg --print-architecture)" "$distro_id" "$distro_codename" \
     > /etc/apt/sources.list.d/docker.list
   apt-get update -qq >/dev/null
   apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -616,7 +616,9 @@ fetch_source() {
   elif [ -d "$INSTALL_DIR/.git" ]; then
     # Reinstalación sobre un clon existente: actualizar sin perder nada que no
     # esté versionado (los datos no lo están).
-    git -C "$INSTALL_DIR" config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
+    if ! git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "$INSTALL_DIR"; then
+      git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
+    fi
     git -C "$INSTALL_DIR" fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1 \
       || die "No se pudo actualizar desde $REPO_URL (rama $BRANCH)"
     git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH" >/dev/null
@@ -666,9 +668,9 @@ build_app() {
     local web_npm="install"
     [ -f "$INSTALL_DIR/web/package-lock.json" ] && web_npm="ci"
     # El panel necesita sus devDependencies para compilar: vite, tailwind y
-    # typescript están ahí. Por eso aquí NO va `--omit=dev`.
-    as_service_user env -C "$INSTALL_DIR/web" npm "$web_npm" --no-audit --no-fund >/dev/null 2>&1 \
-      || as_service_user env -C "$INSTALL_DIR/web" npm install --no-audit --no-fund >/dev/null \
+    # typescript están ahí. Por eso se pasa `--include=dev` explícitamente (ignora NODE_ENV=production del host).
+    as_service_user env -C "$INSTALL_DIR/web" npm "$web_npm" --include=dev --no-audit --no-fund >/dev/null 2>&1 \
+      || as_service_user env -C "$INSTALL_DIR/web" npm install --include=dev --no-audit --no-fund >/dev/null \
       || die "Falló la instalación de dependencias del panel"
     if as_service_user env -C "$INSTALL_DIR" npm run build >/dev/null 2>&1; then
       ok "Panel compilado en web/dist"
@@ -732,6 +734,8 @@ User=$RUN_USER
 Group=$RUN_USER
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$ENV_FILE
+Environment=NPM_CONFIG_CACHE=$INSTALL_DIR/data/.npm-cache
+Environment=DOCKER_CONFIG=$INSTALL_DIR/data/.docker
 ExecStart=/usr/bin/env node $INSTALL_DIR/server/index.js
 Restart=always
 RestartSec=5

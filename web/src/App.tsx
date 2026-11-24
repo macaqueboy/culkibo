@@ -6,9 +6,10 @@ import { AuthGate } from './components/AuthGate';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { CommandPalette } from './components/CommandPalette';
 import { ShortcutsModal } from './components/ShortcutsModal';
-import { api, getAuthToken, setUnauthorizedHandler, type Project } from './lib/api';
+import { api, clearAuthToken, getAuthToken, setUnauthorizedHandler, type Project } from './lib/api';
 import { deployStream } from './lib/deployStream';
 import { liveEvents } from './lib/liveEvents';
+import { setTelemetryCurrentView } from './lib/clientTelemetry';
 import type { ImportSourceTab } from './components/UniversalImporter';
 
 const ProjectDetail = lazy(() => import('./components/ProjectDetail').then((m) => ({ default: m.ProjectDetail })));
@@ -167,6 +168,10 @@ export function App() {
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
+
+  useEffect(() => {
+    setTelemetryCurrentView(activeView);
+  }, [activeView]);
 
   // Atajos globales: Cmd/Ctrl+K, ?, n, y acordes g+letra
   useEffect(() => {
@@ -417,10 +422,17 @@ export function App() {
           }
         };
 
-        ws.onclose = () => {
+        ws.onclose = (ev) => {
           setWsConnected(false);
           if (disposed) return;
-          const backoff = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+          if (ev.code === 4001) {
+            clearAuthToken();
+            setAuthenticated(false);
+            showToast('Sesión cerrada: el token de acceso del servidor ha cambiado.', 'error');
+            return;
+          }
+          const base = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+          const backoff = Math.round(base * (0.75 + Math.random() * 0.5));
           reconnectAttempts++;
           reconnectTimer = setTimeout(() => { void connectWs(); }, backoff);
         };
@@ -428,7 +440,8 @@ export function App() {
         ws.onerror = () => ws.close();
       } catch {
         if (disposed) return;
-        const backoff = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+        const base = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+        const backoff = Math.round(base * (0.75 + Math.random() * 0.5));
         reconnectAttempts++;
         reconnectTimer = setTimeout(() => { void connectWs(); }, backoff);
       }

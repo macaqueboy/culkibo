@@ -432,14 +432,26 @@ async function testDatabases() {
       /inválida/
     );
 
-    const local = await databaseManager.setExposure(created.id, { enabled: true, hostPort: 55432 });
+    // Obtener un puerto efímero realmente libre (evita rangos excluidos de Hyper-V/WSL2 en Windows)
+    const testExposurePort = await new Promise((resolve, reject) => {
+      const net = require('net');
+      const s = net.createServer();
+      s.once('error', reject);
+      s.listen(0, '127.0.0.1', () => {
+        const addr = s.address();
+        const p = typeof addr === 'object' && addr ? addr.port : 55432;
+        s.close(() => resolve(p));
+      });
+    });
+
+    const local = await databaseManager.setExposure(created.id, { enabled: true, hostPort: testExposurePort });
     assert.strictEqual(local.exposure.bindAddress, '127.0.0.1', 'Por defecto sólo local');
     assert.ok(/127\.0\.0\.1/.test(local.warning));
     const reRun = invocations.filter((a) => a[0] === 'run').pop();
-    assert.ok(reRun.includes('127.0.0.1:55432:5432'), 'El mapeo debe fijar la interfaz de escucha');
+    assert.ok(reRun.includes(`127.0.0.1:${testExposurePort}:5432`), 'El mapeo debe fijar la interfaz de escucha');
 
     const open = await databaseManager.setExposure(created.id, {
-      enabled: true, bindAddress: '0.0.0.0', hostPort: 55432, acknowledgeRisk: true
+      enabled: true, bindAddress: '0.0.0.0', hostPort: testExposurePort, acknowledgeRisk: true
     });
     assert.ok(/UFW/.test(open.warning), 'El aviso debe explicar que Docker se salta UFW');
     assert.ok(!JSON.stringify(open).includes(clearPassword));

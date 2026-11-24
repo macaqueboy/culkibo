@@ -4,7 +4,7 @@ const net = require('net');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 
-const { atomicWriteJsonSync } = require('./ssrfGuard');
+const { atomicWriteJsonSync, formatDockerEnvFile } = require('./ssrfGuard');
 const { TEMPLATES, CATEGORIES, validateCatalog } = require('./catalog/templates');
 const portRegistry = require('./portRegistry');
 
@@ -127,15 +127,36 @@ function assertInstallId(id) {
  * las contraseñas de las bases de datos, y al revés.
  */
 function loadOrCreateKey() {
-  try {
-    if (fs.existsSync(KEY_FILE)) {
-      const key = Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
-      if (key.length === 32) return key;
+  if (fs.existsSync(KEY_FILE)) {
+    const raw = fs.readFileSync(KEY_FILE, 'utf8').trim();
+    const key = Buffer.from(raw, 'hex');
+    if (key.length !== 32) {
+      throw new Error(`Clave de cifrado ${KEY_FILE} corrupta (longitud inválida). No se sobrescribe para evitar pérdida de secretos.`);
     }
-  } catch (e) {}
+    return key;
+  }
+  // Defensa anti-pérdida: nunca generar clave nueva si ya existen secretos cifrados en services.json
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      const storeRaw = fs.readFileSync(DATA_FILE, 'utf8');
+      if (/"v1:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+"/.test(storeRaw)) {
+        throw new Error(`Falta ${KEY_FILE} pero ${DATA_FILE} contiene secretos cifrados. Restaura la clave antes de continuar.`);
+      }
+    } catch (err) {
+      if (/Falta /.test(err.message)) throw err;
+    }
+  }
   const key = crypto.randomBytes(32);
   fs.mkdirSync(path.dirname(KEY_FILE), { recursive: true });
-  fs.writeFileSync(KEY_FILE, key.toString('hex'), { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.writeFileSync(KEY_FILE, key.toString('hex'), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  } catch (err) {
+    if (err && err.code === 'EEXIST') {
+      const existing = Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
+      if (existing.length === 32) return existing;
+    }
+    throw err;
+  }
   try { fs.chmodSync(KEY_FILE, 0o600); } catch (e) {}
   return key;
 }
@@ -189,6 +210,7 @@ function resolvePlaceholders(value, context) {
 
     if (expr === 'domain') return context.domain || (context.hostPort ? `127.0.0.1:${context.hostPort}` : 'localhost');
     if (expr === 'protocol') return context.domain ? 'https' : 'http';
+    if (expr === 'isHttps') return context.domain ? 'true' : 'false';
     if (expr === 'url') return context.url || '';
     if (expr === 'install.id') return context.installId;
 
@@ -533,6 +555,16 @@ class CatalogManager extends EventEmitter {
           failed: true
         });
         this.emit('service_failed', { id: record.id, name: record.name, error: record.lastError });
+        try {
+          const ts = require('./telemetryService');
+          ts.recordFeatureUsage(`catalog:${record.templateId}`, false);
+          ts.captureOperationFailure({
+            operation: 'catalog_install',
+            stage: record.progress ? record.progress.step : 'install',
+            kind: record.templateId,
+            message: record.lastError
+          });
+        } catch (e) {}
       })
       .finally(() => this.inFlight.delete(id));
 
@@ -582,12 +614,12 @@ class CatalogManager extends EventEmitter {
       record.databaseId = provisioned.id;
       this.save();
 
-      // Esperar a que la BD esté realmente saludable (hasta 30s) antes de arrancar la app que depende de ella
-      const dbDeadline = Date.now() + 30000;
+      // Esperar a que la BD esté realmente saludable (hasta 60s) antes de arrancar la app que depende de ella
+      const dbDeadline = Date.now() + 60000;
       while (Date.now() < dbDeadline) {
         try {
           const st = await databaseManager.refreshHealth(provisioned.id);
-          if (st.health === 'healthy' || (st.status === 'running' && Date.now() > dbDeadline - 18000)) break;
+          if (st.health === 'healthy' || (st.status === 'running' && Date.now() > dbDeadline - 25000)) break;
         } catch (e) {}
         await new Promise((r) => setTimeout(r, 1500));
       }
@@ -639,6 +671,19 @@ class CatalogManager extends EventEmitter {
           labels: { 'culkibo.service': record.id, 'culkibo.role': spec.name }
         });
       }
+      // Breve espera a que los sidecars (p. ej. ClickHouse) estén en estado `running` antes de lanzar migraciones
+      const sidecarDeadline = Date.now() + 15000;
+      while (Date.now() < sidecarDeadline) {
+        let allUp = true;
+        for (const sc of record.sidecars) {
+          try {
+            const { stdout } = await this.docker(['inspect', '--format', '{{.State.Running}}', sc.containerName], { timeout: 5000 });
+            if (stdout.trim() !== 'true') allUp = false;
+          } catch (e) { allUp = false; }
+        }
+        if (allUp) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
     }
 
     // --- 4. Imagen principal ------------------------------------------------
@@ -651,6 +696,27 @@ class CatalogManager extends EventEmitter {
 
     // --- 5. Contenedor principal -------------------------------------------
     this.setProgress(record, 'arranque', 'Arrancando el contenedor');
+    /** @type {string[]} */
+    const extraPublishes = [];
+    if (Array.isArray(tpl.app.extraPorts) && tpl.app.extraPorts.length > 0) {
+      record.extraPorts = record.extraPorts || {};
+      for (const ep of tpl.app.extraPorts) {
+        const cPort = Number(ep.containerPort);
+        if (!Number.isInteger(cPort) || cPort <= 0 || cPort >= 65536) continue;
+        let hPort = record.extraPorts[String(cPort)];
+        if (!hPort) {
+          hPort = await portRegistry.allocate({
+            kind: 'catalog',
+            owner: `svc_ep_${record.id}_${cPort}`,
+            start: PORT_RANGE_START,
+            end: PORT_RANGE_END
+          });
+          record.extraPorts[String(cPort)] = hPort;
+        }
+        extraPublishes.push(`127.0.0.1:${hPort}:${cPort}`);
+      }
+      this.save();
+    }
     const containerId = await this.runContainer({
       containerName: record.containerName,
       image: tpl.app.image,
@@ -663,7 +729,7 @@ class CatalogManager extends EventEmitter {
       cpus: record.cpus,
       command: tpl.app.command || null,
       // Sólo bucle local. Ver el comentario de cabecera.
-      publish: `127.0.0.1:${record.hostPort}:${tpl.app.port}`,
+      publish: [`127.0.0.1:${record.hostPort}:${tpl.app.port}`, ...extraPublishes],
       labels: { 'culkibo.service': record.id, 'culkibo.role': 'app' }
     });
     record.containerId = containerId;
@@ -715,6 +781,7 @@ class CatalogManager extends EventEmitter {
       { healthy: probe.healthy }
     );
     this.emit('service_installed', this.toPublic(record));
+    try { require('./telemetryService').recordFeatureUsage(`catalog:${record.templateId}`, Boolean(probe.healthy)); } catch (e) {}
   }
 
   /**
@@ -732,6 +799,10 @@ class CatalogManager extends EventEmitter {
     return files.map((file) => {
       const hostPath = path.join(dir, file.name);
       fs.writeFileSync(hostPath, file.content, { encoding: 'utf8', mode: 0o644 });
+      // Forzar 0644 explícito para ignorar UMask=0027 de systemd y evitar EACCES en contenedores no-root
+      if (process.platform !== 'win32') {
+        try { fs.chmodSync(dir, 0o755); fs.chmodSync(hostPath, 0o644); } catch (e) {}
+      }
       // Docker quiere barras normales incluso cuando el daemon corre en
       // Windows contra un motor Linux.
       return `${hostPath.split(path.sep).join('/')}:${file.path}:ro`;
@@ -769,6 +840,9 @@ class CatalogManager extends EventEmitter {
       '--cpus', String(spec.cpus),
       '--pids-limit', '1024',
       '--security-opt', 'no-new-privileges',
+      '--log-driver', 'json-file',
+      '--log-opt', 'max-size=10m',
+      '--log-opt', 'max-file=3',
       '--label', 'culkibo.managed=true',
       '--label', `culkibo.project=${spec.labels['culkibo.service']}`
     ];
@@ -778,7 +852,11 @@ class CatalogManager extends EventEmitter {
     }
     for (const volume of spec.volumes) args.push('-v', volume);
     for (const file of spec.files) args.push('-v', file);
-    if (spec.publish) args.push('-p', spec.publish);
+    if (Array.isArray(spec.publish)) {
+      for (const p of spec.publish) { if (p) args.push('-p', p); }
+    } else if (spec.publish) {
+      args.push('-p', spec.publish);
+    }
 
     args.push(spec.image);
     if (spec.command) args.push(...spec.command);
@@ -786,7 +864,7 @@ class CatalogManager extends EventEmitter {
     try {
       fs.writeFileSync(
         envFile,
-        Object.entries(spec.env).map(([k, v]) => `${k}=${v}`).join('\n') + '\n',
+        formatDockerEnvFile(spec.env),
         { encoding: 'utf8', mode: 0o600 }
       );
       const { stdout } = await this.docker(args, { timeout: 180000 });
@@ -938,6 +1016,7 @@ class CatalogManager extends EventEmitter {
     try { await this.docker(['stop', '-t', '20', record.containerName], { timeout: 60000 }); } catch (e) {}
     try { await this.docker(['rm', '-f', record.containerName], { timeout: 30000 }); } catch (e) {}
 
+    const extraPublishes = Object.entries(record.extraPorts || {}).map(([cPort, hPort]) => `127.0.0.1:${hPort}:${cPort}`);
     const containerId = await this.runContainer({
       containerName: record.containerName,
       image: targetImage,
@@ -949,7 +1028,7 @@ class CatalogManager extends EventEmitter {
       memoryMb: record.memoryMb,
       cpus: record.cpus,
       command: tpl.app.command || null,
-      publish: `127.0.0.1:${record.hostPort}:${tpl.app.port}`,
+      publish: [`127.0.0.1:${record.hostPort}:${tpl.app.port}`, ...extraPublishes],
       labels: { 'culkibo.service': record.id, 'culkibo.role': 'app' }
     });
     record.containerId = containerId;
@@ -1025,7 +1104,7 @@ class CatalogManager extends EventEmitter {
     await this.pullImage(img);
     try {
       await this.recreateAppContainer(record, { imageOverride: img });
-      const probe = await this.waitUntilReady(record, { ...tpl.app.readiness, timeoutMs: Math.min(tpl.app.readiness.timeoutMs || 60000, 60000) });
+      const probe = await this.waitUntilReady(record, { ...tpl.app.readiness, timeoutMs: Math.max(tpl.app.readiness.timeoutMs || 90000, 60000) });
       if (!probe.healthy) {
         throw new Error(`La nueva imagen no respondió en ${tpl.app.readiness.path} (${probe.detail})`);
       }
@@ -1217,6 +1296,10 @@ class CatalogManager extends EventEmitter {
     record.url = `https://${domain}`;
     record.updatedAt = new Date().toISOString();
     this.save();
+    // Recrear el contenedor si está activo para aplicar el nuevo `{{url}}` / `{{domain}}` / `{{isHttps}}`
+    if (record.status === 'running' && (await this.isDockerAvailable())) {
+      try { await this.recreateAppContainer(record); } catch (e) {}
+    }
     const ingress = await getIngressManager().reconcile().catch((e) => ({ applied: false, reason: e.message }));
     record.ingress = {
       applied: Boolean(ingress && ingress.applied),
@@ -1242,9 +1325,10 @@ class CatalogManager extends EventEmitter {
     };
 
     if (await this.isDockerAvailable()) {
+      const rmFlag = deleteVolumes ? '-fv' : '-f';
       for (const name of this.allContainerNames(record)) {
         try {
-          await this.docker(['rm', '-f', name], { timeout: 90000 });
+          await this.docker(['rm', rmFlag, name], { timeout: 90000 });
           removed.containers.push(name);
         } catch (e) {}
       }

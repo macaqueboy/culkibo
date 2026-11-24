@@ -300,15 +300,17 @@ class MetricsCollector {
     const cpu = process.cpuUsage();
     const mem = process.memoryUsage();
     /** @type {number | null} */
-    let cpuPercent = null;
+    let cpuPercent = this._procCache?.data?.cpuPercent ?? null;
     if (this.lastCpuSample) {
       const elapsedMs = now - this.lastCpuSample.at;
-      const usedMicros = (cpu.user - this.lastCpuSample.user) + (cpu.system - this.lastCpuSample.system);
-      if (elapsedMs > 0) {
+      if (elapsedMs >= 200) {
+        const usedMicros = (cpu.user - this.lastCpuSample.user) + (cpu.system - this.lastCpuSample.system);
         cpuPercent = Number(((usedMicros / 1000 / elapsedMs) * 100).toFixed(1));
+        this.lastCpuSample = { at: now, user: cpu.user, system: cpu.system };
       }
+    } else {
+      this.lastCpuSample = { at: now, user: cpu.user, system: cpu.system };
     }
-    this.lastCpuSample = { at: now, user: cpu.user, system: cpu.system };
 
     if (this.prevElu && typeof performance.eventLoopUtilization === 'function') {
       const cur = performance.eventLoopUtilization();
@@ -589,4 +591,5 @@ class MetricsCollector {
   }
 }
 
-module.exports = new MetricsCollector();
+const metricsCollectorInstance = Object.assign(new MetricsCollector(), { canonicalizeRoute });
+module.exports = metricsCollectorInstance;

@@ -147,6 +147,23 @@ class NotificationService extends EventEmitter {
   setConfig(patch = {}) {
     const isMasked = (v) => typeof v === 'string' && (v === '' || v.includes('••'));
     const sanitized = JSON.parse(JSON.stringify(patch));
+
+    // Anti-exfiltración (Dokploy #5926): cambiar la URL del webhook teniendo un secretHeader
+    // almacenado exige reintroducir explícitamente `secretHeader` (o `null` para borrarlo).
+    const incomingWhUrl = sanitized.channels?.webhook?.url;
+    const prevWhUrl = this.config.channels.webhook.url || '';
+    const prevWhSecret = this.config.channels.webhook.secretHeader || '';
+    if (
+      typeof incomingWhUrl === 'string' &&
+      incomingWhUrl.trim() !== prevWhUrl &&
+      prevWhSecret
+    ) {
+      const incomingSecret = sanitized.channels?.webhook?.secretHeader;
+      if (incomingSecret !== null && (incomingSecret === undefined || isMasked(incomingSecret))) {
+        throw new Error('Para cambiar la URL del webhook debes volver a introducir el secretHeader (o enviar null para limpiarlo)');
+      }
+    }
+
     const secretPaths = [
       ['telegram', 'botToken'],
       ['discord', 'webhookUrl'],
@@ -260,9 +277,13 @@ class NotificationService extends EventEmitter {
       this.emit('notification', entry);
 
       const okCount = Object.values(entry.results).filter(r => r === 'ok').length;
-      // Solo registrar ventana anti-tormenta cuando al menos un canal entregó la alerta.
-      if (okCount > 0 && dedupeKey) {
-        this.lastSentAt.set(dedupeKey, dedupeNow || Date.now());
+      // Registrar ventana anti-tormenta si entregó, o backoff corto (15s) si todos fallaron
+      if (dedupeKey) {
+        if (okCount > 0) {
+          this.lastSentAt.set(dedupeKey, dedupeNow || Date.now());
+        } else if (effectiveWindowMs > 15000) {
+          this.lastSentAt.set(dedupeKey, (dedupeNow || Date.now()) - effectiveWindowMs + 15000);
+        }
       }
       return { sent: okCount > 0, delivered: okCount, results: entry.results, id: entry.id };
     } catch (err) {
@@ -287,18 +308,29 @@ class NotificationService extends EventEmitter {
     const meta = LEVEL_META[level] || LEVEL_META.info;
     const heading = projectName ? `${title} — ${projectName}` : title;
 
+    const safeLinkUrl = (() => {
+      if (!url || typeof url !== 'string') return null;
+      try {
+        const u = new URL(url.trim());
+        return (u.protocol === 'https:' || u.protocol === 'http:') ? u.toString() : null;
+      } catch (e) {
+        return null;
+      }
+    })();
+
     if (name === 'telegram') {
       const { botToken, chatId } = this.config.channels.telegram;
       const cleanToken = String(botToken || '').trim();
       if (!TELEGRAM_TOKEN_RE.test(cleanToken)) {
         throw new Error('Formato de botToken de Telegram inválido');
       }
-      // P1-6: no aplicar encodeURIComponent al token (convertía ':' en '%3A' y daba 404 en Telegram)
-      // y usar HTML con escape seguro en lugar de Markdown v1 con escapes v2.
+      // Escapar primero y truncar el texto plano/escapado SIN cortar nunca etiquetas HTML ni entidades `&...;` ni surrogates UTF-16
       const esc = (s) => this.escapeHtml(s);
-      const safeUrl = url ? `\n<a href="${esc(url)}">${esc(url)}</a>` : '';
-      const rawText = `<b>${esc(meta.label)}: ${esc(heading.slice(0, 200))}</b>\n${esc(String(message).slice(0, 3600))}${safeUrl}`;
-      const text = rawText.slice(0, 4096);
+      const headerHtml = `<b>${esc(meta.label)}: ${esc(heading.slice(0, 180))}</b>\n`;
+      const footerHtml = safeLinkUrl ? `\n<a href="${esc(safeLinkUrl)}">${esc(safeLinkUrl)}</a>` : '';
+      const budget = Math.max(128, 4096 - headerHtml.length - footerHtml.length);
+      const safeBody = this.truncateHtmlEscaped(esc(String(message || '')), budget);
+      const text = `${headerHtml}${safeBody}${footerHtml}`;
       return this.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
         chat_id: chatId,
         text,
@@ -319,7 +351,7 @@ class NotificationService extends EventEmitter {
           title: `${meta.emoji} ${heading}`.slice(0, 256),
           description: String(message || '').slice(0, 4000),
           color: meta.color,
-          url: url || undefined,
+          url: safeLinkUrl || undefined,
           footer: { text: 'Culkibo Orchestrator' },
           timestamp: new Date().toISOString()
         }]
@@ -332,8 +364,11 @@ class NotificationService extends EventEmitter {
         throw new Error('La URL de Slack debe ser un webhook oficial (https://hooks.slack.com/...)');
       }
       const { url: parsed } = await assertSafeUrl(preParsed.toString(), { requireHttps: true });
+      const escSlack = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const linkPart = safeLinkUrl ? `\n<${safeLinkUrl}|Abrir en Culkibo>` : '';
+      const slackBody = `${meta.emoji} *${escSlack(heading.slice(0, 200))}*\n${escSlack(String(message || '').slice(0, 3200))}${linkPart}`;
       return this.post(parsed.toString(), {
-        text: `${meta.emoji} *${heading}*\n${message}${url ? `\n<${url}|Abrir en Culkibo>` : ''}`
+        text: slackBody.slice(0, 3900)
       });
     }
 
@@ -371,23 +406,54 @@ class NotificationService extends EventEmitter {
       .replace(/"/g, '&quot;');
   }
 
+  /** Trunca texto ya escapado para HTML sin partir entidades `&amp;`/`&lt;` ni pares sustitutos UTF-16. */
+  truncateHtmlEscaped(escaped, maxLen) {
+    if (escaped.length <= maxLen) return escaped;
+    let end = Math.max(0, maxLen - 1);
+    // Evitar partir un par sustituto UTF-16 (emoji)
+    if (end > 0) {
+      const code = escaped.charCodeAt(end - 1);
+      if (code >= 0xd800 && code <= 0xdbff) end--;
+    }
+    // Evitar partir una entidad HTML (`&amp;`, `&lt;`, `&gt;`, `&quot;`)
+    const lastAmp = escaped.lastIndexOf('&', end - 1);
+    if (lastAmp !== -1 && lastAmp >= end - 7) {
+      const semi = escaped.indexOf(';', lastAmp);
+      if (semi === -1 || semi >= end) end = lastAmp;
+    }
+    return `${escaped.slice(0, end)}…`;
+  }
+
   escapeMarkdown(text) {
     return String(text == null ? '' : text).replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
   }
 
   async post(url, body, extraHeaders = {}) {
-    const res = await safeFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...extraHeaders },
-      body: typeof body === 'string' ? body : JSON.stringify(body),
-      requireHttps: true,
-      maxRedirects: 0,
-      timeoutMs: 8000
-    });
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} ${res.text().slice(0, 200)}`);
+    const payload = typeof body === 'string' ? body : JSON.stringify(body);
+    let lastStatus = 0;
+    let lastText = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await safeFetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...extraHeaders },
+        body: payload,
+        requireHttps: true,
+        maxRedirects: 0,
+        timeoutMs: 8000
+      });
+      if (res.ok) return true;
+      lastStatus = res.status;
+      lastText = res.text().slice(0, 200);
+      const retryable = res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504;
+      if (attempt === 0 && retryable) {
+        const ra = Number(res.headers?.['retry-after'] || 0);
+        const delayMs = Number.isFinite(ra) && ra > 0 ? Math.min(5000, ra * 1000) : 1000;
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      break;
     }
-    return true;
+    throw new Error(`HTTP ${lastStatus} ${lastText}`);
   }
 }
 

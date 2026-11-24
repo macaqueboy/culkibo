@@ -1,6 +1,10 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
+const net = require('net');
 const path = require('path');
+const { Readable } = require('stream');
 const { isMetadataIp, assertSafeUrl } = require('./ssrfGuard');
 
 /**
@@ -279,8 +283,94 @@ class S3Client {
       return { canonicalUri, url: this.origin + canonicalUri, host: this.host };
     }
     const canonicalUri = segments.length > 0 ? '/' + segments.map(rfc3986).join('/') : '/';
-    const host = `${this.bucket}.${this.host}`;
+    const alreadyPrefixed = this.host.toLowerCase().startsWith(`${this.bucket.toLowerCase()}.`);
+    const host = alreadyPrefixed ? this.host : `${this.bucket}.${this.host}`;
     return { canonicalUri, url: `${new URL(this.origin).protocol}//${host}${canonicalUri}`, host };
+  }
+
+  /**
+   * Petición HTTP(S) fijada a la IP validada por `assertSafeUrl` (cierra TOCTOU
+   * de DNS rebinding hacia metadatos cloud) devolviendo un adaptador compatible
+   * con Fetch streaming (`res.status`, `res.headers.get`, `res.text`, `res.body`).
+   */
+  _pinnedRequest(fullUrl, { method, headers, body, timeoutMs, pinnedIp }) {
+    const parsed = new URL(fullUrl);
+    const isHttps = parsed.protocol === 'https:';
+    const mod = isHttps ? https : http;
+    const family = net.isIP(pinnedIp) === 6 ? 6 : 4;
+    const targetHostname = parsed.hostname.replace(/^\[|\]$/g, '');
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (err, val) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      const reqOpts = {
+        protocol: parsed.protocol,
+        hostname: targetHostname,
+        port: parsed.port ? Number(parsed.port) : (isHttps ? 443 : 80),
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        method,
+        headers,
+        timeout: timeoutMs > 0 ? timeoutMs : undefined,
+        ...(isHttps ? { servername: net.isIP(targetHostname) ? undefined : targetHostname } : {}),
+        lookup: (_host, _opts, cb) => {
+          if (typeof _opts === 'function') return _opts(null, pinnedIp, family);
+          if (_opts && _opts.all) return cb(null, [{ address: pinnedIp, family }]);
+          return cb(null, pinnedIp, family);
+        }
+      };
+
+      const req = mod.request(reqOpts, (res) => {
+        const rawHeaders = res.headers || {};
+        const headerAdapter = {
+          get(name) {
+            const val = rawHeaders[String(name || '').toLowerCase()];
+            if (Array.isArray(val)) return val.join(', ');
+            return val === undefined ? null : String(val);
+          }
+        };
+        /** @type {any} */
+        let webBody = null;
+        try {
+          webBody = Readable.toWeb(res);
+        } catch (e) {
+          webBody = null;
+        }
+        const readAllText = async () => {
+          if (!webBody) {
+            const chunks = [];
+            for await (const ch of res) chunks.push(Buffer.isBuffer(ch) ? ch : Buffer.from(ch));
+            return Buffer.concat(chunks).toString('utf8');
+          }
+          const reader = webBody.getReader();
+          const chunks = [];
+          for (;;) {
+            const { done: d, value } = await reader.read();
+            if (d) break;
+            chunks.push(Buffer.from(value));
+          }
+          return Buffer.concat(chunks).toString('utf8');
+        };
+        done(null, {
+          status: res.statusCode || 0,
+          headers: headerAdapter,
+          body: webBody,
+          text: readAllText
+        });
+      });
+
+      req.on('timeout', () => req.destroy(new Error(`Tiempo de espera agotado en S3 (${timeoutMs} ms)`)));
+      req.on('error', (err) => done(err, null));
+      if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') {
+        req.write(body);
+      }
+      req.end();
+    });
   }
 
   /**
@@ -291,8 +381,9 @@ class S3Client {
    */
   async request(method, key, { query = {}, headers = {}, body = undefined, expectStatus = [200, 204], timeoutMs = undefined, allowEmptyKey = false } = {}) {
     const { canonicalUri, url, host } = this.resolve(key, { allowEmptyKey });
-    // Protección SSRF con resolución DNS: permite MinIO privado pero bloquea siempre metadatos cloud
-    await assertSafeUrl(url, { allowPrivate: true, allowLoopback: true });
+    const parsedUrl = new URL(url);
+    const targetPort = Number(parsedUrl.port) || (parsedUrl.protocol === 'https:' ? 443 : 80);
+    const daemonPort = Number(process.env.PORT || 3030);
     const payload = body === undefined || body === null ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(body);
     const payloadHash = payload ? sha256Hex(payload) : EMPTY_SHA256;
 
@@ -306,6 +397,15 @@ class S3Client {
     /** @type {any} */
     let lastError = null;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      // Re-validar DNS y fijar IP en CADA intento (cierra DNS rebinding hacia metadatos cloud y plano de control local)
+      const safeInfo = await assertSafeUrl(url, { allowPrivate: true, allowLoopback: true });
+      const pinnedIp = (safeInfo.addresses || []).find((a) => net.isIP(a) === 4) || (safeInfo.addresses || [])[0];
+      if (pinnedIp && (pinnedIp === '127.0.0.1' || pinnedIp === '::1' || pinnedIp.startsWith('127.'))) {
+        if (targetPort === 2019 || targetPort === daemonPort) {
+          throw new Error(`Puerto de plano de control local (${targetPort}) bloqueado como destino S3`);
+        }
+      }
+
       // Re-firmar en cada intento para que el timestamp SigV4 nunca caduque en reintentos largos.
       const signed = signRequest({
         method,
@@ -319,17 +419,15 @@ class S3Client {
         region: this.region,
         service: 's3'
       });
-      // `host` lo pone undici; enviarlo a mano lanza en Node.
       const wire = { ...signed.headers, Authorization: signed.authorization };
-      delete wire.host;
 
       try {
-        const res = await fetch(fullUrl, {
+        const res = await this._pinnedRequest(fullUrl, {
           method,
           headers: wire,
           body: payload,
-          redirect: 'manual',
-          signal: effectiveTimeout > 0 ? AbortSignal.timeout(effectiveTimeout) : undefined
+          timeoutMs: effectiveTimeout,
+          pinnedIp
         });
 
         if (expectStatus.includes(res.status)) {
@@ -359,14 +457,16 @@ class S3Client {
   }
 
   async putObject(key, body, contentType = 'application/octet-stream') {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+    const contentMd5 = crypto.createHash('md5').update(buf).digest('base64');
     const res = await this.request('PUT', key, {
-      headers: { 'content-type': contentType },
-      body,
+      headers: { 'content-type': contentType, 'content-md5': contentMd5 },
+      body: buf,
       expectStatus: [200]
     });
     const etag = res.headers.get('etag');
     try { await res.body?.cancel?.(); } catch (e) {}
-    return { key, etag, size: Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body), 'utf8') };
+    return { key, etag, size: buf.length };
   }
 
   async deleteObject(key) {
@@ -405,10 +505,12 @@ class S3Client {
   }
 
   async uploadPart(key, uploadId, partNumber, chunk) {
-    // Escalar timeout si partSize creció para volcados >80 GB
+    // Escalar timeout si partSize creció para volcados >80 GB y enviar Content-MD5 (Object Lock)
     const scaledTimeout = Math.max(this.timeoutMs, Math.ceil((chunk.length / (1024 * 1024)) * 15000));
+    const contentMd5 = crypto.createHash('md5').update(chunk).digest('base64');
     const res = await this.request('PUT', key, {
       query: { partNumber: String(partNumber), uploadId },
+      headers: { 'content-md5': contentMd5 },
       body: chunk,
       expectStatus: [200],
       timeoutMs: Math.min(30 * 60 * 1000, scaledTimeout)
@@ -419,18 +521,25 @@ class S3Client {
     return { partNumber, etag };
   }
 
-  /** Lista objetos remotos del bucket (ListObjectsV2) para navegación y Disaster Recovery. */
-  async listObjectsV2(prefix = '', { maxKeys = 100 } = {}) {
+  /** Lista objetos remotos del bucket (ListObjectsV2) con paginación y unescape XML seguro. */
+  async listObjectsV2(prefix = '', { maxKeys = 100, continuationToken = null } = {}) {
     const safeMax = Math.min(1000, Math.max(1, Number(maxKeys) || 100));
     /** @type {Record<string, string>} */
     const query = { 'list-type': '2', 'max-keys': String(safeMax) };
     if (prefix) query.prefix = String(prefix);
+    if (continuationToken) query['continuation-token'] = String(continuationToken);
     const res = await this.request('GET', '', {
       query,
       expectStatus: [200],
       allowEmptyKey: true
     });
     const xml = await res.text();
+    const unescapeXml = (s) => String(s || '')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;|&#39;/g, "'")
+      .replace(/&amp;/g, '&');
     /** @type {Array<{ key: string, sizeBytes: number, lastModified: string | null, etag: string | null }>} */
     const objects = [];
     const blockRe = /<Contents>([\s\S]*?)<\/Contents>/g;
@@ -440,14 +549,19 @@ class S3Client {
       const key = xmlField(blk, 'Key');
       if (!key) continue;
       objects.push({
-        key: key.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'),
+        key: unescapeXml(key),
         sizeBytes: parseInt(xmlField(blk, 'Size') || '0', 10) || 0,
         lastModified: xmlField(blk, 'LastModified') || null,
-        etag: (xmlField(blk, 'ETag') || '').replace(/&quot;/g, '"') || null
+        etag: unescapeXml(xmlField(blk, 'ETag') || '') || null
       });
     }
     objects.sort((a, b) => Date.parse(b.lastModified || '0') - Date.parse(a.lastModified || '0'));
-    return { objects, truncated: xmlField(xml, 'IsTruncated') === 'true' };
+    const nextToken = xmlField(xml, 'NextContinuationToken') || null;
+    return {
+      objects,
+      truncated: xmlField(xml, 'IsTruncated') === 'true',
+      nextContinuationToken: nextToken ? unescapeXml(nextToken) : null
+    };
   }
 
   async completeMultipartUpload(key, uploadId, parts) {

@@ -1,0 +1,15 @@
+{
+  "name": "culkibo-telemetry-collector",
+  "version": "1.0.0",
+  "description": "Recolector cloud de telemetría anónima, diagnósticos de fallos y panel de operaciones para Culkibo (cero dependencias externas)",
+  "private": true,
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/collector.test.js"
+  },
+  "dependencies": {}
+}

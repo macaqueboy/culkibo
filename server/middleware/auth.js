@@ -55,16 +55,44 @@ const TRUST_PROXY_UNIQUE_LOCAL = String(process.env.CULKIBO_TRUST_PROXY || 'loop
 
 /** @param {string} ip */
 function isPrivateProxyPeer(ip) {
-  const clean = String(ip || '').replace(/^::ffff:/, '');
+  const clean = String(ip || '').trim().toLowerCase().replace(/^::ffff:/, '');
   if (LOOPBACK.has(clean)) return true;
   if (!TRUST_PROXY_UNIQUE_LOCAL) return false;
   if (clean.startsWith('10.') || clean.startsWith('192.168.')) return true;
+  if (/^(fc|fd)[0-9a-f]{2}:/i.test(clean)) return true;
   const m = clean.match(/^172\.(\d+)\./);
   if (m) {
     const second = Number(m[1]);
     if (second >= 16 && second <= 31) return true;
   }
   return false;
+}
+
+/**
+ * Extrae el hostname limpio de una cabecera `Host` (quitando puerto, corchetes IPv6 y punto FQDN).
+ * @param {string | undefined} rawHost
+ * @returns {string}
+ */
+function extractHostHeaderName(rawHost) {
+  if (!rawHost) return '';
+  const first = String(rawHost).split(',')[0].trim().toLowerCase();
+  if (!first) return '';
+  if (first.startsWith('[')) {
+    const end = first.indexOf(']');
+    return end > 1 ? first.slice(1, end).replace(/\.+$/, '') : '';
+  }
+  const colonIdx = first.indexOf(':');
+  const name = colonIdx !== -1 ? first.slice(0, colonIdx) : first;
+  return name.replace(/\.+$/, '');
+}
+
+/** Normaliza `host[:port]` quitando puerto por defecto (`:80` / `:443`). */
+function normalizeHostWithPort(rawHost, protocol) {
+  const clean = String(rawHost || '').trim().toLowerCase();
+  if (!clean) return '';
+  if (protocol === 'https:' && clean.endsWith(':443')) return clean.slice(0, -4);
+  if (protocol === 'http:' && clean.endsWith(':80')) return clean.slice(0, -3);
+  return clean;
 }
 
 /** Permite registrar un origen adicional en caliente (p. ej. dominio propio del panel). */
@@ -177,13 +205,15 @@ function isOriginAllowed(origin, req = null) {
     try {
       const parsedOrigin = new URL(origin);
       if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') return false;
-      const originHost = parsedOrigin.host.toLowerCase();
+      const originHost = normalizeHostWithPort(parsedOrigin.host, parsedOrigin.protocol);
       const peerAddr = req.socket?.remoteAddress || '';
       const trustFwd = isPrivateProxyPeer(peerAddr);
-      const rawHost = (trustFwd && req.headers['x-forwarded-host'])
-        ? req.headers['x-forwarded-host']
-        : req.headers.host;
-      const reqHost = String(rawHost || '').split(',')[0].trim().toLowerCase();
+      let reqHostRaw = req.headers.host;
+      if (trustFwd && req.headers['x-forwarded-host']) {
+        const fwdHosts = String(req.headers['x-forwarded-host']).split(',').map((s) => s.trim()).filter(Boolean);
+        if (fwdHosts.length > 0) reqHostRaw = fwdHosts[fwdHosts.length - 1];
+      }
+      const reqHost = normalizeHostWithPort(String(reqHostRaw || '').split(',')[0].trim(), parsedOrigin.protocol);
       if (originHost && reqHost && originHost === reqHost) return true;
     } catch (e) {}
   }
@@ -207,12 +237,20 @@ function tokenMatches(provided) {
 
 /** Extrae IP efectiva del cliente para buckets de rate-limiting y tickets WS. */
 function clientIp(req) {
-  const peer = String(req?.socket?.remoteAddress || '').replace(/^::ffff:/, '');
-  if (isPrivateProxyPeer(peer) && req?.headers?.['x-forwarded-for']) {
-    const hops = String(req.headers['x-forwarded-for']).split(',').map(s => s.trim()).filter(Boolean);
-    if (hops.length > 0) return hops[hops.length - 1].replace(/^::ffff:/, '');
+  const peer = String(req?.socket?.remoteAddress || '').trim().toLowerCase().replace(/^::ffff:/, '');
+  if (isPrivateProxyPeer(peer)) {
+    if (req?.headers?.['x-forwarded-for']) {
+      const hops = String(req.headers['x-forwarded-for']).split(',').map((s) => s.trim()).filter(Boolean);
+      if (hops.length > 0) return hops[hops.length - 1].toLowerCase().replace(/^::ffff:/, '');
+    }
+    if (req?.headers?.forwarded) {
+      const matches = Array.from(String(req.headers.forwarded).matchAll(/for=(?:"?\[?)([^;\s,"\]]+)/gi));
+      if (matches.length > 0) {
+        return matches[matches.length - 1][1].trim().toLowerCase().replace(/^::ffff:/, '');
+      }
+    }
   }
-  return peer || String(req?.ip || 'local').replace(/^::ffff:/, '');
+  return peer || String(req?.ip || 'local').trim().toLowerCase().replace(/^::ffff:/, '');
 }
 
 /** Emite un ticket WebSocket efímero (30 s, un solo uso) ligado a la IP del cliente. */
@@ -250,9 +288,15 @@ function consumeWsTicket(ticket, req) {
 
 /**
  * Extrae token o ticket efímero de la petición (sin asignaciones innecesarias en /ws).
+ * Por seguridad, `Sec-WebSocket-Protocol` SOLO se lee cuando `allowWsSubprotocol: true`
+ * (exclusivamente desde `server.on('upgrade')`), impidiendo que peticiones HTTP normales
+ * falseen `Upgrade: websocket` para eludir rate-limiting o consumir tickets WS.
+ *
+ * @param {any} req
+ * @param {{ allowWsSubprotocol?: boolean }} [options]
  * @returns {{ token: string | null, ticket: string | null }}
  */
-function extractCredentials(req) {
+function extractCredentials(req, options = {}) {
   const header = req.headers.authorization;
   if (header && header.length > 7 && header.slice(0, 7).toLowerCase() === 'bearer ') {
     return { token: header.slice(7).trim(), ticket: null };
@@ -260,18 +304,20 @@ function extractCredentials(req) {
   const xTok = req.headers['x-culkibo-token'];
   if (xTok) return { token: String(xTok).trim(), ticket: null };
 
-  const upgrade = req.headers.upgrade;
-  if (upgrade && String(upgrade).toLowerCase() === 'websocket') {
-    const proto = req.headers['sec-websocket-protocol'];
-    if (proto) {
-      const parts = String(proto).split(',');
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i].trim();
-        if (part.startsWith('culkibo-ticket.')) {
-          return { token: null, ticket: part.slice('culkibo-ticket.'.length).trim() };
-        }
-        if (part.startsWith('culkibo-token.')) {
-          return { token: part.slice('culkibo-token.'.length).trim(), ticket: null };
+  if (options && options.allowWsSubprotocol) {
+    const upgrade = req.headers.upgrade;
+    if (upgrade && String(upgrade).toLowerCase() === 'websocket') {
+      const proto = req.headers['sec-websocket-protocol'];
+      if (proto) {
+        const parts = String(proto).split(',');
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i].trim();
+          if (part.startsWith('culkibo-ticket.')) {
+            return { token: null, ticket: part.slice('culkibo-ticket.'.length).trim() };
+          }
+          if (part.startsWith('culkibo-token.')) {
+            return { token: part.slice('culkibo-token.'.length).trim(), ticket: null };
+          }
         }
       }
     }
@@ -279,8 +325,8 @@ function extractCredentials(req) {
   return { token: null, ticket: null };
 }
 
-function extractToken(req) {
-  return extractCredentials(req).token;
+function extractToken(req, options = {}) {
+  return extractCredentials(req, options).token;
 }
 
 /**
@@ -360,10 +406,16 @@ function recordAuthFailure(req) {
   const now = Date.now();
   let entry = authFailMap.get(ip);
   if (!entry || entry.resetAt <= now) {
-    // Evicción LRU acotada: un flood de IPs falsas jamás limpia bloqueos activos
+    // Barrido de caducados antes de evicción LRU para que IPs muertas no expulsen bloqueos activos
     if (authFailMap.size >= AUTH_FAIL_MAP_CAP) {
-      const oldestKey = authFailMap.keys().next().value;
-      if (oldestKey) authFailMap.delete(oldestKey);
+      for (const [k, v] of authFailMap.entries()) {
+        if (v.resetAt <= now) authFailMap.delete(k);
+        if (authFailMap.size < AUTH_FAIL_MAP_CAP) break;
+      }
+      if (authFailMap.size >= AUTH_FAIL_MAP_CAP) {
+        const oldestKey = authFailMap.keys().next().value;
+        if (oldestKey) authFailMap.delete(oldestKey);
+      }
     }
     entry = { count: 1, resetAt: now + AUTH_FAIL_WINDOW_MS };
   } else {
@@ -381,9 +433,10 @@ function resetAuthRateLimit() {
 /**
  * Evaluación compartida para HTTP y WebSocket.
  * @param {any} req
+ * @param {{ allowWsSubprotocol?: boolean }} [options]
  * @returns {{ ok: boolean, status?: number, error?: string, detail?: string, method?: string }}
  */
-function authorizeRequest(req) {
+function authorizeRequest(req, options = {}) {
   const origin = req.headers.origin;
   if (origin && !isOriginAllowed(origin, req)) {
     return {
@@ -394,7 +447,7 @@ function authorizeRequest(req) {
     };
   }
 
-  const { token, ticket } = extractCredentials(req);
+  const { token, ticket } = extractCredentials(req, options);
   if (ticket) {
     return consumeWsTicket(ticket, req) ? OK_WS_TICKET : ERR_INVALID_TICKET;
   }
@@ -404,6 +457,11 @@ function authorizeRequest(req) {
 
   const requireToken = process.env.CULKIBO_REQUIRE_TOKEN === '1';
   if (!requireToken && isLoopback(req)) {
+    // Defensa DNS Rebinding (MCP SDK CVE-2025-66414): si viene cabecera Host, debe apuntar a loopback.
+    const hostName = extractHostHeaderName(req.headers && req.headers.host);
+    if (hostName && !LOOPBACK.has(hostName)) {
+      return ERR_AUTH_REQUIRED;
+    }
     if (!origin) return OK_LOOPBACK;
     if (allowedOrigins().has(origin)) {
       return OK_LOOPBACK_ORIGIN;
@@ -438,10 +496,11 @@ function authMiddleware(req, res, next) {
     });
   }
 
-  const decision = authorizeRequest(req);
+  const decision = authorizeRequest(req, { allowWsSubprotocol: false });
   if (decision.ok) return next();
 
-  if (decision.status === 401 && extractToken(req)) {
+  const creds = extractCredentials(req, { allowWsSubprotocol: false });
+  if (decision.status === 401 && (creds.token || creds.ticket)) {
     recordAuthFailure(req);
   }
   return res.status(decision.status || 401).json({
@@ -493,6 +552,7 @@ function authStatus() {
 module.exports = {
   authMiddleware,
   authorizeRequest,
+  extractCredentials,
   corsOptions,
   corsDelegate,
   resolveToken,

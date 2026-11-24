@@ -69,8 +69,14 @@ function createRateLimiter({
     let entry = hits.get(ip);
     if (!entry || entry.resetAt <= now) {
       if (hits.size >= cap) {
-        const oldest = hits.keys().next().value;
-        if (oldest) hits.delete(oldest);
+        for (const [k, v] of hits.entries()) {
+          if (v.resetAt <= now) hits.delete(k);
+          if (hits.size < cap) break;
+        }
+        if (hits.size >= cap) {
+          const oldest = hits.keys().next().value;
+          if (oldest) hits.delete(oldest);
+        }
       }
       entry = { count: 1, resetAt: now + windowMs };
       hits.set(ip, entry);

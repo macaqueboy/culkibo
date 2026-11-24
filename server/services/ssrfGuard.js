@@ -446,33 +446,126 @@ async function safeFetch(rawUrl, opts = {}) {
 }
 
 /**
- * Escritura atómica síncrona con nombre temporal único, permisos 0600 opcionales
- * y fallback seguro para Windows cuando un lector retiene brevemente el destino.
+ * Escritura atómica síncrona con `fsync`, nombre temporal único, permisos 0600,
+ * respaldo `.bak` opcional y reintentos en Windows ante bloqueo breve de lectores.
  *
  * @param {string} targetPath
  * @param {any} data
- * @param {number | { mode?: number, pretty?: boolean }} [opts]
+ * @param {number | { mode?: number, pretty?: boolean, backup?: boolean }} [opts]
  */
 function atomicWriteJsonSync(targetPath, data, opts = {}) {
   const mode = typeof opts === 'number' ? opts : (opts.mode ?? 0o600);
   const pretty = typeof opts === 'number' ? true : (opts.pretty ?? true);
+  const backup = typeof opts === 'number' ? false : Boolean(opts.backup);
   const dir = path.dirname(targetPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const payload = pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data);
   const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   try {
-    fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode });
+    const fd = fs.openSync(tmpPath, 'wx', mode);
     try {
-      fs.renameSync(tmpPath, targetPath);
-    } catch (renameErr) {
+      fs.writeSync(fd, payload, 0, 'utf8');
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (backup && fs.existsSync(targetPath)) {
+      try {
+        fs.copyFileSync(targetPath, `${targetPath}.bak`);
+        try { fs.chmodSync(`${targetPath}.bak`, mode); } catch (e) {}
+      } catch (e) {}
+    }
+    let renamed = false;
+    /** @type {any} */
+    let lastRenameErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        fs.renameSync(tmpPath, targetPath);
+        renamed = true;
+        break;
+      } catch (renameErr) {
+        lastRenameErr = renameErr;
+        if (renameErr && (renameErr.code === 'EPERM' || renameErr.code === 'EBUSY' || renameErr.code === 'EACCES') && attempt < 2) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * (attempt + 1));
+          continue;
+        }
+        break;
+      }
+    }
+    if (!renamed) {
       fs.copyFileSync(tmpPath, targetPath);
       try { fs.unlinkSync(tmpPath); } catch (e) {}
+      if (lastRenameErr && !fs.existsSync(targetPath)) throw lastRenameErr;
     }
     try { fs.chmodSync(targetPath, mode); } catch (e) {}
   } catch (err) {
     try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
     throw err;
   }
+}
+
+/**
+ * Carga un fichero JSON intentando primero la copia principal y luego `.bak`.
+ * Si el fichero existe en disco pero ambas copias están corruptas, lo pone en
+ * cuarentena (`<ruta>.corrupt.<ts>`) en lugar de sobrescribirlo silenciosamente.
+ *
+ * @param {string} targetPath
+ * @param {{ validate?: ((parsed: any) => boolean) | null }} [opts]
+ * @returns {{ ok: boolean, data: any, exists: boolean, corrupt: boolean, recoveredFromBak: boolean, quarantinePath: string | null }}
+ */
+function loadJsonWithBackupSync(targetPath, { validate = null } = {}) {
+  const bakPath = `${targetPath}.bak`;
+  const primaryExists = fs.existsSync(targetPath);
+  const bakExists = fs.existsSync(bakPath);
+  if (!primaryExists && !bakExists) {
+    return { ok: false, data: null, exists: false, corrupt: false, recoveredFromBak: false, quarantinePath: null };
+  }
+  const check = (parsed) => (typeof validate === 'function' ? Boolean(validate(parsed)) : parsed !== null && typeof parsed === 'object');
+  if (primaryExists) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
+      if (check(parsed)) {
+        return { ok: true, data: parsed, exists: true, corrupt: false, recoveredFromBak: false, quarantinePath: null };
+      }
+    } catch (e) {}
+  }
+  if (bakExists) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(bakPath, 'utf8'));
+      if (check(parsed)) {
+        return { ok: true, data: parsed, exists: true, corrupt: false, recoveredFromBak: true, quarantinePath: null };
+      }
+    } catch (e) {}
+  }
+  /** @type {string | null} */
+  let quarantinePath = null;
+  if (primaryExists) {
+    quarantinePath = `${targetPath}.corrupt.${Date.now()}`;
+    try { fs.copyFileSync(targetPath, quarantinePath); } catch (e) { quarantinePath = null; }
+  }
+  return { ok: false, data: null, exists: true, corrupt: true, recoveredFromBak: false, quarantinePath };
+}
+
+/**
+ * Formatea un mapa de variables para Docker `--env-file` rechazando inyecciones
+ * de saltos de línea (`\r`, `\n`) y bytes nulos (`\0`) que dividirían variables.
+ * @param {Record<string, any>} envObj
+ * @returns {string}
+ */
+function formatDockerEnvFile(envObj) {
+  const lines = [];
+  for (const [rawKey, rawVal] of Object.entries(envObj || {})) {
+    const key = String(rawKey || '').trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,254}$/.test(key)) {
+      throw new Error(`Nombre de variable de entorno inválido para --env-file: ${key}`);
+    }
+    const val = rawVal == null ? '' : String(rawVal);
+    if (/[\r\n\0]/.test(val)) {
+      throw new Error(`La variable de entorno "${key}" contiene saltos de línea o bytes nulos no permitidos en --env-file`);
+    }
+    lines.push(`${key}=${val}`);
+  }
+  return lines.join('\n') + '\n';
 }
 
 /**
@@ -500,5 +593,7 @@ module.exports = {
   assertSafeUrl,
   safeFetch,
   atomicWriteJsonSync,
+  loadJsonWithBackupSync,
+  formatDockerEnvFile,
   assertContainedPath
 };

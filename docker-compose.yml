@@ -41,6 +41,8 @@ services:
         max-size: "10m"
         max-file: "3"
     pids_limit: 256
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - culkibo_internal
       - culkibo

@@ -29,6 +29,7 @@ const auditLogger = require('../services/auditLogger');
 const cronManager = require('../services/cronManager');
 const previewManager = require('../services/previewManager');
 const webhookService = require('../services/webhookService');
+const telemetryService = require('../services/telemetryService');
 const {
   authorizeRequest,
   authStatus,
@@ -36,6 +37,8 @@ const {
   addAllowedOrigin,
   createWsTicket,
   rotateToken,
+  onTokenRotated,
+  isPrivateProxyPeer,
   clientIp,
   checkAuthBruteForce,
   recordAuthFailure,
@@ -540,46 +543,70 @@ router.get('/projects/:id/runtime/logs/stream', (req, res) => {
   const project = projectManager.getById(req.params.id);
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
   try {
-    res.setTimeout(0);
-    const stream = deployManager.streamRuntimeLogs(project.id, {
+    if (typeof req.setTimeout === 'function') req.setTimeout(0);
+    if (typeof res.setTimeout === 'function') res.setTimeout(0);
+    /** @type {ReturnType<typeof setInterval> | null} */
+    let ka = null;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    let maxLife = null;
+    /** @type {{ containerName: string, close: () => void } | null} */
+    let stream = null;
+    /** @type {(() => void) | null} */
+    let unsubRotate = null;
+    let closed = false;
+
+    const safeWrite = (chunk) => {
+      if (closed || res.writableEnded || res.destroyed) return false;
+      try {
+        res.write(chunk);
+        return true;
+      } catch (e) {
+        stopAll();
+        return false;
+      }
+    };
+
+    const stopAll = () => {
+      if (closed) return;
+      closed = true;
+      if (ka) { clearInterval(ka); ka = null; }
+      if (maxLife) { clearTimeout(maxLife); maxLife = null; }
+      if (unsubRotate) { try { unsubRotate(); } catch (e) {} unsubRotate = null; }
+      if (stream) { try { stream.close(); } catch (e) {} }
+      if (!res.writableEnded && !res.destroyed) {
+        try { res.end(); } catch (e) {}
+      }
+    };
+
+    const activeStream = deployManager.streamRuntimeLogs(project.id, {
       tail: req.query.tail || 100,
       target: req.query.target === 'previous' ? 'previous' : 'current',
       onLine: (payload) => {
-        if (!res.writableEnded && !res.destroyed) {
-          res.write(`event: log\ndata: ${JSON.stringify(payload)}\n\n`);
-        }
+        safeWrite(`event: log\ndata: ${JSON.stringify(payload)}\n\n`);
       },
       onEnd: () => {
-        clearInterval(ka);
-        clearTimeout(maxLife);
-        if (!res.writableEnded && !res.destroyed) {
-          res.write(`event: end\ndata: {"ended":true}\n\n`);
-          res.end();
-        }
+        safeWrite(`event: end\ndata: {"ended":true}\n\n`);
+        stopAll();
       }
     });
+    stream = activeStream;
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no'
     });
-    res.write(`event: ready\ndata: ${JSON.stringify({ containerName: stream.containerName })}\n\n`);
-    const ka = setInterval(() => {
-      if (!res.writableEnded && !res.destroyed) res.write(': keepalive\n\n');
-    }, 15000);
+    safeWrite(`event: ready\ndata: ${JSON.stringify({ containerName: activeStream.containerName })}\n\n`);
+    ka = setInterval(() => { safeWrite(': keepalive\n\n'); }, 15000);
     if (ka.unref) ka.unref();
-    const maxLife = setTimeout(() => { stream.close(); }, 30 * 60 * 1000);
+    maxLife = setTimeout(() => { stopAll(); }, 30 * 60 * 1000);
     if (maxLife.unref) maxLife.unref();
-    const stopAll = () => {
-      clearInterval(ka);
-      clearTimeout(maxLife);
-      stream.close();
-    };
+    unsubRotate = onTokenRotated(() => stopAll());
     req.on('close', stopAll);
+    res.on('close', stopAll);
     res.on('error', stopAll);
   } catch (err) {
-    res.status(err.status || 500).json({ error: err.message });
+    if (!res.headersSent) res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -926,11 +953,20 @@ router.post('/import/wordpress/import-sql/upload', heavyOpLimiter, async (req, r
   /** @type {Buffer[]} */
   const chunks = [];
   let total = 0;
+  let overflowed = false;
   try {
     await new Promise((resolve, reject) => {
       req.on('data', (c) => {
+        if (overflowed) return;
         total += c.length;
-        if (total > MAX_BYTES) return reject(new Error('El archivo SQL supera el límite de 50 MB'));
+        if (total > MAX_BYTES) {
+          overflowed = true;
+          chunks.length = 0;
+          req.resume();
+          const err = new Error('El archivo SQL supera el límite de 50 MB');
+          /** @type {any} */ (err).status = 413;
+          return reject(err);
+        }
         chunks.push(c);
       });
       req.on('error', reject);
@@ -941,7 +977,8 @@ router.post('/import/wordpress/import-sql/upload', heavyOpLimiter, async (req, r
     const result = await wordpressMigrator.importSqlDump({ installationId, sqlBuffer, oldDomain, newDomain });
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    if (err.status === 413) res.setHeader('Connection', 'close');
+    res.status(err.status || 400).json({ error: err.message });
   }
 });
 
@@ -1470,10 +1507,11 @@ router.get('/ingress/resolve', async (req, res) => {
       try {
         const stored = await caddyManager.getRoute(desired.projectId);
         if (stored) {
+          const proxyHandler = caddyManager.extractProxyHandler(stored);
           liveRoute = {
             id: stored['@id'],
             hosts: (stored.match && stored.match[0] && stored.match[0].host) || [],
-            upstreams: ((stored.handle && stored.handle[0] && stored.handle[0].upstreams) || []).map(u => u.dial)
+            upstreams: ((proxyHandler && proxyHandler.upstreams) || []).map(u => u.dial)
           };
         }
       } catch (e) { /* la ruta no existe todavía */ }
@@ -1595,6 +1633,10 @@ router.post('/ssl/certificates/upload', async (req, res) => {
   try {
     const result = sslManager.uploadCustomCertificate(req.body || {});
     const ingress = await ingressManager.reconcile();
+    // Eliminar los ficheros PEM reemplazados SOLO tras reconciliar Caddy (evita dejar TLS roto si Caddy falla)
+    if (Array.isArray(result.replacedEntries) && result.replacedEntries.length > 0 && typeof sslManager.cleanupReplacedEntries === 'function') {
+      try { sslManager.cleanupReplacedEntries(result.replacedEntries); } catch (e) {}
+    }
     notificationService.notify({
       event: 'ssl_issued',
       level: 'success',
@@ -1801,10 +1843,18 @@ router.get('/mcp/tools', (req, res) => {
 router.post('/mcp/message', async (req, res) => {
   try {
     mcpStreamableHttp.markLegacyTransport(res, 'POST /api/mcp/message');
-    const response = await mcpServer.handleJsonRpc(req.body);
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+    }
+    const isNotification = body.id === undefined && typeof body.method === 'string';
+    const response = await mcpServer.handleJsonRpc(body);
+    if (isNotification || response === null) {
+      return res.status(202).end();
+    }
     res.json(response);
   } catch (err) {
-    res.status(500).json({ jsonrpc: '2.0', id: req.body?.id || null, error: { code: -32603, message: err.message } });
+    res.status(500).json({ jsonrpc: '2.0', id: req.body?.id ?? null, error: { code: -32603, message: err.message } });
   }
 });
 
@@ -2687,13 +2737,16 @@ router.post('/webhooks/github', async (req, res) => {
 
     const project = matchedProjects[0] || null;
 
-    // Verificación HMAC SHA-256 estricta POR PROYECTO (evita que en un monorepo un hermano
-    // con otro secreto autorice el despliegue de un proyecto diferente).
+    // Verificación HMAC SHA-256 estricta POR PROYECTO (fail-closed: Coolify CVE-2025-22608).
+    // Jamás se permite ejecutar un webhook sin secreto configurado (de proyecto o GITHUB_WEBHOOK_SECRET).
     const globalSecret = process.env.GITHUB_WEBHOOK_SECRET || null;
     const globalValid = Boolean(globalSecret && verifyHmac(globalSecret).ok);
-    const hasAnySecret = Boolean(globalSecret) || matchedProjects.some((p) => Boolean(p?.webhookSecret));
 
-    if (hasAnySecret) {
+    if (matchedProjects.length > 0) {
+      const anyConfigured = Boolean(globalSecret) || matchedProjects.some((p) => Boolean(p?.webhookSecret));
+      if (!anyConfigured) {
+        return res.status(401).json({ error: 'Webhook sin secreto configurado: define webhookSecret en el proyecto o GITHUB_WEBHOOK_SECRET' });
+      }
       matchedProjects = matchedProjects.filter((p) => {
         if (p?.webhookSecret) return verifyHmac(p.webhookSecret).ok;
         return globalValid;
@@ -2703,6 +2756,8 @@ router.post('/webhooks/github', async (req, res) => {
         const firstErr = firstSecret ? verifyHmac(firstSecret).error : 'Firma de webhook inválida';
         return res.status(401).json({ error: firstErr });
       }
+    } else if (!globalValid) {
+      return res.status(401).json({ error: globalSecret ? verifyHmac(globalSecret).error : 'Firma de webhook ausente o proyecto sin secreto configurado' });
     }
 
     const authorizedProject = matchedProjects[0] || null;
@@ -2721,13 +2776,15 @@ router.post('/webhooks/github', async (req, res) => {
       });
     }
 
-    // Handle Pull Request event -> Preview Deployments (con puerta anti-forks)
+    // Handle Pull Request event -> Preview Deployments (puerta anti-forks fail-closed)
     if (event === 'pull_request' && bodyData?.pull_request) {
       if (!authorizedProject) {
         return res.status(404).json({ error: 'No se encontró un proyecto asociado a este repositorio' });
       }
       const pr = bodyData.pull_request;
-      const isFork = Boolean(pr.head?.repo?.full_name && pr.base?.repo?.full_name && pr.head.repo.full_name !== pr.base.repo.full_name);
+      const headFull = String(pr.head?.repo?.full_name || '').trim().toLowerCase();
+      const baseFull = String(pr.base?.repo?.full_name || '').trim().toLowerCase();
+      const isFork = !headFull || !baseFull || headFull !== baseFull;
       const out = await webhookService.dispatchPullRequest({
         provider: 'github',
         projects: matchedProjects,
@@ -3117,12 +3174,18 @@ router.post('/projects/:id/sync/token', (req, res) => {
     const project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
     const ticket = createWsTicket(req);
-    const host = req.headers.host || '127.0.0.1:3030';
-    const proto = (req.socket && /** @type {any} */ (req.socket).encrypted) ? 'wss' : 'ws';
+    const trustFwd = isPrivateProxyPeer(req.socket?.remoteAddress || '');
+    const fwdProto = trustFwd ? String(req.headers['x-forwarded-proto'] || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean).pop() : '';
+    const fwdHost = trustFwd ? String(req.headers['x-forwarded-host'] || '').split(',').map((s) => s.trim()).filter(Boolean).pop() : '';
+    const host = fwdHost || req.headers.host || '127.0.0.1:3030';
+    const isHttps = Boolean((req.socket && /** @type {any} */ (req.socket).encrypted) || fwdProto === 'https');
+    const proto = isHttps ? 'wss' : 'ws';
+    const expiresAt = new Date(Date.now() + (ticket.expiresInMs || 30000)).toISOString();
     res.json({
       projectId: project.id,
       ticket: ticket.ticket,
-      expiresAt: ticket.expiresAt,
+      expiresInMs: ticket.expiresInMs,
+      expiresAt,
       wsUrl: `${proto}://${host}/ws/sync`,
       command: `culkibo sync --project ${project.id}`
     });
@@ -3233,6 +3296,73 @@ router.delete('/projects/:id/databases/:dbId/link', async (req, res) => {
     res.json({ success: true, project: updated });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// --- TELEMETRÍA ANÓNIMA Y REPORTE DE FALLOS ---
+const clientTelemetryLimiter = createRateLimiter({ max: 30, windowMs: 60000, prefix: 'telemetry_client', bypassLoopback: false });
+
+router.get('/telemetry/status', (_req, res) => {
+  try {
+    res.json(telemetryService.getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/telemetry/config', (req, res) => {
+  try {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'Debes enviar un booleano `enabled`' });
+    }
+    const status = telemetryService.setEnabled(enabled);
+    auditLogger.record({
+      source: 'http',
+      action: enabled ? 'telemetry.enable' : 'telemetry.disable',
+      method: 'PUT',
+      path: '/api/telemetry/config',
+      ip: clientIp(req),
+      status: 200
+    });
+    res.json(status);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/telemetry/preview', (_req, res) => {
+  try {
+    res.json(telemetryService.getPreviewPayload());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/telemetry/reset-id', (req, res) => {
+  try {
+    const status = telemetryService.resetInstanceId();
+    auditLogger.record({
+      source: 'http',
+      action: 'telemetry.reset_id',
+      method: 'POST',
+      path: '/api/telemetry/reset-id',
+      ip: clientIp(req),
+      status: 200
+    });
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/telemetry/client-error', clientTelemetryLimiter, (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const accepted = telemetryService.captureClientError(body);
+    res.status(202).json({ accepted });
+  } catch (err) {
+    res.status(202).json({ accepted: false });
   }
 });
 

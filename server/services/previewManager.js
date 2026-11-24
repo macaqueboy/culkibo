@@ -4,7 +4,9 @@ const fs = require('fs');
 const path = require('path');
 
 const portRegistry = require('./portRegistry');
-const { atomicWriteJsonSync } = require('./ssrfGuard');
+const { atomicWriteJsonSync, assertContainedPath, formatDockerEnvFile } = require('./ssrfGuard');
+
+const PREVIEW_DOMAIN_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 
 const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
   ? path.resolve(process.env.CULKIBO_DATA_DIR)
@@ -53,7 +55,10 @@ function dnsLabel(raw, maxLen = 28) {
  * @param {{ prNumber?: number | string | null, branch?: string | null }} target
  */
 function computePreviewIdentity(project, { prNumber = null, branch = null } = {}) {
-  const baseDomain = String(project?.previewDeployments?.baseDomain || '').trim().toLowerCase().replace(/^\*\./, '');
+  const baseDomain = String(project?.previewDeployments?.baseDomain || '').trim().toLowerCase().replace(/^\*\./, '').replace(/\.+$/, '');
+  if (baseDomain && !PREVIEW_DOMAIN_RE.test(baseDomain)) {
+    throw new Error(`Dominio base de previews inválido (debe cumplir RFC-1123): «${baseDomain}»`);
+  }
   const projSlug = dnsLabel(project?.name || project?.id || 'app', 20);
   let key;
   if (prNumber != null && String(prNumber).trim() !== '') {
@@ -248,12 +253,16 @@ class PreviewManager extends EventEmitter {
       updatedAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + ttlHours * 3600 * 1000).toISOString()
     };
+    const previousRecord = existing ? { ...existing } : null;
     this.store[project.id][identity.key] = record;
     this.save();
     this.emit('preview_event', { action: 'building', preview: record });
 
     /** @type {number | null} */
     let hostPort = null;
+    /** @type {string | null} */
+    let envFile = null;
+    const portOwner = `prev_${identity.key}_${suffix}`;
     try {
       const docker = await dm.detectDocker({ force: true });
       if (!docker.available) throw new Error(docker.reason || 'Docker no disponible');
@@ -268,7 +277,7 @@ class PreviewManager extends EventEmitter {
       if (sync.commit) record.commit = sync.shortCommit || sync.commit.slice(0, 7);
 
       const contextDir = project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.'
-        ? path.resolve(checkoutDir, String(project.baseDirectory).replace(/^\/+/, ''))
+        ? assertContainedPath(checkoutDir, String(project.baseDirectory).replace(/^\/+/, ''))
         : checkoutDir;
 
       // 2. Estrategia + build protegido por el semáforo global de deployManager
@@ -289,7 +298,7 @@ class PreviewManager extends EventEmitter {
       await dm.acquireBuildSlot(project.id, `prev_${identity.key}`);
       try {
         const fakeDep = {
-          id: `prev_${identity.key}_${suffix}`,
+          id: portOwner,
           projectId: project.id,
           projectName: project.name,
           imageTag,
@@ -307,20 +316,35 @@ class PreviewManager extends EventEmitter {
         dm.releaseBuildSlot();
       }
 
-      // 3. Arrancar contenedor preview con límites estrictos
+      // 3. Arrancar contenedor preview con límites estrictos (sin fugar env del host)
       await dm.ensureNetwork(dm.DEFAULTS.network);
-      hostPort = await dm.findFreePort(20000, `prev_${identity.key}_${suffix}`);
+      hostPort = await dm.findFreePort(20000, portOwner);
       record.hostPort = hostPort;
       record.containerPort = strategy.containerPort;
 
       const memCap = Math.min(Number(cfg.memoryMb) || 512, Number(project.memoryMb) || 512);
-      const envNames = Object.keys(envVars).filter(dm.helpers.isValidEnvName);
+      const validEnvNames = Object.keys(envVars).filter(dm.helpers.isValidEnvName);
+      const blocklist = dm.helpers.HOST_HIJACK_ENV_BLOCKLIST || new Set();
+      const inlineEnvNames = validEnvNames.filter((k) => !blocklist.has(k.toUpperCase()));
+      const fileOnlyEnvNames = validEnvNames.filter((k) => blocklist.has(k.toUpperCase()));
+
+      if (fileOnlyEnvNames.length > 0) {
+        const tmpDir = path.join(DATA_DIR, '.tmp');
+        fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
+        envFile = path.join(tmpDir, `prevenv_${crypto.randomBytes(8).toString('hex')}`);
+        /** @type {Record<string, any>} */
+        const fileOnlyObj = {};
+        for (const k of fileOnlyEnvNames) fileOnlyObj[k] = envVars[k];
+        fs.writeFileSync(envFile, formatDockerEnvFile(fileOnlyObj), { encoding: 'utf8', mode: 0o600 });
+      }
+
       const runArgs = dm.runArgs({
         containerName,
         imageTag,
         hostPort,
         containerPort: strategy.containerPort,
-        envNames,
+        envNames: inlineEnvNames,
+        envFile,
         network: dm.DEFAULTS.network,
         memoryMb: Math.max(64, memCap),
         cpus: '0.5',
@@ -340,12 +364,19 @@ class PreviewManager extends EventEmitter {
         throw new Error((run.stderr || '').trim().slice(0, 400) || `docker run terminó con código ${run.code}`);
       }
 
+      for (const dbNet of linkedDb.networks || []) {
+        if (dbNet !== dm.DEFAULTS.network) {
+          await dm.runDocker(['network', 'connect', dbNet, containerName], { timeoutMs: 10000 }).catch(() => {});
+        }
+      }
+
       // 4. Healthcheck
       const health = await dm.waitForHealth({
         hostPort,
         containerPort: strategy.containerPort,
         healthPath: strategy.healthPath,
         containerName,
+        hostHeader: record.hostname,
         timeoutMs: 30000,
         intervalMs: 1000
       });
@@ -376,33 +407,61 @@ class PreviewManager extends EventEmitter {
       await ing.reconcile().catch(() => {});
 
       // Retirar contenedor preview anterior de esta misma clave si existía
-      if (existing && existing.containerName && existing.containerName !== containerName) {
-        await dm.runDocker(['rm', '-f', existing.containerName], { timeoutMs: 15000 }).catch(() => {});
+      if (previousRecord && previousRecord.containerName && previousRecord.containerName !== containerName) {
+        await dm.runDocker(['rm', '-f', previousRecord.containerName], { timeoutMs: 15000 }).catch(() => {});
       }
 
       this.emit('preview_event', { action: 'active', preview: record });
       return record;
     } catch (err) {
-      record.status = 'failed';
-      record.error = err.message || 'Error en vista previa';
-      record.updatedAt = new Date().toISOString();
+      // Si ya existía una preview activa sana, preservar su containerName/upstream para no dejar huérfanos
+      if (previousRecord && previousRecord.status === 'active' && previousRecord.containerName) {
+        this.store[project.id][identity.key] = {
+          ...previousRecord,
+          lastBuildError: err.message || 'Error reconstruyendo vista previa',
+          updatedAt: new Date().toISOString()
+        };
+      } else {
+        record.status = 'failed';
+        record.error = err.message || 'Error en vista previa';
+        record.updatedAt = new Date().toISOString();
+      }
       this.save();
-      this.emit('preview_event', { action: 'failed', preview: record });
+      this.emit('preview_event', { action: 'failed', preview: this.store[project.id][identity.key] });
       throw err;
     } finally {
-      if (hostPort) portRegistry.release(hostPort, `prev_${identity.key}_${suffix}`);
+      if (envFile) { try { fs.unlinkSync(envFile); } catch (e) {} }
+      if (hostPort) {
+        if (dm._pendingPorts) dm._pendingPorts.delete(hostPort);
+        portRegistry.release(hostPort, portOwner);
+      }
       this.inFlightKeys.delete(lockKey);
     }
   }
 
   /**
    * Destruye una vista previa (ruta Caddy + contenedor + imagen + directorio temporal).
+   * Acepta clave string (`"pr-42"`) o descriptor `{ prNumber, branch, project }`.
    */
-  async destroyPreview(projectId, key) {
+  async destroyPreview(projectId, keyOrTarget) {
     this._ensureLoaded();
     const projMap = this.store[projectId];
-    const prev = projMap && projMap[key];
-    if (!prev) return { removed: false };
+    if (!projMap) return { removed: false };
+
+    let key = typeof keyOrTarget === 'string' ? keyOrTarget : null;
+    if (!key && keyOrTarget && typeof keyOrTarget === 'object') {
+      if (keyOrTarget.prNumber != null && String(keyOrTarget.prNumber).trim() !== '') {
+        key = `pr-${String(keyOrTarget.prNumber).replace(/[^0-9]/g, '')}`;
+      } else if (keyOrTarget.branch) {
+        try {
+          key = computePreviewIdentity({ id: projectId }, { branch: keyOrTarget.branch }).key;
+        } catch (e) {
+          key = null;
+        }
+      }
+    }
+    const prev = key ? projMap[key] : null;
+    if (!prev || !key) return { removed: false };
 
     const dm = getDeployManager();
     const ing = getIngressManager();
@@ -435,6 +494,10 @@ class PreviewManager extends EventEmitter {
       const r = await this.destroyPreview(projectId, k).catch(() => ({ removed: false }));
       if (r.removed) count++;
     }
+    try {
+      const projectPreviewDir = assertContainedPath(PREVIEWS_WORK_DIR, String(projectId));
+      fs.rmSync(projectPreviewDir, { recursive: true, force: true });
+    } catch (e) {}
     return count;
   }
 
@@ -444,10 +507,12 @@ class PreviewManager extends EventEmitter {
     const dm = getDeployManager();
     const safeTail = Math.min(2000, Math.max(10, Number(tail) || 150));
     const res = await dm.runDocker(['logs', '--tail', String(safeTail), '--timestamps', prev.containerName], { timeoutMs: 10000 });
+    const secrets = typeof dm._secretValuesForProject === 'function' ? dm._secretValuesForProject(projectId) : [];
+    const rawLogs = [res.stdout, res.stderr].filter(Boolean).join('\n');
     return {
       key,
       containerName: prev.containerName,
-      logs: [res.stdout, res.stderr].filter(Boolean).join('\n')
+      logs: typeof dm.redact === 'function' ? dm.redact(rawLogs, secrets) : rawLogs
     };
   }
 

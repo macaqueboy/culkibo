@@ -23,6 +23,8 @@ import {
   ShieldCheck,
   ListChecks,
   FileText,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import {
   api,
@@ -33,12 +35,21 @@ import {
   type RemoteS3Object,
   type InstanceBackupItem,
   type AuditLogEvent,
+  type TelemetryStatus,
+  type TelemetryPreview,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
 
 type SettingsTab = 'remote' | 'integrations' | 'backups' | 'notifications' | 'system';
+
+function formatSafeDate(raw?: string | null): string {
+  if (!raw) return '—';
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString('es-ES');
+}
 
 function normalizeSettingsTab(raw?: string | null): SettingsTab {
   if (!raw) return 'remote';
@@ -81,6 +92,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [startingCaddy, setStartingCaddy] = useState(false);
   const [auditEvents, setAuditEvents] = useState<AuditLogEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
+
+  // Telemetría anónima y diagnósticos
+  const [telemetryStatus, setTelemetryStatus] = useState<TelemetryStatus | null>(null);
+  const [telemetryBusy, setTelemetryBusy] = useState(false);
+  const [telemetryPreview, setTelemetryPreview] = useState<TelemetryPreview | null>(null);
+  const [telemetryPreviewLoading, setTelemetryPreviewLoading] = useState(false);
+  const [showTelemetryPreview, setShowTelemetryPreview] = useState(false);
 
   // Backups & DR (S3 Remote Browser + Instance Snapshot Export/Import)
   const [s3Objects, setS3Objects] = useState<RemoteS3Object[]>([]);
@@ -126,7 +144,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [notifTesting, setNotifTesting] = useState(false);
 
   const loadAll = async () => {
-    const [sys, gh, cf, ntf, doc, ing, s3] = await Promise.all([
+    const [sys, gh, cf, ntf, doc, ing, s3, tel] = await Promise.all([
       api.getSystemStatus().catch(() => null),
       api.getGitHubStatus().catch(() => null),
       api.getCloudflareConfig().catch(() => null),
@@ -134,10 +152,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       api.getDbDockerStatus().catch(() => null),
       api.getIngressStatus({ probe: false }).catch(() => null),
       api.getDbStorage().catch((): DbStorageConfig => ({ configured: false })),
+      api.getTelemetryStatus().catch(() => null),
     ]);
     setSysStatus(sys);
     setGithubStatus(gh);
     setCfConfig(cf);
+    setTelemetryStatus(tel);
     // P0-2: nunca copiar valores enmascarados (`...`/`••`) al input editable
     if (cf?.accountId && !String(cf.accountId).includes('...') && !String(cf.accountId).includes('••')) {
       setCfAccountId(cf.accountId);
@@ -329,6 +349,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       api.getSystemAudit({ limit: 40 })
         .then((res) => { if (active) setAuditEvents(res.events || []); })
         .catch(() => {});
+      api.getTelemetryStatus()
+        .then((res) => { if (active) setTelemetryStatus(res); })
+        .catch(() => {});
     } else if (tab === 'notifications') {
       api.getNotificationsHistory(20)
         .then((res) => { if (active) setNotifHistory(res.notifications || []); })
@@ -452,12 +475,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       if (res.sent) {
         onNotify?.(`Alerta de prueba enviada a ${res.delivered} ${res.delivered === 1 ? 'canal' : 'canales'}`, 'success');
       } else {
+        const failedDetails = Array.isArray(res.results)
+          ? res.results
+              .filter((r: any) => r && !r.ok)
+              .map((r: any) => `${r.channel}: ${r.error || 'error'}`)
+              .join(' · ')
+          : '';
         const reason = res.reason === 'no_channels'
           ? 'Activa al menos un canal (Telegram, Discord, Slack o Webhook) antes de probar.'
           : res.reason === 'disabled'
             ? 'Activa el interruptor principal de alertas.'
-            : (res.reason || 'No se pudo entregar la alerta a ningún canal.');
-        onNotify?.(reason, 'info');
+            : failedDetails
+              ? `Fallo al enviar alerta: ${failedDetails}`
+              : (res.reason || 'No se pudo entregar la alerta a ningún canal.');
+        onNotify?.(reason, failedDetails ? 'error' : 'info');
       }
     } catch (err: any) {
       onNotify?.(err?.message || 'Error al enviar alerta de prueba', 'error');
@@ -488,6 +519,59 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(err?.message || 'No se pudo iniciar Caddy', 'error');
     } finally {
       setStartingCaddy(false);
+    }
+  };
+
+  const handleToggleTelemetry = async () => {
+    if (!telemetryStatus || telemetryStatus.lockedByEnv) return;
+    setTelemetryBusy(true);
+    try {
+      const next = await api.setTelemetryEnabled(!telemetryStatus.persistedEnabled);
+      setTelemetryStatus(next);
+      onNotify?.(
+        next.enabled
+          ? 'Telemetría anónima activada'
+          : 'Telemetría anónima desactivada (cola local vaciada)',
+        'success'
+      );
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo actualizar la telemetría', 'error');
+    } finally {
+      setTelemetryBusy(false);
+    }
+  };
+
+  const handleResetTelemetryId = async () => {
+    setTelemetryBusy(true);
+    try {
+      const next = await api.resetTelemetryId();
+      setTelemetryStatus(next);
+      if (showTelemetryPreview) {
+        const prev = await api.getTelemetryPreview().catch(() => null);
+        if (prev) setTelemetryPreview(prev);
+      }
+      onNotify?.('Identificador anónimo rotado correctamente', 'success');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo rotar el identificador', 'error');
+    } finally {
+      setTelemetryBusy(false);
+    }
+  };
+
+  const handleToggleTelemetryPreview = async () => {
+    if (showTelemetryPreview) {
+      setShowTelemetryPreview(false);
+      return;
+    }
+    setShowTelemetryPreview(true);
+    setTelemetryPreviewLoading(true);
+    try {
+      const prev = await api.getTelemetryPreview();
+      setTelemetryPreview(prev);
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo obtener la vista previa de telemetría', 'error');
+    } finally {
+      setTelemetryPreviewLoading(false);
     }
   };
 
@@ -1183,7 +1267,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         <span className="font-medium text-slate-800">{item.title}</span>
                         <span className="text-slate-400 ml-2 font-mono">{item.event}</span>
                       </div>
-                      <span className="text-slate-400 shrink-0 tabular-nums">{new Date(item.at).toLocaleString('es-ES')}</span>
+                      <span className="text-slate-400 shrink-0 tabular-nums">{formatSafeDate(item.timestamp || item.at)}</span>
                     </div>
                   ))}
                 </div>
@@ -1341,6 +1425,129 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
+          {/* Telemetría anónima y diagnósticos */}
+          <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-sm font-semibold text-slate-900">Telemetría y diagnósticos</h3>
+                    <span className={`px-2 py-0.5 rounded-full text-[11px] font-medium border ${
+                      telemetryStatus?.enabled
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : telemetryStatus?.lockedByEnv
+                          ? 'bg-amber-50 text-amber-800 border-amber-200'
+                          : 'bg-slate-100 text-slate-600 border-slate-200'
+                    }`}>
+                      {telemetryStatus?.enabled
+                        ? 'Activa'
+                        : telemetryStatus?.lockedByEnv
+                          ? 'Controlada por entorno'
+                          : 'Desactivada'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">
+                    Envía informes anónimos de fallos, errores de la interfaz y métricas agregadas para corregir problemas rápidamente. Nunca incluye secretos, dominios ni datos de negocio.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-label="Activar o desactivar telemetría anónima"
+                aria-checked={Boolean(telemetryStatus?.enabled)}
+                disabled={!telemetryStatus || telemetryStatus.lockedByEnv || telemetryBusy}
+                onClick={() => void handleToggleTelemetry()}
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+                  telemetryStatus?.enabled ? 'bg-slate-900' : 'bg-slate-300'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                    telemetryStatus?.enabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {telemetryStatus?.lockedByEnv && (
+              <div className="px-3.5 py-2.5 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                {telemetryStatus.reason}. Modifica las variables de entorno del proceso (<code className="font-mono">CULKIBO_TELEMETRY</code> / <code className="font-mono">DO_NOT_TRACK</code>) para cambiar este estado.
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="font-semibold text-slate-800">Qué enviamos</div>
+                <ul className="space-y-1 text-slate-600 list-disc list-inside text-[11px]">
+                  <li>Versión de Culkibo, Node.js, sistema operativo y rangos de RAM/CPU</li>
+                  <li>Errores fatales del servidor, 5xx en rutas canónicas y fallos de despliegue/copias</li>
+                  <li>Errores capturados por la interfaz web (sin URLs ni texto de usuario)</li>
+                  <li>Contadores agregados de uso de funciones para priorizar mejoras</li>
+                </ul>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="font-semibold text-slate-800">Qué NUNCA recopilamos</div>
+                <ul className="space-y-1 text-slate-600 list-disc list-inside text-[11px]">
+                  {(telemetryStatus?.neverCollected || [
+                    'Nombres o URLs de repositorios, proyectos o dominios',
+                    'Variables de entorno, contraseñas, tokens o certificados',
+                    'Direcciones IP, correos electrónicos o rutas con nombre de usuario',
+                    'Contenido de bases de datos, backups o logs de negocio',
+                  ]).map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2 border-t border-slate-100 text-xs">
+              <div className="text-slate-500 min-w-0">
+                <span>ID anónimo: </span>
+                <code className="font-mono text-[11px] text-slate-700 bg-slate-100 px-1.5 py-0.5 rounded break-all">
+                  {telemetryStatus?.instanceId || '—'}
+                </code>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  onClick={() => void handleResetTelemetryId()}
+                  disabled={telemetryBusy || !telemetryStatus}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 text-slate-500 ${telemetryBusy ? 'animate-spin' : ''}`} />
+                  <span>Rotar ID</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleToggleTelemetryPreview()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 font-medium cursor-pointer"
+                >
+                  {showTelemetryPreview ? <EyeOff className="w-3.5 h-3.5 text-slate-500" /> : <Eye className="w-3.5 h-3.5 text-slate-500" />}
+                  <span>{showTelemetryPreview ? 'Ocultar payload' : 'Ver payload exacto'}</span>
+                </button>
+              </div>
+            </div>
+
+            {showTelemetryPreview && (
+              <div className="rounded-xl border border-slate-200 bg-slate-950 text-slate-100 p-3.5 overflow-x-auto">
+                {telemetryPreviewLoading ? (
+                  <div className="text-xs text-slate-400 flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Generando sobre JSON saneado…</span>
+                  </div>
+                ) : (
+                  <pre className="text-[11px] leading-relaxed font-mono whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
+                    {JSON.stringify(telemetryPreview, null, 2)}
+                  </pre>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Registro de auditoría del servidor */}
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
             <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
@@ -1365,7 +1572,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             ) : (
               <div className="divide-y divide-slate-100 max-h-64 overflow-y-auto text-xs">
                 {auditEvents.map((ev, i) => (
-                  <div key={ev.id || `${ev.at}-${i}`} className="px-5 py-2.5 flex items-center justify-between gap-3">
+                  <div key={ev.id || `${ev.timestamp || ev.at || 'ev'}-${i}`} className="px-5 py-2.5 flex items-center justify-between gap-3">
                     <div className="min-w-0 flex items-center gap-2 flex-wrap">
                       <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
                         {ev.source}
@@ -1374,7 +1581,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       {ev.target && <span className="font-mono text-slate-500 truncate">{ev.target}</span>}
                     </div>
                     <span className="text-[11px] text-slate-400 tabular-nums shrink-0">
-                      {new Date(ev.at).toLocaleString('es-ES')}
+                      {formatSafeDate(ev.timestamp || ev.at)}
                     </span>
                   </div>
                 ))}

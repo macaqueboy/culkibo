@@ -53,7 +53,7 @@ function isValidBranch(value) {
   if (branch.startsWith('-') || branch.startsWith('/') || branch.endsWith('/')) return false;
   if (branch.endsWith('.lock') || branch.endsWith('.')) return false;
   if (branch.includes('..') || branch.includes('//') || branch.includes('@{')) return false;
-  return /^[A-Za-z0-9._/-]+$/.test(branch);
+  return /^[A-Za-z0-9._/#+-]+$/.test(branch);
 }
 
 /** Un SHA abreviado o completo, en minúsculas y sin nada más. */
@@ -145,10 +145,19 @@ class RepoSync {
    *     permite, se profundiza el clon en vez de fallar.
    *
    * @param {any} project
-   * @param {{commit?: string | null, onLine?: ((line: string) => void) | null, timeoutMs?: number}} [options]
+   * @param {{commit?: string | null, targetDir?: string | null, onLine?: ((line: string) => void) | null, timeoutMs?: number}} [options]
    */
-  async sync(project, { commit = null, onLine = null, timeoutMs = 300000 } = {}) {
-    const dir = this.projectDir(project);
+  async sync(project, { commit = null, targetDir = null, onLine = null, timeoutMs = 300000 } = {}) {
+    let dir = this.projectDir(project);
+    if (targetDir) {
+      const projectsRoot = path.resolve(path.dirname(dir));
+      const candidate = path.resolve(String(targetDir));
+      const rel = path.relative(projectsRoot, candidate);
+      if (!rel || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
+        return { ok: false, error: 'Directorio de destino fuera de projects/', dir: candidate, dirtyFiles: [] };
+      }
+      dir = candidate;
+    }
     const emit = (message) => { if (onLine) onLine(localRunner.redactSecrets(message)); };
 
     /** Resultado vacío pero válido: el despliegue puede seguir. */
@@ -288,12 +297,26 @@ class RepoSync {
         ref = `refs/remotes/origin/${branch}`;
       }
 
+      // Limpiar bloqueos huérfanos `.git/*.lock` antiguos (>5 min) dejados por SIGKILL/OOM
+      const gitDir = path.join(dir, '.git');
+      for (const lockName of ['index.lock', 'shallow.lock', 'HEAD.lock']) {
+        const lockFile = path.join(gitDir, lockName);
+        try {
+          if (fs.existsSync(lockFile) && (Date.now() - fs.statSync(lockFile).mtimeMs) > 5 * 60 * 1000) {
+            fs.unlinkSync(lockFile);
+          }
+        } catch (e) {}
+      }
+
       // `checkout -B` crea la rama si no existe y la reposiciona si existe: es
       // el mismo comando para «primera vez», «misma rama» y «rama cambiada».
       const checkout = await runGit(['checkout', '-B', branch, ref], { cwd: dir, env, timeoutMs: 120000, onLine: emit });
       if (checkout.code !== 0) {
         return { ok: false, error: this.errorOf(checkout, `No se pudo situar el repositorio en «${branch}»`), dir, dirtyFiles };
       }
+
+      // Compactación perezosa de packs para evitar crecimiento infinito en clones repetidos (Kamal #1866)
+      await runGit(['gc', '--auto', '--quiet'], { cwd: dir, env, timeoutMs: 30000 }).catch(() => {});
 
       const head = await this.readHead(dir, env);
       const action = previousCommit && head.commit === previousCommit ? 'sin-cambios' : 'actualizado';

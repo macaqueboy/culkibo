@@ -1,0 +1,33 @@
+services:
+  telemetry-collector:
+    build: .
+    container_name: culkibo-telemetry-collector
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      - PORT=8787
+      - BIND=0.0.0.0
+      - DATA_DIR=/data
+      - TRUST_PROXY=1
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - RETENTION_DAYS=${RETENTION_DAYS:-90}
+      - ALERT_TELEGRAM_BOT_TOKEN=${ALERT_TELEGRAM_BOT_TOKEN:-}
+      - ALERT_TELEGRAM_CHAT_ID=${ALERT_TELEGRAM_CHAT_ID:-}
+      - ALERT_DISCORD_WEBHOOK=${ALERT_DISCORD_WEBHOOK:-}
+      - ALERT_SLACK_WEBHOOK=${ALERT_SLACK_WEBHOOK:-}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - ALERT_WEBHOOK_SECRET=${ALERT_WEBHOOK_SECRET:-}
+    volumes:
+      - telemetry_data:/data
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  telemetry_data:

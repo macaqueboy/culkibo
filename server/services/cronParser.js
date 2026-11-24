@@ -36,7 +36,13 @@ function parseCronField(expr, min, max) {
   for (const rawPart of clean.split(',')) {
     const part = rawPart.trim();
     if (!part) throw new Error(`Expresión cron inválida: ${expr}`);
-    const [rangePart, stepPart] = part.split('/');
+    const slashParts = part.split('/');
+    if (slashParts.length > 2) throw new Error(`Expresión cron inválida: ${part}`);
+    const [rangePart, stepPart] = slashParts;
+    if (!rangePart) throw new Error(`Expresión cron inválida: ${part}`);
+    if (stepPart !== undefined && !/^\d+$/.test(stepPart)) {
+      throw new Error(`Paso cron inválido: ${part}`);
+    }
     const step = stepPart !== undefined ? Number(stepPart) : 1;
     if (!Number.isInteger(step) || step < 1 || step > max - min + 1) {
       throw new Error(`Paso cron inválido: ${part}`);
@@ -46,13 +52,19 @@ function parseCronField(expr, min, max) {
     let end = max;
     if (rangePart !== '*') {
       if (rangePart.includes('-')) {
-        const [a, b] = rangePart.split('-').map((n) => Number(n));
+        const bounds = rangePart.split('-');
+        if (bounds.length !== 2 || !/^\d+$/.test(bounds[0]) || !/^\d+$/.test(bounds[1])) {
+          throw new Error(`Rango cron inválido: ${part}`);
+        }
+        const a = Number(bounds[0]);
+        const b = Number(bounds[1]);
         if (!Number.isInteger(a) || !Number.isInteger(b) || a > b) {
           throw new Error(`Rango cron inválido: ${part}`);
         }
         start = a;
         end = b;
       } else {
+        if (!/^\d+$/.test(rangePart)) throw new Error(`Valor cron inválido: ${part}`);
         const n = Number(rangePart);
         if (!Number.isInteger(n)) throw new Error(`Valor cron inválido: ${part}`);
         start = n;

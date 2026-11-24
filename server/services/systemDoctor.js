@@ -78,7 +78,7 @@ function checkKeyFilePermissions() {
   if (process.platform === 'win32') return { ok: true, issues: [] };
   /** @type {string[]} */
   const issues = [];
-  for (const name of ['auth.json', '.databases.key']) {
+  for (const name of ['auth.json', '.databases.key', '.services.key']) {
     const filePath = path.join(DATA_DIR, name);
     try {
       if (!fs.existsSync(filePath)) continue;
@@ -169,12 +169,18 @@ async function listOrphanedManagedContainers() {
       ? catalogManager.list()
       : (typeof catalogManager.listInstallations === 'function' ? catalogManager.listInstallations() : []);
     for (const inst of installs) {
+      if (inst.containerName) known.add(inst.containerName);
       if (inst.appContainer) known.add(inst.appContainer);
       if (inst.dbContainer) known.add(inst.dbContainer);
+      if (Array.isArray(inst.sidecars)) {
+        for (const s of inst.sidecars) {
+          if (s && s.containerName) known.add(s.containerName);
+        }
+      }
       if (Array.isArray(inst.containers)) {
         for (const c of inst.containers) {
           if (typeof c === 'string') known.add(c);
-          else if (c && c.name) known.add(c.name);
+          else if (c && (c.containerName || c.name)) known.add(c.containerName || c.name);
         }
       }
     }

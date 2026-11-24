@@ -5,7 +5,7 @@ const caddyManager = require('./caddyManager');
 const domainManager = require('./domainManager');
 const projectManager = require('./projectManager');
 const containerOrchestrator = require('./containerOrchestrator');
-const { isPrivateIp, isMetadataIp, atomicWriteJsonSync } = require('./ssrfGuard');
+const { isPrivateIp, isMetadataIp, atomicWriteJsonSync, loadJsonWithBackupSync } = require('./ssrfGuard');
 
 const INGRESS_CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'ingress.json');
 const DEPLOYMENTS_FILE = path.join(__dirname, '..', '..', 'data', 'deployments.json');
@@ -127,31 +127,38 @@ class IngressManager {
       wildcardPolicies: [],
       acmeEmail: process.env.CULKIBO_ACME_EMAIL ? String(process.env.CULKIBO_ACME_EMAIL).trim().toLowerCase() : null
     };
-    try {
-      if (fs.existsSync(INGRESS_CONFIG_FILE)) {
-        const cfg = JSON.parse(fs.readFileSync(INGRESS_CONFIG_FILE, 'utf8'));
-        if (cfg && typeof cfg.panelDomain === 'string' && cfg.panelDomain.trim()) {
-          out.panelDomain = cfg.panelDomain.trim().toLowerCase();
-        }
-        if (cfg && Array.isArray(cfg.wildcardPolicies)) {
-          out.wildcardPolicies = cfg.wildcardPolicies.filter((p) => p && typeof p.rootDomain === 'string' && p.rootDomain.trim());
-        }
-        if (cfg && typeof cfg.acmeEmail === 'string' && cfg.acmeEmail.trim()) {
-          out.acmeEmail = cfg.acmeEmail.trim().toLowerCase();
-        }
+    const loaded = loadJsonWithBackupSync(INGRESS_CONFIG_FILE, {
+      validate: (parsed) => Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+    });
+    if (loaded.corrupt) {
+      this._corruptReadOnly = true;
+      console.error(`[IngressManager] data/ingress.json corrupto; archivado en ${loaded.quarantinePath}. Guardado bloqueado para evitar pérdida.`);
+      return out;
+    }
+    if (loaded.ok && loaded.data) {
+      const cfg = loaded.data;
+      if (typeof cfg.panelDomain === 'string' && cfg.panelDomain.trim()) {
+        out.panelDomain = cfg.panelDomain.trim().toLowerCase();
       }
-    } catch (e) {}
+      if (Array.isArray(cfg.wildcardPolicies)) {
+        out.wildcardPolicies = cfg.wildcardPolicies.filter((p) => p && typeof p.rootDomain === 'string' && p.rootDomain.trim());
+      }
+      if (typeof cfg.acmeEmail === 'string' && cfg.acmeEmail.trim()) {
+        out.acmeEmail = cfg.acmeEmail.trim().toLowerCase();
+      }
+    }
     return out;
   }
 
   _saveConfig() {
+    if (this._corruptReadOnly) return;
     try {
       atomicWriteJsonSync(INGRESS_CONFIG_FILE, {
         panelDomain: this.panelDomain,
         wildcardPolicies: this.wildcardPolicies,
         acmeEmail: this.acmeEmail,
         updatedAt: new Date().toISOString()
-      }, 0o600);
+      }, { mode: 0o600, backup: true });
     } catch (e) {
       console.warn('[IngressManager] No se pudo persistir data/ingress.json:', e.message);
     }
@@ -272,31 +279,33 @@ class IngressManager {
     return caddyManager.reconcileTls(this._buildTlsOptions());
   }
 
-  /** Autorización centralizada para `/api/ingress/ask` (incluye redirecciones www/apex y previews PR). */
+  /**
+   * Autorización centralizada para `/api/ingress/ask` (TLS bajo demanda).
+   * Por seguridad anti-DoS (Caddy #6611), solo aprueba hosts exactos configurados,
+   * panelDomain, acompañantes canónicos www/ápex, previews activas y ápex wildcard:
+   * NUNCA aprueba subdominios arbitrarios `<random>.dominio` para emisión HTTP-01
+   * (los comodines se cubren con su certificado DNS-01 automatizado en `certificates.automate`).
+   */
   isHostnameAuthorizedForTls(rawHost) {
-    const host = String(rawHost || '').trim().toLowerCase().split(':')[0];
+    const host = String(rawHost || '').trim().toLowerCase().split(':')[0].replace(/\.+$/, '');
     if (!host) return false;
-    if (this.panelDomain && host === this.panelDomain) return true;
-    if (domainManager.resolveRoute(host)) return true;
-    // Autorizar acompañantes canónicos (`www.X` cuando `X` sin www tiene `www_to_apex`, o `X` cuando `www.X` tiene `apex_to_www`)
+    if (this.panelDomain && host === this.panelDomain.replace(/\.+$/, '')) return true;
+    // Comprobación exacta de dominios no-comodín activos
     for (const d of (domainManager.domains || [])) {
       if (!d || d.status === 'disabled' || d.isWildcard) continue;
-      if (d.canonicalRedirect === 'www_to_apex' && !d.hostname.startsWith('www.') && host === `www.${d.hostname}`) return true;
-      if (d.canonicalRedirect === 'apex_to_www' && d.hostname.startsWith('www.') && host === d.hostname.slice(4)) return true;
+      const dh = String(d.hostname || '').trim().toLowerCase().replace(/\.+$/, '');
+      if (dh === host) return true;
+      if (d.canonicalRedirect === 'www_to_apex' && !dh.startsWith('www.') && host === `www.${dh}`) return true;
+      if (d.canonicalRedirect === 'apex_to_www' && dh.startsWith('www.') && host === dh.slice(4)) return true;
     }
     // Autorizar previews activas de Pull Requests
     for (const pr of this.previewRoutes.values()) {
-      if (pr && pr.hostname === host) return true;
+      if (pr && String(pr.hostname || '').toLowerCase().replace(/\.+$/, '') === host) return true;
     }
-    // Autorizar políticas wildcard persistidas (1 sola etiqueta o ápex)
+    // Autorizar el ápex de políticas wildcard persistidas si includeApex está activo
     for (const wp of this.wildcardPolicies) {
       if (!wp || wp.enabled === false) continue;
-      if (host === wp.rootDomain) return true;
-      const suffix = `.${wp.rootDomain}`;
-      if (host.endsWith(suffix)) {
-        const label = host.slice(0, host.length - suffix.length);
-        if (label && !label.includes('.')) return true;
-      }
+      if (wp.includeApex !== false && host === String(wp.rootDomain || '').toLowerCase().replace(/\.+$/, '')) return true;
     }
     return false;
   }
@@ -858,6 +867,13 @@ class IngressManager {
           tlsResult = await this.reconcileTlsOnly();
         } catch (tlsErr) {
           tlsResult = { applied: false, error: tlsErr.message };
+          try {
+            require('./telemetryService').captureOperationFailure({
+              operation: 'ingress_reconcile',
+              stage: 'tls',
+              message: tlsErr.message
+            });
+          } catch (e) {}
         }
       }
       this.publishedIds = new Set(result.applied);
@@ -890,6 +906,9 @@ class IngressManager {
       this.log('WARN', message);
       return { available: false, applied: false, reason: detection.reason, message };
     }
+
+    // Sondear capacidades del binario Caddy al arrancar para activar caddy-ratelimit / dns-cloudflare desde el primer reconcile
+    await caddyManager.probeCapabilities().catch(() => {});
 
     const result = await this.reconcile();
     this.bootstrapped = Boolean(result.applied);
@@ -1338,9 +1357,9 @@ class IngressManager {
       const det = await caddyManager.detect();
       if (det && det.available) {
         const targets = Array.from(new Set([
-          ...(domainManager.domains || []).filter((d) => d && d.status !== 'disabled' && !d.isWildcard).map((d) => d.hostname),
+          ...(domainManager.domains || []).filter((d) => d && d.status !== 'disabled').map((d) => d.hostname),
           ...(this.panelDomain ? [this.panelDomain] : [])
-        ])).slice(0, MAX_TLS_PROBES);
+        ]));
 
         for (let i = 0; i < targets.length; i += 4) {
           const batch = targets.slice(i, i + 4);

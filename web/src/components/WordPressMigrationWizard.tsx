@@ -25,7 +25,7 @@ interface WordPressMigrationWizardProps {
   onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }
 
-const MAX_SQL_UPLOAD_BYTES = 500 * 1024 * 1024;
+const MAX_SQL_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 export const WordPressMigrationWizard: React.FC<WordPressMigrationWizardProps> = ({
   onComplete,
@@ -154,7 +154,7 @@ export const WordPressMigrationWizard: React.FC<WordPressMigrationWizardProps> =
     e.target.value = '';
     if (!file) return;
     if (file.size > MAX_SQL_UPLOAD_BYTES) {
-      setError('El archivo supera los 500 MB. Comprímelo como .sql.gz o usa el plugin All-in-One WP Migration.');
+      setError('El archivo supera los 50 MB permitidos en subida directa. Comprímelo como .sql.gz o usa el plugin All-in-One WP Migration.');
       return;
     }
     setError(null);
@@ -592,7 +592,7 @@ export const WordPressMigrationWizard: React.FC<WordPressMigrationWizardProps> =
                     />
                   </div>
                   <div>
-                    <label className="block font-medium text-slate-700 mb-1">Subir archivo .sql o .sql.gz (streaming hasta 500 MB)</label>
+                    <label className="block font-medium text-slate-700 mb-1">Subir archivo .sql o .sql.gz (streaming hasta 50 MB)</label>
                     <label className="flex items-center justify-center gap-1.5 px-3 py-2 bg-white border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50 font-medium text-slate-700">
                       <Upload className="w-3.5 h-3.5" />
                       <span className="truncate">{sqlFile ? `${sqlFile.name} (${(sqlFile.size / (1024 * 1024)).toFixed(1)} MB)` : 'Elegir .sql o .sql.gz'}</span>

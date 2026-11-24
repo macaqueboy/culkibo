@@ -97,6 +97,9 @@ capture_*.mjs
 take_screenshot*.js
 take_screenshot*.mjs
 data/auth.json
+data/telemetry.json
+data/telemetry.json.bak
+data/telemetry.json.*.tmp
 
 # Worktrees temporales de los agentes: son copias de trabajo, no fuente
 .claude/

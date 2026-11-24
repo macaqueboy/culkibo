@@ -7,6 +7,13 @@ const path = require('path');
 const net = require('net');
 const { spawn } = require('child_process');
 
+// Evitar crash por EPIPE al encadenar salida CLI con `head`, `jq` o pipes cerrados
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', (err) => {
+    if (err && err.code === 'EPIPE') process.exit(0);
+  });
+}
+
 // Carga perezosa de servicios: comandos ligeros (`--version`, `status`, `update`)
 // arrancan al instante sin levantar timers ni leer JSONs innecesarios.
 const svc = {
@@ -21,6 +28,7 @@ const svc = {
   get caddyManager() { return require('../server/services/caddyManager'); },
   get deployManager() { return require('../server/services/deployManager'); },
   get catalogManager() { return require('../server/services/catalogManager'); },
+  get telemetryService() { return require('../server/services/telemetryService'); },
   get LiveSyncClient() { return require('../server/services/liveSyncClient').LiveSyncClient; }
 };
 
@@ -84,9 +92,11 @@ program
         console.log(`\x1b[32m✅ Culkibo está en ejecución y saludable en http://127.0.0.1:${port} (HTTP 200).\x1b[0m`);
       } else {
         console.log(`\x1b[33m⚠️ Culkibo responde en :${port} pero reporta estado HTTP ${res.status}.\x1b[0m`);
+        process.exitCode = 1;
       }
     } catch (err) {
       console.log(`\x1b[31m❌ Culkibo está detenido o inalcanzable en el puerto ${port}.\x1b[0m`);
+      process.exitCode = 1;
     }
   });
 
@@ -429,6 +439,7 @@ program
   .description('Sincroniza un directorio local en tiempo real vía Commit Frames + Merkle hacia el daemon')
   .option('-u, --url <wsUrl>', 'URL del WebSocket del daemon', process.env.CULKIBO_SYNC_URL || 'ws://127.0.0.1:3030/ws/sync')
   .option('-t, --token <token>', 'Token de autenticación (CULKIBO_TOKEN)', process.env.CULKIBO_TOKEN || '')
+  .option('--ticket <ticket>', 'Ticket temporal de un solo uso para Live Sync')
   .option('-q, --quiescence <ms>', 'Ventana de agrupación de ráfagas en ms', '12')
   .option('--no-reconcile', 'Omitir la reconciliación Merkle inicial al conectar')
   .action(async (projectId, directorio = process.cwd(), options) => {
@@ -436,7 +447,8 @@ program
       projectId,
       sourceDir: directorio,
       wsUrl: options.url,
-      token: options.token || null,
+      token: options.ticket ? null : (options.token || null),
+      ticket: options.ticket || null,
       quiescenceMs: parseInt(options.quiescence, 10) || 12
     });
 
@@ -547,7 +559,12 @@ program
     const dataDir = path.join(rootDir, 'data');
     const webDist = path.join(rootDir, 'web', 'dist');
     const webDistBak = path.join(rootDir, 'web', '.dist.bak');
-    const branch = String(options.branch || 'main').replace(/[^a-zA-Z0-9._/-]/g, '') || 'main';
+    const rawBranch = String(options.branch || 'main').trim();
+    if (!/^[a-zA-Z0-9._/#+-]+$/.test(rawBranch) || rawBranch.startsWith('-') || rawBranch.includes('..')) {
+      console.error(`\x1b[31m❌ Nombre de rama inválido:\x1b[0m ${rawBranch}`);
+      process.exit(1);
+    }
+    const branch = rawBranch;
 
     const captureGit = (args) => new Promise((resolve, reject) => {
       const child = spawn('git', args, { cwd: rootDir, shell: false, windowsHide: true });
@@ -572,13 +589,17 @@ program
       }
       prevSha = await captureGit(['rev-parse', 'HEAD']);
 
-      // 2. Snapshot de configuración data/*.json + copia de seguridad de web/dist
+      // 2. Snapshot de configuración data/*.json (excluyendo auth.json y telemetry.json) + copia de web/dist
       const preUpdateDir = path.join(dataDir, 'backups', `pre-update-${Date.now()}`);
       if (fs.existsSync(dataDir)) {
         fs.mkdirSync(preUpdateDir, { recursive: true, mode: 0o700 });
         for (const f of fs.readdirSync(dataDir)) {
-          if (f.endsWith('.json')) {
-            try { fs.copyFileSync(path.join(dataDir, f), path.join(preUpdateDir, f)); } catch (e) {}
+          if (f.endsWith('.json') && f !== 'auth.json' && f !== 'telemetry.json') {
+            try {
+              const dst = path.join(preUpdateDir, f);
+              fs.copyFileSync(path.join(dataDir, f), dst);
+              if (process.platform !== 'win32') fs.chmodSync(dst, 0o600);
+            } catch (e) {}
           }
         }
       }
@@ -587,13 +608,13 @@ program
         fs.cpSync(webDist, webDistBak, { recursive: true });
       }
 
-      // 3. Descargar y aplicar cambios sin instalar devDependencies pesadas en el servidor
+      // 3. Descargar y aplicar cambios (`reset --hard FETCH_HEAD` soporta clones shallow y reescrituras)
       await runSpawnStep('git', ['fetch', '--depth', '1', 'origin', branch], rootDir);
-      await runSpawnStep('git', ['merge', '--ff-only', 'FETCH_HEAD'], rootDir);
+      await runSpawnStep('git', ['reset', '--hard', 'FETCH_HEAD'], rootDir);
       await runSpawnStep('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund'], rootDir).catch(() =>
         runSpawnStep('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'], rootDir)
       );
-      await runSpawnStep('npm', ['--prefix', 'web', 'ci', '--no-audit', '--no-fund'], rootDir);
+      await runSpawnStep('npm', ['--prefix', 'web', 'ci', '--include=dev', '--no-audit', '--no-fund'], rootDir);
       await runSpawnStep('npm', ['run', 'web:build'], rootDir);
 
       // 4. Verificación de integridad antes de confirmar
@@ -627,6 +648,55 @@ program
     }
   });
 
+// Gestión transparente de telemetría anónima y diagnóstico
+const telemetryCmd = program.command('telemetry').description('Gestiona la telemetría anónima y envío de diagnósticos de fallos');
+
+telemetryCmd
+  .command('status')
+  .description('Muestra el estado actual de telemetría, instanceId y estadísticas')
+  .action(() => {
+    const st = svc.telemetryService.getStatus();
+    console.log('\n📊 Telemetría y diagnósticos de Culkibo');
+    console.log(`   Estado efectivo: ${st.enabled ? '\x1b[32mACTIVA\x1b[0m' : '\x1b[33mDESACTIVADA\x1b[0m'} (${st.reason})`);
+    console.log(`   Instance ID:     ${st.instanceId}`);
+    console.log(`   Endpoint:        ${st.endpoint}`);
+    console.log(`   Bloqueada env:   ${st.lockedByEnv ? 'sí' : 'no'}`);
+    console.log(`   En cola / Env.:  ${st.queuedEvents} / ${st.stats.sent}\n`);
+  });
+
+telemetryCmd
+  .command('enable')
+  .description('Activa la telemetría anónima de fallos y mejoras')
+  .action(() => {
+    const st = svc.telemetryService.setEnabled(true);
+    console.log(st.lockedByEnv
+      ? `\x1b[33m⚠️ Preferencia guardada como activa, pero anulada por entorno: ${st.reason}\x1b[0m`
+      : '\x1b[32m✅ Telemetría anónima activada.\x1b[0m');
+  });
+
+telemetryCmd
+  .command('disable')
+  .description('Desactiva por completo el envío de telemetría y vacía la cola')
+  .action(() => {
+    svc.telemetryService.setEnabled(false);
+    console.log('\x1b[32m✅ Telemetría desactivada y cola local vaciada.\x1b[0m');
+  });
+
+telemetryCmd
+  .command('preview')
+  .description('Imprime el JSON exacto que Culkibo enviaría (100% auditable)')
+  .action(() => {
+    console.log(JSON.stringify(svc.telemetryService.getPreviewPayload(), null, 2));
+  });
+
+telemetryCmd
+  .command('reset')
+  .description('Rota el identificador anónimo aleatorio (instanceId)')
+  .action(() => {
+    const st = svc.telemetryService.resetInstanceId();
+    console.log(`\x1b[32m✅ Nuevo instanceId generado:\x1b[0m ${st.instanceId}`);
+  });
+
 // Transporte stdio MCP (con puente HTTP automático hacia VPS remoto cuando CULKIBO_API_URL está definido)
 program
   .command('mcp')
@@ -649,57 +719,10 @@ program
       terminal: false
     });
 
-    rl.on('line', async (line) => {
-      try {
-        if (!line.trim()) return;
-        const request = JSON.parse(line);
-        if (!('id' in request) || request.id === undefined) return;
-
-        if (remoteApiUrl) {
-          const headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'MCP-Protocol-Version': '2026-07-28',
-            ...(request.method ? { 'Mcp-Method': String(request.method) } : {}),
-            ...(request.params?.name ? { 'Mcp-Name': String(request.params.name) } : {}),
-            ...(remoteToken ? { 'Authorization': `Bearer ${remoteToken}` } : {})
-          };
-          const endpoint = remoteApiUrl.endsWith('/api/mcp') ? remoteApiUrl : `${remoteApiUrl}/api/mcp`;
-          const res = await fetch(endpoint, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(request)
-          });
-          const bodyText = await res.text();
-          if (bodyText.trim()) {
-            process.stdout.write(bodyText.trim() + '\n');
-          } else {
-            process.stdout.write(JSON.stringify({
-              jsonrpc: '2.0',
-              id: request.id,
-              error: { code: -32000, message: `Servidor remoto MCP respondió HTTP ${res.status}` }
-            }) + '\n');
-          }
-          return;
-        }
-
-        if (!mcpServer) return;
-        const useModern = request.method === 'server/discover'
-          || request._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28';
-        const response = useModern && typeof mcpServer.handleModernRpc === 'function'
-          ? await mcpServer.handleModernRpc(request, { transport: 'stdio' })
-          : await mcpServer.handleJsonRpc(request);
-        process.stdout.write(JSON.stringify(response) + '\n');
-      } catch (err) {
-        process.stdout.write(JSON.stringify({
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32700, message: `Error de parseo: ${err.message}` }
-        }) + '\n');
-      }
-    });
-
-    rl.on('close', () => {
+    let inFlight = 0;
+    let stdinClosed = false;
+    const maybeExit = () => {
+      if (!stdinClosed || inFlight > 0) return;
       if (remoteApiUrl) {
         process.exit(0);
         return;
@@ -707,7 +730,97 @@ program
       Promise.resolve(svc.projectManager.flushToDisk()).catch(() => {}).finally(() => {
         process.exit(0);
       });
+    };
+
+    const writeStdLine = (obj) => {
+      process.stdout.write(JSON.stringify(obj) + '\n');
+    };
+
+    rl.on('line', async (line) => {
+      if (!line.trim()) return;
+      inFlight++;
+      /** @type {any} */
+      let parsedId = null;
+      try {
+        const request = JSON.parse(line);
+        if (request && typeof request === 'object' && 'id' in request && request.id !== undefined) {
+          parsedId = request.id;
+        }
+        if (!('id' in request) || request.id === undefined) return;
+
+        if (remoteApiUrl) {
+          const metaVer = request.params?._meta?.['io.modelcontextprotocol/protocolVersion']
+            || request._meta?.['io.modelcontextprotocol/protocolVersion']
+            || null;
+          const isModern = metaVer === '2026-07-28' || request.method === 'server/discover';
+          const nameVal = request.method === 'resources/read' ? request.params?.uri : request.params?.name;
+          const baseOrigin = remoteApiUrl.replace(/\/api\/mcp(?:\/message)?$/, '');
+          const endpoint = isModern ? `${baseOrigin}/api/mcp` : `${baseOrigin}/api/mcp/message`;
+          const headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            ...(isModern ? {
+              'MCP-Protocol-Version': '2026-07-28',
+              ...(request.method ? { 'Mcp-Method': String(request.method) } : {}),
+              ...(nameVal ? { 'Mcp-Name': String(nameVal) } : {})
+            } : {}),
+            ...(remoteToken ? { 'Authorization': `Bearer ${remoteToken}` } : {})
+          };
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(request)
+          });
+          const ct = String(res.headers.get('content-type') || '').toLowerCase();
+          const bodyText = await res.text();
+          if (ct.includes('text/event-stream')) {
+            // Extraer último evento `data: {...}` JSON-RPC del stream SSE
+            const dataLines = bodyText.split(/\r?\n/).filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).filter(Boolean);
+            const finalMsg = dataLines[dataLines.length - 1];
+            if (finalMsg) {
+              process.stdout.write(finalMsg + '\n');
+            } else {
+              writeStdLine({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: `Stream SSE remoto sin respuesta final (HTTP ${res.status})` } });
+            }
+          } else if (bodyText.trim()) {
+            process.stdout.write(bodyText.trim() + '\n');
+          } else {
+            writeStdLine({
+              jsonrpc: '2.0',
+              id: request.id,
+              error: { code: -32000, message: `Servidor remoto MCP respondió HTTP ${res.status}` }
+            });
+          }
+          return;
+        }
+
+        if (!mcpServer) return;
+        const useModern = request.method === 'server/discover'
+          || request.params?._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28'
+          || request._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28';
+        const response = useModern && typeof mcpServer.handleModernRpc === 'function'
+          ? await mcpServer.handleModernRpc(request, { transport: 'stdio' })
+          : await mcpServer.handleJsonRpc(request);
+        if (response !== null) writeStdLine(response);
+      } catch (err) {
+        writeStdLine({
+          jsonrpc: '2.0',
+          id: parsedId,
+          error: { code: parsedId === null ? -32700 : -32603, message: `Error MCP stdio: ${err.message}` }
+        });
+      } finally {
+        inFlight--;
+        maybeExit();
+      }
+    });
+
+    rl.on('close', () => {
+      stdinClosed = true;
+      maybeExit();
     });
   });
 
-program.parse(process.argv);
+program.parseAsync(process.argv).catch((err) => {
+  console.error(`\x1b[31m❌ Error ejecutando CLI:\x1b[0m ${err && err.message ? err.message : String(err)}`);
+  process.exit(1);
+});

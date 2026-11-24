@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
 
@@ -346,9 +347,13 @@ class CloudflareService {
     const wantedName = String(record.name || '').trim().toLowerCase();
     const listed = await this.listDnsRecords(zoneId);
     if (listed.success && Array.isArray(listed.records)) {
-      const exact = listed.records.find(
+      const sameTypeAndName = listed.records.filter(
         (r) => String(r.type || '').toUpperCase() === wantedType && String(r.name || '').toLowerCase() === wantedName
       );
+      // Para TXT/MX/NS puede haber varios registros con el mismo nombre: priorizar coincidencia de contenido
+      const multiAllowed = wantedType === 'TXT' || wantedType === 'MX' || wantedType === 'NS' || wantedType === 'SRV';
+      const exact = sameTypeAndName.find((r) => String(r.content || '').trim() === String(record.content || '').trim())
+        || (!multiAllowed ? sameTypeAndName[0] : null);
       if (exact && exact.id) {
         const upd = await this.updateDnsRecord(zoneId, exact.id, {
           type: wantedType,
@@ -772,7 +777,7 @@ class CloudflareService {
     }
 
     fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
-    const envFile = path.join(TMP_DIR, `cf-tunnel-${Date.now()}.env`);
+    const envFile = path.join(TMP_DIR, `cf-tunnel-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.env`);
     fs.writeFileSync(envFile, `TUNNEL_TOKEN=${cleanToken}\n`, { mode: 0o600 });
 
     const runDocker = (args) => new Promise((resolve) => {
@@ -790,6 +795,9 @@ class CloudflareService {
         '--name', cleanName,
         '--restart', 'unless-stopped',
         '--label', 'culkibo.managed=true',
+        '--log-driver', 'json-file',
+        '--log-opt', 'max-size=10m',
+        '--log-opt', 'max-file=3',
         '--env-file', envFile
       ];
       if (process.platform === 'linux') {
@@ -797,7 +805,8 @@ class CloudflareService {
       } else {
         args.push('--add-host', 'host.docker.internal:host-gateway');
       }
-      args.push('cloudflare/cloudflared:latest', 'tunnel', '--no-autoupdate', 'run');
+      const cfImage = String(process.env.CULKIBO_CLOUDFLARED_IMAGE || 'cloudflare/cloudflared:2025.2.0').trim();
+      args.push(cfImage, 'tunnel', '--no-autoupdate', 'run');
       const res = await runDocker(args);
       if (res.code !== 0) {
         return { started: false, error: res.stderr || `docker run falló (código ${res.code})` };

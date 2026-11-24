@@ -255,9 +255,21 @@ function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
   }
   const tempPath = `${absPath}.culkibo-sync-${process.pid}-${++tempSeq}.tmp`;
   fs.writeFileSync(tempPath, buffer);
-  try {
-    fs.renameSync(tempPath, absPath);
-  } catch (err) {
+  let renamed = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      fs.renameSync(tempPath, absPath);
+      renamed = true;
+      break;
+    } catch (err) {
+      if (attempt < 3 && err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES')) {
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * attempt); } catch (e) {}
+        continue;
+      }
+      break;
+    }
+  }
+  if (!renamed) {
     try {
       const st = fs.lstatSync(absPath);
       if (st.isSymbolicLink()) {
@@ -514,13 +526,14 @@ class LiveSyncEngine extends EventEmitter {
     return s;
   }
 
-  /** Libera buffers en RAM (fileCache + patchHistory) de sesiones desconectadas tras `maxIdleMs`. */
+  /** Libera buffers en RAM y elimina sesiones abandonadas desconectadas tras `maxIdleMs`. */
   evictIdleSessions(maxIdleMs = 15 * 60 * 1000) {
     const now = Date.now();
     let evicted = 0;
-    for (const s of this.sessions.values()) {
+    for (const [pid, s] of Array.from(this.sessions.entries())) {
       if (s.connectedClients > 0) continue;
-      if (now - (s.lastActiveMs || 0) < maxIdleMs) continue;
+      const idleFor = now - (s.lastActiveMs || 0);
+      if (idleFor < maxIdleMs) continue;
       if (s.fileCache && s.fileCache.size > 0) {
         s.fileCache.clear();
         s.fileCacheBytes = 0;
@@ -531,6 +544,10 @@ class LiveSyncEngine extends EventEmitter {
         s.patchHistoryBytes = 0;
       }
       if (s.verifiedDirs) s.verifiedDirs.clear();
+      if (idleFor >= maxIdleMs * 4) {
+        this.sessions.delete(pid);
+        evicted++;
+      }
     }
     return evicted;
   }
@@ -605,8 +622,8 @@ class LiveSyncEngine extends EventEmitter {
     const realBase = session.cachedRealBase;
     const pathCtx = { realBase, verifiedDirs: session.verifiedDirs };
 
-    /** @type {Array<{ rel: string, abs: string, op: 'upsert' | 'delete', buffer: Buffer | null, hash: string | null, stat: import('fs').Stats | null }>} */
-    const prepared = [];
+    /** @type {Map<string, { rel: string, abs: string, op: 'upsert' | 'delete', buffer: Buffer | null, hash: string | null, stat: import('fs').Stats | null }>} */
+    const preparedByRel = new Map();
     for (const item of frame.files) {
       const { rel, abs, stat } = resolveSafeFilePath(baseDir, item.path, pathCtx);
       const op = item.op === 'delete' ? 'delete' : 'upsert';
@@ -626,11 +643,13 @@ class LiveSyncEngine extends EventEmitter {
           }
           verifiedHash = computedHash;
         }
-        prepared.push({ rel, abs, op, buffer, hash: verifiedHash, stat });
+        preparedByRel.set(rel, { rel, abs, op, buffer, hash: verifiedHash, stat });
       } else {
-        prepared.push({ rel, abs, op, buffer: null, hash: null, stat });
+        preparedByRel.set(rel, { rel, abs, op, buffer: null, hash: null, stat });
       }
     }
+    // Deduplicación last-write-wins: evita duplicar entradas en undoEntries si una ruta se repite en la misma trama
+    const prepared = Array.from(preparedByRel.values());
 
     const prevLastSeq = session.lastSeq;
     let reconcileRequired = false;
@@ -935,12 +954,28 @@ class LiveSyncEngine extends EventEmitter {
       const beforeText = beforeBuf ? beforeBuf.toString('utf8').slice(0, 16384) : '';
       const afterText = afterBuf ? afterBuf.toString('utf8').slice(0, 16384) : (u.existed && !afterBuf ? '' : '');
       const status = !u.existed ? 'added' : (!afterBuf && !fs.existsSync(u.abs) ? 'deleted' : 'modified');
+      const beforeLines = beforeText ? beforeText.split(/\r?\n/) : [];
+      const afterLines = afterText ? afterText.split(/\r?\n/) : [];
+      const diffLines = [];
+      const maxLines = Math.min(200, Math.max(beforeLines.length, afterLines.length));
+      for (let i = 0; i < maxLines; i++) {
+        const b = beforeLines[i];
+        const a = afterLines[i];
+        if (b === a) {
+          if (b !== undefined) diffLines.push(`  ${b}`);
+        } else {
+          if (b !== undefined) diffLines.push(`- ${b}`);
+          if (a !== undefined) diffLines.push(`+ ${a}`);
+        }
+      }
       return {
         path: u.rel,
         status,
+        action: status,
         binary: false,
         before: beforeText,
         after: afterText,
+        diff: diffLines.join('\n'),
         truncated: (beforeBuf && beforeBuf.length > 16384) || (afterBuf && afterBuf.length > 16384)
       };
     });

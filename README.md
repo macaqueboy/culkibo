@@ -157,6 +157,7 @@ node bin/culkibo.js ingress <hostname>                  # ruta y estado real en 
 
 node bin/culkibo.js backup <projectId>                  # exportar proyecto con checksum SHA-256
 node bin/culkibo.js restore <archivo.json>              # restaurar verificando integridad SHA-256
+node bin/culkibo.js telemetry status|preview|disable    # inspeccionar o desactivar telemetría anónima
 node bin/culkibo.js mcp                                 # servidor MCP por stdio (logs a stderr)
 ```
 
@@ -208,17 +209,19 @@ curl -s http://localhost:3030/api/mcp \
 npm run typecheck             # TypeScript checkJs en todo el servidor (0 errores)
 npm --prefix web run lint     # oxlint React 19 + Compiler rules (0 warnings, 0 errors)
 npm run web:build             # compilación Vite + TypeScript + precompresión .br/.gz
-npm test                      # 22 suites + live-server + websocket-stress + stress
+npm test                      # 24 suites + live-server + websocket-stress + stress
 npm run test:bench            # aserciones estrictas de benchmarks y paridad competitiva
 npm run bench:all             # reporte completo de los 3 benchmarks reales
 ```
 
-### Cobertura de las 22 suites (`tests/run-all.js`)
+### Cobertura de las 24 suites (`tests/run-all.js`)
 
 | Suite | Qué verifica |
 |---|---|
 | `shell-safety.test.js` | 0 construcción de comandos de shell en `server/`, `bin/`, `scripts/`, `bench/` |
 | `security-hardening.test.js` | C1–C6, H1–H9: SSRF (metadata/RFC1918/S3/webhooks), proxy loopback spoofing, symlinks, PAT scoping, redacción MCP |
+| `competitor-prs.test.js` | Regresiones de PRs/CVEs de competidores (Coolify, Dokploy, CapRover, Dokku, Kamal, Caddy, Portainer, Traefik, NPM, Nixpacks/Railpack, Runtipi, Backrest, MCP SDK): DNS rebinding, WS brute-force, fail-closed HMAC/fork, `::ffff:` CIDR, bcrypt cost, canonical loop, PEM multi-block, Dockerfiles multi-stack, GFS UTC, GCM authTagLength, webhook secret reset, MCP `rawMeta` |
+| `telemetry.test.js` | Saneado anti-PII de 11 fases, deduplicación por fingerprint, cola con prioridad, circuit breaker exponencial, precedencia opt-out (`CULKIBO_TELEMETRY=0`/`DO_NOT_TRACK=1`), endpoints `/api/telemetry/*` y entrega E2E al recolector cloud |
 | `metrics-and-bugs.test.js` | XFF leftmost spoof, IPv6-mapped hex SSRF, tickets WS de un solo uso, rate-limit auth, Prometheus `/metrics`, Doctor 9 checks y regresiones profundas |
 | `scale-and-wildcard.test.js` | Multi-wildcard DNS-01 persistente, 301 `www`, mantenimiento 503, PEM/Origin CA X.509 match/mismatch, `portRegistry` 20-way, semáforo de builds, MCP redaction (72 tools), SHA-256 tamper rejection, Live Sync 520-file chunking, static `br`/ETag/304 |
 | `resilience-and-features.test.js` | `safeCommand` anti-inyección, `cronParser`/`CronManager` CRUD, `previewManager` RFC-1123 + anti-forks, OpenBSD `bcryptHash` + Caddy Basic Auth/IP Allowlist/Body Limit, auditoría TLS, DR snapshot cifrado AES-256-GCM + `dryRun`, multi-Git webhooks + `watchPaths`, WordPress MySQL 8 sanitizer, `railway.toml`, 23 plantillas catálogo, `auditLogger`/`rateLimiter`, runtime HTTP 200 y MCP `72 tools`/`resources`/`prompts` |
@@ -288,12 +291,21 @@ server/
     sslManager.js                  Registro X.509 real + subida criptográfica PEM / Origin CA
     domainManager.js               Dominios, Basic Auth, IP Allowlist, redirecciones canónicas y resolución O(1)
     notificationService.js         Alertas Telegram, Discord, Slack y webhooks HMAC (14 eventos + historial)
-web/src/                           Panel web (React 19 + Tailwind v4, HelpTip, atajos ?, Ctrl+K, es-ES)
+    telemetryService.js            Telemetría anónima opt-out, saneado 11 fases, fingerprint dedup y circuit breaker
+telemetry-collector/               Recolector cloud autónomo (0 deps, SQLite WAL + panel Ops + Cloudflare Workers/D1)
+web/src/                           Panel web (React 19 + Tailwind v4, HelpTip, ErrorBoundary, atajos ?, Ctrl+K, es-ES)
 scripts/                           Instalador VPS Debian/Ubuntu + desinstalador + test systemd
-tests/                             22 suites + estrés + live-server + paridad competitiva
+tests/                             24 suites + estrés + live-server + paridad competitiva
 bench/                             Benchmarks reproducibles (route-swap, live-sync, control-plane)
+PRIVACY.md                         Política transparente de telemetría anónima y guía de opt-out
 docs/superpowers/specs/            Especificación arquitectónica y decisiones de diseño
 ```
+
+---
+
+## Telemetría y privacidad
+
+Culkibo envía informes anónimos de fallos, errores de la interfaz y métricas agregadas para corregir problemas rápidamente en versiones públicas. **Nunca** recopila secretos, contraseñas, dominios, IPs ni datos de negocio. Puedes inspeccionar el sobre JSON exacto en `Ajustes → Sistema` (o con `node bin/culkibo.js telemetry preview`) y desactivarla en cualquier momento (`CULKIBO_TELEMETRY=0`, `DO_NOT_TRACK=1`, CLI o panel web). Consulta [PRIVACY.md](PRIVACY.md) y [telemetry-collector/README.md](telemetry-collector/README.md).
 
 ---
 

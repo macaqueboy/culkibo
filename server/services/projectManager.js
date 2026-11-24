@@ -380,6 +380,31 @@ class ProjectManager extends EventEmitter {
       if (resolved === parsedRoot) {
         throw new Error('No se permite vincular el directorio raíz del sistema');
       }
+      // Bloquear data/ de Culkibo y directorios sensibles del SO (Coolify CVE-2026-34153)
+      const dataDirAbs = path.resolve(path.dirname(this.dataPath));
+      const relToData = path.relative(dataDirAbs, resolved);
+      if (relToData === '' || (!relToData.startsWith('..') && !path.isAbsolute(relToData))) {
+        throw new Error('No se permite vincular el directorio interno data/ de Culkibo como carpeta local');
+      }
+      const forbiddenPrefixes = ['/etc', '/proc', '/sys', '/root', '/var/run', '/run', 'c:\\windows\\system32'];
+      const lowerRes = resolved.toLowerCase();
+      if (forbiddenPrefixes.some((p) => lowerRes === p || lowerRes.startsWith(`${p}${path.sep}`) || lowerRes.startsWith(`${p}/`))) {
+        throw new Error('No se permite vincular un directorio sensible del sistema como carpeta local');
+      }
+    }
+    if (Array.isArray(data.domains) && data.domains.length > 0) {
+      const normalized = Array.from(new Set(
+        data.domains.map((d) => String(d || '').trim().toLowerCase().replace(/\.+$/, '')).filter(Boolean)
+      ));
+      for (const host of normalized) {
+        for (const existing of this.projects.values()) {
+          if (effectiveId && existing.id === effectiveId) continue;
+          if (Array.isArray(existing.domains) && existing.domains.some((ed) => String(ed || '').trim().toLowerCase().replace(/\.+$/, '') === host)) {
+            throw new Error(`El dominio "${host}" ya está asignado al proyecto "${existing.name}"`);
+          }
+        }
+      }
+      data.domains = normalized;
     }
   }
 

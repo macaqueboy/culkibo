@@ -175,6 +175,65 @@ function parseDockerCompose(yamlText) {
   if (text.length > 512 * 1024) throw new Error('El archivo Compose supera el límite de 512 KB');
 
   const lines = text.split(/\r?\n/);
+
+  // Pre-pasada ligera: capturar anclas de extensión de nivel raíz (`x-common: &common`)
+  // para resolver `<<: *common` dentro de los servicios sin dependencias YAML externas.
+  /** @type {Map<string, Record<string, any>>} */
+  const yamlAnchors = new Map();
+  /** @type {string | null} */
+  let curAnchor = null;
+  let anchorPropIndent = -1;
+  /** @type {string | null} */
+  let anchorSection = null;
+  for (const rawLine of lines) {
+    const line = stripYamlComment(rawLine);
+    if (!line.trim()) continue;
+    const indent = line.search(/\S/);
+    const trimmed = line.trim();
+    if (indent === 0) {
+      const am = trimmed.match(/^x-[a-zA-Z0-9_-]+\s*:\s*&([a-zA-Z0-9_-]+)\s*$/);
+      if (am && am[1]) {
+        const anchorName = am[1];
+        curAnchor = anchorName;
+        yamlAnchors.set(anchorName, { envVars: {}, restart: '', image: '', ports: [], volumes: [] });
+        anchorPropIndent = -1;
+        anchorSection = null;
+      } else {
+        curAnchor = null;
+        anchorSection = null;
+      }
+      continue;
+    }
+    if (!curAnchor) continue;
+    const target = yamlAnchors.get(curAnchor);
+    if (!target) continue;
+    if (anchorPropIndent === -1) anchorPropIndent = indent;
+    if (indent === anchorPropIndent && !trimmed.startsWith('-')) {
+      const m = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:(.*)$/);
+      if (!m) continue;
+      anchorSection = m[1];
+      const rest = m[2].trim();
+      if (anchorSection === 'restart' && rest) target.restart = unquote(rest);
+      else if (anchorSection === 'image' && rest) target.image = unquote(rest);
+      else if (anchorSection === 'environment' && rest) {
+        const map = parseFlowMap(rest);
+        if (map) Object.assign(target.envVars, map);
+      }
+    } else if (anchorSection === 'environment') {
+      if (trimmed.startsWith('-')) {
+        const item = unquote(trimmed.slice(1).trim());
+        const eq = item.indexOf('=');
+        if (eq > 0) target.envVars[item.slice(0, eq).trim()] = unquote(item.slice(eq + 1));
+      } else {
+        const eq = trimmed.indexOf(':');
+        if (eq > 0) {
+          const k = trimmed.slice(0, eq).trim();
+          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) target.envVars[k] = unquote(trimmed.slice(eq + 1).trim());
+        }
+      }
+    }
+  }
+
   /** @type {any[]} */
   const services = [];
   let inServices = false;
@@ -261,6 +320,16 @@ function parseDockerCompose(yamlText) {
 
     if (indent === propIndent && !isZeroIndentSeq) {
       flushLongForm();
+      const mergeMatch = trimmed.match(/^<<\s*:\s*\*([a-zA-Z0-9_-]+)$/);
+      if (mergeMatch) {
+        const anchor = yamlAnchors.get(mergeMatch[1]);
+        if (anchor) {
+          if (anchor.restart && !currentService.restart) currentService.restart = anchor.restart;
+          if (anchor.image && !currentService.image) currentService.image = anchor.image;
+          Object.assign(currentService.envVars, anchor.envVars);
+        }
+        continue;
+      }
       const m = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:(.*)$/);
       if (!m) continue;
       const key = m[1];
@@ -408,8 +477,12 @@ function parseDockerCompose(yamlText) {
     svc.containerPort = containerPort;
 
     for (const vol of svc.volumes || []) {
-      const vStr = String(vol || '');
-      if (vStr.includes('/var/run/docker.sock') || vStr.startsWith('/:')) {
+      const vStr = String(vol || '').trim();
+      const hostSide = vStr.split(':')[0] || '';
+      const isSensitiveMount = vStr.includes('/var/run/docker.sock')
+        || vStr.startsWith('/:')
+        || /^\/(?:etc|root|proc|sys|var\/lib\/docker)(?:\/|$)/.test(hostSide);
+      if (isSensitiveMount) {
         svc.warnings.push(`Montaje privilegiado detectado (${vStr}): revisa si este servicio realmente necesita acceso al host.`);
       }
     }

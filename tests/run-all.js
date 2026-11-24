@@ -20,6 +20,8 @@ const testImporters = require('./importers.test');
 const testMetricsAndBugs = require('./metrics-and-bugs.test');
 const testScaleAndWildcard = require('./scale-and-wildcard.test');
 const testResilienceAndFeatures = require('./resilience-and-features.test');
+const testCompetitorPrs = require('./competitor-prs.test');
+const testTelemetry = require('./telemetry.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -64,6 +66,8 @@ async function runAll() {
     { name: 'Observability, Prometheus, Doctor & Bug Regressions', fn: testMetricsAndBugs },
     { name: 'Scale, Multi-Wildcard SSL, Build Semaphore & Fast-Path', fn: testScaleAndWildcard },
     { name: 'Resilience, Edge Hardening, DR Snapshots, Crons/Previews & Multi-Git', fn: testResilienceAndFeatures },
+    { name: 'Competitor PR & CVE Regressions (Wave-1 + Wave-2)', fn: testCompetitorPrs },
+    { name: 'Anonymous Telemetry, PII Scrubbing, Circuit Breaker & E2E Collector', fn: testTelemetry },
     { name: 'Competitor Benchmarks & Parity Verification', fn: testCompetitorBenchmarks }
   ];
 

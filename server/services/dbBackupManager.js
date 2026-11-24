@@ -23,12 +23,12 @@ function assertSafeCliArg(value, field) {
 
 /** Cifra un objeto JSON con AES-256-GCM + scrypt (cero dependencias) usando una frase de paso. */
 function encryptSnapshotPayload(obj, passphrase) {
-  const pwd = String(passphrase || '');
+  const pwd = String(passphrase || '').trim();
   if (pwd.length < 8) throw new Error('La contraseña de cifrado debe tener al menos 8 caracteres');
   const salt = crypto.randomBytes(16);
   const iv = crypto.randomBytes(12);
   const key = crypto.scryptSync(pwd, salt, 32, { N: 16384, r: 8, p: 1 });
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
   const plain = Buffer.from(JSON.stringify(obj), 'utf8');
   const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
   return {
@@ -42,18 +42,21 @@ function encryptSnapshotPayload(obj, passphrase) {
   };
 }
 
-/** Descifra un sobre cifrado por `encryptSnapshotPayload`. */
+/** Descifra un sobre cifrado por `encryptSnapshotPayload` (valida longitudes estrictas de IV=12B y AuthTag=16B). */
 function decryptSnapshotPayload(envelope, passphrase) {
-  const pwd = String(passphrase || '');
+  const pwd = String(passphrase || '').trim();
   if (!pwd) throw new Error('Este snapshot está cifrado; proporciona la contraseña (passphrase)');
-  const salt = Buffer.from(String(envelope.salt || ''), 'base64');
-  const iv = Buffer.from(String(envelope.iv || ''), 'base64');
-  const tag = Buffer.from(String(envelope.tag || ''), 'base64');
-  const data = Buffer.from(String(envelope.ciphertext || ''), 'base64');
-  const key = crypto.scryptSync(pwd, salt, 32, { N: 16384, r: 8, p: 1 });
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(tag);
+  const salt = Buffer.from(String(envelope?.salt || ''), 'base64');
+  const iv = Buffer.from(String(envelope?.iv || ''), 'base64');
+  const tag = Buffer.from(String(envelope?.tag || ''), 'base64');
+  const data = Buffer.from(String(envelope?.ciphertext || ''), 'base64');
+  if (salt.length < 16 || iv.length !== 12 || tag.length !== 16) {
+    throw new Error('Contraseña incorrecta o snapshot cifrado corrupto');
+  }
   try {
+    const key = crypto.scryptSync(pwd, salt, 32, { N: 16384, r: 8, p: 1 });
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
+    decipher.setAuthTag(tag);
     const plain = Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
     return JSON.parse(plain);
   } catch (e) {
@@ -260,7 +263,7 @@ class DbBackupManager {
       throw new Error(`El archivo de backup supera el tamaño máximo permitido (${MAX_PROJECT_BACKUP_BYTES / (1024 * 1024)} MB)`);
     }
 
-    const raw = await fs.promises.readFile(filePath, 'utf8');
+    const raw = (await fs.promises.readFile(filePath, 'utf8')).replace(/^\uFEFF/, '');
     const bundle = JSON.parse(raw);
 
     if (!bundle.project || !bundle.project.name) {
@@ -273,8 +276,8 @@ class DbBackupManager {
       if (checksum !== expected) {
         throw new Error('El checksum SHA-256 del archivo de backup no coincide (archivo modificado o corrupto)');
       }
-    } else if (!allowUnsigned && bundle.version !== '0.9.0' && bundle.checksum !== undefined) {
-      throw new Error('Formato de checksum SHA-256 inválido en el archivo de backup');
+    } else if (!allowUnsigned && bundle.version !== '0.9.0') {
+      throw new Error('El archivo de backup no incluye un checksum SHA-256 válido (pasa allowUnsigned: true solo si confías en el origen)');
     }
 
     let targetProject = { ...bundle.project };
@@ -458,14 +461,13 @@ class DbBackupManager {
   /**
    * Importa un Snapshot Completo de Instancia Culkibo (v2.0.0) con soporte `dryRun`
    * (previsualización de diferencias sin mutar) y copia de seguridad previa automática.
-   * @param {{ snapshot?: any, fileName?: string | null, mode?: 'merge' | 'replace' | 'overwrite', dryRun?: boolean, passphrase?: string | null }} [opts]
+   * @param {{ snapshot?: any, fileName?: string | null, mode?: 'merge' | 'replace' | 'overwrite', dryRun?: boolean, passphrase?: string | null, allowUnsigned?: boolean }} [opts]
    */
-  async importInstanceSnapshot({ snapshot = null, fileName = null, mode = 'merge', dryRun = true, passphrase = '' } = {}) {
+  async importInstanceSnapshot({ snapshot = null, fileName = null, mode = 'merge', dryRun = true, passphrase = '', allowUnsigned = false } = {}) {
     const effectiveMode = mode === 'replace' ? 'overwrite' : mode;
-    void effectiveMode;
     if (!snapshot && fileName) {
       const p = this.resolveDownloadPath(fileName);
-      snapshot = JSON.parse(fs.readFileSync(p, 'utf8'));
+      snapshot = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
     }
     if (!snapshot || typeof snapshot !== 'object') {
       throw new Error('Snapshot JSON inválido o vacío');
@@ -480,6 +482,8 @@ class DbBackupManager {
       if (checksum !== expected) {
         throw new Error('Checksum SHA-256 inválido: el snapshot ha sido alterado o está corrupto');
       }
+    } else if (!allowUnsigned) {
+      throw new Error('Checksum SHA-256 ausente o malformado en el snapshot de instancia');
     }
 
     let payload = snapshot.data;
@@ -500,13 +504,13 @@ class DbBackupManager {
 
     const plan = {
       dryRun: Boolean(dryRun),
-      mode,
+      mode: effectiveMode,
       secretsRedacted: Boolean(snapshot.secretsRedacted),
       projectsToAdd: incomingProjects.filter((p) => p && p.id && !existingIds.has(p.id)).map((p) => ({ id: p.id, name: p.name })),
-      projectsToUpdate: mode === 'overwrite'
+      projectsToUpdate: effectiveMode === 'overwrite'
         ? incomingProjects.filter((p) => p && p.id && existingIds.has(p.id)).map((p) => ({ id: p.id, name: p.name }))
         : [],
-      projectsToSkip: mode !== 'overwrite'
+      projectsToSkip: effectiveMode !== 'overwrite'
         ? incomingProjects.filter((p) => p && p.id && existingIds.has(p.id)).map((p) => ({ id: p.id, name: p.name }))
         : [],
       domainsToAdd: incomingDomains.filter((d) => d && d.hostname && !existingHosts.has(d.hostname)).map((d) => d.hostname),
@@ -531,9 +535,20 @@ class DbBackupManager {
     let updatedProjects = 0;
     for (const p of incomingProjects) {
       if (!p || !p.id) continue;
-      if (projectManager.getById(p.id)) {
-        if (mode === 'overwrite') {
+      const existingProj = projectManager.getById(p.id);
+      if (existingProj) {
+        if (effectiveMode === 'overwrite') {
           const { id, createdAt, ...rest } = p;
+          // Si el snapshot viene redactado, jamás borrar secretos vivos existentes del proyecto
+          if (snapshot.secretsRedacted) {
+            const mergedEnv = { ...(existingProj.envVars || {}) };
+            for (const [k, v] of Object.entries(rest.envVars || {})) {
+              if (v !== '' && v !== undefined) mergedEnv[k] = v;
+            }
+            rest.envVars = mergedEnv;
+            if (!rest.webhookSecret && existingProj.webhookSecret) rest.webhookSecret = existingProj.webhookSecret;
+            if (!rest.deployHookToken && existingProj.deployHookToken) rest.deployHookToken = existingProj.deployHookToken;
+          }
           projectManager.update(id, rest);
           updatedProjects++;
         }
@@ -571,8 +586,7 @@ class DbBackupManager {
       for (const wp of incomingWildcards) {
         if (wp && wp.rootDomain) {
           try {
-            await ingressManager.addWildcardPolicy({
-              rootDomain: wp.rootDomain,
+            await ingressManager.addWildcardPolicy(wp.rootDomain, {
               provider: wp.provider || 'cloudflare',
               tokenEnv: wp.tokenEnv || 'CF_API_TOKEN',
               includeApex: wp.includeApex !== false
@@ -604,7 +618,7 @@ class DbBackupManager {
     };
   }
 
-  /** Resuelve de forma segura una ruta descargable dentro de `data/backups/`. */
+  /** Resuelve de forma segura una ruta descargable dentro de `data/backups/` (bloquea symlinks y archivos gigantes). */
   resolveDownloadPath(fileName) {
     const clean = path.basename(String(fileName || '').trim());
     if (!clean || !clean.endsWith('.json')) {
@@ -612,7 +626,17 @@ class DbBackupManager {
     }
     const full = assertContainedPath(this.backupsDir, clean);
     if (!fs.existsSync(full)) throw new Error('Archivo de backup no encontrado');
-    return full;
+    const realRoot = fs.realpathSync(this.backupsDir);
+    const realFull = fs.realpathSync(full);
+    const rel = path.relative(realRoot, realFull);
+    if (!rel || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error('Ruta de backup fuera del directorio permitido (symlink bloqueado)');
+    }
+    const st = fs.statSync(realFull);
+    if (!st.isFile() || st.size > MAX_PROJECT_BACKUP_BYTES) {
+      throw new Error('Archivo de backup inválido o demasiado grande');
+    }
+    return realFull;
   }
 
   /**

@@ -207,7 +207,7 @@ export const CoolifyImport: React.FC<{
     const vols = getVolCount(resource);
     const mounts = getMountCount(resource);
     const envs = getEnvCount(resource);
-    const statusRunning = resource.status === 'running';
+    const statusRunning = String(resource.status || '').toLowerCase().startsWith('running');
 
     return (
       <label key={resource.uuid} className="flex items-center gap-3 p-3 bg-white border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50 transition-colors">

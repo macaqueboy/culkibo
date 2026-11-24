@@ -1,7 +1,8 @@
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
-const { atomicWriteJsonSync } = require('./ssrfGuard');
+const url = require('url');
+const { atomicWriteJsonSync, loadJsonWithBackupSync } = require('./ssrfGuard');
 const { hashBcrypt, isBcryptHash } = require('./bcryptHash');
 
 /** Carga perezosa: evita arrastrar dns/ssl/cloudflare en el arranque en frío. */
@@ -27,6 +28,34 @@ function getCloudflareService() {
 const DOMAINS_FILE = path.join(__dirname, '..', '..', 'data', 'domains.json');
 const DOMAIN_REGEX = /^(?:\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
+const VALID_TLD_RE = /^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/;
+
+/**
+ * Normaliza y valida un hostname (RFC 1123 + IDN Punycode + sin punto final FQDN
+ * + límite de 63 chars por etiqueta + TLD no numérico + rechazo de IPv4).
+ * @param {string} raw
+ * @returns {string}
+ */
+function normalizeAndValidateHostname(raw) {
+  let clean = String(raw || '').trim().toLowerCase().replace(/\.+$/, '');
+  if (clean === 'localhost') return 'localhost';
+  const isWild = clean.startsWith('*.');
+  const body = isWild ? clean.slice(2) : clean;
+  let ascii = body;
+  if (body && typeof url.domainToASCII === 'function') {
+    const conv = url.domainToASCII(body);
+    if (conv) ascii = conv.toLowerCase().replace(/\.+$/, '');
+  }
+  const normalized = isWild ? `*.${ascii}` : ascii;
+  if (!normalized || normalized.length > 253 || IPV4_RE.test(ascii) || !DOMAIN_REGEX.test(normalized)) {
+    throw new Error(`Invalid domain format (RFC 1123 required): ${raw}`);
+  }
+  const labels = ascii.split('.');
+  if (labels.some((lbl) => !lbl || lbl.length > 63) || !VALID_TLD_RE.test(labels[labels.length - 1])) {
+    throw new Error(`Invalid domain format (RFC 1123 required): ${raw}`);
+  }
+  return normalized;
+}
 const UPDATABLE_DOMAIN_FIELDS = new Set([
   'hostname',
   'projectId',
@@ -64,11 +93,14 @@ function isValidCidrOrIp(entry) {
   if (parts.length > 2) return false;
   const ipKind = net.isIP(parts[0]);
   if (ipKind !== 4 && ipKind !== 6) return false;
+  const isV4MappedV6 = ipKind === 6 && /^::ffff:/i.test(parts[0]);
   if (parts.length === 2) {
     if (!/^\d{1,3}$/.test(parts[1])) return false;
     const prefix = Number(parts[1]);
     const maxBits = ipKind === 4 ? 32 : 128;
     if (prefix < 0 || prefix > maxBits) return false;
+    // Evita que `::ffff:x.x.x.x/24` abra la lista blanca a TODO IPv4 (Traefik/Caddy bypass)
+    if (isV4MappedV6 && prefix < 96) return false;
   }
   return true;
 }
@@ -100,7 +132,12 @@ const CF_IPV4_RANGES = [
   return [netInt & mask, mask];
 });
 
-const CF_IPV6_PREFIXES = ['2400:cb00:', '2606:4700:', '2803:f800:', '2405:b500:', '2405:8100:', '2a06:98c0:', '2c0f:f248:'];
+const CF_IPV6_PREFIXES = [
+  '2400:cb00:', '2606:4700:', '2803:f800:', '2405:b500:', '2405:8100:',
+  '2a06:98c0:', '2a06:98c1:', '2a06:98c2:', '2a06:98c3:',
+  '2a06:98c4:', '2a06:98c5:', '2a06:98c6:', '2a06:98c7:',
+  '2c0f:f248:'
+];
 
 /** @param {string} ip */
 function isCloudflareIp(ip) {
@@ -171,14 +208,19 @@ class DomainManager {
   }
 
   loadDomains() {
-    try {
-      if (fs.existsSync(DOMAINS_FILE)) {
-        return JSON.parse(fs.readFileSync(DOMAINS_FILE, 'utf8'));
-      }
-    } catch (e) {
-      console.error('[DomainManager] Error loading domains:', e.message);
+    const loaded = loadJsonWithBackupSync(DOMAINS_FILE, {
+      validate: (parsed) => Array.isArray(parsed)
+    });
+    if (loaded.ok && Array.isArray(loaded.data)) {
+      return loaded.data;
     }
-    // Default initial seed domains
+    if (loaded.corrupt) {
+      // Defensa anti-borrado (CapRover #2413): nunca reemplazar un domains.json corrupto por semillas de demo
+      this._corruptReadOnly = true;
+      console.error(`[DomainManager] data/domains.json corrupto; archivado en ${loaded.quarantinePath}. Guardado bloqueado para proteger rutas de producción.`);
+      return [];
+    }
+    // Default initial seed domains (solo en instalación completamente nueva sin domains.json)
     return [
       {
         id: 'dom_culkibo_main',
@@ -235,9 +277,48 @@ class DomainManager {
   }
 
   saveDomains() {
+    if (this._corruptReadOnly) return;
     this.ensureDirectory();
     this.rebuildIndex();
-    atomicWriteJsonSync(DOMAINS_FILE, this.domains, 0o600);
+    atomicWriteJsonSync(DOMAINS_FILE, this.domains, { mode: 0o600, backup: true });
+  }
+
+  /** Valida redirección canónica bidireccionalmente (evita bucles 301 www ↔ raíz y colisiones). */
+  _validateCanonicalMode(hostname, mode, excludeIdx = -1) {
+    const m = String(mode || 'none');
+    if (!['none', 'www_to_apex', 'apex_to_www'].includes(m)) {
+      throw new Error(`Modo de redirección canónica inválido: ${m}`);
+    }
+    const isWild = hostname.startsWith('*.');
+    if (m !== 'none' && isWild) {
+      throw new Error('La redirección canónica www ↔ raíz no aplica a dominios comodín (*.dominio)');
+    }
+    if (m === 'www_to_apex' && hostname.startsWith('www.')) {
+      throw new Error('Usa "www → raíz" en el dominio raíz (sin www.), no en www.*');
+    }
+    if (m === 'apex_to_www' && !hostname.startsWith('www.')) {
+      throw new Error('Usa "raíz → www" en el dominio www.*, no en el dominio raíz');
+    }
+    if (m !== 'none') {
+      const companion = m === 'www_to_apex' ? `www.${hostname}` : hostname.slice(4);
+      const dup = this.domains.find((d, i) => i !== excludeIdx && d.hostname === companion);
+      if (dup) {
+        throw new Error(`El dominio acompañante ${companion} ya está registrado por separado en Culkibo`);
+      }
+    }
+    // También comprobar si OTRO dominio ya reclama `hostname` como acompañante canónico (evita bucles 301)
+    if (!isWild) {
+      const claimedBy = this.domains.find((d, i) => {
+        if (i === excludeIdx || !d || d.isWildcard) return false;
+        if (d.canonicalRedirect === 'www_to_apex' && `www.${d.hostname}` === hostname) return true;
+        if (d.canonicalRedirect === 'apex_to_www' && d.hostname.startsWith('www.') && d.hostname.slice(4) === hostname) return true;
+        return false;
+      });
+      if (claimedBy) {
+        throw new Error(`El dominio ${hostname} ya está reservado por la redirección canónica de ${claimedBy.hostname}`);
+      }
+    }
+    return m;
   }
 
   listDomains() {
@@ -411,12 +492,7 @@ class DomainManager {
     serviceId = null,
     serviceName = null
   }) {
-    const cleanHost = (hostname || '').trim().toLowerCase();
-
-    // RFC 1123 domain validation (rejects bare IPv4)
-    if ((!DOMAIN_REGEX.test(cleanHost) || IPV4_RE.test(cleanHost) || cleanHost.length > 253) && cleanHost !== 'localhost') {
-      throw new Error(`Invalid domain format (RFC 1123 required): ${cleanHost}`);
-    }
+    const cleanHost = normalizeAndValidateHostname(hostname);
 
     const isWildcard = cleanHost.startsWith('*.');
     const parsedPort = parseInt(String(targetPort), 10);
@@ -429,9 +505,7 @@ class DomainManager {
       throw new Error(`Domain ${cleanHost} is already configured in Culkibo`);
     }
 
-    const safeCanonical = !isWildcard && (canonicalRedirect === 'www_to_apex' || canonicalRedirect === 'apex_to_www')
-      ? canonicalRedirect
-      : 'none';
+    const safeCanonical = this._validateCanonicalMode(cleanHost, canonicalRedirect || 'none', -1);
 
     // Si piden autoCreateDns sin zoneId explícito, intentar resolver la zona en Cloudflare automáticamente.
     const cloudflareService = getCloudflareService();
@@ -558,10 +632,7 @@ class DomainManager {
       safeUpdates[k] = v;
     }
     if (safeUpdates.hostname !== undefined) {
-      const cleanHost = String(safeUpdates.hostname || '').trim().toLowerCase();
-      if (!DOMAIN_REGEX.test(cleanHost) && cleanHost !== 'localhost') {
-        throw new Error(`Invalid domain format (RFC 1123 required): ${cleanHost}`);
-      }
+      const cleanHost = normalizeAndValidateHostname(safeUpdates.hostname);
       const conflict = this.domains.find((d, i) => i !== idx && d.hostname === cleanHost);
       if (conflict) throw new Error(`Domain ${cleanHost} is already configured in Culkibo`);
       safeUpdates.hostname = cleanHost;
@@ -579,31 +650,13 @@ class DomainManager {
     }
 
     const effectiveHostname = safeUpdates.hostname || this.domains[idx].hostname;
-    const effectiveWildcard = effectiveHostname.startsWith('*.');
 
-    // Validar redirección canónica (evita estados no-op silenciosos en Caddy)
-    if (safeUpdates.canonicalRedirect !== undefined) {
-      const mode = String(safeUpdates.canonicalRedirect || 'none');
-      if (!['none', 'www_to_apex', 'apex_to_www'].includes(mode)) {
-        throw new Error(`Modo de redirección canónica inválido: ${mode}`);
-      }
-      if (mode !== 'none' && effectiveWildcard) {
-        throw new Error('La redirección canónica www ↔ raíz no aplica a dominios comodín (*.dominio)');
-      }
-      if (mode === 'www_to_apex' && effectiveHostname.startsWith('www.')) {
-        throw new Error('Usa "www → raíz" en el dominio raíz (sin www.), no en www.*');
-      }
-      if (mode === 'apex_to_www' && !effectiveHostname.startsWith('www.')) {
-        throw new Error('Usa "raíz → www" en el dominio www.*, no en el dominio raíz');
-      }
-      if (mode !== 'none') {
-        const companion = mode === 'www_to_apex' ? `www.${effectiveHostname}` : effectiveHostname.slice(4);
-        const dup = this.domains.find((d, i) => i !== idx && d.hostname === companion);
-        if (dup) {
-          throw new Error(`El dominio acompañante ${companion} ya está registrado por separado en Culkibo`);
-        }
-      }
-      safeUpdates.canonicalRedirect = mode;
+    // Validar redirección canónica siempre que cambie canonicalRedirect O el hostname (evita bucles 301)
+    if (safeUpdates.canonicalRedirect !== undefined || safeUpdates.hostname !== undefined) {
+      const candidateMode = safeUpdates.canonicalRedirect !== undefined
+        ? safeUpdates.canonicalRedirect
+        : (this.domains[idx].canonicalRedirect || 'none');
+      safeUpdates.canonicalRedirect = this._validateCanonicalMode(effectiveHostname, candidateMode, idx);
     }
 
     // Validar framePolicy
@@ -654,14 +707,28 @@ class DomainManager {
           : (Array.isArray(safeUpdates.basicAuth.users) ? safeUpdates.basicAuth.users : []);
         /** @type {Array<{ username: string, passwordHash: string }>} */
         const hashedAccounts = [];
+        /** @type {Set<string>} */
+        const seenUsers = new Set();
         for (const item of rawList.slice(0, 20)) {
           if (!item || typeof item !== 'object') continue;
           const username = String(item.username || '').trim();
           if (!username || !/^[A-Za-z0-9._@+-]{1,64}$/.test(username)) {
             throw new Error(`Usuario de Basic Auth inválido: "${username.slice(0, 30)}"`);
           }
+          if (seenUsers.has(username)) {
+            throw new Error(`Usuario de Basic Auth duplicado: "${username}" (Caddy exige usuarios únicos)`);
+          }
+          seenUsers.add(username);
           let passwordHash = '';
           if (typeof item.password === 'string' && item.password.length > 0) {
+            if (!isBcryptHash(item.password)) {
+              if (item.password.includes('\0')) {
+                throw new Error(`La contraseña de "${username}" contiene caracteres nulos no permitidos`);
+              }
+              if (Buffer.byteLength(item.password, 'utf8') > 72) {
+                throw new Error(`La contraseña de "${username}" supera el límite de 72 bytes de bcrypt`);
+              }
+            }
             passwordHash = isBcryptHash(item.password) ? item.password : hashBcrypt(item.password, 10);
           } else if (typeof item.passwordHash === 'string' && isBcryptHash(item.passwordHash)) {
             passwordHash = item.passwordHash;
@@ -908,7 +975,7 @@ class DomainManager {
   // Routing resolution: given an HTTP Host header, find destination pod (O(1) exact + RFC 6125 1-label wildcard)
   resolveRoute(hostHeader) {
     if (!hostHeader) return null;
-    const host = String(hostHeader).split(':')[0].toLowerCase();
+    const host = String(hostHeader).split(':')[0].trim().toLowerCase().replace(/\.+$/, '');
 
     // O(1) exact match
     const exact = this._exactIndex.get(host);

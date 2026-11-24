@@ -155,6 +155,7 @@ const TEMPLATES = [
         // Sin esto n8n avisa en cada arranque de que los ficheros de
         // configuración son legibles por otros usuarios del contenedor.
         N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: 'true',
+        N8N_SECURE_COOKIE: '{{isHttps}}',
         N8N_DIAGNOSTICS_ENABLED: 'false',
         N8N_RUNNERS_ENABLED: 'true'
       },
@@ -189,7 +190,11 @@ const TEMPLATES = [
       WORDPRESS_AUTH_KEY: { bytes: 32, encoding: 'base64url' },
       WORDPRESS_SECURE_AUTH_KEY: { bytes: 32, encoding: 'base64url' },
       WORDPRESS_LOGGED_IN_KEY: { bytes: 32, encoding: 'base64url' },
-      WORDPRESS_NONCE_KEY: { bytes: 32, encoding: 'base64url' }
+      WORDPRESS_NONCE_KEY: { bytes: 32, encoding: 'base64url' },
+      WORDPRESS_AUTH_SALT: { bytes: 32, encoding: 'base64url' },
+      WORDPRESS_SECURE_AUTH_SALT: { bytes: 32, encoding: 'base64url' },
+      WORDPRESS_LOGGED_IN_SALT: { bytes: 32, encoding: 'base64url' },
+      WORDPRESS_NONCE_SALT: { bytes: 32, encoding: 'base64url' }
     },
     app: {
       image: 'wordpress:6.7.2-apache',
@@ -205,6 +210,10 @@ const TEMPLATES = [
         WORDPRESS_SECURE_AUTH_KEY: '{{secret.WORDPRESS_SECURE_AUTH_KEY}}',
         WORDPRESS_LOGGED_IN_KEY: '{{secret.WORDPRESS_LOGGED_IN_KEY}}',
         WORDPRESS_NONCE_KEY: '{{secret.WORDPRESS_NONCE_KEY}}',
+        WORDPRESS_AUTH_SALT: '{{secret.WORDPRESS_AUTH_SALT}}',
+        WORDPRESS_SECURE_AUTH_SALT: '{{secret.WORDPRESS_SECURE_AUTH_SALT}}',
+        WORDPRESS_LOGGED_IN_SALT: '{{secret.WORDPRESS_LOGGED_IN_SALT}}',
+        WORDPRESS_NONCE_SALT: '{{secret.WORDPRESS_NONCE_SALT}}',
         WORDPRESS_CONFIG_EXTRA:
           "if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') { $_SERVER['HTTPS'] = 'on'; }"
       },
@@ -341,6 +350,7 @@ const TEMPLATES = [
       port: 8000,
       memoryMb: 1536,
       cpus: 1,
+      command: ['sh', '-c', 'sleep 3 && /entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run'],
       env: {
         BASE_URL: '{{url}}',
         SECRET_KEY_BASE: '{{secret.SECRET_KEY_BASE}}',
@@ -349,8 +359,8 @@ const TEMPLATES = [
         CLICKHOUSE_DATABASE_URL: 'http://{{sidecar.clickhouse.host}}:8123/plausible_events_db',
         DISABLE_REGISTRATION: 'invite_only'
       },
-      volumes: [],
-      readiness: { path: '/', expect: [200, 302] }
+      volumes: [{ name: 'data', path: '/var/lib/plausible' }],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
     },
     nextSteps: [
       'Regístrate en {{url}}/register: la primera cuenta es la de administración y después el registro queda cerrado.',
@@ -1104,6 +1114,7 @@ const TEMPLATES = [
     app: {
       image: 'axllent/mailpit:v1.22.3',
       port: 8025,
+      extraPorts: [{ containerPort: 1025, label: 'SMTP' }],
       memoryMb: 256,
       cpus: 1,
       env: {

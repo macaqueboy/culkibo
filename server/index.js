@@ -24,9 +24,11 @@ const containerOrchestrator = require('./services/containerOrchestrator');
 const projectManager = require('./services/projectManager');
 const metricsCollector = require('./services/metricsCollector');
 const auditLogger = require('./services/auditLogger');
+const telemetryService = require('./services/telemetryService');
 const {
   authMiddleware,
   authorizeRequest,
+  extractCredentials,
   corsDelegate,
   resolveToken,
   onTokenRotated,
@@ -75,6 +77,9 @@ function reportFatal(kind, err) {
   console.error(`[Culkibo:${kind}]`, detail);
   try {
     containerOrchestrator.addLog('ERROR', 'edge', `[Daemon:${kind}] ${err && err.message ? err.message : String(err)}`);
+  } catch (e) {}
+  try {
+    telemetryService.captureCrash(kind, err);
   } catch (e) {}
   if (kind === 'uncaughtException' && require.main === module) {
     const now = Date.now();
@@ -211,19 +216,30 @@ const SPA_CSP = [
   "font-src 'self' https://fonts.gstatic.com",
   "img-src 'self' data: https://avatars.githubusercontent.com",
   "connect-src 'self' ws: wss:",
+  "object-src 'none'",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'"
 ].join('; ');
 
+/** Determina de forma segura si la petición llegó por HTTPS (solo confía en X-Forwarded-Proto desde proxy de confianza). */
+function isHttpsRequest(req) {
+  if (req.socket && req.socket.encrypted) return true;
+  if (!isPrivateProxyPeer(req.socket?.remoteAddress || '')) return false;
+  const proto = req.headers['x-forwarded-proto'];
+  if (!proto) return false;
+  const hops = String(proto).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return hops.length > 0 && hops[hops.length - 1] === 'https';
+}
+
 function applySecurityHeaders(req, res, isApiOrMetrics) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  const proto = req.headers['x-forwarded-proto'];
-  if ((req.socket && req.socket.encrypted) || (proto && String(proto).split(',')[0].trim() === 'https')) {
+  if (isHttpsRequest(req)) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
   if (isApiOrMetrics) {
@@ -467,16 +483,13 @@ function safeWsSend(ws, obj) {
 }
 
 function selectSafeWsProtocol(protocols) {
-  // Nunca devolver culkibo-token.* ni culkibo-ticket.* en la cabecera 101 Sec-WebSocket-Protocol
+  // Jamás devolver culkibo-token.* ni culkibo-ticket.* en la cabecera 101 Sec-WebSocket-Protocol
   if (!protocols) return false;
   if (protocols.has('culkibo.v1')) return 'culkibo.v1';
   for (const p of protocols) {
     if (!p.startsWith('culkibo-token.') && !p.startsWith('culkibo-ticket.')) return p;
   }
-  // Si el cliente solo envió el subprotocolo de ticket/token sin culkibo.v1, devolver el primero
-  // para mantener compatibilidad con navegadores que exigen coincidencia de subprotocolo.
-  const first = protocols.values().next().value;
-  return first || false;
+  return false;
 }
 
 function ensureWsServers() {
@@ -762,15 +775,49 @@ function getZlib() {
 /** @type {WeakMap<Buffer, { etag: string, br?: Buffer, zstd?: Buffer, gzip?: Buffer }>} */
 const compressedApiCache = new WeakMap();
 
+/** Comprueba si `Accept-Encoding` acepta `coding` con q > 0 (RFC 9110). */
+function acceptsEncoding(aeHeader, coding) {
+  if (!aeHeader || typeof aeHeader !== 'string') return false;
+  const parts = aeHeader.toLowerCase().split(',');
+  for (let i = 0; i < parts.length; i++) {
+    const seg = parts[i].trim();
+    if (!seg) continue;
+    const pieces = seg.split(';');
+    const name = pieces[0].trim();
+    if (name !== coding) continue;
+    let q = 1;
+    for (let j = 1; j < pieces.length; j++) {
+      const m = pieces[j].trim().match(/^q\s*=\s*([0-9.]+)$/);
+      if (m) q = Number(m[1]);
+    }
+    return Number.isFinite(q) && q > 0;
+  }
+  return false;
+}
+
+/** Comprueba `If-None-Match` (soporta weak `W/"..."`, listas separadas por coma y `*`). */
+function etagMatches(inmHeader, etag) {
+  if (!inmHeader || !etag) return false;
+  const raw = String(inmHeader).trim();
+  if (raw === '*') return true;
+  const cleanTarget = etag.replace(/^W\//i, '').trim();
+  const candidates = raw.split(',');
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i].trim().replace(/^W\//i, '').trim();
+    if (c === cleanTarget) return true;
+  }
+  return false;
+}
+
 function pickApiEncoding(req) {
   const ae = req.headers['accept-encoding'];
   if (!ae || typeof ae !== 'string') return null;
-  if (ae.includes('br')) return 'br';
-  if (ae.includes('zstd')) {
+  if (acceptsEncoding(ae, 'br')) return 'br';
+  if (acceptsEncoding(ae, 'zstd')) {
     const z = getZlib();
     if (typeof z.zstdCompressSync === 'function') return 'zstd';
   }
-  if (ae.includes('gzip')) return 'gzip';
+  if (acceptsEncoding(ae, 'gzip')) return 'gzip';
   return null;
 }
 
@@ -826,7 +873,7 @@ function getCompressedEntry(buf, encoding) {
  * @param {Buffer} buf
  * @param {string} canonicalRoute
  * @param {number} t0Ms
- * @param {{ cacheControl?: string, etag?: string | null, compress?: boolean, csp?: boolean }} [opts]
+ * @param {{ cacheControl?: string, etag?: string | null, compress?: boolean, csp?: boolean, closeConnection?: boolean }} [opts]
  */
 function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, t0Ms, opts = {}) {
   const allowCompress = Boolean(opts.compress) && statusCode === 200 && buf.length >= 1024;
@@ -838,18 +885,11 @@ function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, 
   /** @type {string | null} */
   let etag = typeof opts.etag === 'string' ? opts.etag : null;
 
-  if (wantEtag && statusCode === 200) {
-    const enc = allowCompress ? pickApiEncoding(req) : null;
-    const comp = getCompressedEntry(buf, enc);
-    if (!etag) etag = comp.etag;
-    body = comp.body;
-    contentEncoding = comp.encoding;
-  }
-
   /** @type {Record<string, string | number>} */
   const headers = {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
+    'X-Permitted-Cross-Domain-Policies': 'none',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
     'Cross-Origin-Opener-Policy': 'same-origin',
@@ -857,6 +897,9 @@ function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, 
   };
   if (opts.csp) {
     headers['Content-Security-Policy'] = SPA_CSP;
+  }
+  if (opts.closeConnection) {
+    headers['Connection'] = 'close';
   }
   const origin = req.headers.origin;
   let vary = '';
@@ -869,19 +912,27 @@ function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, 
   }
   if (vary) headers['Vary'] = vary;
 
-  const proto = req.headers['x-forwarded-proto'];
-  if ((req.socket && req.socket.encrypted) || (proto && String(proto).startsWith('https'))) {
+  if (isHttpsRequest(req)) {
     headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
   }
 
-  if (etag && opts.cacheControl && opts.cacheControl !== 'no-store') {
-    headers['ETag'] = etag;
-    const inm = req.headers['if-none-match'];
-    if (inm && String(inm).trim() === etag) {
-      res.writeHead(304, headers);
-      res.end();
-      metricsCollector.recordFastPath(req.method, canonicalRoute, 304, performance.now() - t0Ms);
-      return;
+  // Comprobar 304 ANTES de comprimir (ahorra CPU en hits de caché)
+  if (wantEtag && statusCode === 200) {
+    if (!etag) etag = getCompressedEntry(buf, null).etag;
+    if (opts.cacheControl && opts.cacheControl !== 'no-store') {
+      headers['ETag'] = etag;
+      if (etagMatches(req.headers['if-none-match'], etag)) {
+        res.writeHead(304, headers);
+        res.end();
+        metricsCollector.recordFastPath(req.method, canonicalRoute, 304, performance.now() - t0Ms);
+        return;
+      }
+    }
+    if (allowCompress) {
+      const enc = pickApiEncoding(req);
+      const comp = getCompressedEntry(buf, enc);
+      body = comp.body;
+      contentEncoding = comp.encoding;
     }
   }
 
@@ -981,10 +1032,10 @@ function tryServeStaticFastPath(req, res, pathname) {
   }
 
   // Comprobación 421 plano de control vs plano de datos antes de servir el panel SPA
-  // Solo confiar en X-Forwarded-Host / X-Culkibo-Host si el peer inmediato es un proxy de confianza
+  // Solo confiar en X-Forwarded-Host (último salto) si el peer inmediato es un proxy de confianza
   const trustProxyHost = isPrivateProxyPeer(req.socket?.remoteAddress || '');
-  const forwarded = trustProxyHost ? (req.headers['x-forwarded-host'] || req.headers['x-culkibo-host']) : null;
-  const host = extractHostnameClean(forwarded || req.headers.host || '');
+  const forwarded = trustProxyHost ? req.headers['x-forwarded-host'] : null;
+  const host = extractHostnameClean(forwarded || req.headers.host || '', Boolean(forwarded));
   const activePanelDomain = (loadedServices.ingressManager?.panelDomain || cachedPanelDomain || '').toLowerCase();
   const isPanelOrLocal = (activePanelDomain && host === activePanelDomain) || (MANAGEMENT_HOSTS_FAST.has(host) && !forwarded);
   if (!isPanelOrLocal) {
@@ -1014,10 +1065,10 @@ function tryServeStaticFastPath(req, res, pathname) {
   let body = asset.raw;
   /** @type {string | null} */
   let encoding = null;
-  if (asset.br && ae.includes('br')) {
+  if (asset.br && acceptsEncoding(ae, 'br')) {
     body = asset.br;
     encoding = 'br';
-  } else if (asset.gz && ae.includes('gzip')) {
+  } else if (asset.gz && acceptsEncoding(ae, 'gzip')) {
     body = asset.gz;
     encoding = 'gzip';
   }
@@ -1026,6 +1077,7 @@ function tryServeStaticFastPath(req, res, pathname) {
   const headers = {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
+    'X-Permitted-Cross-Domain-Policies': 'none',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
     'Cross-Origin-Opener-Policy': 'same-origin',
@@ -1036,16 +1088,14 @@ function tryServeStaticFastPath(req, res, pathname) {
     headers['Content-Security-Policy'] = SPA_CSP;
   } else {
     headers['ETag'] = asset.etag;
-    const inm = req.headers['if-none-match'];
-    if (inm && String(inm).trim() === asset.etag) {
+    if (etagMatches(req.headers['if-none-match'], asset.etag)) {
       res.writeHead(304, headers);
       res.end();
       metricsCollector.recordFastPath(req.method, '/static', 304, performance.now() - t0);
       return true;
     }
   }
-  const proto = req.headers['x-forwarded-proto'];
-  if ((req.socket && req.socket.encrypted) || (proto && String(proto).startsWith('https'))) {
+  if (isHttpsRequest(req)) {
     headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
   }
   headers['Content-Type'] = asset.mime;
@@ -1094,10 +1144,11 @@ function tryHandleFastPath(req, res) {
       return true;
     }
 
-    const decision = authorizeRequest(req);
+    const decision = authorizeRequest(req, { allowWsSubprotocol: false });
     if (!decision.ok) {
       if (decision.status === 403) metricsCollector.recordSecurityEvent('originRejected403');
-      if (decision.status === 401 && (req.headers.authorization || req.headers['x-culkibo-token'])) {
+      const creds = extractCredentials(req, { allowWsSubprotocol: false });
+      if (decision.status === 401 && (creds.token || creds.ticket)) {
         recordAuthFailure(req);
         metricsCollector.recordSecurityEvent('authFailures');
       }
@@ -1108,7 +1159,8 @@ function tryHandleFastPath(req, res) {
     const limitBytes = 1 * 1024 * 1024;
     const declaredLen = Number(req.headers['content-length'] || 0);
     if (declaredLen > limitBytes) {
-      sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', ERR_BODY_TOO_LARGE_BUF, pathname, t0);
+      sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', ERR_BODY_TOO_LARGE_BUF, pathname, t0, { closeConnection: true });
+      req.resume();
       return true;
     }
 
@@ -1122,7 +1174,7 @@ function tryHandleFastPath(req, res) {
       total += chunk.length;
       if (total > limitBytes) {
         aborted = true;
-        sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', ERR_BODY_TOO_LARGE_BUF, pathname, t0);
+        sendFastBuffer(req, res, 413, 'application/json; charset=utf-8', ERR_BODY_TOO_LARGE_BUF, pathname, t0, { closeConnection: true });
         req.resume();
         return;
       }
@@ -1237,7 +1289,7 @@ function tryHandleFastPath(req, res) {
       return true;
     }
     const params = new URLSearchParams(queryStr);
-    const domain = String(params.get('domain') || '').trim().toLowerCase();
+    const domain = String(params.get('domain') || '').trim().toLowerCase().replace(/\.+$/, '');
     if (!domain) {
       sendFastBuffer(req, res, 400, 'text/plain; charset=utf-8', ASK_MISSING_DOMAIN_BUF, pathname, t0);
       return true;
@@ -1304,9 +1356,10 @@ function tryHandleFastPath(req, res) {
     return true;
   }
 
-  const decision = authorizeRequest(req);
+  const decision = authorizeRequest(req, { allowWsSubprotocol: false });
   if (!decision.ok) {
-    if (decision.status === 401 && (req.headers.authorization || req.headers['x-culkibo-token'])) {
+    const creds = extractCredentials(req, { allowWsSubprotocol: false });
+    if (decision.status === 401 && (creds.token || creds.ticket)) {
       recordAuthFailure(req);
     }
     sendFastAuthError(req, res, decision, projectByIdMatch ? '/api/projects/:id' : pathname, t0);
@@ -1400,6 +1453,9 @@ function resolveBodyLimitBytes(reqPath) {
   if (/^\/api\/(?:migrate|import)\/wordpress\/[^/]+\/import-sql$/.test(reqPath) || reqPath === '/api/import/wordpress/import-sql') {
     return 55 * 1024 * 1024; // 55 MB para volcados SQL grandes (MAX_SQL_BYTES = 50 MB)
   }
+  if (reqPath.startsWith('/api/webhooks/')) {
+    return 25 * 1024 * 1024; // 25 MB para webhooks GitHub/GitLab grandes (commits masivos)
+  }
   if (/^\/api\/projects\/[^/]+\/sync\/frame$/.test(reqPath)) {
     return 16 * 1024 * 1024; // 16 MB para Commit Frames HTTP
   }
@@ -1409,6 +1465,9 @@ function resolveBodyLimitBytes(reqPath) {
   if (reqPath.startsWith('/api/import/compose')) {
     return 2 * 1024 * 1024;
   }
+  if (reqPath === '/api/telemetry/client-error') {
+    return 16 * 1024; // 16 KB máximo para reportes de error del cliente SPA
+  }
   return 1 * 1024 * 1024; // 1 MB por defecto (corta DoS de memoria)
 }
 
@@ -1417,9 +1476,10 @@ function nativeBodyParser(req, res, next) {
   if (req.body !== undefined) return next();
 
   const ct = String(req.headers['content-type'] || '').toLowerCase();
-  const isJson = ct.includes('application/json') || ct.includes('+json');
-  const isForm = ct.includes('application/x-www-form-urlencoded');
-  const isText = ct.includes('text/plain');
+  const mediaType = ct.split(';')[0].trim();
+  const isJson = mediaType === 'application/json' || (mediaType.startsWith('application/') && mediaType.endsWith('+json'));
+  const isForm = mediaType === 'application/x-www-form-urlencoded';
+  const isText = mediaType === 'text/plain';
   if (!isJson && !isForm && !isText) {
     req.body = {};
     return next();
@@ -1429,7 +1489,8 @@ function nativeBodyParser(req, res, next) {
   const limitBytes = resolveBodyLimitBytes(rawPath);
   const declaredLen = Number(req.headers['content-length'] || 0);
   if (declaredLen > limitBytes) {
-    const err = new Error(`El cuerpo supera el límite permitido (${Math.round(limitBytes / (1024 * 1024))} MB)`);
+    req.resume();
+    const err = new Error(`El cuerpo supera el límite permitido (${Math.max(1, Math.round(limitBytes / (1024 * 1024)))} MB)`);
     /** @type {any} */ (err).status = 413;
     /** @type {any} */ (err).type = 'entity.too.large';
     return next(err);
@@ -1445,7 +1506,8 @@ function nativeBodyParser(req, res, next) {
     total += chunk.length;
     if (total > limitBytes) {
       aborted = true;
-      const err = new Error(`El cuerpo supera el límite permitido (${Math.round(limitBytes / (1024 * 1024))} MB)`);
+      req.resume();
+      const err = new Error(`El cuerpo supera el límite permitido (${Math.max(1, Math.round(limitBytes / (1024 * 1024)))} MB)`);
       /** @type {any} */ (err).status = 413;
       /** @type {any} */ (err).type = 'entity.too.large';
       return next(err);
@@ -1496,18 +1558,20 @@ function nativeBodyParser(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// Extrae hostname limpio desde Host / X-Forwarded-Host (soporta IPv6 [::1]:3030
-// y listas separadas por comas — corrige P0-8).
+// Extrae hostname limpio desde Host / X-Forwarded-Host (soporta IPv6 [::1]:3030,
+// punto final FQDN y listas separadas por comas — usa el último salto si es X-Forwarded-Host).
 // ---------------------------------------------------------------------------
-function extractHostnameClean(rawHeader) {
-  const first = String(rawHeader || '').split(',')[0].trim().toLowerCase();
-  if (!first) return '';
-  if (first.startsWith('[')) {
-    const end = first.indexOf(']');
-    return end !== -1 ? first.slice(1, end) : first;
+function extractHostnameClean(rawHeader, useRightmost = false) {
+  const parts = String(rawHeader || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const chosen = useRightmost ? (parts[parts.length - 1] || '') : (parts[0] || '');
+  if (!chosen) return '';
+  if (chosen.startsWith('[')) {
+    const end = chosen.indexOf(']');
+    return (end !== -1 ? chosen.slice(1, end) : chosen).replace(/\.+$/, '');
   }
-  const colon = first.indexOf(':');
-  return colon === -1 ? first : first.slice(0, colon);
+  const colon = chosen.indexOf(':');
+  const hostOnly = colon === -1 ? chosen : chosen.slice(0, colon);
+  return hostOnly.replace(/\.+$/, '');
 }
 
 /** @type {string | null} */
@@ -1566,7 +1630,18 @@ function getApp() {
     const finish = () => {
       if (ended) return;
       ended = true;
-      metricsCollector.onRequestEnd(req.method, req.originalUrl || req.url, res.statusCode, Number(process.hrtime.bigint() - t0) / 1e6);
+      const rawUrl = req.originalUrl || req.url;
+      metricsCollector.onRequestEnd(req.method, rawUrl, res.statusCode, Number(process.hrtime.bigint() - t0) / 1e6);
+      if (res.statusCode >= 500 && isApi) {
+        try {
+          telemetryService.captureApi5xx({
+            method: req.method,
+            route: metricsCollector.canonicalizeRoute(rawUrl),
+            status: res.statusCode,
+            message: res.locals?.telemetryErrorMessage || `HTTP ${res.statusCode}`
+          });
+        } catch (e) {}
+      }
     };
     res.once('finish', finish);
     res.once('close', finish);
@@ -1597,6 +1672,8 @@ function getApp() {
     if (activeSseClients >= MAX_SSE_CLIENTS) {
       return res.status(503).json({ error: 'Demasiados clientes SSE conectados simultáneamente' });
     }
+    if (typeof req.setTimeout === 'function') req.setTimeout(0);
+    if (typeof res.setTimeout === 'function') res.setTimeout(0);
     const mcpServer = getService('mcpServer');
     const mcpStreamableHttp = getService('mcpStreamableHttp');
     activeSseClients++;
@@ -1610,12 +1687,15 @@ function getApp() {
     });
 
     let cleaned = false;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    let keepalive = null;
     const onMcp = (entry) => {
       safeWrite(`event: mcp_event\ndata: ${JSON.stringify(entry)}\n\n`);
     };
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
+      if (keepalive) { clearInterval(keepalive); keepalive = null; }
       activeSseResponses.delete(res);
       activeSseClients = Math.max(0, activeSseClients - 1);
       mcpServer.off('mcp_call', onMcp);
@@ -1625,6 +1705,8 @@ function getApp() {
       try { res.write(chunk); } catch (e) { cleanup(); }
     };
 
+    keepalive = setInterval(() => safeWrite(': keepalive\n\n'), 25000);
+    if (keepalive.unref) keepalive.unref();
     safeWrite(`event: endpoint\ndata: /api/mcp/message\n\n`);
     mcpServer.on('mcp_call', onMcp);
     req.on('close', cleanup);
@@ -1645,8 +1727,8 @@ function getApp() {
     }
 
     const trustProxyHost = isPrivateProxyPeer(req.socket?.remoteAddress || '');
-    const forwarded = trustProxyHost ? (req.headers['x-forwarded-host'] || req.headers['x-culkibo-host']) : null;
-    const host = extractHostnameClean(forwarded || req.headers.host || '');
+    const forwarded = trustProxyHost ? req.headers['x-forwarded-host'] : null;
+    const host = extractHostnameClean(forwarded || req.headers.host || '', Boolean(forwarded));
 
     // Acceso directo de gestión (localhost / IPv4 / IPv6 ::1) o dominio oficial del panel (P0-8)
     const activePanelDomain = (loadedServices.ingressManager?.panelDomain || cachedPanelDomain || '').toLowerCase();
@@ -1663,6 +1745,7 @@ function getApp() {
       return next();
     }
 
+    const isAuthed = authorizeRequest(req, { allowWsSubprotocol: false }).ok;
     res.status(421);
     res.setHeader('X-Culkibo-Data-Plane', 'caddy');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1672,8 +1755,7 @@ function getApp() {
         error: 'Petición dirigida al plano de control',
         dataPlane: 'caddy',
         domain: host,
-        matchedRoute: matchedRoute.hostname,
-        isWildcard: Boolean(matchedRoute.isWildcard),
+        ...(isAuthed ? { matchedRoute: matchedRoute.hostname, isWildcard: Boolean(matchedRoute.isWildcard) } : {}),
         routedByDaemon: false,
         message: `El daemon de Culkibo no enruta tráfico. ${host} lo sirve Caddy en los puertos 80/443. Consulta /api/ingress/status para ver si hay ruta y qué certificado se está sirviendo de verdad.`
       });
@@ -1682,7 +1764,7 @@ function getApp() {
     return res.type('text/plain').send(
       `Culkibo: este puerto es el plano de control, no el plano de datos.\n\n` +
       `Dominio solicitado: ${host}\n` +
-      `Regla configurada:  ${matchedRoute.hostname}\n\n` +
+      (isAuthed ? `Regla configurada:  ${matchedRoute.hostname}\n\n` : '\n') +
       `El tráfico de este dominio lo sirve Caddy en los puertos 80 y 443.\n` +
       `Comprueba el estado real del ingress en /api/ingress/status.\n`
     );
@@ -1739,14 +1821,19 @@ function getApp() {
   }
 
   // Manejador de errores limpio (sin reportFatal para 400/413, sanitizado en producción)
-  app.use((err, _req, res, next) => {
+  app.use((err, req, res, next) => {
     const status = err.status || err.statusCode || 500;
+    const reqPath = String(req?.originalUrl || req?.url || '').split('?')[0];
     if (err.type === 'entity.parse.failed') {
       if (res.headersSent) return next(err);
+      if (reqPath === '/api/mcp' || reqPath === '/api/mcp/message') {
+        return res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error: JSON malformado' } });
+      }
       return res.status(400).json({ error: 'JSON malformado en el cuerpo de la petición' });
     }
     if (err.type === 'entity.too.large' || status === 413) {
       if (res.headersSent) return next(err);
+      res.setHeader('Connection', 'close');
       return res.status(413).json({ error: err.message || 'El tamaño de la petición supera el límite permitido' });
     }
     const errorId = crypto.randomBytes(4).toString('hex');
@@ -1813,7 +1900,7 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  const decision = authorizeRequest(req);
+  const decision = authorizeRequest(req, { allowWsSubprotocol: true });
   if (!decision.ok) {
     metricsCollector.recordSecurityEvent('wsAuthRejected');
     if (decision.status === 403) {
@@ -1995,6 +2082,35 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
           } catch (e) {}
         }
 
+        // Telemetría anónima y reporte automático de fallos (cero bloqueo en arranque)
+        try {
+          telemetryService.setHeartbeatCollector(() => {
+            const projects = projectManager.getAll ? projectManager.getAll() : [];
+            const dbs = loadedServices.databaseManager?.list ? loadedServices.databaseManager.list() : [];
+            const svcs = loadedServices.catalogManager?.listInstallations ? loadedServices.catalogManager.listInstallations() : [];
+            const doms = loadedServices.domainManager?.listDomains ? loadedServices.domainManager.listDomains() : [];
+            const crons = loadedServices.cronManager?.list ? loadedServices.cronManager.list().filter((c) => c.enabled) : [];
+            const wildcards = loadedServices.ingressManager?.listWildcardPolicies ? loadedServices.ingressManager.listWildcardPolicies() : [];
+            const s3Cfg = loadedServices.databaseManager?.getS3Config ? loadedServices.databaseManager.getS3Config() : null;
+            return {
+              projectsCount: projects.length,
+              databasesCount: dbs.length,
+              catalogServicesCount: svcs.length,
+              domainsCount: doms.length,
+              activeCronsCount: crons.length,
+              dockerAvailable: loadedServices.deployManager?.dockerChecked ? Boolean(loadedServices.deployManager?.dockerAvailable) : null,
+              caddyAvailable: loadedServices.caddyManager?.lastDetection ? Boolean(loadedServices.caddyManager.lastDetection.available) : null,
+              hasWildcard: wildcards.length > 0,
+              hasS3: Boolean(s3Cfg && s3Cfg.configured),
+              hasNotifications: Boolean(loadedServices.notificationService?.config?.enabled),
+              hasLiveSync: Boolean(loadedServices.liveSyncEngine && loadedServices.liveSyncEngine.sessions.size > 0),
+              hasMcpUsed: Boolean(loadedServices.mcpServer && loadedServices.mcpServer.auditLog.length > 0),
+              hasCloudflare: doms.some((d) => Boolean(d.cloudflareProxied))
+            };
+          });
+          telemetryService.start();
+        } catch (e) {}
+
         // Limpieza periódica no intrusiva de sesiones Live Sync inactivas (cada 5 min)
         trackTimer(setInterval(() => {
           if (loadedServices.liveSyncEngine && typeof loadedServices.liveSyncEngine.evictIdleSessions === 'function') {
@@ -2017,7 +2133,7 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
                 const det = await loadedServices.caddyManager.detect({ force: true });
                 if (det && det.available) {
                   const st = await loadedServices.ingressManager.status();
-                  if (st && st.inSync === false && (st.drift?.missing?.length || 0) > 0) {
+                  if (st && st.inSync === false) {
                     await loadedServices.ingressManager.reconcile().catch(() => {});
                   }
                 }
@@ -2150,7 +2266,8 @@ function shutdown(signal = 'SIGTERM') {
       }
     } catch (e) {}
 
-    // 5. Volcado final atómico a disco (ya no pueden entrar mutaciones nuevas)
+    // 5. Volcado final atómico a disco + envío best-effort de telemetría de sesión/fallos (máx 1.5 s)
+    try { await telemetryService.flushBestEffort({ timeoutMs: 1500 }); } catch (e) {}
     try { await projectManager.flushToDisk(); } catch (e) {}
     try { auditLogger.flushSync(); } catch (e) {}
 

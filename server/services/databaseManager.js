@@ -3,6 +3,7 @@ const path = require('path');
 const net = require('net');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const { Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 const EventEmitter = require('events');
 const { execFile, spawn } = require('child_process');
@@ -11,7 +12,7 @@ const execFilePromise = util.promisify(execFile);
 
 const dbBackupManager = require('./dbBackupManager');
 const { S3Client, redactKey } = require('./s3Uploader');
-const { atomicWriteJsonSync, assertContainedPath } = require('./ssrfGuard');
+const { atomicWriteJsonSync, assertContainedPath, formatDockerEnvFile } = require('./ssrfGuard');
 const portRegistry = require('./portRegistry');
 const { isSubDailyCron } = require('./cronParser');
 
@@ -153,7 +154,7 @@ const ENGINES = {
     dumpExt: '.dump',
     restore: ({ username, dbName, inFile }) => ({
       program: 'pg_restore',
-      args: ['-U', username, '-d', dbName, '--clean', '--if-exists', '--no-owner', inFile]
+      args: ['-U', username, '-d', dbName, '--clean', '--if-exists', '--no-owner', '-e', inFile]
     })
   },
 
@@ -218,7 +219,7 @@ const ENGINES = {
     dumpExt: '.sql',
     restore: ({ dbName, inFile }) => ({
       program: 'mariadb',
-      args: ['-u', 'root', dbName],
+      args: ['--sandbox', '-u', 'root', dbName],
       stdinFile: inFile
     })
   },
@@ -235,7 +236,7 @@ const ENGINES = {
     initEnv: ({ password }) => ({ VALKEY_PASSWORD: password, REDISCLI_AUTH: password, VALKEYCLI_AUTH: password }),
     clientEnv: ({ password }) => ({ REDISCLI_AUTH: password, VALKEYCLI_AUTH: password }),
     command: () => REDIS_FAMILY_COMMAND('valkey-server', 'VALKEY_PASSWORD'),
-    health: () => 'valkey-cli ping',
+    health: () => 'valkey-cli -e ping',
     // buildDbDumpSpec habla de `redis-cli`; en la imagen de Valkey el binario
     // se llama `valkey-cli` y el enlace de compatibilidad no está garantizado.
     dumpProgram: 'valkey-cli',
@@ -254,7 +255,7 @@ const ENGINES = {
     initEnv: ({ password }) => ({ REDIS_PASSWORD: password, REDISCLI_AUTH: password }),
     clientEnv: ({ password }) => ({ REDISCLI_AUTH: password }),
     command: () => REDIS_FAMILY_COMMAND('redis-server', 'REDIS_PASSWORD'),
-    health: () => 'redis-cli ping',
+    health: () => 'redis-cli -e ping',
     dumpExt: '.rdb'
   },
 
@@ -716,6 +717,33 @@ class DatabaseManager extends EventEmitter {
    * proyecto significa que un contenedor sólo alcanza lo que hay en su propio
    * proyecto, y que la resolución por nombre no filtra nombres ajenos.
    */
+  /**
+   * Asigna una subred `/24` libre en `10.128..254.x.0/24` evitando el límite clásico
+   * de ~31 redes bridge por defecto de Docker (`Pool overlaps` — Runtipi #2126/#2140).
+   */
+  async pickAvailableBridgeSubnet() {
+    const usedPrefixes = new Set();
+    try {
+      const { stdout: idsOut } = await this.docker(['network', 'ls', '-q'], { timeout: 10000 });
+      const ids = idsOut.trim().split(/\r?\n/).filter(Boolean).slice(0, 128);
+      if (ids.length > 0) {
+        const { stdout: insp } = await this.docker(['network', 'inspect', ...ids, '--format', '{{range .IPAM.Config}}{{.Subnet}} {{end}}'], { timeout: 15000 });
+        for (const m of insp.matchAll(/\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\/\d{1,2}\b/g)) {
+          usedPrefixes.add(m[1]);
+        }
+      }
+    } catch (e) {}
+    for (let oct2 = 128; oct2 <= 254; oct2++) {
+      for (let oct3 = 10; oct3 <= 250; oct3++) {
+        const prefix = `10.${oct2}.${oct3}`;
+        if (!usedPrefixes.has(prefix)) {
+          return `${prefix}.0/24`;
+        }
+      }
+    }
+    return null;
+  }
+
   async ensureNetwork(projectId) {
     assertResourceId(projectId, 'projectId');
     const name = this.networkName(projectId);
@@ -723,14 +751,27 @@ class DatabaseManager extends EventEmitter {
       await this.docker(['network', 'inspect', name], { timeout: 10000 });
       return { name, created: false };
     } catch (e) {
+      const subnet = await this.pickAvailableBridgeSubnet();
+      const createArgs = [
+        'network', 'create', '--driver', 'bridge',
+        ...(subnet ? ['--subnet', subnet] : []),
+        '--label', 'culkibo.managed=true',
+        '--label', `culkibo.project=${projectId}`,
+        name
+      ];
       try {
-        await this.docker(['network', 'create', '--driver', 'bridge', '--label', 'culkibo.managed=true',
-          '--label', `culkibo.project=${projectId}`, name], { timeout: 20000 });
+        await this.docker(createArgs, { timeout: 20000 });
         return { name, created: true };
       } catch (createErr) {
-        // Dos aprovisionamientos concurrentes en el mismo proyecto: idempotente si ya la creó el otro.
-        if (/already exists/i.test(String(createErr && createErr.message))) {
+        const msg = String(createErr && createErr.message || '');
+        if (/already exists/i.test(msg)) {
           return { name, created: false };
+        }
+        // Si hubo carrera en la subred elegida, reintentar sin `--subnet` como fallback
+        if (subnet && /overlaps|Pool/i.test(msg)) {
+          await this.docker(['network', 'create', '--driver', 'bridge', '--label', 'culkibo.managed=true',
+            '--label', `culkibo.project=${projectId}`, name], { timeout: 20000 });
+          return { name, created: true };
         }
         throw createErr;
       }
@@ -845,6 +886,7 @@ class DatabaseManager extends EventEmitter {
       '--cpus', String(cpus),
       '--pids-limit', '512',
       '--security-opt', 'no-new-privileges',
+      '--log-driver', 'json-file',
       '--log-opt', 'max-size=10m',
       '--log-opt', 'max-file=3',
       '--health-cmd', engine.health({ username, dbName }),
@@ -865,7 +907,7 @@ class DatabaseManager extends EventEmitter {
     try {
       fs.writeFileSync(
         envFile,
-        Object.entries(envVars).map(([k, v]) => `${k}=${v}`).join('\n') + '\n',
+        formatDockerEnvFile(envVars),
         { encoding: 'utf8', mode: 0o600 }
       );
       const { stdout } = await this.docker(args, { timeout: 180000 });
@@ -964,13 +1006,15 @@ class DatabaseManager extends EventEmitter {
         });
       };
 
+      const leaseOwner = `db_${id}`;
+      /** @type {number | null} */
+      let leasedPort = null;
       const preferredFree = await checkPortAvailable(port);
       if (!preferredFree) {
         // Si el usuario NO fijó puerto explícito, asignar un puerto libre automáticamente (evita colisión en 2ª BD del mismo motor)
         if (hostPort == null || String(hostPort).trim() === '') {
-          const leaseOwner = `db_${id}`;
           port = await portRegistry.allocate({ kind: 'database', owner: leaseOwner, preferred: engine.port + 100, host: bind });
-          portRegistry.release(port, leaseOwner);
+          leasedPort = port;
         } else {
           throw new Error(`El puerto ${bind}:${port} ya está ocupado en el host o reservado por otro servicio`);
         }
@@ -990,6 +1034,10 @@ class DatabaseManager extends EventEmitter {
         } catch (e2) {}
         this.save();
         throw err;
+      } finally {
+        if (leasedPort !== null) {
+          portRegistry.release(leasedPort, leaseOwner);
+        }
       }
 
       return {
@@ -1044,6 +1092,7 @@ class DatabaseManager extends EventEmitter {
       '--cpus', String(record.cpus),
       '--pids-limit', '512',
       '--security-opt', 'no-new-privileges',
+      '--log-driver', 'json-file',
       '--log-opt', 'max-size=10m',
       '--log-opt', 'max-file=3',
       '--health-cmd', engine.health({ username: record.username, dbName: record.dbName }),
@@ -1065,7 +1114,7 @@ class DatabaseManager extends EventEmitter {
     try {
       fs.writeFileSync(
         envFile,
-        Object.entries(envVars).map(([k, v]) => `${k}=${v}`).join('\n') + '\n',
+        formatDockerEnvFile(envVars),
         { encoding: 'utf8', mode: 0o600 }
       );
       const { stdout } = await this.docker(args, { timeout: 180000 });
@@ -1159,6 +1208,11 @@ class DatabaseManager extends EventEmitter {
       }
       this.state.databases = this.state.databases.filter((d) => d.id !== id);
       this.save({ strict: true });
+
+      // Si era la última BD del proyecto y la red dedicada está vacía, liberarla para no agotar subredes
+      if (record.networkName && !this.state.databases.some((d) => d.networkName === record.networkName)) {
+        try { await this.docker(['network', 'rm', record.networkName], { timeout: 10000 }); } catch (e) {}
+      }
 
       // Limpiar referencias obsoletas en linkedDatabaseIds de los proyectos
       try {
@@ -1356,14 +1410,16 @@ class DatabaseManager extends EventEmitter {
     if (!bypassOpGuard) {
       this.assertNoActiveLongOp(id);
     }
-    if (!(await this.isDockerAvailable())) {
-      throw new Error('Docker no está disponible: no se puede ejecutar la copia');
-    }
-
+    // Reservar slot ANTES del primer await (isDockerAvailable) para que MAX_CONCURRENT_BACKUPS se cumpla en tick()
     this.runningBackups.add(id);
     const startedAt = Date.now();
     if (!bypassOpGuard) {
       this._activeOps.set(id, { kind: 'backup', startedAt });
+    }
+    if (!(await this.isDockerAvailable())) {
+      this.runningBackups.delete(id);
+      if (!bypassOpGuard) this._activeOps.delete(id);
+      throw new Error('Docker no está disponible: no se puede ejecutar la copia');
     }
     const engine = ENGINES[record.engine];
     const password = this.decryptPassword(record);
@@ -1425,6 +1481,12 @@ class DatabaseManager extends EventEmitter {
 
       await this.docker(['cp', `${record.containerName}:${containerPath}`, localPath], { timeout: 3600 * 1000 });
 
+      // Comprobar tamaño ANTES de gzip (gzip de 0 bytes produce 20 bytes de cabecera y ocultaba volcados vacíos)
+      const rawStat = fs.statSync(localPath);
+      if (rawStat.size <= 0) {
+        throw new Error('El volcado generado está vacío (0 bytes antes de comprimir)');
+      }
+
       // mongodump ya sale comprimido con --gzip; el resto no.
       finalPath = localPath;
       if (!baseName.endsWith('.gz')) {
@@ -1461,7 +1523,10 @@ class DatabaseManager extends EventEmitter {
           entry.remote = { key, etag: uploaded.etag || null, multipart: Boolean(uploaded.multipart), uploadedAt: new Date().toISOString() };
         } catch (s3Err) {
           entry.remote = null;
-          entry.remoteError = this.redactMessage(s3Err.message, password);
+          let msg = this.redactMessage(s3Err.message, password);
+          if (s3.accessKeyId) msg = this.redactMessage(msg, s3.accessKeyId);
+          if (s3.secretAccessKey) msg = this.redactMessage(msg, s3.secretAccessKey);
+          entry.remoteError = msg;
           console.warn(`[Databases] Copia local guardada pero falló la subida S3 (${record.name}): ${entry.remoteError}`);
         }
       }
@@ -1477,6 +1542,19 @@ class DatabaseManager extends EventEmitter {
 
       const pruned = skipRetention ? { pruned: 0, kept: record.backups.length } : await this.applyRetention(id);
       this.emit('backup_completed', { databaseId: id, backupId: entry.id, trigger, remoteError: entry.remoteError });
+      try {
+        const telOk = require('./telemetryService');
+        telOk.recordFeatureUsage(`db_backup:${record.engine}`, !entry.remoteError);
+        if (entry.remoteError) {
+          telOk.captureOperationFailure({
+            operation: 'database_backup',
+            stage: 's3_upload',
+            kind: record.engine,
+            message: entry.remoteError,
+            durationMs: entry.durationMs
+          });
+        }
+      } catch (e) {}
 
       if (trigger !== 'pre-restore') {
         const ns = getNotificationService();
@@ -1520,6 +1598,17 @@ class DatabaseManager extends EventEmitter {
       record.lastError = this.redactMessage(err.message, password);
       this.save();
       this.emit('backup_failed', { databaseId: id, error: record.lastError });
+      try {
+        const telErr = require('./telemetryService');
+        telErr.recordFeatureUsage(`db_backup:${record.engine}`, false);
+        telErr.captureOperationFailure({
+          operation: 'database_backup',
+          stage: 'dump',
+          kind: record.engine,
+          message: record.lastError,
+          durationMs: Date.now() - startedAt
+        });
+      } catch (e) {}
       if (trigger !== 'pre-restore') {
         const ns = getNotificationService();
         if (ns && typeof ns.notify === 'function') {
@@ -1553,8 +1642,100 @@ class DatabaseManager extends EventEmitter {
     await pipeline(fs.createReadStream(src), zlib.createGzip({ level: 6 }), fs.createWriteStream(dest));
   }
 
-  async gunzipFile(src, dest) {
-    await pipeline(fs.createReadStream(src), zlib.createGunzip(), fs.createWriteStream(dest));
+  async gunzipFile(src, dest, maxBytes = 2 * 1024 * 1024 * 1024) {
+    let total = 0;
+    const limiter = new Transform({
+      transform(chunk, _enc, cb) {
+        total += chunk.length;
+        if (total > maxBytes) {
+          cb(new Error(`El archivo descomprimido supera el límite seguro de ${Math.round(maxBytes / (1024 * 1024))} MB`));
+          return;
+        }
+        cb(null, chunk);
+      }
+    });
+    try {
+      await pipeline(fs.createReadStream(src), zlib.createGunzip(), limiter, fs.createWriteStream(dest));
+    } catch (err) {
+      try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch (e) {}
+      throw err;
+    }
+  }
+
+  /**
+   * Valida en streaming que un volcado SQL plano no contenga meta-comandos de
+   * cliente (`\!`, `system`, `source`, `COPY ... PROGRAM`, etc.) capaces de
+   * ejecutar comandos arbitrarios dentro del contenedor al restaurar.
+   * @param {string} filePath
+   * @param {string} family
+   */
+  async assertSafeSqlFile(filePath, family) {
+    const isPg = family === 'postgresql';
+    const pgMetaRe = /^\s*\\(?:!|gexec\b|o\s+\|)|COPY\b[\s\S]{0,200}\b(?:FROM|TO)\s+PROGRAM\b/im;
+    const mysqlMetaRe = /(?:^|[^\\])(?:\\\\)*\\[!TPe.]|^\s*(?:system|tee|pager|edit|source)(?:\s|;|$)/im;
+    let carry = '';
+    const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 128 * 1024 });
+    for await (const chunk of stream) {
+      const windowText = carry + chunk;
+      const lines = windowText.split(/\r?\n/);
+      carry = lines.pop() || '';
+      const body = lines.join('\n');
+      if (isPg ? pgMetaRe.test(body) : mysqlMetaRe.test(body)) {
+        stream.destroy();
+        throw new Error(
+          isPg
+            ? 'Volcado PostgreSQL rechazado por seguridad: contiene meta-comandos de shell (\\!, \\gexec o COPY ... PROGRAM).'
+            : 'Volcado SQL rechazado por seguridad: contiene comandos de cliente peligrosos (\\!, system, source, tee o pager).'
+        );
+      }
+    }
+    if (carry && (isPg ? pgMetaRe.test(carry) : mysqlMetaRe.test(carry))) {
+      throw new Error(
+        isPg
+          ? 'Volcado PostgreSQL rechazado por seguridad: contiene meta-comandos de shell (\\!, \\gexec o COPY ... PROGRAM).'
+          : 'Volcado SQL rechazado por seguridad: contiene comandos de cliente peligrosos (\\!, system, source, tee o pager).'
+      );
+    }
+  }
+
+  /**
+   * Filtra en streaming sentencias `USE`, `CREATE DATABASE` y `GTID_PURGED` en
+   * volcados MySQL/MariaDB para evitar sobrescribir otra BD o fallar en GTID.
+   * @param {string} src
+   * @param {string} dest
+   */
+  async sanitizeMysqlSqlFile(src, dest) {
+    const stripLineRe = /^\s*(?:USE\s+`?[a-zA-Z0-9_$-]+`?\s*;?\s*$|CREATE\s+DATABASE\b[^;\n]*;?\s*$|SET\s+@@GLOBAL\.GTID_PURGED\s*=)/i;
+    const out = fs.createWriteStream(dest, { encoding: 'utf8', mode: 0o600 });
+    let carry = '';
+    const reader = fs.createReadStream(src, { encoding: 'utf8', highWaterMark: 128 * 1024 });
+    try {
+      for await (const chunk of reader) {
+        const text = (carry + chunk).replace(/^\uFEFF/, '');
+        const lines = text.split(/\r?\n/);
+        carry = lines.pop() || '';
+        const filtered = lines.map((line) => (stripLineRe.test(line) ? `-- [Culkibo] omitido` : line)).join('\n') + '\n';
+        if (!out.write(filtered)) {
+          await new Promise((resolve, reject) => {
+            out.once('drain', resolve);
+            out.once('error', reject);
+          });
+        }
+      }
+      if (carry) {
+        const finalLine = stripLineRe.test(carry) ? '-- [Culkibo] omitido\n' : `${carry}\n`;
+        out.write(finalLine);
+      }
+      await new Promise((resolve, reject) => {
+        out.once('finish', resolve);
+        out.once('error', reject);
+        out.end();
+      });
+    } catch (err) {
+      out.destroy();
+      try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch (e) {}
+      throw err;
+    }
   }
 
   /** Comprueba si un fichero en disco comienza por la cabecera gzip (0x1f 0x8b). */
@@ -1730,90 +1911,91 @@ class DatabaseManager extends EventEmitter {
       this.assertNoActiveLongOp(id);
       if (!(await this.isDockerAvailable())) throw new Error('Docker no está disponible');
 
+      // Reservar el slot de operación activa ANTES de descargar de S3 para impedir colisión con backups programados
+      this._activeOps.set(id, { kind: 'restore', startedAt: Date.now() });
+
       const dir = this.backupDir(id);
       /** @type {string | null} */
       let archivePath = null;
       let downloaded = false;
       /** @type {string | null} */
       let tempRemotePath = null;
-
-      if (backupId) {
-        const entry = (record.backups || []).find((b) => b.id === backupId);
-        if (!entry) throw new Error(`Copia ${backupId} no encontrada en el historial`);
-        const candidate = assertContainedPath(dir, entry.fileName);
-        if (fs.existsSync(candidate)) {
-          archivePath = candidate;
-          const actual = await this.sha256File(candidate);
-          if (entry.sha256 && actual !== entry.sha256) {
-            throw new Error('La copia local no coincide con su sha256: fichero corrupto, no se restaura');
-          }
-        } else if (entry.remote && entry.remote.key) {
-          const s3 = this.s3ClientFor();
-          if (!s3) throw new Error('La copia sólo existe en remoto y no hay S3 configurado');
-          archivePath = candidate;
-          await s3.downloadFile(entry.remote.key, archivePath);
-          downloaded = true;
-          if (entry.sha256) {
-            const actual = await this.sha256File(archivePath);
-            if (actual !== entry.sha256) {
-              try { fs.unlinkSync(archivePath); } catch (e) {}
-              throw new Error('La copia descargada de S3 no coincide con su sha256: descarga corrupta, no se restaura');
-            }
-          }
-        } else {
-          throw new Error('La copia no está ni en disco ni en el bucket');
-        }
-      } else if (remoteKey) {
-        const s3 = this.s3ClientFor();
-        if (!s3) throw new Error('No hay almacenamiento S3 configurado');
-        const safeBase = path.basename(String(remoteKey)).replace(/[^a-zA-Z0-9._-]/g, '_') || 'backup.gz';
-        tempRemotePath = assertContainedPath(dir, `remote_${Date.now().toString(36)}_${safeBase}`);
-        archivePath = tempRemotePath;
-        await s3.downloadFile(String(remoteKey), archivePath);
-        downloaded = true;
-      } else {
-        throw new Error('Indique backupId o remoteKey');
-      }
-
-      // Validar integridad básica ANTES de crear snapshot o tocar el contenedor vivo
-      const archStat = fs.statSync(archivePath);
-      if (archStat.size <= 0) {
-        if (tempRemotePath) { try { fs.unlinkSync(tempRemotePath); } catch (e) {} }
-        throw new Error('El archivo de copia está vacío (0 bytes), no se restaura');
-      }
-      if (archivePath.endsWith('.gz') && !this.hasGzipMagic(archivePath)) {
-        if (tempRemotePath) { try { fs.unlinkSync(tempRemotePath); } catch (e) {} }
-        throw new Error('El archivo de copia .gz no tiene una cabecera gzip válida, no se restaura');
-      }
-
-      this._activeOps.set(id, { kind: 'restore', startedAt: Date.now() });
-
-      // Instantánea automática de seguridad previa a la restauración (1-clic Undo)
+      /** @type {string} */
+      let plainPath = '';
+      /** @type {string | null} */
+      let sanitizedSqlPath = null;
+      let madeTemp = false;
+      const inContainer = `/tmp/culkibo_restore_${crypto.randomBytes(6).toString('hex')}`;
       /** @type {any} */
       let safetyBackup = null;
       /** @type {string | null} */
       let safetyBackupWarning = null;
-      if (createSafetySnapshot !== false) {
-        try {
-          const snap = await this.runBackup(id, {
-            trigger: 'pre-restore',
-            skipS3: true,
-            skipRetention: true,
-            bypassOpGuard: true
-          });
-          safetyBackup = snap.backup || null;
-        } catch (snapErr) {
-          safetyBackupWarning = `No se pudo crear la copia previa de seguridad: ${snapErr.message}`;
-          console.warn(`[Databases] ${safetyBackupWarning}`);
-        }
-      }
-
-      /** @type {string} */
-      let plainPath = archivePath;
-      let madeTemp = false;
-      const inContainer = `/tmp/culkibo_restore_${crypto.randomBytes(6).toString('hex')}`;
 
       try {
+        if (backupId) {
+          const entry = (record.backups || []).find((b) => b.id === backupId);
+          if (!entry) throw new Error(`Copia ${backupId} no encontrada en el historial`);
+          const candidate = assertContainedPath(dir, entry.fileName);
+          if (fs.existsSync(candidate)) {
+            archivePath = candidate;
+            const actual = await this.sha256File(candidate);
+            if (entry.sha256 && actual !== entry.sha256) {
+              throw new Error('La copia local no coincide con su sha256: fichero corrupto, no se restaura');
+            }
+          } else if (entry.remote && entry.remote.key) {
+            const s3 = this.s3ClientFor();
+            if (!s3) throw new Error('La copia sólo existe en remoto y no hay S3 configurado');
+            archivePath = candidate;
+            await s3.downloadFile(entry.remote.key, archivePath);
+            downloaded = true;
+            if (entry.sha256) {
+              const actual = await this.sha256File(archivePath);
+              if (actual !== entry.sha256) {
+                try { fs.unlinkSync(archivePath); } catch (e) {}
+                throw new Error('La copia descargada de S3 no coincide con su sha256: descarga corrupta, no se restaura');
+              }
+            }
+          } else {
+            throw new Error('La copia no está ni en disco ni en el bucket');
+          }
+        } else if (remoteKey) {
+          const s3 = this.s3ClientFor();
+          if (!s3) throw new Error('No hay almacenamiento S3 configurado');
+          const safeBase = path.basename(String(remoteKey)).replace(/[^a-zA-Z0-9._-]/g, '_') || 'backup.gz';
+          tempRemotePath = assertContainedPath(dir, `remote_${Date.now().toString(36)}_${safeBase}`);
+          archivePath = tempRemotePath;
+          await s3.downloadFile(String(remoteKey), archivePath);
+          downloaded = true;
+        } else {
+          throw new Error('Indique backupId o remoteKey');
+        }
+
+        // Validar integridad básica ANTES de crear snapshot o tocar el contenedor vivo
+        const archStat = fs.statSync(archivePath);
+        if (archStat.size <= 0) {
+          throw new Error('El archivo de copia está vacío (0 bytes), no se restaura');
+        }
+        if (archivePath.endsWith('.gz') && !this.hasGzipMagic(archivePath)) {
+          throw new Error('El archivo de copia .gz no tiene una cabecera gzip válida, no se restaura');
+        }
+
+        // Instantánea automática de seguridad previa a la restauración (1-clic Undo)
+        if (createSafetySnapshot !== false) {
+          try {
+            const snap = await this.runBackup(id, {
+              trigger: 'pre-restore',
+              skipS3: true,
+              skipRetention: true,
+              bypassOpGuard: true
+            });
+            safetyBackup = snap.backup || null;
+          } catch (snapErr) {
+            safetyBackupWarning = `No se pudo crear la copia previa de seguridad: ${snapErr.message}`;
+            console.warn(`[Databases] ${safetyBackupWarning}`);
+          }
+        }
+
+        plainPath = archivePath;
         if (archivePath.endsWith('.gz') && !archivePath.endsWith('.archive.gz')) {
           plainPath = path.join(TMP_DIR, `restore_${record.id}_${crypto.randomBytes(5).toString('hex')}`);
           madeTemp = true;
@@ -1822,6 +2004,18 @@ class DatabaseManager extends EventEmitter {
 
         if (engine.family === 'redis') {
           const dataDir = record.dataDir || this.resolveDataDir(engine, record.image);
+          // Verificar cabecera mágica de 5 bytes `REDIS` antes de detener el contenedor o sustituir dump.rdb
+          const rdbHeader = Buffer.alloc(5);
+          const rdbFd = fs.openSync(plainPath, 'r');
+          try {
+            const bytesRead = fs.readSync(rdbFd, rdbHeader, 0, 5, 0);
+            if (bytesRead < 5 || rdbHeader.toString('ascii') !== 'REDIS') {
+              throw new Error('El archivo de copia no es un volcado RDB de Redis/Valkey válido (falta cabecera mágica REDIS)');
+            }
+          } finally {
+            fs.closeSync(rdbFd);
+          }
+
           await this.docker(['stop', '-t', '30', record.containerName], { timeout: 90000 });
           try {
             try {
@@ -1862,7 +2056,7 @@ class DatabaseManager extends EventEmitter {
             try { fs.unlinkSync(cfgLocal); } catch (e) {}
             try { await this.docker(['exec', record.containerName, 'rm', '-f', cfgRemote], { timeout: 15000 }); } catch (e) {}
           }
-        } else if (engine.family === 'postgres') {
+        } else if (engine.family === 'postgresql') {
           // Cerrar sesiones abiertas sobre la BD para evitar bloqueos en DROP/CREATE de pg_restore o psql
           try {
             const safeDb = assertIdentifier(record.dbName, 'base de datos');
@@ -1880,6 +2074,7 @@ class DatabaseManager extends EventEmitter {
             await this.docker(['exec', record.containerName, ...argv], { timeout: 6 * 3600 * 1000 });
           } else {
             // Volcado SQL plano (.sql / .sql.gz subido manualmente o de otro proveedor)
+            await this.assertSafeSqlFile(plainPath, 'postgresql');
             await this.docker([
               'exec', '-i', record.containerName, 'psql',
               '-U', record.username, '-d', record.dbName, '-v', 'ON_ERROR_STOP=1'
@@ -1887,14 +2082,21 @@ class DatabaseManager extends EventEmitter {
           }
         } else {
           const plan = engine.restore({ username: record.username, dbName: record.dbName, inFile: inContainer });
+          let inputForRestore = plainPath;
+          if (plan.stdinFile && (engine.family === 'mysql' || engine.family === 'mariadb')) {
+            await this.assertSafeSqlFile(plainPath, engine.family);
+            sanitizedSqlPath = path.join(TMP_DIR, `sanitized_${record.id}_${crypto.randomBytes(5).toString('hex')}.sql`);
+            await this.sanitizeMysqlSqlFile(plainPath, sanitizedSqlPath);
+            inputForRestore = sanitizedSqlPath;
+          }
           if (!plan.stdinFile) {
-            await this.docker(['cp', plainPath, `${record.containerName}:${inContainer}`], { timeout: 3600 * 1000 });
+            await this.docker(['cp', inputForRestore, `${record.containerName}:${inContainer}`], { timeout: 3600 * 1000 });
           }
           const argv = this.wrapInContainer(engine, plan.program, plan.args);
           if (plan.stdinFile) {
             await this.docker(['exec', '-i', record.containerName, ...argv], {
               timeout: 6 * 3600 * 1000,
-              inputFile: plainPath
+              inputFile: inputForRestore
             });
           } else {
             await this.docker(['exec', record.containerName, ...argv], { timeout: 6 * 3600 * 1000 });
@@ -1902,15 +2104,27 @@ class DatabaseManager extends EventEmitter {
         }
 
         this.emit('restore_completed', { databaseId: id, safetyBackupId: safetyBackup ? safetyBackup.id : null });
+        try { require('./telemetryService').recordFeatureUsage(`db_restore:${record.engine}`, true); } catch (e) {}
         return { success: true, databaseId: id, method: engine.family, downloaded, safetyBackup, safetyBackupWarning };
       } catch (err) {
+        try {
+          const ts = require('./telemetryService');
+          ts.recordFeatureUsage(`db_restore:${record.engine}`, false);
+          ts.captureOperationFailure({
+            operation: 'database_restore',
+            stage: 'restore',
+            kind: record.engine,
+            message: this.redactMessage(err.message, this.decryptPassword(record))
+          });
+        } catch (e) {}
         if (safetyBackup) {
           err.safetyBackupId = safetyBackup.id;
         }
         throw err;
       } finally {
         try { await this.docker(['exec', record.containerName, 'rm', '-f', inContainer], { timeout: 15000 }); } catch (e) {}
-        if (madeTemp) { try { fs.unlinkSync(plainPath); } catch (e) {} }
+        if (madeTemp && plainPath) { try { fs.unlinkSync(plainPath); } catch (e) {} }
+        if (sanitizedSqlPath) { try { fs.unlinkSync(sanitizedSqlPath); } catch (e) {} }
         if (tempRemotePath) { try { fs.unlinkSync(tempRemotePath); } catch (e) {} }
         if (this._activeOps.get(id)?.kind === 'restore') {
           this._activeOps.delete(id);
@@ -1993,7 +2207,7 @@ class DatabaseManager extends EventEmitter {
 
     const started = Date.now();
     try {
-      if (engine.family === 'postgres') {
+      if (engine.family === 'postgresql') {
         const ver = await this.docker([
           'exec', record.containerName, 'psql', '-U', record.username, '-d', record.dbName,
           '-tAc', 'SELECT version();'
@@ -2018,7 +2232,7 @@ class DatabaseManager extends EventEmitter {
           const [name, size, rows] = line.split('\t');
           return { name, sizeBytes: parseInt(size, 10) || 0, rows: parseInt(rows, 10) || 0 };
         });
-      } else if (engine.family === 'mysql') {
+      } else if (engine.family === 'mysql' || engine.family === 'mariadb') {
         const cli = record.engine === 'mariadb' ? 'mariadb' : 'mysql';
         const ver = await this.docker([
           'exec', record.containerName, ...this.wrapInContainer(engine, cli, ['-u', 'root', '-N', '-B', '-e', 'SELECT VERSION();'])
@@ -2106,7 +2320,7 @@ class DatabaseManager extends EventEmitter {
    * Plan de retención abuelo-padre-hijo (con soporte opcional de ventana horaria
    * y protección de instantáneas `pre-restore` y copias fijadas).
    *
-   * @param {Array<{id:string, createdAt:string, trigger?:string, pinned?:boolean}>} backups
+   * @param {Array<{id:string, createdAt:string, trigger?:string, pinned?:boolean, remote?:any, remotePendingDelete?:boolean, localDeleted?:boolean}>} backups
    * @param {{hourly?:number | string, daily?:number | string, weekly?:number | string}} [policy]
    * @returns {{keep:string[], prune:string[], reasons:Object}}
    */
@@ -2115,8 +2329,13 @@ class DatabaseManager extends EventEmitter {
     const daily = Math.max(0, parseInt(String(policy.daily ?? 0), 10) || 0);
     const weekly = Math.max(0, parseInt(String(policy.weekly ?? 0), 10) || 0);
 
+    const validTime = (ts) => {
+      const t = new Date(ts).getTime();
+      return Number.isFinite(t) ? t : null;
+    };
+
     const sorted = (backups || [])
-      .filter((b) => b && b.id && b.createdAt)
+      .filter((b) => b && b.id && !b.remotePendingDelete && !b.localDeleted && validTime(b.createdAt) !== null)
       .slice()
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
@@ -2126,6 +2345,13 @@ class DatabaseManager extends EventEmitter {
     if (sorted.length) {
       keep.add(sorted[0].id);
       reasons[sorted[0].id] = 'última copia';
+    }
+
+    // Proteger también la copia S3 remota verificada más reciente (evita borrar el último backup offsite si los últimos locales fallaron al subir)
+    const newestRemote = sorted.find((b) => Boolean(b.remote && b.remote.key));
+    if (newestRemote && !keep.has(newestRemote.id)) {
+      keep.add(newestRemote.id);
+      reasons[newestRemote.id] = 'última copia S3 verificada';
     }
 
     // Proteger copias fijadas y las 3 instantáneas `pre-restore` más recientes
@@ -2141,21 +2367,22 @@ class DatabaseManager extends EventEmitter {
       }
     }
 
+    // Claves en UTC (evita duplicados/huecos en cambios de horario DST)
     const hourKey = (d) => {
       const x = new Date(d);
-      return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}T${String(x.getHours()).padStart(2, '0')}`;
+      return `${x.getUTCFullYear()}-${String(x.getUTCMonth() + 1).padStart(2, '0')}-${String(x.getUTCDate()).padStart(2, '0')}T${String(x.getUTCHours()).padStart(2, '0')}`;
     };
     const dayKey = (d) => {
       const x = new Date(d);
-      return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
+      return `${x.getUTCFullYear()}-${String(x.getUTCMonth() + 1).padStart(2, '0')}-${String(x.getUTCDate()).padStart(2, '0')}`;
     };
     const weekKey = (d) => {
       const x = new Date(d);
-      x.setHours(0, 0, 0, 0);
-      x.setDate(x.getDate() + 3 - ((x.getDay() + 6) % 7));
-      const jan4 = new Date(x.getFullYear(), 0, 4);
-      const week = 1 + Math.round(((x.getTime() - jan4.getTime()) / 86400000 - 3 + ((jan4.getDay() + 6) % 7)) / 7);
-      return `${x.getFullYear()}-W${String(week).padStart(2, '0')}`;
+      x.setUTCHours(0, 0, 0, 0);
+      x.setUTCDate(x.getUTCDate() + 3 - ((x.getUTCDay() + 6) % 7));
+      const jan4 = new Date(Date.UTC(x.getUTCFullYear(), 0, 4));
+      const week = 1 + Math.round(((x.getTime() - jan4.getTime()) / 86400000 - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7);
+      return `${x.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
     };
 
     const pickNewestPerBucket = (keyFn, limit, label) => {
@@ -2480,6 +2707,19 @@ class DatabaseManager extends EventEmitter {
     const rawSecret = String(config.secretAccessKey || '').trim();
     const isMaskedAccess = !rawAccess || rawAccess.includes('***') || rawAccess.includes('…');
     const isMaskedSecret = !rawSecret || /^\*+$/.test(rawSecret);
+
+    // Defensa anti-exfiltración (Dokploy GHSA-7f32-g5xc-mqr7): si cambia el endpoint o bucket,
+    // exigir que se vuelvan a introducir las credenciales reales para no filtrar el secreto guardado.
+    if (existing) {
+      const nextEndpointRaw = config.endpoint ? String(config.endpoint).trim() : existing.endpoint;
+      let nextOrigin = nextEndpointRaw;
+      try { nextOrigin = new URL(nextEndpointRaw).origin; } catch (e) {}
+      const nextBucket = config.bucket ? String(config.bucket).trim() : existing.bucket;
+      const endpointChanged = nextOrigin !== existing.endpoint || nextBucket !== existing.bucket;
+      if (endpointChanged && (isMaskedAccess || isMaskedSecret)) {
+        throw new Error('Al cambiar el endpoint o bucket S3 debes volver a introducir Access Key y Secret Key completos por seguridad');
+      }
+    }
 
     const resolvedConfig = {
       ...config,

@@ -350,9 +350,13 @@ function verifyBcrypt(password, hash) {
   return crypto.timingSafeEqual(a, b);
 }
 
-/** Comprueba si una cadena ya es un hash bcrypt válido. */
+/** Comprueba si una cadena ya es un hash bcrypt válido con coste acotado (4..14). */
 function isBcryptHash(value) {
-  return typeof value === 'string' && /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(value);
+  if (typeof value !== 'string') return false;
+  const m = value.match(/^\$2[aby]\$(\d{2})\$[./A-Za-z0-9]{53}$/);
+  if (!m) return false;
+  const cost = parseInt(m[1], 10);
+  return cost >= 4 && cost <= 14;
 }
 
 module.exports = {

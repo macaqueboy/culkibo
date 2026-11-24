@@ -129,11 +129,11 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
   const syncCommand = cmdMode === 'local'
     ? `npx culkibo sync ${projectId}`
     : tempToken
-      ? `npx culkibo sync ${projectId} --url ${tempToken.wsUrl} --token ${tempToken.ticket}`
+      ? `npx culkibo sync ${projectId} --url ${tempToken.wsUrl} --ticket ${tempToken.ticket}`
       : `npx culkibo sync ${projectId} --url ${wsProto}//${host}/ws/sync --token TU_CULKIBO_TOKEN`;
 
   const displaySyncCommand = cmdMode === 'remote' && tempToken
-    ? `npx culkibo sync ${projectId} --url ${tempToken.wsUrl} --token ${tempToken.ticket.slice(0, 8)}••••••••`
+    ? `npx culkibo sync ${projectId} --url ${tempToken.wsUrl} --ticket ${tempToken.ticket.slice(0, 8)}••••••••`
     : syncCommand;
 
   const handleGenerateSyncToken = async () => {
@@ -142,7 +142,7 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
       const res = await api.createSyncToken(projectId);
       setTempToken({ ticket: res.ticket, wsUrl: res.wsUrl, expiresAt: res.expiresAt });
       setCmdMode('remote');
-      onNotify('Token temporal de Live Sync generado (caduca en 60 s)', 'success');
+      onNotify('Ticket temporal de Live Sync generado (caduca en 30 s)', 'success');
     } catch (err: any) {
       onNotify(err?.message || 'No se pudo generar el token temporal', 'error');
     } finally {

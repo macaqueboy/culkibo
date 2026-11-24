@@ -21,12 +21,24 @@ const MAX_RING_ENTRIES = 250;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const SENSITIVE_KEY_RE = /(token|secret|password|passwd|apikey|api_key|privatekey|private_key|authorization|cookie|passphrase|credential)/i;
 
+/** Redacta secretos incrustados dentro de cadenas libres (Bearer, PATs, URLs con credenciales, PEM). */
+function redactInlineSecrets(str) {
+  let s = str;
+  s = s.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[REDACTED_PEM]');
+  s = s.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]');
+  s = s.replace(/\b(gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,}|ckh_[a-f0-9]{16,})\b/g, '[REDACTED]');
+  s = s.replace(/((?:https?|postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp):\/\/[^:\s/@]+:)([^@\s/]+)(@)/gi, '$1[REDACTED]$3');
+  s = s.replace(/([?&](?:token|key|secret|password|passwd|api_key|apikey|access_token)=)[^&\s]+/gi, '$1[REDACTED]');
+  return s;
+}
+
 /** @param {any} value @param {number} [depth] */
 function sanitizeDetail(value, depth = 0) {
   if (value == null) return value;
   if (depth > 3) return '[truncated]';
   if (typeof value === 'string') {
-    return value.length > 300 ? `${value.slice(0, 300)}...` : value;
+    const clean = redactInlineSecrets(value);
+    return clean.length > 300 ? `${clean.slice(0, 300)}...` : clean;
   }
   if (typeof value === 'number' || typeof value === 'boolean') return value;
   if (Array.isArray(value)) {

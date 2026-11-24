@@ -40,15 +40,44 @@ function verifyHmacSha256(rawBuffer, secret, providedSignature) {
   return timingSafeStrEqual(expected, clean);
 }
 
-/** Extrae el slug canónico `owner/repo` (o `group/sub/repo`) desde cualquier URL Git. */
+/** Extrae el slug canónico `owner/repo` (o `group/sub/repo`) desde cualquier URL Git (incl. `ssh://git@host:2222/org/repo.git`). */
 function normalizeRepoSlug(raw) {
   const s = String(raw || '').trim().toLowerCase();
   if (!s) return '';
   return s
-    .replace(/^https?:\/\/(?:[^@/\s]+@)?[^/\s]+\//, '')
+    .replace(/^(?:https?|ssh|git):\/\/(?:[^@/\s]+@)?[^/\s]+\//, '')
     .replace(/^git@[^:\s]+:/, '')
     .replace(/\.git$/, '')
     .replace(/^\/+|\/+$/g, '');
+}
+
+const SKIP_CI_RE = /\[(skip ci|ci skip|skip cd|cd skip|no ci|culkibo skip)\]/i;
+
+/** Convierte un patrón glob sencillo (`*`, `**`) a RegExp sin dependencias ni ReDoS. */
+function compileWatchGlob(pattern) {
+  let out = '^';
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === '*') {
+      if (pattern[i + 1] === '*') {
+        if (pattern[i + 2] === '/') {
+          out += '(?:.*/)?';
+          i += 2;
+        } else {
+          out += '.*';
+          i += 1;
+        }
+      } else {
+        out += '[^/]*';
+      }
+    } else if (/[.+?^${}()|[\]\\]/.test(ch)) {
+      out += `\\${ch}`;
+    } else {
+      out += ch;
+    }
+  }
+  out += '$';
+  return new RegExp(out);
 }
 
 /** Comprueba si una lista de ficheros tocados en el push intersecta `project.watchPaths`. */
@@ -59,14 +88,15 @@ function matchesWatchPaths(watchPaths, changedFiles) {
     .map((p) => String(p || '').trim().replace(/^\/+|\/+$/g, ''))
     .filter(Boolean);
   if (normalizedWatch.length === 0) return true;
+  const compiled = normalizedWatch.map((w) => ({
+    raw: w,
+    re: w.includes('*') ? compileWatchGlob(w) : null
+  }));
   return changedFiles.some((f) => {
     const cleanFile = String(f || '').replace(/^\/+/, '');
-    return normalizedWatch.some((w) => {
-      if (w.endsWith('/*')) {
-        const prefix = w.slice(0, -1);
-        return cleanFile.startsWith(prefix);
-      }
-      return cleanFile === w || cleanFile.startsWith(`${w}/`);
+    return compiled.some(({ raw, re }) => {
+      if (re) return re.test(cleanFile);
+      return cleanFile === raw || cleanFile.startsWith(`${raw}/`);
     });
   });
 }
@@ -95,6 +125,18 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
   const shortSha = String(commitSha || `c_${Date.now().toString(36)}`).slice(0, 7);
   const now = new Date().toISOString();
   const label = provider.charAt(0).toUpperCase() + provider.slice(1);
+
+  if (commitMsg && SKIP_CI_RE.test(String(commitMsg))) {
+    return {
+      status: 200,
+      body: {
+        success: true,
+        deployed: false,
+        skipped: true,
+        reason: 'Commit marcado con [skip ci] / [ci skip]'
+      }
+    };
+  }
 
   const branchProjects = projects.filter((p) => (p.gitBranch || 'main') === branch);
   if (branchProjects.length === 0) {
@@ -315,8 +357,13 @@ async function handleGitLabWebhook(req) {
 
   if (event === 'Merge Request Hook' || body.object_kind === 'merge_request') {
     const attrs = body.object_attributes || {};
-    const mrAction = attrs.action === 'merge' ? 'merged' : attrs.action === 'close' ? 'closed' : (attrs.action === 'open' ? 'opened' : (attrs.action === 'reopen' ? 'reopened' : 'update'));
-    const isFork = Boolean(attrs.source_project_id && attrs.target_project_id && attrs.source_project_id !== attrs.target_project_id);
+    const actionMap = { merge: 'merged', close: 'closed', open: 'opened', reopen: 'reopened', update: 'update' };
+    const mrAction = actionMap[String(attrs.action || '').toLowerCase()] || null;
+    if (!mrAction) {
+      return { status: 200, body: { success: true, ignored: true, reason: `Acción MR '${attrs.action || ''}' ignorada` } };
+    }
+    // Fail-closed: si falta source_project_id o target_project_id, tratar como fork
+    const isFork = !attrs.source_project_id || !attrs.target_project_id || attrs.source_project_id !== attrs.target_project_id;
     return dispatchPullRequest({
       provider: 'gitlab',
       projects: authorized,
@@ -377,7 +424,9 @@ async function handleGiteaWebhook(req) {
 
   if (event === 'pull_request' && body.pull_request) {
     const pr = body.pull_request;
-    const isFork = Boolean(pr.head?.repo?.full_name && pr.base?.repo?.full_name && pr.head.repo.full_name !== pr.base.repo.full_name);
+    const headFull = String(pr.head?.repo?.full_name || '').trim().toLowerCase();
+    const baseFull = String(pr.base?.repo?.full_name || '').trim().toLowerCase();
+    const isFork = !headFull || !baseFull || headFull !== baseFull;
     return dispatchPullRequest({
       provider: 'gitea',
       projects: authorized,
@@ -434,29 +483,49 @@ async function handleBitbucketWebhook(req) {
   }
 
   if (event === 'repo:push') {
-    const change = Array.isArray(body?.push?.changes) ? body.push.changes[0] : null;
-    if (!change || !change.new || change.new.type !== 'branch') {
+    const allChanges = Array.isArray(body?.push?.changes) ? body.push.changes : [];
+    const branchChanges = allChanges.filter((c) => c && c.new && c.new.type === 'branch');
+    if (branchChanges.length === 0) {
       return { status: 200, body: { success: true, deployed: false, reason: 'Evento Bitbucket sin cambio de rama ignorado' } };
     }
-    const branch = change.new.name;
-    const commitSha = change.new.target?.hash || '';
-    const commitMsg = change.new.target?.message || 'Push desde Bitbucket';
     const author = body?.actor?.display_name || body?.actor?.nickname || 'Bitbucket';
-    return dispatchPush({
-      provider: 'bitbucket',
-      projects: authorized,
-      branch,
-      commitSha,
-      commitMsg,
-      author,
-      deliveryId: req.headers['x-request-uuid'] || null
-    });
+    /** @type {any} */
+    let lastResult = null;
+    for (const change of branchChanges) {
+      const branch = change.new.name;
+      const commitSha = change.new.target?.hash || '';
+      const commitMsg = change.new.target?.message || 'Push desde Bitbucket';
+      const deliveryId = req.headers['x-request-uuid'] ? `${req.headers['x-request-uuid']}:${branch}` : null;
+      const res = await dispatchPush({
+        provider: 'bitbucket',
+        projects: authorized,
+        branch,
+        commitSha,
+        commitMsg,
+        author,
+        deliveryId: /** @type {any} */ (deliveryId)
+      });
+      if (res.body && res.body.deployed) return res;
+      lastResult = res;
+    }
+    return lastResult || { status: 200, body: { success: true, deployed: false, reason: 'Sin ramas coincidentes' } };
   }
 
   if (event.startsWith('pullrequest:') && body.pullrequest) {
     const pr = body.pullrequest;
-    const act = event === 'pullrequest:fulfilled' ? 'merged' : (event === 'pullrequest:rejected' ? 'closed' : 'opened');
-    const isFork = Boolean(pr.source?.repository?.full_name && pr.destination?.repository?.full_name && pr.source.repository.full_name !== pr.destination.repository.full_name);
+    const bbActions = {
+      'pullrequest:created': 'opened',
+      'pullrequest:updated': 'update',
+      'pullrequest:fulfilled': 'merged',
+      'pullrequest:rejected': 'closed'
+    };
+    const act = bbActions[event] || null;
+    if (!act) {
+      return { status: 200, body: { success: true, ignored: true, event } };
+    }
+    const srcRepo = String(pr.source?.repository?.full_name || '').trim().toLowerCase();
+    const dstRepo = String(pr.destination?.repository?.full_name || '').trim().toLowerCase();
+    const isFork = !srcRepo || !dstRepo || srcRepo !== dstRepo;
     return dispatchPullRequest({
       provider: 'bitbucket',
       projects: authorized,

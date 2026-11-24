@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Culkibo Telemetry Ops</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --ink: #0f172a;
+      --muted: #64748b;
+      --red: #dc2626;
+      --amber: #d97706;
+      --green: #059669;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--sans); background: var(--bg); color: var(--ink); font-size: 14px; line-height: 1.45; }
+    header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .brand { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); background: #f1f5f9; color: #334155; font-weight: 600; }
+    .pill.crash { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+    .pill.open { background: #fffbeb; color: #b45309; border-color: #fde68a; }
+    .pill.resolved { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
+    .pill.ignored { background: #f1f5f9; color: #475569; border-color: #cbd5e1; }
+    main { max-width: 1200px; margin: 24px auto; padding: 0 20px 48px; }
+    .btn { background: var(--surface); border: 1px solid var(--border); color: var(--ink); padding: 7px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .btn:hover { background: #f1f5f9; }
+    .btn.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
+    .btn.primary:hover { background: #1e293b; }
+    .grid-kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+    .kpi-label { font-size: 12px; color: var(--muted); }
+    .kpi-val { font-size: 24px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-bottom: 20px; }
+    h2 { font-size: 14px; margin: 0 0 12px; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+    th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: #f8fafc; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover td { background: #f8fafc; }
+    .mono { font-family: var(--mono); font-size: 11px; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    select, input[type="password"] { border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 12px; background: var(--surface); color: var(--ink); }
+    .login-wrap { max-width: 400px; margin: 80px auto; }
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.45); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+    .modal-backdrop.open { display: flex; }
+    .modal { background: var(--surface); border-radius: 14px; max-width: 720px; width: 100%; max-height: 85vh; overflow: auto; padding: 20px; border: 1px solid var(--border); }
+    pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; font-family: var(--mono); font-size: 11px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+    .hidden { display: none !important; }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>Culkibo Telemetry Ops</span>
+      <span class="pill">Zero-PII Collector</span>
+    </div>
+    <div id="top-actions" class="hidden" style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn" id="btn-refresh">Actualizar</button>
+      <button class="btn" id="btn-export-json">Exportar JSON</button>
+      <button class="btn" id="btn-export-csv">Exportar CSV</button>
+      <button class="btn" id="btn-logout">Salir</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="login-view" class="login-wrap card">
+      <h2>Acceso de operaciones</h2>
+      <p class="muted" style="font-size:12px;margin-top:0;">Introduce el <code>ADMIN_TOKEN</code> configurado en tu recolector (o en <code>data/admin-token.txt</code>).</p>
+      <form id="login-form" style="display:flex;flex-direction:column;gap:10px;">
+        <input id="token-input" type="password" placeholder="ADMIN_TOKEN" required autocomplete="off" />
+        <button type="submit" class="btn primary">Entrar al panel</button>
+        <div id="login-error" style="color:var(--red);font-size:12px;"></div>
+      </form>
+    </section>
+
+    <section id="app-view" class="hidden">
+      <div class="grid-kpi" id="kpi-grid"></div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>Adopción de versiones (30 d)</h2>
+          <div id="versions-box"></div>
+        </div>
+        <div class="card">
+          <h2>Plataformas y capacidades (30 d)</h2>
+          <div id="platforms-box"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:20px;">
+        <div class="toolbar">
+          <h2 style="margin:0;">Fallos agrupados por fingerprint</h2>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <select id="filter-status">
+              <option value="open">Abiertos</option>
+              <option value="all">Todos los estados</option>
+              <option value="resolved">Resueltos</option>
+              <option value="ignored">Ignorados</option>
+            </select>
+            <select id="filter-type">
+              <option value="all">Todos los tipos</option>
+              <option value="server_crash">Server crash</option>
+              <option value="client_error">Error de interfaz</option>
+              <option value="operation_failure">Fallo operativo</option>
+              <option value="api_error_5xx">HTTP 5xx</option>
+            </select>
+          </div>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Tipo</th>
+                <th>Problema</th>
+                <th>Estado</th>
+                <th>Ocurrencias</th>
+                <th>Instancias</th>
+                <th>Última v.</th>
+                <th>Última vez</th>
+              </tr>
+            </thead>
+            <tbody id="issues-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Uso de funcionalidades y tasa de fallos (30 d)</h2>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Funcionalidad</th>
+                <th>Correctos</th>
+                <th>Fallidos</th>
+                <th>Tasa éxito</th>
+              </tr>
+            </thead>
+            <tbody id="features-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="issue-modal">
+    <div class="modal">
+      <div class="toolbar">
+        <h2 id="modal-title" style="margin:0;">Detalle del fallo</h2>
+        <button class="btn" id="modal-close">Cerrar</button>
+      </div>
+      <div id="modal-meta" class="muted" style="font-size:12px;margin-bottom:12px;"></div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;" id="modal-actions"></div>
+      <pre id="modal-json"></pre>
+    </div>
+  </div>
+
+  <script>
+    const TOKEN_KEY = 'culkibo_collector_admin_token';
+    const $ = (id) => document.getElementById(id);
+    let currentIssues = [];
+
+    function esc(s) {
+      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function fmtDate(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString('es-ES');
+    }
+    function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ''; }
+
+    async function api(path, opts = {}) {
+      const headers = Object.assign({ Authorization: 'Bearer ' + getToken() }, opts.headers || {});
+      const res = await fetch(path, Object.assign({}, opts, { headers }));
+      if (res.status === 401) {
+        sessionStorage.removeItem(TOKEN_KEY);
+        showLogin('Token inválido o caducado.');
+        throw new Error('Unauthorized');
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }
+
+    function showLogin(msg = '') {
+      $('login-view').classList.remove('hidden');
+      $('app-view').classList.add('hidden');
+      $('top-actions').classList.add('hidden');
+      $('login-error').textContent = msg;
+    }
+
+    function showApp() {
+      $('login-view').classList.add('hidden');
+      $('app-view').classList.remove('hidden');
+      $('top-actions').classList.remove('hidden');
+    }
+
+    async function refreshAll() {
+      const status = $('filter-status').value;
+      const type = $('filter-type').value;
+      const [summary, issuesRes] = await Promise.all([
+        api('/admin/api/summary'),
+        api('/admin/api/issues?status=' + encodeURIComponent(status) + '&type=' + encodeURIComponent(type)),
+      ]);
+      const k = summary.kpis || {};
+      $('kpi-grid').innerHTML = [
+        ['Activas 24 h', k.active24h],
+        ['Activas 7 d', k.active7d],
+        ['Activas 30 d', k.active30d],
+        ['Crashes abiertos', k.openCrashes],
+        ['Fallos abiertos', k.openIssues],
+        ['Eventos totales', k.totalEvents],
+      ].map(([l, v]) => `<div class="card"><div class="kpi-label">${esc(l)}</div><div class="kpi-val">${esc(v ?? 0)}</div></div>`).join('');
+
+      $('versions-box').innerHTML = (summary.versions || []).length
+        ? '<table><tbody>' + summary.versions.map((v) => `<tr><td class="mono">v${esc(v.version)}</td><td style="text-align:right;font-weight:600;">${esc(v.count)}</td></tr>`).join('') + '</tbody></table>'
+        : '<div class="muted">Sin instancias registradas todavía.</div>';
+
+      const c = summary.capabilities || {};
+      const platRows = (summary.platforms || []).map((p) => `<tr><td class="mono">${esc(p.platform)}/${esc(p.arch)}</td><td style="text-align:right;font-weight:600;">${esc(p.count)}</td></tr>`).join('');
+      $('platforms-box').innerHTML = (platRows ? '<table><tbody>' + platRows + '</tbody></table>' : '<div class="muted">Sin datos de plataforma.</div>')
+        + `<div class="muted" style="font-size:11px;margin-top:10px;">Docker: ${c.dockerYes || 0} sí / ${c.dockerNo || 0} no · Caddy: ${c.caddyYes || 0} sí / ${c.caddyNo || 0} no</div>`;
+
+      currentIssues = issuesRes.issues || [];
+      $('issues-body').innerHTML = currentIssues.length
+        ? currentIssues.map((it, idx) => `
+            <tr class="clickable" data-idx="${idx}">
+              <td><span class="pill ${it.type === 'server_crash' ? 'crash' : ''}">${esc(it.type)}</span></td>
+              <td><div style="font-weight:600;">${esc(it.title)}</div><div class="mono muted">${esc(it.fingerprint)}</div></td>
+              <td><span class="pill ${esc(it.status)}">${esc(it.status)}</span></td>
+              <td class="mono">${esc(it.occurrences)}</td>
+              <td class="mono">${esc(it.affectedInstances)}</td>
+              <td class="mono">v${esc(it.lastVersion)}</td>
+              <td class="muted">${esc(fmtDate(it.lastSeen))}</td>
+            </tr>`).join('')
+        : '<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">Sin fallos en este filtro.</td></tr>';
+
+      const feats = summary.topFeatures || [];
+      $('features-body').innerHTML = feats.length
+        ? feats.map((f) => {
+            const total = (f.okCount || 0) + (f.failCount || 0);
+            const pct = total > 0 ? Math.round(((f.okCount || 0) / total) * 100) : 100;
+            return `<tr><td class="mono">${esc(f.feature)}</td><td>${esc(f.okCount)}</td><td>${esc(f.failCount)}</td><td><strong>${pct}%</strong></td></tr>`;
+          }).join('')
+        : '<tr><td colspan="4" class="muted" style="text-align:center;padding:20px;">Sin contadores de funciones todavía.</td></tr>';
+    }
+
+    function openIssueModal(issue) {
+      $('modal-title').textContent = issue.title;
+      $('modal-meta').textContent = `FP: ${issue.fingerprint} · Tipo: ${issue.type} · Ocurrencias: ${issue.occurrences} · Instancias: ${issue.affectedInstances} · Versiones: ${(issue.versions || []).join(', ')}`;
+      $('modal-json').textContent = JSON.stringify(issue.sample, null, 2);
+      $('modal-actions').innerHTML = [
+        ['open', 'Marcar abierto'],
+        ['resolved', 'Marcar resuelto'],
+        ['ignored', 'Ignorar'],
+      ].map(([st, lbl]) => `<button class="btn ${issue.status === st ? 'primary' : ''}" data-set-status="${st}">${lbl}</button>`).join('');
+      $('modal-actions').querySelectorAll('button').forEach((btn) => {
+        btn.onclick = async () => {
+          await api('/admin/api/issues/' + encodeURIComponent(issue.fingerprint), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: btn.dataset.setStatus }),
+          });
+          $('issue-modal').classList.remove('open');
+          await refreshAll();
+        };
+      });
+      $('issue-modal').classList.add('open');
+    }
+
+    $('issues-body').addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-idx]');
+      if (!tr) return;
+      const issue = currentIssues[Number(tr.dataset.idx)];
+      if (issue) openIssueModal(issue);
+    });
+    $('modal-close').onclick = () => $('issue-modal').classList.remove('open');
+    $('filter-status').onchange = () => refreshAll();
+    $('filter-type').onchange = () => refreshAll();
+    $('btn-refresh').onclick = () => refreshAll();
+    $('btn-logout').onclick = () => { sessionStorage.removeItem(TOKEN_KEY); showLogin(); };
+
+    async function downloadExport(format) {
+      const res = await fetch('/admin/api/export?format=' + format, {
+        headers: { Authorization: 'Bearer ' + getToken() },
+      });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'culkibo-telemetry.' + format;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+    $('btn-export-json').onclick = () => downloadExport('json');
+    $('btn-export-csv').onclick = () => downloadExport('csv');
+
+    $('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      sessionStorage.setItem(TOKEN_KEY, $('token-input').value.trim());
+      try {
+        await refreshAll();
+        showApp();
+      } catch {
+        // showLogin ya fue invocado
+      }
+    });
+
+    if (getToken()) {
+      refreshAll().then(showApp).catch(() => {});
+    }
+  </script>
+</body>
+</html>

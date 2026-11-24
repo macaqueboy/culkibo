@@ -1,0 +1,14 @@
+name = "culkibo-telemetry-collector"
+main = "worker.js"
+compatibility_date = "2025-05-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "culkibo-telemetry"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# Configura secretos en producción con:
+#   wrangler secret put ADMIN_TOKEN
+#   wrangler secret put ALERT_TELEGRAM_BOT_TOKEN
+#   wrangler secret put ALERT_TELEGRAM_CHAT_ID
+#   wrangler secret put ALERT_DISCORD_WEBHOOK

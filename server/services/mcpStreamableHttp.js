@@ -58,17 +58,24 @@ function headerValue(req, name) {
   const raw = req.headers[name];
   if (raw === undefined) return null;
   if (Array.isArray(raw)) return { duplicated: true };
-  return String(raw);
+  return String(raw).trim();
 }
 
 function decodeHeaderSentinel(value) {
   if (typeof value !== 'string') return value;
   if (value.startsWith(B64_PREFIX) && value.endsWith(B64_SUFFIX) && value.length > B64_PREFIX.length + B64_SUFFIX.length) {
     const payload = value.slice(B64_PREFIX.length, -B64_SUFFIX.length);
+    if (!/^[A-Za-z0-9+/]+=*$/.test(payload) || payload.length % 4 === 1) {
+      return null;
+    }
     try {
-      return Buffer.from(payload, 'base64').toString('utf8');
+      const decoded = Buffer.from(payload, 'base64');
+      if (decoded.toString('base64').replace(/=+$/, '') !== payload.replace(/=+$/, '')) {
+        return null;
+      }
+      return decoded.toString('utf8');
     } catch (e) {
-      return value;
+      return null;
     }
   }
   return value;
@@ -144,10 +151,11 @@ async function _handlePostInner(req, res) {
   // Una notificación es una petición sin `id`. `id: null` no es válido en MCP,
   // así que no se acepta como notificación encubierta.
   const isNotification = !('id' in body) || body.id === undefined;
-  if (!isNotification && body.id === null) {
+  const isValidId = typeof body.id === 'string' || (typeof body.id === 'number' && Number.isInteger(body.id));
+  if (!isNotification && !isValidId) {
     return sendError(res, 400, jsonRpcError(null, ERROR_CODES.INVALID_REQUEST,
-      'El campo id no puede ser null: usa una cadena o un entero, u omítelo si es una notificación.',
-      { received: null }
+      'El campo id debe ser una cadena o un entero (no null, objeto, array ni booleano), u omitirse si es una notificación.',
+      { received: body.id }
     ));
   }
 
@@ -301,6 +309,8 @@ async function respondJson(res, body) {
 }
 
 async function respondStreaming(req, res, body) {
+  if (typeof req.setTimeout === 'function') req.setTimeout(0);
+  if (typeof res.setTimeout === 'function') res.setTimeout(0);
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
@@ -317,26 +327,24 @@ async function respondStreaming(req, res, body) {
   };
   const alive = () => !cancelled && !res.writableEnded;
 
-  // Cerrar el stream es la señal de cancelación de esta petición: se para el
-  // trabajo que se pueda parar y no se envía ni un mensaje más.
-  //
-  // Se escucha en `res` y no en `req`: `req` emite 'close' en cuanto el cuerpo
-  // del POST se ha leído entero, que es siempre y de inmediato, así que
-  // escucharlo ahí cancelaba todas las peticiones antes de empezar. `res`
-  // también emite 'close' al terminar bien, de ahí el `writableEnded`.
   const ac = new AbortController();
-  res.on('close', () => {
-    if (!res.writableEnded) {
+  const markCancelled = () => {
+    if (!cancelled) {
       cancelled = true;
       try { ac.abort(); } catch (e) {}
     }
     stopTimers();
+  };
+  res.on('close', () => {
+    if (!res.writableEnded) markCancelled();
+    else stopTimers();
   });
+  res.on('error', markCancelled);
 
-  try { res.write(':\r\n'); } catch (e) {}
+  try { res.write(':\r\n'); } catch (e) { markCancelled(); }
   const kaTimer = setInterval(() => {
     if (!alive()) return;
-    try { res.write(':\r\n'); } catch (e) {}
+    try { res.write(':\r\n'); } catch (e) { markCancelled(); }
   }, SSE_KEEPALIVE_MS);
   if (kaTimer.unref) kaTimer.unref();
   timers.push(kaTimer);

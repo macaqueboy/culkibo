@@ -266,7 +266,8 @@ export interface NotificationsConfig {
 
 export interface NotificationHistoryItem {
   id: string;
-  at: string;
+  at?: string;
+  timestamp?: string;
   event: string;
   level: string;
   title: string;
@@ -481,7 +482,8 @@ export interface PreviewDeploymentItem {
 
 export interface AuditLogEvent {
   id?: string;
-  at: string;
+  at?: string;
+  timestamp?: string;
   source: string;
   action: string;
   target?: string | null;
@@ -489,6 +491,38 @@ export interface AuditLogEvent {
   ip?: string | null;
   status?: string | null;
   meta?: Record<string, unknown>;
+}
+
+export interface TelemetryStatus {
+  schemaVersion: number;
+  enabled: boolean;
+  persistedEnabled: boolean;
+  lockedByEnv: boolean;
+  reason: string;
+  instanceId: string;
+  endpoint: string;
+  debug: boolean;
+  queuedEvents: number;
+  stats: {
+    enqueued: number;
+    sent: number;
+    dropped: number;
+    deduplicated: number;
+    lastFlushAt: string | null;
+    lastError: string | null;
+  };
+  circuitOpenUntil: string | null;
+  collectedTypes: string[];
+  neverCollected: string[];
+}
+
+export interface TelemetryPreview {
+  schemaVersion: number;
+  instanceId: string;
+  appVersion: string;
+  sentAt: string;
+  endpoint: string;
+  events: Array<Record<string, unknown>>;
 }
 
 export interface DbCredentials {
@@ -2599,6 +2633,40 @@ export const api = {
         body: JSON.stringify(opts)
       }),
       'No se pudo limpiar la caché de compilación'
+    );
+  },
+
+  // --- Telemetría anónima y diagnóstico ---
+
+  async getTelemetryStatus(): Promise<TelemetryStatus> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/telemetry/status`),
+      'No se pudo consultar el estado de la telemetría'
+    );
+  },
+
+  async setTelemetryEnabled(enabled: boolean): Promise<TelemetryStatus> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/telemetry/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      }),
+      'No se pudo actualizar la preferencia de telemetría'
+    );
+  },
+
+  async getTelemetryPreview(): Promise<TelemetryPreview> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/telemetry/preview`),
+      'No se pudo cargar la vista previa de telemetría'
+    );
+  },
+
+  async resetTelemetryId(): Promise<TelemetryStatus> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/telemetry/reset-id`, { method: 'POST' }),
+      'No se pudo rotar el identificador anónimo'
     );
   },
 

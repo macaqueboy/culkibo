@@ -587,10 +587,28 @@ class LocalRunner {
    * Find an available port starting from desiredPort (never kills unknown host processes).
    */
   async getAvailablePort(desiredPort) {
-    const reservedActive = portRegistry.getAllReservedPorts();
+    const startPort = Math.max(1024, parseInt(String(desiredPort || 3001), 10) || 3001);
+    const activeSet = new Set();
     for (const r of this.activeRunners.values()) {
-      if (r && r.port) reservedActive.add(Number(r.port));
+      if (r && r.port) activeSet.add(Number(r.port));
     }
+    const exclude = new Set([this.daemonPort(), ...RESERVED_PORTS, ...activeSet]);
+    // Asignación atómica vía portRegistry (evita colisiones TOCTOU entre runners locales y servicios)
+    if (typeof portRegistry.allocate === 'function') {
+      try {
+        return await portRegistry.allocate({
+          kind: 'local',
+          owner: `local_${startPort}_${Date.now()}`,
+          start: startPort,
+          end: 65000,
+          preferred: startPort,
+          extraExcluded: exclude,
+          host: '0.0.0.0'
+        });
+      } catch (e) {}
+    }
+    const reservedActive = portRegistry.getAllReservedPorts();
+    for (const p of exclude) reservedActive.add(p);
     const isPortFree = (port) => new Promise((resolve) => {
       const tester = net.createServer()
         .once('error', () => resolve(false))
@@ -600,9 +618,9 @@ class LocalRunner {
         .listen(port, '0.0.0.0');
     });
 
-    let port = Math.max(1024, parseInt(String(desiredPort || 3001), 10) || 3001);
+    let port = startPort;
     while (port < 65535) {
-      if (port !== this.daemonPort() && !RESERVED_PORTS.has(port) && !reservedActive.has(port) && await isPortFree(port)) {
+      if (!reservedActive.has(port) && await isPortFree(port)) {
         return port;
       }
       port++;
@@ -1094,6 +1112,12 @@ class LocalRunner {
 
   /** Ejecuta un comando de inicio personalizado definido por el usuario (sin shell). */
   async startCustomCommandProject(project, projectDir, port, startCommand) {
+    // Si hay package.json sin node_modules en un comando personalizado Node/npm/pnpm/yarn/bun, instalar dependencias primero
+    const pkgFile = path.join(projectDir, 'package.json');
+    const nmDir = path.join(projectDir, 'node_modules');
+    if (fs.existsSync(pkgFile) && !fs.existsSync(nmDir) && /^(?:npm|npx|pnpm|yarn|bun|node)\b/i.test(String(startCommand || '').trim())) {
+      await this.npmInstall(projectDir, { timeout: 300000, rootDir: projectDir, projectId: project.id, project }).catch(() => {});
+    }
     const argv = parseSafeCommandArgv(startCommand);
     const [cmd, ...args] = argv;
     return this.spawnManagedProcess(project, projectDir, port, { cmd, args, runtime: 'custom' });
@@ -1640,7 +1664,7 @@ class LocalRunner {
 
     if (branch != null && branch !== '') {
       const name = String(branch);
-      if (!/^[A-Za-z0-9._/-]+$/.test(name) || name.startsWith('-') || name.includes('..')) {
+      if (!/^[A-Za-z0-9._/#+-]+$/.test(name) || name.startsWith('-') || name.includes('..')) {
         cleanup();
         throw new Error(`Nombre de rama no válido: «${name}»`);
       }
