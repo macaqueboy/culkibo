@@ -39,11 +39,136 @@ const {
   rotateToken,
   onTokenRotated,
   isPrivateProxyPeer,
+  canBootstrapRequest,
   clientIp,
   checkAuthBruteForce,
   recordAuthFailure,
-  getBruteForceStats
+  getBruteForceStats,
+  requireRouteRbac
 } = require('../middleware/auth');
+
+// Carga perezosa de los módulos v2 (0 impacto en RAM al arrancar en 1 solo VPS)
+/** @type {Record<string, any>} */
+const _lazyV2 = Object.create(null);
+function getFleetManager() { return _lazyV2.fleet || (_lazyV2.fleet = require('../services/serverFleetManager')); }
+function getTeamManager() { return _lazyV2.team || (_lazyV2.team = require('../services/teamManager')); }
+function getEnvironmentManager() { return _lazyV2.env || (_lazyV2.env = require('../services/environmentManager')); }
+function getGitOpsManager() { return _lazyV2.gitops || (_lazyV2.gitops = require('../services/gitopsManager')); }
+function getUptimeMonitor() { return _lazyV2.uptime || (_lazyV2.uptime = require('../services/uptimeMonitor')); }
+function getSleepAdvisor() { return _lazyV2.sleep || (_lazyV2.sleep = require('../services/sleepAdvisor')); }
+
+/** @param {any} req */
+function getPrincipal(req) {
+  return (req && req.auth && req.auth.principal) || {
+    kind: 'legacy',
+    isSuperAdmin: true,
+    role: 'owner',
+    teamId: 'team_default',
+    projectIds: null,
+    scopes: ['*']
+  };
+}
+
+/**
+ * Verifica existencia del proyecto y autorización multi-tenant + ACL por proyecto.
+ * Devuelve el proyecto si está autorizado, o responde 404/403 y devuelve null.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} projectId
+ * @param {string} [perm]
+ * @returns {any | null}
+ */
+function assertProjectAccess(req, res, projectId, perm = 'projects:read') {
+  const principal = getPrincipal(req);
+  const project = projectManager.getById(projectId);
+  if (!project) {
+    res.status(404).json({ error: 'Proyecto no encontrado' });
+    return null;
+  }
+  if (!principal.isSuperAdmin) {
+    const check = getTeamManager().authorizeProject(principal, project.id, perm, project);
+    if (!check.allowed) {
+      if (check.status === 404) {
+        res.status(404).json({ error: 'Proyecto no encontrado' });
+        return null;
+      }
+      res.status(check.status || 403).json({
+        error: check.error || 'Sin permisos sobre este proyecto',
+        code: check.code || 'PROJECT_FORBIDDEN'
+      });
+      return null;
+    }
+  }
+  return project;
+}
+
+/**
+ * Deniega mutaciones globales sin proyecto a tokens API acotados a `projectIds`.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} [label]
+ * @returns {boolean}
+ */
+function denyProjectScopedToken(req, res, label = 'esta acción global') {
+  const principal = getPrincipal(req);
+  if (!principal.isSuperAdmin && Array.isArray(principal.projectIds)) {
+    res.status(403).json({
+      error: `Un token acotado a proyectos concretos no puede ejecutar ${label}`,
+      code: 'SCOPED_TOKEN_GLOBAL_DENIED'
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Protege recursos globales de instancia (`/vault`, `/gitops/(plan|apply|drift)`) frente a:
+ *  - tokens API acotados a `projectIds`,
+ *  - tenants de equipos secundarios (`teamId !== 'team_default'`),
+ *  - o admins no-owner cuando existen múltiples equipos activos (`teamsCount > 1`).
+ * @param {any} req
+ * @param {any} res
+ * @param {string} label
+ * @returns {boolean} true si fue denegado (ya respondió HTTP 403)
+ */
+function denyInstanceGlobalForTenant(req, res, label) {
+  if (denyProjectScopedToken(req, res, label)) return true;
+  const principal = getPrincipal(req);
+  if (principal.isSuperAdmin) return false;
+  const tm = getTeamManager();
+  if (principal.teamId && principal.teamId !== 'team_default') {
+    res.status(403).json({
+      error: `Solo el equipo principal puede acceder a ${label}`,
+      code: 'INSTANCE_GLOBAL_FORBIDDEN'
+    });
+    return true;
+  }
+  const summary = typeof tm.getStatusSummary === 'function' ? tm.getStatusSummary() : null;
+  if (summary && Number(summary.teamsCount) > 1) {
+    const ownerCheck = tm.doesPrincipalSatisfyRole(principal, 'owner', 'team_default');
+    if (!ownerCheck.allowed) {
+      res.status(403).json({
+        error: `En instancias multi-equipo solo un owner del equipo principal puede ejecutar ${label}`,
+        code: 'INSTANCE_GLOBAL_OWNER_REQUIRED'
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+/** @param {any} err @param {any} res @param {number} [fallbackStatus] */
+function sendServiceError(err, res, fallbackStatus = 400) {
+  const status = (err && Number.isInteger(err.statusCode) && err.statusCode >= 400 && err.statusCode < 600)
+    ? err.statusCode
+    : (err && Number.isInteger(err.status) && err.status >= 400 && err.status < 600)
+      ? err.status
+      : fallbackStatus;
+  return res.status(status).json({
+    error: (err && err.message) || 'Error procesando la solicitud',
+    ...(err && err.code ? { code: err.code } : {})
+  });
+}
 const { createRateLimiter: createSharedLimiter } = require('../services/rateLimiter');
 const { isPrivateIp, assertContainedPath } = require('../services/ssrfGuard');
 const path = require('path');
@@ -103,6 +228,28 @@ router.use((req, res, next) => {
     } catch (e) {}
   });
   next();
+});
+
+// Política RBAC catch-all default-deny para principals no-superadmin (coste O(1) en modo single-admin)
+const RBAC_PUBLIC_PATHS = new Set([
+  '/health',
+  '/auth/session',
+  '/auth/verify',
+  '/auth/bootstrap',
+  '/auth/login',
+  '/auth/invites/accept',
+  '/ingress/ask',
+  '/webhooks/github',
+  '/webhooks/gitlab',
+  '/webhooks/gitea',
+  '/webhooks/bitbucket'
+]);
+const rbacGuard = requireRouteRbac();
+router.use((req, res, next) => {
+  if (RBAC_PUBLIC_PATHS.has(req.path) || /^\/webhooks\/deploy\/[a-zA-Z0-9_-]{1,80}$/.test(req.path)) {
+    return next();
+  }
+  return rbacGuard(req, res, next);
 });
 
 router.use('/projects', rateLimiter);
@@ -168,6 +315,14 @@ async function detectPublicIp() {
 // --- PROJECTS ---
 router.get('/projects', (req, res) => {
   try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin) {
+      const tm = getTeamManager();
+      const visible = tm.filterProjects(principal, projectManager.getAll())
+        .map((p) => tm.redactProjectForPrincipal(principal, p));
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.json(visible);
+    }
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.send(projectManager.getAllSerialized());
   } catch (err) {
@@ -177,7 +332,12 @@ router.get('/projects', (req, res) => {
 
 router.post('/projects', async (req, res) => {
   try {
-    const project = projectManager.create(req.body);
+    const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+    if (!principal.isSuperAdmin) {
+      body.teamId = principal.teamId || 'team_default';
+    }
+    const project = projectManager.create(body);
     // Automatically pre-clone and prepare dependencies in the background
     if (project.gitRepo) {
       localRunner.prepareProject(project).catch(err => {
@@ -194,6 +354,16 @@ router.post('/projects', async (req, res) => {
 
 router.get('/projects/:id', (req, res) => {
   try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin) {
+      const proj = projectManager.getById(req.params.id);
+      if (!proj) return res.status(404).json({ error: 'Proyecto no encontrado' });
+      const tm = getTeamManager();
+      const authz = tm.authorizeProject(principal, proj.id, 'projects:read', proj);
+      if (!authz.allowed) return res.status(authz.status || 404).json({ error: authz.status === 403 ? 'Sin permiso' : 'Proyecto no encontrado' });
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.json(tm.redactProjectForPrincipal(principal, proj));
+    }
     const serialized = projectManager.getByIdSerialized(req.params.id);
     if (!serialized) return res.status(404).json({ error: 'Proyecto no encontrado' });
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -205,8 +375,14 @@ router.get('/projects/:id', (req, res) => {
 
 router.put('/projects/:id', (req, res) => {
   try {
-    if (!projectManager.getById(req.params.id)) {
+    const existing = projectManager.getById(req.params.id);
+    if (!existing) {
       return res.status(404).json({ error: 'Proyecto no encontrado' });
+    }
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin) {
+      const authz = getTeamManager().authorizeProject(principal, existing.id, 'projects:write', existing);
+      if (!authz.allowed) return res.status(authz.status || 403).json({ error: authz.reason || 'Sin permiso para editar este proyecto' });
     }
     const project = projectManager.update(req.params.id, req.body);
     res.json(project);
@@ -220,6 +396,11 @@ router.delete('/projects/:id', async (req, res) => {
     const projectId = req.params.id;
     const existing = projectManager.getById(projectId);
     if (!existing) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin) {
+      const authz = getTeamManager().authorizeProject(principal, existing.id, 'projects:delete', existing);
+      if (!authz.allowed) return res.status(authz.status || 403).json({ error: authz.reason || 'Sin permiso para eliminar este proyecto' });
+    }
 
     try { await localRunner.stop(projectId, existing.localPort); } catch (e) {}
     try { liveSyncEngine.resetSession(projectId); } catch (e) {}
@@ -1831,8 +2012,13 @@ router.all('/mcp', mcpStreamableHttp.handleMethodNotAllowed);
 
 router.get('/mcp/tools', (req, res) => {
   try {
+    const authCtx = /** @type {any} */ (req).auth || null;
+    const principal = mcpServer.normalizePrincipal(authCtx);
+    if (!principal.isSuperAdmin) {
+      res.setHeader('Cache-Control', 'private, no-store');
+    }
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.send(mcpServer.getToolsSerialized());
+    res.send(mcpServer.getToolsSerialized(authCtx));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1848,7 +2034,7 @@ router.post('/mcp/message', async (req, res) => {
       return res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
     }
     const isNotification = body.id === undefined && typeof body.method === 'string';
-    const response = await mcpServer.handleJsonRpc(body);
+    const response = await mcpServer.handleJsonRpc(body, { auth: /** @type {any} */ (req).auth || null });
     if (isNotification || response === null) {
       return res.status(202).end();
     }
@@ -1860,7 +2046,8 @@ router.post('/mcp/message', async (req, res) => {
 
 router.get('/mcp/audit', (req, res) => {
   try {
-    res.json({ auditLog: mcpServer.getAuditLog(req.query.limit ? parseInt(req.query.limit, 10) : 50) });
+    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 50;
+    res.json({ auditLog: mcpServer.getAuditLog(limit, /** @type {any} */ (req).auth || null) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3368,8 +3555,8 @@ router.post('/telemetry/client-error', clientTelemetryLimiter, (req, res) => {
 
 router.post('/projects/:id/maintenance', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
     const enabled = req.body && typeof req.body.enabled === 'boolean'
       ? req.body.enabled
       : !project.maintenanceMode;
@@ -3379,6 +3566,1104 @@ router.post('/projects/:id/maintenance', async (req, res) => {
     res.json({ success: true, maintenanceMode: enabled, project: updated, ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// ===========================================================================
+// MULTI-SERVER FLEET (SSH Orchestration + AES-256-GCM Key Vault)
+// ===========================================================================
+router.get('/servers', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const servers = fleet.listServers({
+      teamId: principal.isSuperAdmin ? (req.query.teamId ? String(req.query.teamId) : undefined) : principal.teamId,
+      tag: req.query.tag ? String(req.query.tag) : undefined,
+      region: req.query.region ? String(req.query.region) : undefined,
+      includeLocal: req.query.includeLocal !== '0'
+    });
+    res.json({ servers, summary: fleet.getFleetSummary() });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/servers', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const payload = { ...(req.body || {}) };
+    if (!principal.isSuperAdmin) payload.teamId = principal.teamId;
+    const server = await fleet.addServer(payload);
+    res.status(201).json({ success: true, server });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/servers/:id', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const server = fleet.getServer(req.params.id);
+    if (!server) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && server.id !== 'local' && server.teamId && server.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json({ server });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/servers/:id', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    const server = await fleet.updateServer(req.params.id, req.body || {});
+    res.json({ success: true, server });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/servers/:id', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    const assignedProjectIds = projectManager.getAll()
+      .filter((p) => p && p.serverId === req.params.id)
+      .map((p) => p.id);
+    const force = req.query.force === '1' || req.query.force === 'true' || Boolean(req.body?.force);
+    const result = await fleet.deleteServer(req.params.id, { force, assignedProjectIds });
+    res.json({ success: true, deleted: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/servers/:id/probe', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.id !== 'local' && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    const result = await fleet.probeServer(req.params.id, { force: req.body?.force !== false });
+    res.json({ ...result, probe: result.resources || null });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/servers/:id/repin-host-key', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    const result = await fleet.repinHostKey(req.params.id, { expectedFingerprint: req.body?.expectedFingerprint });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/fleet/keys', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const keys = fleet.listKeys({ teamId: principal.isSuperAdmin ? undefined : principal.teamId });
+    res.json({ keys });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/fleet/keys', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const body = req.body || {};
+    const teamId = principal.isSuperAdmin ? (body.teamId || 'team_default') : principal.teamId;
+    const isImport = body.mode === 'import' || Boolean(body.privateKeyPem || body.privateKey);
+    const key = isImport
+      ? await fleet.importKey({ name: body.name, privateKeyPem: body.privateKeyPem || body.privateKey, teamId })
+      : await fleet.generateKeyPair({ name: body.name, teamId });
+    res.status(201).json({ success: true, key });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/fleet/keys/:id', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const key = fleet.getKey(req.params.id);
+    if (!key) return res.status(404).json({ error: 'Llave SSH no encontrada' });
+    if (!principal.isSuperAdmin && key.teamId && key.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Llave SSH no encontrada' });
+    }
+    fleet.deleteKey(req.params.id);
+    res.json({ success: true, deleted: true });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ===========================================================================
+// MULTI-USER AUTH, TEAMS, RBAC, INVITES, PROJECT ACL & SCOPED TOKENS
+// ===========================================================================
+router.post('/auth/bootstrap', sensitiveAuthLimiter, (req, res) => {
+  try {
+    if (!canBootstrapRequest(req)) {
+      return res.status(403).json({ error: 'El bootstrap inicial solo está permitido desde localhost o con el token maestro' });
+    }
+    const tm = getTeamManager();
+    const result = tm.bootstrapOwner({
+      ...(req.body || {}),
+      ip: clientIp(req),
+      ua: req.headers['user-agent'] || ''
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/auth/login', authVerifyLimiter, (req, res) => {
+  const bf = checkAuthBruteForce(req);
+  if (bf.blocked) {
+    res.setHeader('Retry-After', String(bf.retryAfterSec));
+    return res.status(429).json({
+      error: 'Demasiados intentos de autenticación fallidos. Espera antes de reintentar.',
+      code: 'AUTH_RATE_LIMITED',
+      retryAfterSec: bf.retryAfterSec
+    });
+  }
+  try {
+    const tm = getTeamManager();
+    const result = tm.login({
+      ...(req.body || {}),
+      ip: clientIp(req),
+      ua: req.headers['user-agent'] || ''
+    });
+    res.json(result);
+  } catch (err) {
+    recordAuthFailure(req);
+    metricsCollector.recordSecurityEvent('authFailures');
+    sendServiceError(err, res, 401);
+  }
+});
+
+router.post('/auth/invites/accept', authVerifyLimiter, (req, res) => {
+  const bf = checkAuthBruteForce(req);
+  if (bf.blocked) {
+    res.setHeader('Retry-After', String(bf.retryAfterSec));
+    return res.status(429).json({
+      error: 'Demasiados intentos de autenticación fallidos. Espera antes de reintentar.',
+      code: 'AUTH_RATE_LIMITED',
+      retryAfterSec: bf.retryAfterSec
+    });
+  }
+  try {
+    const tm = getTeamManager();
+    const result = tm.acceptInvite({
+      ...(req.body || {}),
+      ip: clientIp(req),
+      ua: req.headers['user-agent'] || ''
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    recordAuthFailure(req);
+    metricsCollector.recordSecurityEvent('authFailures');
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/auth/logout', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (principal.kind === 'session' && principal.userId && principal.sessionId) {
+      getTeamManager().logoutSession(principal.userId, principal.sessionId);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/auth/logout-all', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (principal.userId) {
+      getTeamManager().logoutAll(principal.userId);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/auth/password', sensitiveAuthLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.userId) return res.status(400).json({ error: 'No hay una cuenta de usuario activa en esta sesión' });
+    const result = getTeamManager().changePassword(principal.userId, {
+      ...(req.body || {}),
+      teamId: principal.teamId,
+      ip: clientIp(req),
+      ua: req.headers['user-agent'] || ''
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/auth/me', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const summary = getTeamManager().getStatusSummary();
+    res.json({
+      isSuperAdmin: Boolean(principal.isSuperAdmin),
+      kind: principal.kind || 'legacy',
+      userId: principal.userId || null,
+      email: principal.email || null,
+      name: principal.name || (principal.isSuperAdmin ? 'Administrador local' : null),
+      role: principal.role || 'owner',
+      teamId: principal.teamId || 'team_default',
+      scopes: principal.scopes || ['*'],
+      projectIds: principal.projectIds ?? null,
+      multiUserEnabled: Boolean(summary.multiUserEnabled),
+      usersCount: summary.usersCount,
+      teamsCount: summary.teamsCount
+    });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.get('/teams', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const teams = getTeamManager().listTeams(principal);
+    res.json({ teams });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/teams', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const team = getTeamManager().createTeam(principal, req.body || {});
+    res.status(201).json({ success: true, team });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/teams/:teamId/members', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const tm = getTeamManager();
+    if (!tm.getStatusSummary().multiUserEnabled && req.params.teamId === 'team_default') {
+      return res.json({ members: [], invites: [] });
+    }
+    const members = tm.listMembers(principal, req.params.teamId);
+    let invites = [];
+    try { invites = tm.listInvites(principal, req.params.teamId); } catch (e) {}
+    res.json({ members, invites });
+  } catch (err) {
+    sendServiceError(err, res, 403);
+  }
+});
+
+router.patch('/teams/:teamId/members/:id', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const tm = getTeamManager();
+    const body = req.body || {};
+    let member = null;
+    if (body.role !== undefined) {
+      member = tm.updateMemberRole(principal, req.params.teamId, req.params.id, body.role);
+    }
+    if (body.projectIds !== undefined) {
+      const normalized = body.projectIds === '*' ? null : body.projectIds;
+      member = tm.updateMemberProjects(principal, req.params.teamId, req.params.id, normalized);
+    }
+    res.json({ success: true, member });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/teams/:teamId/members/:id', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const result = getTeamManager().removeMember(principal, req.params.teamId, req.params.id);
+    res.json({ success: true, removed: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/teams/:teamId/invites', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const invites = getTeamManager().listInvites(principal, req.params.teamId);
+    res.json({ invites });
+  } catch (err) {
+    sendServiceError(err, res, 403);
+  }
+});
+
+router.post('/teams/:teamId/invites', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const result = getTeamManager().createInvite(principal, {
+      ...(req.body || {}),
+      teamId: req.params.teamId
+    });
+    res.status(201).json({
+      ...result,
+      token: result.inviteToken || result.token
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/teams/:teamId/invites/:inviteId', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const result = getTeamManager().revokeInvite(principal, req.params.teamId, req.params.inviteId);
+    res.json({ success: true, revoked: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/projects/:id/acl', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const tm = getTeamManager();
+    const authz = tm.authorizeProject(principal, project.id, 'projects:read', project);
+    if (!authz.allowed) return res.status(authz.status || 403).json({ error: authz.reason || 'Sin acceso' });
+    tm._ensureLoaded();
+    const acl = (tm.state && tm.state.projectAcls && tm.state.projectAcls[project.id]) || null;
+    res.json({
+      projectId: project.id,
+      teamId: (acl && acl.teamId) || project.teamId || 'team_default',
+      overrides: (acl && acl.overrides) || {}
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.put('/projects/:id/acl', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const body = req.body || {};
+    const result = getTeamManager().setProjectAcl(principal, project.id, body.userId, body.role, project.teamId || 'team_default');
+    res.json({ success: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/projects/:id/acl/:userId', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const result = getTeamManager().removeProjectAcl(principal, project.id, req.params.userId, project.teamId || 'team_default');
+    res.json({ success: true, removed: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/auth/tokens', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const tokens = getTeamManager().listApiTokens(principal);
+    res.json({ tokens });
+  } catch (err) {
+    sendServiceError(err, res, 403);
+  }
+});
+
+router.post('/auth/tokens', sensitiveAuthLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const body = req.body || {};
+    const projectIds = body.projectIds === '*' ? null : body.projectIds;
+    const result = getTeamManager().createApiToken(principal, { ...body, projectIds });
+    res.status(201).json({
+      ...result,
+      token: result.token || result.rawToken,
+      meta: result.record || result.apiToken || result.meta
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/auth/tokens/:id', sensitiveAuthLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const result = getTeamManager().revokeApiToken(principal, req.params.id);
+    res.json({ success: true, revoked: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ===========================================================================
+// ENVIRONMENTS, SHARED ENCRYPTED VAULT & PROMOTION PIPELINE
+// ===========================================================================
+router.get('/vault', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'listar la bóveda global')) return;
+    const secrets = getEnvironmentManager().listVaultSecrets();
+    res.json({ secrets });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/vault/:key', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'escribir en la bóveda global')) return;
+    const principal = getPrincipal(req);
+    const body = req.body || {};
+    const secret = getEnvironmentManager().setVaultSecret(req.params.key, body.value, {
+      scope: body.scope || 'both',
+      description: body.description || '',
+      actor: principal.email || principal.kind
+    });
+    res.json({ success: true, secret });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/vault/:key', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'eliminar secretos de la bóveda global')) return;
+    const principal = getPrincipal(req);
+    const deleted = getEnvironmentManager().deleteVaultSecret(req.params.key, { actor: principal.email || principal.kind });
+    res.json({ success: true, deleted: Boolean(deleted) });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/projects/:id/environments', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const environments = getEnvironmentManager().listEnvironments(project.id);
+    res.json({ environments });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.get('/projects/:id/environments/diff', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const fromEnv = String(req.query.from || 'staging');
+    const toEnv = String(req.query.to || 'production');
+    const diff = getEnvironmentManager().diffEnvironments(project.id, fromEnv, toEnv);
+    res.json(diff);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/environments/promote', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = assertProjectAccess(req, res, req.params.id, 'environments:write');
+    if (!project) return;
+    const body = req.body || {};
+    if (body.overrideFreeze && !principal.isSuperAdmin) {
+      const tm = getTeamManager();
+      if (!tm.doesPrincipalSatisfyRole(principal, 'admin').allowed) {
+        return res.status(403).json({
+          error: 'Solo un administrador u owner puede anular una ventana de congelación (overrideFreeze)',
+          code: 'FREEZE_OVERRIDE_FORBIDDEN'
+        });
+      }
+    }
+    const result = await getEnvironmentManager().promoteEnvironment(project.id, {
+      fromEnv: body.fromEnv || 'staging',
+      toEnv: body.toEnv || 'production',
+      includeEnvVars: body.includeEnvVars !== false,
+      envKeys: body.envKeys,
+      dryRun: Boolean(body.dryRun),
+      overrideFreeze: Boolean(body.overrideFreeze),
+      approvalId: body.approvalId,
+      reason: body.reason,
+      actor: principal.email || principal.kind
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/environments/:env/rollback', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = assertProjectAccess(req, res, req.params.id, 'environments:write');
+    if (!project) return;
+    const result = getEnvironmentManager().rollbackPromotion(project.id, req.params.env, req.body?.snapshotId, {
+      actor: principal.email || principal.kind,
+      reason: req.body?.reason
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.put('/projects/:id/environments/:env', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = assertProjectAccess(req, res, req.params.id, 'environments:write');
+    if (!project) return;
+    const environment = getEnvironmentManager().upsertEnvironment(project.id, req.params.env, {
+      ...(req.body || {}),
+      actor: principal.email || principal.kind
+    });
+    res.json({ success: true, environment });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/projects/:id/environments/:env', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = assertProjectAccess(req, res, req.params.id, 'environments:write');
+    if (!project) return;
+    const deleted = getEnvironmentManager().deleteEnvironment(project.id, req.params.env, {
+      force: req.query.force === '1',
+      actor: principal.email || principal.kind
+    });
+    res.json({ success: true, deleted: Boolean(deleted) });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ===========================================================================
+// DECLARATIVE GITOPS (`culkibo.yaml` Export / Plan / Apply / Drift)
+// ===========================================================================
+router.post('/gitops/export', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const body = { ...(req.body || {}) };
+    if (!principal.isSuperAdmin) {
+      const allowedProjects = getTeamManager().filterProjects(principal, projectManager.getAll(), { redact: false });
+      const allowedSet = new Set(allowedProjects.map((p) => p.id));
+      if (Array.isArray(body.projectIds) && body.projectIds.length > 0) {
+        const forbidden = body.projectIds.filter((pid) => !allowedSet.has(String(pid)));
+        if (forbidden.length > 0) {
+          return res.status(403).json({
+            error: 'No tienes acceso a uno o más proyectos solicitados en gitops/export',
+            code: 'PROJECT_FORBIDDEN'
+          });
+        }
+      } else {
+        body.projectIds = Array.from(allowedSet);
+      }
+    }
+    const result = getGitOpsManager().exportStack(body);
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/gitops/plan', (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'gitops/plan')) return;
+    const body = req.body || {};
+    const yamlText = String(body.yamlText ?? body.yaml ?? '');
+    const result = getGitOpsManager().planApply(yamlText, {
+      prune: Boolean(body.prune),
+      confirmDestructive: Boolean(body.confirmDestructive),
+      stackId: body.stackId
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/gitops/apply', certAndAdminLimiter, async (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'gitops/apply')) return;
+    const principal = getPrincipal(req);
+    const body = req.body || {};
+    const yamlText = String(body.yamlText ?? body.yaml ?? '');
+    const result = await getGitOpsManager().applyStack(yamlText, {
+      dryRun: Boolean(body.dryRun),
+      prune: Boolean(body.prune),
+      confirmDestructive: Boolean(body.confirmDestructive),
+      stackId: body.stackId,
+      actor: principal.email || principal.kind
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/gitops/drift', (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'gitops/drift')) return;
+    const stackId = req.query.stackId ? String(req.query.stackId) : undefined;
+    const result = getGitOpsManager().detectDrift(stackId);
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ===========================================================================
+// SYNTHETIC UPTIME MONITORS & PUBLIC STATUS PAGES
+// ===========================================================================
+/** @param {any} principal @param {any} monitor */
+function canAccessMonitor(principal, monitor, perm = 'projects:read') {
+  if (!principal || principal.isSuperAdmin) return true;
+  if (monitor && monitor.projectId) {
+    const proj = projectManager.getById(monitor.projectId);
+    return getTeamManager().authorizeProject(principal, monitor.projectId, perm, proj).allowed;
+  }
+  return !Array.isArray(principal.projectIds);
+}
+
+router.get('/uptime/monitors', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const filterProjectId = req.query.projectId ? String(req.query.projectId) : undefined;
+    if (filterProjectId && !principal.isSuperAdmin) {
+      const proj = assertProjectAccess(req, res, filterProjectId, 'projects:read');
+      if (!proj) return;
+    }
+    const raw = getUptimeMonitor().listMonitors({
+      projectId: filterProjectId,
+      projectIds: !principal.isSuperAdmin && Array.isArray(principal.projectIds) ? principal.projectIds : undefined
+    });
+    const monitors = principal.isSuperAdmin
+      ? raw
+      : raw.filter((m) => canAccessMonitor(principal, m, 'projects:read'));
+    res.json({ monitors });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/uptime/monitors', async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (body.projectId) {
+      const proj = assertProjectAccess(req, res, String(body.projectId), 'uptime:write');
+      if (!proj) return;
+    } else if (denyProjectScopedToken(req, res, 'monitores globales sin proyecto')) {
+      return;
+    }
+    const monitor = await getUptimeMonitor().createMonitor(body);
+    res.status(201).json({ success: true, monitor });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.put('/uptime/monitors/:id', async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const existing = getUptimeMonitor().getMonitor(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Monitor no encontrado' });
+    if (!principal.isSuperAdmin) {
+      if (existing.projectId) {
+        const proj = assertProjectAccess(req, res, existing.projectId, 'uptime:write');
+        if (!proj) return;
+      } else if (denyProjectScopedToken(req, res, 'monitores globales sin proyecto')) {
+        return;
+      }
+      if (req.body && req.body.projectId && String(req.body.projectId) !== existing.projectId) {
+        const nextProj = assertProjectAccess(req, res, String(req.body.projectId), 'uptime:write');
+        if (!nextProj) return;
+      }
+    }
+    const monitor = await getUptimeMonitor().updateMonitor(req.params.id, req.body || {});
+    res.json({ success: true, monitor });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/uptime/monitors/:id', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const existing = getUptimeMonitor().getMonitor(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Monitor no encontrado' });
+    if (!principal.isSuperAdmin) {
+      if (existing.projectId) {
+        const proj = assertProjectAccess(req, res, existing.projectId, 'uptime:write');
+        if (!proj) return;
+      } else if (denyProjectScopedToken(req, res, 'monitores globales sin proyecto')) {
+        return;
+      }
+    }
+    const deleted = getUptimeMonitor().deleteMonitor(req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Monitor no encontrado' });
+    res.json({ success: true, deleted: true });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/uptime/monitors/:id/check', async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const existing = getUptimeMonitor().getMonitor(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Monitor no encontrado' });
+    if (!principal.isSuperAdmin) {
+      if (existing.projectId) {
+        const proj = assertProjectAccess(req, res, existing.projectId, 'uptime:write');
+        if (!proj) return;
+      } else if (denyProjectScopedToken(req, res, 'monitores globales sin proyecto')) {
+        return;
+      }
+    }
+    const result = await getUptimeMonitor().runCheck(req.params.id);
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/uptime/incidents', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const um = getUptimeMonitor();
+    const rawIncidents = um.listIncidents({
+      monitorId: req.query.monitorId ? String(req.query.monitorId) : undefined,
+      status: req.query.status ? String(req.query.status) : undefined,
+      limit: req.query.limit ? parseInt(String(req.query.limit), 10) : 50
+    });
+    if (principal.isSuperAdmin) {
+      return res.json({ incidents: rawIncidents });
+    }
+    const allowedMonitorIds = new Set(
+      um.listMonitors().filter((m) => canAccessMonitor(principal, m, 'projects:read')).map((m) => m.id)
+    );
+    const incidents = rawIncidents.filter((inc) => allowedMonitorIds.has(inc.monitorId));
+    res.json({ incidents });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.get('/uptime/pages', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'páginas públicas de estado')) return;
+    const pages = getUptimeMonitor().listStatusPages();
+    res.json({ pages });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/uptime/pages', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'páginas públicas de estado')) return;
+    const principal = getPrincipal(req);
+    const body = req.body || {};
+    if (!principal.isSuperAdmin) {
+      const um = getUptimeMonitor();
+      const cleanSlug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
+      if (cleanSlug) {
+        const existingPage = um.listStatusPages().find((p) => p.slug === cleanSlug);
+        if (existingPage && Array.isArray(existingPage.monitorIds)) {
+          for (const mid of existingPage.monitorIds) {
+            const m = um.getMonitor(String(mid));
+            if (m && !canAccessMonitor(principal, m, 'uptime:write')) {
+              return res.status(403).json({
+                error: 'No tienes permisos para sobrescribir esta página de estado',
+                code: 'PROJECT_FORBIDDEN'
+              });
+            }
+          }
+        }
+      }
+      if (Array.isArray(body.monitorIds)) {
+        for (const mid of body.monitorIds) {
+          const m = um.getMonitor(String(mid));
+          if (m && !canAccessMonitor(principal, m, 'uptime:write')) {
+            return res.status(403).json({
+              error: 'No tienes permisos sobre todos los monitores de esta página de estado',
+              code: 'PROJECT_FORBIDDEN'
+            });
+          }
+        }
+      }
+    }
+    const page = getUptimeMonitor().saveStatusPage(body);
+    res.status(201).json({ success: true, page });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/uptime/pages/:slug', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'páginas públicas de estado')) return;
+    const principal = getPrincipal(req);
+    const um = getUptimeMonitor();
+    const cleanSlug = String(req.params.slug || '').trim().toLowerCase();
+    if (!principal.isSuperAdmin) {
+      const existingPage = um.listStatusPages().find((p) => p.slug === cleanSlug);
+      if (existingPage && Array.isArray(existingPage.monitorIds)) {
+        for (const mid of existingPage.monitorIds) {
+          const m = um.getMonitor(String(mid));
+          if (m && !canAccessMonitor(principal, m, 'uptime:write')) {
+            return res.status(403).json({
+              error: 'No tienes permisos para eliminar esta página de estado',
+              code: 'PROJECT_FORBIDDEN'
+            });
+          }
+        }
+      }
+    }
+    const deleted = um.deleteStatusPage(req.params.slug);
+    if (!deleted) return res.status(404).json({ error: 'Página de estado no encontrada' });
+    res.json({ success: true, deleted: true });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ===========================================================================
+// SCALE-TO-ZERO AUTO-SLEEP & VPS COST/RAM ADVISOR
+// ===========================================================================
+router.get('/sleep/:projectId', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.projectId, 'projects:read');
+    if (!project) return;
+    const policy = getSleepAdvisor().getPolicy(project.id);
+    res.json(policy || { projectId: project.id, enabled: false, idleMinutes: 30, mode: 'pause', excludeCrons: true, sleeping: false });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.put('/sleep/:projectId', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.projectId, 'sleep:write');
+    if (!project) return;
+    const policy = getSleepAdvisor().setPolicy(project.id, req.body || {});
+    res.json(policy);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/sleep/:projectId/sleep', async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.projectId, 'sleep:write');
+    if (!project) return;
+    const result = await getSleepAdvisor().sleepProject(project.id, { force: Boolean(req.body?.force) });
+    res.json({ success: Boolean(result && result.slept), sleeping: Boolean(result && result.slept), ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/sleep/:projectId/wake', async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.projectId, 'sleep:write');
+    if (!project) return;
+    const result = await getSleepAdvisor().wakeProject(project.id);
+    res.json({ success: Boolean(result && result.woken), awake: Boolean(result && result.woken), ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/advisor/resources', async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const vpsMonthlyEur = req.query.vpsMonthlyEur !== undefined ? Number(req.query.vpsMonthlyEur) : undefined;
+    const scopedProjectIds = principal.isSuperAdmin
+      ? undefined
+      : getTeamManager().filterProjects(principal, projectManager.getAll(), { redact: false }).map((p) => p.id);
+    const report = await getSleepAdvisor().analyzeResources({
+      vpsMonthlyEur: Number.isFinite(vpsMonthlyEur) ? vpsMonthlyEur : undefined,
+      projectIds: scopedProjectIds
+    });
+    res.json(report);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+// ===========================================================================
+// LIVE SYNC 2.0 (Per-File Time-Travel & Multi-Client Conflicts)
+// ===========================================================================
+router.get('/projects/:id/sync/files/history', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const filePath = String(req.query.path || '').trim();
+    if (!filePath) return res.status(400).json({ error: 'Falta el parámetro path' });
+    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 20;
+    const includeDiff = req.query.includeDiff === '1' || req.query.includeDiff === 'true';
+    const history = liveSyncEngine.getFileHistory(project.id, filePath, { limit, includeDiff });
+    res.json(history);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/sync/files/rollback', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const project = assertProjectAccess(req, res, req.params.id, 'sync:write');
+    if (!project) return;
+    const body = req.body || {};
+    const result = liveSyncEngine.rollbackFile(project.id, body.path, Number(body.seq), {
+      mode: body.mode || 'to',
+      actor: principal.email || principal.kind
+    });
+    res.json({ success: true, ...result, reverted: true });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/sync/conflicts/:conflictId/resolve', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'sync:write');
+    if (!project) return;
+    const result = liveSyncEngine.resolveConflict(project.id, req.params.conflictId);
+    res.json({ success: true, ...result, resolved: true });
+  } catch (err) {
+    sendServiceError(err, res, err && err.code === 'CONFLICT_NOT_FOUND' ? 404 : 400);
+  }
+});
+
+// ===========================================================================
+// DEPLOY FREEZE WINDOWS, POST-DEPLOY SMOKE TESTS & CANARY CONTROL
+// ===========================================================================
+router.get('/deploy/freeze-windows', (_req, res) => {
+  try {
+    res.json({ windows: deployManager.listFreezeWindows() });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/deploy/freeze-windows', certAndAdminLimiter, (req, res) => {
+  try {
+    const body = req.body || {};
+    if (body.projectId) {
+      const proj = assertProjectAccess(req, res, String(body.projectId), 'deployments:write');
+      if (!proj) return;
+    } else if (denyProjectScopedToken(req, res, 'ventanas globales de congelación')) {
+      return;
+    }
+    const created = deployManager.addFreezeWindow(body);
+    res.status(201).json({ success: true, window: created });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/deploy/freeze-windows/:id', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'eliminar ventanas de congelación')) return;
+    const removed = deployManager.removeFreezeWindow(req.params.id);
+    if (!removed) return res.status(404).json({ error: 'Ventana de congelación no encontrada' });
+    res.json({ success: true, deleted: true });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/deploy/freeze-status', (req, res) => {
+  try {
+    const projectId = req.query.projectId ? String(req.query.projectId) : null;
+    if (projectId) {
+      const proj = assertProjectAccess(req, res, projectId, 'projects:read');
+      if (!proj) return;
+    }
+    res.json(deployManager.evaluateFreezeStatus(projectId));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/smoke-test', async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
+    const result = await deployManager.runSmokeTestsForProject(project.id, req.body || {});
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/canary/promote', certAndAdminLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
+    const result = await deployManager.promoteCanary(project.id);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/canary/abort', certAndAdminLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
+    const result = await deployManager.abortCanary(project.id, req.body?.reason || 'Abortado manualmente');
+    res.json({ success: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
   }
 });
 

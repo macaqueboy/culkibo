@@ -2,12 +2,12 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Node.js >=20](https://img.shields.io/badge/Node.js-%E2%89%A520-339933.svg)](package.json)
-[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28%20(72%20tools)-18181b.svg)](#conectar-agentes-de-ia-mcp-2026-07-28)
+[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28%20(104%20tools)-18181b.svg)](#conectar-agentes-de-ia-mcp-2026-07-28)
 
 **Orquestador cloud autohospedado, open-source y diseñado para la era de los agentes de IA.**  
-Alternativa ultrarrápida, intuitiva y auditable frente a Coolify y Dokploy: Live Sync binario sub-10 ms (*The Forge*), despliegues inmutables sin cortes con **Caddy v2.11** (*The Citadel*), **vistas previas por rama/PR con puerta anti-forks, tareas Cron seguras sin shell, consola de logs/stats/exec en vivo y cancelación + rollback multi-versión**, **Edge Hardening nativo en Caddy (HTTP Basic Auth OpenBSD bcrypt, IP Allowlist CIDR, límite de cuerpo, cabeceras personalizadas, Túneles Cloudflare sin puertos, multi-wildcard SSL persistente + auditoría automática de caducidad TLS)**, **copias de seguridad de BD con snapshot previo automático + deshacer restauración + retención horaria/diaria/semanal + Snapshot completo de instancia cifrado con AES-256-GCM (DR)**, **webhooks multi-Git (GitHub, GitLab, Gitea/Forgejo, Bitbucket) + Deploy Hook CI/CD**, migrador guiado de **WordPress** (subida SQL en streaming hasta 500 MB + `.sql.gz`) e **Importador Universal** (Coolify v4, Compose, Git, Vercel, Netlify, Railway `toml/json`, Render, Dokploy), **72 herramientas MCP `2026-07-28` + `resources/*` y `prompts/*`**, catálogo de **23 servicios en 1 clic (9 categorías incl. IA)** y **cero construcción de comandos de shell**.
+Alternativa ultrarrápida, intuitiva y auditable frente a Coolify y Dokploy: **Live Sync 2.0 binario sub-10 ms con compresión adaptativa Brotli/Gzip, historial por archivo y detector de conflictos** (*The Forge*), **Flota Multi-Servidor SSH sin shell (TOFU + túneles ref-counted + bóveda AES-256-GCM)**, **Equipos multiusuario, RBAC en 4 roles (`owner`/`admin`/`developer`/`viewer`), ACL por proyecto y tokens con alcance**, **Entornos (`dev`/`staging`/`prod`) + Vault cifrado + promoción con rollback**, **GitOps declarativo `culkibo.yaml` (export/plan/apply/drift)**, **Monitores Uptime sintéticos + Páginas públicas `/status/:slug`**, **Auto-Sleep Scale-to-Zero + Asesor de Costes/RAM**, despliegues inmutables sin cortes con **Caddy v2.11** (*The Citadel*) con **Smoke Tests post-deploy, Canary Auto-Guard y Deploy Freeze Windows**, migrador guiado de **WordPress** e **Importador Universal**, **104 herramientas MCP `2026-07-28` (`dryRun`, `7 resources`, `5 prompts`, RBAC)**, catálogo de **100 servicios auditados en 1 clic (12 categorías incl. IA)**, **telemetría anónima opt-out con recolector cloud propio (0 deps)** y **cero construcción de comandos de shell**.
 
-**Apache-2.0 · 6 dependencias de runtime · 22 suites + live-server + estrés + benchmarks reproducibles**
+**Apache-2.0 · 6 dependencias de runtime · 29 suites + live-server + estrés + benchmarks reproducibles**
 
 ---
 
@@ -45,8 +45,9 @@ Cada número de esta tabla procede de código real ejecutado contra **Caddy v2.1
 | **WebSocket fan-out (40 clientes)** | **40/40 clientes listos en 23,7 ms · 0 caídas bajo churn** | Polling / Pusher / Soketi extra | `npm run bench:control` |
 | **Dependencias de runtime** | **6** (`express`, `ws`, `chokidar`, `commander`, `cors`, `dotenv`) | Cientos de paquetes PHP/Composer o monorepo Next.js | `package.json` |
 | **Construcción de comandos de shell** | **0** (verificado en CI por escáner estático) | 21 avisos críticos RCE en Coolify · 34 en Dokploy | `node tests/shell-safety.test.js` |
-| **Superficie MCP (`2026-07-28`)** | **72 herramientas anotadas (41 mutadoras) + `resources/*` + `prompts/*`** | Coolify: 3 mutadoras · Dokploy: sin MCP nativo | `POST /api/mcp` (`tools/list`) |
-| **Observabilidad y Doctor en 1 clic** | **Prometheus `/metrics` + p50/p95/p99 + Event Loop + 9 checks + Audit log** | Requiere stack Prometheus/Grafana externo | `GET /metrics` · `#/metrics` |
+| **Superficie MCP (`2026-07-28`)** | **104 herramientas anotadas (58 mutadoras, `dryRun`) + 7 `resources` + 5 `prompts`** | Coolify: 3 mutadoras · Dokploy: básico | `POST /api/mcp` (`tools/list`) |
+| **Catálogo 1 clic + Flota + RBAC** | **100 apps fijadas (12 cat.) · Multi-VPS SSH · Teams RBAC · Uptime · GitOps** | Coolify/Dokploy: 10×–33× más RAM | `#/catalog` · `#/fleet` · `#/uptime` |
+| **Observabilidad y Doctor en 1 clic** | **Prometheus `/metrics` + p50/p95/p99 + Event Loop + 10 checks + Cost Advisor** | Requiere stack Prometheus/Grafana externo | `GET /metrics` · `#/metrics` |
 
 ---
 

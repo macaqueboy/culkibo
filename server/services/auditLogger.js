@@ -26,7 +26,7 @@ function redactInlineSecrets(str) {
   let s = str;
   s = s.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[REDACTED_PEM]');
   s = s.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]');
-  s = s.replace(/\b(gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,}|ckh_[a-f0-9]{16,})\b/g, '[REDACTED]');
+  s = s.replace(/\b(gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,}|ckh_[a-f0-9]{16,}|ck[stihp]_[A-Za-z0-9._-]{12,})\b/g, '[REDACTED]');
   s = s.replace(/((?:https?|postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp):\/\/[^:\s/@]+:)([^@\s/]+)(@)/gi, '$1[REDACTED]$3');
   s = s.replace(/([?&](?:token|key|secret|password|passwd|api_key|apikey|access_token)=)[^&\s]+/gi, '$1[REDACTED]');
   return s;

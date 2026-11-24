@@ -16,6 +16,10 @@ import {
   Terminal,
   Upload,
   Zap,
+  Server,
+  HeartPulse,
+  Users,
+  FileCode2,
 } from 'lucide-react';
 import type { Project } from '../lib/api';
 
@@ -101,6 +105,24 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         keywords: 'proyectos apps inicio home',
         icon: <FolderKanban className="w-4 h-4 text-slate-500" />,
         onSelect: () => onNavigate('projects'),
+      },
+      {
+        id: 'nav-fleet',
+        group: 'Navegación',
+        label: 'Ir a Flota de servidores',
+        hint: 'Nodos VPS SSH, TOFU y bóveda de llaves',
+        keywords: 'flota fleet servidores vps ssh tofu llaves keys',
+        icon: <Server className="w-4 h-4 text-slate-500" />,
+        onSelect: () => onNavigate('fleet'),
+      },
+      {
+        id: 'nav-uptime',
+        group: 'Navegación',
+        label: 'Ir a Uptime, Estado y Ahorro',
+        hint: 'Monitores, /status/:slug y auto-reposo',
+        keywords: 'uptime monitores estado status page ahorro coste vps sleep reposo',
+        icon: <HeartPulse className="w-4 h-4 text-slate-500" />,
+        onSelect: () => onNavigate('uptime'),
       },
       {
         id: 'nav-metrics',
@@ -236,6 +258,24 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         keywords: 'conectar dominio ssl wildcard tunel cloudflare',
         icon: <Globe className="w-4 h-4 text-slate-500" />,
         onSelect: onQuickConnectDomain,
+      },
+      {
+        id: 'act-team-rbac',
+        group: 'Acciones rápidas',
+        label: 'Equipo, Roles (RBAC) y Tokens API',
+        hint: 'Miembros, invitaciones y tokens con alcance',
+        keywords: 'equipo rbac roles usuarios invitaciones tokens permisos acl',
+        icon: <Users className="w-4 h-4 text-slate-500" />,
+        onSelect: () => onNavigate('settings', 'team'),
+      },
+      {
+        id: 'act-gitops-vault',
+        group: 'Acciones rápidas',
+        label: 'GitOps (culkibo.yaml) y Vault cifrado',
+        hint: 'Exportar, planificar, aplicar y secretos compartidos',
+        keywords: 'gitops yaml vault secretos entornos promocion diff',
+        icon: <FileCode2 className="w-4 h-4 text-slate-500" />,
+        onSelect: () => onNavigate('settings', 'gitops'),
       },
       {
         id: 'act-backups-dr',

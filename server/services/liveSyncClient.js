@@ -1,23 +1,140 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const WebSocket = require('ws');
-const { computeMerkleTree, diffMerkleTrees, sha256 } = require('./liveSyncEngine');
+const {
+  computeMerkleTree,
+  diffMerkleTrees,
+  sha256,
+  FRAME_MAGIC_RAW,
+  FRAME_MAGIC_BROTLI,
+  FRAME_MAGIC_GZIP
+} = require('./liveSyncEngine');
 
 /**
  * Cliente real de sincronización en vivo (máquina local -> daemon de Culkibo).
  *
  * Acumula cambios de disco en una ventana corta de quiescencia (`quiescenceMs`)
  * para enviarlos como un único Commit Frame atómico sobre un WebSocket
- * persistente autenticado, con verificación Merkle delta y auto-reconexión.
+ * persistente autenticado, con compresión adaptativa (Brotli/Gzip),
+ * encabezados optimistas `baseSha256`, verificación Merkle delta y auto-reconexión.
  */
 
 const IGNORED_SEGMENT_RE = /(^|[\\/])(\.git|node_modules|\.next|\.nuxt|\.turbo|\.svelte-kit|\.output|\.astro|\.cache|\.culkibo|dist|build|coverage|__pycache__|\.venv|venv|target|vendor)([\\/]|$)/;
 const EDITOR_SWAP_RE = /(^|[\\/])(\.#[^\\/]+|#[^\\/]+#|~\$[^\\/]+|\.DS_Store|Thumbs\.db|4913)$|(\.(swp|swo|swx|tmp|bak|orig)|~)$/i;
+const INCOMPRESSIBLE_EXT_RE = /\.(png|jpe?g|webp|gif|avif|ico|woff2?|mp4|webm|mp3|ogg|zip|gz|br|zst|7z|rar|pdf|wasm)$/i;
 const MAX_CLIENT_FILE_BYTES = 10 * 1024 * 1024;
 const CHUNK_MAX_FILES = 250;
 const CHUNK_MAX_BYTES = 8 * 1024 * 1024;
+const COMPRESSION_MIN_BYTES = 512;
+const COMPRESSION_MAX_RATIO = 0.85; // Debe ahorrar >= 15% respecto a trama cruda 0x01
+const MAX_STAT_CACHE_ENTRIES = 10000;
+const FRESH_TREE_MAX_AGE_MS = 2000;
+
+/** @type {typeof import('zlib') | null} */
+let _zlib = null;
+function getZlib() {
+  if (!_zlib) _zlib = require('zlib');
+  return _zlib;
+}
+
+/**
+ * Compila un patrón glob simple de `.culkiboignore` (sin dependencias externas).
+ * @param {string} rawLine
+ * @returns {{ negated: boolean, dirOnly: boolean, anchored: boolean, regex: RegExp } | null}
+ */
+function compileIgnoreRule(rawLine) {
+  let line = rawLine.trim();
+  if (!line || line.startsWith('#')) return null;
+  let negated = false;
+  if (line.startsWith('!')) {
+    negated = true;
+    line = line.slice(1).trim();
+    if (!line) return null;
+  }
+  const dirOnly = line.endsWith('/');
+  if (dirOnly) line = line.replace(/\/+$/, '');
+  const anchored = line.startsWith('/') || line.includes('/');
+  if (line.startsWith('/')) line = line.slice(1);
+  if (!line) return null;
+
+  // Escapar metacaracteres regex excepto *, ? y /
+  let reStr = '';
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '*') {
+      if (line[i + 1] === '*') {
+        if (line[i + 2] === '/') {
+          reStr += '(?:.*/)?';
+          i += 2;
+        } else {
+          reStr += '.*';
+          i += 1;
+        }
+      } else {
+        reStr += '[^/]*';
+      }
+    } else if (ch === '?') {
+      reStr += '[^/]';
+    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+      reStr += `\\${ch}`;
+    } else {
+      reStr += ch;
+    }
+  }
+
+  const pattern = anchored
+    ? (dirOnly ? `^${reStr}/.*$` : `^${reStr}(?:/.*)?$`)
+    : (dirOnly ? `(?:^|/)${reStr}/.*$` : `(?:^|/)${reStr}(?:/.*)?$`);
+
+  return { negated, dirOnly, anchored, regex: new RegExp(pattern) };
+}
+
+/**
+ * Lee y parsea `.culkiboignore` si existe en `sourceDir` (0 impacto si no existe).
+ * @param {string} sourceDir
+ */
+function loadCulkiboIgnore(sourceDir) {
+  const ignorePath = path.join(sourceDir, '.culkiboignore');
+  try {
+    const st = fs.lstatSync(ignorePath);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > 256 * 1024) return [];
+    const content = fs.readFileSync(ignorePath, 'utf8');
+    /** @type {Array<{ negated: boolean, dirOnly: boolean, anchored: boolean, regex: RegExp }>} */
+    const rules = [];
+    for (const line of content.split(/\r?\n/)) {
+      const compiled = compileIgnoreRule(line);
+      if (compiled) rules.push(compiled);
+    }
+    return rules;
+  } catch (e) {
+    return [];
+  }
+}
+
+/**
+ * Detecta si un bloque de ficheros es mayoritariamente binario/incompresible (>70% bytes).
+ * @param {Array<{ path: string, op?: string, buf?: Buffer }>} entries
+ */
+function isMostlyIncompressible(entries) {
+  let totalBytes = 0;
+  let incompressibleBytes = 0;
+  for (const e of entries) {
+    if (e.op === 'delete' || !e.buf || e.buf.length === 0) continue;
+    totalBytes += e.buf.length;
+    if (INCOMPRESSIBLE_EXT_RE.test(e.path)) {
+      incompressibleBytes += e.buf.length;
+      continue;
+    }
+    const probeLen = Math.min(512, e.buf.length);
+    if (e.buf.subarray(0, probeLen).includes(0)) {
+      incompressibleBytes += e.buf.length;
+    }
+  }
+  return totalBytes > 0 && (incompressibleBytes / totalBytes) > 0.7;
+}
 
 class LiveSyncClient extends EventEmitter {
   /**
@@ -25,20 +142,22 @@ class LiveSyncClient extends EventEmitter {
    *   projectId: string,
    *   sourceDir: string,
    *   wsUrl?: string,
+   *   serverUrl?: string,
    *   token?: string | null,
    *   ticket?: string | null,
    *   quiescenceMs?: number,
    *   autoWatch?: boolean,
    *   autoReconnect?: boolean,
    *   clientName?: string,
-   *   targetDir?: string | null
+   *   targetDir?: string | null,
+   *   compression?: 'auto' | 'br' | 'gzip' | 'none'
    * }} options
    */
   constructor(options) {
     super();
     this.projectId = options.projectId;
     this.sourceDir = path.resolve(options.sourceDir);
-    this.wsUrl = options.wsUrl || 'ws://127.0.0.1:3030/ws/sync';
+    this.wsUrl = options.wsUrl || options.serverUrl || 'ws://127.0.0.1:3030/ws/sync';
     this.token = options.token || null;
     this.ticket = /** @type {any} */ (options).ticket || null;
     this.quiescenceMs = typeof options.quiescenceMs === 'number' ? options.quiescenceMs : 12;
@@ -46,6 +165,9 @@ class LiveSyncClient extends EventEmitter {
     this.autoReconnect = options.autoReconnect !== false;
     this.clientName = options.clientName || os.hostname();
     this.targetDir = options.targetDir || null;
+    this.compression = options.compression === 'none' || options.compression === 'br' || options.compression === 'gzip'
+      ? options.compression
+      : 'auto';
 
     /** @type {any} */
     this.ws = null;
@@ -54,6 +176,8 @@ class LiveSyncClient extends EventEmitter {
     /** @type {any} */
     this.nativeWatcher = null;
     this.seq = 0;
+    /** @type {string | null} */
+    this.clientId = null;
     this.connected = false;
     this.closed = false;
     this._reconnectAttempt = 0;
@@ -62,15 +186,35 @@ class LiveSyncClient extends EventEmitter {
     this._reconciling = false;
     /** @type {Array<{ resolve: (v: any) => void, reject: (e: any) => void, timer: ReturnType<typeof setTimeout> }>} */
     this._verifyWaiters = [];
+    /** @type {Array<{ resolve: (v: any) => void, reject: (e: any) => void, timer: ReturnType<typeof setTimeout> }>} */
+    this._fileHistoryWaiters = [];
+    /** @type {Array<{ resolve: (v: any) => void, reject: (e: any) => void, timer: ReturnType<typeof setTimeout> }>} */
+    this._rollbackFileWaiters = [];
 
     /** @type {Map<string, 'upsert' | 'delete'>} */
     this.pending = new Map();
     /** @type {Map<string, string>} */
     this.lastSentHashes = new Map();
+    /** Caché de stat `(mtimeMs, ctimeMs, size, sha256)` para evitar lecturas duplicadas en Windows ReadDirectoryChangesW. */
+    /** @type {Map<string, { mtimeMs: number, ctimeMs: number, size: number, sha256: string }>} */
+    this._statCache = new Map();
+    /** Reglas compiladas de `.culkiboignore` (vacío si no existe). */
+    this._ignoreRules = loadCulkiboIgnore(this.sourceDir);
     /** @type {any} */
     this.initialLocalTree = null;
+    this.initialLocalTreeAt = 0;
+    this._initialTreeHasFiles = false;
     this.initialInSync = false;
     this.binaryFramesSupported = false;
+    /** @type {string[]} */
+    this.supportedCodecs = [];
+    this.wireStats = {
+      rawBytes: 0,
+      wireBytes: 0,
+      savedBytes: 0,
+      compressedFrames: 0,
+      rawFrames: 0
+    };
     /** @type {ReturnType<typeof setTimeout> | null} */
     this.coalesceTimer = null;
     /** @type {ReturnType<typeof setImmediate> | null} */
@@ -88,9 +232,75 @@ class LiveSyncClient extends EventEmitter {
     this.inflight = new Map();
   }
 
+  /** Recarga `.culkiboignore` desde disco (sin impacto si no existe). */
+  reloadIgnoreRules() {
+    this._ignoreRules = loadCulkiboIgnore(this.sourceDir);
+    return this._ignoreRules.length;
+  }
+
+  /**
+   * Comprueba si una ruta relativa debe ignorarse (reglas internas + `.culkiboignore`).
+   * @param {string} relPath
+   */
+  isIgnored(relPath) {
+    if (!relPath) return true;
+    const rel = String(relPath).replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!rel || rel.startsWith('..') || IGNORED_SEGMENT_RE.test(rel) || EDITOR_SWAP_RE.test(rel) || rel.includes('.culkibo-sync-')) {
+      return true;
+    }
+    if (!this._ignoreRules || this._ignoreRules.length === 0) return false;
+    let ignored = false;
+    for (const rule of this._ignoreRules) {
+      if (rule.regex.test(rel)) {
+        ignored = !rule.negated;
+      }
+    }
+    return ignored;
+  }
+
+  /** Calcula el árbol Merkle local aplicando `.culkiboignore` sólo cuando existen reglas. */
+  _computeLocalTree() {
+    const tree = computeMerkleTree(this.sourceDir);
+    if (!this._ignoreRules || this._ignoreRules.length === 0) return tree;
+    /** @type {Record<string, string>} */
+    const filtered = Object.create(null);
+    const keys = Object.keys(tree.files).sort();
+    const hasher = crypto.createHash('sha256');
+    let fileCount = 0;
+    for (const k of keys) {
+      if (this.isIgnored(k)) continue;
+      filtered[k] = tree.files[k];
+      hasher.update(`${k}\0${filtered[k]}\n`);
+      fileCount++;
+    }
+    return {
+      rootDigest: hasher.digest('hex'),
+      fileCount,
+      totalBytes: tree.totalBytes,
+      files: filtered
+    };
+  }
+
+  /** Selecciona el códec de compresión negociado con el servidor (`br` | `gzip` | null). */
+  _selectCodec() {
+    if (this.compression === 'none' || !Array.isArray(this.supportedCodecs) || this.supportedCodecs.length === 0) {
+      return null;
+    }
+    if (this.compression === 'br') {
+      return this.supportedCodecs.includes('br') ? 'br' : null;
+    }
+    if (this.compression === 'gzip') {
+      return this.supportedCodecs.includes('gzip') ? 'gzip' : null;
+    }
+    if (this.supportedCodecs.includes('br')) return 'br';
+    if (this.supportedCodecs.includes('gzip')) return 'gzip';
+    return null;
+  }
+
   /** Conecta el WebSocket persistente, realiza handshake Merkle y arranca el watcher. */
   async start() {
     this.closed = false;
+    this.reloadIgnoreRules();
     await this.connect();
 
     if (this.autoWatch) {
@@ -101,7 +311,8 @@ class LiveSyncClient extends EventEmitter {
         this.nativeWatcher = fs.watch(this.sourceDir, { recursive: true }, (_eventType, filename) => {
           if (!filename) return;
           const rel = String(filename).split(path.sep).join('/');
-          if (!rel || IGNORED_SEGMENT_RE.test(rel) || EDITOR_SWAP_RE.test(rel) || rel.includes('.culkibo-sync-')) return;
+          if (rel === '.culkiboignore') this.reloadIgnoreRules();
+          if (this.isIgnored(rel)) return;
           // Sin fs.statSync en el camino caliente: flushNow resuelve ENOENT/EISDIR/symlink al leer.
           this._enqueueRel(rel, 'upsert');
         });
@@ -109,7 +320,11 @@ class LiveSyncClient extends EventEmitter {
       } else {
         const chokidar = require('chokidar');
         this.watcher = chokidar.watch(this.sourceDir, {
-          ignored: (filePath) => IGNORED_SEGMENT_RE.test(filePath) || EDITOR_SWAP_RE.test(filePath) || path.basename(filePath).includes('.culkibo-sync-'),
+          ignored: (filePath) => {
+            const rel = path.relative(this.sourceDir, filePath).split(path.sep).join('/');
+            if (!rel) return false;
+            return this.isIgnored(rel);
+          },
           persistent: true,
           ignoreInitial: true,
           followSymlinks: false,
@@ -181,8 +396,11 @@ class LiveSyncClient extends EventEmitter {
           ws._socket.setNoDelay(true);
         }
 
-        const localTree = computeMerkleTree(this.sourceDir);
+        const localTree = this._computeLocalTree();
         this.initialLocalTree = localTree;
+        this.initialLocalTreeAt = Date.now();
+        this._initialTreeHasFiles = true;
+        const offeredCodecs = this.compression === 'none' ? [] : ['br', 'gzip'];
         ws.send(JSON.stringify({
           type: 'hello',
           projectId: this.projectId,
@@ -191,7 +409,10 @@ class LiveSyncClient extends EventEmitter {
           sourceDir: this.sourceDir,
           pid: process.pid,
           clientDigest: localTree.rootDigest,
-          fileCount: localTree.fileCount
+          fileCount: localTree.fileCount,
+          protocolVersion: 2,
+          codecs: offeredCodecs,
+          compressionAccepted: offeredCodecs
         }));
 
         if (this.pingTimer) {
@@ -222,14 +443,20 @@ class LiveSyncClient extends EventEmitter {
           this.connected = true;
           this._reconnectAttempt = 0;
           this.seq = msg.lastSeq || 0;
+          this.clientId = msg.clientId || null;
           this.initialInSync = Boolean(msg.inSync);
           this.binaryFramesSupported = Boolean(msg.binaryFramesSupported);
+          const advertised = Array.isArray(msg.codecs)
+            ? msg.codecs
+            : (Array.isArray(msg.compressionSupported) ? msg.compressionSupported : []);
+          this.supportedCodecs = advertised.map((c) => String(c).toLowerCase());
           if (this.initialInSync && this.initialLocalTree) {
             this.lastSentHashes.clear();
             for (const [k, v] of Object.entries(this.initialLocalTree.files)) {
               this.lastSentHashes.set(k, v);
             }
             this.initialLocalTree = { rootDigest: this.initialLocalTree.rootDigest, fileCount: this.initialLocalTree.fileCount, files: {} };
+            this._initialTreeHasFiles = false;
           }
           this.emit('ready', msg);
           finishConnect(null, msg);
@@ -262,9 +489,50 @@ class LiveSyncClient extends EventEmitter {
 
         if (msg.type === 'rollback_notice') {
           if (Array.isArray(msg.restoredFiles)) {
-            for (const f of msg.restoredFiles) this.lastSentHashes.delete(String(f));
+            for (const f of msg.restoredFiles) {
+              const rel = String(f);
+              this.lastSentHashes.delete(rel);
+              this._statCache.delete(path.join(this.sourceDir, rel));
+            }
           }
           this.emit('rollback_notice', msg);
+          return;
+        }
+
+        if (msg.type === 'conflict_notice') {
+          this.emit('conflict_notice', msg);
+          this.emit('sync_conflict', msg);
+          return;
+        }
+
+        if (msg.type === 'file_history_ack') {
+          const waiter = this._fileHistoryWaiters.shift();
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(msg);
+          }
+          this.emit('file_history_ack', msg);
+          return;
+        }
+
+        if (msg.type === 'rollback_file_ack') {
+          if (Array.isArray(msg.restoredFiles)) {
+            for (const f of msg.restoredFiles) {
+              const rel = String(f);
+              this.lastSentHashes.delete(rel);
+              this._statCache.delete(path.join(this.sourceDir, rel));
+            }
+          } else if (msg.filePath) {
+            const rel = String(msg.filePath);
+            this.lastSentHashes.delete(rel);
+            this._statCache.delete(path.join(this.sourceDir, rel));
+          }
+          const waiter = this._rollbackFileWaiters.shift();
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(msg);
+          }
+          this.emit('rollback_file_ack', msg);
           return;
         }
 
@@ -296,11 +564,13 @@ class LiveSyncClient extends EventEmitter {
           waiter.reject(new Error('Conexión de sincronización cerrada'));
         }
         this.inflight.clear();
-        while (this._verifyWaiters.length) {
-          const w = this._verifyWaiters.shift();
-          if (w) {
-            clearTimeout(w.timer);
-            w.reject(new Error('Conexión de sincronización cerrada'));
+        for (const queue of [this._verifyWaiters, this._fileHistoryWaiters, this._rollbackFileWaiters]) {
+          while (queue.length) {
+            const w = queue.shift();
+            if (w) {
+              clearTimeout(w.timer);
+              w.reject(new Error('Conexión de sincronización cerrada'));
+            }
           }
         }
         this.emit('close', code);
@@ -365,8 +635,60 @@ class LiveSyncClient extends EventEmitter {
     });
   }
 
-  /** Lee un archivo con reintentos cortos ante EBUSY/EPERM transitorios de editores en Windows (sin seguir symlinks). */
-  async _readFileSafe(abs) {
+  /** Consulta al servidor el historial time-travel de un fichero vía `/ws/sync`. */
+  requestFileHistory(filePath) {
+    if (!this.ws || this.ws.readyState !== 1) {
+      return Promise.reject(new Error('El WebSocket de sincronización no está conectado'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this._fileHistoryWaiters.findIndex((w) => w.timer === timer);
+        if (idx !== -1) this._fileHistoryWaiters.splice(idx, 1);
+        reject(new Error('Tiempo de espera agotado consultando historial de fichero'));
+      }, 10000);
+      if (timer.unref) timer.unref();
+      this._fileHistoryWaiters.push({ resolve, reject, timer });
+      this.ws.send(JSON.stringify({
+        type: 'file_history',
+        projectId: this.projectId,
+        targetDir: this.targetDir,
+        path: filePath
+      }));
+    });
+  }
+
+  /** Solicita al servidor el rollback quirúrgico de un único fichero vía `/ws/sync`. */
+  requestRollbackFile(filePath, seq, opts = {}) {
+    if (!this.ws || this.ws.readyState !== 1) {
+      return Promise.reject(new Error('El WebSocket de sincronización no está conectado'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this._rollbackFileWaiters.findIndex((w) => w.timer === timer);
+        if (idx !== -1) this._rollbackFileWaiters.splice(idx, 1);
+        reject(new Error('Tiempo de espera agotado en rollback de fichero'));
+      }, 10000);
+      if (timer.unref) timer.unref();
+      this._rollbackFileWaiters.push({ resolve, reject, timer });
+      this.ws.send(JSON.stringify({
+        type: 'rollback_file',
+        projectId: this.projectId,
+        targetDir: this.targetDir,
+        path: filePath,
+        seq,
+        mode: opts && opts.mode === 'before' ? 'before' : 'to'
+      }));
+    });
+  }
+
+  /**
+   * Lee un archivo con reintentos cortos ante EBUSY/EPERM transitorios de editores en Windows (sin seguir symlinks)
+   * y caché de stat `(mtimeMs, ctimeMs, size, sha256)` para evitar lecturas/hashes duplicados en ráfagas dobles.
+   *
+   * @param {string} abs
+   * @param {{ skipIfUnchangedHash?: string | null }} [opts]
+   */
+  async _readFileSafe(abs, opts = {}) {
     for (let attempt = 1; attempt <= 4; attempt++) {
       try {
         const st = fs.lstatSync(abs);
@@ -376,9 +698,31 @@ class LiveSyncClient extends EventEmitter {
         if (st.size > MAX_CLIENT_FILE_BYTES) {
           return { kind: 'too_large', size: st.size };
         }
-        return { kind: 'file', buffer: fs.readFileSync(abs) };
+        const cached = this._statCache.get(abs);
+        if (
+          cached &&
+          cached.mtimeMs === st.mtimeMs &&
+          cached.ctimeMs === st.ctimeMs &&
+          cached.size === st.size
+        ) {
+          if (opts.skipIfUnchangedHash && cached.sha256 === opts.skipIfUnchangedHash) {
+            return { kind: 'unchanged', sha256: cached.sha256, mtimeMs: st.mtimeMs, size: st.size };
+          }
+        }
+        const buffer = fs.readFileSync(abs);
+        const hash = sha256(buffer);
+        if (this._statCache.size >= MAX_STAT_CACHE_ENTRIES && !this._statCache.has(abs)) {
+          const oldest = this._statCache.keys().next().value;
+          if (oldest !== undefined) this._statCache.delete(oldest);
+        }
+        this._statCache.delete(abs);
+        this._statCache.set(abs, { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, sha256: hash });
+        return { kind: 'file', buffer, sha256: hash, mtimeMs: st.mtimeMs, size: st.size };
       } catch (e) {
-        if (e && e.code === 'ENOENT') return { kind: 'missing' };
+        if (e && e.code === 'ENOENT') {
+          this._statCache.delete(abs);
+          return { kind: 'missing' };
+        }
         if (e && (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES') && attempt < 4) {
           await new Promise((r) => setTimeout(r, 25 * attempt));
           continue;
@@ -419,7 +763,8 @@ class LiveSyncClient extends EventEmitter {
   /** @param {string} absPath @param {'upsert' | 'delete'} op */
   enqueue(absPath, op) {
     const rel = path.relative(this.sourceDir, absPath).split(path.sep).join('/');
-    if (!rel || rel.startsWith('..') || IGNORED_SEGMENT_RE.test(rel) || EDITOR_SWAP_RE.test(rel)) return;
+    if (rel === '.culkiboignore') this.reloadIgnoreRules();
+    if (this.isIgnored(rel)) return;
     this._enqueueRel(rel, op);
   }
 
@@ -503,26 +848,37 @@ class LiveSyncClient extends EventEmitter {
         const batch = Array.from(this.pending.entries());
         this.pending.clear();
 
-        /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string }>} */
+        /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string, baseSha256?: string }>} */
         const files = [];
         /** @type {Array<{ rel: string, op: 'upsert' | 'delete', hash?: string }>} */
         const pendingHashCommits = [];
 
         for (const [rel, op] of batch) {
+          const prevHash = this.lastSentHashes.get(rel);
+          const abs = path.join(this.sourceDir, rel);
           if (op === 'delete') {
+            this._statCache.delete(abs);
             pendingHashCommits.push({ rel, op: 'delete' });
-            files.push({ path: rel, op: 'delete' });
+            files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
           } else {
-            const abs = path.join(this.sourceDir, rel);
-            const res = await this._readFileSafe(abs);
+            const res = await this._readFileSafe(abs, { skipIfUnchangedHash: prevHash || null });
+            if (res.kind === 'unchanged') {
+              continue;
+            }
             if (res.kind === 'file' && res.buffer) {
-              const h = sha256(res.buffer);
-              if (this.lastSentHashes.get(rel) === h) continue;
+              const h = res.sha256 || sha256(res.buffer);
+              if (prevHash === h) continue;
               pendingHashCommits.push({ rel, op: 'upsert', hash: h });
-              files.push({ path: rel, op: 'upsert', buffer: res.buffer, sha256: h });
+              files.push({
+                path: rel,
+                op: 'upsert',
+                buffer: res.buffer,
+                sha256: h,
+                ...(prevHash ? { baseSha256: prevHash } : {})
+              });
             } else if (res.kind === 'missing') {
               pendingHashCommits.push({ rel, op: 'delete' });
-              files.push({ path: rel, op: 'delete' });
+              files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
             } else if (res.kind === 'too_large') {
               this.emit('file_skipped', { path: rel, size: res.size, limit: MAX_CLIENT_FILE_BYTES });
             }
@@ -558,19 +914,40 @@ class LiveSyncClient extends EventEmitter {
   }
 
   /**
-   * Codifica un Commit Frame como trama binaria `[1B 0x01][4B metaLen][JSON meta][buffers]`
-   * evitando base64 (+33%) y escapes JSON.
+   * Codifica un Commit Frame como trama binaria adaptativa:
+   * - `0x01`: `[1B 0x01][4B metaLen][JSON meta][buffers]` (bypass instantáneo <512 B, incompresibles o servidores antiguos)
+   * - `0x02`: `[1B 0x02][4B rawLen][brotli([4B metaLen][JSON meta][buffers])]` (>=512 B y ahorro >=15%)
+   * - `0x03`: `[1B 0x03][4B rawLen][gzip([4B metaLen][JSON meta][buffers])]` (>=512 B y ahorro >=15%)
+   *
+   * @param {number} seq
+   * @param {Array<{ path: string, op?: 'upsert' | 'delete', buffer?: Buffer, content?: string, encoding?: 'utf8' | 'base64', sha256?: string, baseSha256?: string }>} files
+   * @param {{ forceCodec?: 'br' | 'gzip' | 'none' }} [options]
    */
-  encodeBinaryFrame(seq, files) {
+  encodeBinaryFrame(seq, files, options = {}) {
     /** @type {Buffer[]} */
     const chunks = [];
+    /** @type {Array<{ path: string, op: string, buf?: Buffer }>} */
+    const probeEntries = [];
     const metaFiles = files.map((f) => {
-      if (f.op === 'delete') return { path: f.path, op: 'delete' };
+      if (f.op === 'delete') {
+        return {
+          path: f.path,
+          op: 'delete',
+          ...(f.baseSha256 ? { baseSha256: f.baseSha256 } : {})
+        };
+      }
       const buf = Buffer.isBuffer(f.buffer)
         ? f.buffer
         : Buffer.from(String(f.content ?? ''), f.encoding === 'base64' ? 'base64' : 'utf8');
       chunks.push(buf);
-      return { path: f.path, op: 'upsert', byteLength: buf.length, sha256: f.sha256 };
+      probeEntries.push({ path: f.path, op: 'upsert', buf });
+      return {
+        path: f.path,
+        op: 'upsert',
+        byteLength: buf.length,
+        sha256: f.sha256,
+        ...(f.baseSha256 ? { baseSha256: f.baseSha256 } : {})
+      };
     });
     const metaBuf = Buffer.from(JSON.stringify({
       type: 'frame',
@@ -579,16 +956,56 @@ class LiveSyncClient extends EventEmitter {
       seq,
       files: metaFiles
     }), 'utf8');
-    const prefix = Buffer.allocUnsafe(5);
-    prefix[0] = 0x01;
-    prefix.writeUInt32BE(metaBuf.length, 1);
-    return Buffer.concat([prefix, metaBuf, ...chunks]);
+
+    const metaLenPrefix = Buffer.allocUnsafe(4);
+    metaLenPrefix.writeUInt32BE(metaBuf.length, 0);
+    const rawBody = Buffer.concat([metaLenPrefix, metaBuf, ...chunks]);
+    const rawWireLen = 1 + rawBody.length;
+
+    const codec = options && options.forceCodec !== undefined
+      ? (options.forceCodec === 'none' ? null : options.forceCodec)
+      : this._selectCodec();
+
+    if (codec && rawBody.length >= COMPRESSION_MIN_BYTES && !isMostlyIncompressible(probeEntries)) {
+      try {
+        const z = getZlib();
+        const compressed = codec === 'br'
+          ? z.brotliCompressSync(rawBody, {
+            params: {
+              [z.constants.BROTLI_PARAM_MODE]: z.constants.BROTLI_MODE_TEXT,
+              [z.constants.BROTLI_PARAM_QUALITY]: rawBody.length > 128 * 1024 ? 4 : 1
+            }
+          })
+          : z.gzipSync(rawBody, { level: 1 });
+
+        const compressedWireLen = 5 + compressed.length;
+        if (compressedWireLen <= Math.floor(rawWireLen * COMPRESSION_MAX_RATIO)) {
+          const prefix = Buffer.allocUnsafe(5);
+          prefix[0] = codec === 'br' ? FRAME_MAGIC_BROTLI : FRAME_MAGIC_GZIP;
+          prefix.writeUInt32BE(rawBody.length, 1);
+          this.wireStats.rawBytes += rawWireLen;
+          this.wireStats.wireBytes += compressedWireLen;
+          this.wireStats.savedBytes += (rawWireLen - compressedWireLen);
+          this.wireStats.compressedFrames++;
+          return Buffer.concat([prefix, compressed]);
+        }
+      } catch (e) {
+        // Fallback silencioso a 0x01 crudo ante cualquier fallo de compresión
+      }
+    }
+
+    const rawPrefix = Buffer.allocUnsafe(1);
+    rawPrefix[0] = FRAME_MAGIC_RAW;
+    this.wireStats.rawBytes += rawWireLen;
+    this.wireStats.wireBytes += rawWireLen;
+    this.wireStats.rawFrames++;
+    return Buffer.concat([rawPrefix, rawBody]);
   }
 
   /**
    * Envía un array de ficheros directamente como Commit Frame y espera el ACK.
    *
-   * @param {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, encoding?: 'base64' | 'utf8', content?: string, sha256?: string }>} files
+   * @param {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, encoding?: 'base64' | 'utf8', content?: string, sha256?: string, baseSha256?: string }>} files
    */
   sendFrame(files) {
     if (!this.ws || this.ws.readyState !== 1) {
@@ -604,9 +1021,22 @@ class LiveSyncClient extends EventEmitter {
         this.ws.send(payload);
       } else {
         const jsonFiles = files.map((f) => {
-          if (f.op === 'delete') return { path: f.path, op: 'delete' };
+          if (f.op === 'delete') {
+            return {
+              path: f.path,
+              op: 'delete',
+              ...(f.baseSha256 ? { baseSha256: f.baseSha256 } : {})
+            };
+          }
           if (Buffer.isBuffer(f.buffer)) {
-            return { path: f.path, op: 'upsert', encoding: 'base64', content: f.buffer.toString('base64'), sha256: f.sha256 };
+            return {
+              path: f.path,
+              op: 'upsert',
+              encoding: 'base64',
+              content: f.buffer.toString('base64'),
+              sha256: f.sha256,
+              ...(f.baseSha256 ? { baseSha256: f.baseSha256 } : {})
+            };
           }
           return f;
         });
@@ -626,7 +1056,18 @@ class LiveSyncClient extends EventEmitter {
     if (this._reconciling) return { reconciled: false, skipped: true };
     this._reconciling = true;
     try {
-      const localTree = computeMerkleTree(this.sourceDir);
+      const canReuseInitial = Boolean(
+        this._initialTreeHasFiles &&
+        this.initialLocalTree &&
+        this.initialLocalTree.files &&
+        this.pending.size === 0 &&
+        (Date.now() - (this.initialLocalTreeAt || 0)) < FRESH_TREE_MAX_AGE_MS
+      );
+      const localTree = canReuseInitial ? this.initialLocalTree : this._computeLocalTree();
+      this.initialLocalTree = null;
+      this.initialLocalTreeAt = 0;
+      this._initialTreeHasFiles = false;
+
       const verified = await this.verifyWithServer(localTree.files);
       const cmp = verified && verified.comparison;
       if (!cmp || cmp.inSync) {
@@ -635,19 +1076,28 @@ class LiveSyncClient extends EventEmitter {
         return { reconciled: true, changed: 0, framesSent: 0, rootDigest: localTree.rootDigest };
       }
 
-      /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string }>} */
+      /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string, baseSha256?: string }>} */
       const files = [];
       for (const rel of [...(cmp.missingOnServer || []), ...(cmp.staleOnServer || [])]) {
         const res = await this._readFileSafe(path.join(this.sourceDir, rel));
         if (res.kind === 'file' && res.buffer) {
-          const h = sha256(res.buffer);
+          const h = res.sha256 || sha256(res.buffer);
+          const prevHash = this.lastSentHashes.get(rel);
           this.lastSentHashes.set(rel, h);
-          files.push({ path: rel, op: 'upsert', buffer: res.buffer, sha256: h });
+          files.push({
+            path: rel,
+            op: 'upsert',
+            buffer: res.buffer,
+            sha256: h,
+            ...(prevHash ? { baseSha256: prevHash } : {})
+          });
         }
       }
       for (const rel of (cmp.extraOnServer || [])) {
+        const prevHash = this.lastSentHashes.get(rel);
         this.lastSentHashes.delete(rel);
-        files.push({ path: rel, op: 'delete' });
+        this._statCache.delete(path.join(this.sourceDir, rel));
+        files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
       }
       if (files.length === 0) {
         return { reconciled: true, changed: 0, framesSent: 0, rootDigest: localTree.rootDigest };
@@ -665,6 +1115,8 @@ class LiveSyncClient extends EventEmitter {
       this.initialInSync = false;
       const digest = this.initialLocalTree.rootDigest;
       this.initialLocalTree = null;
+      this.initialLocalTreeAt = 0;
+      this._initialTreeHasFiles = false;
       return { reconciled: true, changed: 0, rootDigest: digest };
     }
     if (!serverFilesMap) {
@@ -674,11 +1126,13 @@ class LiveSyncClient extends EventEmitter {
         // Fallback a reconciliación completa si el servidor no soporta verify delta
       }
     }
-    const localTree = this.initialLocalTree && !serverFilesMap && Object.keys(this.initialLocalTree.files || {}).length > 0
+    const localTree = this._initialTreeHasFiles && this.initialLocalTree && !serverFilesMap && Object.keys(this.initialLocalTree.files || {}).length > 0
       ? this.initialLocalTree
-      : computeMerkleTree(this.sourceDir);
+      : this._computeLocalTree();
     this.initialLocalTree = null;
-    /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string }>} */
+    this.initialLocalTreeAt = 0;
+    this._initialTreeHasFiles = false;
+    /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string, baseSha256?: string }>} */
     const files = [];
 
     if (serverFilesMap) {
@@ -686,18 +1140,34 @@ class LiveSyncClient extends EventEmitter {
       for (const rel of [...diff.missingOnServer, ...diff.staleOnServer]) {
         const buf = fs.readFileSync(path.join(this.sourceDir, rel));
         const h = sha256(buf);
+        const prevHash = this.lastSentHashes.get(rel);
         this.lastSentHashes.set(rel, h);
-        files.push({ path: rel, op: 'upsert', buffer: buf, sha256: h });
+        files.push({
+          path: rel,
+          op: 'upsert',
+          buffer: buf,
+          sha256: h,
+          ...(prevHash ? { baseSha256: prevHash } : {})
+        });
       }
       for (const rel of diff.extraOnServer) {
+        const prevHash = this.lastSentHashes.get(rel);
         this.lastSentHashes.delete(rel);
-        files.push({ path: rel, op: 'delete' });
+        this._statCache.delete(path.join(this.sourceDir, rel));
+        files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
       }
     } else {
       for (const [rel, hash] of Object.entries(localTree.files)) {
         const buf = fs.readFileSync(path.join(this.sourceDir, rel));
+        const prevHash = this.lastSentHashes.get(rel);
         this.lastSentHashes.set(rel, hash);
-        files.push({ path: rel, op: 'upsert', buffer: buf, sha256: hash });
+        files.push({
+          path: rel,
+          op: 'upsert',
+          buffer: buf,
+          sha256: hash,
+          ...(prevHash ? { baseSha256: prevHash } : {})
+        });
       }
     }
 
@@ -741,4 +1211,4 @@ class LiveSyncClient extends EventEmitter {
   }
 }
 
-module.exports = { LiveSyncClient };
+module.exports = { LiveSyncClient, compileIgnoreRule, loadCulkiboIgnore };

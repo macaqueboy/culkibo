@@ -106,13 +106,91 @@ const CATEGORIES = [
   { id: 'desarrollo', label: 'Desarrollo' },
   { id: 'monitorizacion', label: 'Monitorización' },
   { id: 'productividad', label: 'Productividad' },
-  { id: 'seguridad', label: 'Seguridad' }
+  { id: 'seguridad', label: 'Seguridad' },
+  { id: 'docs', label: 'Documentación y wikis' },
+  { id: 'media', label: 'Multimedia y archivos' },
+  { id: 'mensajeria', label: 'Mensajería' }
 ];
+
+/**
+ * @typedef {{ name: string, path: string }} TemplateVolume
+ * @typedef {{ name: string, path: string, content: string }} TemplateFile
+ * @typedef {{ containerPort: number, label: string }} TemplateExtraPort
+ * @typedef {{ path: string, expect: number[], timeoutMs?: number }} TemplateReadiness
+ * @typedef {{ type: 'exec', cmd: string[], timeoutMs?: number } | { type: 'tcp', port: number, timeoutMs?: number }} SidecarReadiness
+ * @typedef {{
+ *   name: string,
+ *   image: string,
+ *   memoryMb: number,
+ *   cpus: number,
+ *   env?: Record<string, string>,
+ *   volumes?: TemplateVolume[],
+ *   files?: TemplateFile[],
+ *   command?: string[],
+ *   readiness?: SidecarReadiness
+ * }} TemplateSidecar
+ * @typedef {{
+ *   engine: 'postgres' | 'mysql' | 'mariadb' | 'valkey' | 'redis' | 'mongodb',
+ *   image?: string,
+ *   dbName?: string,
+ *   username?: string,
+ *   memoryMb?: number,
+ *   cpus?: number
+ * }} TemplateDatabase
+ * @typedef {{ bytes: number, encoding: 'hex' | 'base64' | 'base64url' }} TemplateSecretSpec
+ * @typedef {{
+ *   id: string,
+ *   name: string,
+ *   category: string,
+ *   summary: string,
+ *   description: string,
+ *   website: string,
+ *   licence: string,
+ *   tags?: string[],
+ *   database: TemplateDatabase | null,
+ *   secrets: Record<string, TemplateSecretSpec>,
+ *   sidecars?: TemplateSidecar[],
+ *   app: {
+ *     image: string,
+ *     port: number,
+ *     extraPorts?: TemplateExtraPort[],
+ *     memoryMb: number,
+ *     cpus: number,
+ *     shmSize?: string,
+ *     env: Record<string, string>,
+ *     volumes?: TemplateVolume[],
+ *     files?: TemplateFile[],
+ *     command?: string[],
+ *     readiness: TemplateReadiness
+ *   },
+ *   nextSteps?: string[],
+ *   notes?: string[]
+ * }} CatalogTemplate
+ */
+
+/**
+ * Auxiliar Valkey fijado y listo para comprobar disponibilidad con `valkey-cli ping`.
+ * @param {number} [memoryMb]
+ * @returns {TemplateSidecar}
+ */
+function makeValkeySidecar(memoryMb = 256) {
+  return {
+    name: 'valkey',
+    image: 'valkey/valkey:8.1-alpine',
+    memoryMb,
+    cpus: 0.5,
+    env: {},
+    volumes: [{ name: 'data', path: '/data' }],
+    command: ['valkey-server', '--save', '60', '1', '--loglevel', 'warning'],
+    readiness: { type: 'exec', cmd: ['valkey-cli', 'ping'], timeoutMs: 30000 }
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Plantillas
 // ---------------------------------------------------------------------------
 
+/** @type {CatalogTemplate[]} */
 const TEMPLATES = [
   // -------------------------------------------------------------------------
   {
@@ -1129,6 +1207,3350 @@ const TEMPLATES = [
       'Apunta el cliente SMTP de tus apps de prueba al contenedor en el puerto 1025.'
     ],
     notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  // A. Inteligencia artificial (6 nuevas → 10 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'flowise',
+    name: 'Flowise',
+    category: 'ia',
+    summary: 'Constructor visual de agentes, cadenas RAG y flujos sobre modelos de lenguaje.',
+    description:
+      'Diseña flujos conversacionales, agentes con herramientas y pipelines RAG arrastrando nodos ' +
+      'sobre PostgreSQL, con API REST lista para incrustar en cualquier producto.',
+    website: 'https://flowiseai.com',
+    licence: 'Apache-2.0',
+    tags: ['ia', 'agentes', 'rag', 'langchain', 'flujos'],
+    database: { engine: 'postgres', dbName: 'flowise', username: 'flowise', memoryMb: 512 },
+    secrets: {
+      FLOWISE_PASSWORD: { bytes: 24, encoding: 'base64url' },
+      FLOWISE_SECRETKEY_OVERWRITE: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'flowiseai/flowise:3.1.4',
+      port: 3000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        PORT: '3000',
+        FLOWISE_USERNAME: 'admin',
+        FLOWISE_PASSWORD: '{{secret.FLOWISE_PASSWORD}}',
+        FLOWISE_SECRETKEY_OVERWRITE: '{{secret.FLOWISE_SECRETKEY_OVERWRITE}}',
+        DATABASE_TYPE: 'postgres',
+        DATABASE_HOST: '{{db.host}}',
+        DATABASE_PORT: '{{db.port}}',
+        DATABASE_USER: '{{db.user}}',
+        DATABASE_PASSWORD: '{{db.password}}',
+        DATABASE_NAME: '{{db.name}}',
+        BLOB_STORAGE_PATH: '/root/.flowise/storage',
+        APIKEY_PATH: '/root/.flowise',
+        SECRETKEY_PATH: '/root/.flowise',
+        LOG_PATH: '/root/.flowise/logs'
+      },
+      volumes: [{ name: 'data', path: '/root/.flowise' }],
+      readiness: { path: '/api/v1/ping', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} e inicia sesión con «admin» y la contraseña FLOWISE_PASSWORD en «Credenciales».',
+      'Añade tus claves de OpenAI, Anthropic, Gemini u Ollama desde la pestaña de credenciales de Flowise.'
+    ],
+    notes: [
+      'Guarda FLOWISE_SECRETKEY_OVERWRITE: cifra todas las API keys almacenadas dentro de tus flujos.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'anythingllm',
+    name: 'AnythingLLM',
+    category: 'ia',
+    summary: 'Espacios de trabajo privados para chatear con documentos, bases de conocimiento y agentes.',
+    description:
+      'Ingesta PDFs, repositorios, webs y documentación interna en espacios aislados por equipo, ' +
+      'con soporte para modelos locales (Ollama) y proveedores comerciales.',
+    website: 'https://anythingllm.com',
+    licence: 'MIT',
+    tags: ['ia', 'rag', 'documentos', 'chat', 'agentes'],
+    database: null,
+    secrets: {
+      JWT_SECRET: { bytes: 32, encoding: 'hex' },
+      AUTH_TOKEN: { bytes: 24, encoding: 'base64url' }
+    },
+    app: {
+      image: 'mintplexlabs/anythingllm:1.20.0',
+      port: 3001,
+      memoryMb: 1536,
+      cpus: 2,
+      env: {
+        STORAGE_DIR: '/app/server/storage',
+        SERVER_PORT: '3001',
+        JWT_SECRET: '{{secret.JWT_SECRET}}',
+        AUTH_TOKEN: '{{secret.AUTH_TOKEN}}',
+        DISABLE_TELEMETRY: 'true'
+      },
+      volumes: [{ name: 'storage', path: '/app/server/storage' }],
+      readiness: { path: '/api/ping', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y completa el asistente inicial seleccionando tu proveedor LLM y motor vectorial.',
+      'El acceso queda protegido con AUTH_TOKEN desde el primer arranque: cópialo desde «Credenciales».'
+    ],
+    notes: [
+      'La base vectorial LanceDB y SQLite se guardan en el volumen persistente `/app/server/storage`.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'chromadb',
+    name: 'Chroma',
+    category: 'ia',
+    summary: 'Base de datos vectorial open source para embeddings, memoria de agentes y RAG.',
+    description:
+      'Almacena y consulta colecciones de vectores con metadatos mediante HTTP. Lista para conectar ' +
+      'con LangChain, LlamaIndex, Flowise o tus propios agentes de IA.',
+    website: 'https://www.trychroma.com',
+    licence: 'Apache-2.0',
+    tags: ['ia', 'vectores', 'embeddings', 'rag'],
+    database: null,
+    secrets: {
+      CHROMA_SERVER_AUTHN_CREDENTIALS: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'chromadb/chroma:1.5.9',
+      port: 8000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        IS_PERSISTENT: 'TRUE',
+        PERSIST_DIRECTORY: '/data',
+        ANONYMIZED_TELEMETRY: 'FALSE',
+        CHROMA_SERVER_AUTHN_PROVIDER: 'chromadb.auth.token_authn.TokenAuthenticationServerProvider',
+        CHROMA_SERVER_AUTHN_CREDENTIALS: '{{secret.CHROMA_SERVER_AUTHN_CREDENTIALS}}'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/api/v2/heartbeat', expect: [200] }
+    },
+    nextSteps: [
+      'Copia el token CHROMA_SERVER_AUTHN_CREDENTIALS en «Credenciales» y envíalo en la cabecera `Authorization: Bearer`.',
+      'Usa {{url}} como endpoint HTTP desde tu cliente Python o TypeScript de Chroma.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'weaviate',
+    name: 'Weaviate',
+    category: 'ia',
+    summary: 'Motor de búsqueda vectorial e híbrida BM25 + embeddings con API REST y gRPC.',
+    description:
+      'Base de datos vectorial escrita en Go que combina búsqueda semántica con filtrado estructurado ' +
+      'y BM25. Arranca con acceso anónimo desactivado y clave de administración generada.',
+    website: 'https://weaviate.io',
+    licence: 'BSD-3-Clause',
+    tags: ['ia', 'vectores', 'busqueda', 'hibrida', 'grpc'],
+    database: null,
+    secrets: {
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'cr.weaviate.io/semitechnologies/weaviate:1.40.7',
+      port: 8080,
+      extraPorts: [{ containerPort: 50051, label: 'gRPC' }],
+      memoryMb: 1536,
+      cpus: 2,
+      env: {
+        QUERY_DEFAULTS_LIMIT: '25',
+        PERSISTENCE_DATA_PATH: '/var/lib/weaviate',
+        DEFAULT_VECTORIZER_MODULE: 'none',
+        CLUSTER_HOSTNAME: 'node1',
+        AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'false',
+        AUTHENTICATION_APIKEY_ENABLED: 'true',
+        AUTHENTICATION_APIKEY_ALLOWED_KEYS: '{{secret.AUTHENTICATION_APIKEY_ALLOWED_KEYS}}',
+        AUTHENTICATION_APIKEY_USERS: 'admin@culkibo.local',
+        AUTHORIZATION_ADMINLIST_ENABLED: 'true',
+        AUTHORIZATION_ADMINLIST_USERS: 'admin@culkibo.local'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/weaviate' }],
+      readiness: { path: '/v1/.well-known/ready', expect: [200] }
+    },
+    nextSteps: [
+      'Usa la clave AUTHENTICATION_APIKEY_ALLOWED_KEYS de «Credenciales» en tus clientes Weaviate.',
+      'El puerto 50051 queda disponible en bucle local para clientes gRPC de alto rendimiento.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'searxng',
+    name: 'SearXNG',
+    category: 'ia',
+    summary: 'Metabuscador privado sin rastreo con API JSON ideal para dar búsqueda web a tus LLMs.',
+    description:
+      'Agrega resultados de decenas de motores de búsqueda sin perfilarte ni guardar historial. ' +
+      'Se integra directamente con Open WebUI, Flowise y agentes autónomos como motor de búsqueda.',
+    website: 'https://docs.searxng.org',
+    licence: 'AGPLv3',
+    tags: ['ia', 'busqueda', 'privacidad', 'rag', 'metabuscador'],
+    database: null,
+    secrets: {
+      SEARXNG_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'searxng/searxng:2026.11.18-b867c56a5',
+      port: 8080,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        SEARXNG_BASE_URL: '{{url}}/',
+        SEARXNG_SECRET: '{{secret.SEARXNG_SECRET}}',
+        SEARXNG_REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379/0',
+        SEARXNG_LIMITER: 'true'
+      },
+      volumes: [{ name: 'config', path: '/etc/searxng' }],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para probar búsquedas privadas de inmediato.',
+      'Para habilitar salidas `?format=json` en agentes de IA, activa `json` en `/etc/searxng/settings.yml`.'
+    ],
+    notes: [
+      'Incluye Valkey aislado para limitar peticiones y evitar bloqueos de los motores ascendentes.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'crawl4ai',
+    name: 'Crawl4AI',
+    category: 'ia',
+    summary: 'Rastreador web con navegador headless que convierte páginas dinámicas en Markdown limpio para IA.',
+    description:
+      'Renderiza JavaScript con Chromium y extrae contenido estructurado o Markdown listo para RAG, ' +
+      'protegido por token Bearer y con memoria compartida `/dev/shm` dimensionada.',
+    website: 'https://crawl4ai.com',
+    licence: 'Apache-2.0',
+    tags: ['ia', 'scraping', 'markdown', 'rag', 'navegador'],
+    database: null,
+    secrets: {
+      CRAWL4AI_API_TOKEN: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'unclecode/crawl4ai:0.9.5',
+      port: 11235,
+      memoryMb: 2048,
+      cpus: 2,
+      shmSize: '1g',
+      env: {
+        CRAWL4AI_API_TOKEN: '{{secret.CRAWL4AI_API_TOKEN}}',
+        MAX_CONCURRENT_TASKS: '4'
+      },
+      volumes: [{ name: 'data', path: '/home/appuser/.crawl4ai' }],
+      readiness: { path: '/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Copia CRAWL4AI_API_TOKEN desde «Credenciales» y pásalo como `Authorization: Bearer` al consultar `/crawl`.',
+      'Consulta la documentación interactiva en {{url}}/playground.'
+    ],
+    notes: [
+      'Ejecuta Chromium internamente: necesita al menos 2 GB de RAM y 1 GB de `/dev/shm` para no cerrar pestañas.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  // B. Analítica (5 nuevas → 8 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'matomo',
+    name: 'Matomo',
+    category: 'analitica',
+    summary: 'Suite completa de analítica web con propiedad total de los datos y cumplimiento RGPD.',
+    description:
+      'Alternativa madura a Google Analytics con embudos, comercio electrónico, campañas, objetivos ' +
+      'y gestión multi-sitio respaldada por MariaDB aislada.',
+    website: 'https://matomo.org',
+    licence: 'GPLv3',
+    tags: ['analitica', 'rgpd', 'ecommerce', 'seo'],
+    database: { engine: 'mariadb', dbName: 'matomo', username: 'matomo', memoryMb: 512 },
+    secrets: {},
+    app: {
+      image: 'matomo:5.10.1-apache',
+      port: 80,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        MATOMO_DATABASE_HOST: '{{db.host}}',
+        MATOMO_DATABASE_ADAPTER: 'mysql',
+        MATOMO_DATABASE_TABLES_PREFIX: 'matomo_',
+        MATOMO_DATABASE_USERNAME: '{{db.user}}',
+        MATOMO_DATABASE_PASSWORD: '{{db.password}}',
+        MATOMO_DATABASE_DBNAME: '{{db.name}}',
+        PHP_MEMORY_LIMIT: '512M'
+      },
+      volumes: [{ name: 'data', path: '/var/www/html' }],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y completa el asistente web: los datos de conexión a MariaDB ya vienen precargados.',
+      'Activa la anonimización de IP en Privacidad si quieres operar sin banner de consentimiento.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'superset',
+    name: 'Apache Superset',
+    category: 'analitica',
+    summary: 'Plataforma moderna de exploración de datos, laboratorio SQL y paneles de BI empresarial.',
+    description:
+      'Conecta almacenes SQL, crea gráficas interactivas avanzadas y comparte cuadros de mando con ' +
+      'caché Valkey y metadatos en PostgreSQL.',
+    website: 'https://superset.apache.org',
+    licence: 'Apache-2.0',
+    tags: ['bi', 'sql', 'dashboards', 'datos', 'analitica'],
+    database: { engine: 'postgres', dbName: 'superset', username: 'superset', memoryMb: 512 },
+    secrets: {
+      SUPERSET_SECRET_KEY: { bytes: 32, encoding: 'base64url' },
+      SUPERSET_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'apache/superset:6.0.0',
+      port: 8088,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        SUPERSET_SECRET_KEY: '{{secret.SUPERSET_SECRET_KEY}}',
+        SUPERSET_ADMIN_PASSWORD: '{{secret.SUPERSET_ADMIN_PASSWORD}}',
+        SQLALCHEMY_DATABASE_URI: 'postgresql+psycopg2://{{db.user}}:{{db.password}}@{{db.host}}:{{db.port}}/{{db.name}}',
+        REDIS_HOST: '{{sidecar.valkey.host}}',
+        REDIS_PORT: '6379',
+        SUPERSET_LOAD_EXAMPLES: 'no'
+      },
+      command: [
+        'sh', '-c',
+        'superset db upgrade && ' +
+        '(superset fab create-admin --username admin --firstname Admin --lastname Culkibo ' +
+        '--email admin@culkibo.local --password "$SUPERSET_ADMIN_PASSWORD" || true) && ' +
+        'superset init && ' +
+        'exec gunicorn --bind 0.0.0.0:8088 --workers 2 --timeout 120 "superset.app:create_app()"'
+      ],
+      volumes: [{ name: 'home', path: '/app/superset_home' }],
+      readiness: { path: '/health', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con la contraseña SUPERSET_ADMIN_PASSWORD de «Credenciales».',
+      'Añade tus bases de datos SQL desde Settings → Database Connections.'
+    ],
+    notes: [
+      'El primer arranque migra el esquema completo y crea los roles iniciales: puede tardar entre 1 y 3 minutos.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'goatcounter',
+    name: 'GoatCounter',
+    category: 'analitica',
+    summary: 'Analítica web ultraligera en Go sin cookies y con consumo mínimo de memoria.',
+    description:
+      'Mide páginas vistas, referentes y navegadores en menos de 40 MB de RAM sobre SQLite, sin ' +
+      'rastrear usuarios ni requerir aviso de cookies.',
+    website: 'https://www.goatcounter.com',
+    licence: 'MIT',
+    tags: ['analitica', 'ligera', 'privacidad', 'go'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'arp242/goatcounter:2.6.0',
+      port: 8080,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        GOATCOUNTER_DB: 'sqlite+/home/goatcounter/goatcounter-data/db.sqlite3'
+      },
+      command: ['serve', '-automigrate', '-listen', ':8080', '-tls', 'none'],
+      volumes: [{ name: 'data', path: '/home/goatcounter/goatcounter-data' }],
+      readiness: { path: '/', expect: [200, 302, 303] }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear tu primer sitio y tu cuenta de administración.',
+      'Copia la etiqueta `<script>` generada en el panel para empezar a registrar visitas.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'ackee',
+    name: 'Ackee',
+    category: 'analitica',
+    summary: 'Analítica minimalista en Node.js y MongoDB centrada en la privacidad y la API GraphQL.',
+    description:
+      'Panel limpio para medir tráfico, eventos personalizados y duración de visitas sin almacenar ' +
+      'datos personales ni cookies de terceros.',
+    website: 'https://ackee.electerious.com',
+    licence: 'MIT',
+    tags: ['analitica', 'privacidad', 'graphql', 'mongodb'],
+    database: { engine: 'mongodb', dbName: 'ackee', username: 'ackee', memoryMb: 512 },
+    secrets: {
+      ACKEE_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'electerious/ackee:3.5.1',
+      port: 3000,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        WAIT_HOSTS: '{{db.host}}:{{db.port}}',
+        ACKEE_MONGODB: '{{db.url}}',
+        ACKEE_USERNAME: 'admin',
+        ACKEE_PASSWORD: '{{secret.ACKEE_PASSWORD}}',
+        ACKEE_ALLOW_ORIGIN: '{{url}}'
+      },
+      volumes: [],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Entra en {{url}} con usuario «admin» y la contraseña ACKEE_PASSWORD de «Credenciales».',
+      'Si vas a trackear otros dominios, añade sus orígenes en ACKEE_ALLOW_ORIGIN desde las variables de entorno.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'shlink',
+    name: 'Shlink',
+    category: 'analitica',
+    summary: 'Acortador de enlaces propio con analítica de clics, códigos QR y API REST.',
+    description:
+      'Crea enlaces cortos bajo tu propio dominio, controla redirecciones por dispositivo o fecha ' +
+      'y mide cada clic sin depender de Bitly.',
+    website: 'https://shlink.io',
+    licence: 'MIT',
+    tags: ['enlaces', 'acortador', 'qr', 'analitica', 'api'],
+    database: { engine: 'postgres', dbName: 'shlink', username: 'shlink', memoryMb: 512 },
+    secrets: {
+      INITIAL_API_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'shlinkio/shlink:4.3.0',
+      port: 8080,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        DEFAULT_DOMAIN: '{{domain}}',
+        IS_HTTPS_ENABLED: '{{isHttps}}',
+        DB_DRIVER: 'postgres',
+        DB_HOST: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_NAME: '{{db.name}}',
+        DB_USER: '{{db.user}}',
+        DB_PASSWORD: '{{db.password}}',
+        INITIAL_API_KEY: '{{secret.INITIAL_API_KEY}}'
+      },
+      volumes: [],
+      readiness: { path: '/rest/health', expect: [200] }
+    },
+    nextSteps: [
+      'Copia INITIAL_API_KEY en «Credenciales» para conectar el panel web oficial `app.shlink.io` o llamar a la API REST.',
+      'Asigna un dominio corto a esta instalación antes de compartir enlaces públicos.'
+    ],
+    notes: [
+      'Shlink sirve la API y las redirecciones; su interfaz web se conecta como cliente estático externo usando tu API key.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  // C. Monitorización (8 nuevas → 10 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'prometheus',
+    name: 'Prometheus',
+    category: 'monitorizacion',
+    summary: 'Sistema de métricas de series temporales, scraping y reglas de alerta estándar en la nube.',
+    description:
+      'Recolecta métricas de tus aplicaciones, exportadores y del endpoint `/metrics` de Culkibo, ' +
+      'con retención de 30 días y lenguaje de consultas PromQL.',
+    website: 'https://prometheus.io',
+    licence: 'Apache-2.0',
+    tags: ['metricas', 'promql', 'alertas', 'observabilidad'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'prom/prometheus:v3.5.5',
+      port: 9090,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {},
+      command: [
+        '--config.file=/etc/prometheus/prometheus.yml',
+        '--storage.tsdb.path=/prometheus',
+        '--storage.tsdb.retention.time=30d',
+        '--web.enable-lifecycle'
+      ],
+      files: [
+        {
+          name: 'prometheus.yml',
+          path: '/etc/prometheus/prometheus.yml',
+          content:
+            'global:\n' +
+            '  scrape_interval: 15s\n' +
+            '  evaluation_interval: 15s\n\n' +
+            'scrape_configs:\n' +
+            '  - job_name: prometheus\n' +
+            '    static_configs:\n' +
+            '      - targets:\n' +
+            '          - 127.0.0.1:9090\n'
+        }
+      ],
+      volumes: [{ name: 'data', path: '/prometheus' }],
+      readiness: { path: '/-/healthy', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y protege el dominio con Basic Auth o lista blanca de IP antes de exponerlo a internet.',
+      'Conecta Prometheus como fuente de datos dentro de Grafana.'
+    ],
+    notes: [
+      'Prometheus no trae autenticación propia: usa el dominio protegido de Culkibo o mantén el acceso en bucle local.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'loki',
+    name: 'Grafana Loki',
+    category: 'monitorizacion',
+    summary: 'Agregador de registros centralizado inspirado en Prometheus, ligero y listo para Grafana.',
+    description:
+      'Indexa sólo etiquetas en lugar del texto completo para reducir memoria y disco. Configurado en ' +
+      'modo monolítico TSDB v13 con retención automática de 14 días.',
+    website: 'https://grafana.com/oss/loki',
+    licence: 'AGPLv3',
+    tags: ['logs', 'registros', 'grafana', 'observabilidad'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'grafana/loki:3.7.0',
+      port: 3100,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {},
+      command: ['-config.file=/etc/loki/local-config.yaml'],
+      files: [
+        {
+          name: 'local-config.yaml',
+          path: '/etc/loki/local-config.yaml',
+          content:
+            'auth_enabled: false\n' +
+            'server:\n' +
+            '  http_listen_port: 3100\n' +
+            'common:\n' +
+            '  instance_addr: 127.0.0.1\n' +
+            '  path_prefix: /loki\n' +
+            '  storage:\n' +
+            '    filesystem:\n' +
+            '      chunks_directory: /loki/chunks\n' +
+            '      rules_directory: /loki/rules\n' +
+            '  replication_factor: 1\n' +
+            '  ring:\n' +
+            '    kvstore:\n' +
+            '      store: inmemory\n' +
+            'schema_config:\n' +
+            '  configs:\n' +
+            '    - from: 2024-01-01\n' +
+            '      store: tsdb\n' +
+            '      object_store: filesystem\n' +
+            '      schema: v13\n' +
+            '      index:\n' +
+            '        prefix: index_\n' +
+            '        period: 24h\n' +
+            'limits_config:\n' +
+            '  allow_structured_metadata: true\n' +
+            '  retention_period: 336h\n' +
+            'compactor:\n' +
+            '  working_directory: /loki/compactor\n' +
+            '  retention_enabled: true\n' +
+            '  delete_request_store: filesystem\n'
+        }
+      ],
+      volumes: [{ name: 'data', path: '/loki' }],
+      readiness: { path: '/ready', expect: [200], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Añade Loki en Grafana como fuente de datos y envía logs desde Alloy, Promtail o Fluent Bit.',
+      'Protege el dominio con Basic Auth si vas a recibir logs desde servidores externos.'
+    ],
+    notes: [
+      'Loki no incluye interfaz web propia: se consulta desde Grafana o con `logcli`.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'victoriametrics',
+    name: 'VictoriaMetrics',
+    category: 'monitorizacion',
+    summary: 'Base de datos de series temporales compatible con Prometheus y alta compresión en disco.',
+    description:
+      'Acepta remote_write de Prometheus, InfluxDB y OpenTelemetry con una fracción de la RAM de ' +
+      'Prometheus tradicional. Incluye interfaz `vmui` y retención de 90 días.',
+    website: 'https://victoriametrics.com',
+    licence: 'Apache-2.0',
+    tags: ['metricas', 'tsdb', 'prometheus', 'observabilidad'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'victoriametrics/victoria-metrics:v1.156.0',
+      port: 8428,
+      memoryMb: 768,
+      cpus: 1,
+      env: {},
+      command: [
+        '--storageDataPath=/victoria-metrics-data',
+        '--retentionPeriod=90d',
+        '--httpListenAddr=:8428'
+      ],
+      volumes: [{ name: 'data', path: '/victoria-metrics-data' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}}/vmui para explorar series temporales y lanzar consultas MetricsQL/PromQL.',
+      'Protege el dominio con Basic Auth si publicas el puerto en internet.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'gatus',
+    name: 'Gatus',
+    category: 'monitorizacion',
+    summary: 'Página de estado declarativa para desarrolladores orientada a condiciones HTTP, DNS y TLS.',
+    description:
+      'Evalúa código HTTP, latencia, cuerpo de respuesta y caducidad de certificados con consumo ' +
+      'mínimo de recursos y almacenamiento persistente en SQLite.',
+    website: 'https://gatus.io',
+    licence: 'Apache-2.0',
+    tags: ['uptime', 'pagina de estado', 'sondas', 'alertas'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'twinproduction/gatus:v5.38.0',
+      port: 8080,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        GATUS_CONFIG_PATH: '/config/config.yaml'
+      },
+      files: [
+        {
+          name: 'config.yaml',
+          path: '/config/config.yaml',
+          content:
+            'storage:\n' +
+            '  type: sqlite\n' +
+            '  path: /data/data.db\n' +
+            'endpoints:\n' +
+            '  - name: Gatus\n' +
+            '    url: http://127.0.0.1:8080/health\n' +
+            '    interval: 60s\n' +
+            '    conditions:\n' +
+            '      - "[STATUS] == 200"\n'
+        }
+      ],
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para ver tu página de estado pública en marcha.',
+      'Personaliza los endpoints y canales de alerta editando el fichero de configuración.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'glitchtip',
+    name: 'GlitchTip',
+    category: 'monitorizacion',
+    summary: 'Seguimiento de errores y rendimiento compatible con los SDK oficiales de Sentry.',
+    description:
+      'Recibe excepciones, trazas y monitores de tus aplicaciones usando los mismos SDK de Sentry ' +
+      'pero con una fracción del consumo de memoria. Incluye worker Celery y Valkey aislados.',
+    website: 'https://glitchtip.com',
+    licence: 'MIT',
+    tags: ['errores', 'sentry', 'apm', 'observabilidad'],
+    database: { engine: 'postgres', dbName: 'glitchtip', username: 'glitchtip', memoryMb: 512 },
+    secrets: {
+      SECRET_KEY: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [
+      makeValkeySidecar(256),
+      {
+        name: 'worker',
+        image: 'glitchtip/glitchtip:7.0.0',
+        memoryMb: 512,
+        cpus: 0.5,
+        command: ['./bin/run-celery-with-beat.sh'],
+        env: {
+          DATABASE_URL: '{{db.url}}',
+          REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379/0',
+          SECRET_KEY: '{{secret.SECRET_KEY}}',
+          GLITCHTIP_DOMAIN: '{{url}}',
+          DEFAULT_FROM_EMAIL: 'noreply@{{domain}}'
+        },
+        volumes: []
+      }
+    ],
+    app: {
+      image: 'glitchtip/glitchtip:7.0.0',
+      port: 8000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379/0',
+        SECRET_KEY: '{{secret.SECRET_KEY}}',
+        GLITCHTIP_DOMAIN: '{{url}}',
+        PORT: '8000',
+        DEFAULT_FROM_EMAIL: 'noreply@{{domain}}',
+        ENABLE_USER_REGISTRATION: 'true',
+        ENABLE_ORGANIZATION_CREATION: 'true'
+      },
+      volumes: [{ name: 'uploads', path: '/code/uploads' }],
+      readiness: { path: '/_health/', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Registra tu primera cuenta en {{url}}, crea un proyecto y copia el DSN en tu SDK de Sentry.',
+      'Tras crear tu cuenta, pon `ENABLE_USER_REGISTRATION=false` en variables si quieres cerrar registros públicos.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'beszel',
+    name: 'Beszel',
+    category: 'monitorizacion',
+    summary: 'Hub ligero de monitorización de servidores Linux con histórico, alertas y Docker stats.',
+    description:
+      'Panel minimalista sobre PocketBase que recibe métricas de agentes SSH/WebSocket remotos con ' +
+      'uso mínimo de CPU y memoria.',
+    website: 'https://beszel.dev',
+    licence: 'MIT',
+    tags: ['servidores', 'metricas', 'alertas', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'henrygd/beszel:0.21.2',
+      port: 8090,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        APP_URL: '{{url}}'
+      },
+      volumes: [{ name: 'data', path: '/beszel_data' }],
+      readiness: { path: '/api/health', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea la cuenta administradora en el primer arranque.',
+      'Añade tus servidores remotos instalando `beszel-agent` con la clave pública generada por el hub.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'jaeger',
+    name: 'Jaeger',
+    category: 'monitorizacion',
+    summary: 'Trazado distribuido OpenTelemetry nativo con almacenamiento persistente Badger.',
+    description:
+      'Inspecciona latencias entre microservicios, consultas SQL y llamadas LLM recibiendo spans ' +
+      'por OTLP gRPC (4317) y OTLP HTTP (4318).',
+    website: 'https://www.jaegertracing.io',
+    licence: 'Apache-2.0',
+    tags: ['trazas', 'opentelemetry', 'otlp', 'observabilidad'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'jaegertracing/jaeger:2.23.0',
+      port: 16686,
+      extraPorts: [
+        { containerPort: 4317, label: 'OTLP gRPC' },
+        { containerPort: 4318, label: 'OTLP HTTP' }
+      ],
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        SPAN_STORAGE_TYPE: 'badger',
+        BADGER_EPHEMERAL: 'false',
+        BADGER_DIRECTORY_VALUE: '/badger/data',
+        BADGER_DIRECTORY_KEY: '/badger/key'
+      },
+      volumes: [{ name: 'data', path: '/badger' }],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para explorar trazas y grafos de dependencias.',
+      'Envía trazas OpenTelemetry desde tus servicios locales a los puertos 4317 (gRPC) o 4318 (HTTP).'
+    ],
+    notes: [
+      'Jaeger no trae login propio: activa Basic Auth en el dominio de Culkibo antes de exponer la interfaz.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'healthchecks',
+    name: 'Healthchecks',
+    category: 'monitorizacion',
+    summary: 'Monitorización de tareas cron y trabajos en segundo plano mediante avisos de silencio.',
+    description:
+      'Asigna una URL de ping a cada cron o copia de seguridad: si el trabajo no avisa a tiempo o ' +
+      'falla, alerta al instante por correo, Telegram, Slack o webhook.',
+    website: 'https://healthchecks.io',
+    licence: 'BSD-3-Clause',
+    tags: ['cron', 'alertas', 'deadman', 'monitorizacion'],
+    database: { engine: 'postgres', dbName: 'healthchecks', username: 'healthchecks', memoryMb: 512 },
+    secrets: {
+      SECRET_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'healthchecks/healthchecks:v5.0',
+      port: 8000,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        DB: 'postgres',
+        DB_HOST: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_NAME: '{{db.name}}',
+        DB_USER: '{{db.user}}',
+        DB_PASSWORD: '{{db.password}}',
+        SECRET_KEY: '{{secret.SECRET_KEY}}',
+        SITE_ROOT: '{{url}}',
+        ALLOWED_HOSTS: '*',
+        DEBUG: 'False',
+        REGISTRATION_OPEN: 'True'
+      },
+      volumes: [],
+      readiness: { path: '/', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Abre {{url}}, crea tu cuenta y después fija `REGISTRATION_OPEN=False` si no quieres registros abiertos.',
+      'Configura SMTP o webhooks en las integraciones del proyecto para recibir alertas.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  // D. Automatización (5 nuevas → 6 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'activepieces',
+    name: 'Activepieces',
+    category: 'automatizacion',
+    summary: 'Automatización sin código extensible en TypeScript con cientos de integraciones y nodos IA.',
+    description:
+      'Alternativa MIT a Zapier con editor visual rápido, flujos programados, webhooks y agentes, ' +
+      'respaldada por PostgreSQL y Valkey aislados.',
+    website: 'https://www.activepieces.com',
+    licence: 'MIT (edición comunitaria)',
+    tags: ['automatizacion', 'flujos', 'webhooks', 'zapier', 'ia'],
+    database: { engine: 'postgres', dbName: 'activepieces', username: 'activepieces', memoryMb: 512 },
+    secrets: {
+      // Activepieces exige exactamente 32 caracteres hexadecimales (16 bytes).
+      AP_ENCRYPTION_KEY: { bytes: 16, encoding: 'hex' },
+      AP_JWT_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'activepieces/activepieces:0.93.0',
+      port: 80,
+      memoryMb: 1536,
+      cpus: 1,
+      env: {
+        AP_ENGINE_EXECUTABLE_PATH: 'dist/packages/engine/main.js',
+        AP_ENVIRONMENT: 'prod',
+        AP_FRONTEND_URL: '{{url}}',
+        AP_POSTGRES_HOST: '{{db.host}}',
+        AP_POSTGRES_PORT: '{{db.port}}',
+        AP_POSTGRES_DATABASE: '{{db.name}}',
+        AP_POSTGRES_USERNAME: '{{db.user}}',
+        AP_POSTGRES_PASSWORD: '{{db.password}}',
+        AP_REDIS_HOST: '{{sidecar.valkey.host}}',
+        AP_REDIS_PORT: '6379',
+        AP_ENCRYPTION_KEY: '{{secret.AP_ENCRYPTION_KEY}}',
+        AP_JWT_SECRET: '{{secret.AP_JWT_SECRET}}',
+        AP_EXECUTION_MODE: 'UNSANDBOXED',
+        AP_TELEMETRY_ENABLED: 'false'
+      },
+      volumes: [{ name: 'cache', path: '/usr/src/app/cache' }],
+      readiness: { path: '/api/v1/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea la primera cuenta de administración.',
+      'Conserva AP_ENCRYPTION_KEY: cifra todas las conexiones OAuth y API keys guardadas.'
+    ],
+    notes: [
+      'Ejecuta en modo UNSANDBOXED dentro del contenedor sin privilegios para no requerir privilegios del kernel del host.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'windmill',
+    name: 'Windmill',
+    category: 'automatizacion',
+    summary: 'Plataforma para ejecutar scripts en Python, TypeScript, Go y SQL como flujos y apps internas.',
+    description:
+      'Convierte cualquier script en un endpoint, tarea programada, flujo DAG o interfaz interna con ' +
+      'worker dedicado y cola transaccional en PostgreSQL.',
+    website: 'https://www.windmill.dev',
+    licence: 'AGPLv3',
+    tags: ['scripts', 'flujos', 'python', 'typescript', 'apps internas'],
+    database: { engine: 'postgres', dbName: 'windmill', username: 'windmill', memoryMb: 512 },
+    secrets: {},
+    sidecars: [
+      {
+        name: 'worker',
+        image: 'ghcr.io/windmill-labs/windmill:1.881.0',
+        memoryMb: 1024,
+        cpus: 1,
+        env: {
+          DATABASE_URL: '{{db.url}}',
+          MODE: 'worker',
+          WORKER_GROUP: 'default'
+        },
+        volumes: []
+      }
+    ],
+    app: {
+      image: 'ghcr.io/windmill-labs/windmill:1.881.0',
+      port: 8000,
+      memoryMb: 1536,
+      cpus: 2,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        MODE: 'server',
+        BASE_URL: '{{url}}'
+      },
+      volumes: [],
+      readiness: { path: '/api/version', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} e inicia sesión con el usuario inicial documentado por Windmill (`admin@windmill.dev` / `changeme`) y cambia la contraseña de inmediato.',
+      'Revisa la cola de workers en la pestaña Workers para comprobar que el auxiliar está activo.'
+    ],
+    notes: [
+      'La contraseña inicial la crea Windmill al migrar: cámbiala nada más entrar.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'node-red',
+    name: 'Node-RED',
+    category: 'automatizacion',
+    summary: 'Programación visual basada en eventos para IoT, APIs, MQTT y automatizaciones.',
+    description:
+      'Editor de flujos en el navegador sobre Node.js con miles de nodos comunitarios y cifrado de ' +
+      'credenciales activado mediante secreto aleatorio.',
+    website: 'https://nodered.org',
+    licence: 'Apache-2.0',
+    tags: ['iot', 'flujos', 'eventos', 'mqtt', 'automatizacion'],
+    database: null,
+    secrets: {
+      NODE_RED_CREDENTIAL_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'nodered/node-red:5.0.10',
+      port: 1880,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        TZ: 'Europe/Madrid',
+        NODE_RED_CREDENTIAL_SECRET: '{{secret.NODE_RED_CREDENTIAL_SECRET}}',
+        NODE_RED_ENABLE_PROJECTS: 'true'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/', expect: [200, 401] }
+    },
+    nextSteps: [
+      'Activa Basic Auth en el dominio de Culkibo o configura `adminAuth` en `/data/settings.js` antes de publicar Node-RED en internet.',
+      'Guarda NODE_RED_CREDENTIAL_SECRET: se usa para cifrar las credenciales de tus flujos.'
+    ],
+    notes: [
+      'Por defecto Node-RED no pide contraseña en el editor: protégelo siempre con autenticación en el borde o en `settings.js`.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'changedetection',
+    name: 'changedetection.io',
+    category: 'automatizacion',
+    summary: 'Detecta cambios en páginas web, precios, repositorios o avisos y envía alertas al instante.',
+    description:
+      'Vigila URLs periódicamente, resalta diferencias línea a línea y dispara avisos por Telegram, ' +
+      'Discord, correo o webhook con filtros CSS y JSONPath.',
+    website: 'https://changedetection.io',
+    licence: 'Apache-2.0',
+    tags: ['web', 'alertas', 'cambios', 'monitorizacion', 'scraping'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'ghcr.io/dgtlmoon/changedetection.io:0.70.4',
+      port: 5000,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        PORT: '5000',
+        BASE_URL: '{{url}}',
+        USE_X_SETTINGS: '1',
+        HIDE_REFERER: 'true'
+      },
+      volumes: [{ name: 'datastore', path: '/datastore' }],
+      readiness: { path: '/', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Abre {{url}} y establece una contraseña de acceso en Settings → Password cuanto antes.',
+      'Añade tus primeras URLs y un canal de notificación compatible con Apprise.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'kestra',
+    name: 'Kestra',
+    category: 'automatizacion',
+    summary: 'Orquestador declarativo en YAML para pipelines de datos, ETL y automatizaciones complejas.',
+    description:
+      'Define flujos de trabajo con reintentos, ramificaciones, disparadores y cientos de plugins ' +
+      'usando PostgreSQL como cola y repositorio persistente.',
+    website: 'https://kestra.io',
+    licence: 'Apache-2.0',
+    tags: ['orquestador', 'etl', 'yaml', 'pipelines', 'datos'],
+    database: { engine: 'postgres', dbName: 'kestra', username: 'kestra', memoryMb: 512 },
+    secrets: {
+      KESTRA_BASIC_AUTH_PASS: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'kestra/kestra:v2.0.11-slim',
+      port: 8080,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        DATASOURCES_POSTGRES_URL: 'jdbc:postgresql://{{db.host}}:{{db.port}}/{{db.name}}',
+        DATASOURCES_POSTGRES_DRIVER_CLASS_NAME: 'org.postgresql.Driver',
+        DATASOURCES_POSTGRES_USERNAME: '{{db.user}}',
+        DATASOURCES_POSTGRES_PASSWORD: '{{db.password}}',
+        KESTRA_REPOSITORY_TYPE: 'postgres',
+        KESTRA_QUEUE_TYPE: 'postgres',
+        KESTRA_STORAGE_TYPE: 'local',
+        KESTRA_STORAGE_LOCAL_BASE_PATH: '/app/storage',
+        KESTRA_SERVER_BASIC_AUTH_ENABLED: 'true',
+        KESTRA_SERVER_BASIC_AUTH_USERNAME: 'admin@culkibo.local',
+        KESTRA_SERVER_BASIC_AUTH_PASSWORD: '{{secret.KESTRA_BASIC_AUTH_PASS}}',
+        KESTRA_URL: '{{url}}/'
+      },
+      command: ['server', 'standalone'],
+      volumes: [{ name: 'storage', path: '/app/storage' }],
+      readiness: { path: '/', expect: [200, 302, 401], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}} e inicia sesión con `admin@culkibo.local` y KESTRA_BASIC_AUTH_PASS de «Credenciales».',
+      'Crea tu primer flujo YAML en el editor visual y pruébalo con ejecuciones manuales.'
+    ],
+    notes: [
+      'Kestra corre sobre la JVM y necesita al menos 2 GB de RAM; el primer arranque tarda ~1 minuto.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  // E. Datos y BaaS (9 nuevas → 13 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'pgadmin',
+    name: 'pgAdmin 4',
+    category: 'datos',
+    summary: 'Consola web oficial para administrar bases de datos PostgreSQL, consultas y copias.',
+    description:
+      'Explora esquemas, lanza consultas SQL con planes EXPLAIN, gestiona roles y monitoriza ' +
+      'conexiones de PostgreSQL desde el navegador detrás de HTTPS.',
+    website: 'https://www.pgadmin.org',
+    licence: 'PostgreSQL License',
+    tags: ['postgresql', 'sql', 'administracion', 'datos'],
+    database: null,
+    secrets: {
+      PGADMIN_DEFAULT_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'dpage/pgadmin4:9.19',
+      port: 80,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        PGADMIN_DEFAULT_EMAIL: 'admin@culkibo.local',
+        PGADMIN_DEFAULT_PASSWORD: '{{secret.PGADMIN_DEFAULT_PASSWORD}}',
+        PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: 'True',
+        PGADMIN_CONFIG_PROXY_X_FOR_COUNT: '1',
+        PGADMIN_CONFIG_PROXY_X_PROTO_COUNT: '1',
+        PGADMIN_CONFIG_PROXY_X_HOST_COUNT: '1'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/pgadmin' }],
+      readiness: { path: '/misc/ping', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} con `admin@culkibo.local` y PGADMIN_DEFAULT_PASSWORD de «Credenciales».',
+      'Registra tus servidores PostgreSQL desde Object → Register → Server.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'cloudbeaver',
+    name: 'CloudBeaver',
+    category: 'datos',
+    summary: 'Cliente SQL web multi-motor del equipo de DBeaver para PostgreSQL, MySQL, MariaDB y más.',
+    description:
+      'Interfaz web ligera para consultar, editar tablas y exportar datos en múltiples motores SQL ' +
+      'desde un único panel protegido por cuentas.',
+    website: 'https://dbeaver.com/cloudbeaver',
+    licence: 'Apache-2.0',
+    tags: ['sql', 'dbeaver', 'postgresql', 'mysql', 'cliente'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'dbeaver/cloudbeaver:26.0.0',
+      port: 8978,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        CB_SERVER_NAME: 'Culkibo CloudBeaver',
+        CB_SERVER_URL: '{{url}}'
+      },
+      volumes: [{ name: 'workspace', path: '/opt/cloudbeaver/workspace' }],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} de inmediato y completa el asistente inicial para crear la cuenta de administración.',
+      'Desactiva el acceso anónimo en el asistente si el servicio está publicado en un dominio público.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'hasura',
+    name: 'Hasura GraphQL Engine',
+    category: 'datos',
+    summary: 'API GraphQL y REST instantánea con suscripciones en tiempo real sobre PostgreSQL.',
+    description:
+      'Genera consultas, mutaciones, permisos por fila y disparadores de eventos directamente desde ' +
+      'tu esquema PostgreSQL, protegido con secreto de administración.',
+    website: 'https://hasura.io',
+    licence: 'Apache-2.0',
+    tags: ['graphql', 'api', 'postgresql', 'realtime', 'baas'],
+    database: { engine: 'postgres', dbName: 'hasura', username: 'hasura', memoryMb: 512 },
+    secrets: {
+      HASURA_GRAPHQL_ADMIN_SECRET: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'hasura/graphql-engine:v2.45.13',
+      port: 8080,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        HASURA_GRAPHQL_METADATA_DATABASE_URL: '{{db.url}}',
+        HASURA_GRAPHQL_DATABASE_URL: '{{db.url}}',
+        HASURA_GRAPHQL_ENABLE_CONSOLE: 'true',
+        HASURA_GRAPHQL_DEV_MODE: 'false',
+        HASURA_GRAPHQL_ENABLED_LOG_TYPES: 'startup, http-log, webhook-log, websocket-log, query-log',
+        HASURA_GRAPHQL_ADMIN_SECRET: '{{secret.HASURA_GRAPHQL_ADMIN_SECRET}}',
+        HASURA_GRAPHQL_ENABLE_TELEMETRY: 'false'
+      },
+      volumes: [],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}}/console e introduce HASURA_GRAPHQL_ADMIN_SECRET desde «Credenciales».',
+      'En producción, considera poner `HASURA_GRAPHQL_ENABLE_CONSOLE=false` tras configurar tus metadatos.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'typesense',
+    name: 'Typesense',
+    category: 'datos',
+    summary: 'Motor de búsqueda instantánea en C++ con tolerancia a erratas, facetas y búsqueda vectorial.',
+    description:
+      'Alternativa rápida en memoria a Algolia y Elasticsearch que combina búsqueda full-text, ' +
+      'sinónimos, geolocalización y embeddings con clave API obligatoria.',
+    website: 'https://typesense.org',
+    licence: 'GPLv3',
+    tags: ['busqueda', 'algolia', 'vectores', 'fulltext'],
+    database: null,
+    secrets: {
+      TYPESENSE_API_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'typesense/typesense:30.1',
+      port: 8108,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        TYPESENSE_DATA_DIR: '/data',
+        TYPESENSE_API_KEY: '{{secret.TYPESENSE_API_KEY}}',
+        TYPESENSE_ENABLE_CORS: 'true'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Copia TYPESENSE_API_KEY en «Credenciales» y pásala en la cabecera `X-TYPESENSE-API-KEY`.',
+      'Crea claves con permisos limitados de búsqueda antes de usarlas en navegadores.'
+    ],
+    notes: [
+      'Typesense mantiene los índices en RAM: amplía la memoria si indexas millones de documentos.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'influxdb',
+    name: 'InfluxDB 2',
+    category: 'datos',
+    summary: 'Base de datos de series temporales para telemetría IoT, sensores y métricas en tiempo real.',
+    description:
+      'Almacena millones de puntos por segundo con lenguaje Flux, tareas programadas y paneles ' +
+      'integrados, inicializada de forma segura con usuario y token de administración aleatorios.',
+    website: 'https://www.influxdata.com',
+    licence: 'MIT',
+    tags: ['tsdb', 'iot', 'metricas', 'sensores', 'series temporales'],
+    database: null,
+    secrets: {
+      DOCKER_INFLUXDB_INIT_PASSWORD: { bytes: 18, encoding: 'base64url' },
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'influxdb:2.7.11',
+      port: 8086,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        DOCKER_INFLUXDB_INIT_MODE: 'setup',
+        DOCKER_INFLUXDB_INIT_USERNAME: 'admin',
+        DOCKER_INFLUXDB_INIT_PASSWORD: '{{secret.DOCKER_INFLUXDB_INIT_PASSWORD}}',
+        DOCKER_INFLUXDB_INIT_ORG: 'culkibo',
+        DOCKER_INFLUXDB_INIT_BUCKET: 'metrics',
+        DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: '{{secret.DOCKER_INFLUXDB_INIT_ADMIN_TOKEN}}'
+      },
+      volumes: [
+        { name: 'data', path: '/var/lib/influxdb2' },
+        { name: 'config', path: '/etc/influxdb2' }
+      ],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Entra en {{url}} como «admin» con DOCKER_INFLUXDB_INIT_PASSWORD desde «Credenciales».',
+      'Usa DOCKER_INFLUXDB_INIT_ADMIN_TOKEN para autenticar clientes Telegraf o llamadas API.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'couchdb',
+    name: 'Apache CouchDB',
+    category: 'datos',
+    summary: 'Base de datos documental JSON con API HTTP y replicación offline-first (PouchDB, Obsidian).',
+    description:
+      'Sincroniza documentos bidireccionalmente entre dispositivos, apps móviles y servidores mediante ' +
+      'HTTP nativo, ideal para Obsidian LiveSync y apps local-first.',
+    website: 'https://couchdb.apache.org',
+    licence: 'Apache-2.0',
+    tags: ['nosql', 'documentos', 'pouchdb', 'obsidian', 'offline'],
+    database: null,
+    secrets: {
+      COUCHDB_PASSWORD: { bytes: 24, encoding: 'base64url' },
+      COUCHDB_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'couchdb:3.5.3',
+      port: 5984,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        COUCHDB_USER: 'admin',
+        COUCHDB_PASSWORD: '{{secret.COUCHDB_PASSWORD}}',
+        COUCHDB_SECRET: '{{secret.COUCHDB_SECRET}}'
+      },
+      volumes: [
+        { name: 'data', path: '/opt/couchdb/data' },
+        { name: 'config', path: '/opt/couchdb/etc/local.d' }
+      ],
+      readiness: { path: '/_up', expect: [200] }
+    },
+    nextSteps: [
+      'Abre la consola Fauxton en {{url}}/_utils con usuario «admin» y COUCHDB_PASSWORD de «Credenciales».',
+      'Crea las bases `_users` y `_replicator` desde el panel si vas a sincronizar clientes PouchDB.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'bytebase',
+    name: 'Bytebase',
+    category: 'datos',
+    summary: 'Control de cambios SQL, revisiones de migraciones y auditoría de esquemas para equipos.',
+    description:
+      'Aplica flujo tipo GitLab a tus bases de datos: revisión de DDL, comprobación automática de ' +
+      'reglas SQL, ejecución escalonada e historial de cambios.',
+    website: 'https://www.bytebase.com',
+    licence: 'Apache-2.0 (edición comunitaria)',
+    tags: ['sql', 'migraciones', 'devops', 'esquemas', 'auditoria'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'bytebase/bytebase:3.25.0',
+      port: 8080,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        EXTERNAL_URL: '{{url}}'
+      },
+      command: ['--data', '/var/opt/bytebase', '--port', '8080'],
+      volumes: [{ name: 'data', path: '/var/opt/bytebase' }],
+      readiness: { path: '/healthz', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea la primera cuenta de propietario del espacio de trabajo.',
+      'Conecta tus instancias de PostgreSQL, MySQL o MariaDB para revisar cambios de esquema.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'postgrest',
+    name: 'PostgREST',
+    category: 'datos',
+    summary: 'Convierte directamente cualquier base de datos PostgreSQL en una API REST rápida con JWT.',
+    description:
+      'Servidor ligero en Haskell que expone tablas, vistas y funciones SQL como endpoints REST con ' +
+      'especificación OpenAPI automática y seguridad basada en roles de PostgreSQL.',
+    website: 'https://postgrest.org',
+    licence: 'MIT',
+    tags: ['postgresql', 'rest', 'api', 'jwt', 'openapi'],
+    database: { engine: 'postgres', dbName: 'app', username: 'postgrest', memoryMb: 512 },
+    secrets: {
+      PGRST_JWT_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'postgrest/postgrest:v16.2',
+      port: 3000,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        PGRST_DB_URI: '{{db.url}}',
+        PGRST_DB_SCHEMAS: 'public',
+        PGRST_DB_ANON_ROLE: '{{db.user}}',
+        PGRST_JWT_SECRET: '{{secret.PGRST_JWT_SECRET}}',
+        PGRST_OPENAPI_SERVER_PROXY_URI: '{{url}}'
+      },
+      volumes: [],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Consulta {{url}} para obtener el esquema OpenAPI generado desde PostgreSQL.',
+      'Crea roles SQL dedicados con permisos mínimos y firma tus JWT con PGRST_JWT_SECRET.'
+    ],
+    notes: [
+      'Inicialmente usa el rol de base de datos como anónimo para arrancar: crea un rol restringido antes de exponer tablas sensibles.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'surrealdb',
+    name: 'SurrealDB',
+    category: 'datos',
+    summary: 'Base de datos multimodelo en Rust: relacional, documentos, grafos y vectores en un solo motor.',
+    description:
+      'Ofrece consultas SurrealQL, suscripciones en vivo por WebSocket y almacenamiento RocksDB ' +
+      'persistente en disco con credenciales root aleatorias.',
+    website: 'https://surrealdb.com',
+    licence: 'BSL 1.1 (código a la vista; cambia a Apache-2.0 tras 4 años)',
+    tags: ['rust', 'grafos', 'vectores', 'realtime', 'nosql'],
+    database: null,
+    secrets: {
+      SURREAL_PASS: { bytes: 24, encoding: 'base64url' }
+    },
+    app: {
+      image: 'surrealdb/surrealdb:v4.0.1',
+      port: 8000,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        SURREAL_USER: 'root',
+        SURREAL_PASS: '{{secret.SURREAL_PASS}}',
+        SURREAL_BIND: '0.0.0.0:8000'
+      },
+      command: ['start', '--log', 'info', 'rocksdb:/data/surreal.db'],
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Conecta con Surrealist o el CLI de SurrealDB a {{url}} usando usuario «root» y SURREAL_PASS.',
+      'Define usuarios a nivel de namespace y base de datos para tus aplicaciones.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  // F. Desarrollo y DevTools (9 nuevas → 11 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'forgejo',
+    name: 'Forgejo',
+    category: 'desarrollo',
+    summary: 'Forja Git comunitaria y ligera (bifurcación libre de Gitea) con PostgreSQL y CI Actions.',
+    description:
+      'Hospeda repositorios Git, revisiones de código, registro de paquetes y automatizaciones CI/CD ' +
+      'bajo gobernanza comunitaria sin telemetría ni bloqueos comerciales.',
+    website: 'https://forgejo.org',
+    licence: 'GPLv3+',
+    tags: ['git', 'repositorios', 'ci', 'forja', 'codigo'],
+    database: { engine: 'postgres', dbName: 'forgejo', username: 'forgejo', memoryMb: 512 },
+    secrets: {
+      FORGEJO_SECRET_KEY: { bytes: 32, encoding: 'base64url' },
+      FORGEJO_INTERNAL_TOKEN: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'codeberg.org/forgejo/forgejo:17.0.2',
+      port: 3000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        USER_UID: '1000',
+        USER_GID: '1000',
+        FORGEJO__database__DB_TYPE: 'postgres',
+        FORGEJO__database__HOST: '{{db.host}}:{{db.port}}',
+        FORGEJO__database__NAME: '{{db.name}}',
+        FORGEJO__database__USER: '{{db.user}}',
+        FORGEJO__database__PASSWD: '{{db.password}}',
+        FORGEJO__server__DOMAIN: '{{domain}}',
+        FORGEJO__server__ROOT_URL: '{{url}}/',
+        FORGEJO__server__DISABLE_SSH: 'true',
+        FORGEJO__security__INSTALL_LOCK: 'true',
+        FORGEJO__security__SECRET_KEY: '{{secret.FORGEJO_SECRET_KEY}}',
+        FORGEJO__security__INTERNAL_TOKEN: '{{secret.FORGEJO_INTERNAL_TOKEN}}',
+        FORGEJO__service__DISABLE_REGISTRATION: 'false'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/api/v1/version', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Registra la primera cuenta en {{url}}: se convertirá automáticamente en administradora.',
+      'Después cierra el registro abierto fijando `FORGEJO__service__DISABLE_REGISTRATION=true`.'
+    ],
+    notes: [
+      'El servidor SSH interno viene desactivado para no colisionar con el puerto 22 del host; se clona por HTTPS.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'code-server',
+    name: 'code-server (VS Code)',
+    category: 'desarrollo',
+    summary: 'Visual Studio Code completo en tu navegador para programar desde cualquier dispositivo.',
+    description:
+      'Entorno remoto de VS Code con terminal integrada, extensiones Open VSX y espacio de trabajo ' +
+      'persistente protegido con contraseña aleatoria.',
+    website: 'https://coder.com',
+    licence: 'MIT',
+    tags: ['ide', 'vscode', 'editor', 'remoto'],
+    database: null,
+    secrets: {
+      PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'codercom/code-server:4.146.0',
+      port: 8080,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        PASSWORD: '{{secret.PASSWORD}}',
+        DEFAULT_WORKSPACE: '/home/coder/project'
+      },
+      volumes: [
+        { name: 'config', path: '/home/coder/.config' },
+        { name: 'workspace', path: '/home/coder/project' }
+      ],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} e introduce la contraseña PASSWORD desde «Credenciales».',
+      'Tus proyectos y extensiones se guardan en los volúmenes persistentes `/home/coder/project` y `.config`.'
+    ],
+    notes: [
+      'Sirve siempre code-server detrás de HTTPS para habilitar portapapeles, WebSockets y extensiones modernas.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'verdaccio',
+    name: 'Verdaccio',
+    category: 'desarrollo',
+    summary: 'Registro privado y caché proxy de paquetes npm con cero configuración compleja.',
+    description:
+      'Publica librerías JavaScript/TypeScript internas y acelera los `npm install` de tus ' +
+      'despliegues cacheando paquetes de npmjs en tu propio servidor.',
+    website: 'https://verdaccio.org',
+    licence: 'MIT',
+    tags: ['npm', 'paquetes', 'registro', 'nodejs', 'cache'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'verdaccio/verdaccio:7.1.0',
+      port: 4873,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        VERDACCIO_PORT: '4873',
+        VERDACCIO_PUBLIC_URL: '{{url}}'
+      },
+      volumes: [
+        { name: 'storage', path: '/verdaccio/storage' },
+        { name: 'conf', path: '/verdaccio/conf' }
+      ],
+      readiness: { path: '/-/ping', expect: [200] }
+    },
+    nextSteps: [
+      'Crea tu primer usuario con `npm adduser --registry {{url}}`.',
+      'Desactiva el alta libre en `/verdaccio/conf/config.yaml` (`max_users: -1`) cuando hayas creado tus cuentas.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'docker-registry',
+    name: 'Docker Registry',
+    category: 'desarrollo',
+    summary: 'Registro privado de imágenes OCI/Docker v2 para almacenar y desplegar tus propios builds.',
+    description:
+      'Implementación oficial de CNCF Distribution para alojar imágenes de contenedores privadas con ' +
+      'borrado de manifiestos habilitado y secreto HTTP aleatorio.',
+    website: 'https://distribution.github.io/distribution',
+    licence: 'Apache-2.0',
+    tags: ['docker', 'oci', 'imagenes', 'registro', 'contenedores'],
+    database: null,
+    secrets: {
+      REGISTRY_HTTP_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'registry:2.8.3',
+      port: 5000,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: '/var/lib/registry',
+        REGISTRY_STORAGE_DELETE_ENABLED: 'true',
+        REGISTRY_HTTP_SECRET: '{{secret.REGISTRY_HTTP_SECRET}}',
+        REGISTRY_HTTP_ADDR: '0.0.0.0:5000'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/registry' }],
+      readiness: { path: '/v2/', expect: [200, 401] }
+    },
+    nextSteps: [
+      'Activa Basic Auth en el dominio de Culkibo antes de hacer `docker login` y `docker push`.',
+      'Ejecuta periódicamente `registry garbage-collect` dentro del contenedor para liberar espacio de etiquetas borradas.'
+    ],
+    notes: [
+      'El registro no trae autenticación propia activada por defecto: protégelo siempre con Basic Auth HTTPS en Culkibo.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'onedev',
+    name: 'OneDev',
+    category: 'desarrollo',
+    summary: 'Servidor Git todo-en-uno con CI/CD, tableros kanban, búsqueda de símbolos y paquetes.',
+    description:
+      'Alternativa ligera a GitLab escrita en Java que unifica repositorios, incidencias, revisiones ' +
+      'y pipelines sobre PostgreSQL con contraseña inicial generada.',
+    website: 'https://onedev.io',
+    licence: 'MIT',
+    tags: ['git', 'ci', 'kanban', 'gitlab', 'devops'],
+    database: { engine: 'postgres', dbName: 'onedev', username: 'onedev', memoryMb: 512 },
+    secrets: {
+      ONEDEV_INITIAL_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: '1dev/server:17.2',
+      port: 6610,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        hibernate_dialect: 'io.onedev.server.persistence.PostgreSQLDialect',
+        hibernate_connection_driver_class: 'org.postgresql.Driver',
+        hibernate_connection_url: 'jdbc:postgresql://{{db.host}}:{{db.port}}/{{db.name}}',
+        hibernate_connection_username: '{{db.user}}',
+        hibernate_connection_password: '{{db.password}}',
+        initial_user: 'admin',
+        initial_password: '{{secret.ONEDEV_INITIAL_PASSWORD}}',
+        initial_email: 'admin@culkibo.local',
+        initial_server_url: '{{url}}'
+      },
+      volumes: [{ name: 'data', path: '/opt/onedev' }],
+      readiness: { path: '/~health', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con ONEDEV_INITIAL_PASSWORD desde «Credenciales».',
+      'Actualiza el correo del administrador y configura tu primer proyecto Git.'
+    ],
+    notes: [
+      'Requiere al menos 2 GB de RAM para la JVM y tarda entre 1 y 2 minutos en completar la primera inicialización.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'sonarqube',
+    name: 'SonarQube Community',
+    category: 'desarrollo',
+    summary: 'Análisis estático continuo de calidad de código, deuda técnica y vulnerabilidades.',
+    description:
+      'Inspecciona más de 30 lenguajes buscando bugs, puntos calientes de seguridad y cobertura de ' +
+      'pruebas, respaldado por PostgreSQL aislado.',
+    website: 'https://www.sonarsource.com/products/sonarqube',
+    licence: 'LGPLv3 (edición comunitaria)',
+    tags: ['calidad', 'sast', 'seguridad', 'codigo', 'ci'],
+    database: { engine: 'postgres', dbName: 'sonarqube', username: 'sonarqube', memoryMb: 512 },
+    secrets: {},
+    app: {
+      image: 'sonarqube:2026.5-lta-community',
+      port: 9000,
+      memoryMb: 3072,
+      cpus: 2,
+      env: {
+        SONAR_JDBC_URL: 'jdbc:postgresql://{{db.host}}:{{db.port}}/{{db.name}}',
+        SONAR_JDBC_USERNAME: '{{db.user}}',
+        SONAR_JDBC_PASSWORD: '{{db.password}}',
+        SONAR_WEB_JAVAOPTS: '-Xmx1024m -Xms256m',
+        SONAR_CE_JAVAOPTS: '-Xmx1024m -Xms256m',
+        SONAR_SEARCH_JAVAOPTS: '-Xmx512m -Xms512m'
+      },
+      volumes: [
+        { name: 'data', path: '/opt/sonarqube/data' },
+        { name: 'extensions', path: '/opt/sonarqube/extensions' },
+        { name: 'logs', path: '/opt/sonarqube/logs' }
+      ],
+      readiness: { path: '/api/system/status', expect: [200], timeoutMs: 300000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} con el usuario inicial de SonarQube (`admin` / `admin`) y cambia la contraseña inmediatamente.',
+      'Genera un token en My Account → Security para lanzar `sonar-scanner` desde tu CI.'
+    ],
+    notes: [
+      'Elasticsearch interno exige que el host Linux tenga `sysctl -w vm.max_map_count=262144` (y en `/etc/sysctl.conf` para persistir).',
+      'Necesita al menos 3 GB de RAM dedicada y tarda hasta 3-5 minutos en su primer arranque.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'hoppscotch',
+    name: 'Hoppscotch',
+    category: 'desarrollo',
+    summary: 'Cliente API colaborativo en el navegador para REST, GraphQL, WebSocket y SSE.',
+    description:
+      'Alternativa libre y rápida a Postman con colecciones compartidas por equipo, entornos ' +
+      'sincronizados y panel de administración sobre PostgreSQL.',
+    website: 'https://hoppscotch.io',
+    licence: 'MIT',
+    tags: ['api', 'postman', 'rest', 'graphql', 'websocket'],
+    database: { engine: 'postgres', dbName: 'hoppscotch', username: 'hoppscotch', memoryMb: 512 },
+    secrets: {
+      JWT_SECRET: { bytes: 32, encoding: 'hex' },
+      SESSION_SECRET: { bytes: 32, encoding: 'hex' },
+      // Hoppscotch exige exactamente 32 caracteres (16 bytes en hex).
+      DATA_ENCRYPTION_KEY: { bytes: 16, encoding: 'hex' }
+    },
+    app: {
+      image: 'hoppscotch/hoppscotch:2026.10.0',
+      port: 80,
+      memoryMb: 1536,
+      cpus: 1,
+      env: {
+        ENABLE_SUBPATH_BASED_ACCESS: 'true',
+        DATABASE_URL: '{{db.url}}',
+        JWT_SECRET: '{{secret.JWT_SECRET}}',
+        SESSION_SECRET: '{{secret.SESSION_SECRET}}',
+        DATA_ENCRYPTION_KEY: '{{secret.DATA_ENCRYPTION_KEY}}',
+        REDIRECT_URL: '{{url}}',
+        WHITELISTED_ORIGINS: '{{url}}',
+        VITE_BASE_URL: '{{url}}',
+        VITE_SHORTCODE_BASE_URL: '{{url}}',
+        VITE_ADMIN_URL: '{{url}}/admin',
+        VITE_BACKEND_GQL_URL: '{{url}}/backend/graphql',
+        VITE_BACKEND_WS_URL: 'wss://{{domain}}/backend/graphql',
+        VITE_BACKEND_API_URL: '{{url}}/backend/v1',
+        ALLOW_SECURE_COOKIES: '{{isHttps}}'
+      },
+      volumes: [],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/admin para completar la configuración inicial y crear la cuenta administradora.',
+      'Configura un proveedor OAuth (GitHub/Google) o SMTP en variables de entorno para invitar al equipo.'
+    ],
+    notes: [
+      'Configurado en modo subpath (`ENABLE_SUBPATH_BASED_ACCESS=true`) para funcionar bajo un único dominio HTTPS.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'unleash',
+    name: 'Unleash',
+    category: 'desarrollo',
+    summary: 'Gestión de feature flags, despliegues graduales y pruebas A/B para tus aplicaciones.',
+    description:
+      'Activa o desactiva funcionalidades en producción sin redesplegar, segmenta por porcentaje o ' +
+      'usuarios y conecta SDKs oficiales en Node, Python, Go, Java y frontend.',
+    website: 'https://www.getunleash.io',
+    licence: 'Apache-2.0',
+    tags: ['feature-flags', 'ab-testing', 'despliegues', 'devops'],
+    database: { engine: 'postgres', dbName: 'unleash', username: 'unleash', memoryMb: 512 },
+    secrets: {
+      INIT_ADMIN_API_TOKENS: { bytes: 24, encoding: 'hex' }
+    },
+    app: {
+      image: 'unleashorg/unleash-server:8.3.1',
+      port: 4242,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        DATABASE_SSL: 'false',
+        UNLEASH_URL: '{{url}}',
+        INIT_ADMIN_API_TOKENS: '*:*.{{secret.INIT_ADMIN_API_TOKENS}}',
+        CHECK_VERSION: 'false'
+      },
+      volumes: [],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} con las credenciales por defecto de Unleash (`admin` / `unleash4all`) y cámbialas de inmediato.',
+      'Crea un token de cliente para tus SDKs o usa el token de administración generado en «Credenciales».'
+    ],
+    notes: [
+      'La contraseña inicial la crea Unleash al inicializar la BD: cámbiala nada más entrar.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'woodpecker',
+    name: 'Woodpecker CI',
+    category: 'desarrollo',
+    summary: 'Motor CI/CD ligero basado en contenedores con integración para GitHub, GitLab, Gitea y Forgejo.',
+    description:
+      'Ejecuta pipelines declarativos en `.woodpecker.yml` con consumo mínimo de memoria y secreto ' +
+      'compartido generado para conectar agentes remotos por gRPC.',
+    website: 'https://woodpecker-ci.org',
+    licence: 'Apache-2.0',
+    tags: ['ci', 'cd', 'pipelines', 'git', 'devops'],
+    database: { engine: 'postgres', dbName: 'woodpecker', username: 'woodpecker', memoryMb: 512 },
+    secrets: {
+      WOODPECKER_AGENT_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'woodpeckerci/woodpecker-server:v3.20.1-alpine',
+      port: 8000,
+      extraPorts: [{ containerPort: 9000, label: 'gRPC Agentes' }],
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        WOODPECKER_HOST: '{{url}}',
+        WOODPECKER_OPEN: 'false',
+        WOODPECKER_AGENT_SECRET: '{{secret.WOODPECKER_AGENT_SECRET}}',
+        WOODPECKER_DATABASE_DRIVER: 'postgres',
+        WOODPECKER_DATABASE_DATASOURCE: '{{db.url}}'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/woodpecker' }],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Configura tu forja OAuth (p. ej. `WOODPECKER_GITHUB=true`, `WOODPECKER_GITEA=true` o `WOODPECKER_FORGEJO=true`) en las variables de entorno.',
+      'Conecta uno o varios `woodpecker-agent` usando WOODPECKER_AGENT_SECRET desde «Credenciales».'
+    ],
+    notes: [
+      'Esta plantilla despliega sólo el servidor sin exponer el socket de Docker del host; los agentes de ejecución se conectan de forma aislada.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  // G. Seguridad e identidad (5 nuevas → 6 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'authentik',
+    name: 'Authentik',
+    category: 'seguridad',
+    summary: 'Proveedor de identidad SSO (OIDC, SAML, LDAP, Proxy Auth) con flujos flexibles y passkeys.',
+    description:
+      'Centraliza el inicio de sesión único y el doble factor (WebAuthn/TOTP) de todas tus apps ' +
+      'internas, con servidor web, worker en segundo plano, PostgreSQL y Valkey aislados.',
+    website: 'https://goauthentik.io',
+    licence: 'MIT (con cláusula de marca registrada)',
+    tags: ['sso', 'oidc', 'saml', 'identidad', '2fa'],
+    database: { engine: 'postgres', dbName: 'authentik', username: 'authentik', memoryMb: 512 },
+    secrets: {
+      AUTHENTIK_SECRET_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    sidecars: [
+      makeValkeySidecar(256),
+      {
+        name: 'worker',
+        image: 'ghcr.io/goauthentik/server:2026.8.5',
+        memoryMb: 1024,
+        cpus: 1,
+        command: ['worker'],
+        env: {
+          AUTHENTIK_SECRET_KEY: '{{secret.AUTHENTIK_SECRET_KEY}}',
+          AUTHENTIK_REDIS__HOST: '{{sidecar.valkey.host}}',
+          AUTHENTIK_POSTGRESQL__HOST: '{{db.host}}',
+          AUTHENTIK_POSTGRESQL__PORT: '{{db.port}}',
+          AUTHENTIK_POSTGRESQL__USER: '{{db.user}}',
+          AUTHENTIK_POSTGRESQL__NAME: '{{db.name}}',
+          AUTHENTIK_POSTGRESQL__PASSWORD: '{{db.password}}',
+          AUTHENTIK_ERROR_REPORTING__ENABLED: 'false'
+        },
+        volumes: []
+      }
+    ],
+    app: {
+      image: 'ghcr.io/goauthentik/server:2026.8.5',
+      port: 9000,
+      memoryMb: 1536,
+      cpus: 1,
+      command: ['server'],
+      env: {
+        AUTHENTIK_SECRET_KEY: '{{secret.AUTHENTIK_SECRET_KEY}}',
+        AUTHENTIK_REDIS__HOST: '{{sidecar.valkey.host}}',
+        AUTHENTIK_POSTGRESQL__HOST: '{{db.host}}',
+        AUTHENTIK_POSTGRESQL__PORT: '{{db.port}}',
+        AUTHENTIK_POSTGRESQL__USER: '{{db.user}}',
+        AUTHENTIK_POSTGRESQL__NAME: '{{db.name}}',
+        AUTHENTIK_POSTGRESQL__PASSWORD: '{{db.password}}',
+        AUTHENTIK_ERROR_REPORTING__ENABLED: 'false'
+      },
+      volumes: [
+        { name: 'media', path: '/media' },
+        { name: 'templates', path: '/templates' }
+      ],
+      readiness: { path: '/-/health/live/', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/if/flow/initial-setup/ de inmediato para fijar la contraseña de `akadmin`.',
+      'Crea tus proveedores OIDC/OAuth2 o SAML desde la interfaz de administración.'
+    ],
+    notes: [
+      'Servidor + worker + PostgreSQL + Valkey superan los 3 GB totales: asegúrate de contar con RAM libre suficiente.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'keycloak',
+    name: 'Keycloak',
+    category: 'seguridad',
+    summary: 'Servidor estándar empresarial de gestión de identidad y acceso (OIDC, OAuth 2.0, SAML 2.0).',
+    description:
+      'Gestiona reinos multi-tenant, federación LDAP/AD, inicio de sesión social y control de ' +
+      'acceso por roles con PostgreSQL y cabeceras `xforwarded` preconfiguradas.',
+    website: 'https://www.keycloak.org',
+    licence: 'Apache-2.0',
+    tags: ['sso', 'oauth2', 'oidc', 'saml', 'identidad'],
+    database: { engine: 'postgres', dbName: 'keycloak', username: 'keycloak', memoryMb: 512 },
+    secrets: {
+      KC_BOOTSTRAP_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'quay.io/keycloak/keycloak:26.1.3',
+      port: 8080,
+      memoryMb: 1536,
+      cpus: 2,
+      command: ['start'],
+      env: {
+        KC_DB: 'postgres',
+        KC_DB_URL: 'jdbc:postgresql://{{db.host}}:{{db.port}}/{{db.name}}',
+        KC_DB_USERNAME: '{{db.user}}',
+        KC_DB_PASSWORD: '{{db.password}}',
+        KC_HOSTNAME: '{{url}}',
+        KC_PROXY_HEADERS: 'xforwarded',
+        KC_HTTP_ENABLED: 'true',
+        KC_HEALTH_ENABLED: 'true',
+        // Keycloak 25+ mueve /health/ready al puerto 9000 si no se unifica explícitamente.
+        KC_HTTP_MANAGEMENT_PORT: '8080',
+        KC_BOOTSTRAP_ADMIN_USERNAME: 'admin',
+        KC_BOOTSTRAP_ADMIN_PASSWORD: '{{secret.KC_BOOTSTRAP_ADMIN_PASSWORD}}'
+      },
+      volumes: [],
+      readiness: { path: '/health/ready', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/admin e inicia sesión con «admin» y KC_BOOTSTRAP_ADMIN_PASSWORD desde «Credenciales».',
+      'Crea un nuevo Realm para tus aplicaciones en lugar de usar el reino `master`.'
+    ],
+    notes: [
+      'Arranca en modo producción detrás de Caddy con TLS; requiere un dominio HTTPS asignado para iniciar sesión en la consola.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'pocket-id',
+    name: 'Pocket ID',
+    category: 'seguridad',
+    summary: 'Proveedor OIDC minimalista basado exclusivamente en passkeys (WebAuthn), sin contraseñas.',
+    description:
+      'Autentica tus servicios autohospedados con biometría o llaves FIDO2 en un binario ligero con ' +
+      'SQLite embebido y clave de cifrado generada.',
+    website: 'https://pocket-id.org',
+    licence: 'BSD-2-Clause',
+    tags: ['oidc', 'passkeys', 'webauthn', 'sso', 'ligero'],
+    database: null,
+    secrets: {
+      ENCRYPTION_KEY: { bytes: 32, encoding: 'base64' }
+    },
+    app: {
+      image: 'ghcr.io/pocket-id/pocket-id:v2.10.0',
+      port: 1411,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        APP_URL: '{{url}}',
+        TRUST_PROXY: 'true',
+        ENCRYPTION_KEY: '{{secret.ENCRYPTION_KEY}}'
+      },
+      volumes: [{ name: 'data', path: '/app/data' }],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}}/setup para registrar tu primera cuenta administradora con una passkey.',
+      'Asegúrate de usar un dominio HTTPS: WebAuthn no funciona sobre HTTP plano salvo en localhost.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'infisical',
+    name: 'Infisical',
+    category: 'seguridad',
+    summary: 'Gestor centralizado de secretos, variables de entorno y certificados por proyecto y entorno.',
+    description:
+      'Versiona secretos de desarrollo, staging y producción con cifrado de extremo a extremo, ' +
+      'auditoría e inyección automática mediante CLI o SDKs.',
+    website: 'https://infisical.com',
+    licence: 'MIT (edición comunitaria)',
+    tags: ['secretos', 'boveda', 'env', 'devops', 'seguridad'],
+    database: { engine: 'postgres', dbName: 'infisical', username: 'infisical', memoryMb: 512 },
+    secrets: {
+      // Infisical exige clave de 16 bytes codificada en 32 caracteres hex.
+      ENCRYPTION_KEY: { bytes: 16, encoding: 'hex' },
+      AUTH_SECRET: { bytes: 32, encoding: 'base64' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'infisical/infisical:v0.167.13',
+      port: 8080,
+      memoryMb: 1536,
+      cpus: 1,
+      env: {
+        ENCRYPTION_KEY: '{{secret.ENCRYPTION_KEY}}',
+        AUTH_SECRET: '{{secret.AUTH_SECRET}}',
+        DB_CONNECTION_URI: '{{db.url}}',
+        REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379',
+        SITE_URL: '{{url}}',
+        TELEMETRY_ENABLED: 'false'
+      },
+      volumes: [],
+      readiness: { path: '/api/status', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea la primera cuenta administradora de la instancia.',
+      'Guarda ENCRYPTION_KEY en tu gestor de contraseñas: si se pierde, no podrás descifrar los secretos almacenados.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'privatebin',
+    name: 'PrivateBin',
+    category: 'seguridad',
+    summary: 'Compartición efímera de texto y contraseñas cifrada en el navegador (conocimiento cero).',
+    description:
+      'El servidor jamás ve el contenido ni la clave: el cifrado AES-256-GCM ocurre en el navegador ' +
+      'y la nota se autodestruye al leerse o caducar.',
+    website: 'https://privatebin.info',
+    licence: 'zlib',
+    tags: ['pastebin', 'cifrado', 'privacidad', 'efimero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'privatebin/nginx-fpm-alpine:1.5.1',
+      port: 8080,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        TZ: 'Europe/Madrid'
+      },
+      volumes: [{ name: 'data', path: '/srv/data' }],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y comparte tu primer mensaje cifrado con caducidad o «quemar tras leer».',
+      'Asigna un dominio HTTPS para que la Web Crypto API del navegador funcione en todos los clientes.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  // H. Contenido y CMS (5 nuevas → 9 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'drupal',
+    name: 'Drupal',
+    category: 'contenido',
+    summary: 'CMS modular y plataforma de contenidos empresariales en PHP sobre PostgreSQL.',
+    description:
+      'Arquitectura estructurada de tipos de contenido, taxonomías, multilingüismo y permisos ' +
+      'granulares con volúmenes persistentes para sitios, módulos y temas.',
+    website: 'https://www.drupal.org',
+    licence: 'GPLv2+',
+    tags: ['cms', 'php', 'web', 'editorial'],
+    database: { engine: 'postgres', dbName: 'drupal', username: 'drupal', memoryMb: 512 },
+    secrets: {},
+    app: {
+      image: 'drupal:11.4-apache',
+      port: 80,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        DRUPAL_DB_HOST: '{{db.host}}',
+        DRUPAL_DB_PORT: '{{db.port}}',
+        DRUPAL_DB_NAME: '{{db.name}}',
+        DRUPAL_DB_USER: '{{db.user}}',
+        DRUPAL_DB_PASSWORD: '{{db.password}}'
+      },
+      volumes: [
+        { name: 'sites', path: '/var/www/html/sites' },
+        { name: 'modules', path: '/var/www/html/modules' },
+        { name: 'themes', path: '/var/www/html/themes' }
+      ],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para ejecutar el instalador web de Drupal.',
+      'Introduce las credenciales de PostgreSQL que figuran en Bases de datos → credenciales (host `postgres`).'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'joomla',
+    name: 'Joomla',
+    category: 'contenido',
+    summary: 'Gestor de contenidos web maduro con multilingüismo nativo y gestión avanzada de usuarios.',
+    description:
+      'Crea portales corporativos, intranets y sitios multilingües respaldados por MariaDB aislada ' +
+      'y contraseña de administración generada.',
+    website: 'https://www.joomla.org',
+    licence: 'GPLv2+',
+    tags: ['cms', 'php', 'web', 'portal'],
+    database: { engine: 'mariadb', dbName: 'joomla', username: 'joomla', memoryMb: 512 },
+    secrets: {
+      JOOMLA_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'joomla:5.4-apache',
+      port: 80,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        JOOMLA_DB_HOST: '{{db.host}}',
+        JOOMLA_DB_USER: '{{db.user}}',
+        JOOMLA_DB_PASSWORD: '{{db.password}}',
+        JOOMLA_DB_NAME: '{{db.name}}',
+        JOOMLA_ADMIN_USER: 'admin',
+        JOOMLA_ADMIN_USERNAME: 'admin',
+        JOOMLA_ADMIN_PASSWORD: '{{secret.JOOMLA_ADMIN_PASSWORD}}',
+        JOOMLA_ADMIN_EMAIL: 'admin@culkibo.local'
+      },
+      volumes: [{ name: 'data', path: '/var/www/html' }],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/administrator e inicia sesión con «admin» y JOOMLA_ADMIN_PASSWORD desde «Credenciales».',
+      'Actualiza el correo del superusuario y configura tus idiomas o plantillas.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'halo',
+    name: 'Halo',
+    category: 'contenido',
+    summary: 'Plataforma moderna de publicación y blogs con editor enriquecido, temas y plugins.',
+    description:
+      'CMS rápido con arquitectura de plugins, mercado de temas y soporte Markdown respaldado por ' +
+      'PostgreSQL reactivo (R2DBC).',
+    website: 'https://www.halo.run',
+    licence: 'GPLv3',
+    tags: ['blog', 'cms', 'publicacion', 'temas'],
+    database: { engine: 'postgres', dbName: 'halo', username: 'halo', memoryMb: 512 },
+    secrets: {
+      HALO_SUPER_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'halohub/halo:2.27.0',
+      port: 8090,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        SPRING_R2DBC_URL: 'r2dbc:pool:postgresql://{{db.host}}:{{db.port}}/{{db.name}}',
+        SPRING_R2DBC_USERNAME: '{{db.user}}',
+        SPRING_R2DBC_PASSWORD: '{{db.password}}',
+        SPRING_SQL_INIT_PLATFORM: 'postgresql',
+        HALO_EXTERNAL_URL: '{{url}}/',
+        HALO_SECURITY_INITIALIZER_SUPERADMINUSERNAME: 'admin',
+        HALO_SECURITY_INITIALIZER_SUPERADMINPASSWORD: '{{secret.HALO_SUPER_ADMIN_PASSWORD}}'
+      },
+      volumes: [{ name: 'data', path: '/root/.halo2' }],
+      readiness: { path: '/actuator/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Entra en {{url}}/console con usuario «admin» y HALO_SUPER_ADMIN_PASSWORD desde «Credenciales».',
+      'Elige un tema desde el panel y publica tu primera entrada.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'freshrss',
+    name: 'FreshRSS',
+    category: 'contenido',
+    summary: 'Agregador y lector RSS/Atom rapidísimo con API compatible con apps móviles.',
+    description:
+      'Sigue blogs, boletines y canales de noticias sin algoritmos, con actualización programada ' +
+      'cada 30 minutos, filtros y base PostgreSQL.',
+    website: 'https://freshrss.org',
+    licence: 'AGPLv3',
+    tags: ['rss', 'atom', 'lector', 'noticias'],
+    database: { engine: 'postgres', dbName: 'freshrss', username: 'freshrss', memoryMb: 512 },
+    secrets: {},
+    app: {
+      image: 'freshrss/freshrss:1.26.0',
+      port: 80,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        TZ: 'Europe/Madrid',
+        CRON_MIN: '3,33',
+        TRUSTED_PROXY: '127.0.0.1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16',
+        FRESHRSS_INSTALL:
+          '--api-enabled --base-url {{url}} --db-type pgsql --db-host {{db.host}}:{{db.port}} ' +
+          '--db-base {{db.name}} --db-user {{db.user}} --db-password {{db.password}} ' +
+          '--default-user admin --language es'
+      },
+      volumes: [
+        { name: 'data', path: '/var/www/FreshRSS/data' },
+        { name: 'extensions', path: '/var/www/FreshRSS/extensions' }
+      ],
+      readiness: { path: '/i/', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Abre {{url}} y completa la creación de la cuenta inicial de administración.',
+      'Importa tu fichero OPML desde Gestión de suscripciones.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'prestashop',
+    name: 'PrestaShop',
+    category: 'contenido',
+    summary: 'Plataforma completa de comercio electrónico con catálogo, pedidos, impuestos y pasarelas.',
+    description:
+      'Tienda online autohospedada en español lista para producción con MariaDB aislada, SSL ' +
+      'habilitado e instalación automática inicial.',
+    website: 'https://prestashop.com',
+    licence: 'OSL-3.0 / AFL-3.0',
+    tags: ['ecommerce', 'tienda', 'ventas', 'php'],
+    database: { engine: 'mariadb', dbName: 'prestashop', username: 'prestashop', memoryMb: 512 },
+    secrets: {
+      PS_ADMIN_PASSWD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'prestashop/prestashop:8.2-apache',
+      port: 80,
+      memoryMb: 1536,
+      cpus: 1,
+      env: {
+        DB_SERVER: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_NAME: '{{db.name}}',
+        DB_USER: '{{db.user}}',
+        DB_PASSWD: '{{db.password}}',
+        PS_DOMAIN: '{{domain}}',
+        PS_ENABLE_SSL: '1',
+        PS_INSTALL_AUTO: '1',
+        PS_LANGUAGE: 'es',
+        PS_COUNTRY: 'es',
+        ADMIN_MAIL: 'admin@culkibo.local',
+        ADMIN_PASSWD: '{{secret.PS_ADMIN_PASSWD}}'
+      },
+      volumes: [{ name: 'html', path: '/var/www/html' }],
+      readiness: { path: '/', expect: [200, 301, 302], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Consulta los registros del primer arranque para ver la ruta aleatoria del panel de administración (`/admin...`).',
+      'Inicia sesión con `admin@culkibo.local` y PS_ADMIN_PASSWD desde «Credenciales».'
+    ],
+    notes: [
+      'La primera instalación automática tarda entre 2 y 4 minutos en descomprimir y poblar la tienda.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  // I. Documentación y wikis (6 nuevas → 6 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'docmost',
+    name: 'Docmost',
+    category: 'docs',
+    summary: 'Wiki colaborativa en tiempo real con diagramas, espacios y búsqueda (alternativa a Notion/Confluence).',
+    description:
+      'Edición simultánea por varios miembros, comentarios, diagramas Draw.io/Mermaid y gestión de ' +
+      'espacios sobre PostgreSQL y Valkey aislados.',
+    website: 'https://docmost.com',
+    licence: 'AGPLv3',
+    tags: ['wiki', 'notion', 'confluence', 'documentacion', 'colaboracion'],
+    database: { engine: 'postgres', dbName: 'docmost', username: 'docmost', memoryMb: 512 },
+    secrets: {
+      APP_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'docmost/docmost:0.98.0',
+      port: 3000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        APP_URL: '{{url}}',
+        APP_SECRET: '{{secret.APP_SECRET}}',
+        DATABASE_URL: '{{db.url}}?schema=public',
+        REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379'
+      },
+      volumes: [{ name: 'storage', path: '/app/data/storage' }],
+      readiness: { path: '/api/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear tu espacio de trabajo y la primera cuenta de administración.',
+      'Configura SMTP en las variables de entorno si quieres enviar invitaciones por correo.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'bookstack',
+    name: 'BookStack',
+    category: 'docs',
+    summary: 'Base de conocimiento organizada en estantes, libros y capítulos, rápida y muy intuitiva.',
+    description:
+      'Wiki estructurada con editor visual o Markdown, búsqueda completa, exportación a PDF y ' +
+      'permisos por rol sobre MariaDB aislada.',
+    website: 'https://www.bookstackapp.com',
+    licence: 'MIT',
+    tags: ['wiki', 'documentacion', 'manuales', 'conocimiento'],
+    database: { engine: 'mariadb', dbName: 'bookstack', username: 'bookstack', memoryMb: 512 },
+    secrets: {
+      APP_KEY: { bytes: 32, encoding: 'base64' }
+    },
+    app: {
+      image: 'lscr.io/linuxserver/bookstack:version-v26.09.3',
+      port: 80,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        PUID: '1000',
+        PGID: '1000',
+        TZ: 'Europe/Madrid',
+        APP_URL: '{{url}}',
+        APP_KEY: 'base64:{{secret.APP_KEY}}',
+        DB_HOST: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_USERNAME: '{{db.user}}',
+        DB_PASSWORD: '{{db.password}}',
+        DB_DATABASE: '{{db.name}}'
+      },
+      volumes: [{ name: 'config', path: '/config' }],
+      readiness: { path: '/login', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}}/login con el acceso inicial de BookStack (`admin@admin.com` / `password`) y cambia ambos de inmediato.',
+      'Conserva APP_KEY: Laravel la utiliza para cifrar sesiones y ajustes sensibles.'
+    ],
+    notes: [
+      'La contraseña inicial es fija por diseño del proyecto: cámbiala nada más entrar.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'wikijs',
+    name: 'Wiki.js',
+    category: 'docs',
+    summary: 'Wiki moderna en Node.js con sincronización Git, múltiples editores y búsqueda integrada.',
+    description:
+      'Soporta Markdown, HTML, diagramas y respaldo automático en repositorios Git, con historial ' +
+      'de versiones almacenado en PostgreSQL.',
+    website: 'https://js.wiki',
+    licence: 'AGPLv3',
+    tags: ['wiki', 'markdown', 'git', 'documentacion'],
+    database: { engine: 'postgres', dbName: 'wikijs', username: 'wikijs', memoryMb: 512 },
+    secrets: {},
+    app: {
+      image: 'ghcr.io/requarks/wiki:2.5.317',
+      port: 3000,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        DB_TYPE: 'postgres',
+        DB_HOST: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_USER: '{{db.user}}',
+        DB_PASS: '{{db.password}}',
+        DB_NAME: '{{db.name}}'
+      },
+      volumes: [],
+      readiness: { path: '/healthz', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para completar el asistente inicial y fijar tu cuenta administradora.',
+      'Activa el idioma español en Administración → Idiomas tras terminar el asistente.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'hedgedoc',
+    name: 'HedgeDoc',
+    category: 'docs',
+    summary: 'Notas y presentaciones Markdown colaborativas en tiempo real para equipos técnicos.',
+    description:
+      'Edita actas de reunión, especificaciones técnicas y diapositivas Reveal.js en directo con ' +
+      'vista dividida, diagramas y respaldo en PostgreSQL.',
+    website: 'https://hedgedoc.org',
+    licence: 'AGPLv3',
+    tags: ['markdown', 'notas', 'colaboracion', 'documentacion'],
+    database: { engine: 'postgres', dbName: 'hedgedoc', username: 'hedgedoc', memoryMb: 512 },
+    secrets: {
+      CMD_SESSION_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'quay.io/hedgedoc/hedgedoc:1.12.2',
+      port: 3000,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        CMD_DB_URL: '{{db.url}}',
+        CMD_DOMAIN: '{{domain}}',
+        CMD_PROTOCOL_USESSL: '{{isHttps}}',
+        CMD_URL_ADDPORT: 'false',
+        CMD_SESSION_SECRET: '{{secret.CMD_SESSION_SECRET}}',
+        CMD_ALLOW_ANONYMOUS: 'false',
+        CMD_ALLOW_ANONYMOUS_EDITS: 'false'
+      },
+      volumes: [{ name: 'uploads', path: '/hedgedoc/public/uploads' }],
+      readiness: { path: '/_health', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y registra tu primera cuenta para empezar a crear notas colaborativas.',
+      'La edición anónima viene desactivada por seguridad; puedes permitir usuarios locales o conectar OAuth2.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'memos',
+    name: 'Memos',
+    category: 'docs',
+    summary: 'Cuaderno rápido de notas en Markdown tipo microblog privado en un solo binario Go.',
+    description:
+      'Captura ideas, fragmentos de código, etiquetas y adjuntos en milisegundos con SQLite ' +
+      'embebido y consumo mínimo de memoria.',
+    website: 'https://usememos.com',
+    licence: 'MIT',
+    tags: ['notas', 'markdown', 'diario', 'ligero', 'go'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'neosmemo/memos:0.22.2',
+      port: 5230,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        MEMOS_MODE: 'prod',
+        MEMOS_PORT: '5230'
+      },
+      volumes: [{ name: 'data', path: '/var/opt/memos' }],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea la cuenta de propietario: una vez creada podrás desactivar nuevos registros en Ajustes.',
+      'Conecta apps móviles compatibles o su API REST con un token personal.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'dokuwiki',
+    name: 'DokuWiki',
+    category: 'docs',
+    summary: 'Wiki clásica sin base de datos basada en ficheros de texto plano, estable y ultra ligera.',
+    description:
+      'Almacena todas las páginas, revisiones y adjuntos como archivos legibles en disco sin ' +
+      'necesitar motor SQL, ideal para documentación duradera en VPS pequeños.',
+    website: 'https://www.dokuwiki.org',
+    licence: 'GPLv2',
+    tags: ['wiki', 'documentacion', 'texto plano', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'lscr.io/linuxserver/dokuwiki:2026-07-14c-ls333',
+      port: 80,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        PUID: '1000',
+        PGID: '1000',
+        TZ: 'Europe/Madrid'
+      },
+      volumes: [{ name: 'config', path: '/config' }],
+      readiness: { path: '/', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Abre {{url}}/install.php para ejecutar el asistente inicial, habilitar ACL y crear el superusuario.',
+      'Borra o desactiva `install.php` en cuanto finalice la instalación (el asistente te avisa).'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  // J. Productividad y CRM (8 nuevas → 10 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'vikunja',
+    name: 'Vikunja',
+    category: 'productividad',
+    summary: 'Gestor de tareas y proyectos con listas, kanban, diagrama Gantt y sincronización CalDAV.',
+    description:
+      'Alternativa libre a Todoist y Trello escrita en Go, con equipos, etiquetas, fechas límite y ' +
+      'PostgreSQL aislado.',
+    website: 'https://vikunja.io',
+    licence: 'AGPLv3',
+    tags: ['tareas', 'kanban', 'gantt', 'caldav', 'proyectos'],
+    database: { engine: 'postgres', dbName: 'vikunja', username: 'vikunja', memoryMb: 512 },
+    secrets: {
+      VIKUNJA_SERVICE_JWTSECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'vikunja/vikunja:0.24.6',
+      port: 3456,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        VIKUNJA_SERVICE_PUBLICURL: '{{url}}',
+        VIKUNJA_SERVICE_JWTSECRET: '{{secret.VIKUNJA_SERVICE_JWTSECRET}}',
+        VIKUNJA_DATABASE_TYPE: 'postgres',
+        VIKUNJA_DATABASE_HOST: '{{db.host}}:{{db.port}}',
+        VIKUNJA_DATABASE_USER: '{{db.user}}',
+        VIKUNJA_DATABASE_PASSWORD: '{{db.password}}',
+        VIKUNJA_DATABASE_DATABASE: '{{db.name}}'
+      },
+      volumes: [{ name: 'files', path: '/app/vikunja/files' }],
+      readiness: { path: '/api/v1/info', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea tu primera cuenta de usuario.',
+      'Si es uso privado, añade `VIKUNJA_SERVICE_ENABLEREGISTRATION=false` tras crear tus cuentas.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'planka',
+    name: 'Planka',
+    category: 'productividad',
+    summary: 'Tableros kanban en tiempo real limpios y rápidos para equipos (alternativa libre a Trello).',
+    description:
+      'Organiza proyectos, tarjetas, listas de comprobación, adjuntos y comentarios en directo ' +
+      'sobre PostgreSQL.',
+    website: 'https://planka.app',
+    licence: 'AGPLv3',
+    tags: ['kanban', 'trello', 'proyectos', 'tableros'],
+    database: { engine: 'postgres', dbName: 'planka', username: 'planka', memoryMb: 512 },
+    secrets: {
+      SECRET_KEY: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'ghcr.io/plankanban/planka:2.0.0',
+      port: 1337,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        BASE_URL: '{{url}}',
+        DATABASE_URL: '{{db.url}}',
+        SECRET_KEY: '{{secret.SECRET_KEY}}',
+        TRUST_PROXY: 'true'
+      },
+      volumes: [
+        { name: 'avatars', path: '/app/public/user-avatars' },
+        { name: 'attachments', path: '/app/private/attachments' },
+        { name: 'backgrounds', path: '/app/public/background-images' }
+      ],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea la cuenta administradora en la pantalla de bienvenida inicial.',
+      'Crea tu primer proyecto y añade a los miembros del equipo desde Administración.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'espocrm',
+    name: 'EspoCRM',
+    category: 'productividad',
+    summary: 'CRM completo para ventas, clientes, oportunidades, calendario y correo corporativo.',
+    description:
+      'Gestiona cuentas, contactos, embudos comerciales y automatizaciones de ventas en un CRM ' +
+      'rápido respaldado por MariaDB.',
+    website: 'https://www.espocrm.com',
+    licence: 'GPLv3',
+    tags: ['crm', 'ventas', 'clientes', 'negocio'],
+    database: { engine: 'mariadb', dbName: 'espocrm', username: 'espocrm', memoryMb: 512 },
+    secrets: {
+      ESPOCRM_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'espocrm/espocrm:9.1.8',
+      port: 80,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        ESPOCRM_DATABASE_PLATFORM: 'Mysql',
+        ESPOCRM_DATABASE_HOST: '{{db.host}}',
+        ESPOCRM_DATABASE_PORT: '{{db.port}}',
+        ESPOCRM_DATABASE_NAME: '{{db.name}}',
+        ESPOCRM_DATABASE_USER: '{{db.user}}',
+        ESPOCRM_DATABASE_PASSWORD: '{{db.password}}',
+        ESPOCRM_ADMIN_USERNAME: 'admin',
+        ESPOCRM_ADMIN_PASSWORD: '{{secret.ESPOCRM_ADMIN_PASSWORD}}',
+        ESPOCRM_SITE_URL: '{{url}}'
+      },
+      volumes: [{ name: 'data', path: '/var/www/html' }],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con ESPOCRM_ADMIN_PASSWORD desde «Credenciales».',
+      'Cambia el idioma a español en Preferencias y configura tu servidor SMTP/IMAP.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'paperless-ngx',
+    name: 'Paperless-ngx',
+    category: 'productividad',
+    summary: 'Archivo digital inteligente con OCR automático en español/inglés para facturas y contratos.',
+    description:
+      'Escanea o sube PDFs e imágenes, extrae el texto mediante OCR, clasifica automáticamente por ' +
+      'etiquetas y remitentes y busca en segundos sobre PostgreSQL y Valkey.',
+    website: 'https://docs.paperless-ngx.com',
+    licence: 'GPLv3',
+    tags: ['ocr', 'documentos', 'facturas', 'archivo', 'pdf'],
+    database: { engine: 'postgres', dbName: 'paperless', username: 'paperless', memoryMb: 512 },
+    secrets: {
+      PAPERLESS_SECRET_KEY: { bytes: 32, encoding: 'base64url' },
+      PAPERLESS_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'ghcr.io/paperless-ngx/paperless-ngx:3.1.3',
+      port: 8000,
+      memoryMb: 1536,
+      cpus: 2,
+      env: {
+        PAPERLESS_REDIS: 'redis://{{sidecar.valkey.host}}:6379',
+        PAPERLESS_DBHOST: '{{db.host}}',
+        PAPERLESS_DBPORT: '{{db.port}}',
+        PAPERLESS_DBNAME: '{{db.name}}',
+        PAPERLESS_DBUSER: '{{db.user}}',
+        PAPERLESS_DBPASS: '{{db.password}}',
+        PAPERLESS_SECRET_KEY: '{{secret.PAPERLESS_SECRET_KEY}}',
+        PAPERLESS_URL: '{{url}}',
+        PAPERLESS_TIME_ZONE: 'Europe/Madrid',
+        PAPERLESS_OCR_LANGUAGE: 'spa+eng',
+        PAPERLESS_ADMIN_USER: 'admin',
+        PAPERLESS_ADMIN_PASSWORD: '{{secret.PAPERLESS_ADMIN_PASSWORD}}',
+        PAPERLESS_ADMIN_MAIL: 'admin@culkibo.local'
+      },
+      volumes: [
+        { name: 'data', path: '/usr/src/paperless/data' },
+        { name: 'media', path: '/usr/src/paperless/media' },
+        { name: 'consume', path: '/usr/src/paperless/consume' }
+      ],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con PAPERLESS_ADMIN_PASSWORD desde «Credenciales».',
+      'Arrastra tu primera factura o contrato para probar la indexación OCR automática en español e inglés.'
+    ],
+    notes: [
+      'El procesamiento OCR consume CPU durante picos de ingesta; 2 vCPU y 1,5 GB de RAM son el mínimo cómodo.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'kimai',
+    name: 'Kimai',
+    category: 'productividad',
+    summary: 'Control horario, registro de horas por cliente/proyecto y generación de facturas.',
+    description:
+      'Registra tiempos de equipos y freelancers, calcula presupuestos por tarifa, exporta partes ' +
+      'a Excel/PDF y emite facturas desde una interfaz web sobre MariaDB.',
+    website: 'https://www.kimai.org',
+    licence: 'AGPLv3',
+    tags: ['tiempo', 'facturacion', 'proyectos', 'freelance', 'horas'],
+    database: { engine: 'mariadb', dbName: 'kimai', username: 'kimai', memoryMb: 512 },
+    secrets: {
+      APP_SECRET: { bytes: 32, encoding: 'hex' },
+      ADMINPASS: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'kimai/kimai2:2.72.1',
+      port: 8001,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        APP_ENV: 'prod',
+        APP_SECRET: '{{secret.APP_SECRET}}',
+        DATABASE_URL: 'mysql://{{db.user}}:{{db.password}}@{{db.host}}:{{db.port}}/{{db.name}}?charset=utf8mb4&serverVersion=11.4.0-MariaDB',
+        TRUSTED_HOSTS: '.*',
+        ADMINMAIL: 'admin@culkibo.local',
+        ADMINPASS: '{{secret.ADMINPASS}}'
+      },
+      volumes: [
+        { name: 'data', path: '/opt/kimai/var/data' },
+        { name: 'plugins', path: '/opt/kimai/var/plugins' }
+      ],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Entra en {{url}} con `admin@culkibo.local` y ADMINPASS desde «Credenciales».',
+      'Crea tus primeros clientes, proyectos y actividades antes de invitar al equipo.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'formbricks',
+    name: 'Formbricks',
+    category: 'productividad',
+    summary: 'Encuestas, formularios condicionales y feedback in-app (alternativa libre a Typeform).',
+    description:
+      'Crea formularios con lógica condicional, encuestas NPS dentro de tu web o app y webhooks de ' +
+      'respuestas sobre PostgreSQL con claves de cifrado generadas.',
+    website: 'https://formbricks.com',
+    licence: 'AGPLv3',
+    tags: ['formularios', 'encuestas', 'typeform', 'feedback'],
+    database: { engine: 'postgres', dbName: 'formbricks', username: 'formbricks', memoryMb: 512 },
+    secrets: {
+      NEXTAUTH_SECRET: { bytes: 32, encoding: 'hex' },
+      ENCRYPTION_KEY: { bytes: 32, encoding: 'hex' },
+      CRON_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'ghcr.io/formbricks/formbricks:v2.6.0',
+      port: 3000,
+      memoryMb: 1536,
+      cpus: 1,
+      env: {
+        WEBAPP_URL: '{{url}}',
+        NEXTAUTH_URL: '{{url}}',
+        DATABASE_URL: '{{db.url}}',
+        NEXTAUTH_SECRET: '{{secret.NEXTAUTH_SECRET}}',
+        ENCRYPTION_KEY: '{{secret.ENCRYPTION_KEY}}',
+        CRON_SECRET: '{{secret.CRON_SECRET}}',
+        TELEMETRY_DISABLED: '1'
+      },
+      volumes: [{ name: 'uploads', path: '/home/nextjs/apps/web/uploads' }],
+      readiness: { path: '/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea tu primera cuenta administradora.',
+      'Guarda ENCRYPTION_KEY: cifra las credenciales de integraciones almacenadas en la base de datos.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'twenty',
+    name: 'Twenty CRM',
+    category: 'productividad',
+    summary: 'CRM moderno de código abierto con objetos personalizados, vistas rápidas y API GraphQL.',
+    description:
+      'Alternativa moderna a Salesforce y HubSpot con diseño tipo Linear/Notion, flujos de trabajo ' +
+      'en segundo plano, Valkey y PostgreSQL aislados.',
+    website: 'https://twenty.com',
+    licence: 'AGPLv3',
+    tags: ['crm', 'ventas', 'hubspot', 'graphql', 'equipos'],
+    database: { engine: 'postgres', dbName: 'twenty', username: 'twenty', memoryMb: 512 },
+    secrets: {
+      APP_SECRET: { bytes: 32, encoding: 'base64' }
+    },
+    sidecars: [
+      makeValkeySidecar(256),
+      {
+        name: 'worker',
+        image: 'twentycrm/twenty:v2.38.1',
+        memoryMb: 1024,
+        cpus: 1,
+        command: ['yarn', 'worker:prod'],
+        env: {
+          PG_DATABASE_URL: '{{db.url}}',
+          REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379',
+          SERVER_URL: '{{url}}',
+          APP_SECRET: '{{secret.APP_SECRET}}',
+          STORAGE_TYPE: 'local',
+          DISABLE_DB_MIGRATIONS: 'true',
+          DISABLE_CRON_JOBS_REGISTRATION: 'true'
+        },
+        volumes: []
+      }
+    ],
+    app: {
+      image: 'twentycrm/twenty:v2.38.1',
+      port: 3000,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        NODE_PORT: '3000',
+        PG_DATABASE_URL: '{{db.url}}',
+        REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379',
+        SERVER_URL: '{{url}}',
+        APP_SECRET: '{{secret.APP_SECRET}}',
+        STORAGE_TYPE: 'local'
+      },
+      volumes: [{ name: 'storage', path: '/app/packages/twenty-server/.local-storage' }],
+      readiness: { path: '/healthz', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear tu cuenta y espacio de trabajo comercial.',
+      'El primer arranque ejecuta migraciones de esquema: espera entre 1 y 2 minutos.'
+    ],
+    notes: [
+      'Twenty (servidor + worker + PostgreSQL + Valkey) necesita cerca de 4 GB de RAM total en el host.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'baserow',
+    name: 'Baserow',
+    category: 'productividad',
+    summary: 'Base de datos colaborativa sin código y constructor de apps internas (alternativa a Airtable).',
+    description:
+      'Crea tablas relacionales, formularios, vistas kanban/calendario y portales de datos en una ' +
+      'imagen autocontenida con persistencia íntegra en volumen.',
+    website: 'https://baserow.io',
+    licence: 'MIT (edición comunitaria)',
+    tags: ['airtable', 'tablas', 'sin codigo', 'formularios'],
+    database: null,
+    secrets: {
+      SECRET_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'baserow/baserow:2.4.3',
+      port: 80,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        BASEROW_PUBLIC_URL: '{{url}}',
+        SECRET_KEY: '{{secret.SECRET_KEY}}',
+        BASEROW_CADDY_ADDRESSES: ':80'
+      },
+      volumes: [{ name: 'data', path: '/baserow/data' }],
+      readiness: { path: '/api/_health/', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para registrar la cuenta inicial de administración.',
+      'Puedes desactivar nuevos registros públicos desde Panel de administración → Ajustes.'
+    ],
+    notes: [
+      'La imagen todo-en-uno de Baserow incluye su propio PostgreSQL y Redis internos dentro del volumen `/baserow/data` y necesita 2 GB de RAM.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  // K. Multimedia y archivos (6 nuevas → 6 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'nextcloud',
+    name: 'Nextcloud',
+    category: 'media',
+    summary: 'Nube privada completa: archivos, sincronización, calendarios CalDAV, contactos y fotos.',
+    description:
+      'Alternativa autohospedada a Google Drive y Dropbox con PostgreSQL, caché Valkey para bloqueos ' +
+      'de archivos y límite de subida PHP ampliado a 2 GB.',
+    website: 'https://nextcloud.com',
+    licence: 'AGPLv3',
+    tags: ['nube', 'archivos', 'drive', 'caldav', 'sincronizacion'],
+    database: { engine: 'postgres', dbName: 'nextcloud', username: 'nextcloud', memoryMb: 512 },
+    secrets: {
+      NEXTCLOUD_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'nextcloud:31.0.5-apache',
+      port: 80,
+      memoryMb: 1536,
+      cpus: 2,
+      env: {
+        POSTGRES_HOST: '{{db.host}}:{{db.port}}',
+        POSTGRES_DB: '{{db.name}}',
+        POSTGRES_USER: '{{db.user}}',
+        POSTGRES_PASSWORD: '{{db.password}}',
+        REDIS_HOST: '{{sidecar.valkey.host}}',
+        NEXTCLOUD_ADMIN_USER: 'admin',
+        NEXTCLOUD_ADMIN_PASSWORD: '{{secret.NEXTCLOUD_ADMIN_PASSWORD}}',
+        NEXTCLOUD_TRUSTED_DOMAINS: '{{domain}}',
+        OVERWRITECLIURL: '{{url}}',
+        OVERWRITEPROTOCOL: '{{protocol}}'
+      },
+      files: [
+        {
+          name: 'culkibo-uploads.ini',
+          path: '/usr/local/etc/php/conf.d/culkibo-uploads.ini',
+          content:
+            'memory_limit = 512M\n' +
+            'upload_max_filesize = 2G\n' +
+            'post_max_size = 2G\n' +
+            'max_execution_time = 600\n'
+        }
+      ],
+      volumes: [{ name: 'html', path: '/var/www/html' }],
+      readiness: { path: '/status.php', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con NEXTCLOUD_ADMIN_PASSWORD desde «Credenciales».',
+      'Instala las aplicaciones de escritorio y móvil de Nextcloud apuntando a tu dominio HTTPS.'
+    ],
+    notes: [
+      'La primera inicialización descomprime Nextcloud e inicializa PostgreSQL: puede tardar 1-3 minutos.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'immich',
+    name: 'Immich',
+    category: 'media',
+    summary: 'Copia automática de fotos y vídeos con búsqueda inteligente (alternativa a Google Fotos).',
+    description:
+      'Sincroniza el carrete del móvil en calidad original, agrupa caras y busca por descripción con ' +
+      'PostgreSQL VectorChord, Valkey y contenedor dedicado de Machine Learning.',
+    website: 'https://immich.app',
+    licence: 'AGPLv3',
+    tags: ['fotos', 'videos', 'galeria', 'movil', 'ia'],
+    database: {
+      engine: 'postgres',
+      image: 'ghcr.io/immich-app/postgres:16-vectorchord1.1.1',
+      dbName: 'immich',
+      username: 'immich',
+      memoryMb: 1024
+    },
+    secrets: {},
+    sidecars: [
+      makeValkeySidecar(256),
+      {
+        name: 'ml',
+        image: 'ghcr.io/immich-app/immich-machine-learning:v1.125.0',
+        memoryMb: 2048,
+        cpus: 2,
+        env: {},
+        volumes: [{ name: 'cache', path: '/cache' }]
+      }
+    ],
+    app: {
+      image: 'ghcr.io/immich-app/immich-server:v1.125.0',
+      port: 2283,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        DB_HOSTNAME: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_USERNAME: '{{db.user}}',
+        DB_PASSWORD: '{{db.password}}',
+        DB_DATABASE_NAME: '{{db.name}}',
+        REDIS_HOSTNAME: '{{sidecar.valkey.host}}',
+        IMMICH_MACHINE_LEARNING_URL: 'http://{{sidecar.ml.host}}:3003',
+        UPLOAD_LOCATION: '/usr/src/app/upload'
+      },
+      volumes: [{ name: 'uploads', path: '/usr/src/app/upload' }],
+      readiness: { path: '/api/server/ping', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear la cuenta administradora de Immich.',
+      'Conecta las apps oficiales de iOS y Android indicando {{url}}/api como servidor.'
+    ],
+    notes: [
+      'Immich completo (servidor + ML + PostgreSQL VectorChord + Valkey) requiere al menos 6 GB de RAM en el VPS.',
+      'Actualiza siempre `immich-server` y `immich-machine-learning` juntos y revisa las notas de versión antes de subir de versión.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'filebrowser',
+    name: 'File Browser',
+    category: 'media',
+    summary: 'Gestor de archivos web ultraligero para subir, previsualizar y compartir carpetas.',
+    description:
+      'Interfaz limpia en Go con visor de imágenes, texto y vídeo, enlaces compartidos con caducidad ' +
+      'y gestión de usuarios en menos de 50 MB de RAM.',
+    website: 'https://filebrowser.org',
+    licence: 'Apache-2.0',
+    tags: ['archivos', 'gestor', 'compartir', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'filebrowser/filebrowser:v2.32.0',
+      port: 80,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        FB_PORT: '80',
+        FB_ROOT: '/srv',
+        FB_DATABASE: '/database/filebrowser.db'
+      },
+      volumes: [
+        { name: 'srv', path: '/srv' },
+        { name: 'database', path: '/database' },
+        { name: 'config', path: '/config' }
+      ],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Revisa los registros del contenedor en el primer arranque para obtener la contraseña aleatoria de «admin» y cámbiala al entrar.',
+      'Abre {{url}} para empezar a organizar y compartir archivos.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'jellyfin',
+    name: 'Jellyfin',
+    category: 'media',
+    summary: 'Servidor multimedia libre para películas, series y música sin suscripciones ni telemetría.',
+    description:
+      'Reproduce tu biblioteca en TV, móvil y navegador con metadatos automáticos, subtítulos, ' +
+      'perfiles familiares y control parental.',
+    website: 'https://jellyfin.org',
+    licence: 'GPLv2',
+    tags: ['video', 'peliculas', 'series', 'streaming', 'multimedia'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'jellyfin/jellyfin:10.10.3',
+      port: 8096,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        JELLYFIN_PublishedServerUrl: '{{url}}',
+        TZ: 'Europe/Madrid'
+      },
+      volumes: [
+        { name: 'config', path: '/config' },
+        { name: 'cache', path: '/cache' },
+        { name: 'media', path: '/media' }
+      ],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} de inmediato para completar el asistente y crear la cuenta administradora.',
+      'Añade tus carpetas dentro del volumen `/media` para indexar bibliotecas.'
+    ],
+    notes: [
+      'Sin GPU dedicada, la transcodificación de vídeo 4K por CPU consume muchos recursos: prioriza reproducción directa.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'navidrome',
+    name: 'Navidrome',
+    category: 'media',
+    summary: 'Servidor privado de música en streaming compatible con clientes Subsonic y OpenSubsonic.',
+    description:
+      'Escucha tu colección FLAC/MP3 desde navegador o apps móviles (Symfonium, Feishin, Amperfy) ' +
+      'con listas inteligentes, scrobbling y bajo consumo de RAM.',
+    website: 'https://www.navidrome.org',
+    licence: 'GPLv3',
+    tags: ['musica', 'audio', 'streaming', 'subsonic'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'deluan/navidrome:0.55.0',
+      port: 4533,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        ND_DATAFOLDER: '/data',
+        ND_MUSICFOLDER: '/music',
+        ND_LOGLEVEL: 'info',
+        ND_SCANSCHEDULE: '1h'
+      },
+      volumes: [
+        { name: 'data', path: '/data' },
+        { name: 'music', path: '/music' }
+      ],
+      readiness: { path: '/ping', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear tu cuenta de administrador en el primer arranque.',
+      'Copia tu biblioteca de música en el volumen `/music`; Navidrome la escaneará automáticamente.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'audiobookshelf',
+    name: 'Audiobookshelf',
+    category: 'media',
+    summary: 'Servidor privado de audiolibros y podcasts con sincronización de progreso entre dispositivos.',
+    description:
+      'Gestiona bibliotecas de audiolibros, descarga episodios de podcasts automáticamente y ' +
+      'sincroniza el punto exacto de escucha con sus apps oficiales de iOS y Android.',
+    website: 'https://www.audiobookshelf.org',
+    licence: 'GPLv3',
+    tags: ['audiolibros', 'podcasts', 'audio', 'streaming'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'ghcr.io/advplyr/audiobookshelf:v2.17.0',
+      port: 80,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        TZ: 'Europe/Madrid'
+      },
+      volumes: [
+        { name: 'config', path: '/config' },
+        { name: 'metadata', path: '/metadata' },
+        { name: 'audiobooks', path: '/audiobooks' },
+        { name: 'podcasts', path: '/podcasts' }
+      ],
+      readiness: { path: '/healthcheck', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear el usuario raíz (`root`) y definir tus bibliotecas.',
+      'Sube audiolibros al volumen `/audiobooks` o suscríbete a feeds RSS de podcasts.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  // L. Mensajería y notificaciones (5 nuevas → 5 en total)
+  // -------------------------------------------------------------------------
+  {
+    id: 'mattermost',
+    name: 'Mattermost Team Edition',
+    category: 'mensajeria',
+    summary: 'Chat de equipo por canales, hilos, búsqueda e integraciones (alternativa libre a Slack).',
+    description:
+      'Comunicación corporativa segura con webhooks entrantes/salientes, bots, apps de escritorio y ' +
+      'móvil respaldada por PostgreSQL aislado.',
+    website: 'https://mattermost.com',
+    licence: 'MIT (Team Edition)',
+    tags: ['chat', 'slack', 'equipo', 'canales', 'mensajeria'],
+    database: { engine: 'postgres', dbName: 'mattermost', username: 'mattermost', memoryMb: 512 },
+    secrets: {},
+    app: {
+      image: 'mattermost/mattermost-team-edition:10.5.10',
+      port: 8065,
+      memoryMb: 1536,
+      cpus: 1,
+      env: {
+        MM_SQLSETTINGS_DRIVERNAME: 'postgres',
+        MM_SQLSETTINGS_DATASOURCE: 'postgres://{{db.user}}:{{db.password}}@{{db.host}}:{{db.port}}/{{db.name}}?sslmode=disable&connect_timeout=10',
+        MM_SERVICESETTINGS_SITEURL: '{{url}}',
+        MM_SERVICESETTINGS_LISTENADDRESS: ':8065',
+        MM_BLEVESETTINGS_INDEXDIR: '/mattermost/data/bleve-indexes'
+      },
+      volumes: [
+        { name: 'config', path: '/mattermost/config' },
+        { name: 'data', path: '/mattermost/data' },
+        { name: 'logs', path: '/mattermost/logs' },
+        { name: 'plugins', path: '/mattermost/plugins' }
+      ],
+      readiness: { path: '/api/v4/system/ping', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear la primera cuenta de administrador del sistema y tu equipo inicial.',
+      'Configura SMTP en la Consola del Sistema para enviar invitaciones y notificaciones.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'chatwoot',
+    name: 'Chatwoot',
+    category: 'mensajeria',
+    summary: 'Bandeja omnicanal de soporte al cliente: chat en vivo, correo, WhatsApp, Telegram e Instagram.',
+    description:
+      'Centraliza la atención al cliente con asignaciones por equipo, respuestas rápidas, bot API ' +
+      'y widget incrustable sobre PostgreSQL, Valkey y worker Sidekiq.',
+    website: 'https://www.chatwoot.com',
+    licence: 'MIT (edición comunitaria)',
+    tags: ['soporte', 'atencion al cliente', 'chat', 'omnicanal', 'helpdesk'],
+    database: { engine: 'postgres', dbName: 'chatwoot', username: 'chatwoot', memoryMb: 512 },
+    secrets: {
+      SECRET_KEY_BASE: { bytes: 64, encoding: 'hex' }
+    },
+    sidecars: [
+      makeValkeySidecar(256),
+      {
+        name: 'worker',
+        image: 'chatwoot/chatwoot:v4.20.0-ce',
+        memoryMb: 1024,
+        cpus: 1,
+        command: ['bundle', 'exec', 'sidekiq', '-C', 'config/sidekiq.yml'],
+        env: {
+          RAILS_ENV: 'production',
+          NODE_ENV: 'production',
+          INSTALLATION_ENV: 'docker',
+          FRONTEND_URL: '{{url}}',
+          SECRET_KEY_BASE: '{{secret.SECRET_KEY_BASE}}',
+          POSTGRES_HOST: '{{db.host}}',
+          POSTGRES_PORT: '{{db.port}}',
+          POSTGRES_DATABASE: '{{db.name}}',
+          POSTGRES_USERNAME: '{{db.user}}',
+          POSTGRES_PASSWORD: '{{db.password}}',
+          REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379'
+        },
+        volumes: []
+      }
+    ],
+    app: {
+      image: 'chatwoot/chatwoot:v4.20.0-ce',
+      port: 3000,
+      memoryMb: 1536,
+      cpus: 1,
+      command: [
+        'sh', '-c',
+        'bundle exec rails db:chatwoot_prepare && exec bundle exec rails s -p 3000 -b 0.0.0.0'
+      ],
+      env: {
+        RAILS_ENV: 'production',
+        NODE_ENV: 'production',
+        INSTALLATION_ENV: 'docker',
+        FRONTEND_URL: '{{url}}',
+        SECRET_KEY_BASE: '{{secret.SECRET_KEY_BASE}}',
+        POSTGRES_HOST: '{{db.host}}',
+        POSTGRES_PORT: '{{db.port}}',
+        POSTGRES_DATABASE: '{{db.name}}',
+        POSTGRES_USERNAME: '{{db.user}}',
+        POSTGRES_PASSWORD: '{{db.password}}',
+        REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379',
+        ENABLE_ACCOUNT_SIGNUP: 'false'
+      },
+      volumes: [{ name: 'storage', path: '/app/storage' }],
+      readiness: { path: '/api', expect: [200, 302], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/installation/onboarding para crear la cuenta administradora inicial.',
+      'Configura SMTP en las variables de entorno para enviar correos a clientes e invitar agentes.'
+    ],
+    notes: [
+      'El primer arranque ejecuta `db:chatwoot_prepare`: puede tardar entre 1 y 3 minutos.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'ntfy',
+    name: 'ntfy',
+    category: 'mensajeria',
+    summary: 'Servidor HTTP pub-sub de notificaciones push instantáneas a móvil y escritorio con un simple curl.',
+    description:
+      'Envía alertas desde scripts, crons, webhooks o Culkibo a tu teléfono mediante peticiones PUT/POST ' +
+      'con autenticación por defecto cerrada (`deny-all`).',
+    website: 'https://ntfy.sh',
+    licence: 'Apache-2.0 / GPLv2',
+    tags: ['notificaciones', 'push', 'alertas', 'pubsub', 'webhook'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'binwiederhier/ntfy:v2.11.0',
+      port: 80,
+      memoryMb: 256,
+      cpus: 0.5,
+      command: ['serve'],
+      env: {
+        TZ: 'Europe/Madrid',
+        NTFY_BASE_URL: '{{url}}',
+        NTFY_BEHIND_PROXY: 'true',
+        NTFY_CACHE_FILE: '/var/cache/ntfy/cache.db',
+        NTFY_AUTH_FILE: '/etc/ntfy/user.db',
+        NTFY_AUTH_DEFAULT_ACCESS: 'deny-all'
+      },
+      volumes: [
+        { name: 'cache', path: '/var/cache/ntfy' },
+        { name: 'etc', path: '/etc/ntfy' }
+      ],
+      readiness: { path: '/v1/health', expect: [200] }
+    },
+    nextSteps: [
+      'Crea tu usuario administrador dentro del contenedor con `ntfy user add --role=admin admin`.',
+      'Conecta las apps móviles de ntfy a {{url}} y genera tokens por tema para tus alertas.'
+    ],
+    notes: [
+      'Viene cerrado por defecto (`deny-all`) para que nadie externo publique ni lea tus temas.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'gotify',
+    name: 'Gotify',
+    category: 'mensajeria',
+    summary: 'Servidor minimalista de notificaciones push con tokens por aplicación y WebSockets.',
+    description:
+      'Recibe mensajes en tiempo real mediante API REST sencilla y reenvíalos al navegador o a la ' +
+      'app de Android con registro público desactivado.',
+    website: 'https://gotify.net',
+    licence: 'MIT',
+    tags: ['notificaciones', 'push', 'alertas', 'api', 'ligero'],
+    database: null,
+    secrets: {
+      GOTIFY_DEFAULTUSER_PASS: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'gotify/server:2.6.1',
+      port: 80,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        TZ: 'Europe/Madrid',
+        GOTIFY_DEFAULTUSER_NAME: 'admin',
+        GOTIFY_DEFAULTUSER_PASS: '{{secret.GOTIFY_DEFAULTUSER_PASS}}',
+        GOTIFY_REGISTRATION: 'false'
+      },
+      volumes: [{ name: 'data', path: '/app/data' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con GOTIFY_DEFAULTUSER_PASS desde «Credenciales».',
+      'Crea una aplicación en Gotify para obtener su token y enviar notificaciones por HTTP POST.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'matrix-conduit',
+    name: 'Matrix Conduit',
+    category: 'mensajeria',
+    summary: 'Servidor doméstico Matrix escrito en Rust: mensajería cifrada de extremo a extremo y federada.',
+    description:
+      'Compatible con Element y cualquier cliente Matrix con una fracción de la memoria de Synapse, ' +
+      'almacenamiento RocksDB y registro protegido por token de invitación.',
+    website: 'https://conduit.rs',
+    licence: 'Apache-2.0',
+    tags: ['matrix', 'chat', 'cifrado', 'federado', 'rust'],
+    database: null,
+    secrets: {
+      CONDUIT_REGISTRATION_TOKEN: { bytes: 24, encoding: 'base64url' }
+    },
+    app: {
+      image: 'matrixconduit/matrix-conduit:v0.10.10',
+      port: 6167,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        CONDUIT_SERVER_NAME: '{{domain}}',
+        CONDUIT_DATABASE_PATH: '/var/lib/matrix-conduit/',
+        CONDUIT_DATABASE_BACKEND: 'rocksdb',
+        CONDUIT_PORT: '6167',
+        CONDUIT_ADDRESS: '0.0.0.0',
+        CONDUIT_ALLOW_REGISTRATION: 'true',
+        CONDUIT_REGISTRATION_TOKEN: '{{secret.CONDUIT_REGISTRATION_TOKEN}}',
+        CONDUIT_ALLOW_FEDERATION: 'true',
+        CONDUIT_TRUSTED_SERVERS: '["matrix.org"]'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/matrix-conduit' }],
+      readiness: { path: '/_matrix/client/versions', expect: [200] }
+    },
+    nextSteps: [
+      'Conecta Element (web, escritorio o móvil) indicando {{url}} como servidor doméstico.',
+      'Usa CONDUIT_REGISTRATION_TOKEN desde «Credenciales» para dar de alta tu primera cuenta (será administradora).'
+    ],
+    notes: [
+      'Asigna un dominio HTTPS antes de federar: el nombre del servidor Matrix (`CONDUIT_SERVER_NAME`) no puede cambiarse una vez creados los usuarios.'
+    ]
   }
 ];
 
@@ -1144,14 +4566,20 @@ const TEMPLATES = [
 const ID_RE = /^[a-z][a-z0-9-]{1,31}$/;
 const VOLUME_KEY_RE = /^[a-z][a-z0-9_]{0,31}$/;
 const IMAGE_RE = /^[a-z0-9][a-z0-9._\-/]{0,190}:[a-zA-Z0-9._-]{1,128}$/;
+const FLOATING_TAG_RE = /:(latest|stable|main|master|edge|nightly|release|dev|canary|lts|community)$/i;
+const FILE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
+const SHM_SIZE_RE = /^\d+[mg]$/i;
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,254}$/;
 
 /**
  * Comprueba una plantilla entera y devuelve la lista de problemas.
  *
  * Es deliberadamente severo. El valor del catálogo no está en cuántas
  * plantillas hay, sino en que cada una haya pasado por aquí: imagen fijada
- * (nunca `latest`), límites de memoria y CPU, al menos un volumen si el
- * servicio guarda estado, sonda declarada y ningún secreto escrito a mano.
+ * (nunca `latest` ni etiquetas móviles), límites de memoria y CPU, al menos un
+ * volumen si el servicio guarda estado, sonda declarada y ningún secreto escrito a mano.
+ * @param {any} tpl
+ * @returns {string[]}
  */
 function validateTemplate(tpl) {
   const problems = [];
@@ -1162,6 +4590,9 @@ function validateTemplate(tpl) {
   for (const field of ['name', 'summary', 'description', 'licence', 'website', 'category']) {
     if (!tpl[field] || typeof tpl[field] !== 'string') fail(`${tpl.id}: falta el campo ${field}`);
   }
+  if (typeof tpl.website === 'string' && !/^https?:\/\//.test(tpl.website)) {
+    fail(`${tpl.id}: website debe empezar por http:// o https://`);
+  }
   if (!CATEGORIES.some((c) => c.id === tpl.category)) fail(`${tpl.id}: categoría desconocida «${tpl.category}»`);
 
   const app = tpl.app;
@@ -1170,14 +4601,25 @@ function validateTemplate(tpl) {
     return problems;
   }
 
-  if (!IMAGE_RE.test(String(app.image || ''))) fail(`${tpl.id}: imagen inválida o sin etiqueta: ${app.image}`);
-  if (/:latest$/.test(String(app.image || ''))) {
-    fail(`${tpl.id}: la imagen usa «latest». Una etiqueta móvil convierte un reinicio en una actualización mayor no pedida.`);
+  const appImage = String(app.image || '');
+  if (!IMAGE_RE.test(appImage)) fail(`${tpl.id}: imagen inválida o sin etiqueta: ${app.image}`);
+  if (FLOATING_TAG_RE.test(appImage)) {
+    const tag = appImage.split(':').pop();
+    fail(`${tpl.id}: la imagen usa la etiqueta móvil «${tag}» (como latest). Una etiqueta móvil convierte un reinicio en una actualización mayor no pedida.`);
   }
-  if (!(app.port > 0 && app.port < 65536)) fail(`${tpl.id}: puerto de aplicación inválido`);
+  if (!(Number.isInteger(app.port) && app.port > 0 && app.port < 65536)) fail(`${tpl.id}: puerto de aplicación inválido`);
   if (!(app.memoryMb >= 128)) fail(`${tpl.id}: falta el límite de memoria (mínimo 128 MB)`);
   if (!(app.cpus > 0)) fail(`${tpl.id}: falta el límite de CPU`);
-  if (!app.readiness || !app.readiness.path || !Array.isArray(app.readiness.expect) || app.readiness.expect.length === 0) {
+  if (app.shmSize !== undefined && app.shmSize !== null && !SHM_SIZE_RE.test(String(app.shmSize))) {
+    fail(`${tpl.id}: shmSize inválido «${app.shmSize}»`);
+  }
+  if (
+    !app.readiness ||
+    typeof app.readiness.path !== 'string' ||
+    !app.readiness.path.startsWith('/') ||
+    !Array.isArray(app.readiness.expect) ||
+    app.readiness.expect.length === 0
+  ) {
     fail(`${tpl.id}: falta la sonda de disponibilidad (readiness.path y readiness.expect)`);
   }
 
@@ -1188,17 +4630,49 @@ function validateTemplate(tpl) {
     fail(`${tpl.id}: sin base de datos gestionada y sin volumen: los datos no sobrevivirían a un reinicio`);
   }
 
-  for (const vol of appVolumes) {
-    if (!VOLUME_KEY_RE.test(String(vol.name || ''))) fail(`${tpl.id}: nombre de volumen inválido «${vol.name}»`);
-    if (!String(vol.path || '').startsWith('/')) fail(`${tpl.id}: la ruta del volumen «${vol.name}» debe ser absoluta`);
-  }
+  const validateVolumeList = (vols, scope) => {
+    for (const vol of vols || []) {
+      if (!VOLUME_KEY_RE.test(String(vol.name || ''))) fail(`${tpl.id}: nombre de volumen inválido «${vol.name}» (${scope})`);
+      const vPath = String(vol.path || '');
+      if (!vPath.startsWith('/')) fail(`${tpl.id}: la ruta del volumen «${vol.name}» debe ser absoluta`);
+      if (vPath.includes('docker.sock')) fail(`${tpl.id}: montaje prohibido de docker.sock en ${scope}`);
+    }
+  };
+  const validateFileList = (files, scope) => {
+    for (const file of files || []) {
+      const fname = String(file.name || '');
+      if (!FILE_NAME_RE.test(fname) || fname === '.' || fname === '..' || fname.includes('..')) {
+        fail(`${tpl.id}: nombre de fichero inválido «${file.name}» (${scope})`);
+      }
+      const fPath = String(file.path || '');
+      if (!fPath.startsWith('/')) fail(`${tpl.id}: el fichero «${file.name}» necesita una ruta absoluta`);
+      if (fPath.includes('docker.sock')) fail(`${tpl.id}: montaje prohibido de docker.sock en fichero «${file.name}»`);
+      if (typeof file.content !== 'string') fail(`${tpl.id}: el fichero «${file.name}» no tiene contenido de texto`);
+      else if (file.content.includes('{{secret.')) fail(`${tpl.id}: el fichero «${file.name}» no puede incluir secretos en texto plano`);
+    }
+  };
+  const validateEnvMap = (envMap, scope) => {
+    for (const [k, v] of Object.entries(envMap || {})) {
+      if (!ENV_KEY_RE.test(String(k))) fail(`${tpl.id}: clave de entorno inválida «${k}» (${scope})`);
+      if (/[\r\n\0]/.test(String(v ?? ''))) fail(`${tpl.id}: valor de entorno «${k}» contiene saltos de línea o bytes nulos (${scope})`);
+    }
+  };
+
+  validateVolumeList(appVolumes, 'app');
+  validateFileList(app.files, 'app');
+  validateEnvMap(app.env, 'app');
 
   if (tpl.database) {
     if (!['postgres', 'mysql', 'mariadb', 'valkey', 'redis', 'mongodb'].includes(tpl.database.engine)) {
       fail(`${tpl.id}: motor de base de datos desconocido «${tpl.database.engine}»`);
     }
-    if (tpl.database.image && !IMAGE_RE.test(String(tpl.database.image))) {
-      fail(`${tpl.id}: imagen de base de datos inválida`);
+    if (tpl.database.image) {
+      const dbImg = String(tpl.database.image);
+      if (!IMAGE_RE.test(dbImg)) fail(`${tpl.id}: imagen de base de datos inválida`);
+      if (FLOATING_TAG_RE.test(dbImg)) {
+        const tag = dbImg.split(':').pop();
+        fail(`${tpl.id}: la imagen de base de datos usa la etiqueta móvil «${tag}» (como latest)`);
+      }
     }
   }
 
@@ -1208,14 +4682,27 @@ function validateTemplate(tpl) {
     if (!['hex', 'base64', 'base64url'].includes(spec.encoding)) fail(`${tpl.id}: codificación desconocida en ${key}`);
   }
 
+  const seenSidecars = new Set();
   for (const car of tpl.sidecars || []) {
     if (!VOLUME_KEY_RE.test(String(car.name || ''))) fail(`${tpl.id}: nombre de auxiliar inválido «${car.name}»`);
-    if (!IMAGE_RE.test(String(car.image || ''))) fail(`${tpl.id}: imagen inválida en el auxiliar «${car.name}»`);
-    if (/:latest$/.test(String(car.image || ''))) fail(`${tpl.id}: el auxiliar «${car.name}» usa «latest»`);
+    if (seenSidecars.has(car.name)) fail(`${tpl.id}: auxiliar duplicado «${car.name}»`);
+    seenSidecars.add(car.name);
+    const carImage = String(car.image || '');
+    if (!IMAGE_RE.test(carImage)) fail(`${tpl.id}: imagen inválida en el auxiliar «${car.name}»`);
+    if (FLOATING_TAG_RE.test(carImage)) {
+      const tag = carImage.split(':').pop();
+      fail(`${tpl.id}: el auxiliar «${car.name}» usa la etiqueta móvil «${tag}» (como latest)`);
+    }
     if (!(car.memoryMb >= 128)) fail(`${tpl.id}: el auxiliar «${car.name}» no declara límite de memoria`);
     if (!(car.cpus > 0)) fail(`${tpl.id}: el auxiliar «${car.name}» no declara límite de CPU`);
-    for (const file of car.files || []) {
-      if (!String(file.path || '').startsWith('/')) fail(`${tpl.id}: el fichero «${file.name}» necesita una ruta absoluta`);
+    validateVolumeList(car.volumes, `sidecar:${car.name}`);
+    validateFileList(car.files, `sidecar:${car.name}`);
+    validateEnvMap(car.env, `sidecar:${car.name}`);
+    if (car.readiness) {
+      const r = car.readiness;
+      const validExec = r.type === 'exec' && Array.isArray(r.cmd) && r.cmd.length > 0 && r.cmd.every((a) => typeof a === 'string' && a.length > 0);
+      const validTcp = r.type === 'tcp' && Number.isInteger(r.port) && r.port > 0 && r.port < 65536;
+      if (!validExec && !validTcp) fail(`${tpl.id}: sonda de auxiliar inválida en «${car.name}»`);
     }
   }
 
@@ -1223,19 +4710,19 @@ function validateTemplate(tpl) {
   // texto «{{secret.X}}» dentro, y el servicio arrancaría con una contraseña
   // literal. Es un fallo silencioso: se caza aquí.
   const declared = new Set(Object.keys(tpl.secrets || {}));
-  const envBlobs = [JSON.stringify(app.env || {}), ...(tpl.sidecars || []).map((c) => JSON.stringify(c.env || {}))];
+  const appEnvBlob = JSON.stringify(app.env || {});
+  const envBlobs = [appEnvBlob, ...(tpl.sidecars || []).map((c) => JSON.stringify(c.env || {}))];
   for (const blob of envBlobs) {
     for (const match of blob.matchAll(/\{\{secret\.([A-Z0-9_]+)\}\}/g)) {
       if (!declared.has(match[1])) fail(`${tpl.id}: usa el secreto «${match[1]}» sin declararlo`);
     }
   }
-  // Y al revés: un secreto declarado que nadie usa es ruido que acaba
-  // desconcertando a quien lea la ficha de la instalación.
-  const usedBlob = envBlobs.join('');
+  // Y al revés: un secreto declarado debe llegar a app.env (no quedarse huérfano).
   for (const key of declared) {
-    if (!usedBlob.includes(`{{secret.${key}}}`)) fail(`${tpl.id}: declara el secreto «${key}» y no lo usa`);
+    if (!appEnvBlob.includes(`{{secret.${key}}}`)) fail(`${tpl.id}: declara el secreto «${key}» y no lo usa en app.env`);
   }
 
+  const usedBlob = envBlobs.join('');
   // Referencias a la base de datos sin base de datos declarada.
   if (!tpl.database && usedBlob.includes('{{db.')) {
     fail(`${tpl.id}: usa {{db.*}} pero no declara ninguna base de datos`);
@@ -1261,4 +4748,14 @@ function validateCatalog(templates = TEMPLATES) {
   return problems;
 }
 
-module.exports = { TEMPLATES, CATEGORIES, validateTemplate, validateCatalog, ID_RE, IMAGE_RE };
+module.exports = {
+  TEMPLATES,
+  CATEGORIES,
+  validateTemplate,
+  validateCatalog,
+  ID_RE,
+  IMAGE_RE,
+  FLOATING_TAG_RE,
+  FILE_NAME_RE,
+  SHM_SIZE_RE
+};

@@ -289,16 +289,20 @@ async function _handlePostInner(req, res) {
   if (shouldStream(req, body)) {
     return respondStreaming(req, res, body);
   }
-  return respondJson(res, body);
+  return respondJson(req, res, body);
 }
 
-async function respondJson(res, body) {
+async function respondJson(req, res, body) {
   try {
     const clientInfo = body?.params?._meta?.['io.modelcontextprotocol/clientInfo'] || null;
     const envelope = await mcpServer.handleModernRpc(body, {
       transport: `Streamable HTTP ${PROTOCOL_VERSION}`,
-      clientInfo
+      clientInfo,
+      auth: req.auth || null
     });
+    if (envelope?.result?.cacheScope === 'private') {
+      res.setHeader('Cache-Control', 'private, no-store');
+    }
     res.status(200).json(envelope);
   } catch (err) {
     res.status(500).json(jsonRpcError(body.id, ERROR_CODES.INTERNAL_ERROR,
@@ -313,7 +317,7 @@ async function respondStreaming(req, res, body) {
   if (typeof res.setTimeout === 'function') res.setTimeout(0);
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
+    'Cache-Control': 'private, no-cache, no-transform',
     Connection: 'keep-alive',
     // Sin esto, nginx acumula los eventos en su buffer y el progreso llega
     // todo junto al final, que es como no enviarlo.
@@ -379,6 +383,7 @@ async function respondStreaming(req, res, body) {
     envelope = await mcpServer.handleModernRpc(body, {
       transport: `Streamable HTTP ${PROTOCOL_VERSION} (SSE)`,
       clientInfo,
+      auth: req.auth || null,
       isCancelled: () => cancelled,
       signal: ac.signal,
       onProgress: emitProgress

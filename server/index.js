@@ -32,6 +32,7 @@ const {
   corsDelegate,
   resolveToken,
   onTokenRotated,
+  onPrincipalRevoked,
   authStatus,
   isLoopback,
   isPrivateProxyPeer,
@@ -190,6 +191,14 @@ function getService(name) {
           data.projectId
         );
       });
+      svc.on('sync_conflict', (conflict) => {
+        broadcast('sync_conflict', conflict);
+        for (const ws of syncClients) {
+          if (ws.readyState === 1 && /** @type {any} */ (ws)._projectId === conflict.projectId) {
+            safeWsSend(ws, { type: 'conflict_notice', ...conflict });
+          }
+        }
+      });
       break;
     case 'cronManager':
       svc = require('./services/cronManager');
@@ -198,6 +207,24 @@ function getService(name) {
     case 'previewManager':
       svc = require('./services/previewManager');
       svc.on('preview_event', (data) => broadcast('preview_event', data));
+      break;
+    case 'serverFleetManager':
+      svc = require('./services/serverFleetManager');
+      break;
+    case 'teamManager':
+      svc = require('./services/teamManager');
+      break;
+    case 'environmentManager':
+      svc = require('./services/environmentManager');
+      break;
+    case 'gitopsManager':
+      svc = require('./services/gitopsManager');
+      break;
+    case 'uptimeMonitor':
+      svc = require('./services/uptimeMonitor');
+      break;
+    case 'sleepAdvisor':
+      svc = require('./services/sleepAdvisor');
       break;
     default:
       throw new Error(`Servicio desconocido: ${name}`);
@@ -273,6 +300,30 @@ onTokenRotated(() => {
   activeSseResponses.clear();
 });
 
+if (typeof onPrincipalRevoked === 'function') {
+  onPrincipalRevoked((ev) => {
+    if (!ev) return;
+    const matches = (ws) => {
+      const p = /** @type {any} */ (ws)._authPrincipal;
+      if (!p || p.isSuperAdmin) return false;
+      if (ev.userId && p.userId === ev.userId) {
+        if (ev.sessionId && p.sessionId && p.sessionId !== ev.sessionId) return false;
+        if (ev.tokenId && p.tokenId && p.tokenId !== ev.tokenId) return false;
+        return true;
+      }
+      if (ev.tokenId && p.tokenId === ev.tokenId) return true;
+      return false;
+    };
+    for (const pool of [clients, syncClients]) {
+      for (const ws of Array.from(pool)) {
+        if (matches(ws)) {
+          try { ws.close(4001, 'Session revoked'); } catch (e) {}
+        }
+      }
+    }
+  });
+}
+
 /** @type {any} */
 let _wss = null;
 /** @type {any} */
@@ -328,17 +379,106 @@ metricsCollector.setCaddyGetter(() => {
 const WS_TEXT_OPTS = { binary: false };
 const WS_MAX_BUFFERED_BYTES = 1024 * 1024;
 
+/**
+ * Filtra y redacta un evento de difusión WS para un principal multi-tenant no-superadmin.
+ * Devuelve `{ send: false }` si el principal no debe ver el evento, o `{ send: true, data }`
+ * con secretos redactados según permisos.
+ * @param {any} principal
+ * @param {string} type
+ * @param {any} data
+ */
+function scopeWsEventForPrincipal(principal, type, data) {
+  const tm = getService('teamManager');
+  if (type === 'project_update' || type === 'project_created') {
+    if (!data || !data.id) return { send: false };
+    if (!tm.authorizeProject(principal, data.id, 'projects:read', data).allowed) {
+      return { send: false };
+    }
+    return { send: true, data: tm.redactProjectForPrincipal(principal, data) };
+  }
+  if (type === 'project_deleted') {
+    const pid = data && (data.id || data.projectId);
+    if (pid && !tm.authorizeProject(principal, pid, 'projects:read').allowed) {
+      return { send: false };
+    }
+    return { send: true, data };
+  }
+  if (type === 'mcp_call') {
+    if (!tm.authorizeAction(principal, 'mcp:read').allowed) return { send: false };
+    if (data && data.teamId && principal.teamId && data.teamId !== principal.teamId) return { send: false };
+    if (data && data.projectId) {
+      const proj = projectManager.getById(data.projectId);
+      if (!tm.authorizeProject(principal, data.projectId, 'projects:read', proj).allowed) return { send: false };
+    } else if (Array.isArray(principal.projectIds)) {
+      return { send: false };
+    }
+    return { send: true, data };
+  }
+  if (
+    type.startsWith('sync_') ||
+    type.startsWith('deploy_') ||
+    type.startsWith('sleep_') ||
+    type.startsWith('env_') ||
+    type === 'github_deploy'
+  ) {
+    const pid = data && (data.projectId || data.id);
+    if (pid) {
+      const proj = projectManager.getById(pid);
+      if (!tm.authorizeProject(principal, pid, 'projects:read', proj).allowed) return { send: false };
+      if (data && typeof data === 'object' && ('envVars' in data || 'secrets' in data)) {
+        if (!tm.authorizeProject(principal, pid, 'secrets:read', proj).allowed) {
+          const { envVars: _dropEnv, secrets: _dropSec, ...safeRest } = data;
+          return { send: true, data: safeRest };
+        }
+      }
+    } else if (Array.isArray(principal.projectIds)) {
+      return { send: false };
+    }
+    return { send: true, data };
+  }
+  if (type.startsWith('fleet_')) {
+    if (!tm.authorizeAction(principal, 'fleet:read').allowed) return { send: false };
+    if (data && data.teamId && principal.teamId && data.teamId !== principal.teamId) return { send: false };
+    return { send: true, data };
+  }
+  if (type.startsWith('uptime_')) {
+    if (!tm.authorizeAction(principal, 'uptime:read').allowed) return { send: false };
+    const pid = data && data.projectId;
+    if (pid) {
+      const proj = projectManager.getById(pid);
+      if (!tm.authorizeProject(principal, pid, 'projects:read', proj).allowed) return { send: false };
+    } else if (Array.isArray(principal.projectIds)) {
+      return { send: false };
+    }
+    return { send: true, data };
+  }
+  if (type === 'log') {
+    if (!tm.authorizeAction(principal, 'logs:read').allowed) return { send: false };
+  }
+  return { send: true, data };
+}
+
 /** @param {string} type @param {any} data */
 function broadcast(type, data) {
   if (clients.size === 0) return;
   wsBroadcastsTotal++;
-  // Pre-codifica una única vez como Buffer UTF-8 (`binary: false` -> opcode texto 0x01)
-  const payload = Buffer.from(JSON.stringify({ type, data, timestamp: new Date().toISOString() }), 'utf8');
+  const timestamp = new Date().toISOString();
+  // Pre-codifica una única vez como Buffer UTF-8 (`binary: false` -> opcode texto 0x01) para superadmins
+  const payload = Buffer.from(JSON.stringify({ type, data, timestamp }), 'utf8');
   for (const client of clients) {
     if (client.readyState === 1) {
       // Backpressure: no encolar sobre pestañas lentas/colgadas (>1 MB pendiente)
       if (client.bufferedAmount > WS_MAX_BUFFERED_BYTES) continue;
-      client.send(payload, WS_TEXT_OPTS, (err) => {
+      const principal = /** @type {any} */ (client)._authPrincipal;
+      let outBuf = payload;
+      if (principal && !principal.isSuperAdmin) {
+        const scoped = scopeWsEventForPrincipal(principal, type, data);
+        if (!scoped.send) continue;
+        if (scoped.data !== data) {
+          outBuf = Buffer.from(JSON.stringify({ type, data: scoped.data, timestamp }), 'utf8');
+        }
+      }
+      client.send(outBuf, WS_TEXT_OPTS, (err) => {
         if (err) clients.delete(client);
       });
     } else if (client.readyState === 2 || client.readyState === 3) {
@@ -358,10 +498,27 @@ projectManager.on('project_update', (data) => broadcast('project_update', data))
 projectManager.on('project_created', (data) => broadcast('project_created', data));
 projectManager.on('project_deleted', (data) => broadcast('project_deleted', data));
 
-// Caché de 150 ms del payload inicial de `/ws` como Buffer UTF-8
+// Caché de 150 ms del payload inicial de `/ws` como Buffer UTF-8 (solo superadmins)
 /** @type {{ at: number, buf: Buffer } | null} */
 let cachedInitialState = null;
-function getInitialWsPayloadBuf() {
+/** @param {any} [principal] */
+function getInitialWsPayloadBuf(principal = null) {
+  if (principal && !principal.isSuperAdmin) {
+    const tm = getService('teamManager');
+    const canMcp = tm.authorizeAction(principal, 'mcp:read').allowed;
+    const canLogs = tm.authorizeAction(principal, 'logs:read').allowed;
+    const mcpAudit = canMcp && loadedServices.mcpServer
+      ? loadedServices.mcpServer.getAuditLog(20, principal)
+      : [];
+    return Buffer.from(JSON.stringify({
+      type: 'initial_state',
+      data: {
+        pods: containerOrchestrator.getPods(),
+        logs: canLogs ? containerOrchestrator.getLogs({ limit: 40 }) : [],
+        mcpAudit
+      }
+    }), 'utf8');
+  }
   const now = Date.now();
   if (cachedInitialState && now - cachedInitialState.at < 150) {
     return cachedInitialState.buf;
@@ -514,14 +671,35 @@ function ensureWsServers() {
     syncClients.add(ws);
     wsConnectionsTotal++;
     ws.isAlive = true;
+    /** @type {any} */ (ws)._authPrincipal = /** @type {any} */ (req)._wsPrincipal || null;
     ws.on('pong', () => { ws.isAlive = true; });
 
     const liveSyncEngine = getService('liveSyncEngine');
     /** @type {string | null} */
     let boundProjectId = null;
+    /** @type {string | null} */
+    let boundClientName = null;
     const clientId = `sc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
     /** @type {{ rawDir: any, safeDir: string | null } | null} */
     let cachedDirCheck = null;
+
+    const assertSyncAccess = (pid, perm) => {
+      const principal = /** @type {any} */ (ws)._authPrincipal;
+      if (!principal || principal.isSuperAdmin) return;
+      const tm = getService('teamManager');
+      if (!tm.isPrincipalStillValid(principal)) {
+        const err = new Error('Sesión o token revocado');
+        /** @type {any} */ (err).code = 'AUTH_REVOKED';
+        throw err;
+      }
+      const proj = projectManager.getById(pid);
+      const check = tm.authorizeProject(principal, pid, perm, proj);
+      if (!check.allowed) {
+        const err = new Error(check.reason || 'Sin permiso para sincronizar este proyecto');
+        /** @type {any} */ (err).code = 'FORBIDDEN';
+        throw err;
+      }
+    };
 
     const resolveDirCached = (rawDir) => {
       if (!rawDir) return null;
@@ -554,12 +732,12 @@ function ensureWsServers() {
       try {
         if (isBinary) {
           const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(/** @type {any} */ (raw));
-          msg = decodeBinarySyncFrame(buf);
+          msg = liveSyncEngine.decodeBinarySyncFrame(buf);
         } else {
           msg = JSON.parse(raw.toString());
         }
       } catch (e) {
-        safeWsSend(ws, { type: 'error', code: 'BAD_FRAME', error: e.message || 'Mensaje inválido' });
+        safeWsSend(ws, { type: 'error', code: (e && e.code) || 'BAD_FRAME', error: e.message || 'Mensaje inválido' });
         return;
       }
 
@@ -567,6 +745,7 @@ function ensureWsServers() {
         if (msg.type === 'hello') {
           if (!msg.projectId) throw new Error('hello requiere projectId');
           const nextPid = String(msg.projectId);
+          assertSyncAccess(nextPid, 'projects:read');
           // P1-16: validar targetDir y projectId ANTES de mutar boundProjectId o connectedClients
           const safeDir = resolveDirCached(msg.targetDir);
           liveSyncEngine.resolveTargetDir(nextPid, safeDir);
@@ -575,9 +754,10 @@ function ensureWsServers() {
             clientDigest: msg.clientDigest || null,
             targetDir: safeDir
           });
+          boundClientName = msg.clientName ? String(msg.clientName).slice(0, 80) : null;
           const clientMeta = {
             id: clientId,
-            clientName: msg.clientName || null,
+            clientName: boundClientName,
             sourceDir: msg.sourceDir || null,
             pid: typeof msg.pid === 'number' ? msg.pid : null
           };
@@ -592,6 +772,10 @@ function ensureWsServers() {
           }
           safeWsSend(ws, {
             type: 'hello_ack',
+            clientId,
+            protocolVersion: 2,
+            codecs: ['br', 'gzip'],
+            compressionSupported: ['br', 'gzip'],
             projectId: boundProjectId,
             lastSeq: session.lastSeq,
             serverDigest: verification.serverDigest,
@@ -607,8 +791,15 @@ function ensureWsServers() {
         if (msg.type === 'frame') {
           const pid = String(msg.projectId || boundProjectId || '');
           if (!pid) throw new Error('frame requiere projectId');
+          assertSyncAccess(pid, 'projects:write');
           const safeDir = resolveDirCached(msg.targetDir);
-          const result = liveSyncEngine.applyCommitFrame(pid, msg, { targetDir: safeDir || undefined, deferEmit: true });
+          const result = liveSyncEngine.applyCommitFrame(pid, msg, {
+            targetDir: safeDir || undefined,
+            deferEmit: true,
+            clientId,
+            clientName: boundClientName,
+            wireStats: msg._wireStats || null
+          });
           safeWsSend(ws, { type: 'frame_ack', ...result });
           setImmediate(() => liveSyncEngine.emitApplied(result));
           return;
@@ -617,6 +808,7 @@ function ensureWsServers() {
         if (msg.type === 'verify') {
           const pid = String(msg.projectId || boundProjectId || '');
           if (!pid) throw new Error('verify requiere projectId');
+          assertSyncAccess(pid, 'projects:read');
           const safeDir = resolveDirCached(msg.targetDir);
           const result = liveSyncEngine.verifySync(pid, {
             clientDigest: msg.clientDigest || null,
@@ -630,8 +822,38 @@ function ensureWsServers() {
         if (msg.type === 'rollback') {
           const pid = String(msg.projectId || boundProjectId || '');
           if (!pid) throw new Error('rollback requiere projectId');
+          assertSyncAccess(pid, 'projects:write');
           const result = liveSyncEngine.rollback(pid, msg.steps || 1);
           safeWsSend(ws, { type: 'rollback_ack', ...result });
+          return;
+        }
+
+        if (msg.type === 'file_history') {
+          const pid = String(msg.projectId || boundProjectId || '');
+          if (!pid) throw new Error('file_history requiere projectId');
+          assertSyncAccess(pid, 'projects:read');
+          const safeDir = resolveDirCached(msg.targetDir);
+          const result = liveSyncEngine.getFileHistory(pid, msg.path, {
+            targetDir: safeDir || undefined,
+            limit: msg.limit,
+            includeDiff: Boolean(msg.includeDiff)
+          });
+          safeWsSend(ws, { type: 'file_history_ack', ...result });
+          return;
+        }
+
+        if (msg.type === 'rollback_file') {
+          const pid = String(msg.projectId || boundProjectId || '');
+          if (!pid) throw new Error('rollback_file requiere projectId');
+          assertSyncAccess(pid, 'projects:write');
+          const safeDir = resolveDirCached(msg.targetDir);
+          const result = liveSyncEngine.rollbackFile(pid, msg.path, msg.seq, {
+            targetDir: safeDir || undefined,
+            mode: msg.mode,
+            clientId,
+            clientName: boundClientName
+          });
+          safeWsSend(ws, { type: 'rollback_file_ack', ...result });
           return;
         }
 
@@ -649,10 +871,11 @@ function ensureWsServers() {
     ws.on('close', cleanupSync);
   });
 
-  _wss.on('connection', (ws) => {
+  _wss.on('connection', (ws, req) => {
     clients.add(ws);
     wsConnectionsTotal++;
     ws.isAlive = true;
+    /** @type {any} */ (ws)._authPrincipal = /** @type {any} */ (req)._wsPrincipal || null;
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('error', () => {
@@ -661,7 +884,7 @@ function ensureWsServers() {
     });
 
     try {
-      ws.send(getInitialWsPayloadBuf(), { binary: false });
+      ws.send(getInitialWsPayloadBuf(/** @type {any} */ (ws)._authPrincipal), { binary: false });
     } catch (e) {
       clients.delete(ws);
     }
@@ -1123,6 +1346,133 @@ function tryHandleFastPath(req, res) {
   const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
   const queryStr = qIdx === -1 ? '' : rawUrl.slice(qIdx + 1);
 
+  // Endpoint interno de Wake-on-Request para proyectos en Auto-Sleep (protegido por proxy privado + wake secret)
+  if (pathname.startsWith('/_culkibo/wake/')) {
+    let pid = '';
+    try {
+      pid = decodeURIComponent(pathname.slice('/_culkibo/wake/'.length).split('/')[0] || '');
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end('{"error":"projectId con codificación URL inválida"}');
+      return true;
+    }
+    if (!pid) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end('{"error":"Falta projectId"}');
+      return true;
+    }
+    try {
+      const sa = getService('sleepAdvisor');
+      Promise.resolve(sa.handleWakeRequest(req, res, pid)).catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end('{"error":"No se pudo despertar el servicio"}');
+        }
+      });
+    } catch (e) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end('{"error":"Servicio de Auto-Sleep no disponible"}');
+    }
+    return true;
+  }
+
+  // Páginas públicas de estado (`/status/:slug`, `/status/:slug.json`, `/status/:slug/status.json`, `/status/:slug.svg`, `/status/:slug/badge.svg`) — cero fugas internas
+  if ((method === 'GET' || method === 'HEAD') && pathname.startsWith('/status/')) {
+    const rest = pathname.slice(8).replace(/\/+$/, '');
+    const parts = rest ? rest.split('/') : [];
+    let slug = '';
+    /** @type {'html' | 'json' | 'svg' | null} */
+    let format = null;
+    if (parts.length === 1 && parts[0]) {
+      const seg = parts[0];
+      try {
+        if (seg.endsWith('.json')) {
+          slug = decodeURIComponent(seg.slice(0, -5));
+          format = 'json';
+        } else if (seg.endsWith('.svg')) {
+          slug = decodeURIComponent(seg.slice(0, -4));
+          format = 'svg';
+        } else {
+          slug = decodeURIComponent(seg);
+          format = 'html';
+        }
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Slug inválido');
+        return true;
+      }
+    } else if (parts.length === 2 && parts[0] && (parts[1] === 'status.json' || parts[1] === 'badge.svg')) {
+      try {
+        slug = decodeURIComponent(parts[0]);
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Slug inválido');
+        return true;
+      }
+      format = parts[1] === 'status.json' ? 'json' : 'svg';
+    }
+    if (format && slug) {
+      try {
+        const um = getService('uptimeMonitor');
+        if (format === 'json') {
+          const data = um.getPublicStatusData(slug);
+          if (!data) {
+            res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end('{"error":"Página de estado no encontrada"}');
+            return true;
+          }
+          const body = Buffer.from(JSON.stringify(data), 'utf8');
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'public, max-age=15',
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Length': body.length
+          });
+          res.end(method === 'HEAD' ? undefined : body);
+          return true;
+        }
+        if (format === 'svg') {
+          const svg = um.renderBadgeSvg(slug);
+          if (!svg) {
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Not Found');
+            return true;
+          }
+          const body = Buffer.from(svg, 'utf8');
+          res.writeHead(200, {
+            'Content-Type': 'image/svg+xml; charset=utf-8',
+            'Cache-Control': 'public, max-age=30',
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Length': body.length
+          });
+          res.end(method === 'HEAD' ? undefined : body);
+          return true;
+        }
+        const resp = um.renderPublicStatusResponse(slug);
+        if (!resp) {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end('Página de estado no encontrada');
+          return true;
+        }
+        res.writeHead(resp.status || 200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Security-Policy': um.PUBLIC_STATUS_CSP || "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+          'X-Content-Type-Options': 'nosniff',
+          'X-Frame-Options': 'DENY',
+          'Referrer-Policy': 'no-referrer',
+          'Cache-Control': 'public, max-age=15',
+          'Content-Length': resp.body.length
+        });
+        res.end(method === 'HEAD' ? undefined : resp.body);
+        return true;
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Error al renderizar página de estado');
+        return true;
+      }
+    }
+  }
+
   // Fast-path nativo para POST /api/projects (evita bloquear el event loop cargando
   // Express y 18 servicios auxiliares en la primera alta concurrente).
   if (method === 'POST' && pathname === '/api/projects') {
@@ -1154,6 +1504,10 @@ function tryHandleFastPath(req, res) {
       }
       sendFastAuthError(req, res, decision, pathname, t0);
       return true;
+    }
+    // En modo multiusuario/token con alcance limitado, delegar en Express para aplicar RBAC y teamId
+    if (decision.principal && !decision.principal.isSuperAdmin) {
+      return false;
     }
 
     const limitBytes = 1 * 1024 * 1024;
@@ -1364,6 +1718,11 @@ function tryHandleFastPath(req, res) {
     }
     sendFastAuthError(req, res, decision, projectByIdMatch ? '/api/projects/:id' : pathname, t0);
     return true;
+  }
+
+  // Aislamiento multi-tenant: todo principal no-superadmin pasa por Express RBAC + filtrado por equipo/ACL
+  if (decision.principal && !decision.principal.isSuperAdmin) {
+    return false;
   }
 
   const fresh = queryStr.includes('fresh=1');
@@ -1923,6 +2282,7 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
+  /** @type {any} */ (req)._wsPrincipal = decision.principal || null;
   const { wss, syncWss } = ensureWsServers();
   const target = pathname === '/ws/sync' ? syncWss : wss;
   // Coalescencia 101 Switching Protocols + initial_state en 1 solo segmento TCP
@@ -2070,6 +2430,16 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
           } catch (e) {}
         }
 
+        if (fs.existsSync(path.join(DATA_DIR, 'uptime.json'))) {
+          try { getService('uptimeMonitor').start(); } catch (e) {}
+        }
+        if (fs.existsSync(path.join(DATA_DIR, 'sleep-policies.json'))) {
+          try { getService('sleepAdvisor').start(); } catch (e) {}
+        }
+        if (fs.existsSync(path.join(DATA_DIR, 'servers.json'))) {
+          try { getService('serverFleetManager').startMonitor(); } catch (e) {}
+        }
+
         if (reconcileIngress) {
           try {
             const im = getService('ingressManager');
@@ -2211,6 +2581,9 @@ function shutdown(signal = 'SIGTERM') {
     try { if (loadedServices.databaseManager) loadedServices.databaseManager.stopScheduler(); } catch (e) {}
     try { if (loadedServices.cronManager) loadedServices.cronManager.stopScheduler(); } catch (e) {}
     try { if (loadedServices.previewManager) loadedServices.previewManager.stopReaper(); } catch (e) {}
+    try { if (loadedServices.uptimeMonitor) loadedServices.uptimeMonitor.shutdown(); } catch (e) {}
+    try { if (loadedServices.sleepAdvisor) loadedServices.sleepAdvisor.shutdown(); } catch (e) {}
+    try { if (loadedServices.serverFleetManager) await loadedServices.serverFleetManager.shutdown(); } catch (e) {}
 
     // 2. Dejar de aceptar nuevas conexiones y cerrar WS/SSE activos (sin cortar peticiones HTTP en vuelo)
     const serverClosed = new Promise((resolve) => {

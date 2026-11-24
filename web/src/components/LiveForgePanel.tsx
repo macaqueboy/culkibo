@@ -16,8 +16,19 @@ import {
   ChevronRight,
   KeyRound,
   FolderOpen,
+  History,
+  Minimize2,
+  X,
+  Clock,
 } from 'lucide-react';
-import { api, type LiveSyncStatus, type LiveSyncRecentFrame, type LiveSyncFrameDiff } from '../lib/api';
+import {
+  api,
+  type LiveSyncStatus,
+  type LiveSyncRecentFrame,
+  type LiveSyncFrameDiff,
+  type LiveSyncConflict,
+  type LiveSyncFileHistory,
+} from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 import { HelpTip } from './HelpTip';
@@ -54,6 +65,13 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
   const [expandedSeq, setExpandedSeq] = useState<number | null>(null);
   const [frameDiffs, setFrameDiffs] = useState<Record<number, LiveSyncFrameDiff | null>>({});
   const [loadingDiffSeq, setLoadingDiffSeq] = useState<number | null>(null);
+  const [conflicts, setConflicts] = useState<LiveSyncConflict[]>([]);
+  const [busyConflictId, setBusyConflictId] = useState<string | null>(null);
+  const [historyPathInput, setHistoryPathInput] = useState('');
+  const [activeHistoryPath, setActiveHistoryPath] = useState<string | null>(null);
+  const [fileHistory, setFileHistory] = useState<LiveSyncFileHistory | null>(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [rollingBackSeq, setRollingBackSeq] = useState<number | null>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadStatus = useCallback(async () => {
@@ -61,6 +79,9 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
       const s = await api.getSyncStatus(projectId);
       setStatus(s);
       if (Array.isArray(s.recentFrames)) setFrames(s.recentFrames);
+      if (Array.isArray(s.recentConflicts)) {
+        setConflicts(s.recentConflicts.filter((c) => !c.resolved));
+      }
     } catch (err) {
       console.error(err);
     } finally {
@@ -83,6 +104,9 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
         if (!active) return;
         setStatus(s);
         if (Array.isArray(s.recentFrames)) setFrames(s.recentFrames);
+        if (Array.isArray(s.recentConflicts)) {
+          setConflicts(s.recentConflicts.filter((c) => !c.resolved));
+        }
       })
       .catch((err) => console.error(err))
       .finally(() => { if (active) setLoading(false); });
@@ -112,6 +136,14 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
       if (ev.projectId !== projectId) return;
       setStatus((prev) => (prev ? { ...prev, connectedClients: ev.connectedClients } : prev));
     });
+    const offConflict = liveEvents.onSyncConflict((ev) => {
+      if (ev.projectId !== projectId) return;
+      setConflicts((prev) => {
+        if (prev.some((c) => c.id === ev.id)) return prev;
+        return [ev, ...prev].slice(0, 25);
+      });
+      scheduleLoadStatus();
+    });
     return () => {
       active = false;
       if (refreshTimerRef.current) {
@@ -121,6 +153,7 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
       offApplied();
       offRollback();
       offClient();
+      offConflict();
     };
   }, [projectId, scheduleLoadStatus]);
 
@@ -240,6 +273,71 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
     }
   };
 
+  const openFileHistory = async (filePath: string) => {
+    const clean = filePath.trim();
+    if (!clean) return;
+    setActiveHistoryPath(clean);
+    setHistoryPathInput(clean);
+    setLoadingHistory(true);
+    try {
+      const hist = await api.getSyncFileHistory(projectId, clean);
+      setFileHistory(hist);
+    } catch (err: any) {
+      setFileHistory(null);
+      onNotify(err?.message || `No hay historial en memoria para ${clean}`, 'error');
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
+
+  const handleSurgicalRollback = async (filePath: string, seq: number) => {
+    setRollingBackSeq(seq);
+    try {
+      const res = await api.rollbackSyncFile(projectId, filePath, seq, 'to');
+      onNotify(
+        `Archivo ${filePath} restaurado a #${seq} en ${res.durationMs ?? '<1'} ms`,
+        'success'
+      );
+      await Promise.all([loadStatus(), openFileHistory(filePath)]);
+    } catch (err: any) {
+      onNotify(err?.message || 'No se pudo restaurar el archivo a esa revisión', 'error');
+    } finally {
+      setRollingBackSeq(null);
+    }
+  };
+
+  const handleRestoreConflict = async (conflict: LiveSyncConflict) => {
+    setBusyConflictId(conflict.id);
+    try {
+      const targetSeq = conflict.previousSeq ?? Math.max(0, conflict.seq - 1);
+      await api.rollbackSyncFile(projectId, conflict.path, targetSeq, 'to');
+      await api.resolveSyncConflict(projectId, conflict.id).catch(() => {});
+      setConflicts((prev) => prev.filter((c) => c.id !== conflict.id));
+      onNotify(
+        `Versión anterior de ${conflict.path} (#${targetSeq}) restaurada en 1 clic`,
+        'success'
+      );
+      await loadStatus();
+    } catch (err: any) {
+      onNotify(err?.message || 'No se pudo restaurar el archivo en conflicto', 'error');
+    } finally {
+      setBusyConflictId(null);
+    }
+  };
+
+  const handleDismissConflict = async (conflict: LiveSyncConflict) => {
+    setBusyConflictId(conflict.id);
+    try {
+      await api.resolveSyncConflict(projectId, conflict.id);
+      setConflicts((prev) => prev.filter((c) => c.id !== conflict.id));
+      onNotify(`Conflicto en ${conflict.path} marcado como resuelto`, 'info');
+    } catch (err: any) {
+      onNotify(err?.message || 'No se pudo descartar el conflicto', 'error');
+    } finally {
+      setBusyConflictId(null);
+    }
+  };
+
   if (loading) {
     return (
       <div className="p-10 bg-white rounded-xl border border-slate-200 text-center text-xs text-slate-500 flex items-center justify-center gap-2">
@@ -251,6 +349,21 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
   const clientCount = status?.connectedClients || 0;
   const connected = clientCount > 0;
   const historyDepth = status?.historyDepth ?? 0;
+
+  const rawBytesTotal = status?.wireStats?.rawBytes ?? status?.rawBytesReceived ?? 0;
+  const wireBytesTotal = status?.wireStats?.wireBytes ?? status?.wireBytesReceived ?? 0;
+  const savedBytesTotal = status?.compressionSavedBytes ?? Math.max(0, rawBytesTotal - wireBytesTotal);
+  const savedPct =
+    status?.wireStats?.savedPct ??
+    status?.compressionRatio ??
+    (rawBytesTotal > 0 ? Math.round((savedBytesTotal / rawBytesTotal) * 100) : 0);
+  const activeCodec = status?.wireStats?.codec || status?.lastCompression || null;
+  const recentTouchedPaths = Array.from(
+    new Set([
+      ...(status?.lastPath ? [status.lastPath] : []),
+      ...frames.flatMap((f) => (f.files || []).map((x) => x.path)),
+    ])
+  ).slice(0, 6);
 
   return (
     <div className="space-y-5">
@@ -278,6 +391,23 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
                   {connected
                     ? `${clientCount} ${clientCount === 1 ? 'cliente conectado' : 'clientes conectados'}`
                     : 'Esperando conexión'}
+                </span>
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium border tabular-nums ${
+                    savedPct > 0
+                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                      : 'bg-slate-50 text-slate-600 border-slate-200'
+                  }`}
+                  title={
+                    savedPct > 0
+                      ? `Compresión ${activeCodec || 'Brotli/Gzip'}: ${formatBytes(wireBytesTotal)} enviados frente a ${formatBytes(rawBytesTotal)} originales`
+                      : 'Compresión adaptable Brotli/Gzip activa para lotes >= 512 B'
+                  }
+                >
+                  <Minimize2 className="w-3 h-3" />
+                  {savedPct > 0
+                    ? `−${Math.round(savedPct)}% tráfico (${formatBytes(savedBytesTotal)} ahorrados)`
+                    : 'Brotli/Gzip adaptable'}
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-0.5">
@@ -316,6 +446,82 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
             </button>
           </div>
         </div>
+
+        {/* Banner ámbar de conflictos multi-cliente con restauración en 1 clic */}
+        {conflicts.length > 0 && (
+          <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 space-y-2.5 text-xs">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2 font-semibold text-amber-950">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>
+                  {conflicts.length === 1
+                    ? 'Conflicto de edición concurrente detectado'
+                    : `${conflicts.length} conflictos de edición concurrente detectados`}
+                </span>
+              </div>
+              <span className="text-[11px] text-amber-800">
+                La versión sobrescrita se conserva en el historial para restaurarla al instante.
+              </span>
+            </div>
+
+            <div className="space-y-2">
+              {conflicts.map((conflict) => {
+                const prevName = conflict.previous?.clientName || 'cliente anterior';
+                const incName = conflict.incoming?.clientName || 'otro cliente';
+                const prevSeq = conflict.previousSeq ?? Math.max(0, conflict.seq - 1);
+                const busy = busyConflictId === conflict.id;
+                return (
+                  <div
+                    key={conflict.id}
+                    className="p-3 rounded-lg bg-white border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+                  >
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <code className="font-mono font-semibold text-slate-900 break-all">{conflict.path}</code>
+                        <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 text-[10px] font-medium">
+                          {conflict.reason === 'stale_base_hash' ? 'Base desactualizada' : 'Edición simultánea'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-600">
+                        <strong className="text-slate-800">{incName}</strong> (#{conflict.seq}) sobrescribió a{' '}
+                        <strong className="text-slate-800">{prevName}</strong> (#{prevSeq})
+                        {conflict.deltaMs != null ? ` en ${(conflict.deltaMs / 1000).toFixed(1)} s` : ''}.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void handleRestoreConflict(conflict)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium text-[11px] cursor-pointer disabled:opacity-50"
+                      >
+                        {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+                        <span>Restaurar #{prevSeq}</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void openFileHistory(conflict.path)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium text-[11px] cursor-pointer"
+                      >
+                        <History className="w-3 h-3" />
+                        <span>Historial</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void handleDismissConflict(conflict)}
+                        className="px-2 py-1.5 rounded-lg text-amber-900 hover:bg-amber-100 text-[11px] font-medium cursor-pointer"
+                      >
+                        Descartar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Métricas reales */}
         <div className="bg-slate-50/60 border border-slate-200 rounded-xl grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 text-xs">
@@ -442,6 +648,139 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
         </div>
       </div>
 
+      {/* Viaje en el tiempo por archivo (rollback quirúrgico) */}
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
+            <History className="w-3.5 h-3.5 text-slate-500" />
+            <span>Viaje en el tiempo por archivo (reversión quirúrgica)</span>
+          </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void openFileHistory(historyPathInput);
+            }}
+            className="flex items-center gap-1.5 w-full sm:w-auto"
+          >
+            <input
+              value={historyPathInput}
+              onChange={(e) => setHistoryPathInput(e.target.value)}
+              placeholder="src/App.tsx"
+              className="flex-1 sm:w-56 px-2.5 py-1 rounded-lg border border-slate-200 bg-white font-mono text-[11px] text-slate-900 placeholder:text-slate-400"
+            />
+            <button
+              type="submit"
+              disabled={!historyPathInput.trim() || loadingHistory}
+              className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-medium cursor-pointer disabled:opacity-50 shrink-0"
+            >
+              Ver historial
+            </button>
+          </form>
+        </div>
+
+        {recentTouchedPaths.length > 0 && !activeHistoryPath && (
+          <div className="px-5 py-2.5 bg-white flex items-center gap-1.5 flex-wrap text-[11px]">
+            <span className="text-slate-400">Recientes:</span>
+            {recentTouchedPaths.map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => void openFileHistory(p)}
+                className="px-2 py-0.5 rounded-md bg-slate-50 hover:bg-slate-100 border border-slate-200 font-mono text-slate-700 cursor-pointer truncate max-w-[220px]"
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {activeHistoryPath && (
+          <div className="p-4 space-y-3 text-xs">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2 min-w-0">
+                <code className="font-mono font-semibold text-slate-900 truncate">{activeHistoryPath}</code>
+                {fileHistory && (
+                  <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 text-[10px] text-slate-600 tabular-nums">
+                    {fileHistory.revisionCount} {fileHistory.revisionCount === 1 ? 'revisión' : 'revisiones'}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                aria-label="Cerrar historial del archivo"
+                onClick={() => {
+                  setActiveHistoryPath(null);
+                  setFileHistory(null);
+                }}
+                className="p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {loadingHistory ? (
+              <div className="py-4 text-slate-500 flex items-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Cargando revisiones de {activeHistoryPath}…
+              </div>
+            ) : fileHistory && fileHistory.revisions.length > 0 ? (
+              <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                {fileHistory.revisions.map((rev) => (
+                  <div key={`${rev.seq}-${rev.appliedAt || rev.action}`} className="px-3.5 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white">
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-mono font-semibold text-slate-800 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded tabular-nums">
+                          #{rev.seq}
+                        </span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-50 border border-slate-200 text-[10px] text-slate-700">
+                          {rev.action === 'initial'
+                            ? 'Base inicial'
+                            : rev.action === 'created'
+                              ? 'Creado'
+                              : rev.action === 'modified'
+                                ? 'Modificado'
+                                : rev.action === 'deleted'
+                                  ? 'Borrado'
+                                  : rev.action === 'rolled_back'
+                                    ? `Restaurado de #${rev.restoredFromSeq ?? '?'}`
+                                    : rev.action}
+                        </span>
+                        {rev.clientName && (
+                          <span className="font-mono text-[10px] text-slate-500">{rev.clientName}</span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap font-mono tabular-nums">
+                        {rev.appliedAt && (
+                          <span className="inline-flex items-center gap-1">
+                            <Clock className="w-3 h-3" />
+                            {new Date(rev.appliedAt).toLocaleTimeString('es-ES')}
+                          </span>
+                        )}
+                        {rev.byteLength != null && <span>{formatBytes(rev.byteLength)}</span>}
+                        {rev.sha256 && <span>{rev.sha256.slice(0, 10)}</span>}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={rev.restorable === false || rollingBackSeq !== null}
+                      onClick={() => void handleSurgicalRollback(fileHistory.path, rev.seq)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-[11px] font-medium text-slate-800 cursor-pointer disabled:opacity-40 shrink-0 self-start sm:self-auto"
+                    >
+                      {rollingBackSeq === rev.seq ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+                      <span>{rev.restorable === false ? 'Muy grande' : `Restaurar #${rev.seq}`}</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="py-3 text-slate-500">
+                No se encontraron revisiones recientes en memoria para <code className="font-mono">{activeHistoryPath}</code>.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* Historial de envíos en vivo con inspector de diff */}
       <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
         <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
@@ -505,7 +844,17 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
                           <div key={file.path} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                             <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 font-mono text-[11px]">
                               <span className="text-slate-800 truncate">{file.path}</span>
-                              <span className="text-slate-500 shrink-0">{file.action}</span>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <span className="text-slate-500">{file.action}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => void openFileHistory(file.path)}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-white hover:bg-slate-100 border border-slate-200 font-sans text-[10px] font-medium text-slate-700 cursor-pointer"
+                                >
+                                  <History className="w-3 h-3" />
+                                  <span>Historial</span>
+                                </button>
+                              </div>
                             </div>
                             {file.diff ? (
                               <pre className="p-3 text-[11px] font-mono text-slate-700 overflow-x-auto max-h-56 leading-relaxed whitespace-pre">

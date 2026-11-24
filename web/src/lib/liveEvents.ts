@@ -27,6 +27,31 @@ export interface SyncClientEvent {
   connectedClients: number;
 }
 
+export interface SyncConflictEvent {
+  id: string;
+  projectId: string;
+  path: string;
+  seq: number;
+  previousSeq?: number;
+  reason?: string;
+  deltaMs?: number;
+  incoming?: {
+    clientId?: string;
+    clientName?: string | null;
+    sha256?: string;
+    op?: string;
+  };
+  previous?: {
+    clientId?: string;
+    clientName?: string | null;
+    sha256?: string;
+    at?: string;
+  };
+  detectedAt?: string;
+  policy?: string;
+  resolved?: boolean;
+}
+
 export interface ServiceProgressEvent {
   id: string;
   status?: string;
@@ -85,6 +110,7 @@ class LiveEventsBus {
   private syncAppliedHandlers = new Set<Handler<SyncAppliedEvent>>();
   private syncRollbackHandlers = new Set<Handler<SyncRollbackEvent>>();
   private syncClientHandlers = new Set<Handler<SyncClientEvent>>();
+  private syncConflictHandlers = new Set<Handler<SyncConflictEvent>>();
   private mcpCallHandlers = new Set<Handler<McpAuditEntry>>();
   private serviceProgressHandlers = new Set<Handler<ServiceProgressEvent>>();
   private serviceInstalledHandlers = new Set<Handler<any>>();
@@ -119,6 +145,9 @@ class LiveEventsBus {
 
   onSyncClient(handler: Handler<SyncClientEvent>) { return this.subscribe(this.syncClientHandlers, handler); }
   emitSyncClient(payload: SyncClientEvent) { this.dispatch(this.syncClientHandlers, payload); }
+
+  onSyncConflict(handler: Handler<SyncConflictEvent>) { return this.subscribe(this.syncConflictHandlers, handler); }
+  emitSyncConflict(payload: SyncConflictEvent) { this.dispatch(this.syncConflictHandlers, payload); }
 
   onMcpCall(handler: Handler<McpAuditEntry>) { return this.subscribe(this.mcpCallHandlers, handler); }
   emitMcpCall(payload: McpAuditEntry) { this.dispatch(this.mcpCallHandlers, payload); }

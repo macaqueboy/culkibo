@@ -13,6 +13,8 @@ import { setTelemetryCurrentView } from './lib/clientTelemetry';
 import type { ImportSourceTab } from './components/UniversalImporter';
 
 const ProjectDetail = lazy(() => import('./components/ProjectDetail').then((m) => ({ default: m.ProjectDetail })));
+const FleetView = lazy(() => import('./components/FleetView').then((m) => ({ default: m.FleetView })));
+const UptimeStatusView = lazy(() => import('./components/UptimeStatusView').then((m) => ({ default: m.UptimeStatusView })));
 const ObservabilityView = lazy(() => import('./components/ObservabilityView').then((m) => ({ default: m.ObservabilityView })));
 const UniversalImporter = lazy(() => import('./components/UniversalImporter').then((m) => ({ default: m.UniversalImporter })));
 const DomainManager = lazy(() => import('./components/DomainManager').then((m) => ({ default: m.DomainManager })));
@@ -25,6 +27,8 @@ export type ToastKind = 'info' | 'success' | 'error';
 
 const VALID_VIEWS: ReadonlySet<AppView> = new Set([
   'projects',
+  'fleet',
+  'uptime',
   'metrics',
   'import',
   'domains',
@@ -210,6 +214,8 @@ export function App() {
         const lower = key.toLowerCase();
         const map: Record<string, AppView> = {
           p: 'projects',
+          f: 'fleet',
+          u: 'uptime',
           m: 'metrics',
           d: 'domains',
           c: 'catalog',
@@ -365,6 +371,11 @@ export function App() {
               liveEvents.emitSyncApplied(data);
             } else if (type === 'sync_rollback') {
               liveEvents.emitSyncRollback(data);
+            } else if (type === 'sync_conflict') {
+              liveEvents.emitSyncConflict(data);
+              if (data?.path) {
+                showToast(`Conflicto de Live Sync detectado en ${data.path}`, 'error');
+              }
             } else if (type === 'sync_client') {
               liveEvents.emitSyncClient(data);
               if (data?.projectId) {
@@ -661,6 +672,14 @@ export function App() {
                 onOpenCatalog={() => openCatalog('catalogo')}
                 onOpenBackupSettings={() => navigate('settings', 'backups')}
               />
+            )}
+
+            {activeView === 'fleet' && !activeProjectId && (
+              <FleetView onNotify={showToast} />
+            )}
+
+            {activeView === 'uptime' && !activeProjectId && (
+              <UptimeStatusView onNotify={showToast} />
             )}
 
             {activeView === 'metrics' && !activeProjectId && (

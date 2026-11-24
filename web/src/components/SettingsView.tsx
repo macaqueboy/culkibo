@@ -25,6 +25,15 @@ import {
   FileText,
   Eye,
   EyeOff,
+  Users,
+  FileCode2,
+  Lock,
+  Copy,
+  Check,
+  GitBranch,
+  ArrowRightLeft,
+  Rocket,
+  Plus,
 } from 'lucide-react';
 import {
   api,
@@ -37,12 +46,20 @@ import {
   type AuditLogEvent,
   type TelemetryStatus,
   type TelemetryPreview,
+  type VaultSecretMeta,
+  type GitOpsPlanResult,
+  type GitOpsDriftResult,
+  type Project,
+  type ProjectEnvironmentItem,
+  type EnvironmentDiffResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
+import { TeamAccessPanel } from './TeamAccessPanel';
+import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
 
-type SettingsTab = 'remote' | 'integrations' | 'backups' | 'notifications' | 'system';
+type SettingsTab = 'remote' | 'team' | 'gitops' | 'integrations' | 'backups' | 'notifications' | 'system';
 
 function formatSafeDate(raw?: string | null): string {
   if (!raw) return '—';
@@ -54,7 +71,15 @@ function formatSafeDate(raw?: string | null): string {
 function normalizeSettingsTab(raw?: string | null): SettingsTab {
   if (!raw) return 'remote';
   const k = raw.toLowerCase();
-  if (k === 'remote' || k === 'integrations' || k === 'backups' || k === 'notifications' || k === 'system') {
+  if (
+    k === 'remote' ||
+    k === 'team' ||
+    k === 'gitops' ||
+    k === 'integrations' ||
+    k === 'backups' ||
+    k === 'notifications' ||
+    k === 'system'
+  ) {
     return k;
   }
   return 'remote';
@@ -142,6 +167,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [notifLoadFailed, setNotifLoadFailed] = useState(false);
   const [notifBusy, setNotifBusy] = useState(false);
   const [notifTesting, setNotifTesting] = useState(false);
+
+  // GitOps (culkibo.yaml), Shared Encrypted Vault & Project Environments
+  const [gitopsYaml, setGitopsYaml] = useState('');
+  const [gitopsPrune, setGitopsPrune] = useState(false);
+  const [gitopsConfirmDestructive, setGitopsConfirmDestructive] = useState(false);
+  const [gitopsPlan, setGitopsPlan] = useState<GitOpsPlanResult | null>(null);
+  const [gitopsDrift, setGitopsDrift] = useState<GitOpsDriftResult | null>(null);
+  const [gitopsBusy, setGitopsBusy] = useState<'export' | 'plan' | 'apply' | 'drift' | null>(null);
+  const [copiedYaml, setCopiedYaml] = useState(false);
+
+  const [vaultSecrets, setVaultSecrets] = useState<VaultSecretMeta[]>([]);
+  const [vaultKey, setVaultKey] = useState('');
+  const [vaultValue, setVaultValue] = useState('');
+  const [vaultScope, setVaultScope] = useState<'both' | 'runtime' | 'build'>('both');
+  const [vaultBusy, setVaultBusy] = useState(false);
+
+  const [envProjects, setEnvProjects] = useState<Project[]>([]);
+  const [envProjectId, setEnvProjectId] = useState('');
+  const [projectEnvs, setProjectEnvs] = useState<ProjectEnvironmentItem[]>([]);
+  const [envEditName, setEnvEditName] = useState('staging');
+  const [envEditBranch, setEnvEditBranch] = useState('staging');
+  const [envEditVars, setEnvEditVars] = useState('');
+  const [envDiffFrom, setEnvDiffFrom] = useState('staging');
+  const [envDiffTo, setEnvDiffTo] = useState('production');
+  const [envDiffResult, setEnvDiffResult] = useState<EnvironmentDiffResult | null>(null);
+  const [envBusy, setEnvBusy] = useState(false);
 
   const loadAll = async () => {
     const [sys, gh, cf, ntf, doc, ing, s3, tel] = await Promise.all([
@@ -356,9 +407,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       api.getNotificationsHistory(20)
         .then((res) => { if (active) setNotifHistory(res.notifications || []); })
         .catch(() => {});
+    } else if (tab === 'gitops') {
+      Promise.all([
+        api.getVaultSecrets().catch(() => ({ secrets: [] })),
+        api.getGitOpsDrift().catch(() => null),
+        api.getProjects().catch(() => []),
+      ]).then(([vRes, dRes, pList]) => {
+        if (!active) return;
+        setVaultSecrets(vRes.secrets || []);
+        setGitopsDrift(dRes);
+        const list = Array.isArray(pList) ? pList : [];
+        setEnvProjects(list);
+        if (list.length > 0) {
+          setEnvProjectId((prev) => prev || list[0].id);
+        }
+      });
     }
     return () => { active = false; };
   }, [tab]);
+
+  useEffect(() => {
+    if (tab !== 'gitops' || !envProjectId) return;
+    let active = true;
+    api.getProjectEnvironments(envProjectId)
+      .then((res) => { if (active) setProjectEnvs(res.environments || []); })
+      .catch(() => { if (active) setProjectEnvs([]); });
+    return () => { active = false; };
+  }, [tab, envProjectId]);
 
   const handleExportInstance = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -575,6 +650,192 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  const handleExportGitOps = async () => {
+    setGitopsBusy('export');
+    try {
+      const res = await api.exportGitOps({ includeCrons: true, includeMonitors: true });
+      setGitopsYaml(res.yaml || '');
+      setGitopsPlan(null);
+      onNotify?.('Manifiesto culkibo.yaml exportado sin secretos en claro', 'success');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo exportar culkibo.yaml', 'error');
+    } finally {
+      setGitopsBusy(null);
+    }
+  };
+
+  const handlePlanGitOps = async () => {
+    if (!gitopsYaml.trim()) return;
+    setGitopsBusy('plan');
+    try {
+      const res = await api.planGitOps(gitopsYaml, gitopsPrune);
+      setGitopsPlan(res);
+      onNotify?.('Simulación GitOps completada. Revisa el plan antes de aplicar.', 'info');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'Error al simular el manifiesto YAML', 'error');
+    } finally {
+      setGitopsBusy(null);
+    }
+  };
+
+  const handleApplyGitOps = async () => {
+    if (!gitopsYaml.trim()) return;
+    setGitopsBusy('apply');
+    try {
+      const res = await api.applyGitOps(gitopsYaml, {
+        dryRun: false,
+        prune: gitopsPrune,
+        confirmDestructive: gitopsPrune && gitopsConfirmDestructive,
+      });
+      setGitopsPlan(res);
+      const drift = await api.getGitOpsDrift().catch(() => null);
+      if (drift) setGitopsDrift(drift);
+      onNotify?.('Manifiesto culkibo.yaml aplicado correctamente', 'success');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'Error al aplicar el manifiesto GitOps', 'error');
+    } finally {
+      setGitopsBusy(null);
+    }
+  };
+
+  const handleCheckDrift = async () => {
+    setGitopsBusy('drift');
+    try {
+      const drift = await api.getGitOpsDrift();
+      setGitopsDrift(drift);
+      const isInSync = drift.inSync ?? !(drift.drifted ?? drift.hasDrift ?? false);
+      const diffCount =
+        drift.drifts?.length ??
+        ((drift.summary?.create || 0) + (drift.summary?.update || 0) + (drift.summary?.delete || 0));
+      onNotify?.(
+        isInSync ? 'Estado en vivo sincronizado con culkibo.yaml' : `Drift detectado (${diffCount} diferencias)`,
+        isInSync ? 'success' : 'info'
+      );
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo comprobar el drift', 'error');
+    } finally {
+      setGitopsBusy(null);
+    }
+  };
+
+  const handleCopyYaml = async () => {
+    if (!gitopsYaml.trim()) return;
+    const ok = await copyToClipboard(gitopsYaml);
+    if (!ok) return;
+    setCopiedYaml(true);
+    window.setTimeout(() => setCopiedYaml(false), 1800);
+    onNotify?.('culkibo.yaml copiado al portapapeles', 'success');
+  };
+
+  const handleDownloadYaml = () => {
+    if (!gitopsYaml.trim()) return;
+    const blob = new Blob([gitopsYaml], { type: 'text/yaml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'culkibo.yaml';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleSaveVaultSecret = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanKey = vaultKey.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+    if (!cleanKey || !vaultValue) return;
+    setVaultBusy(true);
+    try {
+      await api.setVaultSecret(cleanKey, vaultValue, { scope: vaultScope });
+      setVaultKey('');
+      setVaultValue('');
+      const res = await api.getVaultSecrets();
+      setVaultSecrets(res.secrets || []);
+      onNotify?.(`Secreto \${vault.${cleanKey}} cifrado en el Vault`, 'success');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo guardar el secreto', 'error');
+    } finally {
+      setVaultBusy(false);
+    }
+  };
+
+  const handleDeleteVaultSecret = async (key: string) => {
+    setVaultBusy(true);
+    try {
+      await api.deleteVaultSecret(key);
+      setVaultSecrets((prev) => prev.filter((s) => s.key !== key));
+      onNotify?.(`Secreto ${key} eliminado del Vault`, 'info');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo eliminar el secreto', 'error');
+    } finally {
+      setVaultBusy(false);
+    }
+  };
+
+  const handleSaveProjectEnv = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!envProjectId || !envEditName.trim()) return;
+    setEnvBusy(true);
+    try {
+      const envVars: Record<string, string> = {};
+      for (const line of envEditVars.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        const idx = t.indexOf('=');
+        if (idx > 0) envVars[t.slice(0, idx).trim()] = t.slice(idx + 1);
+      }
+      await api.saveProjectEnvironment(envProjectId, envEditName.trim().toLowerCase(), {
+        branch: envEditBranch.trim() || undefined,
+        envVars,
+      });
+      setEnvEditVars('');
+      const res = await api.getProjectEnvironments(envProjectId);
+      setProjectEnvs(res.environments || []);
+      onNotify?.(`Entorno «${envEditName}» guardado con cifrado en reposo`, 'success');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo guardar el entorno', 'error');
+    } finally {
+      setEnvBusy(false);
+    }
+  };
+
+  const handleDiffEnvs = async () => {
+    if (!envProjectId) return;
+    setEnvBusy(true);
+    try {
+      const diff = await api.diffProjectEnvironments(envProjectId, envDiffFrom, envDiffTo);
+      setEnvDiffResult(diff);
+      onNotify?.(`Diff seguro (solo hashes) ${envDiffFrom} → ${envDiffTo} calculado`, 'info');
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo calcular el diff de entornos', 'error');
+    } finally {
+      setEnvBusy(false);
+    }
+  };
+
+  const handlePromoteEnv = async (dryRun: boolean) => {
+    if (!envProjectId) return;
+    setEnvBusy(true);
+    try {
+      await api.promoteProjectEnvironment(envProjectId, {
+        fromEnv: envDiffFrom,
+        toEnv: envDiffTo,
+        includeEnvVars: false,
+        dryRun,
+      });
+      onNotify?.(
+        dryRun
+          ? `Simulación de promoción ${envDiffFrom} → ${envDiffTo} lista`
+          : `Promoción ${envDiffFrom} → ${envDiffTo} aplicada`,
+        'success'
+      );
+      const res = await api.getProjectEnvironments(envProjectId).catch(() => ({ environments: [] }));
+      setProjectEnvs(res.environments || []);
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo promocionar el entorno', 'error');
+    } finally {
+      setEnvBusy(false);
+    }
+  };
+
   const hasCfToken = Boolean(cfConfig?.hasApiToken || cfConfig?.hasToken);
 
   return (
@@ -587,9 +848,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       </div>
 
       {/* Pestañas */}
-      <div className="flex flex-wrap gap-1 p-1 bg-slate-100 border border-slate-200 rounded-lg text-xs">
+      <div className="flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-lg text-xs overflow-x-auto no-scrollbar">
         {([
           { id: 'remote', label: 'Acceso remoto', icon: Globe },
+          { id: 'team', label: 'Equipo y RBAC', icon: Users },
+          { id: 'gitops', label: 'GitOps (culkibo.yaml)', icon: FileCode2 },
           { id: 'integrations', label: 'Integraciones', icon: Plug },
           { id: 'backups', label: 'Backups y DR', icon: HardDrive },
           { id: 'notifications', label: 'Notificaciones', icon: Bell },
@@ -601,7 +864,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               key={t.id}
               type="button"
               onClick={() => setTab(t.id)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition-colors cursor-pointer ${
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
                 tab === t.id ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
@@ -613,6 +876,454 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       </div>
 
       {tab === 'remote' && <RemoteAccessPanel onNotify={onNotify} />}
+
+      {tab === 'team' && <TeamAccessPanel onNotify={onNotify} />}
+
+      {tab === 'gitops' && (
+        <div className="space-y-5">
+          {/* Declarative GitOps culkibo.yaml */}
+          <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4 text-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <FileCode2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">GitOps declarativo (culkibo.yaml)</h2>
+                    {gitopsDrift && (() => {
+                      const isInSync = gitopsDrift.inSync ?? !(gitopsDrift.drifted ?? gitopsDrift.hasDrift ?? false);
+                      const diffCount =
+                        gitopsDrift.drifts?.length ??
+                        ((gitopsDrift.summary?.create || 0) + (gitopsDrift.summary?.update || 0) + (gitopsDrift.summary?.delete || 0));
+                      return (
+                        <span className={`px-2 py-0.5 rounded-full text-[11px] font-medium border ${
+                          isInSync
+                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            : 'bg-amber-50 text-amber-800 border-amber-200'
+                        }`}>
+                          {isInSync ? 'Sincronizado' : `Drift (${diffCount})`}
+                        </span>
+                      );
+                    })()}
+                  </div>
+                  <p className="text-slate-500 mt-0.5">
+                    Exporta todo tu stack sin secretos (usando <code className="font-mono">${'{vault.CLAVE}'}</code>), simula un plan y reconcilia cambios de forma idempotente.
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  disabled={gitopsBusy !== null}
+                  onClick={() => void handleCheckDrift()}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${gitopsBusy === 'drift' ? 'animate-spin' : ''}`} />
+                  <span>Drift</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={gitopsBusy !== null}
+                  onClick={() => void handleExportGitOps()}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {gitopsBusy === 'export' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                  <span>Exportar stack</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <label htmlFor="gitops-yaml-editor" className="font-medium text-slate-700">
+                  Manifiesto culkibo.yaml (v1 · máx. 256 KB, sin anclas YAML)
+                </label>
+                {gitopsYaml.trim() && (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyYaml()}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer"
+                    >
+                      {copiedYaml ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                      <span>Copiar</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDownloadYaml}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer"
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>Descargar</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+              <textarea
+                id="gitops-yaml-editor"
+                rows={11}
+                value={gitopsYaml}
+                onChange={(e) => setGitopsYaml(e.target.value)}
+                placeholder={'version: 1\nprojects:\n  - name: mi-app\n    gitRepo: https://github.com/org/mi-app\n    env:\n      DATABASE_URL: ${vault.PROD_DB_URL}'}
+                spellCheck={false}
+                className="w-full p-3.5 bg-slate-50 focus:bg-white border border-slate-200 rounded-xl font-mono text-[11px] leading-relaxed text-slate-900"
+              />
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+              <div className="flex items-center gap-4 flex-wrap">
+                <label className="inline-flex items-center gap-1.5 text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={gitopsPrune}
+                    onChange={(e) => {
+                      setGitopsPrune(e.target.checked);
+                      if (!e.target.checked) setGitopsConfirmDestructive(false);
+                    }}
+                    className="accent-slate-900"
+                  />
+                  <span>Prune (eliminar recursos ausentes)</span>
+                </label>
+                {gitopsPrune && (
+                  <label className="inline-flex items-center gap-1.5 text-red-700 font-medium cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={gitopsConfirmDestructive}
+                      onChange={(e) => setGitopsConfirmDestructive(e.target.checked)}
+                      className="accent-red-600"
+                    />
+                    <span>Confirmar borrados destructivos</span>
+                  </label>
+                )}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={!gitopsYaml.trim() || gitopsBusy !== null}
+                  onClick={() => void handlePlanGitOps()}
+                  className="px-3.5 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {gitopsBusy === 'plan' ? 'Simulando…' : 'Simular Plan (Dry-Run)'}
+                </button>
+                <button
+                  type="button"
+                  disabled={!gitopsYaml.trim() || gitopsBusy !== null}
+                  onClick={() => void handleApplyGitOps()}
+                  className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {gitopsBusy === 'apply' ? 'Aplicando…' : 'Aplicar stack'}
+                </button>
+              </div>
+            </div>
+
+            {gitopsPlan && (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="font-semibold text-slate-900">Resultado del plan GitOps</span>
+                  <div className="flex items-center gap-2 font-mono text-[11px] tabular-nums">
+                    <span className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-800">
+                      +{gitopsPlan.create?.length || 0} crear
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
+                      ~{gitopsPlan.update?.length || 0} actualizar
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700">
+                      -{gitopsPlan.delete?.length || 0} borrar
+                    </span>
+                  </div>
+                </div>
+                {gitopsPlan.warnings && gitopsPlan.warnings.length > 0 && (
+                  <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 space-y-1">
+                    {gitopsPlan.warnings.map((w, i) => <div key={i}>· {w}</div>)}
+                  </div>
+                )}
+                <div className="space-y-1 font-mono text-[11px] max-h-40 overflow-y-auto">
+                  {(gitopsPlan.create || []).map((c, i) => (
+                    <div key={`c-${i}`} className="text-emerald-800">+ [{c.kind}] {c.name}</div>
+                  ))}
+                  {(gitopsPlan.update || []).map((u, i) => (
+                    <div key={`u-${i}`} className="text-amber-800">
+                      ~ [{u.kind}] {u.name}
+                      {u.changes?.length
+                        ? ` (${u.changes.map((ch) => (typeof ch === 'string' ? ch : ch.field)).join(', ')})`
+                        : ''}
+                    </div>
+                  ))}
+                  {(gitopsPlan.delete || []).map((d, i) => (
+                    <div key={`d-${i}`} className="text-red-700">- [{d.kind}] {d.name}</div>
+                  ))}
+                  {(gitopsPlan.create?.length || 0) + (gitopsPlan.update?.length || 0) + (gitopsPlan.delete?.length || 0) === 0 && (
+                    <div className="text-slate-500">Sin cambios pendientes frente al estado actual.</div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Bóveda compartida cifrada (Shared Encrypted Vault) */}
+          <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4 text-xs">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                <Lock className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">Bóveda compartida cifrada (Vault AES-256-GCM)</h2>
+                <p className="text-slate-500 mt-0.5">
+                  Guarda secretos una vez y referéncialos en entornos o <code className="font-mono">culkibo.yaml</code> como{' '}
+                  <code className="font-mono text-slate-800">${'{vault.NOMBRE_CLAVE}'}</code>. Los valores nunca se devuelven en texto plano.
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handleSaveVaultSecret} className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+              <label className="block sm:col-span-4">
+                <span className="font-medium text-slate-700">Clave</span>
+                <input
+                  required
+                  value={vaultKey}
+                  onChange={(e) => setVaultKey(e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '_'))}
+                  placeholder="STRIPE_SECRET_KEY"
+                  className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 font-mono text-slate-900"
+                />
+              </label>
+              <label className="block sm:col-span-4">
+                <span className="font-medium text-slate-700">Valor secreto</span>
+                <input
+                  type="password"
+                  required
+                  value={vaultValue}
+                  onChange={(e) => setVaultValue(e.target.value)}
+                  placeholder="••••••••••••"
+                  className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 font-mono text-slate-900"
+                />
+              </label>
+              <label className="block sm:col-span-2">
+                <span className="font-medium text-slate-700">Alcance</span>
+                <select
+                  value={vaultScope}
+                  onChange={(e) => setVaultScope(e.target.value as 'both' | 'runtime' | 'build')}
+                  className="mt-1 w-full px-2.5 py-2 rounded-lg border border-slate-200 bg-white text-slate-900"
+                >
+                  <option value="both">Ambos</option>
+                  <option value="runtime">Runtime</option>
+                  <option value="build">Build</option>
+                </select>
+              </label>
+              <button
+                type="submit"
+                disabled={vaultBusy}
+                className="sm:col-span-2 inline-flex items-center justify-center gap-1 px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Guardar</span>
+              </button>
+            </form>
+
+            {vaultSecrets.length === 0 ? (
+              <div className="p-5 rounded-xl bg-slate-50 border border-slate-200 text-center text-slate-500">
+                El Vault compartido está vacío. Añade claves reutilizables para mantener tus manifiestos GitOps libres de secretos.
+              </div>
+            ) : (
+              <div className="border border-slate-200 rounded-xl divide-y divide-slate-100 overflow-hidden">
+                {vaultSecrets.map((sec) => (
+                  <div key={sec.key} className="px-4 py-2.5 flex items-center justify-between gap-3 bg-white">
+                    <div className="min-w-0 flex items-center gap-2 flex-wrap">
+                      <code className="font-mono font-semibold text-slate-900">${`{vault.${sec.key}}`}</code>
+                      {sec.scope && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-[10px] text-slate-600">
+                          {sec.scope}
+                        </span>
+                      )}
+                      {(sec.fingerprint || sec.hash) && (
+                        <span className="font-mono text-[10px] text-slate-400">
+                          sha256:{(sec.fingerprint || sec.hash || '').slice(0, 10)}
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      disabled={vaultBusy}
+                      aria-label={`Eliminar secreto ${sec.key}`}
+                      onClick={() => void handleDeleteVaultSecret(sec.key)}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-red-700 hover:bg-red-50 cursor-pointer shrink-0"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Entornos por proyecto, Diff seguro y Promoción */}
+          <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4 text-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <GitBranch className="w-4 h-4" />
+                </div>
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Entornos aislados y Promoción (dev → staging → production)</h2>
+                  <p className="text-slate-500 mt-0.5">
+                    Compara variables por huella HMAC sin exponer secretos y promociona artefactos verificados entre entornos.
+                  </p>
+                </div>
+              </div>
+              <select
+                aria-label="Seleccionar proyecto para entornos"
+                value={envProjectId}
+                onChange={(e) => {
+                  setEnvProjectId(e.target.value);
+                  setEnvDiffResult(null);
+                }}
+                className="px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-900 min-w-[200px]"
+              >
+                {envProjects.length === 0 && <option value="">Sin proyectos</option>}
+                {envProjects.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            </div>
+
+            {envProjects.length > 0 && (
+              <>
+                {projectEnvs.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    {projectEnvs.map((env) => (
+                      <div key={env.name} className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-900 font-mono">{env.name}</span>
+                          <span className="text-[10px] text-slate-500 tabular-nums">
+                            {env.envCount ?? env.envKeys?.length ?? 0} vars
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 font-mono truncate">
+                          Rama: {env.branch || 'main'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  {/* Guardar override de entorno */}
+                  <form onSubmit={handleSaveProjectEnv} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+                    <div className="font-semibold text-slate-800">Configurar entorno</div>
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <select
+                        value={envEditName}
+                        onChange={(e) => setEnvEditName(e.target.value)}
+                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                      >
+                        <option value="development">development</option>
+                        <option value="staging">staging</option>
+                        <option value="production">production</option>
+                      </select>
+                      <input
+                        value={envEditBranch}
+                        onChange={(e) => setEnvEditBranch(e.target.value)}
+                        placeholder="Rama Git (ej. staging)"
+                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                      />
+                    </div>
+                    <textarea
+                      rows={3}
+                      value={envEditVars}
+                      onChange={(e) => setEnvEditVars(e.target.value)}
+                      placeholder={'NODE_ENV=staging\nAPI_KEY=${vault.STAGING_KEY}'}
+                      spellCheck={false}
+                      className="w-full p-2.5 rounded-lg border border-slate-200 bg-white font-mono text-[11px]"
+                    />
+                    <button
+                      type="submit"
+                      disabled={envBusy}
+                      className="px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                    >
+                      Guardar entorno
+                    </button>
+                  </form>
+
+                  {/* Diff seguro y Promoción */}
+                  <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+                    <div className="font-semibold text-slate-800">Comparar y promocionar</div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <select
+                        aria-label="Entorno origen"
+                        value={envDiffFrom}
+                        onChange={(e) => setEnvDiffFrom(e.target.value)}
+                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                      >
+                        <option value="development">development</option>
+                        <option value="staging">staging</option>
+                        <option value="production">production</option>
+                      </select>
+                      <ArrowRightLeft className="w-3.5 h-3.5 text-slate-400" />
+                      <select
+                        aria-label="Entorno destino"
+                        value={envDiffTo}
+                        onChange={(e) => setEnvDiffTo(e.target.value)}
+                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                      >
+                        <option value="staging">staging</option>
+                        <option value="production">production</option>
+                        <option value="development">development</option>
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        disabled={envBusy}
+                        onClick={() => void handleDiffEnvs()}
+                        className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-800 font-medium cursor-pointer disabled:opacity-50"
+                      >
+                        Ver diff (HMAC)
+                      </button>
+                      <button
+                        type="button"
+                        disabled={envBusy}
+                        onClick={() => void handlePromoteEnv(true)}
+                        className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-800 font-medium cursor-pointer disabled:opacity-50"
+                      >
+                        Simular promoción
+                      </button>
+                      <button
+                        type="button"
+                        disabled={envBusy}
+                        onClick={() => void handlePromoteEnv(false)}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                      >
+                        <Rocket className="w-3.5 h-3.5" />
+                        <span>Promocionar</span>
+                      </button>
+                    </div>
+
+                    {envDiffResult && (
+                      <div className="p-2.5 rounded-lg bg-white border border-slate-200 font-mono text-[11px] space-y-1">
+                        <div className="text-emerald-700">
+                          + Añadidas: {envDiffResult.added.length
+                            ? envDiffResult.added.map((a) => (typeof a === 'string' ? a : a.key)).join(', ')
+                            : 'ninguna'}
+                        </div>
+                        <div className="text-amber-700">
+                          ~ Modificadas: {envDiffResult.changed.length
+                            ? envDiffResult.changed.map((c) => (typeof c === 'string' ? c : c.key)).join(', ')
+                            : 'ninguna'}
+                        </div>
+                        <div className="text-red-700">
+                          - Solo en destino: {envDiffResult.removed.length
+                            ? envDiffResult.removed.map((r) => (typeof r === 'string' ? r : r.key)).join(', ')
+                            : 'ninguna'}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {tab === 'integrations' && (
         <div className="space-y-5">

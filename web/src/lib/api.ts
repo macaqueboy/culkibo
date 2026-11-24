@@ -94,6 +94,61 @@ export interface LiveSyncClientInfo {
   lastFrameAt?: string | null;
 }
 
+export interface LiveSyncConflict {
+  id: string;
+  projectId: string;
+  path: string;
+  seq: number;
+  previousSeq?: number;
+  reason?: 'concurrent_window' | 'stale_base_hash' | string;
+  deltaMs?: number;
+  incoming?: {
+    clientId?: string;
+    clientName?: string | null;
+    sha256?: string;
+    op?: string;
+  };
+  previous?: {
+    clientId?: string;
+    clientName?: string | null;
+    sha256?: string;
+    at?: string;
+  };
+  detectedAt?: string;
+  policy?: string;
+  resolved?: boolean;
+}
+
+export interface LiveSyncFileRevision {
+  seq: number;
+  appliedAt?: string;
+  action: 'initial' | 'created' | 'modified' | 'deleted' | 'rolled_back' | string;
+  clientId?: string | null;
+  clientName?: string | null;
+  existed?: boolean;
+  byteLength?: number;
+  sha256?: string | null;
+  restorable?: boolean;
+  restoredFromSeq?: number | null;
+}
+
+export interface LiveSyncFileHistory {
+  projectId: string;
+  path: string;
+  existsOnDisk?: boolean;
+  currentSha256?: string | null;
+  revisionCount: number;
+  revisions: LiveSyncFileRevision[];
+}
+
+export interface LiveSyncWireStats {
+  rawBytes: number;
+  wireBytes: number;
+  savedPct: number;
+  compressedFrames?: number;
+  codec?: string | null;
+}
+
 export interface LiveSyncStatus {
   projectId: string;
   targetDir: string;
@@ -113,6 +168,14 @@ export interface LiveSyncStatus {
   lastApplyMs: number | null;
   historyDepth: number;
   recentFrames?: LiveSyncRecentFrame[];
+  wireBytesReceived?: number;
+  rawBytesReceived?: number;
+  compressionSavedBytes?: number;
+  compressionRatio?: number;
+  lastCompression?: string | null;
+  wireStats?: LiveSyncWireStats;
+  conflictsCount?: number;
+  recentConflicts?: LiveSyncConflict[];
   latencyMs: {
     samples: number;
     p50: number | null;
@@ -890,7 +953,9 @@ export interface Project {
   name: string;
   description: string;
   icon: string;
-  status: 'active' | 'hibernated' | 'stopped';
+  status: 'active' | 'hibernated' | 'stopped' | 'sleeping';
+  serverId?: string;
+  teamId?: string;
   forgePort: number;
   citadelPort: number;
   trafficSplit: { forge: number; citadel: number };
@@ -1168,6 +1233,354 @@ export interface SystemDoctorReport {
   timestamp: string;
   summary: { ok: number; warn: number; fail: number };
   checks: DoctorCheck[];
+}
+
+// --- Multi-Server Fleet (SSH Orchestration) ---
+
+export interface FleetServerProbe {
+  os?: string | null;
+  arch?: string | null;
+  cpus?: number | null;
+  load1m?: number | null;
+  memoryTotalMb?: number | null;
+  memoryAvailableMb?: number | null;
+  diskTotalGb?: number | null;
+  diskAvailableGb?: number | null;
+  dockerVersion?: string | null;
+  dockerReady?: boolean;
+  caddyAvailable?: boolean;
+  caddyMode?: string | null;
+  latencyMs?: number | null;
+  probedAt?: string | null;
+  warnings?: string[];
+  error?: string | null;
+}
+
+export interface FleetServer {
+  id: string;
+  name: string;
+  isLocal?: boolean;
+  host: string;
+  port: number;
+  user: string;
+  keyId?: string | null;
+  dockerSocketPath?: string;
+  region?: string;
+  tags?: string[];
+  teamId?: string;
+  status: 'online' | 'degraded' | 'offline' | 'host_key_mismatch' | 'pending' | 'unknown' | string;
+  statusReason?: string | null;
+  statusFix?: string | null;
+  warnings?: string[];
+  hostKeyPolicy?: 'tofu' | 'strict';
+  hostKeyFingerprint?: string | null;
+  hostKeyType?: string | null;
+  hostKeyPinnedAt?: string | null;
+  lastProbedAt?: string | null;
+  resources?: FleetServerProbe | null;
+  probe?: FleetServerProbe | null;
+  lastError?: string | null;
+  projectsCount?: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface FleetSshKey {
+  id: string;
+  name: string;
+  fingerprint: string;
+  publicKey: string;
+  keyType?: string;
+  algorithm?: string;
+  teamId?: string;
+  serversUsing?: number;
+  createdAt?: string;
+}
+
+// --- Teams, RBAC y Tokens con alcance ---
+
+export type RbacRole = 'owner' | 'admin' | 'developer' | 'viewer';
+
+export interface RbacIdentity {
+  authenticated: boolean;
+  method?: string | null;
+  authKind?: string | null;
+  multiUserEnabled?: boolean;
+  isSuperAdmin?: boolean;
+  userId?: string | null;
+  email?: string | null;
+  name?: string | null;
+  role: RbacRole;
+  teamId?: string | null;
+  projectIds?: string[] | '*' | null;
+  scopes?: string[];
+}
+
+export interface TeamSummary {
+  id: string;
+  slug?: string;
+  name: string;
+  isDefault?: boolean;
+  memberCount?: number;
+  role?: RbacRole;
+  createdAt?: string;
+}
+
+export interface TeamMember {
+  id: string;
+  userId?: string;
+  email: string;
+  name?: string;
+  role: RbacRole;
+  status?: 'active' | 'disabled' | string;
+  projectIds?: string[] | '*' | null;
+  addedAt?: string;
+  lastLoginAt?: string | null;
+}
+
+export interface TeamInvite {
+  id: string;
+  teamId: string;
+  email: string;
+  role: RbacRole;
+  tokenPrefix?: string;
+  projectIds?: string[] | null;
+  createdAt?: string;
+  expiresAt: string;
+  usedAt?: string | null;
+  revokedAt?: string | null;
+}
+
+export interface ScopedApiToken {
+  id: string;
+  name: string;
+  tokenPrefix: string;
+  role?: RbacRole;
+  teamId?: string;
+  scopes: string[];
+  projectIds: string[] | '*' | null;
+  createdAt?: string;
+  expiresAt?: string | null;
+  lastUsedAt?: string | null;
+  lastUsedIp?: string | null;
+  revokedAt?: string | null;
+}
+
+// --- Entornos, Shared Vault y GitOps culkibo.yaml ---
+
+export interface VaultSecretMeta {
+  key: string;
+  fingerprint?: string;
+  hash?: string;
+  scope?: 'runtime' | 'build' | 'both' | string;
+  secret?: boolean;
+  updatedAt?: string;
+  createdAt?: string;
+}
+
+export interface ProjectEnvironmentItem {
+  name: string;
+  branch?: string | null;
+  domains?: string[];
+  serverId?: string | null;
+  envKeys?: string[];
+  envCount?: number;
+  envVars?: Record<string, string>;
+  lastRelease?: {
+    version?: string;
+    imageTag?: string;
+    promotedAt?: string;
+  } | null;
+  promotionHistory?: Array<{
+    id?: string;
+    fromEnv: string;
+    toEnv: string;
+    at: string;
+    actor?: string | null;
+  }>;
+  updatedAt?: string;
+}
+
+export interface EnvironmentDiffResult {
+  projectId?: string;
+  fromEnv: string;
+  toEnv: string;
+  added: Array<string | { key: string; fromHash?: string; fromFingerprint?: string }>;
+  removed: Array<string | { key: string; toHash?: string; toFingerprint?: string }>;
+  changed: Array<string | { key: string; fromHash?: string; toHash?: string }>;
+  sameCount?: number;
+  unchangedCount?: number;
+}
+
+export interface GitOpsPlanResult {
+  valid?: boolean;
+  dryRun?: boolean;
+  create: Array<{ kind: string; name: string; detail?: string }>;
+  update: Array<{ kind: string; name: string; changes?: Array<string | { field: string; from?: unknown; to?: unknown }>; detail?: string }>;
+  delete: Array<{ kind: string; name: string; detail?: string }>;
+  warnings: string[];
+  manifestHash?: string;
+}
+
+export interface GitOpsDriftResult {
+  inSync?: boolean;
+  drifted?: boolean;
+  hasDrift?: boolean;
+  hasAppliedManifest?: boolean;
+  manifestHash?: string | null;
+  expectedHash?: string | null;
+  liveHash?: string | null;
+  lastAppliedAt?: string | null;
+  drifts?: Array<{ kind: string; name: string; field?: string; expected?: string; actual?: string; detail?: string }>;
+  differences?: {
+    create?: Array<{ kind: string; name: string }>;
+    update?: Array<{ kind: string; name: string }>;
+    delete?: Array<{ kind: string; name: string }>;
+  };
+  summary?: {
+    create: number;
+    update: number;
+    delete: number;
+    hasChanges?: boolean;
+  };
+}
+
+// --- Uptime Monitors, Páginas públicas de estado, Auto-Sleep y Cost Advisor ---
+
+export interface UptimeMonitorCheckPoint {
+  at: string;
+  ok: boolean;
+  status?: 'up' | 'degraded' | 'down' | string;
+  statusCode?: number | null;
+  latencyMs?: number | null;
+  error?: string | null;
+}
+
+export interface UptimeHistoryBar {
+  status: 'up' | 'degraded' | 'down' | 'nodata' | string;
+  uptimePct: number | null;
+}
+
+export interface UptimeMonitor {
+  id: string;
+  name: string;
+  type: 'http' | 'tcp' | 'managed_project' | string;
+  target?: string;
+  url?: string;
+  host?: string;
+  port?: number | null;
+  projectId?: string | null;
+  intervalSec: number;
+  expectedStatus?: number;
+  keyword?: string | null;
+  maxLatencyMs?: number | null;
+  enabled: boolean;
+  public?: boolean;
+  status: 'up' | 'degraded' | 'down' | 'pending' | string;
+  uptime24h?: number | null;
+  uptime7d?: number | null;
+  uptime30d?: number | null;
+  p50LatencyMs?: number | null;
+  p95LatencyMs?: number | null;
+  lastLatencyMs?: number | null;
+  lastCheckedAt?: string | null;
+  lastError?: string | null;
+  incidentOpen?: boolean;
+  activeIncidentId?: string | null;
+  history30?: UptimeHistoryBar[];
+  recentChecks?: UptimeMonitorCheckPoint[];
+  createdAt?: string;
+}
+
+export interface PublicStatusPage {
+  slug: string;
+  title: string;
+  description?: string;
+  accentColor?: string;
+  monitorIds: string[];
+  publicUrl?: string;
+  badgeUrl?: string;
+  overallStatus?: 'operational' | 'degraded' | 'outage' | string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface SleepPolicy {
+  projectId: string;
+  enabled: boolean;
+  idleMinutes: number;
+  mode: 'pause' | 'stop';
+  wakeTimeoutMs?: number;
+  excludeCrons?: boolean;
+  sleeping?: boolean;
+  isSleeping?: boolean;
+  lastSleptAt?: string | null;
+  lastWokenAt?: string | null;
+}
+
+export interface AdvisorRecommendation {
+  id?: string;
+  severity: 'info' | 'warn' | 'critical' | string;
+  category: 'auto_sleep' | 'oversized_ram' | 'oom_risk' | 'cost_savings' | string;
+  projectId?: string | null;
+  projectName?: string | null;
+  title: string;
+  detail: string;
+  reclaimableRamMb?: number | null;
+  estimatedMonthlySavingsEur?: number | null;
+  estimatedSavingsEur?: number | null;
+  actionLabel?: string | null;
+}
+
+export interface ResourceAdvisorReport {
+  checkedAt?: string;
+  generatedAt?: string;
+  vpsMonthlyEur?: number;
+  host?: {
+    totalMemMb?: number;
+    freeMemMb?: number;
+    usedMemMb?: number;
+    freeMemPct?: number;
+    usedMemPct?: number;
+    cpuCount?: number;
+    totalRamMb?: number;
+    usedRamMb?: number;
+    freeRamMb?: number;
+    freePercent?: number;
+    cpus?: number;
+  };
+  summary?: {
+    containersCount?: number;
+    reclaimableRamMb?: number;
+    oomRiskCount?: number;
+    idleCandidatesCount?: number;
+    oversizedCapsCount?: number;
+  };
+  costLedger?: {
+    currency?: string;
+    vpsMonthlyEur: number;
+    saasAverageMonthlyEur: number;
+    monthlySavingsEur: number;
+    annualSavingsEur?: number;
+    savingsPct?: number;
+    potentialAdditionalSavingsEur?: number;
+  };
+  savingsLedger?: {
+    vpsMonthlyEur: number;
+    estimatedSaasMonthlyEur: number;
+    monthlySavingsEur: number;
+    annualSavingsEur?: number;
+    reclaimableRamMb?: number;
+  };
+  sleepCandidates?: Array<{
+    projectId: string;
+    projectName: string;
+    memoryMb: number;
+    idleMinutes?: number;
+    isSleeping?: boolean;
+    policyEnabled?: boolean;
+  }>;
+  recommendations: AdvisorRecommendation[];
 }
 
 export const api = {
@@ -2698,5 +3111,560 @@ export const api = {
       }),
       'Error al invocar la herramienta MCP'
     );
-  }
+  },
+
+  // --- Multi-Server Fleet (SSH Orchestration) ---
+
+  async getServers(params: { tag?: string; region?: string } = {}): Promise<{ servers: FleetServer[] }> {
+    const qs = new URLSearchParams();
+    if (params.tag) qs.set('tag', params.tag);
+    if (params.region) qs.set('region', params.region);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/servers${suffix}`),
+      'No se pudieron cargar los servidores de la flota'
+    );
+    return Array.isArray(data) ? { servers: data } : { servers: data?.servers || [] };
+  },
+
+  async addServer(payload: {
+    name: string;
+    host: string;
+    port?: number;
+    user?: string;
+    keyId?: string;
+    generateKey?: boolean;
+    privateKeyPem?: string;
+    dockerSocketPath?: string;
+    region?: string;
+    tags?: string[];
+    hostKeyPolicy?: 'tofu' | 'strict';
+    expectedFingerprint?: string;
+  }): Promise<FleetServer> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/servers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo añadir el servidor remoto'
+    );
+    return data?.server || data;
+  },
+
+  async updateServer(id: string, payload: Partial<{
+    name: string;
+    host: string;
+    port: number;
+    user: string;
+    keyId: string;
+    dockerSocketPath: string;
+    region: string;
+    tags: string[];
+    hostKeyPolicy: 'tofu' | 'strict';
+  }>): Promise<FleetServer> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/servers/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo actualizar el servidor'
+    );
+    return data?.server || data;
+  },
+
+  async deleteServer(id: string, force = false): Promise<{ deleted?: boolean; removed?: boolean }> {
+    const qs = force ? '?force=1' : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/servers/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' }),
+      'No se pudo eliminar el servidor'
+    );
+  },
+
+  async probeServer(id: string, force = true): Promise<{ server?: FleetServer; probe?: FleetServerProbe; resources?: FleetServerProbe | null; status?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/servers/${encodeURIComponent(id)}/probe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force }),
+      }),
+      'No se pudo sondear el servidor remoto'
+    );
+  },
+
+  async repinServerHostKey(id: string, expectedFingerprint?: string): Promise<{ server?: FleetServer; fingerprint?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/servers/${encodeURIComponent(id)}/repin-host-key`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(expectedFingerprint ? { expectedFingerprint } : {}),
+      }),
+      'No se pudo volver a fijar la huella SSH'
+    );
+  },
+
+  async getFleetKeys(): Promise<{ keys: FleetSshKey[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/keys`),
+      'No se pudieron cargar las llaves SSH'
+    );
+    return Array.isArray(data) ? { keys: data } : { keys: data?.keys || [] };
+  },
+
+  async createFleetKey(payload: {
+    name: string;
+    mode?: 'generate' | 'import';
+    privateKeyPem?: string;
+  }): Promise<FleetSshKey> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/keys`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo crear la llave SSH'
+    );
+    return data?.key || data;
+  },
+
+  async deleteFleetKey(id: string): Promise<{ deleted?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/keys/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'No se pudo eliminar la llave SSH'
+    );
+  },
+
+  // --- Teams, RBAC y Tokens con alcance ---
+
+  async getRbacMe(): Promise<RbacIdentity> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/me`),
+      'No se pudo obtener la identidad de acceso'
+    );
+  },
+
+  async getTeams(): Promise<{ teams: TeamSummary[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/teams`),
+      'No se pudieron cargar los equipos'
+    );
+    return Array.isArray(data) ? { teams: data } : { teams: data?.teams || [] };
+  },
+
+  async getTeamMembers(teamId = 'team_default'): Promise<{ members: TeamMember[]; invites?: TeamInvite[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/teams/${encodeURIComponent(teamId)}/members`),
+      'No se pudieron cargar los miembros del equipo'
+    );
+    return Array.isArray(data)
+      ? { members: data, invites: [] }
+      : { members: data?.members || [], invites: data?.invites || [] };
+  },
+
+  async getTeamInvites(teamId = 'team_default'): Promise<{ invites: TeamInvite[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/teams/${encodeURIComponent(teamId)}/invites`),
+      'No se pudieron cargar las invitaciones pendientes'
+    );
+    return Array.isArray(data) ? { invites: data } : { invites: data?.invites || [] };
+  },
+
+  async createTeamInvite(payload: {
+    teamId?: string;
+    email: string;
+    role: RbacRole;
+    ttlHours?: number;
+    projectIds?: string[] | null;
+  }): Promise<{ invite: TeamInvite; token?: string; inviteToken?: string; inviteUrl?: string }> {
+    const teamId = payload.teamId || 'team_default';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/teams/${encodeURIComponent(teamId)}/invites`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo generar la invitación'
+    );
+  },
+
+  async revokeTeamInvite(inviteId: string, teamId = 'team_default'): Promise<{ revoked?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/teams/${encodeURIComponent(teamId)}/invites/${encodeURIComponent(inviteId)}`, {
+        method: 'DELETE',
+      }),
+      'No se pudo revocar la invitación'
+    );
+  },
+
+  async updateTeamMember(
+    id: string,
+    payload: { teamId?: string; role?: RbacRole; projectIds?: string[] | '*' | null }
+  ): Promise<TeamMember> {
+    const teamId = payload.teamId || 'team_default';
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/teams/${encodeURIComponent(teamId)}/members/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo actualizar el miembro del equipo'
+    );
+    return data?.member || data;
+  },
+
+  async removeTeamMember(id: string, teamId = 'team_default'): Promise<{ removed?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/teams/${encodeURIComponent(teamId)}/members/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      }),
+      'No se pudo eliminar el miembro del equipo'
+    );
+  },
+
+  async getProjectAcl(projectId: string): Promise<{ teamId?: string; overrides: Record<string, string> }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/acl`),
+      'No se pudieron cargar los permisos del proyecto'
+    );
+  },
+
+  async setProjectAcl(projectId: string, payload: { userId: string; role: string }): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/acl`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo actualizar el permiso del proyecto'
+    );
+  },
+
+  async removeProjectAcl(projectId: string, userId: string): Promise<{ removed?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(
+        `${API_BASE}/projects/${encodeURIComponent(projectId)}/acl/${encodeURIComponent(userId)}`,
+        { method: 'DELETE' }
+      ),
+      'No se pudo restablecer el permiso del proyecto'
+    );
+  },
+
+  async getScopedTokens(): Promise<{ tokens: ScopedApiToken[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/tokens`),
+      'No se pudieron cargar los tokens de API'
+    );
+    return Array.isArray(data) ? { tokens: data } : { tokens: data?.tokens || [] };
+  },
+
+  async createScopedToken(payload: {
+    name: string;
+    role?: RbacRole;
+    scopes: string[];
+    projectIds?: string[] | '*' | null;
+    expiresInDays?: number | null;
+    teamId?: string;
+  }): Promise<{ token: string; record?: ScopedApiToken; meta?: ScopedApiToken }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo crear el token con alcance'
+    );
+  },
+
+  async revokeScopedToken(id: string): Promise<{ revoked?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'No se pudo revocar el token'
+    );
+  },
+
+  // --- Entornos y Shared Encrypted Vault ---
+
+  async getVaultSecrets(): Promise<{ secrets: VaultSecretMeta[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/vault`),
+      'No se pudieron cargar los secretos del Vault'
+    );
+    return Array.isArray(data) ? { secrets: data } : { secrets: data?.secrets || [] };
+  },
+
+  async setVaultSecret(key: string, value: string, opts: { scope?: 'runtime' | 'build' | 'both' } = {}): Promise<VaultSecretMeta> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/vault/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, value, ...opts }),
+      }),
+      'No se pudo guardar el secreto en el Vault'
+    );
+    return data?.secret || data;
+  },
+
+  async deleteVaultSecret(key: string): Promise<{ deleted?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/vault/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+      'No se pudo eliminar el secreto del Vault'
+    );
+  },
+
+  async getProjectEnvironments(projectId: string): Promise<{ environments: ProjectEnvironmentItem[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/environments`),
+      'No se pudieron cargar los entornos del proyecto'
+    );
+    return Array.isArray(data) ? { environments: data } : { environments: data?.environments || [] };
+  },
+
+  async saveProjectEnvironment(
+    projectId: string,
+    env: string,
+    payload: { branch?: string; domains?: string[]; serverId?: string; envVars?: Record<string, string> }
+  ): Promise<ProjectEnvironmentItem> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(env)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo guardar el entorno'
+    );
+    return data?.environment || data;
+  },
+
+  async diffProjectEnvironments(projectId: string, from: string, to: string): Promise<EnvironmentDiffResult> {
+    const qs = new URLSearchParams({ from, to });
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/environments/diff?${qs.toString()}`),
+      'No se pudo calcular el diff entre entornos'
+    );
+  },
+
+  async promoteProjectEnvironment(
+    projectId: string,
+    payload: { fromEnv: string; toEnv: string; includeEnvVars?: boolean; dryRun?: boolean }
+  ): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/environments/promote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo promocionar el entorno'
+    );
+  },
+
+  // --- Declarative GitOps (culkibo.yaml) ---
+
+  async exportGitOps(opts: { projectIds?: string[]; name?: string; includeCrons?: boolean; includeMonitors?: boolean } = {}): Promise<{ yaml: string; manifestHash?: string }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/gitops/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      }),
+      'No se pudo exportar culkibo.yaml'
+    );
+    return { yaml: data?.yaml || data?.yamlText || '', manifestHash: data?.manifestHash };
+  },
+
+  async planGitOps(yaml: string, prune = false): Promise<GitOpsPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/gitops/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ yaml, yamlText: yaml, prune }),
+      }),
+      'No se pudo simular el plan GitOps'
+    );
+  },
+
+  async applyGitOps(
+    yaml: string,
+    opts: { dryRun?: boolean; prune?: boolean; confirmDestructive?: boolean } = {}
+  ): Promise<GitOpsPlanResult & { applied?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/gitops/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ yaml, yamlText: yaml, ...opts }),
+      }),
+      'No se pudo aplicar el manifiesto GitOps'
+    );
+  },
+
+  async getGitOpsDrift(): Promise<GitOpsDriftResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/gitops/drift`),
+      'No se pudo comprobar el drift de GitOps'
+    );
+  },
+
+  // --- Uptime Monitors y Páginas públicas de estado ---
+
+  async getUptimeMonitors(): Promise<{ monitors: UptimeMonitor[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/monitors`),
+      'No se pudieron cargar los monitores de disponibilidad'
+    );
+    return Array.isArray(data) ? { monitors: data } : { monitors: data?.monitors || [] };
+  },
+
+  async createUptimeMonitor(payload: {
+    name: string;
+    type: 'http' | 'tcp' | 'managed_project';
+    url?: string;
+    host?: string;
+    port?: number;
+    projectId?: string;
+    intervalSec?: number;
+    expectedStatus?: number;
+    keyword?: string;
+    maxLatencyMs?: number;
+    public?: boolean;
+  }): Promise<UptimeMonitor> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/monitors`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo crear el monitor de disponibilidad'
+    );
+    return data?.monitor || data;
+  },
+
+  async deleteUptimeMonitor(id: string): Promise<{ deleted?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/monitors/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'No se pudo eliminar el monitor'
+    );
+  },
+
+  async runUptimeCheck(id: string): Promise<{ monitor?: UptimeMonitor; check?: UptimeMonitorCheckPoint }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/monitors/${encodeURIComponent(id)}/check`, { method: 'POST' }),
+      'No se pudo ejecutar la comprobación manual'
+    );
+  },
+
+  async getStatusPages(): Promise<{ pages: PublicStatusPage[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/pages`),
+      'No se pudieron cargar las páginas de estado'
+    );
+    return Array.isArray(data) ? { pages: data } : { pages: data?.pages || [] };
+  },
+
+  async saveStatusPage(payload: {
+    slug: string;
+    title: string;
+    description?: string;
+    accentColor?: string;
+    monitorIds: string[];
+  }): Promise<PublicStatusPage> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/pages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo guardar la página pública de estado'
+    );
+    return data?.page || data;
+  },
+
+  async deleteStatusPage(slug: string): Promise<{ deleted?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/pages/${encodeURIComponent(slug)}`, { method: 'DELETE' }),
+      'No se pudo eliminar la página de estado'
+    );
+  },
+
+  // --- Scale-to-Zero Auto-Sleep y VPS Cost/RAM Advisor ---
+
+  async getSleepPolicy(projectId: string): Promise<SleepPolicy> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/sleep/${encodeURIComponent(projectId)}`),
+      'No se pudo leer la política de auto-reposo'
+    );
+  },
+
+  async saveSleepPolicy(
+    projectId: string,
+    payload: { enabled: boolean; idleMinutes?: number; mode?: 'pause' | 'stop'; excludeCrons?: boolean }
+  ): Promise<SleepPolicy> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/sleep/${encodeURIComponent(projectId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo guardar la política de auto-reposo'
+    );
+  },
+
+  async sleepProject(projectId: string): Promise<{ sleeping?: boolean; status?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/sleep/${encodeURIComponent(projectId)}/sleep`, { method: 'POST' }),
+      'No se pudo suspender el proyecto'
+    );
+  },
+
+  async wakeProject(projectId: string): Promise<{ awake?: boolean; status?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/sleep/${encodeURIComponent(projectId)}/wake`, { method: 'POST' }),
+      'No se pudo despertar el proyecto'
+    );
+  },
+
+  async getResourceAdvisor(vpsMonthlyEur?: number): Promise<ResourceAdvisorReport> {
+    const qs = typeof vpsMonthlyEur === 'number' && Number.isFinite(vpsMonthlyEur)
+      ? `?vpsMonthlyEur=${encodeURIComponent(String(vpsMonthlyEur))}`
+      : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/advisor/resources${qs}`),
+      'No se pudo analizar el ahorro y consumo del VPS'
+    );
+  },
+
+  // --- Live Sync 2.0 (Per-File Time-Travel & Multi-Client Conflicts) ---
+
+  async getSyncFileHistory(projectId: string, filePath: string): Promise<LiveSyncFileHistory> {
+    const qs = new URLSearchParams({ path: filePath });
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/sync/files/history?${qs.toString()}`),
+      'No se pudo cargar el historial del archivo'
+    );
+  },
+
+  async rollbackSyncFile(
+    projectId: string,
+    filePath: string,
+    seq: number,
+    mode: 'to' | 'before' = 'to'
+  ): Promise<{ reverted?: boolean; filePath?: string; targetSeq?: number; durationMs?: number }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/sync/files/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath, seq, mode }),
+      }),
+      'No se pudo revertir el archivo a esa revisión'
+    );
+  },
+
+  async resolveSyncConflict(projectId: string, conflictId: string): Promise<{ resolved?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(
+        `${API_BASE}/projects/${encodeURIComponent(projectId)}/sync/conflicts/${encodeURIComponent(conflictId)}/resolve`,
+        { method: 'POST' }
+      ),
+      'No se pudo marcar el conflicto como resuelto'
+    );
+  },
 };

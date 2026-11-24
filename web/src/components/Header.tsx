@@ -15,6 +15,8 @@ import {
   Zap,
   Check,
   Terminal,
+  Server,
+  HeartPulse,
 } from 'lucide-react';
 import { CulkiboLogo } from './CulkiboLogo';
 
@@ -22,6 +24,8 @@ const IS_MAC = typeof navigator !== 'undefined' && /mac|iphone|ipad/i.test(navig
 
 export type AppView =
   | 'projects'
+  | 'fleet'
+  | 'uptime'
   | 'metrics'
   | 'import'
   | 'domains'
@@ -86,13 +90,15 @@ export const Header: React.FC<HeaderProps> = ({
 
   const currentProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) : null;
 
-  const navItems: Array<{ id: AppView; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+  const navItems: Array<{ id: AppView; label: string; shortLabel?: string; icon: React.ComponentType<{ className?: string }> }> = [
     { id: 'projects', label: 'Proyectos', icon: LayoutGrid },
+    { id: 'fleet', label: 'Flota', icon: Server },
+    { id: 'uptime', label: 'Uptime', icon: HeartPulse },
     { id: 'metrics', label: 'Métricas', icon: Gauge },
     { id: 'domains', label: 'Dominios', icon: Globe },
     { id: 'catalog', label: 'Catálogo', icon: Package },
     { id: 'import', label: 'Importar', icon: Download },
-    { id: 'ai', label: 'Agentes IA', icon: Bot },
+    { id: 'ai', label: 'Agentes IA', shortLabel: 'IA', icon: Bot },
   ];
 
   const mobileNavItems: Array<{ id: AppView; label: string; icon: React.ComponentType<{ className?: string }> }> = [
@@ -174,7 +180,7 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           {/* Navegación principal */}
-          <nav aria-label="Navegación principal" className="hidden lg:flex items-center gap-0.5">
+          <nav aria-label="Navegación principal" className="hidden lg:flex items-center gap-0.5 min-w-0 overflow-x-auto no-scrollbar">
             {navItems.map((item) => {
               const Icon = item.icon;
               const isActive = activeView === item.id && !activeProjectId;
@@ -184,14 +190,21 @@ export const Header: React.FC<HeaderProps> = ({
                   type="button"
                   aria-current={isActive ? 'page' : undefined}
                   onClick={() => setActiveView(item.id)}
-                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[13px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  className={`flex items-center gap-1.5 px-2 xl:px-2.5 py-1.5 rounded-lg text-[13px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                     isActive
                       ? 'bg-slate-100 text-slate-900'
                       : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
                   }`}
                 >
-                  <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-slate-900' : 'text-slate-400'}`} />
-                  <span>{item.label}</span>
+                  <Icon className={`w-3.5 h-3.5 shrink-0 ${isActive ? 'text-slate-900' : 'text-slate-400'}`} />
+                  {item.shortLabel ? (
+                    <>
+                      <span className="xl:hidden">{item.shortLabel}</span>
+                      <span className="hidden xl:inline">{item.label}</span>
+                    </>
+                  ) : (
+                    <span>{item.label}</span>
+                  )}
                   {item.id === 'ai' && aiPulseLabel && (
                     <span className="w-1.5 h-1.5 rounded-full bg-slate-900" title={aiPulseLabel} />
                   )}
@@ -228,12 +241,12 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${wsConnected ? 'bg-emerald-500' : 'bg-red-500'}`} />
               {activeSyncCount > 0 ? (
-                <span className="hidden sm:inline-flex items-center gap-1 text-slate-900 font-semibold tabular-nums">
+                <span className="hidden xl:inline-flex items-center gap-1 text-slate-900 font-semibold tabular-nums">
                   <Zap className="w-3 h-3 text-amber-500" />
                   En vivo ({activeSyncCount})
                 </span>
               ) : (
-                <span className="hidden sm:inline">{wsConnected ? 'Registros' : 'Reconectando…'}</span>
+                <span className="hidden xl:inline">{wsConnected ? 'Registros' : 'Reconectando…'}</span>
               )}
             </button>
 

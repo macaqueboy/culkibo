@@ -23,6 +23,8 @@ const GROUPS: Array<{
     title: 'Navegación rápida (pulsa g y luego la letra)',
     items: [
       { keys: ['g', 'p'], label: 'Ir a Proyectos' },
+      { keys: ['g', 'f'], label: 'Ir a Flota de servidores (SSH)' },
+      { keys: ['g', 'u'], label: 'Ir a Uptime, Estado y Ahorro' },
       { keys: ['g', 'm'], label: 'Ir a Métricas y Doctor del sistema' },
       { keys: ['g', 'd'], label: 'Ir a Dominios, HTTPS y túneles' },
       { keys: ['g', 'c'], label: 'Ir al Catálogo de servicios (1 clic)' },

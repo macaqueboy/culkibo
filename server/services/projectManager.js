@@ -406,6 +406,241 @@ class ProjectManager extends EventEmitter {
       }
       data.domains = normalized;
     }
+
+    if (data.serverId !== undefined && data.serverId !== null && data.serverId !== '') {
+      if (typeof data.serverId !== 'string') {
+        throw new Error('Invalid serverId');
+      }
+      const sid = data.serverId.trim();
+      if (!/^[a-z0-9_-]{1,64}$/.test(sid)) {
+        throw new Error('Invalid serverId (expected /^[a-z0-9_-]{1,64}$/)');
+      }
+      data.serverId = sid;
+    }
+
+    if (data.teamId !== undefined && data.teamId !== null && data.teamId !== '') {
+      if (typeof data.teamId !== 'string') {
+        throw new Error('Invalid teamId');
+      }
+      const tid = data.teamId.trim();
+      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(tid)) {
+        throw new Error('Invalid teamId');
+      }
+      data.teamId = tid;
+    }
+
+    if (data.smokeTests !== undefined && data.smokeTests !== null) {
+      /** @type {any[]} */
+      let checksList = [];
+      if (Array.isArray(data.smokeTests)) {
+        checksList = data.smokeTests;
+      } else if (typeof data.smokeTests === 'object' && Array.isArray(data.smokeTests.checks)) {
+        if (data.smokeTests.failPolicy !== undefined && !['abort', 'rollback', 'warn'].includes(data.smokeTests.failPolicy)) {
+          throw new Error('Invalid smokeTests.failPolicy');
+        }
+        checksList = data.smokeTests.checks;
+      } else {
+        throw new Error('Invalid smokeTests payload');
+      }
+      if (checksList.length > 10) {
+        throw new Error('smokeTests supports at most 10 checks');
+      }
+      const blockedHeaders = /^(host|connection|content-length|transfer-encoding|keep-alive|te|trailer|upgrade)$/i;
+      const forbiddenJsonSegs = new Set(['__proto__', 'constructor', 'prototype']);
+      for (const chk of checksList) {
+        if (!chk || typeof chk !== 'object' || Array.isArray(chk)) {
+          throw new Error('Invalid smokeTest check entry');
+        }
+        if (typeof chk.path !== 'string') {
+          throw new Error('Invalid smokeTest path');
+        }
+        const p = chk.path.trim();
+        if (!p.startsWith('/') || p.startsWith('//') || p.length > 512 || p.includes('..') || /[\s\r\n\0]/.test(p)) {
+          throw new Error(`Invalid smokeTest path: ${p.slice(0, 60)}`);
+        }
+        if (chk.method !== undefined && !['GET', 'HEAD', 'POST'].includes(String(chk.method).toUpperCase())) {
+          throw new Error(`Invalid smokeTest method: ${chk.method}`);
+        }
+        const stRaw = chk.expectStatus !== undefined ? chk.expectStatus : chk.expectedStatus;
+        if (stRaw !== undefined && stRaw !== null) {
+          const validNum = typeof stRaw === 'number' && Number.isInteger(stRaw) && stRaw >= 100 && stRaw <= 599;
+          const validClass = typeof stRaw === 'string' && /^[1-5]xx$/i.test(stRaw.trim());
+          const validArr = Array.isArray(stRaw) && stRaw.length > 0 && stRaw.length <= 10 &&
+            stRaw.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 100 && n <= 599);
+          if (!validNum && !validClass && !validArr) {
+            throw new Error('Invalid smokeTest expectStatus');
+          }
+        }
+        const containsRaw = chk.expectBodyContains !== undefined ? chk.expectBodyContains : chk.bodyContains;
+        if (containsRaw !== undefined && containsRaw !== null) {
+          if (typeof containsRaw !== 'string' || containsRaw.length > 256 || containsRaw.includes('\0')) {
+            throw new Error('Invalid smokeTest expectBodyContains');
+          }
+        }
+        if (chk.bodyNotContains !== undefined && chk.bodyNotContains !== null) {
+          if (typeof chk.bodyNotContains !== 'string' || chk.bodyNotContains.length > 256 || chk.bodyNotContains.includes('\0')) {
+            throw new Error('Invalid smokeTest bodyNotContains');
+          }
+        }
+        if (chk.maxLatencyMs !== undefined && chk.maxLatencyMs !== null && chk.maxLatencyMs !== '') {
+          const ml = Number(chk.maxLatencyMs);
+          if (!Number.isFinite(ml) || ml < 1 || ml > 60000) {
+            throw new Error('Invalid smokeTest maxLatencyMs (1..60000)');
+          }
+        }
+        if (chk.timeoutMs !== undefined && chk.timeoutMs !== null) {
+          const tm = Number(chk.timeoutMs);
+          if (!Number.isFinite(tm) || tm < 50 || tm > 30000) {
+            throw new Error('Invalid smokeTest timeoutMs (50..30000)');
+          }
+        }
+        if (chk.retries !== undefined && chk.retries !== null) {
+          const rt = Number(chk.retries);
+          if (!Number.isInteger(rt) || rt < 0 || rt > 3) {
+            throw new Error('Invalid smokeTest retries (0..3)');
+          }
+        }
+        if (chk.headers !== undefined && chk.headers !== null) {
+          if (typeof chk.headers !== 'object' || Array.isArray(chk.headers)) {
+            throw new Error('Invalid smokeTest headers');
+          }
+          const entries = Object.entries(chk.headers);
+          if (entries.length > 10) throw new Error('Too many smokeTest headers (max 10)');
+          for (const [hk, hv] of entries) {
+            if (!/^[A-Za-z0-9-]+$/.test(hk) || blockedHeaders.test(hk)) {
+              throw new Error(`Disallowed smokeTest header: ${hk}`);
+            }
+            if (typeof hv !== 'string' || /[\r\n\0]/.test(hv) || hv.length > 512) {
+              throw new Error(`Invalid smokeTest header value for ${hk}`);
+            }
+          }
+        }
+        if (chk.jsonPathEquals !== undefined && chk.jsonPathEquals !== null) {
+          if (typeof chk.jsonPathEquals !== 'object' || Array.isArray(chk.jsonPathEquals) || typeof chk.jsonPathEquals.path !== 'string') {
+            throw new Error('Invalid smokeTest jsonPathEquals');
+          }
+          const segs = chk.jsonPathEquals.path.trim().split('.').filter(Boolean);
+          if (segs.length < 1 || segs.length > 5 || segs.some((s) => forbiddenJsonSegs.has(s) || !/^[A-Za-z0-9_-]{1,64}$/.test(s))) {
+            throw new Error('Invalid smokeTest jsonPathEquals path');
+          }
+        }
+      }
+    }
+
+    if (data.canary !== undefined && data.canary !== null) {
+      if (typeof data.canary !== 'object' || Array.isArray(data.canary)) {
+        throw new Error('Invalid canary configuration');
+      }
+      if (data.canary.weightPercent !== undefined && data.canary.weightPercent !== null) {
+        const wp = Number(data.canary.weightPercent);
+        if (!Number.isFinite(wp) || wp < 1 || wp > 99) {
+          throw new Error('Invalid canary.weightPercent (1..99)');
+        }
+      }
+      if (data.canary.observeSeconds !== undefined && data.canary.observeSeconds !== null) {
+        const obs = Number(data.canary.observeSeconds);
+        if (!Number.isFinite(obs) || obs <= 0 || obs > 3600) {
+          throw new Error('Invalid canary.observeSeconds (0..3600]');
+        }
+      }
+      if (data.canary.maxErrorRate !== undefined && data.canary.maxErrorRate !== null) {
+        const mer = Number(data.canary.maxErrorRate);
+        if (!Number.isFinite(mer) || mer < 0 || mer > 1) {
+          throw new Error('Invalid canary.maxErrorRate (0..1)');
+        }
+      }
+      if (data.canary.steps !== undefined && data.canary.steps !== null) {
+        if (!Array.isArray(data.canary.steps) || data.canary.steps.length < 1 || data.canary.steps.length > 5) {
+          throw new Error('Invalid canary.steps (1..5 ascending ints)');
+        }
+        let prevStep = 0;
+        for (const s of data.canary.steps) {
+          if (typeof s !== 'number' || !Number.isInteger(s) || s < 1 || s > 100 || s <= prevStep) {
+            throw new Error('Invalid canary.steps (must be strictly ascending integers in 1..100)');
+          }
+          prevStep = s;
+        }
+      }
+      if (data.canary.stepDurationMs !== undefined && data.canary.stepDurationMs !== null) {
+        const sd = Number(data.canary.stepDurationMs);
+        if (!Number.isFinite(sd) || sd < 10 || sd > 300000) {
+          throw new Error('Invalid canary.stepDurationMs (10..300000)');
+        }
+      }
+      if (data.canary.checksPerStep !== undefined && data.canary.checksPerStep !== null) {
+        const cps = Number(data.canary.checksPerStep);
+        if (!Number.isInteger(cps) || cps < 1 || cps > 10) {
+          throw new Error('Invalid canary.checksPerStep (1..10)');
+        }
+      }
+      if (data.canary.maxLatencyMs !== undefined && data.canary.maxLatencyMs !== null) {
+        const ml = Number(data.canary.maxLatencyMs);
+        if (!Number.isFinite(ml) || ml < 1 || ml > 60000) {
+          throw new Error('Invalid canary.maxLatencyMs (1..60000)');
+        }
+      }
+    }
+
+    if (data.freezeWindows !== undefined && data.freezeWindows !== null) {
+      if (!Array.isArray(data.freezeWindows)) {
+        throw new Error('Invalid freezeWindows (expected array)');
+      }
+      if (data.freezeWindows.length > 16) {
+        throw new Error('freezeWindows supports at most 16 entries');
+      }
+      const validDayNames = new Set(['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']);
+      for (const fw of data.freezeWindows) {
+        if (!fw || typeof fw !== 'object' || Array.isArray(fw)) {
+          throw new Error('Invalid freezeWindow entry');
+        }
+        const tzRaw = fw.tz !== undefined ? fw.tz : (fw.timezone !== undefined ? fw.timezone : 'UTC');
+        if (typeof tzRaw !== 'string' || !tzRaw.trim() || tzRaw.length > 64) {
+          throw new Error('Invalid freezeWindow timezone');
+        }
+        try {
+          new Intl.DateTimeFormat('en-US', { timeZone: tzRaw.trim() });
+        } catch (e) {
+          throw new Error(`Invalid IANA timezone in freezeWindow: ${tzRaw}`);
+        }
+        if (fw.reason !== undefined && fw.reason !== null) {
+          if (typeof fw.reason !== 'string' || fw.reason.length > 200 || fw.reason.includes('\0')) {
+            throw new Error('Invalid freezeWindow reason');
+          }
+        }
+        const daysRaw = fw.days !== undefined ? fw.days : fw.daysOfWeek;
+        if (daysRaw !== undefined && daysRaw !== null) {
+          if (!Array.isArray(daysRaw) || daysRaw.length === 0 || daysRaw.length > 7) {
+            throw new Error('Invalid freezeWindow days');
+          }
+          for (const d of daysRaw) {
+            const okNum = typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 6;
+            const okStr = typeof d === 'string' && validDayNames.has(d.trim().toLowerCase().slice(0, 3));
+            if (!okNum && !okStr) {
+              throw new Error(`Invalid freezeWindow day: ${d}`);
+            }
+          }
+        }
+        if (fw.kind === 'once') {
+          const s = Date.parse(String(fw.startAt || ''));
+          const e = Date.parse(String(fw.endAt || ''));
+          if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) {
+            throw new Error('Invalid freezeWindow startAt/endAt');
+          }
+        } else if (fw.startHour !== undefined || fw.endHour !== undefined) {
+          const sh = Number(fw.startHour);
+          const eh = Number(fw.endHour);
+          if (!Number.isInteger(sh) || sh < 0 || sh > 23 || !Number.isInteger(eh) || eh < 0 || eh > 24) {
+            throw new Error('Invalid freezeWindow startHour/endHour (startHour 0..23, endHour 0..24)');
+          }
+        } else if (typeof fw.startTime === 'string' && typeof fw.endTime === 'string') {
+          if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(fw.startTime.trim()) || !/^(([01]\d|2[0-3]):[0-5]\d|24:00)$/.test(fw.endTime.trim())) {
+            throw new Error('Invalid freezeWindow startTime/endTime (expected HH:MM)');
+          }
+        } else {
+          throw new Error('freezeWindow requires startHour/endHour, startTime/endTime, or kind:"once" with startAt/endAt');
+        }
+      }
+    }
   }
 
   create(data) {
@@ -418,11 +653,19 @@ class ProjectManager extends EventEmitter {
     return project;
   }
 
-  update(id, data) {
+  /**
+   * @param {string} id
+   * @param {any} data
+   * @param {{ allowTeamReassign?: boolean }} [options]
+   */
+  update(id, data, options = {}) {
     const safeData = data && typeof data === 'object' ? { ...data } : {};
-    // Never let a caller overwrite immutable identity/audit fields via PUT.
+    // Never let a caller overwrite immutable identity/audit/tenant fields via generic PUT.
     delete safeData.id;
     delete safeData.createdAt;
+    if (!options || !options.allowTeamReassign) {
+      delete safeData.teamId;
+    }
     this.validateProjectData(safeData, id);
     const project = this.projects.get(id);
     if (!project) throw new Error('Project not found');

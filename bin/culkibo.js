@@ -453,7 +453,11 @@ program
     });
 
     client.on('frame_ack', (ack) => {
-      console.log(`⚡ [Forge] Frame #${ack.seq} · ${ack.written} escritos, ${ack.deleted} borrados, ${ack.dedupSkipped} sin cambios · ${ack.applyMs} ms [${ack.mode}]`);
+      const comp = ack.wireStats && ack.wireStats.savedPct > 0 ? ` · compresión -${ack.wireStats.savedPct}% (${ack.wireStats.codec})` : '';
+      console.log(`⚡ [Forge] Frame #${ack.seq} · ${ack.written} escritos, ${ack.deleted} borrados, ${ack.dedupSkipped} sin cambios · ${ack.applyMs} ms [${ack.mode}]${comp}`);
+    });
+    client.on('sync_conflict', (conflict) => {
+      console.warn(`\x1b[33m⚠️  [Forge:Conflicto] ${conflict.path} modificado también por ${conflict.otherClientName || 'otro cliente'} (rev #${conflict.previousSeq || '?'})\x1b[0m`);
     });
     client.on('sync_error', (err) => {
       console.error(`❌ [Forge] ${err.message}`);
@@ -818,6 +822,108 @@ program
       stdinClosed = true;
       maybeExit();
     });
+  });
+
+// Flota Multi-Servidor (SSH sin shell)
+program
+  .command('fleet <action> [serverId]')
+  .description('Gestiona nodos VPS remotos por SSH (list, probe, keys)')
+  .action(async (action, serverId) => {
+    try {
+      const fleet = require('../server/services/serverFleetManager');
+      if (action === 'list') {
+        const list = fleet.listServers({ includeLocal: true });
+        console.table(list.map((s) => ({
+          ID: s.id,
+          Nombre: s.name,
+          Host: s.host || '127.0.0.1',
+          Estado: s.status,
+          Region: s.region || '—',
+          Docker: s.resources?.dockerVersion || '—'
+        })));
+      } else if (action === 'probe' && serverId) {
+        const res = await fleet.probeServer(serverId, { force: true });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (action === 'keys') {
+        console.table(fleet.listKeys().map((k) => ({
+          ID: k.id,
+          Nombre: k.name,
+          Tipo: k.keyType,
+          Huella: k.fingerprint
+        })));
+      } else {
+        console.error('Acción inválida. Usa: list | probe <serverId> | keys');
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`❌ Error en fleet: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+// GitOps declarativo (culkibo.yaml)
+program
+  .command('gitops <action> [file]')
+  .description('Exporta, simula o aplica pilas completas declarativas (export, plan <file>, apply <file>, drift)')
+  .option('--prune', 'Eliminar recursos no declarados en el manifiesto')
+  .option('--confirm-destructive', 'Confirmar operaciones destructivas con --prune')
+  .action(async (action, file, options) => {
+    try {
+      const gitops = require('../server/services/gitopsManager');
+      if (action === 'export') {
+        const res = gitops.exportStack({});
+        console.log(res.yaml);
+      } else if (action === 'plan' && file) {
+        const yamlText = fs.readFileSync(path.resolve(file), 'utf8');
+        console.log(JSON.stringify(gitops.planApply(yamlText, { prune: Boolean(options.prune) }), null, 2));
+      } else if (action === 'apply' && file) {
+        const yamlText = fs.readFileSync(path.resolve(file), 'utf8');
+        const res = await gitops.applyStack(yamlText, {
+          dryRun: false,
+          prune: Boolean(options.prune),
+          confirmDestructive: Boolean(options.confirmDestructive)
+        });
+        console.log(JSON.stringify(res, null, 2));
+      } else if (action === 'drift') {
+        console.log(JSON.stringify(gitops.detectDrift(), null, 2));
+      } else {
+        console.error('Acción inválida. Usa: export | plan <archivo.yaml> | apply <archivo.yaml> | drift');
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`❌ Error en gitops: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+// Monitorización Uptime y Asesor de Costes/RAM
+program
+  .command('uptime <action> [id]')
+  .description('Consulta monitores sintéticos y páginas públicas de estado (list, check <id>, pages)')
+  .action(async (action, id) => {
+    try {
+      const um = require('../server/services/uptimeMonitor');
+      if (action === 'list') {
+        console.table(um.listMonitors().map((m) => ({
+          ID: m.id,
+          Nombre: m.name,
+          Tipo: m.type,
+          Estado: m.status,
+          Uptime24h: m.stats?.uptime24h != null ? `${m.stats.uptime24h}%` : '—',
+          P95ms: m.stats?.p95Ms ?? '—'
+        })));
+      } else if (action === 'check' && id) {
+        console.log(JSON.stringify(await um.runCheck(id), null, 2));
+      } else if (action === 'pages') {
+        console.table(um.listStatusPages().map((p) => ({ Slug: p.slug, Titulo: p.title, URL: `/status/${p.slug}` })));
+      } else {
+        console.error('Acción inválida. Usa: list | check <monitorId> | pages');
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`❌ Error en uptime: ${err.message}`);
+      process.exit(1);
+    }
   });
 
 program.parseAsync(process.argv).catch((err) => {

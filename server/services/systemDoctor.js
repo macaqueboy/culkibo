@@ -78,7 +78,20 @@ function checkKeyFilePermissions() {
   if (process.platform === 'win32') return { ok: true, issues: [] };
   /** @type {string[]} */
   const issues = [];
-  for (const name of ['auth.json', '.databases.key', '.services.key']) {
+  const sensitiveFiles = [
+    'auth.json',
+    '.databases.key',
+    '.services.key',
+    '.fleet.key',
+    'fleet-keys.json',
+    '.vault.key',
+    '.rbac.key',
+    '.teams.key',
+    'teams.json',
+    'advisor.json',
+    'deploy-freeze.json'
+  ];
+  for (const name of sensitiveFiles) {
     const filePath = path.join(DATA_DIR, name);
     try {
       if (!fs.existsSync(filePath)) continue;
@@ -89,6 +102,228 @@ function checkKeyFilePermissions() {
     } catch (e) {}
   }
   return { ok: issues.length === 0, issues };
+}
+
+/**
+ * Estima el tramo VPS europeo de referencia según RAM total del host (sin dependencias).
+ * @param {number} totalMb
+ */
+function estimateVpsTierEur(totalMb) {
+  const tiers = [
+    { ramGb: 2, eur: 3.79 },
+    { ramGb: 4, eur: 4.59 },
+    { ramGb: 8, eur: 7.59 },
+    { ramGb: 16, eur: 13.99 },
+    { ramGb: 32, eur: 26.99 }
+  ];
+  const gb = totalMb / 1024;
+  return tiers.find((t) => gb <= t.ramGb + 0.5) || tiers[tiers.length - 1];
+}
+
+/** Lee `/proc/meminfo` en Linux (degrada limpiamente en Windows/macOS). */
+function readLinuxMemInfo() {
+  if (process.platform !== 'linux') return null;
+  try {
+    const raw = fs.readFileSync('/proc/meminfo', 'utf8');
+    /** @type {Record<string, number>} */
+    const map = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^([A-Za-z0-9_()]+):\s+(\d+)\s+kB/);
+      if (m) map[m[1]] = Math.round(Number(m[2]) / 1024);
+    }
+    if (!map.MemTotal) return null;
+    const swapTotalMb = map.SwapTotal || 0;
+    const swapFreeMb = map.SwapFree || 0;
+    const swapUsedMb = Math.max(0, swapTotalMb - swapFreeMb);
+    const swapUsedPct = swapTotalMb > 0 ? Math.round((swapUsedMb / swapTotalMb) * 100) : 0;
+    return {
+      memTotalMb: map.MemTotal,
+      memAvailableMb: map.MemAvailable ?? map.MemFree ?? 0,
+      swapTotalMb,
+      swapUsedMb,
+      swapUsedPct
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Comprobación #10: Asesor de costes/RAM del VPS + salud de nodos de flota SSH.
+ * Carga de forma perezosa `sleepAdvisor` y `serverFleetManager` con degradación
+ * limpia si aún no están disponibles o configurados.
+ *
+ * @param {{
+ *   snap?: any,
+ *   sleepAdvisorMod?: any,
+ *   fleetManagerMod?: any
+ * }} [opts]
+ */
+async function checkCostAndFleet({ snap = null, sleepAdvisorMod = undefined, fleetManagerMod = undefined } = {}) {
+  let advisorMod = sleepAdvisorMod;
+  if (advisorMod === undefined) {
+    try { advisorMod = require('./sleepAdvisor'); } catch (e) { advisorMod = null; }
+  }
+  let fleetMod = fleetManagerMod;
+  if (fleetMod === undefined) {
+    try { fleetMod = require('./serverFleetManager'); } catch (e) { fleetMod = null; }
+  }
+
+  /** @type {'ok' | 'warn' | 'fail'} */
+  let status = 'ok';
+  const summaryParts = [];
+  const detailParts = [];
+  /** @type {Record<string, any>} */
+  const metrics = {};
+
+  // 1. Asesor de costes y RAM del VPS
+  let advisorHandled = false;
+  if (advisorMod && typeof advisorMod === 'object') {
+    try {
+      /** @type {any} */
+      let adv = null;
+      if (typeof advisorMod.getDoctorSummary === 'function') {
+        adv = await Promise.resolve(advisorMod.getDoctorSummary());
+      } else if (typeof advisorMod.analyzeResources === 'function') {
+        adv = await Promise.resolve(advisorMod.analyzeResources());
+      }
+      if (adv && typeof adv === 'object') {
+        advisorHandled = true;
+        const advStatus = adv.status === 'fail' ? 'fail' : (adv.status === 'warn' ? 'warn' : 'ok');
+        if (advStatus === 'fail') status = 'fail';
+        else if (advStatus === 'warn' && status === 'ok') status = 'warn';
+
+        const advMetrics = (adv.metrics && typeof adv.metrics === 'object') ? adv.metrics : {};
+        const reclaimableMb = Number(advMetrics.reclaimableRamMb ?? adv.reclaimableMb ?? adv.savings?.reclaimableRamMb ?? 0) || 0;
+        const savingsEur = Number(advMetrics.monthlySavingsEur ?? adv.estimatedSavingsEurMonth ?? adv.savings?.estimatedMonthlyEur ?? 0) || 0;
+        const idleCount = Number(advMetrics.idleCandidatesCount ?? adv.idleCount ?? adv.idleCandidates?.length ?? 0) || 0;
+        const oomRiskCount = Number(advMetrics.oomRiskCount ?? adv.oomRiskCount ?? adv.oomRisks?.length ?? 0) || 0;
+
+        metrics.advisor = {
+          source: 'sleepAdvisor',
+          reclaimableMb,
+          estimatedSavingsEurMonth: Number(savingsEur.toFixed(2)),
+          idleCount,
+          oomRiskCount
+        };
+
+        if (typeof adv.summary === 'string' && adv.summary.trim()) {
+          summaryParts.push(adv.summary.trim());
+        } else if (oomRiskCount > 0) {
+          summaryParts.push(`${oomRiskCount} servicio(s) en riesgo de OOM`);
+        } else if (reclaimableMb > 0 || savingsEur > 0) {
+          summaryParts.push(`~${reclaimableMb} MB recuperables (~€${savingsEur.toFixed(2)}/mes)`);
+        } else {
+          summaryParts.push('Uso de RAM/costes optimizado');
+        }
+
+        if (typeof adv.detail === 'string' && adv.detail.trim()) {
+          detailParts.push(adv.detail.trim());
+        } else if (idleCount > 0) {
+          detailParts.push(`${idleCount} servicio(s) inactivos candidatos a Auto-Sleep (Scale-to-Zero).`);
+        } else {
+          detailParts.push('Sin contenedores inactivos ni sobrecapacidad crítica detectada.');
+        }
+      }
+    } catch (e) {
+      advisorHandled = false;
+    }
+  }
+
+  if (!advisorHandled) {
+    const totalMb = Math.round(os.totalmem() / 1024 / 1024);
+    const freeMb = Math.round(os.freemem() / 1024 / 1024);
+    const linuxMem = readLinuxMemInfo();
+    const availMb = linuxMem ? linuxMem.memAvailableMb : freeMb;
+    const availPct = totalMb > 0 ? Math.round((availMb / totalMb) * 100) : 100;
+    const tier = estimateVpsTierEur(totalMb);
+    const rssMb = snap && snap.process && Number.isFinite(snap.process.memoryMb) ? snap.process.memoryMb : Math.round(process.memoryUsage().rss / 1024 / 1024);
+
+    metrics.advisor = {
+      source: 'builtin_fallback',
+      hostTotalMb: totalMb,
+      hostAvailableMb: availMb,
+      hostAvailablePct: availPct,
+      daemonRssMb: rssMb,
+      estimatedTierEurMonth: tier.eur,
+      swapSupported: Boolean(linuxMem && linuxMem.swapTotalMb > 0),
+      swapUsedPct: linuxMem ? linuxMem.swapUsedPct : null
+    };
+
+    if (linuxMem && linuxMem.swapTotalMb > 0 && linuxMem.swapUsedPct >= 85) {
+      status = 'fail';
+      summaryParts.push(`Presión crítica de swap (${linuxMem.swapUsedPct}%) · VPS ~€${tier.eur.toFixed(2)}/mes`);
+      detailParts.push('El host está usando más del 85% del swap. Reduce límites de memoria o activa Auto-Sleep en servicios secundarios.');
+    } else if ((linuxMem && linuxMem.swapTotalMb > 0 && linuxMem.swapUsedPct >= 50) || availPct < 15) {
+      if (status === 'ok') status = 'warn';
+      summaryParts.push(`RAM disponible ajustada (${availPct}%) · VPS ~€${tier.eur.toFixed(2)}/mes`);
+      detailParts.push('Considera habilitar Auto-Sleep o ajustar los topes de RAM de los contenedores.');
+    } else {
+      summaryParts.push(`VPS ~${Math.max(1, Math.round(totalMb / 1024))} GB (~€${tier.eur.toFixed(2)}/mes) · ${availPct}% RAM libre`);
+      detailParts.push(`Plano de control en ${rssMb} MB RSS con margen saludable de memoria.`);
+    }
+  }
+
+  // 2. Salud de nodos de flota SSH (`serverFleetManager`)
+  if (fleetMod && typeof fleetMod.listServers === 'function') {
+    try {
+      const allServers = fleetMod.listServers();
+      const remotes = Array.isArray(allServers) ? allServers.filter((s) => s && s.id && s.id !== 'local') : [];
+      if (remotes.length > 0) {
+        let online = 0;
+        let degraded = 0;
+        let offline = 0;
+        let hostKeyMismatch = 0;
+        const problemNames = [];
+        for (const s of remotes) {
+          const st = String(s.status || 'unknown').toLowerCase();
+          if (st === 'online') online++;
+          else if (st === 'host_key_mismatch') {
+            hostKeyMismatch++;
+            problemNames.push(`${s.name || s.id} (host_key_mismatch)`);
+          } else if (st === 'degraded') {
+            degraded++;
+            problemNames.push(`${s.name || s.id} (degraded)`);
+          } else {
+            offline++;
+            problemNames.push(`${s.name || s.id} (${st})`);
+          }
+        }
+        metrics.fleet = { totalRemote: remotes.length, online, degraded, offline, hostKeyMismatch };
+
+        if (hostKeyMismatch > 0) {
+          status = 'fail';
+          summaryParts.push(`Flota: ${hostKeyMismatch} nodo(s) bloqueados por host_key_mismatch`);
+          detailParts.push(`Alerta SSH TOFU en: ${problemNames.slice(0, 4).join(', ')}. Verifica la huella y usa repin manual.`);
+        } else if (offline > 0 || degraded > 0) {
+          if (status === 'ok') status = 'warn';
+          summaryParts.push(`Flota: ${online}/${remotes.length} nodos remotos online`);
+          detailParts.push(`Nodos con incidencias: ${problemNames.slice(0, 4).join(', ')}.`);
+        } else {
+          summaryParts.push(`Flota: ${online}/${remotes.length} nodos remotos online`);
+          detailParts.push('Todos los nodos remotos SSH responden con Docker operativo.');
+        }
+      } else {
+        metrics.fleet = { totalRemote: 0, online: 0, degraded: 0, offline: 0, hostKeyMismatch: 0 };
+        summaryParts.push('Flota: nodo local');
+      }
+    } catch (e) {
+      metrics.fleet = { available: false, error: String(e.message || 'error').slice(0, 120) };
+    }
+  } else {
+    metrics.fleet = { totalRemote: 0, mode: 'local_only' };
+  }
+
+  return {
+    id: 'cost_ram_advisor',
+    name: 'Asesor de costes/RAM y flota VPS',
+    status,
+    summary: summaryParts.join(' · '),
+    detail: detailParts.join(' '),
+    fixAction: null,
+    fixLabel: null,
+    metrics
+  };
 }
 
 /**
@@ -211,7 +446,7 @@ async function runDoctor() {
   const sslManager = require('./sslManager');
   const { authStatus } = require('../middleware/auth');
 
-  /** @type {Array<{ id: string, name: string, status: 'ok' | 'warn' | 'fail', summary: string, detail: string, fixAction: string | null, fixLabel: string | null }>} */
+  /** @type {Array<{ id: string, name: string, status: 'ok' | 'warn' | 'fail', summary: string, detail: string, fixAction: string | null, fixLabel: string | null, metrics?: any }>} */
   const checks = [];
 
   // 1. Runtime & Event Loop
@@ -428,6 +663,9 @@ async function runDoctor() {
     fixLabel: staleTmp > 0 ? 'Limpiar archivos temporales' : null
   });
 
+  // 10. Asesor de costes/RAM del VPS y salud de nodos de flota SSH (perezoso, degradación limpia)
+  checks.push(await checkCostAndFleet({ snap }));
+
   const summary = {
     ok: checks.filter((c) => c.status === 'ok').length,
     warn: checks.filter((c) => c.status === 'warn').length,
@@ -524,4 +762,4 @@ async function applyFix(action) {
   throw err;
 }
 
-module.exports = { runDoctor, applyFix, checkDiskSpace, checkHostMemory, checkKeyFilePermissions, listOrphanedManagedContainers };
+module.exports = { runDoctor, applyFix, checkDiskSpace, checkHostMemory, checkKeyFilePermissions, listOrphanedManagedContainers, checkCostAndFleet };

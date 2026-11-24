@@ -22,6 +22,11 @@ const testScaleAndWildcard = require('./scale-and-wildcard.test');
 const testResilienceAndFeatures = require('./resilience-and-features.test');
 const testCompetitorPrs = require('./competitor-prs.test');
 const testTelemetry = require('./telemetry.test');
+const testFleet = require('./fleet.test');
+const testRbac = require('./rbac.test');
+const { testEnvironmentsGitops } = require('./environments-gitops.test');
+const testUptimeSleep = require('./uptime-sleep.test');
+const { testCoreBoost } = require('./core-boost.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -59,7 +64,7 @@ async function runAll() {
     { name: 'Ingress Data Plane (Caddy)', fn: testCaddy },
     { name: 'Managed Databases (Provision, Backup, S3, Retention)', fn: testDatabases },
     { name: 'Production Deploy Pipeline (build, cutover, rollback)', fn: testDeploy },
-    { name: 'One-Click Service Catalog (23 templates, 9 categories, secrets, ports)', fn: testCatalog },
+    { name: 'One-Click Service Catalog (100 templates, 12 categories, secrets, ports)', fn: testCatalog },
     { name: 'Live Sync Engine (Commit Frames, Merkle, Rollback <10ms, WS)', fn: testLiveSync },
     { name: 'Security Hardening (SSRF, Proxy Loopback, Symlinks, Redaction)', fn: testSecurityHardening },
     { name: 'WordPress Migrator & Universal Importer (Compose/Git/Platforms)', fn: testImporters },
@@ -68,6 +73,11 @@ async function runAll() {
     { name: 'Resilience, Edge Hardening, DR Snapshots, Crons/Previews & Multi-Git', fn: testResilienceAndFeatures },
     { name: 'Competitor PR & CVE Regressions (Wave-1 + Wave-2)', fn: testCompetitorPrs },
     { name: 'Anonymous Telemetry, PII Scrubbing, Circuit Breaker & E2E Collector', fn: testTelemetry },
+    { name: 'Multi-Server SSH Fleet Orchestration (TOFU, Tunnels, Key Vault)', fn: testFleet },
+    { name: 'Multi-User Teams, RBAC, Scoped Tokens & Triple-Layer Revocation', fn: testRbac },
+    { name: 'Environments, Encrypted Vault, Promotion & GitOps culkibo.yaml', fn: testEnvironmentsGitops },
+    { name: 'Synthetic Uptime Monitors, Public Status Pages & Auto-Sleep Advisor', fn: testUptimeSleep },
+    { name: 'Core +70% Boost (Smoke Tests, Canary Auto-Guard, Freeze Windows, Remote Fleet)', fn: testCoreBoost },
     { name: 'Competitor Benchmarks & Parity Verification', fn: testCompetitorBenchmarks }
   ];
 

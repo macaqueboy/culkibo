@@ -8,7 +8,7 @@ const path = require('path');
 const caddyManager = require('./caddyManager');
 const repoSync = require('./repoSync');
 const portRegistry = require('./portRegistry');
-const { atomicWriteJsonSync, assertContainedPath } = require('./ssrfGuard');
+const { atomicWriteJsonSync, loadJsonWithBackupSync, assertContainedPath, isMetadataIp } = require('./ssrfGuard');
 const { parseSafeCommandArgv, sanitizeWorkdir } = require('./safeCommand');
 
 /** @type {any} */
@@ -35,6 +35,38 @@ function getProjectManager() {
     try { _projectManager = require('./projectManager'); } catch (e) {}
   }
   return _projectManager;
+}
+/** @type {any} */
+let _serverFleetManager = null;
+function getServerFleetManager() {
+  if (!_serverFleetManager) {
+    try { _serverFleetManager = require('./serverFleetManager'); } catch (e) {}
+  }
+  return _serverFleetManager;
+}
+/** @type {any} */
+let _auditLogger = null;
+function getAuditLogger() {
+  if (!_auditLogger) {
+    try { _auditLogger = require('./auditLogger'); } catch (e) {}
+  }
+  return _auditLogger;
+}
+/** @type {any} */
+let _sleepAdvisor = null;
+function getSleepAdvisor() {
+  if (!_sleepAdvisor) {
+    try { _sleepAdvisor = require('./sleepAdvisor'); } catch (e) {}
+  }
+  return _sleepAdvisor;
+}
+/** @type {any} */
+let _environmentManager = null;
+function getEnvironmentManager() {
+  if (!_environmentManager) {
+    try { _environmentManager = require('./environmentManager'); } catch (e) {}
+  }
+  return _environmentManager;
 }
 
 /** Calcula concurrencia máxima segura de builds según la RAM total del VPS para evitar OOM. */
@@ -167,8 +199,12 @@ const DEFAULTS = {
 
 const STORE_FILE = path.join(DATA_DIR, 'deployments.json');
 const STORE_BAK_FILE = `${STORE_FILE}.bak`;
+const FREEZE_STORE_FILE = path.join(DATA_DIR, 'deploy-freeze.json');
+const MAX_SMOKE_BODY_BYTES = 256 * 1024;
+const SMOKE_BLOCKED_HEADERS = /^(host|connection|content-length|transfer-encoding|keep-alive|te|trailer|upgrade)$/i;
+const WEEKDAY_SHORT_TO_INDEX = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
 const NON_TERMINAL_STATUSES = new Set([
-  'pendiente', 'en_cola', 'sincronizando', 'construyendo', 'pre_deploy', 'arrancando', 'verificando', 'promocionando', 'post_deploy'
+  'pendiente', 'en_cola', 'sincronizando', 'construyendo', 'pre_deploy', 'arrancando', 'verificando', 'smoke_test', 'canario', 'promocionando', 'post_deploy'
 ]);
 const MAX_RUNTIME_LOG_STREAMS = 20;
 
@@ -213,6 +249,295 @@ function sanitizeHealthPath(value) {
   if (!/^\/[A-Za-z0-9._~\-/]*$/.test(raw)) return null;
   if (raw.includes('..')) return null;
   return raw;
+}
+
+/**
+ * Ruta segura para smoke tests post-despliegue: nunca permite URLs completas,
+ * `//`, traversal `..`, espacios ni caracteres de control; admite query strings.
+ * @param {any} value
+ * @returns {string | null}
+ */
+function sanitizeSmokePath(value) {
+  if (typeof value !== 'string') return null;
+  const raw = value.trim();
+  if (!raw || raw.length > 512) return null;
+  if (!raw.startsWith('/') || raw.startsWith('//')) return null;
+  if (raw.includes('..') || raw.includes('://') || /[\s\r\n\0]/.test(raw)) return null;
+  return raw;
+}
+
+/**
+ * Convierte `HH:MM` (00:00..24:00) a minutos desde medianoche.
+ * @param {string} hhmm
+ * @returns {number | null}
+ */
+function parseTimeToMinutes(hhmm) {
+  if (typeof hhmm !== 'string') return null;
+  const m = hhmm.trim().match(/^(\d{2}):(\d{2})$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h === 24 && min === 0) return 1440;
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/**
+ * Obtiene día de semana (0=domingo..6=sábado) y minutos del día (0..1439)
+ * en cualquier zona horaria IANA usando V8 `Intl.DateTimeFormat` nativo (0 deps).
+ * @param {Date} date
+ * @param {string} timeZone
+ * @returns {{ dow: number, minutes: number } | null}
+ */
+function getZonedDayAndMinutes(date, timeZone) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timeZone || 'UTC',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(date);
+    let weekday = '';
+    let hour = 0;
+    let minute = 0;
+    for (const p of parts) {
+      if (p.type === 'weekday') weekday = p.value.toLowerCase().slice(0, 3);
+      else if (p.type === 'hour') hour = parseInt(p.value, 10) || 0;
+      else if (p.type === 'minute') minute = parseInt(p.value, 10) || 0;
+    }
+    if (hour === 24) hour = 0;
+    const dow = Object.prototype.hasOwnProperty.call(WEEKDAY_SHORT_TO_INDEX, weekday)
+      ? WEEKDAY_SHORT_TO_INDEX[/** @type {keyof typeof WEEKDAY_SHORT_TO_INDEX} */ (weekday)]
+      : date.getUTCDay();
+    return { dow, minutes: hour * 60 + minute };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Normaliza lista de días a un Set de enteros `0..6`.
+ * @param {any} rawDays
+ * @returns {Set<number>}
+ */
+function normalizeFreezeDays(rawDays) {
+  if (!Array.isArray(rawDays) || rawDays.length === 0) {
+    return new Set([0, 1, 2, 3, 4, 5, 6]);
+  }
+  /** @type {Set<number>} */
+  const out = new Set();
+  for (const d of rawDays) {
+    if (typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 6) {
+      out.add(d);
+    } else if (typeof d === 'string') {
+      const key = d.trim().toLowerCase().slice(0, 3);
+      if (Object.prototype.hasOwnProperty.call(WEEKDAY_SHORT_TO_INDEX, key)) {
+        out.add(WEEKDAY_SHORT_TO_INDEX[/** @type {keyof typeof WEEKDAY_SHORT_TO_INDEX} */ (key)]);
+      } else {
+        const parsed = parseInt(d.trim(), 10);
+        if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 6) out.add(parsed);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Evalúa si una ventana de congelación está activa en `date` para `trigger`.
+ * Soporta rangos en el mismo día, rangos nocturnos (`start > end`) y ventanas puntuales (`kind: 'once'`).
+ * @param {any} win
+ * @param {Date} date
+ * @param {string} trigger
+ * @returns {boolean}
+ */
+function matchesFreezeWindow(win, date, trigger) {
+  if (!win || typeof win !== 'object' || win.enabled === false) return false;
+  if (Array.isArray(win.blockTriggers) && win.blockTriggers.length > 0 && trigger) {
+    if (!win.blockTriggers.includes(trigger)) return false;
+  }
+
+  if (win.kind === 'once' && win.startAt && win.endAt) {
+    const startMs = Date.parse(String(win.startAt));
+    const endMs = Date.parse(String(win.endAt));
+    const nowMs = date.getTime();
+    return Number.isFinite(startMs) && Number.isFinite(endMs) && nowMs >= startMs && nowMs < endMs;
+  }
+
+  const tz = String(win.tz || win.timezone || 'UTC').trim() || 'UTC';
+  const zoned = getZonedDayAndMinutes(date, tz);
+  if (!zoned) return false;
+
+  /** @type {number | null} */
+  let startMin = null;
+  /** @type {number | null} */
+  let endMin = null;
+  if (win.startHour !== undefined && win.endHour !== undefined) {
+    const sh = Number(win.startHour);
+    const eh = Number(win.endHour);
+    if (Number.isFinite(sh) && Number.isFinite(eh) && sh >= 0 && sh <= 23 && eh >= 0 && eh <= 24) {
+      startMin = Math.round(sh * 60);
+      endMin = Math.round(eh * 60);
+    }
+  } else if (typeof win.startTime === 'string' && typeof win.endTime === 'string') {
+    startMin = parseTimeToMinutes(win.startTime);
+    endMin = parseTimeToMinutes(win.endTime);
+  }
+  if (startMin === null || endMin === null) return false;
+
+  const days = normalizeFreezeDays(win.days !== undefined ? win.days : win.daysOfWeek);
+  if (days.size === 0) return false;
+
+  if (startMin === endMin) {
+    return days.has(zoned.dow);
+  }
+  if (startMin < endMin) {
+    return days.has(zoned.dow) && zoned.minutes >= startMin && zoned.minutes < endMin;
+  }
+  // Ventana nocturna (p. ej. 22:00 -> 06:00): activa hoy >= startMin O ayer en `days` y hoy < endMin
+  const prevDow = (zoned.dow + 6) % 7;
+  return (days.has(zoned.dow) && zoned.minutes >= startMin) || (days.has(prevDow) && zoned.minutes < endMin);
+}
+
+/**
+ * Evaluador puro compartido de ventanas de congelación (usado por `deployManager` y `environmentManager`).
+ * JAMÁS bloquea operaciones de rollback (`rollback`, `auto-rollback`, `post-deploy-rollback`).
+ *
+ * @param {any} projectOrId
+ * @param {Date | number | string | { now?: Date | number | string, trigger?: string, includeGlobal?: boolean }} [nowOrOpts]
+ * @param {any[]} [globalWindows]
+ * @returns {{ frozen: boolean, active: boolean, window: any | null, reason: string | null, evaluatedAt: string }}
+ */
+function evaluateFreezeStatus(projectOrId, nowOrOpts = {}, globalWindows = []) {
+  let nowDate = new Date();
+  let trigger = 'manual';
+  let includeGlobal = true;
+  if (nowOrOpts instanceof Date) {
+    nowDate = nowOrOpts;
+  } else if (typeof nowOrOpts === 'number' || typeof nowOrOpts === 'string') {
+    nowDate = new Date(nowOrOpts);
+  } else if (nowOrOpts && typeof nowOrOpts === 'object') {
+    if (nowOrOpts.now !== undefined && nowOrOpts.now !== null) {
+      nowDate = nowOrOpts.now instanceof Date ? nowOrOpts.now : new Date(nowOrOpts.now);
+    }
+    if (typeof nowOrOpts.trigger === 'string' && nowOrOpts.trigger) trigger = nowOrOpts.trigger;
+    if (nowOrOpts.includeGlobal === false) includeGlobal = false;
+  }
+  if (Number.isNaN(nowDate.getTime())) nowDate = new Date();
+
+  const evaluatedAt = nowDate.toISOString();
+  if (trigger === 'rollback' || trigger === 'auto-rollback' || trigger === 'post-deploy-rollback') {
+    return { frozen: false, active: false, window: null, reason: null, evaluatedAt };
+  }
+
+  let projectObj = (projectOrId && typeof projectOrId === 'object') ? projectOrId : null;
+  const projectId = projectObj ? projectObj.id : (typeof projectOrId === 'string' ? projectOrId : null);
+  if (!projectObj && projectId) {
+    try {
+      const pm = getProjectManager();
+      if (pm && typeof pm.getById === 'function') projectObj = pm.getById(projectId);
+    } catch (e) {}
+  }
+
+  /** @type {any[]} */
+  const candidates = [];
+  if (projectObj && Array.isArray(projectObj.freezeWindows)) {
+    for (const w of projectObj.freezeWindows) {
+      candidates.push({ ...w, scope: w.scope || 'project' });
+    }
+  }
+  if (includeGlobal && Array.isArray(globalWindows)) {
+    for (const gw of globalWindows) {
+      if (!gw || typeof gw !== 'object') continue;
+      if (gw.scope === 'project' && Array.isArray(gw.projectIds) && gw.projectIds.length > 0) {
+        if (!projectId || !gw.projectIds.includes(projectId)) continue;
+      }
+      candidates.push({ ...gw, scope: gw.scope || 'global' });
+    }
+  }
+
+  for (const win of candidates) {
+    if (matchesFreezeWindow(win, nowDate, trigger)) {
+      const reason = String(win.reason || win.name || 'Ventana de congelación de despliegues activa').trim();
+      return { frozen: true, active: true, window: win, reason, evaluatedAt };
+    }
+  }
+  return { frozen: false, active: false, window: null, reason: null, evaluatedAt };
+}
+
+/**
+ * Helper booleano rápido: `true` si el proyecto está actualmente dentro de una ventana de congelación.
+ * @param {any} project
+ * @param {Date | number | string} [now]
+ * @param {string} [trigger]
+ * @param {any[]} [globalWindows]
+ * @returns {boolean}
+ */
+function isInFreezeWindow(project, now = new Date(), trigger = 'manual', globalWindows = []) {
+  return evaluateFreezeStatus(project, { now, trigger }, globalWindows).frozen;
+}
+
+/**
+ * Normaliza la lista de smoke tests desde `options.smokeTests` o `project.smokeTests`.
+ * Soporta tanto array compacto `[{ path, expectStatus, ... }]` como `{ enabled, failPolicy, checks }`.
+ * @param {any} raw
+ * @returns {{ enabled: boolean, failPolicy: 'abort' | 'rollback' | 'warn', checks: any[] }}
+ */
+function normalizeSmokeConfig(raw) {
+  if (Array.isArray(raw)) {
+    const checks = raw.filter((c) => c && typeof c === 'object').slice(0, 10);
+    return { enabled: checks.length > 0, failPolicy: 'abort', checks };
+  }
+  if (raw && typeof raw === 'object' && Array.isArray(raw.checks)) {
+    const checks = raw.checks.filter((c) => c && typeof c === 'object').slice(0, 10);
+    /** @type {'abort' | 'rollback' | 'warn'} */
+    const failPolicy = raw.failPolicy === 'rollback' || raw.failPolicy === 'warn' ? raw.failPolicy : 'abort';
+    return { enabled: Boolean(raw.enabled) && checks.length > 0, failPolicy, checks };
+  }
+  return { enabled: false, failPolicy: 'abort', checks: [] };
+}
+
+/**
+ * Normaliza la configuración de Canary Auto-Guard.
+ * @param {any} raw
+ */
+function normalizeCanaryConfig(raw) {
+  if (!raw || typeof raw !== 'object' || !raw.enabled) {
+    return { enabled: false, steps: [], stepDurationMs: 30000, checksPerStep: 2, maxErrorRate: 0.05, maxLatencyMs: null, autoRollback: true, requireManualPromote: false };
+  }
+  const wpRaw = Number(raw.weightPercent);
+  const weightPercent = Number.isFinite(wpRaw) && wpRaw >= 1 && wpRaw <= 99 ? Math.round(wpRaw) : 10;
+  /** @type {number[]} */
+  let steps = [];
+  if (Array.isArray(raw.steps) && raw.steps.length > 0) {
+    steps = raw.steps
+      .map((s) => Math.round(Number(s)))
+      .filter((n) => Number.isInteger(n) && n >= 1 && n <= 100);
+  }
+  if (steps.length === 0) steps = [weightPercent, 100];
+  if (steps[steps.length - 1] !== 100) steps.push(100);
+
+  const stepDurationMs = raw.stepDurationMs !== undefined && raw.stepDurationMs !== null && Number.isFinite(Number(raw.stepDurationMs))
+    ? Math.min(300000, Math.max(10, Math.round(Number(raw.stepDurationMs))))
+    : Math.min(300000, Math.max(10, Math.round((Number(raw.observeSeconds) || 30) * 1000)));
+  const checksPerStep = Math.min(10, Math.max(1, Math.round(Number(raw.checksPerStep) || 2)));
+  const errRaw = raw.maxErrorRate !== undefined && raw.maxErrorRate !== null ? Number(raw.maxErrorRate) : 0.05;
+  const maxErrorRate = Number.isFinite(errRaw) && errRaw >= 0 && errRaw <= 1 ? errRaw : 0.05;
+  const maxLatencyMs = raw.maxLatencyMs !== undefined && raw.maxLatencyMs !== null && Number.isFinite(Number(raw.maxLatencyMs))
+    ? Math.min(60000, Math.max(1, Math.round(Number(raw.maxLatencyMs))))
+    : null;
+
+  return {
+    enabled: true,
+    weightPercent,
+    steps,
+    stepDurationMs,
+    checksPerStep,
+    maxErrorRate,
+    maxLatencyMs,
+    autoRollback: raw.autoRollback !== undefined ? Boolean(raw.autoRollback) : true,
+    requireManualPromote: Boolean(raw.requireManualPromote)
+  };
 }
 
 /**
@@ -263,6 +588,15 @@ class DeployManager extends EventEmitter {
     /** Operaciones activas por proyecto para cancelación limpia en cualquier fase previa a promoción. */
     /** @type {Map<string, { deploymentId: string, stage: string, controller: AbortController, children: Set<any>, containerName: string | null }>} */
     this._activeOps = new Map();
+    /** Canarios activos en observación (projectId -> estado de tráfico y control de promoción/aborto). */
+    /** @type {Map<string, any>} */
+    this.activeCanaries = new Map();
+    /** Gancho inyectable para el gestor de flota SSH (perezoso; jamás se carga cuando serverId === 'local'). */
+    this._getFleetManager = () => getServerFleetManager();
+    /** Caché perezosa de ventanas globales de congelación (`data/deploy-freeze.json`). */
+    /** @type {any[] | null} */
+    this._globalFreezeWindows = null;
+    this._freezeStoreFile = FREEZE_STORE_FILE;
     /** Cooldown y circuit-breaker por contenedor para el watchdog de producción (evita spam y ping-pong A<->B). */
     /** @type {Map<string, { lastNotifiedAt: number, rolledBackPairs: Set<string> }>} */
     this._incidentCooldown = new Map();
@@ -290,8 +624,12 @@ class DeployManager extends EventEmitter {
       /** @type {number[]} */
       const ports = [];
       for (const st of Object.values(this.store)) {
-        if (st && st.current && st.current.hostPort) ports.push(Number(st.current.hostPort));
-        if (st && st.previous && st.previous.hostPort) ports.push(Number(st.previous.hostPort));
+        if (st && st.current && st.current.hostPort && (!st.current.serverId || st.current.serverId === 'local')) {
+          ports.push(Number(st.current.hostPort));
+        }
+        if (st && st.previous && st.previous.hostPort && (!st.previous.serverId || st.previous.serverId === 'local')) {
+          ports.push(Number(st.previous.hostPort));
+        }
       }
       return ports;
     });
@@ -466,8 +804,21 @@ class DeployManager extends EventEmitter {
   /**
    * Detiene inmediatamente los contenedores en ventana de drenaje al apagar el daemon,
    * evitando que contenedores `--restart unless-stopped` queden vivos para siempre.
+   * Si existe algún canario activo, restaura primero el 100% del tráfico a la versión estable.
    */
   async flushDrainsForShutdown({ timeoutMs = 3500 } = {}) {
+    // Restaurar 100% tráfico estable para cualquier canario en curso antes de salir
+    for (const [pid, canary] of Array.from(this.activeCanaries.entries())) {
+      try {
+        this.abortCanary(pid, { reason: 'Apagado del daemon' });
+        if (canary && typeof canary.restoreStable === 'function') {
+          await Promise.race([
+            Promise.resolve(canary.restoreStable()).catch(() => {}),
+            new Promise((r) => { const t = setTimeout(r, 1000); if (t.unref) t.unref(); })
+          ]);
+        }
+      } catch (e) {}
+    }
     // Cancelar builds / hooks pre-deploy en curso (nunca interrumpir la promoción atómica)
     for (const [pid, op] of Array.from(this._activeOps.entries())) {
       if (op && op.stage !== 'promocionando') {
@@ -505,6 +856,9 @@ class DeployManager extends EventEmitter {
    * Mata el proceso activo (git/docker build/pre-deploy) y libera cualquier plaza de cola.
    */
   cancelDeploy(projectId, { reason = 'Cancelado por el usuario' } = {}) {
+    if (this.activeCanaries.has(projectId)) {
+      this.abortCanary(projectId, { reason });
+    }
     const op = this._activeOps.get(projectId);
     if (!op) {
       if (this.pending.has(projectId)) {
@@ -555,14 +909,307 @@ class DeployManager extends EventEmitter {
     if (had) {
       this.saveStore();
       const names = [prevState.current?.containerName, prevState.previous?.containerName].filter(Boolean);
+      const targetServerId = prevState.current?.serverId || prevState.previous?.serverId || 'local';
       if (names.length > 0) {
-        Promise.allSettled([
-          caddyManager.removeRoute(projectId).catch(() => {}),
-          ...names.map((n) => this.runDocker(['rm', '-f', n], { timeoutMs: 20000 }).catch(() => {}))
-        ]).catch(() => {});
+        if (targetServerId && targetServerId !== 'local') {
+          this._withRemoteDockerEnv(targetServerId, {}, async (remoteDockerHost, fleet) => {
+            const env = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+            await Promise.allSettled([
+              this._withRouteTarget(targetServerId, fleet, ({ adminUrl }) => caddyManager.removeRoute(projectId, { adminUrl })).catch(() => {}),
+              ...names.map((n) => this.runDocker(['rm', '-f', n], { timeoutMs: 20000, env }).catch(() => {}))
+            ]);
+          }).catch(() => {});
+        } else {
+          Promise.allSettled([
+            caddyManager.removeRoute(projectId).catch(() => {}),
+            ...names.map((n) => this.runDocker(['rm', '-f', n], { timeoutMs: 20000 }).catch(() => {}))
+          ]).catch(() => {});
+        }
       }
     }
     return { removed: had };
+  }
+
+  // -------------------------------------------------------------------------
+  // Auditoría, Ventanas de Congelación, Control de Canarios y Flota SSH
+  // -------------------------------------------------------------------------
+
+  /** @param {any} entry */
+  _recordAudit(entry) {
+    try {
+      const al = getAuditLogger();
+      if (al && typeof al.record === 'function') {
+        al.record(entry);
+      }
+    } catch (e) {}
+  }
+
+  _loadGlobalFreezeWindows() {
+    if (this._globalFreezeWindows !== null) return this._globalFreezeWindows;
+    try {
+      const loaded = loadJsonWithBackupSync(this._freezeStoreFile, {
+        validate: (d) => Array.isArray(d)
+      });
+      this._globalFreezeWindows = loaded.ok && Array.isArray(loaded.data) ? loaded.data : [];
+    } catch (e) {
+      this._globalFreezeWindows = [];
+    }
+    return this._globalFreezeWindows;
+  }
+
+  _saveGlobalFreezeWindows() {
+    try {
+      atomicWriteJsonSync(this._freezeStoreFile, this._globalFreezeWindows || [], { mode: 0o600, backup: true });
+    } catch (e) {}
+  }
+
+  listFreezeWindows() {
+    return this._loadGlobalFreezeWindows().map((w) => ({ ...w }));
+  }
+
+  /** @param {any} win */
+  addFreezeWindow(win) {
+    if (!win || typeof win !== 'object' || Array.isArray(win)) {
+      throw new Error('Ventana de congelación inválida');
+    }
+    const list = this._loadGlobalFreezeWindows();
+    if (list.length >= 32) {
+      throw new Error('Máximo de 32 ventanas globales de congelación alcanzado');
+    }
+    const tz = String(win.tz || win.timezone || 'UTC').trim() || 'UTC';
+    try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch (e) {
+      throw new Error(`Zona horaria IANA inválida: ${tz}`);
+    }
+    const isOnce = win.kind === 'once';
+    if (isOnce) {
+      const s = Date.parse(String(win.startAt || ''));
+      const e = Date.parse(String(win.endAt || ''));
+      if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) {
+        throw new Error('Ventana puntual requiere startAt y endAt ISO válidos (endAt > startAt)');
+      }
+    } else if (win.startHour !== undefined || win.endHour !== undefined) {
+      const sh = Number(win.startHour);
+      const eh = Number(win.endHour);
+      if (!Number.isInteger(sh) || sh < 0 || sh > 23 || !Number.isInteger(eh) || eh < 0 || eh > 24) {
+        throw new Error('startHour (0..23) y endHour (0..24) inválidos en ventana de congelación');
+      }
+    } else if (typeof win.startTime === 'string' && typeof win.endTime === 'string') {
+      if (parseTimeToMinutes(win.startTime) === null || parseTimeToMinutes(win.endTime) === null) {
+        throw new Error('startTime y endTime deben tener formato HH:MM válido');
+      }
+    } else {
+      throw new Error('La ventana de congelación requiere startHour/endHour, startTime/endTime o kind:"once" con startAt/endAt');
+    }
+    const entry = {
+      id: `frz_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`,
+      name: String(win.name || 'Ventana de congelación').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 80),
+      enabled: win.enabled !== false,
+      scope: win.scope === 'project' ? 'project' : 'global',
+      projectIds: Array.isArray(win.projectIds) ? win.projectIds.map(String).slice(0, 64) : [],
+      kind: win.kind === 'once' ? 'once' : 'recurring',
+      ...(win.days !== undefined ? { days: Array.from(normalizeFreezeDays(win.days)) } : {}),
+      ...(win.daysOfWeek !== undefined ? { daysOfWeek: Array.from(normalizeFreezeDays(win.daysOfWeek)) } : {}),
+      ...(win.startHour !== undefined ? { startHour: Number(win.startHour) } : {}),
+      ...(win.endHour !== undefined ? { endHour: Number(win.endHour) } : {}),
+      ...(win.startTime ? { startTime: String(win.startTime).trim() } : {}),
+      ...(win.endTime ? { endTime: String(win.endTime).trim() } : {}),
+      ...(win.startAt ? { startAt: new Date(win.startAt).toISOString() } : {}),
+      ...(win.endAt ? { endAt: new Date(win.endAt).toISOString() } : {}),
+      tz,
+      reason: String(win.reason || '').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 200),
+      ...(Array.isArray(win.blockTriggers) ? { blockTriggers: win.blockTriggers.map(String).slice(0, 8) } : {})
+    };
+    list.push(entry);
+    this._saveGlobalFreezeWindows();
+    return { ...entry };
+  }
+
+  /** @param {string} id @param {any} patch */
+  updateFreezeWindow(id, patch) {
+    const list = this._loadGlobalFreezeWindows();
+    const idx = list.findIndex((w) => w && w.id === id);
+    if (idx === -1) return null;
+    if (patch && (patch.tz || patch.timezone)) {
+      const tz = String(patch.tz || patch.timezone).trim();
+      new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    }
+    list[idx] = { ...list[idx], ...patch, id };
+    this._saveGlobalFreezeWindows();
+    return { ...list[idx] };
+  }
+
+  /** @param {string} id */
+  removeFreezeWindow(id) {
+    const list = this._loadGlobalFreezeWindows();
+    const before = list.length;
+    this._globalFreezeWindows = list.filter((w) => w && w.id !== id);
+    if (this._globalFreezeWindows.length !== before) {
+      this._saveGlobalFreezeWindows();
+      return { removed: true, id };
+    }
+    return { removed: false, id };
+  }
+
+  /**
+   * Evalúa si un proyecto está bloqueado por una ventana de congelación (de proyecto o global).
+   * @param {any} projectOrId
+   * @param {Date | number | string | { now?: Date | number | string, trigger?: string, includeGlobal?: boolean }} [nowOrOpts]
+   */
+  evaluateFreezeStatus(projectOrId, nowOrOpts = {}) {
+    return evaluateFreezeStatus(projectOrId, nowOrOpts, this._loadGlobalFreezeWindows());
+  }
+
+  /**
+   * Devuelve `true` si el proyecto está en una ventana de congelación activa en `now`.
+   * @param {any} project
+   * @param {Date | number | string} [now]
+   * @param {string} [trigger]
+   */
+  isInFreezeWindow(project, now = new Date(), trigger = 'manual') {
+    return this.evaluateFreezeStatus(project, { now, trigger }).frozen;
+  }
+
+  /** Devuelve el estado de un canario en curso (para UI, API e `ingressManager.buildDesiredState()`). */
+  getCanaryState(projectId) {
+    const c = this.activeCanaries.get(projectId);
+    if (!c) return null;
+    return {
+      projectId,
+      deploymentId: c.deploymentId,
+      stableDial: c.stableDial,
+      canaryDial: c.canaryDial,
+      stableContainer: c.stableContainer,
+      canaryContainer: c.canaryContainer,
+      weight: c.weight,
+      stepIndex: c.stepIndex,
+      steps: [...c.steps],
+      startedAt: c.startedAt
+    };
+  }
+
+  /** Promociona inmediatamente un canario activo al 100%. */
+  promoteCanary(projectId) {
+    const c = this.activeCanaries.get(projectId);
+    if (!c) return { ok: false, status: 404, error: 'No hay ningún despliegue canario activo para este proyecto' };
+    c.manualPromote = true;
+    if (typeof c.wake === 'function') c.wake();
+    return { ok: true, deploymentId: c.deploymentId, action: 'promote' };
+  }
+
+  /** Aborta inmediatamente un canario activo y solicita restauración al 100% de la versión estable. */
+  abortCanary(projectId, { reason = 'Abortado manualmente' } = {}) {
+    const c = this.activeCanaries.get(projectId);
+    if (!c) return { ok: false, status: 404, error: 'No hay ningún despliegue canario activo para este proyecto' };
+    c.aborted = true;
+    c.abortReason = reason;
+    if (typeof c.wake === 'function') c.wake();
+    return { ok: true, deploymentId: c.deploymentId, action: 'abort', reason };
+  }
+
+  /**
+   * Envuelve operaciones Docker en un túnel SSH ref-counted cuando `serverId !== 'local'`.
+   * Para `serverId === 'local'`, jamás importa ni llama a `serverFleetManager` (coste 0).
+   * @template T
+   * @param {string} serverId
+   * @param {{ signal?: AbortSignal | null }} opts
+   * @param {(remoteDockerHost: string | null, fleet: any | null) => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async _withRemoteDockerEnv(serverId, opts, fn) {
+    const sid = String(serverId || 'local').trim() || 'local';
+    if (sid === 'local') {
+      return fn(null, null);
+    }
+    const fleet = typeof this._getFleetManager === 'function' ? this._getFleetManager() : getServerFleetManager();
+    if (!fleet) {
+      throw new Error(`Gestor de flota SSH no disponible para el servidor remoto «${sid}»`);
+    }
+    if (typeof fleet.acquireDockerTunnel === 'function') {
+      const lease = await fleet.acquireDockerTunnel(sid, { signal: opts?.signal || null });
+      const dh = typeof lease === 'string' ? lease : lease?.dockerHost;
+      if (!dh) {
+        if (lease && typeof lease.release === 'function') await Promise.resolve(lease.release()).catch(() => {});
+        throw new Error(`No se obtuvo DOCKER_HOST del túnel para el servidor «${sid}»`);
+      }
+      try {
+        return await fn(dh, fleet);
+      } finally {
+        if (lease && typeof lease.release === 'function') {
+          await Promise.resolve(lease.release()).catch(() => {});
+        }
+      }
+    }
+    if (typeof fleet.withDockerTunnel === 'function') {
+      return fleet.withDockerTunnel(sid, async (leaseOrHost) => {
+        const dh = typeof leaseOrHost === 'string' ? leaseOrHost : leaseOrHost?.dockerHost;
+        if (!dh) throw new Error(`No se obtuvo DOCKER_HOST del túnel para el servidor «${sid}»`);
+        return fn(dh, fleet);
+      });
+    }
+    throw new Error(`serverFleetManager no expone túnel Docker para «${sid}»`);
+  }
+
+  /**
+   * Abre un túnel efímero hacia la Admin API de Caddy del nodo remoto (o passthrough en `local`).
+   * @template T
+   * @param {string} serverId
+   * @param {any} fleet
+   * @param {(routeOpts: { adminUrl?: string | null, isRemote?: boolean }) => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async _withRouteTarget(serverId, fleet, fn) {
+    const sid = String(serverId || 'local').trim() || 'local';
+    if (sid === 'local') return fn({ adminUrl: null, isRemote: false });
+    if (!fleet || typeof fleet.withCaddyTunnel !== 'function') {
+      throw new Error(`serverFleetManager no soporta túnel de Caddy para «${sid}»`);
+    }
+    return fleet.withCaddyTunnel(sid, async (tunnelInfo) => {
+      const adminUrl = typeof tunnelInfo === 'string' ? tunnelInfo : tunnelInfo?.adminUrl;
+      if (!adminUrl) throw new Error(`Túnel de Caddy inválido para el servidor «${sid}»`);
+      return fn({ adminUrl, isRemote: true });
+    });
+  }
+
+  /**
+   * Abre un túnel de puerto loopback efímero hacia el contenedor remoto para `waitForHealth` y smoke tests.
+   * @template T
+   * @param {string} serverId
+   * @param {any} fleet
+   * @param {number} remoteHostPort
+   * @param {(localPort: number) => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async _withHealthTarget(serverId, fleet, remoteHostPort, fn) {
+    const sid = String(serverId || 'local').trim() || 'local';
+    if (sid === 'local') return fn(remoteHostPort);
+    if (!fleet || typeof fleet.withPortTunnel !== 'function') {
+      return fn(remoteHostPort);
+    }
+    return fleet.withPortTunnel(sid, remoteHostPort, async (tunnelInfo) => {
+      const localPort = typeof tunnelInfo === 'number'
+        ? tunnelInfo
+        : Number(tunnelInfo?.localPort || tunnelInfo?.port || remoteHostPort);
+      return fn(localPort);
+    });
+  }
+
+  /** Asigna un puerto libre en el nodo remoto (delegando en `fleet.allocateRemotePort` o consultando `docker ps`). */
+  async _allocateRemotePort(serverId, fleet, remoteDockerHost) {
+    if (fleet && typeof fleet.allocateRemotePort === 'function') {
+      return Number(await fleet.allocateRemotePort(serverId, { dockerHost: remoteDockerHost }));
+    }
+    const env = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+    const ps = await this.runDocker(['ps', '-a', '--format', '{{.Ports}}'], { timeoutMs: 10000, env });
+    const used = new Set();
+    if (ps.code === 0) {
+      for (const m of (ps.stdout || '').matchAll(/:(\d{2,5})->/g)) {
+        used.add(Number(m[1]));
+      }
+    }
+    for (let p = 20000; p <= 24999; p++) {
+      if (!used.has(p)) return p;
+    }
+    throw new Error(`No se encontró un puerto libre en el nodo remoto «${serverId}»`);
   }
 
   // -------------------------------------------------------------------------
@@ -680,25 +1327,33 @@ class DeployManager extends EventEmitter {
     return this.runTool('docker', args, options);
   }
 
-  /** ¿Hay un daemon de Docker con el que hablar? No lanza nunca. */
-  async detectDocker({ force = false } = {}) {
+  /**
+   * ¿Hay un daemon de Docker con el que hablar? No lanza nunca.
+   * Cuando se pasa `env` (p. ej. `DOCKER_HOST` de un nodo remoto), no usa ni sobrescribe la caché local.
+   * @param {{ force?: boolean, env?: any }} [opts]
+   */
+  async detectDocker({ force = false, env = undefined } = {}) {
+    const isRemoteEnv = Boolean(env && env.DOCKER_HOST && env.DOCKER_HOST !== process.env.DOCKER_HOST);
     const now = Date.now();
-    if (!force && this.dockerProbe && (now - this.dockerProbeAt) < this.dockerProbeTtlMs) {
+    if (!isRemoteEnv && !force && this.dockerProbe && (now - this.dockerProbeAt) < this.dockerProbeTtlMs) {
       return this.dockerProbe;
     }
-    const res = await this.runDocker(['version', '--format', '{{.Server.Version}}'], { timeoutMs: 5000 });
+    const res = await this.runDocker(['version', '--format', '{{.Server.Version}}'], { timeoutMs: 5000, env });
     const version = (res.stdout || '').trim();
-    this.dockerProbe = res.code === 0 && version
+    const probe = res.code === 0 && version
       ? { available: true, version, reason: null }
       : {
           available: false,
           version: null,
           reason: res.spawnError
             ? 'El cliente de Docker no está instalado en este host'
-            : 'El daemon de Docker no responde en este host'
+            : (isRemoteEnv ? 'El daemon de Docker del servidor remoto no responde' : 'El daemon de Docker no responde en este host')
         };
-    this.dockerProbeAt = now;
-    return this.dockerProbe;
+    if (!isRemoteEnv) {
+      this.dockerProbe = probe;
+      this.dockerProbeAt = now;
+    }
+    return probe;
   }
 
   /** ¿Está `bin` en el PATH? Cacheado 60 s para no spawnear por cada build. */
@@ -731,8 +1386,12 @@ class DeployManager extends EventEmitter {
    * cubre más stacks que la nuestra. Pero es una dependencia OPCIONAL: si no
    * está ninguno de los dos, generamos un Dockerfile y seguimos. Culkibo no
    * puede exigir instalar un binario extra para desplegar una app de Node.
+   *
+   * @param {string} contextDir
+   * @param {any} [project]
+   * @param {{ isRemote?: boolean }} [opts]
    */
-  async detectStrategy(contextDir, project = {}) {
+  async detectStrategy(contextDir, project = {}, { isRemote = false } = {}) {
     const pkgPath = path.join(contextDir, 'package.json');
     const pkg = fs.existsSync(pkgPath) ? this.readJson(pkgPath) : null;
     const deps = pkg ? { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) } : {};
@@ -769,7 +1428,9 @@ class DeployManager extends EventEmitter {
     // arrancar si `BUILDKIT_HOST` no está definido. Tenerlo en el PATH no basta,
     // así que se comprueba y, si no está configurado, se sigue bajando por la
     // lista en vez de fallar el despliegue.
-    for (const bin of ['railpack', 'nixpacks']) {
+    // En nodos remotos (Fleet SSH), se omite railpack local para construir directamente sobre DOCKER_HOST.
+    const externalBins = isRemote ? ['nixpacks'] : ['railpack', 'nixpacks'];
+    for (const bin of externalBins) {
       if (!(await this.hasBinary(bin))) continue;
       if (bin === 'railpack' && !process.env.BUILDKIT_HOST) {
         continue; // sin BUILDKIT_HOST, railpack no puede construir nada
@@ -785,7 +1446,7 @@ class DeployManager extends EventEmitter {
       };
     }
 
-    if (await this.hasBinary('railpack')) {
+    if (!isRemote && await this.hasBinary('railpack')) {
       // Estaba, pero inutilizable. Decirlo es mejor que ignorarlo en silencio.
       console.warn('[DeployManager] railpack está instalado pero BUILDKIT_HOST no está definido; se ignora');
     }
@@ -1390,19 +2051,24 @@ class DeployManager extends EventEmitter {
   // Utilidades de red y puertos
   // -------------------------------------------------------------------------
 
-  /** Crea la red de Culkibo si no existe. Idempotente y cacheada 60 s. */
-  async ensureNetwork(name = DEFAULTS.network) {
+  /**
+   * Crea la red de Culkibo si no existe. Idempotente y cacheada 60 s por nodo.
+   * @param {string} [name]
+   * @param {{ env?: any, cacheKey?: string | null }} [opts]
+   */
+  async ensureNetwork(name = DEFAULTS.network, { env = undefined, cacheKey = null } = {}) {
+    const key = cacheKey ? `${cacheKey}:${name}` : name;
     const now = Date.now();
-    const cachedAt = this._networkCache.get(name);
+    const cachedAt = this._networkCache.get(key);
     if (cachedAt && (now - cachedAt) < 60000) return true;
-    const inspect = await this.runDocker(['network', 'inspect', name], { timeoutMs: 8000 });
+    const inspect = await this.runDocker(['network', 'inspect', name], { timeoutMs: 8000, env });
     if (inspect.code === 0) {
-      this._networkCache.set(name, now);
+      this._networkCache.set(key, now);
       return true;
     }
-    const created = await this.runDocker(['network', 'create', name], { timeoutMs: 10000 });
+    const created = await this.runDocker(['network', 'create', name], { timeoutMs: 10000, env });
     if (created.code === 0) {
-      this._networkCache.set(name, now);
+      this._networkCache.set(key, now);
       return true;
     }
     return false;
@@ -1415,12 +2081,14 @@ class DeployManager extends EventEmitter {
    * marcarlo así produce una ruta que apunta a la nada. Lo correcto es
    * adjuntarlo a la red de Culkibo y marcar el nombre del contenedor. Si Caddy
    * corre nativo en el host, `127.0.0.1:<puertoHost>` sí es correcto.
+   *
+   * @param {{ containerName: string, containerPort: number, hostPort: number, network?: string, env?: any }} spec
    */
-  async resolveUpstream({ containerName, containerPort, hostPort, network = DEFAULTS.network }) {
+  async resolveUpstream({ containerName, containerPort, hostPort, network = DEFAULTS.network, env = undefined }) {
     const caddyName = DEFAULTS.caddyContainerName;
     const inspect = await this.runDocker(
       ['inspect', '-f', '{{json .NetworkSettings.Networks}}', caddyName],
-      { timeoutMs: 8000 }
+      { timeoutMs: 8000, env }
     );
 
     if (inspect.code !== 0) {
@@ -1431,7 +2099,7 @@ class DeployManager extends EventEmitter {
     let networks = {};
     try { networks = JSON.parse((inspect.stdout || '{}').trim()) || {}; } catch (e) {}
     if (!networks[network]) {
-      const connected = await this.runDocker(['network', 'connect', network, caddyName], { timeoutMs: 10000 });
+      const connected = await this.runDocker(['network', 'connect', network, caddyName], { timeoutMs: 10000, env });
       if (connected.code !== 0) {
         // No se pudo adjuntar: caemos al host, que al menos funciona si Caddy
         // publica puertos con acceso al gateway.
@@ -1581,11 +2249,11 @@ class DeployManager extends EventEmitter {
    *      el primer ciclo en vez de consumir los 30 s completos.
    */
   /**
-   * @param {{ hostPort?: number | null, containerPort?: number | null, healthPath: string, containerName?: string | null, hostHeader?: string | null, timeoutMs: number, intervalMs: number, onProgress?: ((msg: string) => void) | null, signal?: AbortSignal | null }} spec
+   * @param {{ hostPort?: number | null, containerPort?: number | null, healthPath: string, containerName?: string | null, hostHeader?: string | null, timeoutMs: number, intervalMs: number, onProgress?: ((msg: string) => void) | null, signal?: AbortSignal | null, isRemote?: boolean, dockerEnv?: any }} spec
    */
-  async waitForHealth({ hostPort, containerPort = null, healthPath, containerName, hostHeader = null, timeoutMs, intervalMs, onProgress = null, signal = null }) {
+  async waitForHealth({ hostPort, containerPort = null, healthPath, containerName, hostHeader = null, timeoutMs, intervalMs, onProgress = null, signal = null, isRemote = false, dockerEnv = undefined }) {
     const deadline = Date.now() + timeoutMs;
-    const isContainerized = fs.existsSync('/.dockerenv');
+    const isContainerized = !isRemote && fs.existsSync('/.dockerenv');
     const probeUrls = [];
     if (isContainerized && containerName && containerPort) {
       probeUrls.push(`http://${containerName}:${containerPort}${healthPath}`);
@@ -1635,7 +2303,7 @@ class DeployManager extends EventEmitter {
       if (containerName) {
         const state = await this.runDocker(
           ['inspect', '-f', '{{.State.Running}}|{{.State.Restarting}}|{{.RestartCount}}', containerName],
-          { timeoutMs: 5000, signal }
+          { timeoutMs: 5000, signal, env: dockerEnv }
         );
         if (state.aborted) {
           return { healthy: false, attempts, reason: 'Verificación de salud cancelada', aborted: true };
@@ -1671,6 +2339,484 @@ class DeployManager extends EventEmitter {
     return { healthy: false, attempts, reason: `No respondió en ${Math.round(timeoutMs / 1000)} s (${lastError})` };
   }
 
+  /**
+   * Petición HTTP nativa para smoke tests (`http`/`https` lazy-loaded):
+   * - Respeta la cabecera `Host` explícita (que `fetch()`/undici ignora como forbidden header).
+   * - Nunca sigue redirecciones (0 SSRF por 3xx).
+   * - Acota la lectura del cuerpo a `maxBytes` (256 KB) en streaming real.
+   *
+   * @param {string} targetUrl
+   * @param {{ method: string, headers: Record<string, string>, body?: string | null, timeoutMs: number, signal?: AbortSignal | null, needBody: boolean, maxBytes?: number }} opts
+   * @returns {Promise<{ status: number, bodyText: string, truncated: boolean }>}
+   */
+  _smokeHttpRequest(targetUrl, { method, headers, body = null, timeoutMs, signal = null, needBody, maxBytes = MAX_SMOKE_BODY_BYTES }) {
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        const err = new Error('Smoke test cancelado');
+        err.name = 'AbortError';
+        return reject(err);
+      }
+      const parsed = new URL(targetUrl);
+      const isHttps = parsed.protocol === 'https:';
+      const mod = isHttps ? require('https') : require('http');
+      const payloadBuf = (body != null && method !== 'GET' && method !== 'HEAD') ? Buffer.from(body, 'utf8') : null;
+      /** @type {Record<string, string>} */
+      const reqHeaders = { ...headers };
+      if (payloadBuf) reqHeaders['Content-Length'] = String(payloadBuf.length);
+
+      let settled = false;
+      /** @type {ReturnType<typeof setTimeout> | null} */
+      let timer = null;
+      const cleanup = () => {
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (signal) signal.removeEventListener('abort', onAbort);
+      };
+      const done = (err, val) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      const req = mod.request(
+        {
+          hostname: parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname,
+          port: parsed.port ? Number(parsed.port) : (isHttps ? 443 : 80),
+          path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+          method,
+          headers: reqHeaders,
+          agent: false
+        },
+        (res) => {
+          const status = res.statusCode || 0;
+          if (!needBody) {
+            res.resume();
+            res.once('end', () => done(null, { status, bodyText: '', truncated: false }));
+            res.once('error', (err) => done(err, null));
+            return;
+          }
+          /** @type {Buffer[]} */
+          const chunks = [];
+          let total = 0;
+          let truncated = false;
+          res.on('data', (chunk) => {
+            if (truncated) return;
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            const remaining = maxBytes - total;
+            if (buf.length > remaining) {
+              if (remaining > 0) chunks.push(buf.subarray(0, remaining));
+              total = maxBytes;
+              truncated = true;
+              res.destroy();
+              done(null, { status, bodyText: Buffer.concat(chunks, total).toString('utf8'), truncated: true });
+              return;
+            }
+            chunks.push(buf);
+            total += buf.length;
+          });
+          res.once('end', () => {
+            done(null, { status, bodyText: Buffer.concat(chunks, total).toString('utf8'), truncated });
+          });
+          res.once('error', (err) => {
+            if (truncated) return;
+            done(err, null);
+          });
+        }
+      );
+
+      const onAbort = () => {
+        const err = new Error('Smoke test cancelado');
+        err.name = 'AbortError';
+        req.destroy(err);
+        done(err, null);
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+      timer = setTimeout(() => {
+        const err = new Error(`Timeout (${timeoutMs} ms)`);
+        err.name = 'TimeoutError';
+        req.destroy(err);
+        done(err, null);
+      }, timeoutMs);
+      if (timer.unref) timer.unref();
+
+      req.once('error', (err) => done(err, null));
+      if (payloadBuf) req.end(payloadBuf);
+      else req.end();
+    });
+  }
+
+  /**
+   * Lee el cuerpo de una respuesta Fetch acotado estrictamente a `maxBytes` (256 KB)
+   * cuando un llamante inyecta un `fetchImpl` personalizado.
+   * @param {any} res
+   * @param {number} [maxBytes]
+   * @returns {Promise<{ text: string, truncated: boolean }>}
+   */
+  async _readCappedResponseText(res, maxBytes = MAX_SMOKE_BODY_BYTES) {
+    if (!res) return { text: '', truncated: false };
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      /** @type {Uint8Array[]} */
+      const chunks = [];
+      let total = 0;
+      let truncated = false;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.byteLength > 0) {
+            const remaining = maxBytes - total;
+            if (value.byteLength > remaining) {
+              if (remaining > 0) chunks.push(value.subarray(0, remaining));
+              total = maxBytes;
+              truncated = true;
+              try { await reader.cancel(); } catch (e) {}
+              break;
+            }
+            chunks.push(value);
+            total += value.byteLength;
+          }
+        }
+      } finally {
+        try { reader.releaseLock(); } catch (e) {}
+      }
+      const buf = Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)), total);
+      return { text: buf.toString('utf8'), truncated };
+    }
+    if (typeof res.text === 'function') {
+      const raw = String(await res.text());
+      const truncated = Buffer.byteLength(raw, 'utf8') > maxBytes;
+      return { text: raw.slice(0, maxBytes), truncated };
+    }
+    return { text: '', truncated: false };
+  }
+
+  /**
+   * Resuelve el origen base seguro de un upstream para smoke tests (nunca sigue URLs externas arbitrarias).
+   * @param {string | { hostPort?: number | null, containerName?: string | null, containerPort?: number | null, isRemote?: boolean }} upstream
+   * @returns {string}
+   */
+  _resolveSmokeBaseUrl(upstream) {
+    if (upstream && typeof upstream === 'object') {
+      const isContainerized = !upstream.isRemote && fs.existsSync('/.dockerenv');
+      if (isContainerized && upstream.containerName && upstream.containerPort) {
+        return `http://${upstream.containerName}:${upstream.containerPort}`;
+      }
+      if (upstream.hostPort) {
+        return `http://127.0.0.1:${upstream.hostPort}`;
+      }
+      throw new Error('Upstream de smoke test sin puerto ni contenedor válido');
+    }
+    const raw = String(upstream || '').trim();
+    if (!raw || /[\s\r\n\0]/.test(raw)) {
+      throw new Error('Upstream de smoke test inválido');
+    }
+    const withProto = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+    const parsed = new URL(withProto);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`Protocolo de upstream no permitido: ${parsed.protocol}`);
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error('Credenciales embebidas no permitidas en upstream de smoke test');
+    }
+    const cleanHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    const forbiddenMetaHosts = new Set(['metadata', 'metadata.google.internal', 'metadata.goog', 'instance-data']);
+    if (
+      !cleanHost ||
+      forbiddenMetaHosts.has(cleanHost) ||
+      cleanHost.endsWith('.internal') ||
+      cleanHost.endsWith('.goog') ||
+      isMetadataIp(cleanHost)
+    ) {
+      throw new Error('Upstream de smoke test bloqueado por protección SSRF (metadatos cloud)');
+    }
+    const isLoopback = cleanHost === '127.0.0.1' || cleanHost === 'localhost' || cleanHost === '::1';
+    const isLocalContainerHost = (cleanHost.startsWith('culkibo_') && /^[a-z0-9_.-]{1,80}$/.test(cleanHost))
+      || /^[a-z0-9][a-z0-9_-]{0,63}$/.test(cleanHost);
+    if (!isLoopback && !isLocalContainerHost) {
+      throw new Error(`Upstream de smoke test fuera de loopback/contenedor local bloqueado: ${cleanHost.slice(0, 64)}`);
+    }
+    return `${parsed.protocol}//${parsed.host}`;
+  }
+
+  /**
+   * Ejecuta pruebas de humo HTTP deterministas contra el contenedor candidato o activo:
+   * - Sin SSRF (solo rutas relativas validadas con `sanitizeSmokePath`, `redirect: 'manual'`).
+   * - Sin ReDoS (búsqueda literal `String.includes()` únicamente, cero RegExp de usuario).
+   * - Cuerpo acotado a 256 KB y cabeceras hop-by-hop/`Host` bloqueadas en config de usuario.
+   *
+   * @param {string | { hostPort?: number | null, containerName?: string | null, containerPort?: number | null, isRemote?: boolean }} upstream
+   * @param {any[] | { enabled?: boolean, failPolicy?: string, checks?: any[] }} smokeTests
+   * @param {{ hostHeader?: string | null, signal?: AbortSignal | null, secrets?: string[], fetchImpl?: typeof fetch | null }} [options]
+   */
+  async runSmokeTests(upstream, smokeTests, options = {}) {
+    const started = Date.now();
+    const checks = Array.isArray(smokeTests)
+      ? smokeTests.slice(0, 10)
+      : (smokeTests && typeof smokeTests === 'object' && Array.isArray(smokeTests.checks)
+          ? smokeTests.checks.slice(0, 10)
+          : []);
+    if (checks.length === 0) {
+      return { ok: true, passed: 0, failed: 0, total: 0, durationMs: 0, checks: [], summary: 'Sin smoke tests configurados' };
+    }
+
+    const baseUrl = this._resolveSmokeBaseUrl(upstream);
+    const secrets = Array.isArray(options.secrets) ? options.secrets : [];
+    const signal = options.signal || null;
+    const customFetch = typeof options.fetchImpl === 'function' ? options.fetchImpl : null;
+    const safeHostHeader = options.hostHeader && /^[a-z0-9.-]+(?::\d{1,5})?$/i.test(String(options.hostHeader))
+      ? String(options.hostHeader)
+      : null;
+
+    /** @type {any[]} */
+    const results = [];
+    let passed = 0;
+    let failed = 0;
+    const forbiddenJsonKeys = new Set(['__proto__', 'constructor', 'prototype']);
+
+    for (let i = 0; i < checks.length; i++) {
+      const chk = checks[i] || {};
+      const label = chk.name ? String(chk.name).slice(0, 80) : `check_${i + 1}`;
+      const cleanPath = sanitizeSmokePath(chk.path);
+      if (!cleanPath) {
+        failed++;
+        results.push({
+          name: label,
+          path: String(chk.path || '').slice(0, 80),
+          ok: false,
+          status: null,
+          latencyMs: 0,
+          attempts: 0,
+          error: 'Ruta de smoke test inválida (debe ser relativa empezando por /, sin .. ni URLs completas)'
+        });
+        continue;
+      }
+
+      const methodRaw = String(chk.method || 'GET').toUpperCase();
+      const method = (methodRaw === 'HEAD' || methodRaw === 'POST') ? methodRaw : 'GET';
+      const expectedStatus = chk.expectStatus !== undefined
+        ? chk.expectStatus
+        : (chk.expectedStatus !== undefined ? chk.expectedStatus : '2xx');
+      const expectBodyContains = chk.expectBodyContains !== undefined
+        ? chk.expectBodyContains
+        : (chk.bodyContains !== undefined ? chk.bodyContains : null);
+      const bodyNotContains = chk.bodyNotContains !== undefined ? chk.bodyNotContains : null;
+      const maxLatencyMs = chk.maxLatencyMs !== undefined && chk.maxLatencyMs !== null && Number.isFinite(Number(chk.maxLatencyMs))
+        ? Number(chk.maxLatencyMs)
+        : null;
+      const timeoutMs = Math.min(15000, Math.max(50, Number(chk.timeoutMs) || 5000));
+      const retries = Math.min(3, Math.max(0, parseInt(String(chk.retries ?? 0), 10) || 0));
+
+      /** @type {Record<string, string>} */
+      const reqHeaders = {};
+      if (safeHostHeader) reqHeaders.Host = safeHostHeader;
+      if (chk.headers && typeof chk.headers === 'object' && !Array.isArray(chk.headers)) {
+        let hCount = 0;
+        for (const [hk, hv] of Object.entries(chk.headers)) {
+          if (hCount >= 10) break;
+          if (/^[A-Za-z0-9-]+$/.test(hk) && !SMOKE_BLOCKED_HEADERS.test(hk) && typeof hv === 'string') {
+            reqHeaders[hk] = hv.replace(/[\r\n\0]/g, '').slice(0, 512);
+            hCount++;
+          }
+        }
+      }
+
+      /** @type {any} */
+      let lastResult = null;
+      for (let attempt = 1; attempt <= retries + 1; attempt++) {
+        if (signal && signal.aborted) {
+          lastResult = {
+            name: label, path: cleanPath, method, ok: false, status: null, latencyMs: 0, attempts: attempt,
+            error: 'Smoke test cancelado'
+          };
+          break;
+        }
+        const t0 = Date.now();
+        try {
+          const needBody = method !== 'HEAD' && (expectBodyContains != null || bodyNotContains != null || chk.jsonPathEquals != null);
+          const reqBody = method === 'POST' && typeof chk.body === 'string' ? chk.body.slice(0, 16384) : null;
+          let resStatus = 0;
+          let bodyText = '';
+
+          if (customFetch) {
+            const reqTimeout = AbortSignal.timeout(timeoutMs);
+            const combinedSignal = (signal && typeof AbortSignal.any === 'function')
+              ? AbortSignal.any([signal, reqTimeout])
+              : reqTimeout;
+            /** @type {any} */
+            const fetchOpts = {
+              method,
+              headers: reqHeaders,
+              redirect: 'manual',
+              signal: combinedSignal
+            };
+            if (reqBody !== null) fetchOpts.body = reqBody;
+            const res = await customFetch(`${baseUrl}${cleanPath}`, fetchOpts);
+            resStatus = res.status;
+            if (needBody) {
+              const read = await this._readCappedResponseText(res, MAX_SMOKE_BODY_BYTES);
+              bodyText = read.text;
+            } else if (res.body && typeof res.body.cancel === 'function') {
+              try { await res.body.cancel(); } catch (e) {}
+            }
+          } else {
+            const nativeRes = await this._smokeHttpRequest(`${baseUrl}${cleanPath}`, {
+              method,
+              headers: reqHeaders,
+              body: reqBody,
+              timeoutMs,
+              signal,
+              needBody,
+              maxBytes: MAX_SMOKE_BODY_BYTES
+            });
+            resStatus = nativeRes.status;
+            bodyText = nativeRes.bodyText;
+          }
+          const latencyMs = Date.now() - t0;
+
+          /** @type {string[]} */
+          const errors = [];
+
+          // 1. Verificar código de estado HTTP
+          let statusOk = false;
+          if (typeof expectedStatus === 'number') {
+            statusOk = resStatus === expectedStatus;
+          } else if (Array.isArray(expectedStatus)) {
+            statusOk = expectedStatus.includes(resStatus);
+          } else if (typeof expectedStatus === 'string' && /^[1-5]xx$/i.test(expectedStatus)) {
+            statusOk = Math.floor(resStatus / 100) === Number(expectedStatus[0]);
+          } else {
+            statusOk = resStatus >= 200 && resStatus < 300;
+          }
+          if (!statusOk) {
+            errors.push(`Estado HTTP ${resStatus} (esperado ${Array.isArray(expectedStatus) ? expectedStatus.join('/') : expectedStatus})`);
+          }
+
+          // 2. Verificar latencia máxima
+          if (maxLatencyMs !== null && latencyMs > maxLatencyMs) {
+            errors.push(`Latencia ${latencyMs} ms superó el límite de ${maxLatencyMs} ms`);
+          }
+
+          // 3. Verificar contenido literal (cero RegExp = 0 ReDoS)
+          if (typeof expectBodyContains === 'string' && expectBodyContains.length > 0) {
+            if (!bodyText.includes(expectBodyContains.slice(0, 256))) {
+              errors.push(`El cuerpo no contiene el texto esperado`);
+            }
+          }
+          if (typeof bodyNotContains === 'string' && bodyNotContains.length > 0) {
+            if (bodyText.includes(bodyNotContains.slice(0, 256))) {
+              errors.push(`El cuerpo contiene una cadena prohibida`);
+            }
+          }
+
+          // 4. Verificar jsonPathEquals seguro (Object.hasOwn, profundidad <= 5, bloquea prototype pollution)
+          if (chk.jsonPathEquals && typeof chk.jsonPathEquals === 'object' && typeof chk.jsonPathEquals.path === 'string') {
+            const segs = chk.jsonPathEquals.path.trim().split('.').filter(Boolean);
+            if (segs.length === 0 || segs.length > 5 || segs.some((s) => forbiddenJsonKeys.has(s))) {
+              errors.push('Ruta jsonPathEquals inválida o prohibida');
+            } else {
+              try {
+                let cur = JSON.parse(bodyText);
+                let found = true;
+                for (const seg of segs) {
+                  if (cur !== null && typeof cur === 'object' && Object.prototype.hasOwnProperty.call(cur, seg)) {
+                    cur = cur[seg];
+                  } else {
+                    found = false;
+                    break;
+                  }
+                }
+                if (!found || cur !== chk.jsonPathEquals.value) {
+                  errors.push(`jsonPathEquals ${chk.jsonPathEquals.path} no coincide con el valor esperado`);
+                }
+              } catch (jsonErr) {
+                errors.push('La respuesta no es JSON válido para jsonPathEquals');
+              }
+            }
+          }
+
+          lastResult = {
+            name: label,
+            path: cleanPath,
+            method,
+            ok: errors.length === 0,
+            status: resStatus,
+            latencyMs,
+            attempts: attempt,
+            error: errors.length > 0 ? this.redact(errors.join('; '), secrets).slice(0, 400) : null
+          };
+          if (lastResult.ok) break;
+        } catch (err) {
+          const latencyMs = Date.now() - t0;
+          const msg = err && err.name === 'TimeoutError'
+            ? `Timeout (${timeoutMs} ms)`
+            : this.redact(String((err && err.message) || 'Error de conexión'), secrets).slice(0, 300);
+          lastResult = {
+            name: label,
+            path: cleanPath,
+            method,
+            ok: false,
+            status: null,
+            latencyMs,
+            attempts: attempt,
+            error: msg
+          };
+        }
+
+        if (attempt <= retries) {
+          await new Promise((r) => {
+            const t = setTimeout(r, 150);
+            if (t.unref) t.unref();
+          });
+        }
+      }
+
+      if (lastResult && lastResult.ok) passed++;
+      else failed++;
+      results.push(lastResult);
+    }
+
+    const durationMs = Date.now() - started;
+    const ok = failed === 0;
+    const summary = ok
+      ? `Smoke tests superados (${passed}/${results.length} en ${durationMs} ms)`
+      : `Smoke tests fallidos (${failed}/${results.length} fallaron)`;
+    return { ok, passed, failed, total: results.length, durationMs, checks: results, summary };
+  }
+
+  /** Ejecuta los smoke tests configurados de un proyecto contra su contenedor activo (`state.current`). */
+  async runSmokeTestsForProject(projectId, options = {}) {
+    const state = this.getState(projectId);
+    const current = state.current;
+    if (!current || (!current.hostPort && !current.containerName)) {
+      return { ok: false, status: 404, error: 'No hay ningún despliegue activo para ejecutar smoke tests' };
+    }
+    const pm = getProjectManager();
+    const project = options.project || (pm && typeof pm.getById === 'function' ? pm.getById(projectId) : null);
+    const smokeCfg = normalizeSmokeConfig(options.smokeTests !== undefined ? options.smokeTests : (project && project.smokeTests));
+    if (smokeCfg.checks.length === 0) {
+      return { ok: true, passed: 0, failed: 0, total: 0, durationMs: 0, checks: [], summary: 'Sin smoke tests configurados' };
+    }
+    const serverId = current.serverId || (project && project.serverId) || 'local';
+    const secrets = this._secretValuesForProject(projectId);
+    const hostHeader = options.hostHeader || (Array.isArray(current.hostnames) && current.hostnames[0]) || null;
+
+    if (serverId !== 'local') {
+      return this._withRemoteDockerEnv(serverId, {}, async (_dh, fleet) =>
+        this._withHealthTarget(serverId, fleet, current.hostPort, (localPort) =>
+          this.runSmokeTests(`127.0.0.1:${localPort}`, smokeCfg.checks, { hostHeader, secrets })
+        )
+      );
+    }
+    return this.runSmokeTests(
+      { hostPort: current.hostPort, containerName: current.containerName, containerPort: current.containerPort, isRemote: false },
+      smokeCfg.checks,
+      { hostHeader, secrets }
+    );
+  }
+
   // -------------------------------------------------------------------------
   // 5. Despliegue
   // -------------------------------------------------------------------------
@@ -1687,11 +2833,77 @@ class DeployManager extends EventEmitter {
   /** Serializa despliegues del mismo proyecto: dos a la vez es corrupción segura. */
   async deploy(project, options = {}) {
     if (!project || !project.id) throw new Error('Proyecto inválido');
+
+    // Ventanas de congelación de despliegues (nunca bloquean rollback; overrideFreeze queda auditado).
+    const freezeTrigger = options.trigger || 'manual';
+    const freezeNow = options.now !== undefined ? new Date(options.now) : new Date();
+    const freezeCheck = this.evaluateFreezeStatus(project, { now: freezeNow, trigger: freezeTrigger });
+    /** @type {any} */
+    let freezeOverrideMeta = null;
+    if (freezeCheck.frozen) {
+      if (!options.overrideFreeze) {
+        this._recordAudit({
+          source: options.auditSource || 'system',
+          action: 'deploy.freeze_blocked',
+          resourceId: project.id,
+          ip: options.actorIp || null,
+          status: 423,
+          detail: {
+            projectName: project.name || project.id,
+            trigger: freezeTrigger,
+            reason: freezeCheck.reason,
+            window: freezeCheck.window
+          }
+        });
+        this.emit('deploy_freeze_blocked', {
+          projectId: project.id,
+          trigger: freezeTrigger,
+          reason: freezeCheck.reason,
+          window: freezeCheck.window
+        });
+        const err = new Error(`Despliegue bloqueado por ventana de congelación: ${freezeCheck.reason || 'ventana activa'}`);
+        /** @type {any} */ (err).code = 'DEPLOY_FROZEN';
+        /** @type {any} */ (err).status = 423;
+        /** @type {any} */ (err).freezeWindow = freezeCheck.window;
+        throw err;
+      }
+      freezeOverrideMeta = {
+        overridden: true,
+        actor: String(options.actor || 'operator').slice(0, 120),
+        overrideReason: String(options.overrideReason || '').slice(0, 300),
+        window: freezeCheck.window,
+        at: freezeNow.toISOString()
+      };
+      this._recordAudit({
+        source: options.auditSource || 'system',
+        action: 'deploy.freeze_override',
+        resourceId: project.id,
+        ip: options.actorIp || null,
+        status: 200,
+        detail: {
+          projectName: project.name || project.id,
+          trigger: freezeTrigger,
+          actor: freezeOverrideMeta.actor,
+          overrideReason: freezeOverrideMeta.overrideReason,
+          window: freezeCheck.window
+        }
+      });
+      this.notify({
+        event: 'deploy_freeze_override',
+        level: 'warning',
+        title: 'Anulación de congelación de despliegues',
+        message: `${project.name || project.id}: despliegue forzado durante ventana de congelación por ${freezeOverrideMeta.actor}${freezeOverrideMeta.overrideReason ? ` (${freezeOverrideMeta.overrideReason})` : ''}.`,
+        projectId: project.id,
+        projectName: project.name || project.id
+      });
+    }
+
     const inFlight = this.locks.get(project.id);
     if (inFlight) {
       throw new Error('Ya hay un despliegue en curso para este proyecto');
     }
-    const task = this._deploy(project, options).finally(() => {
+    const deployOpts = freezeOverrideMeta ? { ...options, _freezeOverride: freezeOverrideMeta } : options;
+    const task = this._deploy(project, deployOpts).finally(() => {
       if (this.locks.get(project.id) === task) this.locks.delete(project.id);
       this.drainPending(project.id);
     });
@@ -1709,10 +2921,42 @@ class DeployManager extends EventEmitter {
    * («ya hay uno en curso», el usuario lo ve); para un disparo automático no lo
    * es.
    *
-   * @returns {{started: boolean, queued: boolean, promise?: Promise<any>}}
+   * @returns {{started: boolean, queued: boolean, blocked?: boolean, code?: string, window?: any, reason?: string | null, promise?: Promise<any>}}
    */
   enqueue(project, options = {}) {
     if (!project || !project.id) throw new Error('Proyecto inválido');
+    const freezeTrigger = options.trigger || 'manual';
+    const freezeNow = options.now !== undefined ? new Date(options.now) : new Date();
+    const freezeCheck = this.evaluateFreezeStatus(project, { now: freezeNow, trigger: freezeTrigger });
+    if (freezeCheck.frozen && !options.overrideFreeze) {
+      this._recordAudit({
+        source: options.auditSource || 'system',
+        action: 'deploy.freeze_blocked',
+        resourceId: project.id,
+        ip: options.actorIp || null,
+        status: 423,
+        detail: {
+          projectName: project.name || project.id,
+          trigger: freezeTrigger,
+          reason: freezeCheck.reason,
+          window: freezeCheck.window
+        }
+      });
+      this.emit('deploy_freeze_blocked', {
+        projectId: project.id,
+        trigger: freezeTrigger,
+        reason: freezeCheck.reason,
+        window: freezeCheck.window
+      });
+      return {
+        started: false,
+        queued: false,
+        blocked: true,
+        code: 'DEPLOY_FROZEN',
+        window: freezeCheck.window,
+        reason: freezeCheck.reason
+      };
+    }
     if (this.locks.has(project.id)) {
       this.pending.set(project.id, { project, options });
       return { started: false, queued: true };
@@ -1734,6 +2978,16 @@ class DeployManager extends EventEmitter {
       const fresh = pm && typeof pm.getById === 'function' ? pm.getById(projectId) : null;
       if (fresh) latestProject = fresh;
     } catch (e) {}
+    const freezeCheck = this.evaluateFreezeStatus(latestProject, { trigger: next.options?.trigger || 'manual' });
+    if (freezeCheck.frozen && !next.options?.overrideFreeze) {
+      this.emit('deploy_freeze_blocked', {
+        projectId,
+        trigger: next.options?.trigger || 'manual',
+        reason: freezeCheck.reason,
+        window: freezeCheck.window
+      });
+      return;
+    }
     const promise = this.deploy(latestProject, next.options);
     promise.catch(() => {});
   }
@@ -1743,13 +2997,34 @@ class DeployManager extends EventEmitter {
     const opts = { ...DEFAULTS, ...options };
     const state = this.getState(project.id);
     const slug = safeSlug(project.id);
+    const serverId = String(options.serverId || project.serverId || 'local').trim() || 'local';
+    if (!/^[a-z0-9_-]{1,64}$/.test(serverId)) {
+      throw new Error(`serverId inválido: ${serverId.slice(0, 40)}`);
+    }
+    const isRemote = serverId !== 'local';
     const version = options.version
       ? safeSlug(options.version, 'v')
       : `b${Date.now().toString(36)}`;
 
     const linkedDb = this.resolveLinkedDatabases(project);
     // Las variables explícitas del proyecto prevalecen sobre las autoinyectadas de BDs vinculadas.
-    const envVars = { ...linkedDb.injectedEnv, ...(project.envVars || {}) };
+    let envVars = { ...linkedDb.injectedEnv, ...(project.envVars || {}) };
+    const vaultSecrets = [];
+    if (Object.values(envVars).some((v) => typeof v === 'string' && v.includes('${vault.'))) {
+      const envMgr = getEnvironmentManager();
+      if (envMgr && typeof envMgr.resolveEnvWithVault === 'function') {
+        try {
+          const resolved = envMgr.resolveEnvWithVault(envVars);
+          if (resolved && typeof resolved === 'object') {
+            const nextMap = resolved.env && typeof resolved.env === 'object' ? resolved.env : resolved;
+            for (const [k, v] of Object.entries(nextMap)) {
+              if (envVars[k] !== v && typeof v === 'string' && v.length >= 8) vaultSecrets.push(v);
+            }
+            envVars = nextMap;
+          }
+        } catch (e) {}
+      }
+    }
     const envNames = Object.keys(envVars).filter(isValidEnvName);
     const rejectedEnv = Object.keys(envVars).filter(k => !isValidEnvName(k));
 
@@ -1760,6 +3035,7 @@ class DeployManager extends EventEmitter {
       id: preassignedId,
       projectId: project.id,
       projectName: project.name || project.id,
+      serverId,
       status: 'pendiente',
       imageTag: `culkibo/${slug}:${version}`,
       // Sufijo aleatorio: evita colisiones si el usuario redespliega la misma `version`
@@ -1774,6 +3050,9 @@ class DeployManager extends EventEmitter {
       /** Qué código es esto exactamente. Lo rellena la sincronización con git. */
       git: null,
       trigger: options.trigger || 'manual',
+      ...(options._freezeOverride ? { freezeOverride: options._freezeOverride } : {}),
+      smokeTestResults: null,
+      canaryResult: null,
       previous: state.current ? { ...state.current } : null,
       startedAt: new Date().toISOString(),
       finishedAt: null,
@@ -1781,11 +3060,12 @@ class DeployManager extends EventEmitter {
       error: null,
       logLines: []
     };
-    // No se persiste: solo sirve para redactar la salida en vivo (envVars + buildArgs + BDs vinculadas).
+    // No se persiste: solo sirve para redactar la salida en vivo (envVars + buildArgs + BDs vinculadas + vault).
     const allSecretValues = [
       ...Object.values(envVars),
       ...Object.values(project.buildArgs || {}),
-      ...linkedDb.secretValues
+      ...linkedDb.secretValues,
+      ...vaultSecrets
     ];
     Object.defineProperty(deployment, '__secrets', { value: allSecretValues, enumerable: false });
 
@@ -1863,506 +3143,867 @@ class DeployManager extends EventEmitter {
       }
     }
 
+    // Preflight específico para nodos remotos (Fleet SSH): rechazar bind mounts locales y BDs locales privadas
+    if (isRemote) {
+      const hostBindMounts = [
+        ...(Array.isArray(project.volumes) ? project.volumes.filter((v) => typeof v === 'string' && (/^[./\\]|^[A-Za-z]:/.test(v.split(':')[0] || ''))) : []),
+        ...(Array.isArray(project.fileMounts) ? project.fileMounts.filter(Boolean) : [])
+      ];
+      if (hostBindMounts.length > 0) {
+        const msg = `El nodo remoto «${serverId}» no admite montajes locales del host (volumes/fileMounts). Usa volúmenes nombrados de Docker.`;
+        this.log(deployment, 'ERROR', msg);
+        this._activeOps.delete(project.id);
+        return finish('fallido', msg);
+      }
+      if (linkedDb.networks.length > 0) {
+        const msg = `El nodo remoto «${serverId}» no puede conectarse a redes privadas de bases de datos locales (${linkedDb.linkedNames.join(', ')}). Configura DATABASE_URL accesible desde el nodo remoto.`;
+        this.log(deployment, 'ERROR', msg);
+        this._activeOps.delete(project.id);
+        return finish('fallido', msg);
+      }
+    }
+
     this.notify({
       event: 'deploy_started',
       level: 'info',
       title: 'Despliegue iniciado',
-      message: `${deployment.projectName}: iniciando despliegue (${deployment.trigger}).`,
+      message: `${deployment.projectName}: iniciando despliegue (${deployment.trigger})${isRemote ? ` en nodo «${serverId}»` : ''}.`,
       projectId: project.id,
       projectName: deployment.projectName
     });
 
+    /** @type {any} */
+    let activeDockerEnv = undefined;
     try {
-      // --- 0. Requisitos --------------------------------------------------
-      const docker = await this.detectDocker({ force: true });
-      if (!docker.available) {
-        this.log(deployment, 'ERROR', `No se puede desplegar: ${docker.reason}.`);
-        return finish('fallido', docker.reason);
-      }
+      return await this._withRemoteDockerEnv(serverId, { signal: opController.signal }, async (remoteDockerHost, fleet) => {
+        const dockerBaseEnv = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+        activeDockerEnv = dockerBaseEnv;
+        if (isRemote) {
+          this.log(deployment, 'INFO', `Túnel SSH Docker adquirido para nodo remoto «${serverId}»`);
+        }
 
-      // Guardia anti-ENOSPC antes de iniciar el build (configurable vía CULKIBO_MIN_FREE_DISK_MB)
-      if (!options.skipDiskCheck && process.env.NODE_ENV !== 'test' && typeof fs.statfsSync === 'function') {
-        try {
-          const minFreeMb = Math.max(0, Number(process.env.CULKIBO_MIN_FREE_DISK_MB ?? 1024));
-          if (minFreeMb > 0) {
-            const st = fs.statfsSync(DATA_DIR);
-            const freeMb = Math.round((st.bavail * st.bsize) / (1024 * 1024));
-            if (freeMb < minFreeMb) {
-              const msg = `Espacio en disco insuficiente (${freeMb} MB libres; mínimo requerido ${minFreeMb} MB). Limpia la caché de BuildKit desde Ajustes → Doctor antes de desplegar.`;
-              this.log(deployment, 'ERROR', msg);
-              return finish('fallido', msg);
+        // --- 0. Requisitos --------------------------------------------------
+        const docker = await this.detectDocker({ force: true, env: dockerBaseEnv });
+        if (!docker.available) {
+          this.log(deployment, 'ERROR', `No se puede desplegar: ${docker.reason}.`);
+          return finish('fallido', docker.reason);
+        }
+
+        // Guardia anti-ENOSPC antes de iniciar el build (solo en local; configurable vía CULKIBO_MIN_FREE_DISK_MB)
+        if (!isRemote && !options.skipDiskCheck && process.env.NODE_ENV !== 'test' && typeof fs.statfsSync === 'function') {
+          try {
+            const minFreeMb = Math.max(0, Number(process.env.CULKIBO_MIN_FREE_DISK_MB ?? 1024));
+            if (minFreeMb > 0) {
+              const st = fs.statfsSync(DATA_DIR);
+              const freeMb = Math.round((st.bavail * st.bsize) / (1024 * 1024));
+              if (freeMb < minFreeMb) {
+                const msg = `Espacio en disco insuficiente (${freeMb} MB libres; mínimo requerido ${minFreeMb} MB). Limpia la caché de BuildKit desde Ajustes → Doctor antes de desplegar.`;
+                this.log(deployment, 'ERROR', msg);
+                return finish('fallido', msg);
+              }
             }
+          } catch (e) {}
+        }
+
+        const rootContextDir = options.contextDir
+          || (project.localPath && fs.existsSync(project.localPath) ? project.localPath : path.join(ROOT_BASE_DIR, 'projects', project.id));
+        let contextDir = rootContextDir;
+        if (!options.contextDir && project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
+          try {
+            contextDir = assertContainedPath(rootContextDir, String(project.baseDirectory).replace(/^\/+/, ''));
+          } catch (e) {
+            this.log(deployment, 'WARN', `baseDirectory inválido ignorado (${project.baseDirectory}): ${e.message}`);
           }
-        } catch (e) {}
-      }
-
-      const rootContextDir = options.contextDir
-        || (project.localPath && fs.existsSync(project.localPath) ? project.localPath : path.join(ROOT_BASE_DIR, 'projects', project.id));
-      let contextDir = rootContextDir;
-      if (!options.contextDir && project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
-        try {
-          contextDir = assertContainedPath(rootContextDir, String(project.baseDirectory).replace(/^\/+/, ''));
-        } catch (e) {
-          this.log(deployment, 'WARN', `baseDirectory inválido ignorado (${project.baseDirectory}): ${e.message}`);
         }
-      }
 
-      // --- 0.5. Código fuente ---------------------------------------------
-      if (!options.contextDir && options.gitSync !== false && !project.localPath) {
-        setStage('sincronizando');
-        // Si localRunner está clonando este proyecto en paralelo tras POST /projects, esperar a que termine
-        try {
-          const localRunner = require('./localRunner');
-          const pendingClone = localRunner && localRunner.cloningLocks && localRunner.cloningLocks.get(project.id);
-          if (pendingClone) {
-            this.log(deployment, 'INFO', 'Esperando a que finalice la clonación inicial en curso...');
-            await pendingClone.catch(() => {});
+        // --- 0.5. Código fuente ---------------------------------------------
+        if (!options.contextDir && options.gitSync !== false && !project.localPath) {
+          setStage('sincronizando');
+          // Si localRunner está clonando este proyecto en paralelo tras POST /projects, esperar a que termine
+          try {
+            const localRunner = require('./localRunner');
+            const pendingClone = localRunner && localRunner.cloningLocks && localRunner.cloningLocks.get(project.id);
+            if (pendingClone) {
+              this.log(deployment, 'INFO', 'Esperando a que finalice la clonación inicial en curso...');
+              await pendingClone.catch(() => {});
+            }
+          } catch (e) {}
+
+          const sync = await repoSync.sync(project, {
+            commit: options.commit || null,
+            onLine: (line) => this.log(deployment, 'INFO', line)
+          });
+
+          if (opController.signal.aborted || this._abortedProjects.has(project.id)) {
+            this.log(deployment, 'WARN', 'Despliegue cancelado durante la sincronización Git');
+            return finish('cancelado', 'Despliegue cancelado');
           }
-        } catch (e) {}
+          if (!sync.ok) {
+            this.log(deployment, 'ERROR', `No se pudo obtener el código: ${sync.error}`);
+            return finish('fallido', sync.error);
+          }
 
-        const sync = await repoSync.sync(project, {
-          commit: options.commit || null,
-          onLine: (line) => this.log(deployment, 'INFO', line)
-        });
+          deployment.git = {
+            branch: sync.branch,
+            commit: sync.commit,
+            shortCommit: sync.shortCommit,
+            subject: sync.subject,
+            author: sync.author,
+            committedAt: sync.committedAt || null,
+            action: sync.action,
+            previousCommit: sync.previousCommit,
+            discardedChanges: (sync.dirtyFiles || []).length
+          };
 
-        if (opController.signal.aborted || this._abortedProjects.has(project.id)) {
-          this.log(deployment, 'WARN', 'Despliegue cancelado durante la sincronización Git');
-          return finish('cancelado', 'Despliegue cancelado');
+          if (sync.action === 'omitido') {
+            this.log(deployment, 'WARN', sync.reason);
+          } else {
+            const verb = sync.action === 'clonado'
+              ? 'Repositorio clonado'
+              : sync.action === 'sin-cambios'
+                ? 'El repositorio ya estaba al día'
+                : 'Repositorio actualizado';
+            this.log(
+              deployment,
+              'INFO',
+              `${verb}: ${sync.shortCommit} en «${sync.branch}»${sync.subject ? ` — ${sync.subject}` : ''}${sync.author ? ` (${sync.author})` : ''}`
+            );
+          }
         }
-        if (!sync.ok) {
-          this.log(deployment, 'ERROR', `No se pudo obtener el código: ${sync.error}`);
-          return finish('fallido', sync.error);
+
+        if (!fs.existsSync(contextDir)) {
+          const msg = `No hay código en ${contextDir}. Clona el repositorio del proyecto antes de desplegar.`;
+          this.log(deployment, 'ERROR', msg);
+          return finish('fallido', msg);
         }
 
-        deployment.git = {
-          branch: sync.branch,
-          commit: sync.commit,
-          shortCommit: sync.shortCommit,
-          subject: sync.subject,
-          author: sync.author,
-          committedAt: sync.committedAt || null,
-          action: sync.action,
-          previousCommit: sync.previousCommit,
-          discardedChanges: (sync.dirtyFiles || []).length
+        if (rejectedEnv.length > 0) {
+          this.log(deployment, 'WARN', `Variables de entorno ignoradas por nombre inválido: ${rejectedEnv.join(', ')}`);
+        }
+
+        // --- 1. Estrategia --------------------------------------------------
+        const strategy = await this.detectStrategy(contextDir, project, { isRemote });
+        deployment.strategy = {
+          builder: strategy.builder,
+          stack: strategy.stack,
+          containerPort: strategy.containerPort,
+          healthPath: strategy.healthPath,
+          reason: strategy.reason
         };
+        deployment.containerPort = strategy.containerPort;
+        this.log(deployment, 'INFO', `Estrategia de construcción: ${strategy.reason}`);
 
-        if (sync.action === 'omitido') {
-          this.log(deployment, 'WARN', sync.reason);
-        } else {
-          const verb = sync.action === 'clonado'
-            ? 'Repositorio clonado'
-            : sync.action === 'sin-cambios'
-              ? 'El repositorio ya estaba al día'
-              : 'Repositorio actualizado';
+        if (strategy.builder === 'generated' && strategy.stack === 'desconocido') {
+          const msg = 'No se ha podido determinar cómo construir este proyecto. Añade un Dockerfile al repositorio o instala railpack.';
+          this.log(deployment, 'ERROR', msg);
+          return finish('fallido', msg);
+        }
+
+        // --- 2. Construcción (protegida por semáforo global de concurrencia) ---
+        if (this._activeBuilds >= this.maxConcurrentBuilds) {
+          setStage('en_cola');
           this.log(
             deployment,
             'INFO',
-            `${verb}: ${sync.shortCommit} en «${sync.branch}»${sync.subject ? ` — ${sync.subject}` : ''}${sync.author ? ` (${sync.author})` : ''}`
+            `Esperando turno en la cola de builds (${this._activeBuilds}/${this.maxConcurrentBuilds} en curso para proteger la RAM del host)`
           );
         }
-      }
-
-      if (!fs.existsSync(contextDir)) {
-        const msg = `No hay código en ${contextDir}. Clona el repositorio del proyecto antes de desplegar.`;
-        this.log(deployment, 'ERROR', msg);
-        return finish('fallido', msg);
-      }
-
-      if (rejectedEnv.length > 0) {
-        this.log(deployment, 'WARN', `Variables de entorno ignoradas por nombre inválido: ${rejectedEnv.join(', ')}`);
-      }
-
-      // --- 1. Estrategia --------------------------------------------------
-      const strategy = await this.detectStrategy(contextDir, project);
-      deployment.strategy = {
-        builder: strategy.builder,
-        stack: strategy.stack,
-        containerPort: strategy.containerPort,
-        healthPath: strategy.healthPath,
-        reason: strategy.reason
-      };
-      deployment.containerPort = strategy.containerPort;
-      this.log(deployment, 'INFO', `Estrategia de construcción: ${strategy.reason}`);
-
-      if (strategy.builder === 'generated' && strategy.stack === 'desconocido') {
-        const msg = 'No se ha podido determinar cómo construir este proyecto. Añade un Dockerfile al repositorio o instala railpack.';
-        this.log(deployment, 'ERROR', msg);
-        return finish('fallido', msg);
-      }
-
-      // --- 2. Construcción (protegida por semáforo global de concurrencia) ---
-      if (this._activeBuilds >= this.maxConcurrentBuilds) {
-        setStage('en_cola');
-        this.log(
-          deployment,
-          'INFO',
-          `Esperando turno en la cola de builds (${this._activeBuilds}/${this.maxConcurrentBuilds} en curso para proteger la RAM del host)`
-        );
-      }
-      let slot;
-      try {
-        slot = await this.acquireBuildSlot(project.id, deployment.id, { signal: opController.signal });
-      } catch (slotErr) {
-        if (slotErr && slotErr.code === 'DEPLOY_CANCELLED') {
-          this.log(deployment, 'WARN', slotErr.message);
-          return finish('cancelado', slotErr.message);
+        let slot;
+        try {
+          slot = await this.acquireBuildSlot(project.id, deployment.id, { signal: opController.signal });
+        } catch (slotErr) {
+          if (slotErr && slotErr.code === 'DEPLOY_CANCELLED') {
+            this.log(deployment, 'WARN', slotErr.message);
+            return finish('cancelado', slotErr.message);
+          }
+          throw slotErr;
         }
-        throw slotErr;
-      }
-      if (slot.waited) {
-        this.log(deployment, 'INFO', `Turno de construcción adquirido tras cola (posición ${slot.position})`);
-      }
-      let buildOk;
-      try {
+        if (slot.waited) {
+          this.log(deployment, 'INFO', `Turno de construcción adquirido tras cola (posición ${slot.position})`);
+        }
+        let buildOk;
+        try {
+          if (opController.signal.aborted || this._abortedProjects.has(project.id)) {
+            this.log(deployment, 'WARN', 'Despliegue cancelado antes de iniciar la construcción');
+            return finish('cancelado', 'Despliegue cancelado');
+          }
+          setStage('construyendo');
+          buildOk = await this.runBuild(deployment, {
+            strategy,
+            contextDir,
+            project,
+            opts,
+            envVars,
+            signal: opController.signal,
+            remoteDockerHost
+          });
+        } finally {
+          this.releaseBuildSlot();
+        }
         if (opController.signal.aborted || this._abortedProjects.has(project.id)) {
-          this.log(deployment, 'WARN', 'Despliegue cancelado antes de iniciar la construcción');
+          this.log(deployment, 'WARN', 'Despliegue cancelado durante la construcción');
           return finish('cancelado', 'Despliegue cancelado');
         }
-        setStage('construyendo');
-        buildOk = await this.runBuild(deployment, { strategy, contextDir, project, opts, envVars, signal: opController.signal });
-      } finally {
-        this.releaseBuildSlot();
-      }
-      if (opController.signal.aborted || this._abortedProjects.has(project.id)) {
-        this.log(deployment, 'WARN', 'Despliegue cancelado durante la construcción');
-        return finish('cancelado', 'Despliegue cancelado');
-      }
-      if (!buildOk.ok) return finish('fallido', buildOk.error);
+        if (!buildOk.ok) return finish('fallido', buildOk.error);
 
-      // Precedencia correcta de memoria: options.memoryMb explícito > project.memoryMb > DEFAULTS.memoryMb
-      const rawMem = options.memoryMb != null ? Number(options.memoryMb) : Number(project.memoryMb);
-      const safeMemMb = Number.isInteger(rawMem) && rawMem >= 32 && rawMem <= 65536 ? rawMem : opts.memoryMb;
-      const safeCpus = /^[0-9]+(\.[0-9]+)?$/.test(String(project.cpus || '')) ? String(project.cpus) : opts.cpus;
+        // Precedencia correcta de memoria: options.memoryMb explícito > project.memoryMb > DEFAULTS.memoryMb
+        const rawMem = options.memoryMb != null ? Number(options.memoryMb) : Number(project.memoryMb);
+        const safeMemMb = Number.isInteger(rawMem) && rawMem >= 32 && rawMem <= 65536 ? rawMem : opts.memoryMb;
+        const safeCpus = /^[0-9]+(\.[0-9]+)?$/.test(String(project.cpus || '')) ? String(project.cpus) : opts.cpus;
 
-      // Preparar paso de variables de entorno: preferir `-e KEY` en memoria (conserva PEM multilínea
-      // y no escribe secretos en disco), usando `--env-file` solo para claves en HOST_HIJACK_ENV_BLOCKLIST.
-      const inlineEnvNames = envNames.filter((k) => !HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
-      const fileOnlyEnvNames = envNames.filter((k) => HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
-      const childRunEnv = { ...process.env, ...filterSafeHostEnv(envVars) };
+        // Preparar paso de variables de entorno: preferir `-e KEY` en memoria (conserva PEM multilínea
+        // y no escribe secretos en disco), usando `--env-file` solo para claves en HOST_HIJACK_ENV_BLOCKLIST.
+        // CRÍTICO: `DOCKER_HOST` del túnel remoto se inyecta DESPUÉS de `filterSafeHostEnv(envVars)` para que
+        // ninguna variable del usuario pueda secuestrar `DOCKER_HOST`.
+        const inlineEnvNames = envNames.filter((k) => !HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
+        const fileOnlyEnvNames = envNames.filter((k) => HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
+        const childRunEnv = {
+          ...process.env,
+          ...filterSafeHostEnv(envVars),
+          ...(remoteDockerHost ? { DOCKER_HOST: remoteDockerHost } : {})
+        };
 
-      // --- 2.5. Hook pre-deploy (ej. migraciones Prisma/Drizzle antes de arrancar tráfico) ---
-      if (preHookArgv && preHookArgv.length > 0) {
-        setStage('pre_deploy');
-        await this.ensureNetwork(opts.network);
-        const preName = `${deployment.containerName}_pre`;
-        const hookTimeoutMs = Math.min(600000, Math.max(5000, Number(project.hookTimeoutMs) || 120000));
-        this.log(deployment, 'INFO', `Ejecutando hook pre-despliegue: ${preHookArgv.join(' ')}`);
+        // --- 2.5. Hook pre-deploy (ej. migraciones Prisma/Drizzle antes de arrancar tráfico) ---
+        if (preHookArgv && preHookArgv.length > 0) {
+          setStage('pre_deploy');
+          await this.ensureNetwork(opts.network, { env: dockerBaseEnv, cacheKey: isRemote ? serverId : null });
+          const preName = `${deployment.containerName}_pre`;
+          const hookTimeoutMs = Math.min(600000, Math.max(5000, Number(project.hookTimeoutMs) || 120000));
+          this.log(deployment, 'INFO', `Ejecutando hook pre-despliegue: ${preHookArgv.join(' ')}`);
+
+          /** @type {string | null} */
+          let preEnvFile = null;
+          try {
+            const createArgs = [
+              'create',
+              '--name', preName,
+              '--network', opts.network,
+              '--memory', `${safeMemMb}m`,
+              '--memory-swap', `${safeMemMb}m`,
+              '--cpus', String(safeCpus),
+              '--pids-limit', String(opts.pidsLimit),
+              '--security-opt', 'no-new-privileges',
+              '--cap-drop', 'ALL',
+              '--label', 'culkibo.managed=true',
+              '--label', `com.culkibo.project_id=${project.id}`,
+              '--label', `com.culkibo.hook=pre_deploy`
+            ];
+            if (fileOnlyEnvNames.length > 0) {
+              fs.mkdirSync(TMP_ENV_DIR, { recursive: true, mode: 0o700 });
+              preEnvFile = path.join(TMP_ENV_DIR, `preenv_${crypto.randomBytes(8).toString('hex')}`);
+              const lines = fileOnlyEnvNames.map(k => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n]+/g, ' ')}`);
+              fs.writeFileSync(preEnvFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+              createArgs.push('--env-file', preEnvFile);
+            }
+            for (const k of inlineEnvNames) createArgs.push('-e', k);
+            // Sobrescribir --entrypoint para que imágenes con ENTRYPOINT fijo ejecuten el hook (Kamal #936)
+            createArgs.push('--entrypoint', preHookArgv[0], deployment.imageTag, ...preHookArgv.slice(1));
+
+            const created = await this.runDocker(createArgs, { timeoutMs: 30000, env: childRunEnv, signal: opController.signal, projectId: project.id });
+            if (created.code !== 0) {
+              const msg = this.redact(created.stderr.trim() || `No se pudo crear contenedor pre-deploy (código ${created.code})`, allSecretValues);
+              this.log(deployment, 'ERROR', msg);
+              return finish('fallido', msg);
+            }
+
+            for (const dbNet of linkedDb.networks) {
+              if (dbNet === opts.network) continue;
+              await this.runDocker(['network', 'connect', dbNet, preName], { timeoutMs: 10000, env: dockerBaseEnv }).catch(() => {});
+            }
+
+            const preRes = await this.runDocker(['start', '-a', preName], {
+              timeoutMs: hookTimeoutMs,
+              env: dockerBaseEnv,
+              signal: opController.signal,
+              projectId: project.id,
+              onLine: (line) => this.log(deployment, 'INFO', `[pre-deploy] ${this.redact(line, allSecretValues)}`)
+            });
+            if (preRes.aborted || opController.signal.aborted) {
+              return finish('cancelado', 'Despliegue cancelado durante hook pre-despliegue');
+            }
+            if (preRes.code !== 0) {
+              const msg = this.redact(preRes.stderr.trim() || `Hook pre-despliegue falló con código ${preRes.code}`, allSecretValues);
+              this.log(deployment, 'ERROR', `Hook pre-despliegue abortado: ${msg.slice(0, 600)}`);
+              return finish('fallido', `Hook pre-despliegue falló: ${msg.slice(0, 400)}`);
+            }
+            this.log(deployment, 'SUCCESS', 'Hook pre-despliegue completado correctamente');
+          } finally {
+            if (preEnvFile) { try { fs.unlinkSync(preEnvFile); } catch (e) {} }
+            await this.runDocker(['rm', '-f', preName], { timeoutMs: 15000, env: dockerBaseEnv }).catch(() => {});
+          }
+        }
+
+        // --- 3. Arranque del contenedor nuevo --------------------------------
+        setStage('arrancando');
+        await this.ensureNetwork(opts.network, { env: dockerBaseEnv, cacheKey: isRemote ? serverId : null });
+
+        const hostPort = isRemote
+          ? await this._allocateRemotePort(serverId, fleet, remoteDockerHost)
+          : await this.findFreePort(20000, deployment.id);
+        deployment.hostPort = hostPort;
+        this.inFlightContainers.add(deployment.containerName);
 
         /** @type {string | null} */
-        let preEnvFile = null;
+        let envFile = null;
+        let run;
         try {
-          const createArgs = [
-            'create',
-            '--name', preName,
-            '--network', opts.network,
-            '--memory', `${safeMemMb}m`,
-            '--memory-swap', `${safeMemMb}m`,
-            '--cpus', String(safeCpus),
-            '--pids-limit', String(opts.pidsLimit),
-            '--security-opt', 'no-new-privileges',
-            '--cap-drop', 'ALL',
-            '--label', 'culkibo.managed=true',
-            '--label', `com.culkibo.project_id=${project.id}`,
-            '--label', `com.culkibo.hook=pre_deploy`
-          ];
           if (fileOnlyEnvNames.length > 0) {
             fs.mkdirSync(TMP_ENV_DIR, { recursive: true, mode: 0o700 });
-            preEnvFile = path.join(TMP_ENV_DIR, `preenv_${crypto.randomBytes(8).toString('hex')}`);
+            envFile = path.join(TMP_ENV_DIR, `depenv_${crypto.randomBytes(8).toString('hex')}`);
             const lines = fileOnlyEnvNames.map(k => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n]+/g, ' ')}`);
-            fs.writeFileSync(preEnvFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
-            createArgs.push('--env-file', preEnvFile);
-          }
-          for (const k of inlineEnvNames) createArgs.push('-e', k);
-          // Sobrescribir --entrypoint para que imágenes con ENTRYPOINT fijo ejecuten el hook (Kamal #936)
-          createArgs.push('--entrypoint', preHookArgv[0], deployment.imageTag, ...preHookArgv.slice(1));
-
-          const created = await this.runDocker(createArgs, { timeoutMs: 30000, env: childRunEnv, signal: opController.signal, projectId: project.id });
-          if (created.code !== 0) {
-            const msg = this.redact(created.stderr.trim() || `No se pudo crear contenedor pre-deploy (código ${created.code})`, allSecretValues);
-            this.log(deployment, 'ERROR', msg);
-            return finish('fallido', msg);
+            fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
           }
 
+          const runArgs = this.runArgs({
+            containerName: deployment.containerName,
+            imageTag: deployment.imageTag,
+            hostPort,
+            containerPort: strategy.containerPort,
+            envNames: inlineEnvNames,
+            envFile,
+            network: opts.network,
+            memoryMb: safeMemMb,
+            cpus: safeCpus,
+            pidsLimit: opts.pidsLimit,
+            healthCmd: strategy.injectHealthcheck ? this.healthCommandFor(strategy) : null,
+            labels: {
+              'culkibo.managed': 'true',
+              'com.culkibo.project': safeSlug(project.id),
+              'com.culkibo.project_id': project.id,
+              'com.culkibo.deployment': deployment.id,
+              'com.culkibo.version': version
+            }
+          });
+
+          run = await this.runDocker(runArgs, { timeoutMs: 60000, env: childRunEnv, signal: opController.signal, projectId: project.id });
+        } finally {
+          if (!isRemote) this._pendingPorts.delete(hostPort);
+          if (envFile) {
+            try { fs.unlinkSync(envFile); } catch (e) {}
+          }
+        }
+        const protectedContainers = new Set(
+          [state.current && state.current.containerName, state.previous && state.previous.containerName].filter(Boolean)
+        );
+        if (run.aborted || opController.signal.aborted) {
+          await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+          return finish('cancelado', 'Despliegue cancelado durante el arranque');
+        }
+        if (run.code !== 0) {
+          const msg = this.redact(run.stderr.trim() || `docker run terminó con código ${run.code}`, allSecretValues);
+          this.log(deployment, 'ERROR', `No se pudo arrancar el contenedor: ${msg}`);
+          await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+          this._pruneFailedImage(deployment.imageTag, state, { env: dockerBaseEnv });
+          return finish('fallido', msg);
+        }
+
+        // Conectar redes aisladas de bases de datos vinculadas al proyecto
+        if (linkedDb.networks.length > 0) {
           for (const dbNet of linkedDb.networks) {
             if (dbNet === opts.network) continue;
-            await this.runDocker(['network', 'connect', dbNet, preName], { timeoutMs: 10000 }).catch(() => {});
+            const conn = await this.runDocker(['network', 'connect', dbNet, deployment.containerName], { timeoutMs: 10000, env: dockerBaseEnv });
+            if (conn.code !== 0 && !/already exists/i.test(conn.stderr || '')) {
+              this.log(deployment, 'WARN', `No se pudo conectar la red de BD ${dbNet}: ${(conn.stderr || '').trim().slice(0, 200)}`);
+            }
           }
+          this.log(deployment, 'INFO', `Conectado a ${linkedDb.linkedNames.length} base(s) de datos vinculada(s): ${linkedDb.linkedNames.join(', ')}`);
+        }
+        this.log(deployment, 'INFO', `Contenedor ${deployment.containerName} arrancado en 127.0.0.1:${hostPort}${isRemote ? ` (nodo «${serverId}»)` : ''}`);
 
-          const preRes = await this.runDocker(['start', '-a', preName], {
-            timeoutMs: hookTimeoutMs,
+        // --- 4. Puerta de salud ---------------------------------------------
+        setStage('verificando');
+        const health = await this._withHealthTarget(serverId, fleet, hostPort, (probePort) =>
+          this.waitForHealth({
+            hostPort: probePort,
+            containerPort: strategy.containerPort,
+            healthPath: strategy.healthPath,
+            containerName: deployment.containerName,
+            timeoutMs: opts.healthTimeoutMs,
+            intervalMs: opts.healthIntervalMs,
             signal: opController.signal,
+            isRemote,
+            dockerEnv: dockerBaseEnv,
+            onProgress: (m) => this.log(deployment, 'INFO', m)
+          })
+        );
+
+        if (health.aborted || opController.signal.aborted) {
+          await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+          return finish('cancelado', 'Despliegue cancelado durante verificación de salud');
+        }
+        if (!health.healthy) {
+          this.log(deployment, 'ERROR', `La versión nueva no pasó la verificación de salud: ${health.reason}`);
+          await this.captureContainerLogs(deployment, deployment.containerName, 60, { env: dockerBaseEnv });
+          await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+          this._pruneFailedImage(deployment.imageTag, state, { env: dockerBaseEnv });
+          deployment.__failNotified = true;
+          this.notify({
+            event: 'deploy_failed',
+            level: 'error',
+            title: 'Despliegue abortado',
+            message: `${deployment.projectName}: la versión nueva no pasó la verificación de salud (${health.reason}). La versión anterior sigue sirviendo tráfico.`,
             projectId: project.id,
-            onLine: (line) => this.log(deployment, 'INFO', `[pre-deploy] ${this.redact(line, allSecretValues)}`)
+            projectName: deployment.projectName
           });
-          if (preRes.aborted || opController.signal.aborted) {
-            return finish('cancelado', 'Despliegue cancelado durante hook pre-despliegue');
-          }
-          if (preRes.code !== 0) {
-            const msg = this.redact(preRes.stderr.trim() || `Hook pre-despliegue falló con código ${preRes.code}`, allSecretValues);
-            this.log(deployment, 'ERROR', `Hook pre-despliegue abortado: ${msg.slice(0, 600)}`);
-            return finish('fallido', `Hook pre-despliegue falló: ${msg.slice(0, 400)}`);
-          }
-          this.log(deployment, 'SUCCESS', 'Hook pre-despliegue completado correctamente');
-        } finally {
-          if (preEnvFile) { try { fs.unlinkSync(preEnvFile); } catch (e) {} }
-          await this.runDocker(['rm', '-f', preName], { timeoutMs: 15000 }).catch(() => {});
+          return finish('fallido', health.reason);
         }
-      }
+        this.log(deployment, 'SUCCESS', `Verificación de salud superada (HTTP ${health.status} tras ${health.attempts} intentos)`);
 
-      // --- 3. Arranque del contenedor nuevo --------------------------------
-      setStage('arrancando');
-      await this.ensureNetwork(opts.network);
-
-      const hostPort = await this.findFreePort(20000, deployment.id);
-      deployment.hostPort = hostPort;
-      this.inFlightContainers.add(deployment.containerName);
-
-      /** @type {string | null} */
-      let envFile = null;
-      let run;
-      try {
-        if (fileOnlyEnvNames.length > 0) {
-          fs.mkdirSync(TMP_ENV_DIR, { recursive: true, mode: 0o700 });
-          envFile = path.join(TMP_ENV_DIR, `depenv_${crypto.randomBytes(8).toString('hex')}`);
-          const lines = fileOnlyEnvNames.map(k => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n]+/g, ' ')}`);
-          fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+        // --- 4.5. Smoke Tests post-despliegue (solo si están configurados) ---
+        const smokeCfg = normalizeSmokeConfig(options.smokeTests !== undefined ? options.smokeTests : project.smokeTests);
+        const primaryHostHeader = deployment.hostnames[0] || null;
+        if (smokeCfg.enabled && smokeCfg.checks.length > 0) {
+          setStage('smoke_test');
+          this.log(deployment, 'INFO', `Ejecutando ${smokeCfg.checks.length} smoke test(s) antes de conmutar tráfico...`);
+          const smokeRes = await this._withHealthTarget(serverId, fleet, hostPort, (probePort) =>
+            this.runSmokeTests(
+              isRemote
+                ? `127.0.0.1:${probePort}`
+                : { hostPort: probePort, containerName: deployment.containerName, containerPort: strategy.containerPort, isRemote: false },
+              smokeCfg.checks,
+              { hostHeader: primaryHostHeader, signal: opController.signal, secrets: allSecretValues }
+            )
+          );
+          deployment.smokeTestResults = smokeRes;
+          if (!smokeRes.ok) {
+            const firstErr = (smokeRes.checks.find((c) => !c.ok) || {}).error || smokeRes.summary;
+            if (smokeCfg.failPolicy === 'warn') {
+              this.log(deployment, 'WARN', `Smoke tests con advertencias (failPolicy=warn): ${smokeRes.summary} (${firstErr})`);
+            } else {
+              this.log(deployment, 'ERROR', `Smoke tests fallidos antes de promoción: ${smokeRes.summary} — ${firstErr}`);
+              await this.captureContainerLogs(deployment, deployment.containerName, 60, { env: dockerBaseEnv });
+              await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+              this._pruneFailedImage(deployment.imageTag, state, { env: dockerBaseEnv });
+              deployment.__failNotified = true;
+              this.notify({
+                event: 'deploy_failed',
+                level: 'error',
+                title: 'Smoke tests fallidos',
+                message: `${deployment.projectName}: ${smokeRes.summary} (${firstErr}). La versión anterior sigue sirviendo al 100%.`,
+                projectId: project.id,
+                projectName: deployment.projectName
+              });
+              return finish('fallido', `Smoke tests fallidos: ${firstErr}`);
+            }
+          } else {
+            this.log(deployment, 'SUCCESS', smokeRes.summary);
+          }
         }
 
-        const runArgs = this.runArgs({
+        if (this._abortedProjects.has(project.id) || opController.signal.aborted) {
+          this.log(deployment, 'WARN', 'Despliegue cancelado antes de promocionar');
+          await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+          return finish('cancelado', 'Despliegue cancelado');
+        }
+
+        // --- 4.8. Canary Auto-Guard (tráfico progresivo + auto-rollback) -----
+        const canaryCfg = normalizeCanaryConfig(options.canary !== undefined ? options.canary : project.canary);
+        /** @type {any} */
+        let resolvedUpstream = null;
+        const canRunCanary = Boolean(
+          canaryCfg.enabled &&
+          state.current &&
+          state.current.upstream &&
+          deployment.hostnames.length > 0 &&
+          !project.maintenanceMode
+        );
+        if (canRunCanary) {
+          resolvedUpstream = await this.resolveUpstream({
+            containerName: deployment.containerName,
+            containerPort: strategy.containerPort,
+            hostPort,
+            network: opts.network,
+            env: dockerBaseEnv
+          });
+          deployment.upstream = resolvedUpstream.dial;
+          if (resolvedUpstream.warning) {
+            this.log(deployment, 'WARN', `No se pudo adjuntar Caddy a la red ${opts.network}: ${resolvedUpstream.warning}`);
+          }
+
+          const stableDial = state.current.upstream;
+          const stableContainer = state.current.containerName;
+          const canaryDial = resolvedUpstream.dial;
+          const progressiveSteps = canaryCfg.steps.filter((w) => w < 100);
+          if (stableContainer) this.inFlightContainers.add(stableContainer);
+
+          /** @type {any} */
+          const canaryState = {
+            deploymentId: deployment.id,
+            stableDial,
+            canaryDial,
+            stableContainer,
+            canaryContainer: deployment.containerName,
+            weight: 0,
+            stepIndex: 0,
+            steps: canaryCfg.steps,
+            startedAt: new Date().toISOString(),
+            aborted: false,
+            abortReason: null,
+            manualPromote: false,
+            wake: null,
+            restoreStable: async () => {
+              await this._withRouteTarget(serverId, fleet, (routeOpts) =>
+                this.switchRoute(deployment, deployment.hostnames, stableDial, project, routeOpts)
+              );
+            }
+          };
+          this.activeCanaries.set(project.id, canaryState);
+
+          let canaryTotalChecks = 0;
+          let canaryFailedChecks = 0;
+          /** @type {string | null} */
+          let canaryFailureReason = null;
+          let failedAtWeight = 0;
+
+          try {
+            setStage('canario');
+            // Capturar contador base de fallos pasivos de Caddy (best-effort)
+            let baselineCaddyFails = 0;
+            try {
+              const upstreamsNow = await this._withRouteTarget(serverId, fleet, ({ adminUrl }) =>
+                caddyManager.getUpstreamsStatus({ adminUrl })
+              );
+              const found = upstreamsNow.find((u) => u.address === canaryDial);
+              if (found) baselineCaddyFails = found.fails;
+            } catch (e) {}
+
+            for (let sIdx = 0; sIdx < progressiveSteps.length; sIdx++) {
+              const weight = progressiveSteps[sIdx];
+              canaryState.weight = weight;
+              canaryState.stepIndex = sIdx;
+              failedAtWeight = weight;
+
+              const shifted = await this._withRouteTarget(serverId, fleet, (routeOpts) =>
+                this.switchCanaryRoute(
+                  deployment,
+                  deployment.hostnames,
+                  { stableDial, canaryDial, canaryWeight: weight },
+                  project,
+                  routeOpts
+                )
+              );
+              if (!shifted.ok) {
+                canaryFailureReason = `No se pudo aplicar peso canario ${weight}%: ${shifted.error}`;
+                break;
+              }
+              this.log(deployment, 'INFO', `Canario activo al ${weight}% (${canaryDial}) / ${100 - weight}% (${stableDial})`);
+
+              const tickIntervalMs = Math.max(10, Math.floor(canaryCfg.stepDurationMs / canaryCfg.checksPerStep));
+              for (let tick = 0; tick < canaryCfg.checksPerStep; tick++) {
+                if (canaryState.manualPromote) break;
+                if (canaryState.aborted || opController.signal.aborted || this._abortedProjects.has(project.id)) {
+                  canaryFailureReason = canaryState.abortReason || 'Canario abortado';
+                  break;
+                }
+
+                // Esperar intervalo de observación (despertable inmediatamente por promote/abort, sin fuga de listeners)
+                await new Promise((resolve) => {
+                  let done = false;
+                  const finishWait = () => {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
+                    canaryState.wake = null;
+                    opController.signal.removeEventListener('abort', onAb);
+                    resolve(undefined);
+                  };
+                  const onAb = () => finishWait();
+                  const timer = setTimeout(finishWait, tickIntervalMs);
+                  canaryState.wake = finishWait;
+                  opController.signal.addEventListener('abort', onAb, { once: true });
+                });
+
+                if (canaryState.manualPromote) break;
+                if (canaryState.aborted || opController.signal.aborted || this._abortedProjects.has(project.id)) {
+                  canaryFailureReason = canaryState.abortReason || 'Canario abortado';
+                  break;
+                }
+
+                // 1. Comprobar salud del contenedor canario (Running & !OOMKilled & RestartCount === 0)
+                const insp = await this.runDocker(
+                  ['inspect', '-f', '{{.State.Running}}|{{.State.OOMKilled}}|{{.RestartCount}}', deployment.containerName],
+                  { timeoutMs: 5000, env: dockerBaseEnv, signal: opController.signal }
+                );
+                if (insp.code === 0 && (insp.stdout || '').trim()) {
+                  const [runFlag, oomFlag, rstRaw] = (insp.stdout || '').trim().split('|');
+                  const rstCount = parseInt(rstRaw || '0', 10) || 0;
+                  if (runFlag === 'false' || oomFlag === 'true' || rstCount > 0) {
+                    canaryFailureReason = oomFlag === 'true'
+                      ? 'Contenedor canario terminado por OOMKilled'
+                      : rstCount > 0
+                        ? `Contenedor canario en bucle de reinicios (${rstCount})`
+                        : 'Contenedor canario detenido inesperadamente';
+                    break;
+                  }
+                }
+
+                // 2. Ejecutar smoke tests o sonda HTTP rápida en el canario
+                canaryTotalChecks++;
+                const canarySmokeList = smokeCfg.checks.length > 0
+                  ? smokeCfg.checks
+                  : [{ path: strategy.healthPath || '/', expectStatus: '2xx', ...(canaryCfg.maxLatencyMs ? { maxLatencyMs: canaryCfg.maxLatencyMs } : {}) }];
+                const tickSmoke = await this._withHealthTarget(serverId, fleet, hostPort, (probePort) =>
+                  this.runSmokeTests(
+                    isRemote
+                      ? `127.0.0.1:${probePort}`
+                      : { hostPort: probePort, containerName: deployment.containerName, containerPort: strategy.containerPort, isRemote: false },
+                    canarySmokeList,
+                    { hostHeader: primaryHostHeader, signal: opController.signal, secrets: allSecretValues }
+                  )
+                );
+                if (!tickSmoke.ok) {
+                  canaryFailedChecks++;
+                }
+
+                // 3. Comprobar fallos pasivos reales en Caddy (best-effort)
+                try {
+                  const upstreamsTick = await this._withRouteTarget(serverId, fleet, ({ adminUrl }) =>
+                    caddyManager.getUpstreamsStatus({ adminUrl })
+                  );
+                  const found = upstreamsTick.find((u) => u.address === canaryDial);
+                  if (found && found.fails > baselineCaddyFails) {
+                    const delta = found.fails - baselineCaddyFails;
+                    baselineCaddyFails = found.fails;
+                    canaryFailedChecks += delta;
+                    canaryTotalChecks += delta;
+                  }
+                } catch (e) {}
+
+                const errorRate = canaryTotalChecks > 0 ? canaryFailedChecks / canaryTotalChecks : 0;
+                if (errorRate > canaryCfg.maxErrorRate) {
+                  const failedDetail = (tickSmoke.checks.find((c) => !c.ok) || {}).error || 'tasa de error excedida';
+                  canaryFailureReason = `Tasa de error del canario ${(errorRate * 100).toFixed(1)}% superó el límite ${(canaryCfg.maxErrorRate * 100).toFixed(1)}% (${failedDetail})`;
+                  break;
+                }
+              }
+
+              if (canaryFailureReason || canaryState.manualPromote) break;
+            }
+          } finally {
+            this.activeCanaries.delete(project.id);
+            if (stableContainer) this.inFlightContainers.delete(stableContainer);
+          }
+
+          if (canaryFailureReason) {
+            const finalErrRate = canaryTotalChecks > 0 ? canaryFailedChecks / canaryTotalChecks : 1;
+            if (canaryCfg.autoRollback !== false) {
+              this.log(deployment, 'ERROR', `Auto-rollback canario (<5 ms): restaurando 100% del tráfico a ${stableDial} (${canaryFailureReason})`);
+              try {
+                await this._withRouteTarget(serverId, fleet, (routeOpts) =>
+                  this.switchRoute(deployment, deployment.hostnames, stableDial, project, routeOpts)
+                );
+              } catch (rbErr) {
+                this.log(deployment, 'ERROR', `Error al restaurar ruta estable tras fallo canario: ${rbErr.message}`);
+              }
+            }
+            await this.captureContainerLogs(deployment, deployment.containerName, 60, { env: dockerBaseEnv });
+            await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+            this._pruneFailedImage(deployment.imageTag, state, { env: dockerBaseEnv });
+            deployment.canaryResult = {
+              promoted: false,
+              rolledBack: canaryCfg.autoRollback !== false,
+              failedAtWeight,
+              totalChecks: canaryTotalChecks,
+              failedChecks: canaryFailedChecks,
+              errorRate: Number(finalErrRate.toFixed(4)),
+              reason: canaryFailureReason
+            };
+            this._recordAudit({
+              source: options.auditSource || 'system',
+              action: 'deploy.canary_rollback',
+              resourceId: project.id,
+              ip: options.actorIp || null,
+              status: 200,
+              detail: {
+                deploymentId: deployment.id,
+                failedAtWeight,
+                errorRate: deployment.canaryResult.errorRate,
+                reason: canaryFailureReason
+              }
+            });
+            deployment.__failNotified = true;
+            this.notify({
+              event: 'canary_rollback',
+              level: 'warning',
+              title: 'Canario revertido automáticamente',
+              message: `${deployment.projectName}: ${canaryFailureReason}. Tráfico restaurado al 100% en la versión anterior.`,
+              projectId: project.id,
+              projectName: deployment.projectName
+            });
+            return finish('fallido', `Canario revertido automáticamente al ${failedAtWeight}%: ${canaryFailureReason}`);
+          }
+
+          deployment.canaryResult = {
+            promoted: true,
+            rolledBack: false,
+            steps: canaryCfg.steps,
+            totalChecks: canaryTotalChecks,
+            failedChecks: canaryFailedChecks,
+            errorRate: canaryTotalChecks > 0 ? Number((canaryFailedChecks / canaryTotalChecks).toFixed(4)) : 0
+          };
+          this.log(deployment, 'SUCCESS', `Canario verificado correctamente (${canaryTotalChecks} comprobaciones); promoviendo al 100%`);
+        }
+
+        // --- 5. Conmutación de la ruta ---------------------------------------
+        setStage('promocionando');
+        const upstream = resolvedUpstream || await this.resolveUpstream({
           containerName: deployment.containerName,
+          containerPort: strategy.containerPort,
+          hostPort,
+          network: opts.network,
+          env: dockerBaseEnv
+        });
+        deployment.upstream = upstream.dial;
+        if (!resolvedUpstream && upstream.warning) {
+          this.log(deployment, 'WARN', `No se pudo adjuntar Caddy a la red ${opts.network}: ${upstream.warning}`);
+        }
+
+        if (deployment.hostnames.length === 0) {
+          this.log(deployment, 'WARN', 'El proyecto no tiene dominios asignados: el servicio queda accesible solo en el host. Añade un dominio para publicarlo.');
+        } else {
+          const switched = await this._withRouteTarget(serverId, fleet, (routeOpts) =>
+            this.switchRoute(deployment, deployment.hostnames, upstream.dial, project, routeOpts)
+          );
+          if (!switched.ok) {
+            this.log(deployment, 'ERROR', `No se pudo conmutar la ruta: ${switched.error}. Se conserva la versión anterior.`);
+            await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+            return finish('fallido', switched.error);
+          }
+        }
+
+        // Re-comprobar aborto tras conmutar (cierra ventana race con forget() durante switchRoute)
+        if (this._abortedProjects.has(project.id)) {
+          try {
+            await this._withRouteTarget(serverId, fleet, ({ adminUrl }) => caddyManager.removeRoute(project.id, { adminUrl }));
+          } catch (e) {}
+          await this.forceRemove(deployment.containerName, protectedContainers, { env: dockerBaseEnv });
+          return finish('cancelado', 'Proyecto eliminado durante la promoción');
+        }
+
+        // --- 6. Promoción del registro ---------------------------------------
+        /** @type {any} */
+        const release = {
+          deploymentId: deployment.id,
+          projectName: deployment.projectName,
+          serverId,
           imageTag: deployment.imageTag,
+          containerName: deployment.containerName,
           hostPort,
           containerPort: strategy.containerPort,
-          envNames: inlineEnvNames,
-          envFile,
-          network: opts.network,
-          memoryMb: safeMemMb,
-          cpus: safeCpus,
-          pidsLimit: opts.pidsLimit,
-          healthCmd: strategy.injectHealthcheck ? this.healthCommandFor(strategy) : null,
-          labels: {
-            'culkibo.managed': 'true',
-            'com.culkibo.project': safeSlug(project.id),
-            'com.culkibo.project_id': project.id,
-            'com.culkibo.deployment': deployment.id,
-            'com.culkibo.version': version
+          upstream: deployment.upstream,
+          healthPath: strategy.healthPath,
+          hostnames: deployment.hostnames,
+          version,
+          git: deployment.git,
+          promotedAt: new Date().toISOString()
+        };
+        const retiring = state.current;
+        state.previous = retiring || null;
+        state.current = release;
+        this.saveStore();
+
+        // Actualizar lastDeployedAt y lastCommit en Project únicamente cuando llega a activo
+        try {
+          const pm = getProjectManager();
+          if (pm && typeof pm.getById === 'function' && pm.getById(project.id)) {
+            pm.update(project.id, {
+              lastDeployedAt: release.promotedAt,
+              ...(deployment.git?.shortCommit ? { lastCommit: deployment.git.shortCommit } : {})
+            });
           }
-        });
+        } catch (e) {}
 
-        run = await this.runDocker(runArgs, { timeoutMs: 60000, env: childRunEnv, signal: opController.signal, projectId: project.id });
-      } finally {
-        this._pendingPorts.delete(hostPort);
-        if (envFile) {
-          try { fs.unlinkSync(envFile); } catch (e) {}
-        }
-      }
-      const protectedContainers = new Set(
-        [state.current && state.current.containerName, state.previous && state.previous.containerName].filter(Boolean)
-      );
-      if (run.aborted || opController.signal.aborted) {
-        await this.forceRemove(deployment.containerName, protectedContainers);
-        return finish('cancelado', 'Despliegue cancelado durante el arranque');
-      }
-      if (run.code !== 0) {
-        const msg = this.redact(run.stderr.trim() || `docker run terminó con código ${run.code}`, allSecretValues);
-        this.log(deployment, 'ERROR', `No se pudo arrancar el contenedor: ${msg}`);
-        await this.forceRemove(deployment.containerName, protectedContainers);
-        this._pruneFailedImage(deployment.imageTag, state);
-        return finish('fallido', msg);
-      }
-
-      // Conectar redes aisladas de bases de datos vinculadas al proyecto
-      if (linkedDb.networks.length > 0) {
-        for (const dbNet of linkedDb.networks) {
-          if (dbNet === opts.network) continue;
-          const conn = await this.runDocker(['network', 'connect', dbNet, deployment.containerName], { timeoutMs: 10000 });
-          if (conn.code !== 0 && !/already exists/i.test(conn.stderr || '')) {
-            this.log(deployment, 'WARN', `No se pudo conectar la red de BD ${dbNet}: ${(conn.stderr || '').trim().slice(0, 200)}`);
+        // --- 6.5. Hook post-deploy (en contenedor recién promocionado) ---------
+        if (postHookArgv && postHookArgv.length > 0) {
+          setStage('post_deploy');
+          const hookTimeoutMs = Math.min(600000, Math.max(5000, Number(project.hookTimeoutMs) || 120000));
+          this.log(deployment, 'INFO', `Ejecutando hook post-despliegue: ${postHookArgv.join(' ')}`);
+          const postRes = await this.runDocker(['exec', deployment.containerName, ...postHookArgv], {
+            timeoutMs: hookTimeoutMs,
+            env: dockerBaseEnv,
+            onLine: (line) => this.log(deployment, 'INFO', `[post-deploy] ${this.redact(line, allSecretValues)}`)
+          });
+          if (postRes.code !== 0) {
+            const postErr = this.redact(postRes.stderr.trim() || `Hook post-despliegue terminó con código ${postRes.code}`, allSecretValues);
+            this.log(deployment, 'WARN', `Hook post-despliegue falló: ${postErr.slice(0, 400)}`);
+            if (project.postDeployFailPolicy === 'rollback' && state.previous) {
+              this.log(deployment, 'ERROR', 'Política postDeployFailPolicy=rollback: revirtiendo inmediatamente a la versión anterior...');
+              // Descartar despliegues pendientes en cola y revertir DENTRO del lock (evita carrera con drainPending, Kamal #1395)
+              this.pending.delete(project.id);
+              try {
+                await this._rollback(project.id, { ...opts, trigger: 'post-deploy-rollback' });
+              } catch (rbErr) {
+                this.log(deployment, 'ERROR', `Auto-rollback tras fallo de hook post-deploy falló: ${rbErr.message}`);
+              }
+              return finish('fallido', `Hook post-despliegue falló (revertido a versión anterior): ${postErr.slice(0, 300)}`);
+            }
+          } else {
+            this.log(deployment, 'SUCCESS', 'Hook post-despliegue completado correctamente');
           }
         }
-        this.log(deployment, 'INFO', `Conectado a ${linkedDb.linkedNames.length} base(s) de datos vinculada(s): ${linkedDb.linkedNames.join(', ')}`);
-      }
-      this.log(deployment, 'INFO', `Contenedor ${deployment.containerName} arrancado en 127.0.0.1:${hostPort}`);
 
-      // --- 4. Puerta de salud ---------------------------------------------
-      setStage('verificando');
-      const health = await this.waitForHealth({
-        hostPort,
-        containerPort: strategy.containerPort,
-        healthPath: strategy.healthPath,
-        containerName: deployment.containerName,
-        timeoutMs: opts.healthTimeoutMs,
-        intervalMs: opts.healthIntervalMs,
-        signal: opController.signal,
-        onProgress: (m) => this.log(deployment, 'INFO', m)
-      });
+        // --- 7. Drenaje del viejo, en segundo plano ---------------------------
+        if (retiring && retiring.containerName !== deployment.containerName) {
+          const drain = this.drainAndRetire(deployment, retiring, opts)
+            .catch(err => this.log(deployment, 'WARN', `Fallo al retirar la versión anterior: ${err.message}`))
+            .finally(() => { if (this.drains.get(project.id) === drain) this.drains.delete(project.id); });
+          this.drains.set(project.id, drain);
+        }
 
-      if (health.aborted || opController.signal.aborted) {
-        await this.forceRemove(deployment.containerName, protectedContainers);
-        return finish('cancelado', 'Despliegue cancelado durante verificación de salud');
-      }
-      if (!health.healthy) {
-        this.log(deployment, 'ERROR', `La versión nueva no pasó la verificación de salud: ${health.reason}`);
-        await this.captureContainerLogs(deployment, deployment.containerName);
-        await this.forceRemove(deployment.containerName, protectedContainers);
-        this._pruneFailedImage(deployment.imageTag, state);
-        deployment.__failNotified = true;
+        this.log(deployment, 'SUCCESS', `Despliegue completado en ${((Date.now() - started) / 1000).toFixed(1)} s — sirviendo ${deployment.imageTag}`);
         this.notify({
-          event: 'deploy_failed',
-          level: 'error',
-          title: 'Despliegue abortado',
-          message: `${deployment.projectName}: la versión nueva no pasó la verificación de salud (${health.reason}). La versión anterior sigue sirviendo tráfico.`,
+          event: 'deploy_succeeded',
+          level: 'success',
+          title: 'Despliegue completado',
+          message: `${deployment.projectName} está sirviendo ${deployment.imageTag}${deployment.hostnames.length ? ` en ${deployment.hostnames.join(', ')}` : ''}.`,
           projectId: project.id,
           projectName: deployment.projectName
         });
-        return finish('fallido', health.reason);
-      }
-      this.log(deployment, 'SUCCESS', `Verificación de salud superada (HTTP ${health.status} tras ${health.attempts} intentos)`);
-
-      if (this._abortedProjects.has(project.id) || opController.signal.aborted) {
-        this.log(deployment, 'WARN', 'Despliegue cancelado antes de promocionar');
-        await this.forceRemove(deployment.containerName, protectedContainers);
-        return finish('cancelado', 'Despliegue cancelado');
-      }
-
-      // --- 5. Conmutación de la ruta ---------------------------------------
-      setStage('promocionando');
-      const upstream = await this.resolveUpstream({
-        containerName: deployment.containerName,
-        containerPort: strategy.containerPort,
-        hostPort,
-        network: opts.network
+        return finish('activo');
       });
-      deployment.upstream = upstream.dial;
-      if (upstream.warning) this.log(deployment, 'WARN', `No se pudo adjuntar Caddy a la red ${opts.network}: ${upstream.warning}`);
-
-      if (deployment.hostnames.length === 0) {
-        this.log(deployment, 'WARN', 'El proyecto no tiene dominios asignados: el servicio queda accesible solo en el host. Añade un dominio para publicarlo.');
-      } else {
-        const switched = await this.switchRoute(deployment, deployment.hostnames, upstream.dial, project);
-        if (!switched.ok) {
-          this.log(deployment, 'ERROR', `No se pudo conmutar la ruta: ${switched.error}. Se conserva la versión anterior.`);
-          await this.forceRemove(deployment.containerName, protectedContainers);
-          return finish('fallido', switched.error);
-        }
-      }
-
-      // Re-comprobar aborto tras conmutar (cierra ventana race con forget() durante switchRoute)
-      if (this._abortedProjects.has(project.id)) {
-        try { await caddyManager.removeRoute(project.id); } catch (e) {}
-        await this.forceRemove(deployment.containerName, protectedContainers);
-        return finish('cancelado', 'Proyecto eliminado durante la promoción');
-      }
-
-      // --- 6. Promoción del registro ---------------------------------------
-      /** @type {any} */
-      const release = {
-        deploymentId: deployment.id,
-        projectName: deployment.projectName,
-        imageTag: deployment.imageTag,
-        containerName: deployment.containerName,
-        hostPort,
-        containerPort: strategy.containerPort,
-        upstream: deployment.upstream,
-        healthPath: strategy.healthPath,
-        hostnames: deployment.hostnames,
-        version,
-        git: deployment.git,
-        promotedAt: new Date().toISOString()
-      };
-      const retiring = state.current;
-      state.previous = retiring || null;
-      state.current = release;
-      this.saveStore();
-
-      // Actualizar lastDeployedAt y lastCommit en Project únicamente cuando llega a activo
-      try {
-        const pm = getProjectManager();
-        if (pm && typeof pm.getById === 'function' && pm.getById(project.id)) {
-          pm.update(project.id, {
-            lastDeployedAt: release.promotedAt,
-            ...(deployment.git?.shortCommit ? { lastCommit: deployment.git.shortCommit } : {})
-          });
-        }
-      } catch (e) {}
-
-      // --- 6.5. Hook post-deploy (en contenedor recién promocionado) ---------
-      if (postHookArgv && postHookArgv.length > 0) {
-        setStage('post_deploy');
-        const hookTimeoutMs = Math.min(600000, Math.max(5000, Number(project.hookTimeoutMs) || 120000));
-        this.log(deployment, 'INFO', `Ejecutando hook post-despliegue: ${postHookArgv.join(' ')}`);
-        const postRes = await this.runDocker(['exec', deployment.containerName, ...postHookArgv], {
-          timeoutMs: hookTimeoutMs,
-          onLine: (line) => this.log(deployment, 'INFO', `[post-deploy] ${this.redact(line, allSecretValues)}`)
-        });
-        if (postRes.code !== 0) {
-          const postErr = this.redact(postRes.stderr.trim() || `Hook post-despliegue terminó con código ${postRes.code}`, allSecretValues);
-          this.log(deployment, 'WARN', `Hook post-despliegue falló: ${postErr.slice(0, 400)}`);
-          if (project.postDeployFailPolicy === 'rollback' && state.previous) {
-            this.log(deployment, 'ERROR', 'Política postDeployFailPolicy=rollback: revirtiendo inmediatamente a la versión anterior...');
-            // Descartar despliegues pendientes en cola y revertir DENTRO del lock (evita carrera con drainPending, Kamal #1395)
-            this.pending.delete(project.id);
-            try {
-              await this._rollback(project.id, { ...opts, trigger: 'post-deploy-rollback' });
-            } catch (rbErr) {
-              this.log(deployment, 'ERROR', `Auto-rollback tras fallo de hook post-deploy falló: ${rbErr.message}`);
-            }
-            return finish('fallido', `Hook post-despliegue falló (revertido a versión anterior): ${postErr.slice(0, 300)}`);
-          }
-        } else {
-          this.log(deployment, 'SUCCESS', 'Hook post-despliegue completado correctamente');
-        }
-      }
-
-      // --- 7. Drenaje del viejo, en segundo plano ---------------------------
-      if (retiring && retiring.containerName !== deployment.containerName) {
-        const drain = this.drainAndRetire(deployment, retiring, opts)
-          .catch(err => this.log(deployment, 'WARN', `Fallo al retirar la versión anterior: ${err.message}`))
-          .finally(() => { if (this.drains.get(project.id) === drain) this.drains.delete(project.id); });
-        this.drains.set(project.id, drain);
-      }
-
-      this.log(deployment, 'SUCCESS', `Despliegue completado en ${((Date.now() - started) / 1000).toFixed(1)} s — sirviendo ${deployment.imageTag}`);
-      this.notify({
-        event: 'deploy_succeeded',
-        level: 'success',
-        title: 'Despliegue completado',
-        message: `${deployment.projectName} está sirviendo ${deployment.imageTag}${deployment.hostnames.length ? ` en ${deployment.hostnames.join(', ')}` : ''}.`,
-        projectId: project.id,
-        projectName: deployment.projectName
-      });
-      return finish('activo');
     } catch (err) {
       this.log(deployment, 'ERROR', `Error inesperado en el despliegue: ${err.message}`);
       const protectedSet = new Set(
         [state.current && state.current.containerName, state.previous && state.previous.containerName].filter(Boolean)
       );
-      try { await this.forceRemove(deployment.containerName, protectedSet); } catch (e) {}
+      try { await this.forceRemove(deployment.containerName, protectedSet, { env: activeDockerEnv }); } catch (e) {}
       return finish('fallido', err.message);
     } finally {
       this._activeOps.delete(project.id);
       this._abortedProjects.delete(project.id);
+      this.activeCanaries.delete(project.id);
       this.inFlightContainers.delete(deployment.containerName);
-      if (deployment.hostPort) portRegistry.release(deployment.hostPort, deployment.id);
+      if (!isRemote && deployment.hostPort) portRegistry.release(deployment.hostPort, deployment.id);
     }
   }
 
-  /** Elimina una imagen recién construida de un despliegue fallido (si no la usa current/previous). */
-  _pruneFailedImage(imageTag, state) {
+  /**
+   * Elimina una imagen recién construida de un despliegue fallido (si no la usa current/previous).
+   * @param {string} imageTag
+   * @param {any} state
+   * @param {{ env?: any }} [opts]
+   */
+  _pruneFailedImage(imageTag, state, { env = undefined } = {}) {
     if (!imageTag) return;
     if (state?.current?.imageTag === imageTag || state?.previous?.imageTag === imageTag) return;
-    this.runDocker(['rmi', imageTag], { timeoutMs: 15000 }).catch(() => {});
+    this.runDocker(['rmi', imageTag], { timeoutMs: 15000, env }).catch(() => {});
   }
 
   /**
    * Ejecuta el constructor elegido y transmite su salida como eventos de log.
    * @param {any} deployment
-   * @param {{ strategy: any, contextDir: string, project: any, opts: any, envVars: Record<string, any>, signal?: AbortSignal | null }} spec
+   * @param {{ strategy: any, contextDir: string, project: any, opts: any, envVars: Record<string, any>, signal?: AbortSignal | null, remoteDockerHost?: string | null }} spec
    */
-  async runBuild(deployment, { strategy, contextDir, project, opts, envVars, signal = null }) {
+  async runBuild(deployment, { strategy, contextDir, project, opts, envVars, signal = null, remoteDockerHost = null }) {
     const buildArgsMap = project.buildArgs || {};
     const secrets = [...Object.values(envVars), ...Object.values(buildArgsMap)];
     const onLine = (line) => this.log(deployment, 'INFO', line);
+    const buildEnv = {
+      ...process.env,
+      DOCKER_BUILDKIT: '1',
+      ...filterSafeHostEnv(buildArgsMap),
+      ...(remoteDockerHost ? { DOCKER_HOST: remoteDockerHost } : {})
+    };
 
     if (strategy.builder === 'railpack' || strategy.builder === 'nixpacks') {
       const buildArgNames = Object.keys(buildArgsMap).filter(isValidEnvName);
@@ -2375,7 +4016,7 @@ class DeployManager extends EventEmitter {
       const res = await this.runTool(strategy.builder, args, {
         timeoutMs: opts.buildTimeoutMs,
         cwd: contextDir,
-        env: { ...process.env, DOCKER_BUILDKIT: '1', ...filterSafeHostEnv(buildArgsMap) },
+        env: buildEnv,
         onLine,
         signal,
         projectId: deployment.projectId
@@ -2423,7 +4064,7 @@ class DeployManager extends EventEmitter {
     const res = await this.runDocker(args, {
       timeoutMs: opts.buildTimeoutMs,
       cwd: contextDir,
-      env: { ...process.env, DOCKER_BUILDKIT: '1', ...filterSafeHostEnv(project.buildArgs || {}) },
+      env: buildEnv,
       onLine,
       signal,
       projectId: deployment.projectId
@@ -2450,10 +4091,76 @@ class DeployManager extends EventEmitter {
   }
 
   /**
+   * Construye buckets de ruta Caddy preservando TODAS las políticas por dominio
+   * (buckets exactos vs comodines, Basic Auth, IP Allowlist, maxBodySizeMb,
+   * framePolicy, rateLimit y cabeceras personalizadas) excluyendo dominios deshabilitados.
+   *
+   * @param {any} deployment
+   * @param {string[]} hostnames
+   * @param {string[]} upstreams
+   * @param {number[] | null} [weights]
+   */
+  _buildRouteBuckets(deployment, hostnames, upstreams, weights = null) {
+    /** @type {any[]} */
+    const buckets = [];
+    try {
+      const domainManager = require('./domainManager');
+      const doms = domainManager.listByProject ? domainManager.listByProject(deployment.projectId) : [];
+      const activeDoms = doms.filter((d) => d && d.status !== 'disabled');
+      if (activeDoms.length > 0) {
+        /** @type {Map<string, any>} */
+        const grouped = new Map();
+        for (const d of activeDoms) {
+          const isWc = String(d.hostname || '').startsWith('*.');
+          const policy = {
+            securityHeaders: d.securityHeaders !== false,
+            framePolicy: d.framePolicy || null,
+            customHeaders: d.customHeaders || null,
+            basicAuth: d.basicAuth && d.basicAuth.enabled ? d.basicAuth : null,
+            ipAllowlist: Array.isArray(d.ipAllowlist) && d.ipAllowlist.length > 0 ? d.ipAllowlist : null,
+            maxBodySizeMb: d.maxBodySizeMb || null,
+            rateLimit: d.rateLimit && d.rateLimit.enabled ? d.rateLimit : null
+          };
+          const key = `${isWc ? 'wc' : 'ex'}:${JSON.stringify(policy)}`;
+          if (!grouped.has(key)) grouped.set(key, { hosts: [], policy });
+          grouped.get(key).hosts.push(d.hostname);
+        }
+        let idx = 0;
+        for (const entry of grouped.values()) {
+          buckets.push({
+            projectId: idx === 0 ? deployment.projectId : `${deployment.projectId}_p${idx}`,
+            hostnames: entry.hosts,
+            upstreams,
+            ...(weights ? { weights } : {}),
+            ...entry.policy
+          });
+          idx++;
+        }
+      }
+    } catch (e) {}
+
+    if (buckets.length === 0) {
+      buckets.push({
+        projectId: deployment.projectId,
+        hostnames,
+        upstreams,
+        ...(weights ? { weights } : {})
+      });
+    }
+    return buckets;
+  }
+
+  /**
    * Mueve la ruta del proyecto al destino nuevo preservando modo mantenimiento,
    * cabeceras de seguridad, Basic Auth y orden de especificidad en Caddy.
+   *
+   * @param {any} deployment
+   * @param {string[]} hostnames
+   * @param {string} dial
+   * @param {any} [projectHint]
+   * @param {{ adminUrl?: string | null, isRemote?: boolean }} [routeOpts]
    */
-  async switchRoute(deployment, hostnames, dial, projectHint = null) {
+  async switchRoute(deployment, hostnames, dial, projectHint = null, routeOpts = {}) {
     try {
       const pm = getProjectManager();
       const liveProject = projectHint || (pm && typeof pm.getById === 'function' ? pm.getById(deployment.projectId) : null);
@@ -2466,69 +4173,62 @@ class DeployManager extends EventEmitter {
         return { ok: true, maintenancePreserved: true };
       }
 
-      const detection = await caddyManager.detect();
+      const adminUrl = routeOpts && routeOpts.adminUrl ? routeOpts.adminUrl : null;
+      const isRemote = Boolean(routeOpts && routeOpts.isRemote);
+      const detection = await caddyManager.detect(adminUrl ? { adminUrl } : {});
       if (!detection.available) {
         return { ok: false, error: `Caddy no está disponible: ${detection.reason}` };
       }
 
-      // Preservar TODAS las políticas por dominio (buckets exactos vs comodines, Basic Auth, IP Allowlist,
-      // maxBodySizeMb, framePolicy, rateLimit y cabeceras personalizadas) y excluir dominios deshabilitados (Dokku #5313).
-      const ing = getIngressManager();
-      if (ing && typeof ing.ensureServer === 'function') {
-        try { await ing.ensureServer(); } catch (e) {}
-      }
-      /** @type {any[]} */
-      let buckets = [];
-      try {
-        const domainManager = require('./domainManager');
-        const doms = domainManager.listByProject ? domainManager.listByProject(deployment.projectId) : [];
-        const activeDoms = doms.filter((d) => d && d.status !== 'disabled');
-        if (activeDoms.length > 0) {
-          /** @type {Map<string, any>} */
-          const grouped = new Map();
-          for (const d of activeDoms) {
-            const isWc = String(d.hostname || '').startsWith('*.');
-            const policy = {
-              securityHeaders: d.securityHeaders !== false,
-              framePolicy: d.framePolicy || null,
-              customHeaders: d.customHeaders || null,
-              basicAuth: d.basicAuth && d.basicAuth.enabled ? d.basicAuth : null,
-              ipAllowlist: Array.isArray(d.ipAllowlist) && d.ipAllowlist.length > 0 ? d.ipAllowlist : null,
-              maxBodySizeMb: d.maxBodySizeMb || null,
-              rateLimit: d.rateLimit && d.rateLimit.enabled ? d.rateLimit : null
-            };
-            const key = `${isWc ? 'wc' : 'ex'}:${JSON.stringify(policy)}`;
-            if (!grouped.has(key)) grouped.set(key, { hosts: [], policy });
-            grouped.get(key).hosts.push(d.hostname);
-          }
-          let idx = 0;
-          for (const entry of grouped.values()) {
-            buckets.push({
-              projectId: idx === 0 ? deployment.projectId : `${deployment.projectId}_p${idx}`,
-              hostnames: entry.hosts,
-              upstreams: [dial],
-              ...entry.policy
-            });
-            idx++;
-          }
+      if (!isRemote) {
+        const ing = getIngressManager();
+        if (ing && typeof ing.ensureServer === 'function') {
+          try { await ing.ensureServer(); } catch (e) {}
         }
-      } catch (e) {}
-
-      if (buckets.length === 0) {
-        buckets.push({
-          projectId: deployment.projectId,
-          hostnames,
-          upstreams: [dial]
-        });
       }
-
+      const buckets = this._buildRouteBuckets(deployment, hostnames, [dial], null);
       for (const spec of buckets) {
-        await caddyManager.upsertRoute(spec);
+        await caddyManager.upsertRoute(spec, adminUrl ? { adminUrl } : {});
       }
       deployment.routeSwitched = true;
       const publishedHosts = buckets.flatMap((b) => b.hostnames);
       this.log(deployment, 'SUCCESS', `Ruta conmutada: ${publishedHosts.join(', ')} -> ${dial}`);
       return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  }
+
+  /**
+   * Aplica un reparto ponderado de tráfico canario (`weighted_round_robin`) en Caddy
+   * preservando todas las políticas de dominio (Basic Auth, IP Allowlist, cabeceras, etc.).
+   *
+   * @param {any} deployment
+   * @param {string[]} hostnames
+   * @param {{ stableDial: string, canaryDial: string, canaryWeight: number }} split
+   * @param {any} [projectHint]
+   * @param {{ adminUrl?: string | null, isRemote?: boolean }} [routeOpts]
+   */
+  async switchCanaryRoute(deployment, hostnames, { stableDial, canaryDial, canaryWeight }, projectHint = null, routeOpts = {}) {
+    try {
+      const weight = Math.min(99, Math.max(1, Math.round(Number(canaryWeight) || 10)));
+      const adminUrl = routeOpts && routeOpts.adminUrl ? routeOpts.adminUrl : null;
+      const isRemote = Boolean(routeOpts && routeOpts.isRemote);
+      const detection = await caddyManager.detect(adminUrl ? { adminUrl } : {});
+      if (!detection.available) {
+        return { ok: false, error: `Caddy no está disponible: ${detection.reason}` };
+      }
+      if (!isRemote) {
+        const ing = getIngressManager();
+        if (ing && typeof ing.ensureServer === 'function') {
+          try { await ing.ensureServer(); } catch (e) {}
+        }
+      }
+      const buckets = this._buildRouteBuckets(deployment, hostnames, [stableDial, canaryDial], [100 - weight, weight]);
+      for (const spec of buckets) {
+        await caddyManager.upsertRoute(spec, adminUrl ? { adminUrl } : {});
+      }
+      return { ok: true, weights: [100 - weight, weight], upstreams: [stableDial, canaryDial] };
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -2559,6 +4259,7 @@ class DeployManager extends EventEmitter {
     // jamás dejen B colgado sin detenerse ni cancelen el drenaje de otro contenedor distinto.
     const projectId = deployment.projectId;
     const retiringName = retiring.containerName;
+    const retiringServerId = retiring.serverId || deployment.serverId || 'local';
     this.cancelContainerDrain(retiringName);
     this.log(deployment, 'INFO', `Drenando ${retiringName} durante ${Math.round(opts.drainTimeoutMs / 1000)} s antes de detenerlo`);
 
@@ -2581,21 +4282,29 @@ class DeployManager extends EventEmitter {
       return;
     }
 
-    const stop = await this.runDocker(
-      ['stop', '--time', String(opts.stopGraceSeconds), retiringName],
-      { timeoutMs: (opts.stopGraceSeconds + 20) * 1000 }
-    );
-    if (stop.code === 0) {
-      this.log(deployment, 'INFO', `Versión anterior detenida: ${retiringName} (se conserva para el rollback)`);
-    } else {
-      this.log(deployment, 'WARN', `No se pudo detener ${retiringName}: ${stop.stderr.trim()}`);
-    }
+    await this._withRemoteDockerEnv(retiringServerId, {}, async (remoteDockerHost) => {
+      const env = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+      const stop = await this.runDocker(
+        ['stop', '--time', String(opts.stopGraceSeconds), retiringName],
+        { timeoutMs: (opts.stopGraceSeconds + 20) * 1000, env }
+      );
+      if (stop.code === 0) {
+        this.log(deployment, 'INFO', `Versión anterior detenida: ${retiringName} (se conserva para el rollback)`);
+      } else {
+        this.log(deployment, 'WARN', `No se pudo detener ${retiringName}: ${stop.stderr.trim()}`);
+      }
 
-    await this.pruneOldReleases(projectId, opts.keepReleases);
+      await this.pruneOldReleases(projectId, opts.keepReleases, { env });
+    });
     this.saveStore();
   }
 
-  async pruneOldReleases(projectId, keep = DEFAULTS.keepReleases) {
+  /**
+   * @param {string} projectId
+   * @param {number} [keep]
+   * @param {{ env?: any }} [opts]
+   */
+  async pruneOldReleases(projectId, keep = DEFAULTS.keepReleases, { env = undefined } = {}) {
     const state = this.getState(projectId);
     const slug = safeSlug(projectId);
     // Proteger current, previous, cualquier contenedor en vuelo (arrancando/verificando) y cualquier drenaje activo
@@ -2609,11 +4318,11 @@ class DeployManager extends EventEmitter {
     // Buscar primero por label exacto `com.culkibo.project_id`, excluyendo SIEMPRE previews y hooks activos (Kamal #1923, Coolify #9654)
     const listById = await this.runDocker(
       ['ps', '-a', '--filter', `label=com.culkibo.project_id=${projectId}`, '--format', '{{.Names}}|{{.Label "com.culkibo.preview"}}|{{.Label "com.culkibo.hook"}}'],
-      { timeoutMs: 10000 }
+      { timeoutMs: 10000, env }
     );
     const listBySlug = await this.runDocker(
       ['ps', '-a', '--filter', `label=com.culkibo.project=${slug}`, '--format', '{{.Names}}|{{.Label "com.culkibo.project_id"}}|{{.Label "com.culkibo.preview"}}|{{.Label "com.culkibo.hook"}}'],
-      { timeoutMs: 10000 }
+      { timeoutMs: 10000, env }
     );
     /** @type {Set<string>} */
     const candidateContainers = new Set();
@@ -2638,7 +4347,7 @@ class DeployManager extends EventEmitter {
     const removed = [];
     for (const name of candidateContainers) {
       if (alive.has(name)) continue;
-      const res = await this.runDocker(['rm', '-f', name], { timeoutMs: 20000 });
+      const res = await this.runDocker(['rm', '-f', name], { timeoutMs: 20000, env });
       if (res.code === 0) removed.push(name);
     }
 
@@ -2652,8 +4361,8 @@ class DeployManager extends EventEmitter {
     for (const tag of historyImgs.slice(0, Math.max(2, Number(keep) || 2))) keepTags.add(tag);
 
     const [imgByLabel, imgByRef] = await Promise.all([
-      this.runDocker(['images', '--filter', `label=com.culkibo.project_id=${projectId}`, '--format', '{{.Repository}}:{{.Tag}}'], { timeoutMs: 10000 }),
-      this.runDocker(['images', '--filter', `reference=culkibo/${slug}:*`, '--format', '{{.Repository}}:{{.Tag}}|{{.Label "com.culkibo.project_id"}}'], { timeoutMs: 10000 })
+      this.runDocker(['images', '--filter', `label=com.culkibo.project_id=${projectId}`, '--format', '{{.Repository}}:{{.Tag}}'], { timeoutMs: 10000, env }),
+      this.runDocker(['images', '--filter', `reference=culkibo/${slug}:*`, '--format', '{{.Repository}}:{{.Tag}}|{{.Label "com.culkibo.project_id"}}'], { timeoutMs: 10000, env })
     ]);
     /** @type {Set<string>} */
     const candidateTags = new Set();
@@ -2671,25 +4380,35 @@ class DeployManager extends EventEmitter {
     }
     for (const tag of candidateTags) {
       if (!tag || tag.includes('<none>') || keepTags.has(tag)) continue;
-      const rmi = await this.runDocker(['rmi', tag], { timeoutMs: 20000 });
+      const rmi = await this.runDocker(['rmi', tag], { timeoutMs: 20000, env });
       if (rmi.code === 0) removedImages.push(tag);
     }
     // Podar capas huérfanas `<none>` etiquetadas para este proyecto
-    await this.runDocker(['image', 'prune', '-f', '--filter', `label=com.culkibo.project_id=${projectId}`], { timeoutMs: 15000 }).catch(() => {});
+    await this.runDocker(['image', 'prune', '-f', '--filter', `label=com.culkibo.project_id=${projectId}`], { timeoutMs: 15000, env }).catch(() => {});
 
     return { removed, removedImages, keep };
   }
 
-  /** @param {string} containerName @param {Set<string> | null} [protectedNames] */
-  async forceRemove(containerName, protectedNames = null) {
+  /**
+   * @param {string} containerName
+   * @param {Set<string> | null} [protectedNames]
+   * @param {{ env?: any }} [opts]
+   */
+  async forceRemove(containerName, protectedNames = null, { env = undefined } = {}) {
     if (!containerName) return;
     if (protectedNames && protectedNames.has(containerName)) return;
-    await this.runDocker(['rm', '-f', containerName], { timeoutMs: 20000 });
+    await this.runDocker(['rm', '-f', containerName], { timeoutMs: 20000, env });
   }
 
-  /** Vuelca las últimas líneas del contenedor al log del despliegue. */
-  async captureContainerLogs(deployment, containerName, lines = 60) {
-    const res = await this.runDocker(['logs', '--tail', String(lines), containerName], { timeoutMs: 10000 });
+  /**
+   * Vuelca las últimas líneas del contenedor al log del despliegue.
+   * @param {any} deployment
+   * @param {string} containerName
+   * @param {number} [lines]
+   * @param {{ env?: any }} [opts]
+   */
+  async captureContainerLogs(deployment, containerName, lines = 60, { env = undefined } = {}) {
+    const res = await this.runDocker(['logs', '--tail', String(lines), containerName], { timeoutMs: 10000, env });
     const text = `${res.stdout || ''}${res.stderr || ''}`.trim();
     if (!text) return;
     this.log(deployment, 'ERROR', `Últimas líneas del contenedor:\n${text.slice(0, 3000)}`);
@@ -2749,6 +4468,7 @@ class DeployManager extends EventEmitter {
         target = {
           deploymentId: hist.id,
           projectName: hist.projectName || projectId,
+          serverId: hist.serverId || 'local',
           imageTag: hist.imageTag,
           containerName: hist.containerName,
           hostPort: hist.hostPort,
@@ -2770,12 +4490,16 @@ class DeployManager extends EventEmitter {
     const pm = getProjectManager();
     const liveProject = pm && typeof pm.getById === 'function' ? pm.getById(projectId) : null;
     const liveHostnames = liveProject ? this.hostnamesFor(liveProject) : (target.hostnames || []);
+    const targetServerId = String(target.serverId || (current && current.serverId) || (liveProject && liveProject.serverId) || 'local').trim() || 'local';
+    const isRemote = targetServerId !== 'local';
+    target.serverId = targetServerId;
 
     /** @type {any} */
     const record = {
       id: `rbk_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
       projectId,
       projectName: (liveProject && liveProject.name) || (current && current.projectName) || projectId,
+      serverId: targetServerId,
       status: 'promocionando',
       kind: 'rollback',
       imageTag: target.imageTag,
@@ -2824,179 +4548,197 @@ class DeployManager extends EventEmitter {
 
     let recreatedFromImage = false;
     try {
-      const docker = await this.detectDocker({ force: true });
-      if (!docker.available) return finish('fallido', docker.reason);
+      return await this._withRemoteDockerEnv(targetServerId, {}, async (remoteDockerHost, fleet) => {
+        const dockerBaseEnv = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+        const docker = await this.detectDocker({ force: true, env: dockerBaseEnv });
+        if (!docker.available) return finish('fallido', docker.reason);
 
-      const running = await this.runDocker(['inspect', '-f', '{{.State.Running}}', target.containerName], { timeoutMs: 8000 });
-      let needsRecreate = running.code !== 0;
-      let startedExisting = false;
+        const running = await this.runDocker(['inspect', '-f', '{{.State.Running}}', target.containerName], { timeoutMs: 8000, env: dockerBaseEnv });
+        let needsRecreate = running.code !== 0;
+        let startedExisting = false;
 
-      if (!needsRecreate && (running.stdout || '').trim() !== 'true') {
-        this.log(record, 'INFO', `Arrancando la versión anterior ${target.containerName}...`);
-        const start = await this.runDocker(['start', target.containerName], { timeoutMs: 30000 });
-        if (start.code !== 0) {
-          const msg = start.stderr.trim() || `docker start terminó con código ${start.code}`;
-          if (/port is already allocated|address already in use/i.test(msg) && options.recreateOnMissing !== false && target.imageTag) {
-            this.log(record, 'WARN', `Puerto ocupado al arrancar ${target.containerName}; recreando contenedor desde la imagen ${target.imageTag}...`);
-            needsRecreate = true;
+        if (!needsRecreate && (running.stdout || '').trim() !== 'true') {
+          this.log(record, 'INFO', `Arrancando la versión anterior ${target.containerName}...`);
+          const start = await this.runDocker(['start', target.containerName], { timeoutMs: 30000, env: dockerBaseEnv });
+          if (start.code !== 0) {
+            const msg = start.stderr.trim() || `docker start terminó con código ${start.code}`;
+            if (/port is already allocated|address already in use/i.test(msg) && options.recreateOnMissing !== false && target.imageTag) {
+              this.log(record, 'WARN', `Puerto ocupado al arrancar ${target.containerName}; recreando contenedor desde la imagen ${target.imageTag}...`);
+              needsRecreate = true;
+            } else {
+              this.log(record, 'ERROR', `No se pudo arrancar la versión anterior: ${msg}`);
+              return finish('fallido', msg);
+            }
           } else {
-            this.log(record, 'ERROR', `No se pudo arrancar la versión anterior: ${msg}`);
+            startedExisting = true;
+          }
+        } else if (!needsRecreate) {
+          this.log(record, 'INFO', 'La versión anterior sigue viva dentro de su ventana de drenaje: el rollback es solo un cambio de ruta');
+        }
+
+        // Auto-recuperación desde imagen Docker si el contenedor antiguo fue eliminado o colisionó puerto
+        if (needsRecreate) {
+          if (options.recreateOnMissing === false || !target.imageTag) {
+            const msg = `El contenedor de la versión anterior (${target.containerName}) ya no existe; no se puede revertir sin reconstruir`;
+            this.log(record, 'ERROR', msg);
             return finish('fallido', msg);
           }
-        } else {
+          const imgCheck = await this.runDocker(['image', 'inspect', target.imageTag], { timeoutMs: 8000, env: dockerBaseEnv });
+          if (imgCheck.code !== 0) {
+            const msg = `El contenedor (${target.containerName}) y su imagen (${target.imageTag}) ya no existen; no se puede revertir sin reconstruir`;
+            this.log(record, 'ERROR', msg);
+            return finish('fallido', msg);
+          }
+
+          await this.ensureNetwork(opts.network, { env: dockerBaseEnv, cacheKey: isRemote ? targetServerId : null });
+          const newPort = isRemote
+            ? await this._allocateRemotePort(targetServerId, fleet, remoteDockerHost)
+            : await this.findFreePort(20000, record.id);
+          const newName = `culkibo_${safeSlug(projectId)}_rbk_${crypto.randomBytes(3).toString('hex')}`;
+          const linkedDb = liveProject ? this.resolveLinkedDatabases(liveProject) : { injectedEnv: {}, networks: [], secretValues: [] };
+          const envVars = { ...linkedDb.injectedEnv, ...((liveProject && liveProject.envVars) || {}) };
+          const validEnvNames = Object.keys(envVars).filter(isValidEnvName);
+          const inlineEnvNames = validEnvNames.filter((k) => !HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
+          const fileOnlyEnvNames = validEnvNames.filter((k) => HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
+          const containerPort = target.containerPort || (liveProject && liveProject.containerPort) || DEFAULTS.containerPort;
+          const safeMemMb = Math.min(32768, Math.max(64, Number(liveProject && liveProject.memoryMb) || opts.memoryMb));
+          const safeCpus = String(Math.min(32, Math.max(0.1, Number(liveProject && liveProject.cpus) || Number(opts.cpus) || 1)));
+          const healthPath = sanitizeHealthPath((liveProject && liveProject.healthPath) || target.healthPath || '/');
+          const healthCmd = `node -e "fetch('http://127.0.0.1:${containerPort}${healthPath}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))" || wget -qO- http://127.0.0.1:${containerPort}${healthPath} >/dev/null 2>&1 || exit 1`;
+
+          /** @type {string | null} */
+          let rbEnvFile = null;
+          this.inFlightContainers.add(newName);
+          try {
+            if (fileOnlyEnvNames.length > 0) {
+              fs.mkdirSync(TMP_ENV_DIR, { recursive: true, mode: 0o700 });
+              rbEnvFile = path.join(TMP_ENV_DIR, `rbkenv_${crypto.randomBytes(8).toString('hex')}`);
+              const lines = fileOnlyEnvNames.map((k) => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n\0]+/g, ' ')}`);
+              fs.writeFileSync(rbEnvFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+            }
+            const runArgs = this.runArgs({
+              containerName: newName,
+              imageTag: target.imageTag,
+              hostPort: newPort,
+              containerPort,
+              envNames: inlineEnvNames,
+              envFile: rbEnvFile,
+              network: opts.network,
+              memoryMb: safeMemMb,
+              cpus: safeCpus,
+              pidsLimit: opts.pidsLimit,
+              healthCmd,
+              labels: {
+                'culkibo.managed': 'true',
+                'com.culkibo.project': safeSlug(projectId),
+                'com.culkibo.project_id': projectId,
+                'com.culkibo.deployment': record.id
+              }
+            });
+            const rbChildEnv = {
+              ...process.env,
+              ...filterSafeHostEnv(envVars),
+              ...(remoteDockerHost ? { DOCKER_HOST: remoteDockerHost } : {})
+            };
+            const runRes = await this.runDocker(runArgs, { timeoutMs: 60000, env: rbChildEnv });
+            if (runRes.code !== 0) {
+              const secrets = this._secretValuesForProject(projectId);
+              const msg = this.redact((runRes.stderr || '').trim() || `docker run falló en rollback (${runRes.code})`, secrets);
+              this.log(record, 'ERROR', msg);
+              this.inFlightContainers.delete(newName);
+              return finish('fallido', msg);
+            }
+            for (const dbNet of linkedDb.networks) {
+              if (dbNet !== opts.network) {
+                await this.runDocker(['network', 'connect', dbNet, newName], { timeoutMs: 10000, env: dockerBaseEnv }).catch(() => {});
+              }
+            }
+            const up = await this.resolveUpstream({ containerName: newName, containerPort, hostPort: newPort, network: opts.network, env: dockerBaseEnv });
+            target.containerName = newName;
+            target.hostPort = newPort;
+            target.containerPort = containerPort;
+            target.upstream = up.dial;
+            record.containerName = newName;
+            record.hostPort = newPort;
+            record.upstream = up.dial;
+          } finally {
+            if (rbEnvFile) { try { fs.unlinkSync(rbEnvFile); } catch (e) {} }
+            if (!isRemote) {
+              this._pendingPorts.delete(newPort);
+              portRegistry.release(newPort, record.id);
+            }
+          }
+          recreatedFromImage = true;
           startedExisting = true;
         }
-      } else if (!needsRecreate) {
-        this.log(record, 'INFO', 'La versión anterior sigue viva dentro de su ventana de drenaje: el rollback es solo un cambio de ruta');
-      }
 
-      // Auto-recuperación desde imagen Docker local si el contenedor antiguo fue eliminado o colisionó puerto
-      if (needsRecreate) {
-        if (options.recreateOnMissing === false || !target.imageTag) {
-          const msg = `El contenedor de la versión anterior (${target.containerName}) ya no existe; no se puede revertir sin reconstruir`;
-          this.log(record, 'ERROR', msg);
-          return finish('fallido', msg);
-        }
-        const imgCheck = await this.runDocker(['image', 'inspect', target.imageTag], { timeoutMs: 8000 });
-        if (imgCheck.code !== 0) {
-          const msg = `El contenedor (${target.containerName}) y su imagen (${target.imageTag}) ya no existen; no se puede revertir sin reconstruir`;
-          this.log(record, 'ERROR', msg);
-          return finish('fallido', msg);
-        }
-
-        await this.ensureNetwork(opts.network);
-        const newPort = await this.findFreePort(20000, record.id);
-        const newName = `culkibo_${safeSlug(projectId)}_rbk_${crypto.randomBytes(3).toString('hex')}`;
-        const linkedDb = liveProject ? this.resolveLinkedDatabases(liveProject) : { injectedEnv: {}, networks: [], secretValues: [] };
-        const envVars = { ...linkedDb.injectedEnv, ...((liveProject && liveProject.envVars) || {}) };
-        const validEnvNames = Object.keys(envVars).filter(isValidEnvName);
-        const inlineEnvNames = validEnvNames.filter((k) => !HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
-        const fileOnlyEnvNames = validEnvNames.filter((k) => HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
-        const containerPort = target.containerPort || (liveProject && liveProject.containerPort) || DEFAULTS.containerPort;
-        const safeMemMb = Math.min(32768, Math.max(64, Number(liveProject && liveProject.memoryMb) || opts.memoryMb));
-        const safeCpus = String(Math.min(32, Math.max(0.1, Number(liveProject && liveProject.cpus) || Number(opts.cpus) || 1)));
-        const healthPath = sanitizeHealthPath((liveProject && liveProject.healthPath) || target.healthPath || '/');
-        const healthCmd = `node -e "fetch('http://127.0.0.1:${containerPort}${healthPath}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))" || wget -qO- http://127.0.0.1:${containerPort}${healthPath} >/dev/null 2>&1 || exit 1`;
-
-        /** @type {string | null} */
-        let rbEnvFile = null;
-        this.inFlightContainers.add(newName);
-        try {
-          if (fileOnlyEnvNames.length > 0) {
-            fs.mkdirSync(TMP_ENV_DIR, { recursive: true, mode: 0o700 });
-            rbEnvFile = path.join(TMP_ENV_DIR, `rbkenv_${crypto.randomBytes(8).toString('hex')}`);
-            const lines = fileOnlyEnvNames.map((k) => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n\0]+/g, ' ')}`);
-            fs.writeFileSync(rbEnvFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
-          }
-          const runArgs = this.runArgs({
-            containerName: newName,
-            imageTag: target.imageTag,
-            hostPort: newPort,
-            containerPort,
-            envNames: inlineEnvNames,
-            envFile: rbEnvFile,
-            network: opts.network,
-            memoryMb: safeMemMb,
-            cpus: safeCpus,
-            pidsLimit: opts.pidsLimit,
-            healthCmd,
-            labels: {
-              'culkibo.managed': 'true',
-              'com.culkibo.project': safeSlug(projectId),
-              'com.culkibo.project_id': projectId,
-              'com.culkibo.deployment': record.id
-            }
-          });
-          const runRes = await this.runDocker(runArgs, { timeoutMs: 60000, env: { ...process.env, ...filterSafeHostEnv(envVars) } });
-          if (runRes.code !== 0) {
-            const secrets = this._secretValuesForProject(projectId);
-            const msg = this.redact((runRes.stderr || '').trim() || `docker run falló en rollback (${runRes.code})`, secrets);
+        if (startedExisting) {
+          const health = await this._withHealthTarget(targetServerId, fleet, target.hostPort, (probePort) =>
+            this.waitForHealth({
+              hostPort: probePort,
+              containerPort: target.containerPort,
+              healthPath: target.healthPath || DEFAULTS.healthPath,
+              containerName: target.containerName,
+              timeoutMs: opts.healthTimeoutMs,
+              intervalMs: opts.healthIntervalMs,
+              isRemote,
+              dockerEnv: dockerBaseEnv,
+              onProgress: (m) => this.log(record, 'INFO', m)
+            })
+          );
+          if (!health.healthy) {
+            const msg = `La versión anterior tampoco pasó la verificación de salud: ${health.reason}`;
             this.log(record, 'ERROR', msg);
-            this.inFlightContainers.delete(newName);
+            // Detener (o eliminar si fue recién recreado) para no dejar contenedores rotos en crash-loop
+            if (recreatedFromImage) {
+              await this.runDocker(['rm', '-f', target.containerName], { timeoutMs: 15000, env: dockerBaseEnv }).catch(() => {});
+            } else {
+              await this.runDocker(['stop', '--time', '5', target.containerName], { timeoutMs: 15000, env: dockerBaseEnv }).catch(() => {});
+            }
             return finish('fallido', msg);
           }
-          for (const dbNet of linkedDb.networks) {
-            if (dbNet !== opts.network) {
-              await this.runDocker(['network', 'connect', dbNet, newName], { timeoutMs: 10000 }).catch(() => {});
+          this.log(record, 'SUCCESS', `Versión anterior sana (HTTP ${health.status})`);
+        }
+
+        const hostnames = record.hostnames;
+        if (hostnames.length > 0) {
+          const switched = await this._withRouteTarget(targetServerId, fleet, (routeOpts) =>
+            this.switchRoute(record, hostnames, target.upstream, liveProject, routeOpts)
+          );
+          if (!switched.ok) {
+            if (recreatedFromImage) {
+              await this.runDocker(['rm', '-f', target.containerName], { timeoutMs: 15000, env: dockerBaseEnv }).catch(() => {});
             }
+            return finish('fallido', switched.error);
           }
-          const up = await this.resolveUpstream({ containerName: newName, containerPort, hostPort: newPort, network: opts.network });
-          target.containerName = newName;
-          target.hostPort = newPort;
-          target.containerPort = containerPort;
-          target.upstream = up.dial;
-          record.containerName = newName;
-          record.hostPort = newPort;
-          record.upstream = up.dial;
-        } finally {
-          if (rbEnvFile) { try { fs.unlinkSync(rbEnvFile); } catch (e) {} }
-          this._pendingPorts.delete(newPort);
-          portRegistry.release(newPort, record.id);
+        } else {
+          this.log(record, 'WARN', 'Sin dominios asignados: no hay ninguna ruta que conmutar');
         }
-        recreatedFromImage = true;
-        startedExisting = true;
-      }
 
-      if (startedExisting) {
-        const health = await this.waitForHealth({
-          hostPort: target.hostPort,
-          containerPort: target.containerPort,
-          healthPath: target.healthPath || DEFAULTS.healthPath,
-          containerName: target.containerName,
-          timeoutMs: opts.healthTimeoutMs,
-          intervalMs: opts.healthIntervalMs,
-          onProgress: (m) => this.log(record, 'INFO', m)
+        target.status = 'activo';
+        target.hostnames = hostnames;
+        state.current = target;
+        state.previous = current || null;
+        this.saveStore();
+
+        if (current && current.containerName !== target.containerName) {
+          const drain = this.drainAndRetire(record, current, opts)
+            .catch(err => this.log(record, 'WARN', `Fallo al retirar ${current.containerName}: ${err.message}`))
+            .finally(() => { if (this.drains.get(projectId) === drain) this.drains.delete(projectId); });
+          this.drains.set(projectId, drain);
+        }
+
+        this.log(record, 'SUCCESS', `Rollback completado: sirviendo ${target.imageTag}`);
+        this.notify({
+          event: 'rollback',
+          level: 'warning',
+          title: 'Rollback ejecutado',
+          message: `${record.projectName} ha vuelto a ${target.imageTag}.`,
+          projectId,
+          projectName: record.projectName
         });
-        if (!health.healthy) {
-          const msg = `La versión anterior tampoco pasó la verificación de salud: ${health.reason}`;
-          this.log(record, 'ERROR', msg);
-          // Detener (o eliminar si fue recién recreado) para no dejar contenedores rotos en crash-loop
-          if (recreatedFromImage) {
-            await this.runDocker(['rm', '-f', target.containerName], { timeoutMs: 15000 }).catch(() => {});
-          } else {
-            await this.runDocker(['stop', '--time', '5', target.containerName], { timeoutMs: 15000 }).catch(() => {});
-          }
-          return finish('fallido', msg);
-        }
-        this.log(record, 'SUCCESS', `Versión anterior sana (HTTP ${health.status})`);
-      }
-
-      const hostnames = record.hostnames;
-      if (hostnames.length > 0) {
-        const switched = await this.switchRoute(record, hostnames, target.upstream, liveProject);
-        if (!switched.ok) {
-          if (recreatedFromImage) {
-            await this.runDocker(['rm', '-f', target.containerName], { timeoutMs: 15000 }).catch(() => {});
-          }
-          return finish('fallido', switched.error);
-        }
-      } else {
-        this.log(record, 'WARN', 'Sin dominios asignados: no hay ninguna ruta que conmutar');
-      }
-
-      target.status = 'activo';
-      target.hostnames = hostnames;
-      state.current = target;
-      state.previous = current || null;
-      this.saveStore();
-
-      if (current && current.containerName !== target.containerName) {
-        const drain = this.drainAndRetire(record, current, opts)
-          .catch(err => this.log(record, 'WARN', `Fallo al retirar ${current.containerName}: ${err.message}`))
-          .finally(() => { if (this.drains.get(projectId) === drain) this.drains.delete(projectId); });
-        this.drains.set(projectId, drain);
-      }
-
-      this.log(record, 'SUCCESS', `Rollback completado: sirviendo ${target.imageTag}`);
-      this.notify({
-        event: 'rollback',
-        level: 'warning',
-        title: 'Rollback ejecutado',
-        message: `${record.projectName} ha vuelto a ${target.imageTag}.`,
-        projectId,
-        projectName: record.projectName
+        return finish('activo');
       });
-      return finish('activo');
     } catch (err) {
       this.log(record, 'ERROR', `Error inesperado en el rollback: ${err.message}`);
       return finish('fallido', err.message);
@@ -3008,7 +4750,13 @@ class DeployManager extends EventEmitter {
   /** Espera al drenaje en curso. Lo usan las pruebas y el apagado ordenado. */
   async awaitDrain(projectId) {
     const drain = this.drains.get(projectId);
-    if (drain) await drain;
+    if (!drain) return;
+    for (const entry of this._drainTimers.values()) {
+      if (entry.projectId === projectId && entry.timer && typeof entry.timer.ref === 'function') {
+        entry.timer.ref();
+      }
+    }
+    await drain;
   }
 
   // -------------------------------------------------------------------------
@@ -3017,25 +4765,50 @@ class DeployManager extends EventEmitter {
 
   async status(projectId) {
     const state = this.getState(projectId);
-    const docker = await this.detectDocker();
+    const serverId = (state.current && state.current.serverId) || 'local';
+    let docker;
     /** @type {any} */
     let containerState = null;
-    if (docker.available && state.current) {
-      const res = await this.runDocker(
-        ['inspect', '-f', '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}', state.current.containerName],
-        { timeoutMs: 8000 }
-      );
-      if (res.code === 0) {
-        const [status, health] = (res.stdout || '').trim().split('|');
-        containerState = { status, health };
+    if (serverId !== 'local' && state.current) {
+      try {
+        await this._withRemoteDockerEnv(serverId, {}, async (remoteDockerHost) => {
+          const env = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+          docker = await this.detectDocker({ env });
+          if (docker.available && state.current) {
+            const res = await this.runDocker(
+              ['inspect', '-f', '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}', state.current.containerName],
+              { timeoutMs: 8000, env }
+            );
+            if (res.code === 0) {
+              const [status, health] = (res.stdout || '').trim().split('|');
+              containerState = { status, health };
+            }
+          }
+        });
+      } catch (e) {
+        docker = { available: false, version: null, reason: e.message };
+      }
+    } else {
+      docker = await this.detectDocker();
+      if (docker.available && state.current) {
+        const res = await this.runDocker(
+          ['inspect', '-f', '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}', state.current.containerName],
+          { timeoutMs: 8000 }
+        );
+        if (res.code === 0) {
+          const [status, health] = (res.stdout || '').trim().split('|');
+          containerState = { status, health };
+        }
       }
     }
     const last = state.history[0] || null;
     return {
       docker,
+      serverId,
       current: state.current,
       previous: state.previous,
       canRollback: Boolean(state.previous),
+      activeCanary: this.getCanaryState(projectId),
       containerState,
       // Sin esto el panel no puede distinguir «no hay despliegue» de «hay uno
       // a medio construir», que es justo cuando el usuario mira la pantalla.
@@ -3144,10 +4917,21 @@ class DeployManager extends EventEmitter {
 
     /** @type {Array<{ projectId: string, state: any }>} */
     const active = [];
+    // Mantener lazy-load sin coste RAM en instalaciones sin Auto-Sleep/Advisor configurado
+    const sleepAdv = (_sleepAdvisor || fs.existsSync(path.join(DATA_DIR, 'sleep-policies.json')) || fs.existsSync(path.join(DATA_DIR, 'advisor.json')))
+      ? getSleepAdvisor()
+      : null;
     for (const [projectId, state] of Object.entries(this.store)) {
-      if (state && state.current && state.current.containerName && state.current.status !== 'detenido' && state.current.status !== 'stopped') {
-        active.push({ projectId, state });
+      if (!state || !state.current || !state.current.containerName) continue;
+      if (state.current.status === 'detenido' || state.current.status === 'stopped' || state.current.status === 'sleeping') {
+        continue;
       }
+      // Saltar despliegues de nodos remotos (monitorizados por serverFleetManager) y servicios dormidos (Scale-to-Zero)
+      if (state.current.serverId && state.current.serverId !== 'local') continue;
+      if (sleepAdv && typeof sleepAdv.isSleeping === 'function') {
+        try { if (sleepAdv.isSleeping(projectId)) continue; } catch (e) {}
+      }
+      active.push({ projectId, state });
     }
     if (active.length === 0) return { checked: 0, incidents: [] };
 
@@ -3256,21 +5040,27 @@ class DeployManager extends EventEmitter {
       this.cancelDrain(projectId);
       const state = this.getState(projectId);
       if (!state.current) return { stopped: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
-      try { await caddyManager.removeRoute(projectId); } catch (e) {}
-      const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000 });
-      if (res.code === 0) {
-        state.current.status = 'detenido';
-        this.saveStore();
-        this.notify({
-          event: 'project_stopped',
-          level: 'info',
-          title: `Servicio detenido: ${state.current.projectName || projectId}`,
-          message: `El contenedor de producción ${state.current.containerName} fue detenido manualmente.`,
-          projectId,
-          projectName: state.current.projectName || projectId
-        });
-      }
-      return { stopped: res.code === 0, containerName: state.current.containerName, error: res.code === 0 ? null : res.stderr.trim() };
+      const targetServerId = state.current.serverId || 'local';
+      return this._withRemoteDockerEnv(targetServerId, {}, async (remoteDockerHost, fleet) => {
+        const env = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+        try {
+          await this._withRouteTarget(targetServerId, fleet, ({ adminUrl }) => caddyManager.removeRoute(projectId, { adminUrl }));
+        } catch (e) {}
+        const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000, env });
+        if (res.code === 0) {
+          state.current.status = 'detenido';
+          this.saveStore();
+          this.notify({
+            event: 'project_stopped',
+            level: 'info',
+            title: `Servicio detenido: ${state.current.projectName || projectId}`,
+            message: `El contenedor de producción ${state.current.containerName} fue detenido manualmente.`,
+            projectId,
+            projectName: state.current.projectName || projectId
+          });
+        }
+        return { stopped: res.code === 0, containerName: state.current.containerName, error: res.code === 0 ? null : res.stderr.trim() };
+      });
     })().finally(() => {
       if (this.locks.get(projectId) === task) this.locks.delete(projectId);
       // Nunca re-desplegar un push encolado justo después de parar el servicio manualmente
@@ -3294,55 +5084,67 @@ class DeployManager extends EventEmitter {
       const state = this.getState(projectId);
       if (!state.current) return { started: false, reason: 'Este proyecto no tiene ningún despliegue activo' };
 
-      const docker = await this.detectDocker({ force: true });
-      if (!docker.available) return { started: false, reason: docker.reason };
-
       const target = state.current;
-      const start = await this.runDocker(['start', target.containerName], { timeoutMs: 40000 });
-      if (start.code !== 0) {
-        return {
-          started: false,
-          containerName: target.containerName,
-          error: (start.stderr || '').trim() || `docker start terminó con código ${start.code}`
-        };
-      }
+      const targetServerId = target.serverId || 'local';
+      const isRemote = targetServerId !== 'local';
 
-      const health = await this.waitForHealth({
-        hostPort: target.hostPort,
-        containerPort: target.containerPort,
-        healthPath: target.healthPath || DEFAULTS.healthPath,
-        containerName: target.containerName,
-        timeoutMs: opts.healthTimeoutMs,
-        intervalMs: opts.healthIntervalMs,
-        onProgress: null
-      });
-      if (!health.healthy) {
-        // Detener contenedor fallido para no dejarlo en crash-loop bajo --restart unless-stopped
-        await this.runDocker(['stop', '--time', '5', target.containerName], { timeoutMs: 15000 }).catch(() => {});
-        return {
-          started: false,
-          containerName: target.containerName,
-          error: `El contenedor arrancó pero no pasó la verificación de salud: ${health.reason}`
-        };
-      }
+      return this._withRemoteDockerEnv(targetServerId, {}, async (remoteDockerHost, fleet) => {
+        const dockerBaseEnv = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+        const docker = await this.detectDocker({ force: true, env: dockerBaseEnv });
+        if (!docker.available) return { started: false, reason: docker.reason };
 
-      target.status = 'activo';
-      this.saveStore();
-
-      if ((target.hostnames || []).length > 0 && target.upstream) {
-        const fakeDep = { projectId, projectName: target.projectName || projectId, logLines: [] };
-        const switched = await this.switchRoute(fakeDep, target.hostnames, target.upstream);
-        if (!switched.ok) {
+        const start = await this.runDocker(['start', target.containerName], { timeoutMs: 40000, env: dockerBaseEnv });
+        if (start.code !== 0) {
           return {
-            started: true,
-            routeRestored: false,
+            started: false,
             containerName: target.containerName,
-            error: `El servicio está arriba, pero no se pudo reponer la ruta: ${switched.error}`
+            error: (start.stderr || '').trim() || `docker start terminó con código ${start.code}`
           };
         }
-      }
 
-      return { started: true, routeRestored: true, containerName: target.containerName, error: null };
+        const health = await this._withHealthTarget(targetServerId, fleet, target.hostPort, (probePort) =>
+          this.waitForHealth({
+            hostPort: probePort,
+            containerPort: target.containerPort,
+            healthPath: target.healthPath || DEFAULTS.healthPath,
+            containerName: target.containerName,
+            timeoutMs: opts.healthTimeoutMs,
+            intervalMs: opts.healthIntervalMs,
+            isRemote,
+            dockerEnv: dockerBaseEnv,
+            onProgress: null
+          })
+        );
+        if (!health.healthy) {
+          // Detener contenedor fallido para no dejarlo en crash-loop bajo --restart unless-stopped
+          await this.runDocker(['stop', '--time', '5', target.containerName], { timeoutMs: 15000, env: dockerBaseEnv }).catch(() => {});
+          return {
+            started: false,
+            containerName: target.containerName,
+            error: `El contenedor arrancó pero no pasó la verificación de salud: ${health.reason}`
+          };
+        }
+
+        target.status = 'activo';
+        this.saveStore();
+
+        if ((target.hostnames || []).length > 0 && target.upstream) {
+          const fakeDep = { projectId, projectName: target.projectName || projectId, logLines: [] };
+          const switched = await this._withRouteTarget(targetServerId, fleet, (routeOpts) =>
+            this.switchRoute(fakeDep, target.hostnames, target.upstream, null, routeOpts)
+          );
+          if (!switched.ok) {
+            return {
+              started: true,
+              routeRestored: false,
+              containerName: target.containerName,
+              error: `El servicio está arriba, pero no se pudo reponer la ruta: ${switched.error}`
+            };
+          }
+        }
+
+        return { started: true, routeRestored: true, containerName: target.containerName, error: null };
+      });
     })().finally(() => {
       if (this.locks.get(projectId) === task) this.locks.delete(projectId);
       this.drainPending(projectId);
@@ -3393,7 +5195,13 @@ class DeployManager extends EventEmitter {
     }
     args.push(release.containerName);
 
-    const res = await this.runDocker(args, { timeoutMs: 15000 });
+    const targetServerId = release.serverId || 'local';
+    const res = await this._withRemoteDockerEnv(targetServerId, {}, (remoteDockerHost) =>
+      this.runDocker(args, {
+        timeoutMs: 15000,
+        env: remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined
+      })
+    );
     const secrets = this._secretValuesForProject(projectId);
     const combined = [res.stdout, res.stderr]
       .filter(Boolean)
@@ -3582,6 +5390,19 @@ class DeployManager extends EventEmitter {
 const instance = /** @type {any} */ (new DeployManager());
 instance.DeployManager = DeployManager;
 instance.DEFAULTS = DEFAULTS;
-instance.helpers = { safeSlug, isValidEnvName, sanitizeHealthPath, sanitizeNodeMajor, sanitizePort, filterSafeHostEnv, HOST_HIJACK_ENV_BLOCKLIST };
+instance.helpers = {
+  safeSlug,
+  isValidEnvName,
+  sanitizeHealthPath,
+  sanitizeSmokePath,
+  sanitizeNodeMajor,
+  sanitizePort,
+  filterSafeHostEnv,
+  HOST_HIJACK_ENV_BLOCKLIST,
+  evaluateFreezeStatus,
+  isInFreezeWindow,
+  normalizeSmokeConfig,
+  normalizeCanaryConfig
+};
 
 module.exports = instance;

@@ -218,7 +218,13 @@ function testShellSafety() {
     'server/services/deployManager.js',
     'server/services/databaseManager.js',
     'server/services/dbBackupManager.js',
-    'server/services/caddyManager.js'
+    'server/services/caddyManager.js',
+    'server/services/serverFleetManager.js',
+    'server/services/sleepAdvisor.js',
+    'server/services/teamManager.js',
+    'server/services/environmentManager.js',
+    'server/services/gitopsManager.js',
+    'server/services/uptimeMonitor.js'
   ];
   for (const rel of MUST_NOT_IMPORT_EXEC) {
     const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');

@@ -1,12 +1,23 @@
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 const WebSocket = require('ws');
 
 const liveSyncEngine = require('../server/services/liveSyncEngine');
-const { computeMerkleTree, diffMerkleTrees, classifyChanges, resolveSafeFilePath, sha256 } = liveSyncEngine;
+const {
+  LiveSyncEngine,
+  computeMerkleTree,
+  diffMerkleTrees,
+  classifyChanges,
+  resolveSafeFilePath,
+  sha256,
+  decodeCompressedPayload,
+  decodeBinarySyncFrame
+} = liveSyncEngine;
 const { LiveSyncClient } = require('../server/services/liveSyncClient');
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -172,9 +183,315 @@ async function testLiveSync() {
     assert.strictEqual(finalLocalTree.rootDigest, finalTargetTree.rootDigest, 'El árbol Merkle local y destino deben ser idénticos tras Live Sync');
     console.log(`  ✓ End-to-end real (edición en disco -> WS /ws/sync -> HTTP vivo) en ${totalEndToEndMs}ms · Merkle idéntico (${finalTargetTree.rootDigest.slice(0, 10)})`);
 
-    // Limpiar sesión de prueba
+    // 7. Live Sync 2.0: Compresión adaptativa (0x01 / 0x02 Brotli / 0x03 Gzip) + anti-zip-bomb
+    const codecClient = new LiveSyncClient({
+      projectId: 'proj_codec_test',
+      sourceDir,
+      targetDir,
+      autoWatch: false
+    });
+    codecClient.supportedCodecs = ['br', 'gzip'];
+
+    // 7a. Edición pequeña (<512 B) -> bypass 0x01 crudo (0 ms CPU compresión)
+    const tinyBuf = Buffer.from('export const x = 1;\n', 'utf8');
+    const tinyFrame = codecClient.encodeBinaryFrame(1, [{
+      path: 'src/tiny.js',
+      op: 'upsert',
+      buffer: tinyBuf,
+      sha256: sha256(tinyBuf)
+    }]);
+    assert.strictEqual(tinyFrame[0], 0x01, 'Tramas < 512 B deben usar bypass 0x01 crudo');
+    const decodedTiny = decodeBinarySyncFrame(tinyFrame);
+    assert.strictEqual(decodedTiny._wireStats.codec, 'none');
+    assert.strictEqual(decodedTiny.files[0].buffer.toString('utf8'), 'export const x = 1;\n');
+
+    // 7b. Ráfaga grande compresible (>= 512 B) -> 0x02 Brotli y 0x03 Gzip con ahorro real
+    const bigTsx = Array.from({ length: 120 }, (_, i) =>
+      `export function Widget${i}({ title = 'Culkibo Forge' }) { return <section className="card">{title} #{i}</section>; }`
+    ).join('\n');
+    const bigBuf = Buffer.from(bigTsx, 'utf8');
+    const bigSha = sha256(bigBuf);
+    const baseShaExample = sha256('prev-version');
+    const brFrame = codecClient.encodeBinaryFrame(2, [{
+      path: 'src/Widgets.tsx',
+      op: 'upsert',
+      buffer: bigBuf,
+      sha256: bigSha,
+      baseSha256: baseShaExample
+    }]);
+    assert.strictEqual(brFrame[0], 0x02, 'Payload compresible >= 512 B debe negociar 0x02 Brotli');
+    assert.ok(brFrame.length < bigBuf.length * 0.4, `Brotli debe ahorrar >60% (wire=${brFrame.length}, raw=${bigBuf.length})`);
+    const decodedBr = decodeBinarySyncFrame(brFrame);
+    assert.strictEqual(decodedBr._wireStats.codec, 'br');
+    assert.strictEqual(decodedBr.files[0].buffer.equals(bigBuf), true);
+    assert.strictEqual(decodedBr.files[0].sha256, bigSha);
+    assert.strictEqual(decodedBr.files[0].baseSha256, baseShaExample, 'baseSha256 debe preservarse en trama comprimida');
+
+    codecClient.compression = 'gzip';
+    const gzFrame = codecClient.encodeBinaryFrame(3, [{
+      path: 'src/Widgets.tsx',
+      op: 'upsert',
+      buffer: bigBuf,
+      sha256: bigSha
+    }]);
+    assert.strictEqual(gzFrame[0], 0x03, 'Modo gzip debe emitir trama 0x03');
+    assert.ok(gzFrame.length < bigBuf.length * 0.4, `Gzip debe ahorrar >60% (wire=${gzFrame.length}, raw=${bigBuf.length})`);
+    const decodedGz = decodeBinarySyncFrame(gzFrame);
+    assert.strictEqual(decodedGz._wireStats.codec, 'gzip');
+    assert.strictEqual(decodedGz.files[0].buffer.equals(bigBuf), true);
+
+    // 7c. Fallback a 0x01 para servidores antiguos sin codecs y para binarios incompresibles
+    codecClient.compression = 'auto';
+    codecClient.supportedCodecs = [];
+    const legacyFrame = codecClient.encodeBinaryFrame(4, [{ path: 'src/Widgets.tsx', op: 'upsert', buffer: bigBuf, sha256: bigSha }]);
+    assert.strictEqual(legacyFrame[0], 0x01, 'Sin codecs negociados en hello_ack debe degradar a 0x01');
+
+    codecClient.supportedCodecs = ['br', 'gzip'];
+    const randomBin = crypto.randomBytes(4096);
+    const binFrame = codecClient.encodeBinaryFrame(5, [{ path: 'assets/photo.png', op: 'upsert', buffer: randomBin, sha256: sha256(randomBin) }]);
+    assert.strictEqual(binFrame[0], 0x01, 'Archivos binarios incompresibles deben usar 0x01');
+
+    // 7d. decodeCompressedPayload directo (0x01 / 0x02 / 0x03) + rechazo anti-zip-bomb
+    const sampleBuf = Buffer.from('hola culkibo '.repeat(200), 'utf8');
+    assert.strictEqual(LiveSyncEngine.decodeCompressedPayload(0x01, sampleBuf, 8192).equals(sampleBuf), true);
+    assert.strictEqual(decodeCompressedPayload(0x02, zlib.brotliCompressSync(sampleBuf), 8192).equals(sampleBuf), true);
+    assert.strictEqual(decodeCompressedPayload(0x03, zlib.gzipSync(sampleBuf), 8192).equals(sampleBuf), true);
+
+    const bombPlain = Buffer.alloc(2 * 1024 * 1024, 0x41); // 2 MiB altamente compresible
+    const bombBr = zlib.brotliCompressSync(bombPlain);
+    const bombGz = zlib.gzipSync(bombPlain);
+    assert.ok(bombBr.length < 2048 && bombGz.length < 4096, 'La bomba de prueba debe comprimirse a pocos KB');
+    assert.throws(
+      () => decodeCompressedPayload(0x02, bombBr, 64 * 1024),
+      (err) => err && err.code === 'FRAME_TOO_LARGE',
+      'Bomba Brotli que excede maxOutBytes debe rechazarse con FRAME_TOO_LARGE'
+    );
+    assert.throws(
+      () => decodeCompressedPayload(0x03, bombGz, 64 * 1024),
+      (err) => err && err.code === 'FRAME_TOO_LARGE',
+      'Bomba Gzip que excede maxOutBytes debe rechazarse con FRAME_TOO_LARGE'
+    );
+
+    // Bomba con rawLen falsificado en cabecera (declara 1024 B pero expande a 2 MiB)
+    const spoofedHeader = Buffer.allocUnsafe(5);
+    spoofedHeader[0] = 0x02;
+    spoofedHeader.writeUInt32BE(1024, 1);
+    assert.throws(
+      () => decodeBinarySyncFrame(Buffer.concat([spoofedHeader, bombBr]), 64 * 1024),
+      (err) => err && err.code === 'FRAME_TOO_LARGE',
+      'rawLen falsificado menor que la expansión real debe rechazarse con FRAME_TOO_LARGE'
+    );
+
+    // rawLen declarado por encima del límite máximo permitido
+    const hugeHeader = Buffer.allocUnsafe(5);
+    hugeHeader[0] = 0x03;
+    hugeHeader.writeUInt32BE(32 * 1024 * 1024, 1);
+    assert.throws(
+      () => decodeBinarySyncFrame(Buffer.concat([hugeHeader, bombGz])),
+      (err) => err && err.code === 'FRAME_TOO_LARGE',
+      'rawLen > 16.5 MiB debe rechazarse antes de descomprimir'
+    );
+    console.log(`  ✓ Compresión adaptativa (0x01/0x02 br/0x03 gzip) y defensa anti-zip-bomb verificadas`);
+
+    // 8. Live Sync 2.0: Historial time-travel por fichero + rollbackFile quirúrgico + bloqueo traversal
+    const ttTargetDir = path.join(tmpRoot, 'time-travel-target');
+    fs.mkdirSync(ttTargetDir, { recursive: true });
+    const ttProjectId = `proj_tt_${Date.now()}`;
+    liveSyncEngine.setTargetDir(ttProjectId, ttTargetDir);
+
+    liveSyncEngine.applyCommitFrame(ttProjectId, {
+      seq: 1,
+      files: [
+        { path: 'src/alpha.ts', op: 'upsert', content: 'export const v = 1;\n' },
+        { path: 'src/beta.ts', op: 'upsert', content: 'export const b = 1;\n' }
+      ],
+      _wireStats: decodedBr._wireStats
+    });
+    liveSyncEngine.applyCommitFrame(ttProjectId, {
+      seq: 2,
+      files: [
+        { path: 'src/alpha.ts', op: 'upsert', content: 'export const v = 2;\n' },
+        { path: 'src/beta.ts', op: 'upsert', content: 'export const b = 2;\n' }
+      ]
+    });
+    liveSyncEngine.applyCommitFrame(ttProjectId, {
+      seq: 3,
+      files: [
+        { path: 'src/alpha.ts', op: 'upsert', content: 'export const v = 3;\n' }
+      ]
+    });
+
+    const alphaHist = liveSyncEngine.getFileHistory(ttProjectId, 'src/alpha.ts');
+    assert.strictEqual(alphaHist.path, 'src/alpha.ts');
+    assert.strictEqual(alphaHist.existsOnDisk, true);
+    assert.strictEqual(alphaHist.revisionCount, 4, 'Debe contener seq 3, 2, 1 y baseline seq 0');
+    assert.deepStrictEqual(alphaHist.revisions.map((r) => r.seq), [3, 2, 1, 0]);
+    assert.strictEqual(alphaHist.versions.length, 4, 'Alias versions debe coincidir con revisions');
+    assert.strictEqual(alphaHist.revisions[0].restorable, true);
+    assert.strictEqual(alphaHist.revisions[0].snapshot, undefined, 'No debe exponer buffers crudos en JSON de historial');
+    const limitedHist = liveSyncEngine.getFileHistory(ttProjectId, 'src/alpha.ts', { limit: 2, includeDiff: true });
+    assert.strictEqual(limitedHist.revisions.length, 2);
+    assert.ok(typeof limitedHist.revisions[0].diff === 'string' && limitedHist.revisions[0].diff.includes('+ export const v = 3;'));
+
+    // Rollback quirúrgico SOLO de src/alpha.ts a seq 1 (sin tocar src/beta.ts!)
+    const rbFile1 = liveSyncEngine.rollbackFile(ttProjectId, 'src/alpha.ts', 1);
+    assert.strictEqual(rbFile1.reverted, true);
+    assert.strictEqual(rbFile1.scope, 'file');
+    assert.strictEqual(rbFile1.targetSeq, 1);
+    assert.strictEqual(fs.readFileSync(path.join(ttTargetDir, 'src/alpha.ts'), 'utf8'), 'export const v = 1;\n');
+    assert.strictEqual(fs.readFileSync(path.join(ttTargetDir, 'src/beta.ts'), 'utf8'), 'export const b = 2;\n', 'rollbackFile no debe tocar otros ficheros');
+
+    // Verificar que fileCache quedó repoblada tras rollbackFile
+    const ttSession = liveSyncEngine.getOrCreateSession(ttProjectId);
+    const alphaAbs = path.resolve(ttTargetDir, 'src/alpha.ts');
+    assert.ok(ttSession.fileCache.has(alphaAbs), 'rollbackFile debe repoblar session.fileCache');
+    assert.strictEqual(ttSession.fileCache.get(alphaAbs).buf.toString('utf8'), 'export const v = 1;\n');
+
+    // El propio rollbackFile genera un frame deshacible vía rollback(id, 1) -> vuelve a v = 3 y repuebla fileCache!
+    const undoRbFile = liveSyncEngine.rollback(ttProjectId, 1);
+    assert.strictEqual(undoRbFile.reverted, true);
+    assert.strictEqual(fs.readFileSync(alphaAbs, 'utf8'), 'export const v = 3;\n');
+    assert.ok(ttSession.fileCache.has(alphaAbs), 'rollback() debe repoblar session.fileCache');
+    assert.strictEqual(ttSession.fileCache.get(alphaAbs).buf.toString('utf8'), 'export const v = 3;\n');
+
+    // mode: 'before' restaura la versión previa a seq 2 (v = 1), y seq 0 elimina fichero creado en sesión
+    const rbBefore = liveSyncEngine.rollbackFile(ttProjectId, 'src/alpha.ts', 2, { mode: 'before' });
+    assert.strictEqual(rbBefore.targetSeq, 1);
+    assert.strictEqual(fs.readFileSync(alphaAbs, 'utf8'), 'export const v = 1;\n');
+
+    const rbBaseline = liveSyncEngine.rollbackFile(ttProjectId, 'src/alpha.ts', 0);
+    assert.strictEqual(rbBaseline.action, 'deleted');
+    assert.strictEqual(fs.existsSync(alphaAbs), false, 'Rollback a baseline seq 0 de fichero nuevo debe eliminarlo');
+
+    // Seguridad traversal en getFileHistory y rollbackFile
+    for (const badPath of ['../outside.txt', '/etc/passwd', '.git/config', 'ok\0evil.js']) {
+      assert.throws(
+        () => liveSyncEngine.getFileHistory(ttProjectId, badPath),
+        (err) => err && err.code === 'PATH_TRAVERSAL_BLOCKED',
+        `getFileHistory debe bloquear ${badPath}`
+      );
+      assert.throws(
+        () => liveSyncEngine.rollbackFile(ttProjectId, badPath, 1),
+        (err) => err && err.code === 'PATH_TRAVERSAL_BLOCKED',
+        `rollbackFile debe bloquear ${badPath}`
+      );
+    }
+
+    // Telemetría wireStats en getStatus
+    const ttStatus = liveSyncEngine.getStatus(ttProjectId);
+    assert.ok(ttStatus.wireStats && ttStatus.wireStats.compressedFrames === 1);
+    assert.ok(ttStatus.wireStats.rawBytes > ttStatus.wireStats.wireBytes);
+    assert.ok(ttStatus.wireStats.savedPct > 50);
+    console.log(`  ✓ Time-travel por fichero (getFileHistory + rollbackFile quirúrgico + fileCache + traversal block) verificado`);
+
+    // 9. Live Sync 2.0: Detección de conflictos multi-cliente (ventana concurrente + stale baseSha256)
+    const confTargetDir = path.join(tmpRoot, 'conflict-target');
+    fs.mkdirSync(confTargetDir, { recursive: true });
+    const confProjectId = `proj_conf_${Date.now()}`;
+    liveSyncEngine.setTargetDir(confProjectId, confTargetDir);
+    liveSyncEngine.registerClient(confProjectId, { id: 'cli_alice', clientName: 'Alice' });
+    liveSyncEngine.registerClient(confProjectId, { id: 'cli_bob', clientName: 'Bob' });
+
+    const emittedConflicts = [];
+    const onConflict = (c) => { if (c.projectId === confProjectId) emittedConflicts.push(c); };
+    liveSyncEngine.on('sync_conflict', onConflict);
+    try {
+      // Alice edita shared.js (seq: 1)
+      const cA = liveSyncEngine.applyCommitFrame(confProjectId, {
+        seq: 1,
+        files: [{ path: 'shared.js', op: 'upsert', content: 'export const owner = "alice";\n' }]
+      }, { clientId: 'cli_alice', clientName: 'Alice' });
+      assert.strictEqual(cA.conflicts.length, 0);
+      assert.strictEqual(cA.reconcileRequired, false);
+
+      // Bob también envía seq: 1 (sin false drift en modo multi-cliente) sobre el mismo fichero dentro de la ventana
+      const cB = liveSyncEngine.applyCommitFrame(confProjectId, {
+        seq: 1,
+        files: [{ path: 'shared.js', op: 'upsert', content: 'export const owner = "bob";\n' }]
+      }, { clientId: 'cli_bob', clientName: 'Bob' });
+      assert.strictEqual(cB.reconcileRequired, false, 'Dos clientes enviando seq: 1 no deben disparar drift falso');
+      assert.strictEqual(cB.conflicts.length, 1, 'Edición concurrente de 2 clientes debe señalar conflicto');
+      assert.strictEqual(cB.conflicts[0].reason, 'concurrent_window');
+      assert.strictEqual(cB.conflicts[0].previous.clientId, 'cli_alice');
+      assert.strictEqual(cB.conflicts[0].incoming.clientId, 'cli_bob');
+      assert.strictEqual(emittedConflicts.length, 1);
+
+      // Recuperación en 1 clic de la versión de Alice mediante previousSeq
+      const recovered = liveSyncEngine.rollbackFile(confProjectId, 'shared.js', cB.conflicts[0].previousSeq);
+      assert.strictEqual(recovered.reverted, true);
+      assert.strictEqual(fs.readFileSync(path.join(confTargetDir, 'shared.js'), 'utf8'), 'export const owner = "alice";\n');
+
+      // Capa 2: stale baseSha256 detectado incluso con conflictWindowMs = 0 (ventana expirada)
+      const v1Content = 'export const n = 1;\n';
+      const v2Content = 'export const n = 2;\n';
+      liveSyncEngine.applyCommitFrame(confProjectId, {
+        seq: 2,
+        files: [{ path: 'cas.js', op: 'upsert', content: v1Content }]
+      }, { clientId: 'cli_alice', clientName: 'Alice' });
+      liveSyncEngine.applyCommitFrame(confProjectId, {
+        seq: 3,
+        files: [{ path: 'cas.js', op: 'upsert', content: v2Content }]
+      }, { clientId: 'cli_alice', clientName: 'Alice' });
+
+      // Bob intenta escribir con baseSha256 obsoleto (v1) en modo reject
+      const cStaleReject = liveSyncEngine.applyCommitFrame(confProjectId, {
+        seq: 2,
+        files: [{ path: 'cas.js', op: 'upsert', content: 'export const n = 999;\n', baseSha256: sha256(v1Content) }]
+      }, { clientId: 'cli_bob', clientName: 'Bob', conflictWindowMs: 0, conflictPolicy: 'reject' });
+      assert.strictEqual(cStaleReject.conflicts.length, 1);
+      assert.strictEqual(cStaleReject.conflicts[0].reason, 'stale_base_hash');
+      assert.strictEqual(cStaleReject.conflicts[0].rejected, true);
+      assert.strictEqual(fs.readFileSync(path.join(confTargetDir, 'cas.js'), 'utf8'), v2Content, 'Política reject no debe sobrescribir el disco');
+
+      // Resolver conflicto y verificar getStatus
+      const resolved = liveSyncEngine.resolveConflict(confProjectId, cB.conflicts[0].id);
+      assert.strictEqual(resolved.resolved, true);
+      const confStatus = liveSyncEngine.getStatus(confProjectId);
+      assert.ok(Array.isArray(confStatus.recentConflicts) && confStatus.recentConflicts.length >= 2);
+      assert.strictEqual(confStatus.recentConflicts.find((c) => c.id === cB.conflicts[0].id).resolved, true);
+    } finally {
+      liveSyncEngine.off('sync_conflict', onConflict);
+    }
+    console.log('  ✓ Conflictos multi-cliente (ventana concurrente + stale baseSha256 + reject + resolveConflict) verificados');
+
+    // 10. Diff unificado LCS (getFrameDiff), .culkiboignore y caché stat anti doble-lectura
+    const diffDir = path.join(tmpRoot, 'lcs-diff-target');
+    fs.mkdirSync(diffDir, { recursive: true });
+    const diffProj = `proj_lcs_${Date.now()}`;
+    liveSyncEngine.setTargetDir(diffProj, diffDir);
+    const twentyLines = Array.from({ length: 20 }, (_, i) => `const line${i + 1} = ${i + 1};`).join('\n') + '\n';
+    liveSyncEngine.applyCommitFrame(diffProj, { seq: 1, files: [{ path: 'app.js', op: 'upsert', content: twentyLines }] });
+    liveSyncEngine.applyCommitFrame(diffProj, { seq: 2, files: [{ path: 'app.js', op: 'upsert', content: '// encabezado nuevo\n' + twentyLines }] });
+    const lcsDiff = liveSyncEngine.getFrameDiff(diffProj, 2);
+    assert.ok(lcsDiff && lcsDiff.files.length === 1);
+    assert.strictEqual(lcsDiff.files[0].action, 'modified');
+    assert.ok(lcsDiff.files[0].diff.includes('+ // encabezado nuevo'));
+    assert.ok(!lcsDiff.files[0].diff.includes('- const line1 = 1;'), 'Diff LCS no debe marcar líneas desplazadas intactas como eliminadas');
+
+    // .culkiboignore + caché stat del cliente
+    const ignDir = path.join(tmpRoot, 'ignore-src');
+    fs.mkdirSync(path.join(ignDir, 'scratch'), { recursive: true });
+    fs.writeFileSync(path.join(ignDir, '.culkiboignore'), '*.log\n!keep.log\nscratch/\n', 'utf8');
+    fs.writeFileSync(path.join(ignDir, 'debug.log'), 'ignored', 'utf8');
+    fs.writeFileSync(path.join(ignDir, 'keep.log'), 'kept', 'utf8');
+    fs.writeFileSync(path.join(ignDir, 'scratch', 'temp.txt'), 'ignored', 'utf8');
+    const ignClient = new LiveSyncClient({ projectId: 'proj_ign', sourceDir: ignDir, autoWatch: false });
+    assert.strictEqual(ignClient.isIgnored('debug.log'), true);
+    assert.strictEqual(ignClient.isIgnored('keep.log'), false, 'Negación !keep.log debe respetarse');
+    assert.strictEqual(ignClient.isIgnored('scratch/temp.txt'), true);
+    const keepAbs = path.join(ignDir, 'keep.log');
+    const read1 = await ignClient._readFileSafe(keepAbs);
+    assert.strictEqual(read1.kind, 'file');
+    const read2 = await ignClient._readFileSafe(keepAbs, { skipIfUnchangedHash: read1.sha256 });
+    assert.strictEqual(read2.kind, 'unchanged', 'Caché stat (mtimeMs, size, sha256) debe evitar lectura duplicada');
+    console.log('  ✓ Diff LCS unificado, .culkiboignore y caché stat anti-doble-disparo verificados');
+
+    // Limpiar sesiones de prueba
     liveSyncEngine.resetSession(projectId);
     liveSyncEngine.resetSession(wsProjectId);
+    liveSyncEngine.resetSession(ttProjectId);
+    liveSyncEngine.resetSession(confProjectId);
+    liveSyncEngine.resetSession(diffProj);
     console.log('✅ Todas las pruebas de Live Sync superadas!\n');
   } finally {
     if (client) await client.stop().catch(() => {});

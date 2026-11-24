@@ -22,6 +22,9 @@ import {
   SlidersHorizontal,
   Activity,
   ArrowUpCircle,
+  X,
+  Zap,
+  Database,
 } from 'lucide-react';
 import {
   api,
@@ -60,6 +63,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
   const [installations, setInstallations] = useState<ServiceInstallation[]>([]);
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<string | null>(null);
+  const [ramFilter, setRamFilter] = useState<'all' | 'lightweight'>('all');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -151,19 +155,28 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
     return () => clearInterval(timer);
   }, [installing]);
 
+  const lightweightCount = useMemo(
+    () => templates.filter((t) => t.totalMemoryMb <= 512).length,
+    [templates]
+  );
+
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return templates.filter((t) => {
       if (category && t.category !== category) return false;
+      if (ramFilter === 'lightweight' && t.totalMemoryMb > 512) return false;
       if (!needle) return true;
       return (
         t.name.toLowerCase().includes(needle) ||
+        t.id.toLowerCase().includes(needle) ||
+        t.categoryLabel.toLowerCase().includes(needle) ||
         t.summary.toLowerCase().includes(needle) ||
         t.description.toLowerCase().includes(needle) ||
-        t.tags.some((tag) => tag.includes(needle))
+        t.image.toLowerCase().includes(needle) ||
+        t.tags.some((tag) => tag.toLowerCase().includes(needle))
       );
     });
-  }, [templates, query, category]);
+  }, [templates, query, category, ramFilter]);
 
   const guard = async (key: string, fn: () => Promise<void>) => {
     setBusy(key);
@@ -304,8 +317,13 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
 
       {/* Cabecera */}
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Catálogo de servicios</h1>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Catálogo de servicios</h1>
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-xs font-medium text-slate-700 tabular-nums">
+              {templates.length} plantillas · {categories.length} categorías
+            </span>
+          </div>
           <p className="text-sm text-slate-500 mt-1 max-w-2xl">
             Servicios listos en un clic con versión fijada, límites de recursos, volumen persistente y secretos aleatorios.
           </p>
@@ -334,44 +352,118 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
 
       {tab === 'catalogo' && (
         <>
-          <div className="flex flex-col lg:flex-row gap-3">
-            <div className="relative flex-1 min-w-0">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Buscar servicio o etiqueta…"
-                className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-900 placeholder:text-slate-400"
-              />
+          <div className="space-y-2.5">
+            <div className="flex flex-col sm:flex-row gap-2.5">
+              <div className="relative flex-1 min-w-0">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder={`Buscar entre ${templates.length} plantillas (nombre, categoría, etiqueta o imagen)…`}
+                  className="w-full pl-9 pr-8 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-900 placeholder:text-slate-400"
+                />
+                {query && (
+                  <button
+                    type="button"
+                    aria-label="Limpiar búsqueda"
+                    onClick={() => setQuery('')}
+                    className="p-1 text-slate-400 hover:text-slate-700 absolute right-2 top-1/2 -translate-y-1/2 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Filtro de RAM ligera */}
+              <div className="inline-flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-lg text-xs shrink-0 self-start sm:self-auto">
+                <button
+                  type="button"
+                  onClick={() => setRamFilter('all')}
+                  className={`px-2.5 py-1.5 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                    ramFilter === 'all' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Todos
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRamFilter(ramFilter === 'lightweight' ? 'all' : 'lightweight')}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap tabular-nums ${
+                    ramFilter === 'lightweight' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Zap className="w-3 h-3 text-emerald-600" />
+                  <span>≤512 MB</span>
+                  <span className="text-[11px] text-slate-400">({lightweightCount})</span>
+                </button>
+              </div>
             </div>
-            <div className="flex items-center gap-1.5 flex-wrap">
+
+            {/* Píldoras horizontales desplazables para las 12 categorías */}
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1" role="tablist" aria-label="Categorías del catálogo">
               <button
                 type="button"
+                role="tab"
+                aria-selected={category === null}
                 onClick={() => setCategory(null)}
-                className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap ${
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums ${
                   category === null ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
                 }`}
               >
-                Todas
+                Todas ({templates.length})
               </button>
               {categories.map((c) => (
                 <button
                   key={c.id}
                   type="button"
+                  role="tab"
+                  aria-selected={category === c.id}
                   onClick={() => setCategory(c.id === category ? null : c.id)}
-                  className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap ${
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums ${
                     category === c.id ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
                   }`}
                 >
-                  {c.label}
+                  {c.label} <span className={category === c.id ? 'text-slate-300' : 'text-slate-400'}>({c.count})</span>
                 </button>
               ))}
             </div>
+
+            {(query || category || ramFilter !== 'all') && (
+              <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
+                <span className="tabular-nums">
+                  Mostrando <strong className="text-slate-900">{visible.length}</strong> de {templates.length} plantillas
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQuery('');
+                    setCategory(null);
+                    setRamFilter('all');
+                  }}
+                  className="text-slate-700 hover:text-slate-900 font-medium underline cursor-pointer"
+                >
+                  Limpiar filtros
+                </button>
+              </div>
+            )}
           </div>
 
           {visible.length === 0 ? (
-            <div className="text-center py-12 text-xs text-slate-500">
-              No hay servicios que coincidan con «{query}».
+            <div className="bg-white border border-slate-200 rounded-xl text-center py-12 px-4 text-xs text-slate-500 space-y-2.5">
+              <p>
+                No hay servicios que coincidan con los filtros actuales{query ? ` («${query}»)` : ''}.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery('');
+                  setCategory(null);
+                  setRamFilter('all');
+                }}
+                className="px-3 py-1.5 rounded-lg bg-slate-900 text-white font-medium cursor-pointer"
+              >
+                Ver todas las plantillas
+              </button>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -385,11 +477,18 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                       <h2 className="font-semibold text-sm text-slate-900 leading-tight">{t.name}</h2>
                       <p className="text-xs text-slate-500 mt-0.5">{t.categoryLabel}</p>
                     </div>
-                    {t.installedCount > 0 && (
-                      <span className="shrink-0 text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-2 py-0.5 tabular-nums">
-                        {t.installedCount} {t.installedCount === 1 ? 'instalado' : 'instalados'}
-                      </span>
-                    )}
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {t.totalMemoryMb <= 512 && (
+                        <span className="text-[10px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-1.5 py-0.5">
+                          Ligero
+                        </span>
+                      )}
+                      {t.installedCount > 0 && (
+                        <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-2 py-0.5 tabular-nums">
+                          {t.installedCount} {t.installedCount === 1 ? 'instalado' : 'instalados'}
+                        </span>
+                      )}
+                    </div>
                   </div>
 
                   <p className="text-xs text-slate-600 leading-relaxed flex-1">{t.summary}</p>
@@ -403,6 +502,12 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                       <Cpu className="w-3.5 h-3.5 shrink-0 text-slate-400" />
                       <span className="truncate">{t.cpus} CPU</span>
                     </div>
+                    {t.database && (
+                      <div className="col-span-2 flex items-center gap-1.5 min-w-0 text-[11px]">
+                        <Database className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                        <span className="truncate">Incluye {t.database.engine} gestionada</span>
+                      </div>
+                    )}
                     <div className="col-span-2 flex items-center gap-1.5 min-w-0">
                       <Package className="w-3.5 h-3.5 shrink-0 text-slate-400" />
                       <code className="font-mono text-[11px] truncate text-slate-500">{t.image}</code>

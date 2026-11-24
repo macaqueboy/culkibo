@@ -5,7 +5,15 @@ const crypto = require('crypto');
 const EventEmitter = require('events');
 
 const { atomicWriteJsonSync, formatDockerEnvFile } = require('./ssrfGuard');
-const { TEMPLATES, CATEGORIES, validateCatalog } = require('./catalog/templates');
+const {
+  TEMPLATES,
+  CATEGORIES,
+  validateCatalog,
+  IMAGE_RE,
+  FLOATING_TAG_RE,
+  FILE_NAME_RE,
+  SHM_SIZE_RE
+} = require('./catalog/templates');
 const portRegistry = require('./portRegistry');
 
 // Carga perezosa: GET /api/catalog solo necesita las plantillas y nunca debe
@@ -600,11 +608,19 @@ class CatalogManager extends EventEmitter {
     /** @type {any} */
     let dbContext = null;
     if (tpl.database) {
-      this.setProgress(record, 'base_datos', `Aprovisionando ${tpl.database.engine}`);
+      const dbImage = tpl.database.image ? String(tpl.database.image).trim() : undefined;
+      if (dbImage && (!IMAGE_RE.test(dbImage) || FLOATING_TAG_RE.test(dbImage))) {
+        throw new Error(`Imagen de base de datos inválida o móvil en «${tpl.id}»: ${dbImage}`);
+      }
+      this.setProgress(
+        record,
+        'base_datos',
+        dbImage ? `Aprovisionando ${tpl.database.engine} (${dbImage})` : `Aprovisionando ${tpl.database.engine}`
+      );
       const provisioned = await databaseManager.provision({
         projectId: record.id,
         engine: tpl.database.engine,
-        image: tpl.database.image || undefined,
+        image: dbImage,
         name: `${record.name} · datos`,
         dbName: tpl.database.dbName,
         username: tpl.database.username || 'culkibo',
@@ -612,14 +628,15 @@ class CatalogManager extends EventEmitter {
         cpus: tpl.database.cpus || 1
       });
       record.databaseId = provisioned.id;
+      record.databaseImage = dbImage || provisioned.image || null;
       this.save();
 
-      // Esperar a que la BD esté realmente saludable (hasta 60s) antes de arrancar la app que depende de ella
-      const dbDeadline = Date.now() + 60000;
+      // Esperar a que la BD esté realmente saludable (hasta 90s) antes de arrancar sidecars y la app
+      const dbDeadline = Date.now() + 90000;
       while (Date.now() < dbDeadline) {
         try {
           const st = await databaseManager.refreshHealth(provisioned.id);
-          if (st.health === 'healthy' || (st.status === 'running' && Date.now() > dbDeadline - 25000)) break;
+          if (st.health === 'healthy') break;
         } catch (e) {}
         await new Promise((r) => setTimeout(r, 1500));
       }
@@ -653,8 +670,9 @@ class CatalogManager extends EventEmitter {
     // --- 3. Auxiliares ------------------------------------------------------
     if (record.sidecars.length > 0) {
       this.setProgress(record, 'auxiliares', `Levantando ${record.sidecars.length} servicio(s) auxiliar(es)`);
-      for (const spec of tpl.sidecars) {
+      for (const spec of tpl.sidecars || []) {
         const stored = record.sidecars.find((c) => c.name === spec.name);
+        if (!stored) continue;
         await this.pullImage(spec.image);
         await this.runContainer({
           containerName: stored.containerName,
@@ -671,18 +689,11 @@ class CatalogManager extends EventEmitter {
           labels: { 'culkibo.service': record.id, 'culkibo.role': spec.name }
         });
       }
-      // Breve espera a que los sidecars (p. ej. ClickHouse) estén en estado `running` antes de lanzar migraciones
-      const sidecarDeadline = Date.now() + 15000;
-      while (Date.now() < sidecarDeadline) {
-        let allUp = true;
-        for (const sc of record.sidecars) {
-          try {
-            const { stdout } = await this.docker(['inspect', '--format', '{{.State.Running}}', sc.containerName], { timeout: 5000 });
-            if (stdout.trim() !== 'true') allUp = false;
-          } catch (e) { allUp = false; }
-        }
-        if (allUp) break;
-        await new Promise((r) => setTimeout(r, 1000));
+      // Esperar a que cada auxiliar esté `running` y supere su sonda interna (p. ej. `valkey-cli ping`)
+      for (const spec of tpl.sidecars || []) {
+        const stored = record.sidecars.find((c) => c.name === spec.name);
+        if (!stored) continue;
+        await this.waitSidecarReady(stored.containerName, spec.readiness || null);
       }
     }
 
@@ -727,6 +738,7 @@ class CatalogManager extends EventEmitter {
       files: this.materialiseFiles(record.id, 'app', tpl.app.files || []),
       memoryMb: record.memoryMb,
       cpus: record.cpus,
+      shmSize: tpl.app.shmSize || null,
       command: tpl.app.command || null,
       // Sólo bucle local. Ver el comentario de cabecera.
       publish: [`127.0.0.1:${record.hostPort}:${tpl.app.port}`, ...extraPublishes],
@@ -785,6 +797,36 @@ class CatalogManager extends EventEmitter {
   }
 
   /**
+   * Espera a que un auxiliar esté arrancado y, si declara `readiness`, pase
+   * su comprobación interna (siempre vía `docker` argv, nunca shell).
+   * @param {string} containerName
+   * @param {any} readiness
+   */
+  async waitSidecarReady(containerName, readiness) {
+    const runningDeadline = Date.now() + 15000;
+    while (Date.now() < runningDeadline) {
+      try {
+        const { stdout } = await this.docker(['inspect', '--format', '{{.State.Running}}', containerName], { timeout: 5000 });
+        if (stdout.trim() === 'true') break;
+      } catch (e) {}
+      await new Promise((r) => setTimeout(r, 800));
+    }
+
+    if (!readiness || typeof readiness !== 'object') return;
+    if (readiness.type === 'exec' && Array.isArray(readiness.cmd) && readiness.cmd.length > 0) {
+      const cmd = readiness.cmd.map((a) => String(a));
+      const deadline = Date.now() + Math.max(5000, Math.min(90000, Number(readiness.timeoutMs) || 30000));
+      while (Date.now() < deadline) {
+        try {
+          await this.docker(['exec', containerName, ...cmd], { timeout: 5000 });
+          return;
+        } catch (e) {}
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+
+  /**
    * Escribe en disco los ficheros de configuración de una plantilla y devuelve
    * los montajes que hay que pasar a `docker run`.
    *
@@ -794,10 +836,29 @@ class CatalogManager extends EventEmitter {
    */
   materialiseFiles(installId, role, files) {
     if (!files || files.length === 0) return [];
-    const dir = path.join(FILES_ROOT, installId, role);
-    fs.mkdirSync(dir, { recursive: true });
+    const safeRole = String(role || '');
+    if (!/^[a-z][a-z0-9_]{0,31}$/.test(safeRole)) {
+      throw new Error(`Rol de contenedor inválido al materializar ficheros: «${safeRole}»`);
+    }
+    const dir = path.resolve(FILES_ROOT, installId, safeRole);
+    const rootResolved = path.resolve(FILES_ROOT);
+    if (!dir.startsWith(rootResolved + path.sep)) {
+      throw new Error('Ruta de destino fuera del directorio de servicios');
+    }
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
     return files.map((file) => {
-      const hostPath = path.join(dir, file.name);
+      const fileName = String(file.name || '');
+      if (!FILE_NAME_RE.test(fileName) || fileName === '.' || fileName === '..' || fileName.includes('..')) {
+        throw new Error(`Nombre de fichero de configuración inválido: «${fileName}»`);
+      }
+      const targetPath = String(file.path || '');
+      if (!targetPath.startsWith('/') || targetPath.includes('docker.sock')) {
+        throw new Error(`Ruta de montaje inválida en fichero de configuración: «${targetPath}»`);
+      }
+      const hostPath = path.resolve(dir, fileName);
+      if (!hostPath.startsWith(dir + path.sep)) {
+        throw new Error(`Nombre de fichero fuera del directorio permitido: «${fileName}»`);
+      }
       fs.writeFileSync(hostPath, file.content, { encoding: 'utf8', mode: 0o644 });
       // Forzar 0644 explícito para ignorar UMask=0027 de systemd y evitar EACCES en contenedores no-root
       if (process.platform !== 'win32') {
@@ -805,7 +866,7 @@ class CatalogManager extends EventEmitter {
       }
       // Docker quiere barras normales incluso cuando el daemon corre en
       // Windows contra un motor Linux.
-      return `${hostPath.split(path.sep).join('/')}:${file.path}:ro`;
+      return `${hostPath.split(path.sep).join('/')}:${targetPath}:ro`;
     });
   }
 
@@ -847,11 +908,29 @@ class CatalogManager extends EventEmitter {
       '--label', `culkibo.project=${spec.labels['culkibo.service']}`
     ];
 
+    if (spec.shmSize) {
+      const shm = String(spec.shmSize).trim();
+      if (!SHM_SIZE_RE.test(shm)) {
+        throw new Error(`Tamaño shmSize inválido: «${shm}»`);
+      }
+      args.push('--shm-size', shm);
+    }
+
     for (const [key, value] of Object.entries(spec.labels)) {
       args.push('--label', `${key}=${value}`);
     }
-    for (const volume of spec.volumes) args.push('-v', volume);
-    for (const file of spec.files) args.push('-v', file);
+    for (const volume of spec.volumes) {
+      if (String(volume).includes('docker.sock')) {
+        throw new Error('Montaje de docker.sock prohibido en el catálogo de servicios');
+      }
+      args.push('-v', volume);
+    }
+    for (const file of spec.files) {
+      if (String(file).includes('docker.sock')) {
+        throw new Error('Montaje de docker.sock prohibido en ficheros de configuración');
+      }
+      args.push('-v', file);
+    }
     if (Array.isArray(spec.publish)) {
       for (const p of spec.publish) { if (p) args.push('-p', p); }
     } else if (spec.publish) {
@@ -1027,6 +1106,7 @@ class CatalogManager extends EventEmitter {
       files: this.materialiseFiles(record.id, 'app', tpl.app.files || []),
       memoryMb: record.memoryMb,
       cpus: record.cpus,
+      shmSize: tpl.app.shmSize || null,
       command: tpl.app.command || null,
       publish: [`127.0.0.1:${record.hostPort}:${tpl.app.port}`, ...extraPublishes],
       labels: { 'culkibo.service': record.id, 'culkibo.role': 'app' }
@@ -1091,8 +1171,7 @@ class CatalogManager extends EventEmitter {
     }
     const record = this.mustGet(id);
     const img = String(newImage || '').trim();
-    const { IMAGE_RE } = require('./catalog/templates');
-    if (!IMAGE_RE.test(img) || /:(latest|stable|main|master|edge|nightly)$/i.test(img)) {
+    if (!IMAGE_RE.test(img) || FLOATING_TAG_RE.test(img)) {
       throw new Error('La nueva imagen debe llevar una etiqueta de versión fija (no :latest ni etiquetas móviles)');
     }
     if (!(await this.isDockerAvailable())) {

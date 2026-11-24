@@ -135,7 +135,7 @@ const ENGINES = {
     // que ir al sitio que esa versión espera.
     dataDirFor: (image) => {
       const tagSeg = String(image || '').split('/').pop() || '';
-      const m = /:(\d+)/.exec(tagSeg);
+      const m = /:(?:pg)?(\d+)/.exec(tagSeg);
       const major = m ? parseInt(m[1], 10) : 18;
       return major >= 18 ? '/var/lib/postgresql' : '/var/lib/postgresql/data';
     },
