@@ -266,34 +266,31 @@ class S3Client {
 
   /**
    * Devuelve la ruta canónica (ya codificada) y la URL absoluta de una clave.
-   * Ambas se derivan de la misma cadena para que firma y petición coincidan.
+   * Permite `allowEmptyKey: true` únicamente para operaciones a nivel de bucket (ListObjectsV2).
    */
-  resolve(key) {
-    const segments = String(key).split('/').filter((s) => s.length > 0);
-    if (!segments.length) throw new Error('Clave de objeto vacía');
+  resolve(key, { allowEmptyKey = false } = {}) {
+    const segments = String(key ?? '').split('/').filter((s) => s.length > 0);
+    if (!segments.length && !allowEmptyKey) throw new Error('Clave de objeto vacía');
 
     if (this.forcePathStyle) {
-      const canonicalUri = '/' + [this.bucket, ...segments].map(rfc3986).join('/');
+      const canonicalUri = segments.length > 0
+        ? '/' + [this.bucket, ...segments].map(rfc3986).join('/')
+        : '/' + rfc3986(this.bucket);
       return { canonicalUri, url: this.origin + canonicalUri, host: this.host };
     }
-    const canonicalUri = '/' + segments.map(rfc3986).join('/');
+    const canonicalUri = segments.length > 0 ? '/' + segments.map(rfc3986).join('/') : '/';
     const host = `${this.bucket}.${this.host}`;
     return { canonicalUri, url: `${new URL(this.origin).protocol}//${host}${canonicalUri}`, host };
   }
 
   /**
-   * Petición firmada. `body` debe ser Buffer/Uint8Array o undefined: firmamos
-   * el sha256 real del cuerpo en lugar de UNSIGNED-PAYLOAD porque así la
-   * integridad va cubierta extremo a extremo aunque el transporte sea http
-   * (MinIO en una red interna, por ejemplo).
-   */
-  /**
+   * Petición firmada.
    * @param {string} method
    * @param {string} key
-   * @param {{ query?: Record<string, any>, headers?: Record<string, any>, body?: any, expectStatus?: number[], timeoutMs?: number }} [opts]
+   * @param {{ query?: Record<string, any>, headers?: Record<string, any>, body?: any, expectStatus?: number[], timeoutMs?: number, allowEmptyKey?: boolean }} [opts]
    */
-  async request(method, key, { query = {}, headers = {}, body = undefined, expectStatus = [200, 204], timeoutMs = undefined } = {}) {
-    const { canonicalUri, url, host } = this.resolve(key);
+  async request(method, key, { query = {}, headers = {}, body = undefined, expectStatus = [200, 204], timeoutMs = undefined, allowEmptyKey = false } = {}) {
+    const { canonicalUri, url, host } = this.resolve(key, { allowEmptyKey });
     // Protección SSRF con resolución DNS: permite MinIO privado pero bloquea siempre metadatos cloud
     await assertSafeUrl(url, { allowPrivate: true, allowLoopback: true });
     const payload = body === undefined || body === null ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(body);
@@ -408,15 +405,49 @@ class S3Client {
   }
 
   async uploadPart(key, uploadId, partNumber, chunk) {
+    // Escalar timeout si partSize creció para volcados >80 GB
+    const scaledTimeout = Math.max(this.timeoutMs, Math.ceil((chunk.length / (1024 * 1024)) * 15000));
     const res = await this.request('PUT', key, {
       query: { partNumber: String(partNumber), uploadId },
       body: chunk,
-      expectStatus: [200]
+      expectStatus: [200],
+      timeoutMs: Math.min(30 * 60 * 1000, scaledTimeout)
     });
     const etag = res.headers.get('etag');
     try { await res.body?.cancel?.(); } catch (e) {}
     if (!etag) throw new Error(`La parte ${partNumber} no devolvió ETag`);
     return { partNumber, etag };
+  }
+
+  /** Lista objetos remotos del bucket (ListObjectsV2) para navegación y Disaster Recovery. */
+  async listObjectsV2(prefix = '', { maxKeys = 100 } = {}) {
+    const safeMax = Math.min(1000, Math.max(1, Number(maxKeys) || 100));
+    /** @type {Record<string, string>} */
+    const query = { 'list-type': '2', 'max-keys': String(safeMax) };
+    if (prefix) query.prefix = String(prefix);
+    const res = await this.request('GET', '', {
+      query,
+      expectStatus: [200],
+      allowEmptyKey: true
+    });
+    const xml = await res.text();
+    /** @type {Array<{ key: string, sizeBytes: number, lastModified: string | null, etag: string | null }>} */
+    const objects = [];
+    const blockRe = /<Contents>([\s\S]*?)<\/Contents>/g;
+    let m;
+    while ((m = blockRe.exec(xml)) !== null) {
+      const blk = m[1];
+      const key = xmlField(blk, 'Key');
+      if (!key) continue;
+      objects.push({
+        key: key.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'),
+        sizeBytes: parseInt(xmlField(blk, 'Size') || '0', 10) || 0,
+        lastModified: xmlField(blk, 'LastModified') || null,
+        etag: (xmlField(blk, 'ETag') || '').replace(/&quot;/g, '"') || null
+      });
+    }
+    objects.sort((a, b) => Date.parse(b.lastModified || '0') - Date.parse(a.lastModified || '0'));
+    return { objects, truncated: xmlField(xml, 'IsTruncated') === 'true' };
   }
 
   async completeMultipartUpload(key, uploadId, parts) {
@@ -499,19 +530,19 @@ class S3Client {
     const uploadId = await this.createMultipartUpload(key, contentType);
     const parts = [];
     const handle = await fs.promises.open(filePath, 'r');
+    // Reutilizar un solo buffer de parte en todo el bucle (reduce presión de GC en subidas multi-GB)
+    const partBuf = Buffer.alloc(partSize);
     try {
       let uploaded = 0;
       for (let i = 0; i < partCount; i++) {
         const length = Math.min(partSize, total - i * partSize);
-        // P0-9: Buffer.alloc (cero fugas de heap) + bucle de lectura completo ante lecturas parciales.
-        const buf = Buffer.alloc(length);
         let totalRead = 0;
         while (totalRead < length) {
-          const { bytesRead } = await handle.read(buf, totalRead, length - totalRead, i * partSize + totalRead);
+          const { bytesRead } = await handle.read(partBuf, totalRead, length - totalRead, i * partSize + totalRead);
           if (bytesRead <= 0) break;
           totalRead += bytesRead;
         }
-        const chunk = totalRead === length ? buf : buf.subarray(0, totalRead);
+        const chunk = totalRead === partBuf.length ? partBuf : partBuf.subarray(0, totalRead);
         parts.push(await this.uploadPart(key, uploadId, i + 1, chunk));
         uploaded += totalRead;
         if (onProgress) onProgress({ uploaded, total, part: i + 1, parts: partCount });
@@ -521,19 +552,20 @@ class S3Client {
       return { ...out, sizeBytes: total, multipart: true, parts: partCount };
     } catch (err) {
       try { await handle.close(); } catch (e) {}
-      // Sin abort, las partes huérfanas se facturan indefinidamente en R2 y S3.
       await this.abortMultipartUpload(key, uploadId);
       throw err;
     }
   }
 
-  /** Descarga a disco en streaming, para restaurar desde remoto (sin abortar descargas grandes ni deadlocks ENOSPC). */
+  /** Descarga a disco en streaming de forma atómica (.tmp -> rename) verificando Content-Length y sin deadlocks ENOSPC. */
   async downloadFile(key, destPath) {
-    // Sin timeout corto de 120s sobre el cuerpo streaming: un dump de varios GB necesita margen (2 h máx).
     const res = await this.request('GET', key, { expectStatus: [200], timeoutMs: 2 * 3600 * 1000 });
     await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
     if (!res.body) throw new Error('La respuesta S3 no contiene cuerpo descargable');
-    const out = fs.createWriteStream(destPath, { mode: 0o600 });
+    const declaredLenRaw = res.headers.get('content-length');
+    const declaredLen = declaredLenRaw != null ? parseInt(declaredLenRaw, 10) : null;
+    const tmpPath = `${destPath}.tmp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const out = fs.createWriteStream(tmpPath, { mode: 0o600 });
     const reader = res.body.getReader();
     let bytes = 0;
     /** @type {Error | null} */
@@ -564,16 +596,40 @@ class S3Client {
           });
         }
       }
+      // P0: escuchar finish + error + close en el cierre final (out.end(cb) nunca pasa err y cuelga ante ENOSPC)
       await new Promise((resolve, reject) => {
         if (streamErr) return reject(streamErr);
-        out.end((err) => (err ? reject(err) : resolve(undefined)));
+        let settled = false;
+        const cleanup = () => {
+          out.off('finish', onFinish);
+          out.off('error', onErr);
+          out.off('close', onClose);
+        };
+        const onFinish = () => { if (settled) return; settled = true; cleanup(); resolve(undefined); };
+        const onErr = (e) => { if (settled) return; settled = true; cleanup(); reject(e); };
+        const onClose = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (streamErr) reject(streamErr);
+          else if (out.writableFinished) resolve(undefined);
+          else reject(new Error('El archivo de destino se cerró antes de vaciar el buffer'));
+        };
+        out.once('finish', onFinish);
+        out.once('error', onErr);
+        out.once('close', onClose);
+        out.end();
       });
       if (streamErr) throw streamErr;
+      if (declaredLen !== null && Number.isFinite(declaredLen) && bytes !== declaredLen) {
+        throw new Error(`Descarga S3 truncada: recibidos ${bytes} bytes de ${declaredLen} declarados`);
+      }
+      await fs.promises.rename(tmpPath, destPath);
       return { key, destPath, sizeBytes: bytes };
     } catch (err) {
       try { await reader.cancel(); } catch (e) {}
       try { out.destroy(); } catch (e) {}
-      try { await fs.promises.unlink(destPath); } catch (e) {}
+      try { await fs.promises.unlink(tmpPath); } catch (e) {}
       throw err;
     }
   }

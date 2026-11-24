@@ -37,7 +37,21 @@ function canonicalizeRoute(rawPath) {
   if (!p.startsWith('/api/')) return '/static';
   const parts = p.split('/');
   // /api/<resource>/<id>/<sub...> -> /api/<resource>/:id/<sub...>
-  if (parts.length >= 4 && parts[3] && parts[3] !== 'status' && parts[3] !== 'summary' && parts[3] !== 'config' && parts[3] !== 'doctor' && parts[3] !== 'installations' && parts[3] !== 'session' && parts[3] !== 'verify') {
+  if (
+    parts.length >= 4 &&
+    parts[3] &&
+    parts[3] !== 'status' &&
+    parts[3] !== 'summary' &&
+    parts[3] !== 'config' &&
+    parts[3] !== 'doctor' &&
+    parts[3] !== 'installations' &&
+    parts[3] !== 'session' &&
+    parts[3] !== 'verify' &&
+    parts[3] !== 'rotate' &&
+    parts[3] !== 'ws-ticket' &&
+    parts[3] !== 'audit' &&
+    parts[3] !== 'health-summary'
+  ) {
     parts[3] = ':id';
   }
   if (parts.length >= 6 && parts[5]) {
@@ -70,6 +84,15 @@ class MetricsCollector {
     this.status4xx = 0;
     this.status5xx = 0;
     this.methods = { GET: 0, POST: 0, PUT: 0, PATCH: 0, DELETE: 0, OTHER: 0 };
+
+    // Security telemetry counters (zero-dep, exposed in JSON + Prometheus)
+    this.security = {
+      authFailures: 0,
+      authBlocked429: 0,
+      originRejected403: 0,
+      rateLimited429: 0,
+      wsAuthRejected: 0
+    };
 
     // 60-second rolling RPS ring
     this.rpsCounts = new Uint32Array(60);
@@ -429,6 +452,7 @@ class MetricsCollector {
         noopSkips: this.caddyNoopSkips,
         swapLatencyMs: caddyLatency
       },
+      security: { ...this.security },
       history: this.history
     };
 
@@ -531,7 +555,23 @@ class MetricsCollector {
     lines.push(`culkibo_caddy_route_swaps_total ${snap.caddy.swapsTotal || 0}`);
     lines.push('');
 
+    lines.push('# HELP culkibo_security_events_total Security & abuse control events by category.');
+    lines.push('# TYPE culkibo_security_events_total counter');
+    lines.push(`culkibo_security_events_total{kind="auth_failures"} ${snap.security?.authFailures || 0}`);
+    lines.push(`culkibo_security_events_total{kind="auth_blocked_429"} ${snap.security?.authBlocked429 || 0}`);
+    lines.push(`culkibo_security_events_total{kind="origin_rejected_403"} ${snap.security?.originRejected403 || 0}`);
+    lines.push(`culkibo_security_events_total{kind="rate_limited_429"} ${snap.security?.rateLimited429 || 0}`);
+    lines.push(`culkibo_security_events_total{kind="ws_auth_rejected"} ${snap.security?.wsAuthRejected || 0}`);
+    lines.push('');
+
     return lines.join('\n');
+  }
+
+  /** @param {'authFailures'|'authBlocked429'|'originRejected403'|'rateLimited429'|'wsAuthRejected'} kind */
+  recordSecurityEvent(kind) {
+    if (Object.prototype.hasOwnProperty.call(this.security, kind)) {
+      this.security[kind]++;
+    }
   }
 
   getPrometheusBuffer(fresh = false) {

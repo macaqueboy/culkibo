@@ -19,6 +19,9 @@ import {
   CircleCheck,
   CircleAlert,
   Loader2,
+  SlidersHorizontal,
+  Activity,
+  ArrowUpCircle,
 } from 'lucide-react';
 import {
   api,
@@ -30,6 +33,7 @@ import {
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
+import { DomainWizardModal } from './DomainWizardModal';
 
 interface Props {
   onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
@@ -60,14 +64,19 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [chosen, setChosen] = useState<ServiceTemplate | null>(null);
+  const [dockerOk, setDockerOk] = useState<boolean | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   const [secrets, setSecrets] = useState<Record<string, ServiceSecrets>>({});
-  const [logs, setLogs] = useState<Record<string, string>>({});
+  const [logs, setLogs] = useState<Record<string, { output: string; role: string }>>({});
+  const [statsMap, setStatsMap] = useState<Record<string, Array<{ role: string; containerName: string; cpuPercent: number | null; memoryUsage: string; status?: string }>>>({});
+  const [envTarget, setEnvTarget] = useState<ServiceInstallation | null>(null);
+  const [envText, setEnvText] = useState('');
+  const [updateTarget, setUpdateTarget] = useState<ServiceInstallation | null>(null);
+  const [updateImageInput, setUpdateImageInput] = useState('');
   const [copied, setCopied] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<ServiceInstallation | null>(null);
-  const [domainTarget, setDomainTarget] = useState<ServiceInstallation | null>(null);
-  const [domainInput, setDomainInput] = useState('');
+  const [domainWizardTarget, setDomainWizardTarget] = useState<ServiceInstallation | null>(null);
 
   const [prevTabTrigger, setPrevTabTrigger] = useState(tabTrigger);
   if (tabTrigger !== prevTabTrigger) {
@@ -97,12 +106,17 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
 
   useEffect(() => {
     let active = true;
-    Promise.all([api.getCatalog(), api.getInstallations()])
-      .then(([cat, inst]) => {
+    Promise.all([
+      api.getCatalog(),
+      api.getInstallations(),
+      api.getDbDockerStatus().catch(() => ({ available: false })),
+    ])
+      .then(([cat, inst, doc]) => {
         if (!active) return;
         setTemplates(cat.templates);
         setCategories(cat.categories);
         setInstallations(inst.installations);
+        setDockerOk(Boolean(doc?.available));
         setLoadError(null);
       })
       .catch((err) => {
@@ -183,25 +197,6 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
     });
   };
 
-  const handleAttachDomain = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!domainTarget || !domainInput.trim()) return;
-    const target = domainTarget;
-    const cleanDom = domainInput.trim().toLowerCase();
-    await guard(`dom-${target.id}`, async () => {
-      const res = await api.attachCatalogDomain(target.id, cleanDom);
-      setDomainTarget(null);
-      setDomainInput('');
-      onNotify(
-        res.ingress?.applied
-          ? `Dominio ${cleanDom} conectado y publicado en Caddy.`
-          : `Dominio ${cleanDom} guardado (${res.ingress?.reason || 'pendiente de Caddy'}).`,
-        'success'
-      );
-      await load();
-    });
-  };
-
   const toggleSecrets = (inst: ServiceInstallation) => guard(`sec-${inst.id}`, async () => {
     if (secrets[inst.id]) {
       const next = { ...secrets };
@@ -212,16 +207,67 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
     setSecrets({ ...secrets, [inst.id]: await api.getInstallationSecrets(inst.id) });
   });
 
-  const toggleLogs = (inst: ServiceInstallation) => guard(`log-${inst.id}`, async () => {
-    if (logs[inst.id]) {
+  const toggleLogs = (inst: ServiceInstallation, role?: string) => guard(`log-${inst.id}`, async () => {
+    if (!role && logs[inst.id]) {
       const next = { ...logs };
       delete next[inst.id];
       setLogs(next);
       return;
     }
-    const res = await api.getInstallationLogs(inst.id, 300);
-    setLogs({ ...logs, [inst.id]: res.output || '(sin salida)' });
+    const targetRole = role || 'app';
+    const res = await api.getInstallationLogs(inst.id, 300, targetRole);
+    setLogs({ ...logs, [inst.id]: { output: res.output || '(sin salida)', role: targetRole } });
   });
+
+  const toggleStats = (inst: ServiceInstallation) => guard(`st-${inst.id}`, async () => {
+    if (statsMap[inst.id]) {
+      const next = { ...statsMap };
+      delete next[inst.id];
+      setStatsMap(next);
+      return;
+    }
+    const res = await api.getInstallationStats(inst.id);
+    setStatsMap({ ...statsMap, [inst.id]: res.containers || [] });
+  });
+
+  const openEnvEditor = (inst: ServiceInstallation) => guard(`env-${inst.id}`, async () => {
+    const res = await api.getInstallationEnv(inst.id);
+    const merged = res.overrides && Object.keys(res.overrides).length > 0 ? res.overrides : (res.env || {});
+    setEnvText(Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('\n'));
+    setEnvTarget(inst);
+  });
+
+  const handleSaveEnv = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!envTarget) return;
+    const target = envTarget;
+    const parsed: Record<string, string> = {};
+    for (const line of envText.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const idx = trimmed.indexOf('=');
+      if (idx > 0) parsed[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1);
+    }
+    await guard(`envsave-${target.id}`, async () => {
+      await api.updateInstallationEnv(target.id, parsed);
+      setEnvTarget(null);
+      onNotify(`Variables de ${target.name} actualizadas y servicio reiniciado`, 'success');
+      await load();
+    });
+  };
+
+  const handleUpdateImage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!updateTarget || !updateImageInput.trim()) return;
+    const target = updateTarget;
+    const nextImg = updateImageInput.trim();
+    await guard(`upd-${target.id}`, async () => {
+      await api.updateInstallationImage(target.id, nextImg);
+      setUpdateTarget(null);
+      onNotify(`${target.name} actualizado a ${nextImg}`, 'success');
+      await load();
+    });
+  };
 
   if (loading) {
     return (
@@ -234,6 +280,18 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
 
   return (
     <div className="space-y-5">
+      {dockerOk === false && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
+          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <div className="text-xs">
+            <p className="font-semibold text-amber-900">Docker está detenido</p>
+            <p className="text-amber-800 mt-0.5">
+              Puedes explorar las {templates.length} plantillas del catálogo, pero instalar o arrancar servicios requiere tener Docker en marcha.
+            </p>
+          </div>
+        </div>
+      )}
+
       {loadError && (
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
           <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
@@ -282,7 +340,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Buscar servicio por nombre, descripción o etiqueta…"
+                placeholder="Buscar servicio o etiqueta…"
                 className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-900 placeholder:text-slate-400"
               />
             </div>
@@ -374,10 +432,17 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
           busy={busy}
           secrets={secrets}
           logs={logs}
+          statsMap={statsMap}
           copied={copied}
           onCopy={(text, key) => { void copy(text, key); }}
           onToggleSecrets={(inst) => { void toggleSecrets(inst); }}
-          onToggleLogs={(inst) => { void toggleLogs(inst); }}
+          onToggleLogs={(inst, role) => { void toggleLogs(inst, role); }}
+          onToggleStats={(inst) => { void toggleStats(inst); }}
+          onEditEnv={(inst) => { void openEnvEditor(inst); }}
+          onUpdateImage={(inst) => {
+            setUpdateTarget(inst);
+            setUpdateImageInput(inst.image);
+          }}
           onControl={(inst, action) => {
             void guard(`ctl-${inst.id}`, async () => {
               await api.controlInstallation(inst.id, action);
@@ -391,8 +456,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
             });
           }}
           onAttachDomain={(inst) => {
-            setDomainTarget(inst);
-            setDomainInput(inst.domain || '');
+            setDomainWizardTarget(inst);
           }}
           onRemove={setConfirmRemove}
           onBrowse={() => setTab('catalogo')}
@@ -428,40 +492,89 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
         />
       )}
 
-      {/* Modal: Conectar o cambiar dominio del servicio */}
+      {/* Asistente guiado de 3 pasos para dominio del servicio */}
+      <DomainWizardModal
+        isOpen={Boolean(domainWizardTarget)}
+        onClose={() => setDomainWizardTarget(null)}
+        onComplete={() => {
+          setDomainWizardTarget(null);
+          void load();
+        }}
+        onNotify={onNotify}
+        preset={
+          domainWizardTarget
+            ? {
+                serviceId: domainWizardTarget.id,
+                serviceName: domainWizardTarget.name,
+                targetPort: domainWizardTarget.hostPort || undefined,
+                suggestedHostname: domainWizardTarget.domain || undefined,
+              }
+            : null
+        }
+      />
+
+      {/* Modal: Editor de variables de entorno del servicio */}
       <Modal
-        open={Boolean(domainTarget)}
-        onClose={() => setDomainTarget(null)}
-        title={`Conectar dominio a ${domainTarget?.name || ''}`}
-        subtitle="Publica el servicio con HTTPS automático a través de Caddy."
-        maxWidthClass="max-w-md"
+        open={Boolean(envTarget)}
+        onClose={() => setEnvTarget(null)}
+        title={`Variables de ${envTarget?.name || ''}`}
+        subtitle="Añade o sobrescribe variables CLAVE=valor; el contenedor se recreará conservando volúmenes."
+        maxWidthClass="max-w-lg"
       >
-        <form onSubmit={handleAttachDomain} className="p-5 space-y-4">
-          <label className="block">
-            <span className="text-xs font-medium text-slate-700">Dominio</span>
-            <input
-              type="text"
-              required
-              autoFocus
-              value={domainInput}
-              onChange={(e) => setDomainInput(e.target.value)}
-              placeholder="miweb.tudominio.com"
-              className="mt-1.5 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono text-slate-900"
-            />
-          </label>
-          <p className="text-xs text-slate-500 leading-relaxed">
-            Apunta antes el registro A del dominio hacia la IP de este servidor. Caddy solicitará el certificado TLS automáticamente.
-          </p>
+        <form onSubmit={handleSaveEnv} className="p-5 space-y-4 text-xs">
+          <textarea
+            value={envText}
+            onChange={(e) => setEnvText(e.target.value)}
+            rows={8}
+            placeholder={'TZ=Europe/Madrid\nCUSTOM_OPTION=true'}
+            className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-xs focus:bg-white"
+            spellCheck={false}
+          />
           <div className="flex justify-end gap-2">
-            <button type="button" onClick={() => setDomainTarget(null)} className="px-3.5 py-2 rounded-lg text-xs font-medium text-slate-600 border border-slate-200 hover:bg-slate-50 cursor-pointer">
+            <button type="button" onClick={() => setEnvTarget(null)} className="px-3.5 py-2 rounded-lg text-slate-600 border border-slate-200 hover:bg-slate-50 cursor-pointer">
               Cancelar
             </button>
             <button
               type="submit"
-              disabled={!domainInput.trim() || busy === `dom-${domainTarget?.id}`}
-              className="px-4 py-2 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+              disabled={busy === `envsave-${envTarget?.id}`}
+              className="px-4 py-2 rounded-lg text-white bg-slate-900 hover:bg-slate-800 font-medium cursor-pointer disabled:opacity-50"
             >
-              {busy === `dom-${domainTarget?.id}` ? 'Guardando…' : 'Conectar dominio'}
+              {busy === `envsave-${envTarget?.id}` ? 'Aplicando…' : 'Guardar y reiniciar'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Modal: Actualizar imagen fijada con rollback automático */}
+      <Modal
+        open={Boolean(updateTarget)}
+        onClose={() => setUpdateTarget(null)}
+        title={`Actualizar imagen de ${updateTarget?.name || ''}`}
+        subtitle="Usa una etiqueta fijada (no :latest). Si el nuevo contenedor falla la salud, Culkibo revierte automáticamente."
+        maxWidthClass="max-w-md"
+      >
+        <form onSubmit={handleUpdateImage} className="p-5 space-y-4 text-xs">
+          <label className="block">
+            <span className="font-medium text-slate-700">Nueva imagen Docker</span>
+            <input
+              type="text"
+              required
+              value={updateImageInput}
+              onChange={(e) => setUpdateImageInput(e.target.value)}
+              placeholder="imagen:1.2.3"
+              className="mt-1.5 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono text-slate-900"
+            />
+          </label>
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={() => setUpdateTarget(null)} className="px-3.5 py-2 rounded-lg text-slate-600 border border-slate-200 hover:bg-slate-50 cursor-pointer">
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={!updateImageInput.trim() || busy === `upd-${updateTarget?.id}`}
+              className="px-4 py-2 rounded-lg text-white bg-slate-900 hover:bg-slate-800 font-medium cursor-pointer disabled:opacity-50"
+            >
+              {busy === `upd-${updateTarget?.id}` ? 'Actualizando…' : 'Actualizar ahora'}
             </button>
           </div>
         </form>
@@ -656,11 +769,15 @@ const InstalledList: React.FC<{
   installations: ServiceInstallation[];
   busy: string | null;
   secrets: Record<string, ServiceSecrets>;
-  logs: Record<string, string>;
+  logs: Record<string, { output: string; role: string }>;
+  statsMap: Record<string, Array<{ role: string; containerName: string; cpuPercent: number | null; memoryUsage: string; status?: string }>>;
   copied: string | null;
   onCopy: (text: string, key: string) => void;
   onToggleSecrets: (i: ServiceInstallation) => void;
-  onToggleLogs: (i: ServiceInstallation) => void;
+  onToggleLogs: (i: ServiceInstallation, role?: string) => void;
+  onToggleStats: (i: ServiceInstallation) => void;
+  onEditEnv: (i: ServiceInstallation) => void;
+  onUpdateImage: (i: ServiceInstallation) => void;
   onControl: (i: ServiceInstallation, action: 'start' | 'stop' | 'restart') => void;
   onRefreshHealth: (i: ServiceInstallation) => void;
   onAttachDomain: (i: ServiceInstallation) => void;
@@ -671,10 +788,14 @@ const InstalledList: React.FC<{
   busy,
   secrets,
   logs,
+  statsMap,
   copied,
   onCopy,
   onToggleSecrets,
   onToggleLogs,
+  onToggleStats,
+  onEditEnv,
+  onUpdateImage,
   onControl,
   onRefreshHealth,
   onAttachDomain,
@@ -700,6 +821,7 @@ const InstalledList: React.FC<{
         const style = STATUS_STYLE[inst.status] || STATUS_STYLE.stopped;
         const sec = secrets[inst.id];
         const log = logs[inst.id];
+        const stats = statsMap[inst.id];
 
         return (
           <section key={inst.id} className="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -757,6 +879,9 @@ const InstalledList: React.FC<{
               {inst.status !== 'installing' && (
                 <div className="flex items-center gap-1.5 flex-wrap shrink-0">
                   <IconButton label="Dominio" icon={Globe} onClick={() => onAttachDomain(inst)} />
+                  <IconButton label="Variables" icon={SlidersHorizontal} onClick={() => onEditEnv(inst)} busy={busy === `env-${inst.id}`} />
+                  <IconButton label="Stats" icon={Activity} onClick={() => onToggleStats(inst)} busy={busy === `st-${inst.id}`} active={Boolean(stats)} />
+                  <IconButton label="Actualizar" icon={ArrowUpCircle} onClick={() => onUpdateImage(inst)} />
                   <IconButton label="Comprobar" icon={inst.health === 'healthy' ? CircleCheck : CircleAlert} onClick={() => onRefreshHealth(inst)} busy={busy === `hp-${inst.id}`} />
                   <IconButton label="Secretos" icon={KeyRound} onClick={() => onToggleSecrets(inst)} busy={busy === `sec-${inst.id}`} active={Boolean(sec)} />
                   <IconButton label="Registros" icon={ScrollText} onClick={() => onToggleLogs(inst)} busy={busy === `log-${inst.id}`} active={Boolean(log)} />
@@ -770,6 +895,25 @@ const InstalledList: React.FC<{
                 </div>
               )}
             </div>
+
+            {stats && (
+              <div className="border-t border-slate-200 bg-slate-50 px-5 py-3.5 text-xs space-y-2">
+                <div className="font-semibold text-slate-800">Consumo en vivo</div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                  {stats.map((c) => (
+                    <div key={c.containerName} className="bg-white border border-slate-200 rounded-lg p-3 space-y-1">
+                      <div className="font-medium text-slate-900 flex items-center justify-between gap-2">
+                        <span>{c.role}</span>
+                        <span className="font-mono text-[11px] text-slate-400 truncate">{c.containerName}</span>
+                      </div>
+                      <div className="font-mono text-slate-700 tabular-nums">
+                        CPU: {c.cpuPercent != null ? `${c.cpuPercent}%` : '—'} · RAM: {c.memoryUsage || '—'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {sec && (
               <div className="border-t border-slate-200 bg-slate-50 px-5 py-4 space-y-2">
@@ -795,8 +939,27 @@ const InstalledList: React.FC<{
             )}
 
             {log && (
-              <div className="border-t border-slate-200 bg-slate-50 px-5 py-4">
-                <pre className="text-xs font-mono text-slate-800 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed">{log}</pre>
+              <div className="border-t border-slate-200 bg-slate-50 px-5 py-4 space-y-2.5">
+                {inst.sidecars && inst.sidecars.length > 0 && (
+                  <div className="flex items-center gap-1.5 flex-wrap text-xs">
+                    <span className="text-slate-500">Contenedor:</span>
+                    {['app', ...inst.sidecars.map((s) => s.name)].map((roleName) => (
+                      <button
+                        key={roleName}
+                        type="button"
+                        onClick={() => onToggleLogs(inst, roleName)}
+                        className={`px-2 py-0.5 rounded-md border font-mono text-[11px] cursor-pointer ${
+                          log.role === roleName
+                            ? 'bg-slate-900 text-white border-slate-900'
+                            : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                        }`}
+                      >
+                        {roleName}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <pre className="text-xs font-mono text-slate-800 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed">{log.output}</pre>
               </div>
             )}
           </section>

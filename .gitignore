@@ -61,6 +61,20 @@ data/services.json.*.tmp
 data/.services.key
 data/services/
 data/backups/
+data/audit.jsonl
+data/audit.jsonl.*
+data/crons.json
+data/crons.json.bak
+data/crons.json.*.tmp
+data/previews.json
+data/previews.json.bak
+data/previews.json.*.tmp
+data/domains.json.bak
+data/ingress.json.bak
+data/deployments.json.bak
+data/services.json.bak
+data/databases.json.bak
+data/notifications.json.bak
 # Ficheros efímeros de --env-file y de configuración de mongodump. Se borran
 # solos, pero un proceso muerto a mitad puede dejar alguno.
 data/.tmp/

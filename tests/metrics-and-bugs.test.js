@@ -244,7 +244,7 @@ async function testMetricsAndBugs() {
 
     const doctor = await httpRequest('/api/system/doctor');
     assert.strictEqual(doctor.status, 200, '/api/system/doctor must return 200');
-    assert.ok(doctor.json && Array.isArray(doctor.json.checks) && doctor.json.checks.length === 8, 'Doctor must return 8 checks');
+    assert.ok(doctor.json && Array.isArray(doctor.json.checks) && doctor.json.checks.length >= 9, 'Doctor must return at least 9 checks');
     assert.ok(['ok', 'warn', 'fail'].includes(doctor.json.overall), 'Doctor overall status must be valid');
 
     const wsTicketHttp = await httpRequest('/api/auth/ws-ticket', 'POST', {});
@@ -254,7 +254,7 @@ async function testMetricsAndBugs() {
     // Local direct sanity on metricsCollector & systemDoctor
     assert.ok(metricsCollector.getSnapshot(false).process.memoryMb > 0, 'metricsCollector must measure real RSS > 0 MB');
     const localDoc = await systemDoctor.runDoctor();
-    assert.strictEqual(localDoc.checks.length, 8, 'Local systemDoctor.runDoctor() must return 8 checks');
+    assert.ok(localDoc.checks.length >= 9, 'Local systemDoctor.runDoctor() must return at least 9 checks');
 
     console.log('✅ 10. Live security headers, Prometheus /metrics, /api/observability/snapshot, /api/system/doctor & ws-ticket verified');
   }

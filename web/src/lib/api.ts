@@ -83,12 +83,22 @@ export interface LiveSyncRecentFrame {
   mode: string;
   reason?: string;
   at: string;
+  files?: Array<{ path: string; action: string; size?: number }>;
+}
+
+export interface LiveSyncClientInfo {
+  id?: string;
+  clientName?: string | null;
+  sourceDir?: string | null;
+  connectedAt?: string | null;
+  lastFrameAt?: string | null;
 }
 
 export interface LiveSyncStatus {
   projectId: string;
   targetDir: string;
   connectedClients: number;
+  clients?: LiveSyncClientInfo[];
   lastSeq: number;
   framesApplied: number;
   filesWritten: number;
@@ -109,6 +119,22 @@ export interface LiveSyncStatus {
     p95: number | null;
     p99: number | null;
   };
+}
+
+export interface LiveSyncFrameDiff {
+  projectId: string;
+  seq: number;
+  at?: string;
+  mode?: string;
+  reason?: string;
+  files: Array<{
+    path: string;
+    action: string;
+    previousSize?: number | null;
+    currentSize?: number | null;
+    diff?: string | null;
+    binary?: boolean;
+  }>;
 }
 
 export interface WordPressAnalysis {
@@ -216,17 +242,38 @@ export interface NotificationsConfig {
   enabled: boolean;
   events: {
     service_down: boolean;
+    service_failed?: boolean;
+    deploy_started?: boolean;
     deploy_failed: boolean;
     deploy_succeeded: boolean;
+    rollback?: boolean;
+    production_unhealthy?: boolean;
     ssl_issued: boolean;
+    tls_expiring?: boolean;
+    backup_succeeded?: boolean;
+    backup_failed?: boolean;
+    disk_warning?: boolean;
+    cron_failed?: boolean;
     project_stopped: boolean;
   };
   channels: {
     telegram: { enabled: boolean; botToken: string; chatId: string; configured?: boolean };
     discord: { enabled: boolean; webhookUrl: string; configured?: boolean };
     slack: { enabled: boolean; webhookUrl: string; configured?: boolean };
-    webhook: { enabled: boolean; url: string; secretHeader?: string; configured?: boolean };
+    webhook: { enabled: boolean; url: string; secretHeader?: string; hasSecretHeader?: boolean; configured?: boolean };
   };
+}
+
+export interface NotificationHistoryItem {
+  id: string;
+  at: string;
+  event: string;
+  level: string;
+  title: string;
+  message: string;
+  deliveredChannels?: string[];
+  failedChannels?: Array<{ channel: string; error: string }>;
+  skipped?: boolean;
 }
 
 export interface ServiceCategory {
@@ -348,11 +395,100 @@ export interface ManagedDatabase {
     lastRunAt: string | null;
     lastStatus: string | null;
   };
-  retention: { daily: number; weekly: number };
+  retention: { hourly?: number; daily: number; weekly: number };
   backupsCount: number;
   /** Cadena de conexión con la contraseña sustituida por asteriscos. */
   connectionTemplate: string;
   hasPassword: boolean;
+}
+
+export interface DbInspectResult {
+  id: string;
+  engine: string;
+  reachable: boolean;
+  latencyMs: number | null;
+  version: string | null;
+  databaseSizeBytes?: number | null;
+  databaseSizeHuman?: string | null;
+  volumeSizeBytes?: number | null;
+  volumeSizeHuman?: string | null;
+  volumeExists?: boolean;
+  containerState?: { running?: boolean; status?: string; health?: string } | null;
+  topTables?: Array<{ name: string; rows?: number | null; size?: string | null }>;
+  keyCount?: number | null;
+  error?: string | null;
+}
+
+export interface RemoteS3Object {
+  key: string;
+  size: number;
+  lastModified: string;
+  etag?: string;
+}
+
+export interface InstanceBackupItem {
+  fileName: string;
+  sizeBytes?: number;
+  createdAt?: string;
+  encrypted?: boolean;
+  includesSecrets?: boolean;
+  kind?: string;
+}
+
+export interface CronJobItem {
+  id: string;
+  projectId: string;
+  name: string;
+  schedule: string;
+  command: string;
+  enabled: boolean;
+  timeoutSec: number;
+  lastRunAt?: string | null;
+  lastStatus?: string | null;
+  nextRunAt?: string | null;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface CronRunItem {
+  id: string;
+  jobId?: string;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  status: string;
+  exitCode: number | null;
+  output?: string;
+  trigger?: string;
+}
+
+export interface PreviewDeploymentItem {
+  key: string;
+  projectId: string;
+  branch: string;
+  prNumber: number | null;
+  title?: string | null;
+  commit?: string | null;
+  hostname?: string | null;
+  url: string | null;
+  hostPort: number | null;
+  containerName: string | null;
+  status: string;
+  error?: string | null;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface AuditLogEvent {
+  id?: string;
+  at: string;
+  source: string;
+  action: string;
+  target?: string | null;
+  actor?: string | null;
+  ip?: string | null;
+  status?: string | null;
+  meta?: Record<string, unknown>;
 }
 
 export interface DbCredentials {
@@ -503,7 +639,21 @@ export interface DomainItem {
   routingMode: string;
   canonicalRedirect?: 'none' | 'www_to_apex' | 'apex_to_www';
   securityHeaders?: boolean;
+  framePolicy?: 'SAMEORIGIN' | 'DENY' | 'ALLOW';
   customHeaders?: Record<string, string>;
+  basicAuth?: {
+    enabled: boolean;
+    username?: string;
+    password?: string;
+    passwordHash?: string;
+    realm?: string;
+  } | null;
+  ipAllowlist?: string[];
+  maxBodySizeMb?: number | null;
+  rateLimit?: {
+    enabled: boolean;
+    requestsPerMinute?: number;
+  } | null;
   createdAt: string;
   lastCheckedAt: string;
   migrationSource?: string;
@@ -565,7 +715,7 @@ export interface IngressStatus {
   routes: IngressRoute[];
   desired: Array<{ id: string; kind: string; label?: string; hosts: string[]; upstreams: string[]; weights: number[] | null }>;
   skipped: Array<{ hostnames: string[]; projectId?: string; reason: string }>;
-  drift: { missing: string[]; unexpected: string[] };
+  drift: { missing: string[]; unexpected: string[]; modified?: string[] };
   inSync: boolean;
   lastReconcile: { at: string; applied: number; removed: number; skipped: number } | null;
   tlsProbed: boolean;
@@ -744,6 +894,17 @@ export interface Project {
   linkedDatabaseIds?: string[];
   maintenanceMode?: boolean;
   autoRollback?: boolean;
+  localPath?: string | null;
+  deployHookToken?: string | null;
+  preDeployCommand?: string | null;
+  postDeployCommand?: string | null;
+  previewDeployments?: {
+    enabled: boolean;
+    baseDomain?: string | null;
+    maxActive?: number;
+    ttlHours?: number;
+    allowForks?: boolean;
+  } | null;
 }
 
 // --- Despliegue a producción ---
@@ -1131,6 +1292,12 @@ export const api = {
     serverIp?: string | null;
     canonicalRedirect?: 'none' | 'www_to_apex' | 'apex_to_www';
     securityHeaders?: boolean;
+    framePolicy?: 'SAMEORIGIN' | 'DENY' | 'ALLOW';
+    customHeaders?: Record<string, string>;
+    basicAuth?: { enabled: boolean; username?: string; password?: string; realm?: string } | null;
+    ipAllowlist?: string[];
+    maxBodySizeMb?: number | null;
+    rateLimit?: { enabled: boolean; requestsPerMinute?: number } | null;
   }): Promise<DomainItem & { ingress?: IngressOutcome }> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/domains`, {
@@ -1501,12 +1668,68 @@ export const api = {
     );
   },
 
-  async restoreDatabase(id: string, body: { backupId?: string; remoteKey?: string }): Promise<any> {
+  async restoreDatabase(id: string, body: { backupId?: string; remoteKey?: string; createSafetySnapshot?: boolean }): Promise<any> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/databases/${id}/restore`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'Error al restaurar'
+    );
+  },
+
+  async inspectDatabase(id: string): Promise<DbInspectResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${id}/inspect`, { method: 'POST' }),
+      'Error al inspeccionar la base de datos'
+    );
+  },
+
+  async recoverDatabase(id: string): Promise<ManagedDatabase & { recovered?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${id}/recover`, { method: 'POST' }),
+      'Error al recrear el contenedor de la base de datos'
+    );
+  },
+
+  async deleteDatabaseBackup(id: string, backupId: string, deleteRemote = false): Promise<any> {
+    const qs = deleteRemote ? '?deleteRemote=1' : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${id}/backups/${encodeURIComponent(backupId)}${qs}`, { method: 'DELETE' }),
+      'Error al eliminar la copia de seguridad'
+    );
+  },
+
+  async downloadDatabaseBackupBlob(id: string, backupId: string): Promise<{ blob: Blob; fileName: string }> {
+    const res = await apiFetch(`${API_BASE}/databases/${id}/backups/${encodeURIComponent(backupId)}/download`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error((body && (body.error || body.message)) || `Error al descargar copia (HTTP ${res.status})`);
+    }
+    const cd = res.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="([^"]+)"/i);
+    const fileName = match ? match[1] : `${backupId}.sql.gz`;
+    return { blob: await res.blob(), fileName };
+  },
+
+  async uploadDatabaseBackup(
+    id: string,
+    file: File,
+    opts: { restore?: boolean; safety?: boolean } = {}
+  ): Promise<{ success: boolean; backup: DbBackup; restored?: any }> {
+    const qs = new URLSearchParams();
+    if (opts.restore) qs.set('restore', '1');
+    if (opts.safety === false) qs.set('safety', '0');
+    const qStr = qs.toString() ? `?${qs.toString()}` : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${id}/backups/upload${qStr}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Backup-Filename': file.name,
+        },
+        body: file,
+      }),
+      'Error al subir la copia de seguridad'
     );
   },
 
@@ -1519,13 +1742,64 @@ export const api = {
     );
   },
 
-  async setDatabaseRetention(id: string, body: { daily: number; weekly: number }): Promise<ManagedDatabase> {
+  async setDatabaseRetention(id: string, body: { hourly?: number; daily: number; weekly: number }): Promise<ManagedDatabase> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/databases/${id}/retention`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }),
       'Error al guardar la retención'
     );
+  },
+
+  async listRemoteS3Objects(prefix?: string, maxKeys = 200): Promise<{ bucket?: string; prefix?: string; objects: RemoteS3Object[] }> {
+    const qs = new URLSearchParams();
+    if (prefix !== undefined) qs.set('prefix', prefix);
+    qs.set('maxKeys', String(maxKeys));
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/storage/objects?${qs.toString()}`),
+      'Error al listar objetos remotos en S3'
+    );
+  },
+
+  async listInstanceBackups(): Promise<{ backups: InstanceBackupItem[] }> {
+    return jsonOrThrow(await apiFetch(`${API_BASE}/backup/list`), 'Error al listar snapshots de instancia');
+  },
+
+  async exportInstanceSnapshot(body: { includeSecrets?: boolean; passphrase?: string; uploadToS3?: boolean } = {}): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/backup/instance/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'Error al exportar snapshot completo'
+    );
+  },
+
+  async importInstanceSnapshot(body: {
+    snapshot?: any;
+    fileName?: string | null;
+    passphrase?: string;
+    dryRun?: boolean;
+    mode?: 'merge' | 'overwrite';
+  }): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/backup/instance/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'Error al importar snapshot completo'
+    );
+  },
+
+  async downloadInstanceSnapshotBlob(fileName: string): Promise<{ blob: Blob; fileName: string }> {
+    const res = await apiFetch(`${API_BASE}/backup/download/${encodeURIComponent(fileName)}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error((body && (body.error || body.message)) || `Error al descargar snapshot (HTTP ${res.status})`);
+    }
+    return { blob: await res.blob(), fileName };
   },
 
   async getDbStorage(): Promise<DbStorageConfig> {
@@ -1585,10 +1859,138 @@ export const api = {
     );
   },
 
-  async rollbackDeploy(projectId: string): Promise<Deployment> {
+  async rollbackDeploy(projectId: string, body: { targetDeploymentId?: string } = {}): Promise<Deployment> {
     return jsonOrThrow(
-      await apiFetch(`${API_BASE}/projects/${projectId}/rollback`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/projects/${projectId}/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
       'No se pudo revertir'
+    );
+  },
+
+  async cancelDeploy(projectId: string): Promise<{ cancelled: boolean; reason?: string; deploymentId?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/deploy/cancel`, { method: 'POST' }),
+      'No se pudo cancelar el despliegue'
+    );
+  },
+
+  async getRuntimeLogs(projectId: string, opts: { tail?: number; target?: 'current' | 'previous' } = {}): Promise<{ ok: boolean; containerName?: string; output?: string; lines?: string[]; error?: string }> {
+    const qs = new URLSearchParams();
+    if (opts.tail) qs.set('tail', String(opts.tail));
+    if (opts.target) qs.set('target', opts.target);
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/runtime/logs?${qs.toString()}`),
+      'No se pudieron leer los registros del contenedor'
+    );
+  },
+
+  async getRuntimeStats(projectId: string): Promise<{ ok: boolean; containerName?: string; cpuPercent?: number | null; memoryUsage?: string; memoryPercent?: number | null; netIO?: string; blockIO?: string; pids?: string; status?: string; health?: string; error?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/runtime/stats`),
+      'No se pudieron leer las estadísticas del contenedor'
+    );
+  },
+
+  async execRuntimeCommand(projectId: string, body: { command: string; workdir?: string; timeoutMs?: number }): Promise<{ ok: boolean; exitCode: number; stdout: string; stderr: string; durationMs: number }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/runtime/exec`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'No se pudo ejecutar el comando en el contenedor'
+    );
+  },
+
+  async getProjectCrons(projectId: string): Promise<{ jobs: CronJobItem[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/crons`),
+      'No se pudieron cargar las tareas programadas'
+    );
+  },
+
+  async createProjectCron(projectId: string, body: { name: string; schedule: string; command: string; enabled?: boolean; timeoutSec?: number }): Promise<CronJobItem> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/crons`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'No se pudo crear la tarea cron'
+    );
+  },
+
+  async updateProjectCron(projectId: string, jobId: string, body: Partial<CronJobItem>): Promise<CronJobItem> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/crons/${encodeURIComponent(jobId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'No se pudo actualizar la tarea cron'
+    );
+  },
+
+  async deleteProjectCron(projectId: string, jobId: string): Promise<{ deleted: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/crons/${encodeURIComponent(jobId)}`, { method: 'DELETE' }),
+      'No se pudo eliminar la tarea cron'
+    );
+  },
+
+  async runProjectCron(projectId: string, jobId: string): Promise<{ run: CronRunItem }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/crons/${encodeURIComponent(jobId)}/run`, { method: 'POST' }),
+      'No se pudo ejecutar la tarea cron'
+    );
+  },
+
+  async getProjectCronRuns(projectId: string, jobId: string): Promise<{ runs: CronRunItem[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/crons/${encodeURIComponent(jobId)}/runs`),
+      'No se pudo leer el historial de la tarea cron'
+    );
+  },
+
+  async getProjectPreviews(projectId: string): Promise<{ config: any; previews: PreviewDeploymentItem[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/previews`),
+      'No se pudieron cargar las vistas previas'
+    );
+  },
+
+  async deployProjectPreview(projectId: string, body: { branch?: string; prNumber?: number | null; commit?: string | null; title?: string | null }): Promise<PreviewDeploymentItem> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/previews`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'No se pudo desplegar la vista previa'
+    );
+  },
+
+  async destroyProjectPreview(projectId: string, key: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/previews/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+      'No se pudo eliminar la vista previa'
+    );
+  },
+
+  async getProjectPreviewLogs(projectId: string, key: string, tail = 150): Promise<{ output: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/previews/${encodeURIComponent(key)}/logs?tail=${tail}`),
+      'No se pudieron leer los registros de la vista previa'
+    );
+  },
+
+  async rotateDeployHook(projectId: string): Promise<{ projectId: string; deployHookToken: string; hookUrl: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/deploy-hook/rotate`, { method: 'POST' }),
+      'No se pudo rotar el token del Deploy Hook'
     );
   },
 
@@ -1634,10 +2036,48 @@ export const api = {
     );
   },
 
-  async getInstallationLogs(id: string, lines = 300): Promise<{ output: string }> {
+  async getInstallationLogs(id: string, lines = 300, role?: string): Promise<{ output: string; roles?: string[]; role?: string }> {
+    const qs = new URLSearchParams({ lines: String(lines) });
+    if (role) qs.set('role', role);
     return jsonOrThrow(
-      await apiFetch(`${API_BASE}/catalog/installations/${id}/logs?lines=${lines}`),
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/logs?${qs.toString()}`),
       'No se pudieron leer los registros'
+    );
+  },
+
+  async getInstallationEnv(id: string): Promise<{ id: string; env: Record<string, string>; overrides: Record<string, string>; secretKeys?: string[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/env`),
+      'No se pudieron leer las variables del servicio'
+    );
+  },
+
+  async updateInstallationEnv(id: string, env: Record<string, string>): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/env`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ env }),
+      }),
+      'No se pudieron actualizar las variables del servicio'
+    );
+  },
+
+  async getInstallationStats(id: string): Promise<{ id: string; containers: Array<{ role: string; containerName: string; cpuPercent: number | null; memoryUsage: string; memoryPercent: number | null; netIO?: string; pids?: string; status?: string }> }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/stats`),
+      'No se pudieron leer las estadísticas del servicio'
+    );
+  },
+
+  async updateInstallationImage(id: string, image: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/catalog/installations/${id}/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image }),
+      }),
+      'No se pudo actualizar la imagen del servicio'
     );
   },
 
@@ -1762,10 +2202,128 @@ export const api = {
     );
   },
 
-  async promoteForge(projectId: string): Promise<any> {
+  async promoteForge(projectId: string, opts: { async?: boolean } = {}): Promise<any> {
+    const qs = opts.async ? '?async=1' : '';
     return jsonOrThrow(
-      await apiFetch(`${API_BASE}/projects/${projectId}/sync/promote`, { method: 'POST' }),
+      await apiFetch(`${API_BASE}/projects/${projectId}/sync/promote${qs}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts.async ? { async: true } : {}),
+      }),
       'No se pudo promocionar el espacio de trabajo a producción'
+    );
+  },
+
+  async getSyncFrameDiff(projectId: string, seq: number): Promise<LiveSyncFrameDiff> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/sync/frames/${seq}/diff`),
+      'No se pudo cargar el diff del Commit Frame'
+    );
+  },
+
+  async createSyncToken(projectId: string): Promise<{ projectId: string; ticket: string; expiresAt: string; wsUrl: string; command: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${projectId}/sync/token`, { method: 'POST' }),
+      'No se pudo generar el token temporal de Live Sync'
+    );
+  },
+
+  async runTlsAudit(opts: { warnDays?: number; probeLive?: boolean } = {}): Promise<{
+    checkedAt: string;
+    warnDays: number;
+    ok: any[];
+    expiring: any[];
+    expired: any[];
+    errors: any[];
+  }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/tls-audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      }),
+      'No se pudo ejecutar la auditoría de caducidad TLS'
+    );
+  },
+
+  async getCloudflareTunnelToken(tunnelId: string): Promise<{ tunnelId: string; token: string; mock?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cloudflare/tunnels/${encodeURIComponent(tunnelId)}/token`),
+      'No se pudo obtener el token del túnel'
+    );
+  },
+
+  async routeCloudflareTunnel(tunnelId: string, body: { hostname: string; serviceUrl: string; zoneId?: string | null }): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cloudflare/tunnels/${encodeURIComponent(tunnelId)}/route`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'No se pudo conectar el dominio al túnel de Cloudflare'
+    );
+  },
+
+  async deleteCloudflareTunnel(tunnelId: string): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cloudflare/tunnels/${encodeURIComponent(tunnelId)}`, { method: 'DELETE' }),
+      'No se pudo eliminar el túnel de Cloudflare'
+    );
+  },
+
+  async startCloudflareTunnelConnector(body: { tunnelToken: string; containerName?: string }): Promise<{ started: boolean; containerName?: string; error?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cloudflare/tunnels/connector/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+      'No se pudo iniciar el conector cloudflared en Docker'
+    );
+  },
+
+  async getSystemAudit(opts: { limit?: number; source?: string; action?: string } = {}): Promise<{ events: AuditLogEvent[] }> {
+    const qs = new URLSearchParams();
+    if (opts.limit) qs.set('limit', String(opts.limit));
+    if (opts.source) qs.set('source', opts.source);
+    if (opts.action) qs.set('action', opts.action);
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/audit?${qs.toString()}`),
+      'No se pudo leer el registro de auditoría'
+    );
+  },
+
+  async getSystemHealthSummary(fresh = false): Promise<any> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/health-summary${fresh ? '?fresh=1' : ''}`),
+      'No se pudo consultar el resumen de salud del sistema'
+    );
+  },
+
+  async getNotificationsHistory(limit = 30): Promise<{ notifications: NotificationHistoryItem[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/notifications/history?limit=${limit}`),
+      'No se pudo leer el historial de notificaciones'
+    );
+  },
+
+  async uploadWordPressSql(
+    file: File,
+    opts: { installationId: string; oldDomain?: string; newDomain?: string }
+  ): Promise<any> {
+    const qs = new URLSearchParams({ installationId: opts.installationId });
+    if (opts.oldDomain) qs.set('oldDomain', opts.oldDomain);
+    if (opts.newDomain) qs.set('newDomain', opts.newDomain);
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/wordpress/import-sql/upload?${qs.toString()}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Sql-Filename': file.name,
+        },
+        body: file,
+      }),
+      'No se pudo subir e importar el volcado SQL'
     );
   },
 

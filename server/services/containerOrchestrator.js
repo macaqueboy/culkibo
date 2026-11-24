@@ -22,6 +22,9 @@ class ContainerOrchestrator extends EventEmitter {
     // Ring-buffer con índice descendente en push (O(1) en addLog, sin unshift O(N)).
     this.logs = [];
     this.maxLogs = 2000;
+    /** @type {Map<string, any[]>} Buffer dedicado por proyecto (500 líneas/proyecto) para que un proyecto ruidoso no borre los logs de otros. */
+    this.projectLogs = new Map();
+    this.maxProjectLogs = 500;
     this.watcher = null;
     this.watchedDirectory = null;
     this.debounceTimer = null;
@@ -133,6 +136,25 @@ class ContainerOrchestrator extends EventEmitter {
       this.logs.splice(0, this.logs.length - this.maxLogs);
     }
 
+    if (projectId && projectId !== 'global') {
+      let bucket = this.projectLogs.get(projectId);
+      if (!bucket) {
+        bucket = [];
+        this.projectLogs.set(projectId, bucket);
+        // Evitar crecimiento ilimitado de buckets si se crean/borran cientos de proyectos
+        if (this.projectLogs.size > 120) {
+          const oldestKey = this.projectLogs.keys().next().value;
+          if (oldestKey !== undefined && oldestKey !== projectId) {
+            this.projectLogs.delete(oldestKey);
+          }
+        }
+      }
+      bucket.push(logEntry);
+      if (bucket.length > this.maxProjectLogs + 100) {
+        bucket.splice(0, bucket.length - this.maxProjectLogs);
+      }
+    }
+
     this.emit('log', logEntry);
     return logEntry;
   }
@@ -183,10 +205,13 @@ class ContainerOrchestrator extends EventEmitter {
     const cap = Math.max(1, Math.min(2000, Number(limit) || 100));
     const upperLevel = level ? String(level).toUpperCase() : null;
     const q = search ? String(search).toLowerCase() : '';
+    const source = (projectId && projectId !== 'global' && this.projectLogs.has(projectId))
+      ? /** @type {any[]} */ (this.projectLogs.get(projectId))
+      : this.logs;
     /** @type {any[]} */
     const out = [];
-    for (let i = this.logs.length - 1; i >= 0 && out.length < cap; i--) {
-      const l = this.logs[i];
+    for (let i = source.length - 1; i >= 0 && out.length < cap; i--) {
+      const l = source[i];
       if (projectId && l.projectId !== projectId) continue;
       if (pod && l.pod !== pod) continue;
       if (upperLevel && l.level !== upperLevel) continue;

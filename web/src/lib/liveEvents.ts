@@ -46,6 +46,31 @@ export interface ProjectChangeEvent {
   id?: string;
 }
 
+export interface CronRunEvent {
+  jobId: string;
+  projectId: string;
+  run: {
+    id: string;
+    startedAt: string;
+    finishedAt?: string | null;
+    durationMs?: number | null;
+    status: string;
+    exitCode?: number | null;
+    output?: string;
+    trigger?: string;
+  };
+}
+
+export interface PreviewLiveEvent {
+  projectId: string;
+  key: string;
+  action?: string;
+  status?: string;
+  url?: string | null;
+  branch?: string | null;
+  prNumber?: number | null;
+}
+
 type Handler<T> = (payload: T) => void;
 
 /**
@@ -65,6 +90,8 @@ class LiveEventsBus {
   private serviceInstalledHandlers = new Set<Handler<any>>();
   private serviceFailedHandlers = new Set<Handler<any>>();
   private projectChangeHandlers = new Set<Handler<ProjectChangeEvent>>();
+  private cronRunHandlers = new Set<Handler<CronRunEvent>>();
+  private previewEventHandlers = new Set<Handler<PreviewLiveEvent>>();
 
   private subscribe<T>(set: Set<Handler<T>>, handler: Handler<T>): () => void {
     set.add(handler);
@@ -107,6 +134,12 @@ class LiveEventsBus {
 
   onProjectChange(handler: Handler<ProjectChangeEvent>) { return this.subscribe(this.projectChangeHandlers, handler); }
   emitProjectChange(payload: ProjectChangeEvent) { this.dispatch(this.projectChangeHandlers, payload); }
+
+  onCronRun(handler: Handler<CronRunEvent>) { return this.subscribe(this.cronRunHandlers, handler); }
+  emitCronRun(payload: CronRunEvent) { this.dispatch(this.cronRunHandlers, payload); }
+
+  onPreviewEvent(handler: Handler<PreviewLiveEvent>) { return this.subscribe(this.previewEventHandlers, handler); }
+  emitPreviewEvent(payload: PreviewLiveEvent) { this.dispatch(this.previewEventHandlers, payload); }
 }
 
 export const liveEvents = new LiveEventsBus();

@@ -361,13 +361,24 @@ class ProjectManager extends EventEmitter {
       });
     }
     if (data.startCommand !== undefined && data.startCommand !== null) {
-      if (typeof data.startCommand !== 'string' || data.startCommand.includes(';')) {
+      if (typeof data.startCommand !== 'string' || /[;\0\r\n]/.test(data.startCommand)) {
         throw new Error('Invalid start command');
       }
     }
     if (data.buildCommand !== undefined && data.buildCommand !== null) {
-      if (typeof data.buildCommand !== 'string' || data.buildCommand.includes(';')) {
+      if (typeof data.buildCommand !== 'string' || /[;\0\r\n]/.test(data.buildCommand)) {
         throw new Error('Invalid build command');
+      }
+    }
+    if (data.localPath !== undefined && data.localPath !== null && String(data.localPath).trim() !== '') {
+      const lp = String(data.localPath).trim();
+      if (/[\0\r\n]/.test(lp) || lp.length > 512) {
+        throw new Error('Invalid localPath');
+      }
+      const resolved = path.resolve(lp);
+      const parsedRoot = path.parse(resolved).root;
+      if (resolved === parsedRoot) {
+        throw new Error('No se permite vincular el directorio raíz del sistema');
       }
     }
   }

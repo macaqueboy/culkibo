@@ -18,8 +18,46 @@ import type { McpAuditEntry, RemoteAccessInfo } from '../lib/api';
 import { api } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
+import { HelpTip } from './HelpTip';
 
 type ClientTab = 'cursor' | 'claude' | 'vscode' | 'cli';
+
+function classifyMcpToolGroup(name: string): string {
+  const n = name.toLowerCase();
+  if (n.includes('sync') || n.includes('forge') || n.includes('merkle')) return 'Live Sync (The Forge)';
+  if (n.includes('domain') || n.includes('ssl') || n.includes('tls') || n.includes('caddy') || n.includes('ingress') || n.includes('wildcard') || n.includes('tunnel') || n.includes('cloudflare')) return 'Dominios, TLS y Caddy';
+  if (n.includes('database') || n.includes('_db') || n.includes('backup') || n.includes('snapshot') || n.includes('restore') || n.includes('s3')) return 'Bases de datos y Backups';
+  if (n.includes('catalog') || n.includes('service') || n.includes('install')) return 'Catálogo de servicios';
+  if (n.includes('deploy') || n.includes('rollback') || n.includes('cron') || n.includes('preview') || n.includes('runtime') || n.includes('container') || n.includes('traffic')) return 'Despliegues, Cron y Previews';
+  if (n.includes('wordpress') || n.includes('coolify') || n.includes('compose') || n.includes('import')) return 'Migradores e Importadores';
+  if (n.includes('project') || n.includes('env') || n.includes('webhook')) return 'Proyectos y Variables';
+  return 'Sistema, Métricas y Auditoría';
+}
+
+function buildDefaultArgsFromSchema(spec: any): Record<string, unknown> {
+  const props = spec?.inputSchema?.properties || {};
+  const required = new Set<string>(spec?.inputSchema?.required || []);
+  const out: Record<string, unknown> = {};
+  for (const [key, def] of Object.entries<any>(props)) {
+    if (!required.has(key) && key !== 'action' && key !== 'limit') continue;
+    if (def?.default !== undefined) {
+      out[key] = def.default;
+    } else if (Array.isArray(def?.enum) && def.enum.length > 0) {
+      out[key] = def.enum[0];
+    } else if (def?.type === 'number' || def?.type === 'integer') {
+      out[key] = key === 'limit' ? 20 : 1;
+    } else if (def?.type === 'boolean') {
+      out[key] = false;
+    } else if (def?.type === 'array') {
+      out[key] = [];
+    } else if (def?.type === 'object') {
+      out[key] = {};
+    } else {
+      out[key] = key.toLowerCase().includes('url') ? 'https://tuweb.com' : '';
+    }
+  }
+  return out;
+}
 
 export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void }> = ({ onNotify }) => {
   const [tools, setTools] = useState<any[]>([]);
@@ -34,6 +72,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
   const [jsonError, setJsonError] = useState<string | null>(null);
   const [toolResult, setToolResult] = useState<any>(null);
   const [executing, setExecuting] = useState(false);
+  const [confirmDestructive, setConfirmDestructive] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const loadMcpData = async () => {
@@ -99,21 +138,34 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     [tools, effectiveToolName]
   );
 
+  const groupedTools = useMemo(() => {
+    const map = new Map<string, any[]>();
+    for (const t of filteredTools) {
+      const g = classifyMcpToolGroup(String(t.name || ''));
+      if (!map.has(g)) map.set(g, []);
+      map.get(g)!.push(t);
+    }
+    return Array.from(map.entries());
+  }, [filteredTools]);
+
   const handleSelectTool = (toolName: string) => {
     setSelectedTool(toolName);
+    setConfirmDestructive(false);
     setJsonError(null);
-    if (toolName === 'culkibo_analyze_wordpress') {
-      setToolArgs(JSON.stringify({ url: 'https://tuweb.com' }, null, 2));
-    } else if (toolName === 'culkibo_manage_domain') {
-      setToolArgs(JSON.stringify({ action: 'list' }, null, 2));
-    } else if (toolName === 'culkibo_get_logs') {
-      setToolArgs(JSON.stringify({ limit: 20 }, null, 2));
-    } else {
-      setToolArgs('{}');
-    }
+    const spec = tools.find((t) => t.name === toolName);
+    const defaults = buildDefaultArgsFromSchema(spec);
+    setToolArgs(Object.keys(defaults).length > 0 ? JSON.stringify(defaults, null, 2) : '{}');
   };
 
+  const isDestructive = Boolean(currentToolSpec?.annotations?.destructiveHint);
+  const isReadOnly = Boolean(currentToolSpec?.annotations?.readOnlyHint);
+
   const handleExecuteTool = async () => {
+    if (isDestructive && !confirmDestructive) {
+      setConfirmDestructive(true);
+      return;
+    }
+    setConfirmDestructive(false);
     setJsonError(null);
     let parsedArgs: Record<string, unknown> = {};
     try {
@@ -193,6 +245,10 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
               MCP {mcpConfig?.protocol?.current || '2026-07-28'}
             </span>
+            <HelpTip title="Model Context Protocol (MCP)">
+              <p>Permite que Claude, Cursor, Windsurf o VS Code lean estado, desplieguen o diagnostiquen tu servidor sin copiar comandos manualmente.</p>
+              <p>Culkibo expone {tools.length} herramientas con anotaciones de seguridad, recursos de solo lectura y prompts guiados.</p>
+            </HelpTip>
           </div>
           <p className="text-sm text-slate-500 mt-1">
             Conecta Claude, Cursor, Windsurf, VS Code o Antigravity para operar despliegues, dominios, bases de datos y diagnóstico en directo.
@@ -311,15 +367,34 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               onChange={(e) => handleSelectTool(e.target.value)}
               className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
             >
-              {filteredTools.map((t) => (
-                <option key={t.name} value={t.name}>
-                  {t.name}
-                </option>
+              {groupedTools.map(([groupName, groupItems]) => (
+                <optgroup key={groupName} label={`${groupName} (${groupItems.length})`}>
+                  {groupItems.map((t) => (
+                    <option key={t.name} value={t.name}>
+                      {t.name}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
 
             {currentToolSpec && (
               <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-1.5">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="font-mono text-[11px] font-semibold text-slate-800">{currentToolSpec.name}</span>
+                  <div className="flex items-center gap-1.5">
+                    {isReadOnly && (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                        Solo lectura
+                      </span>
+                    )}
+                    {isDestructive && (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-red-50 text-red-700 border border-red-200">
+                        Acción destructiva
+                      </span>
+                    )}
+                  </div>
+                </div>
                 <p className="text-slate-700 leading-relaxed">{currentToolSpec.description}</p>
                 {schemaProps.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 pt-1">
@@ -343,7 +418,10 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               <label className="block text-xs font-medium text-slate-700 mb-1">Argumentos (JSON)</label>
               <textarea
                 value={toolArgs}
-                onChange={(e) => setToolArgs(e.target.value)}
+                onChange={(e) => {
+                  setToolArgs(e.target.value);
+                  setConfirmDestructive(false);
+                }}
                 rows={3}
                 className="w-full p-3 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
               />
@@ -356,21 +434,56 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               </div>
             )}
 
+            {confirmDestructive && (
+              <div role="alert" className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2">
+                <span>Esta herramienta modifica o borra recursos reales. Pulsa de nuevo para confirmar.</span>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDestructive(false)}
+                  className="text-slate-600 hover:text-slate-900 underline shrink-0 cursor-pointer"
+                >
+                  Cancelar
+                </button>
+              </div>
+            )}
+
             <button
               type="button"
               onClick={() => void handleExecuteTool()}
               disabled={executing || !effectiveToolName}
-              className="w-full py-2 px-4 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium text-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              className={`w-full py-2 px-4 rounded-lg text-white font-medium text-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 ${
+                confirmDestructive ? 'bg-red-600 hover:bg-red-700' : 'bg-slate-900 hover:bg-slate-800'
+              }`}
             >
               {executing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-              <span>{executing ? 'Ejecutando…' : 'Ejecutar herramienta'}</span>
+              <span>
+                {executing
+                  ? 'Ejecutando…'
+                  : confirmDestructive
+                    ? 'Confirmar y ejecutar acción destructiva'
+                    : 'Ejecutar herramienta'}
+              </span>
             </button>
 
-            {toolResult && (
-              <pre className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-800 max-h-48 overflow-y-auto">
-                {JSON.stringify(toolResult, null, 2)}
-              </pre>
-            )}
+            {toolResult && (() => {
+              const remediation =
+                toolResult?.remediation ||
+                toolResult?.result?.remediation ||
+                toolResult?.error?.data?.remediation ||
+                null;
+              return (
+                <div className="space-y-2">
+                  {remediation && (
+                    <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                      <strong>Cómo solucionarlo:</strong> {String(remediation)}
+                    </div>
+                  )}
+                  <pre className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-800 max-h-48 overflow-y-auto">
+                    {JSON.stringify(toolResult, null, 2)}
+                  </pre>
+                </div>
+              );
+            })()}
           </div>
         </div>
       </div>

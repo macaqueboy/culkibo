@@ -38,11 +38,13 @@ class Project {
     this.volumes = data.volumes || [];
     this.fileMounts = data.fileMounts || [];
     this.webhookSecret = data.webhookSecret || crypto.randomBytes(16).toString('hex');
+    this.deployHookToken = data.deployHookToken || crypto.randomBytes(24).toString('hex');
     this.autoDeploy = data.autoDeploy !== undefined ? data.autoDeploy : true;
     this.lastDeployedAt = data.lastDeployedAt || null;
     this.lastCommit = data.lastCommit || null;
     this.githubOwner = data.githubOwner || '';
     this.githubRepo = data.githubRepo || '';
+    this.localPath = data.localPath ? String(data.localPath).trim() : '';
     this.localRunning = data.localRunning !== undefined ? data.localRunning : false;
     this.localPort = data.localPort || null;
     // Ajustes del despliegue a producción (deployManager). Sin estos campos en
@@ -54,6 +56,11 @@ class Project {
     this.memoryMb = data.memoryMb || null;
     this.cpus = data.cpus || null;
     this.buildArgs = data.buildArgs || {};
+    // Hooks pre/post despliegue ejecutados sin shell (argv puro dentro del contenedor).
+    this.preDeployCommand = data.preDeployCommand || '';
+    this.postDeployCommand = data.postDeployCommand || '';
+    this.hookTimeoutMs = Math.min(600000, Math.max(5000, Number(data.hookTimeoutMs) || 120000));
+    this.postDeployFailPolicy = data.postDeployFailPolicy === 'rollback' ? 'rollback' : 'warn';
     // Enlaces declarativos a bases de datos gestionadas (solo IDs; los secretos
     // nunca se persisten en texto plano en projects.json) y dependencias internas.
     this.linkedDatabaseIds = Array.isArray(data.linkedDatabaseIds)
@@ -61,16 +68,19 @@ class Project {
       : [];
     this.dependencies = Array.isArray(data.dependencies) ? data.dependencies : [];
     // Modo mantenimiento atómico (<10 ms en Caddy), auto-rollback ante crash-loop/OOM
-    // y vistas previas HTTPS automáticas por Pull Request.
+    // y vistas previas HTTPS automáticas por Pull Request / rama.
     this.maintenanceMode = Boolean(data.maintenanceMode);
     this.autoRollback = data.autoRollback !== undefined ? Boolean(data.autoRollback) : true;
     this.previewDeployments = data.previewDeployments && typeof data.previewDeployments === 'object'
       ? {
           enabled: Boolean(data.previewDeployments.enabled),
           baseDomain: String(data.previewDeployments.baseDomain || '').trim().toLowerCase(),
-          maxPreviews: Math.min(20, Math.max(1, Number(data.previewDeployments.maxPreviews) || 5))
+          maxPreviews: Math.min(20, Math.max(1, Number(data.previewDeployments.maxPreviews) || 5)),
+          allowForks: Boolean(data.previewDeployments.allowForks),
+          ttlHours: Math.min(720, Math.max(1, Number(data.previewDeployments.ttlHours) || 168)),
+          memoryMb: Math.min(4096, Math.max(64, Number(data.previewDeployments.memoryMb) || 512))
         }
-      : { enabled: false, baseDomain: '', maxPreviews: 5 };
+      : { enabled: false, baseDomain: '', maxPreviews: 5, allowForks: false, ttlHours: 168, memoryMb: 512 };
   }
 }
 

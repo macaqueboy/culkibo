@@ -69,12 +69,24 @@ async function testWebSocketStress() {
     }
     console.log(`  ✓ Abruptly terminated ${half} connections without server errors`);
 
-    // 4. Remaining connections still receive data
+    // 4. Remaining connections still receive data and complete clean close handshake
     await new Promise(r => setTimeout(r, 200));
+    const closePromises = [];
     for (let i = half; i < NUM_CLIENTS; i++) {
       assert.strictEqual(clients[i].readyState, WebSocket.OPEN);
-      clients[i].close();
+      closePromises.push(new Promise((resolve) => {
+        const t = setTimeout(() => {
+          try { clients[i].terminate(); } catch (e) {}
+          resolve();
+        }, 2000);
+        clients[i].once('close', () => {
+          clearTimeout(t);
+          resolve();
+        });
+        clients[i].close();
+      }));
     }
+    await Promise.all(closePromises);
     console.log(`  ✓ Remaining connections clean disconnect complete`);
 
     console.log('✅ WebSocket Stress & Churn test passed!\n');

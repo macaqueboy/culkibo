@@ -26,6 +26,7 @@ interface OnboardingChecklistProps {
   onOpenDomains: () => void;
   onOpenAi: () => void;
   onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void;
+  restoreTick?: number;
 }
 
 export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
@@ -37,6 +38,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
   onOpenDomains,
   onOpenAi,
   onNotify,
+  restoreTick = 0,
 }) => {
   const [dismissed, setDismissed] = useState<boolean>(() => {
     try {
@@ -46,6 +48,14 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
     }
   });
   const [expanded, setExpanded] = useState<boolean>(() => projectsCount === 0);
+  const [prevRestoreTick, setPrevRestoreTick] = useState(restoreTick);
+  if (restoreTick !== prevRestoreTick) {
+    setPrevRestoreTick(restoreTick);
+    if (restoreTick > 0) {
+      setDismissed(false);
+      setExpanded(true);
+    }
+  }
   const [serverIp, setServerIp] = useState<string | null>(null);
   const [dockerOk, setDockerOk] = useState<boolean | null>(null);
   const [caddyOk, setCaddyOk] = useState<boolean | null>(null);

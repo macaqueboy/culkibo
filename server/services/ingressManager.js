@@ -111,6 +111,13 @@ class IngressManager {
     this.acmeEmail = persisted.acmeEmail;
     /** @type {Map<string, { hostname: string, upstream: string, projectId: string, prNumber: number }>} */
     this.previewRoutes = new Map();
+    /** @type {any} */
+    this.lastTlsAudit = null;
+    /** Deduplicación 24h por hostname para alertas de caducidad TLS. */
+    /** @type {Map<string, number>} */
+    this._tlsAlertSentAt = new Map();
+    /** Marca si el Caddy externo traía su propia apps.tls ajena a Culkibo. */
+    this._hasForeignTls = false;
   }
 
   _loadConfig() {
@@ -232,9 +239,30 @@ class IngressManager {
     const sslManager = getSslManager();
     const containerMountPrefix = caddyManager.isContainerized ? '/etc/culkibo-certs' : null;
     const customCertFiles = sslManager.listCaddyLoadFiles({ containerMountPrefix });
+
+    // Si el usuario guardó un token real en Cloudflare Settings pero CF_API_TOKEN no está en process.env,
+    // pasarlo solo en memoria a la política DNS-01 (jamás se persiste en ingress.json).
+    /** @type {string | null} */
+    let runtimeCfToken = null;
+    if (!process.env.CF_API_TOKEN && !process.env.CLOUDFLARE_API_TOKEN) {
+      try {
+        const cf = require('./cloudflareService');
+        const st = cf.getConfigStatus();
+        if (!st.useMock && cf.config && cf.config.apiToken) {
+          runtimeCfToken = String(cf.config.apiToken);
+        }
+      } catch (e) {}
+    }
+    const effectivePolicies = (this.wildcardPolicies || []).map((wp) => {
+      if (runtimeCfToken && (!wp.tokenEnv || wp.tokenEnv === 'CF_API_TOKEN')) {
+        return { ...wp, apiToken: runtimeCfToken };
+      }
+      return wp;
+    });
+
     return {
       askEndpoint: this.askEndpoint(),
-      wildcardPolicies: this.wildcardPolicies,
+      wildcardPolicies: effectivePolicies,
       acmeEmail: this.acmeEmail,
       customCertFiles
     };
@@ -250,10 +278,10 @@ class IngressManager {
     if (!host) return false;
     if (this.panelDomain && host === this.panelDomain) return true;
     if (domainManager.resolveRoute(host)) return true;
-    // Autorizar acompañantes canónicos (`www.X` cuando `X` tiene `www_to_apex`, o `X` cuando `www.X` tiene `apex_to_www`)
+    // Autorizar acompañantes canónicos (`www.X` cuando `X` sin www tiene `www_to_apex`, o `X` cuando `www.X` tiene `apex_to_www`)
     for (const d of (domainManager.domains || [])) {
       if (!d || d.status === 'disabled' || d.isWildcard) continue;
-      if (d.canonicalRedirect === 'www_to_apex' && host === `www.${d.hostname}`) return true;
+      if (d.canonicalRedirect === 'www_to_apex' && !d.hostname.startsWith('www.') && host === `www.${d.hostname}`) return true;
       if (d.canonicalRedirect === 'apex_to_www' && d.hostname.startsWith('www.') && host === d.hostname.slice(4)) return true;
     }
     // Autorizar previews activas de Pull Requests
@@ -341,8 +369,15 @@ class IngressManager {
   podRouteFor(domain, traffic) {
     const port = Number(domain.targetPort) || (domain.targetPod === 'citadel' ? CITADEL_PORT : FORGE_PORT);
     const isPodPort = port === FORGE_PORT || port === CITADEL_PORT;
-    const securityHeaders = domain.securityHeaders !== false;
-    const customHeaders = domain.customHeaders || null;
+    const edgeOpts = {
+      securityHeaders: domain.securityHeaders !== false,
+      framePolicy: domain.framePolicy || null,
+      customHeaders: domain.customHeaders || null,
+      basicAuth: domain.basicAuth || null,
+      ipAllowlist: domain.ipAllowlist || null,
+      maxBodySizeMb: domain.maxBodySizeMb || null,
+      rateLimit: domain.rateLimit || null
+    };
 
     if (isPodPort && traffic.forge > 0 && traffic.citadel > 0) {
       return {
@@ -350,8 +385,7 @@ class IngressManager {
         hostnames: [domain.hostname],
         upstreams: [this._hostDial(FORGE_PORT), this._hostDial(CITADEL_PORT)],
         weights: [traffic.forge, traffic.citadel],
-        securityHeaders,
-        customHeaders,
+        ...edgeOpts,
         kind: 'pod',
         label: `Reparto ${traffic.forge}/${traffic.citadel} entre Desarrollo y Producción`
       };
@@ -361,8 +395,7 @@ class IngressManager {
       projectId: domain.id,
       hostnames: [domain.hostname],
       upstreams: [this._hostDial(port)],
-      securityHeaders,
-      customHeaders,
+      ...edgeOpts,
       kind: domain.targetPod === 'service' ? 'service' : 'pod',
       label: domain.targetPod === 'service'
         ? (domain.serviceName || 'Servicio')
@@ -420,11 +453,32 @@ class IngressManager {
     const grouped = new Map();
     const disabledHosts = new Set();
 
+    // Consultar catálogo solo si algún dominio referencia `serviceId` (evita cargar catalogManager en frío)
+    /** @type {any} */
+    let catalogMod = null;
+    const hasServiceDomains = domains.some((d) => d && d.serviceId);
+    if (hasServiceDomains) {
+      try { catalogMod = require('./catalogManager'); } catch (e) {}
+    }
+
     for (const domain of domains) {
       if (domain.status === 'disabled') {
         disabledHosts.add(domain.hostname);
         skipped.push({ hostnames: [domain.hostname], reason: 'El dominio está deshabilitado' });
         continue;
+      }
+
+      // P0: omitir dominios cuyo servicio del catálogo está detenido o con error
+      if (domain.serviceId && catalogMod && typeof catalogMod.get === 'function') {
+        const inst = catalogMod.get(domain.serviceId);
+        if (inst && (inst.status === 'stopped' || inst.status === 'error' || inst.status === 'failed')) {
+          skipped.push({
+            hostnames: [domain.hostname],
+            serviceId: domain.serviceId,
+            reason: `El servicio «${inst.name || domain.serviceName || domain.serviceId}» está detenido`
+          });
+          continue;
+        }
       }
 
       const project = this.projectForDomain(domain, projectsByHost);
@@ -466,16 +520,46 @@ class IngressManager {
         continue;
       }
       includedProjectIds.add(project.id);
-      const anySecurityHeaders = entry.domains.some((d) => d.securityHeaders !== false);
-      const firstCustomHeaders = entry.domains.find((d) => d.customHeaders)?.customHeaders || null;
-      specs.push({
-        projectId: project.id,
-        hostnames,
-        upstreams: [upstream],
-        securityHeaders: anySecurityHeaders,
-        customHeaders: firstCustomHeaders,
-        kind: 'project',
-        label: project.name
+
+      // Agrupar por (isWildcard, firma de política de borde): así un dominio exacto jamás
+      // hereda prioridad wildcard y cada dominio puede tener Basic Auth / IP Allowlist / cabeceras propias.
+      /** @type {Map<string, { domains: any[], isWildcard: boolean, sample: any }>} */
+      const policyBuckets = new Map();
+      for (const d of entry.domains) {
+        const isW = Boolean(d.isWildcard || String(d.hostname).startsWith('*.'));
+        const sig = JSON.stringify([
+          isW,
+          d.securityHeaders !== false,
+          d.framePolicy || null,
+          d.customHeaders || null,
+          d.basicAuth?.enabled ? { realm: d.basicAuth.realm, accounts: d.basicAuth.accounts } : null,
+          Array.isArray(d.ipAllowlist) && d.ipAllowlist.length > 0 ? d.ipAllowlist : null,
+          d.maxBodySizeMb || null,
+          d.rateLimit?.enabled ? d.rateLimit : null
+        ]);
+        if (!policyBuckets.has(sig)) policyBuckets.set(sig, { domains: [], isWildcard: isW, sample: d });
+        const bucketObj = policyBuckets.get(sig);
+        if (bucketObj) bucketObj.domains.push(d);
+      }
+
+      const bucketList = Array.from(policyBuckets.values());
+      bucketList.forEach((bucket, idx) => {
+        const s = bucket.sample;
+        specs.push({
+          projectId: idx === 0 ? project.id : `${project.id}_p${idx}`,
+          ownerProjectId: project.id,
+          hostnames: bucket.domains.map((d) => d.hostname),
+          upstreams: [upstream],
+          securityHeaders: s.securityHeaders !== false,
+          framePolicy: s.framePolicy || null,
+          customHeaders: s.customHeaders || null,
+          basicAuth: s.basicAuth || null,
+          ipAllowlist: s.ipAllowlist || null,
+          maxBodySizeMb: s.maxBodySizeMb || null,
+          rateLimit: s.rateLimit || null,
+          kind: 'project',
+          label: project.name
+        });
       });
       for (const d of entry.domains) this._appendCanonicalRedirectSpec(d, specs);
     }
@@ -623,8 +707,10 @@ class IngressManager {
     /** @type {string | null} */
     let note = null;
     if (!full.apps.tls) {
+      this._hasForeignTls = false;
       await this.reconcileTlsOnly();
     } else {
+      this._hasForeignTls = true;
       note = 'Caddy ya tenía configuración de TLS propia: Culkibo no la ha tocado, así que la emisión de certificados bajo demanda depende de ella.';
       this.log('WARN', note);
     }
@@ -687,7 +773,7 @@ class IngressManager {
     };
   }
 
-  /** Da de alta o refresca la ruta de un proyecto; la retira si ya no procede. */
+  /** Da de alta o refresca la ruta de un proyecto (incluyendo mantenimiento y múltiples políticas); la retira si ya no procede. */
   async syncProject(projectId) {
     if (!this.mayHaveRoute(projectId)) {
       return this.nothingToDo(projectId, 'El proyecto no tiene ningún dominio vinculado');
@@ -695,9 +781,12 @@ class IngressManager {
 
     return this.guard(async () => {
       const state = this.buildDesiredState();
-      const spec = state.specs.find(s => s.kind === 'project' && s.projectId === projectId);
+      const projectSpecs = state.specs.filter(
+        (s) => (s.projectId === projectId || s.ownerProjectId === projectId) &&
+          (s.kind === 'project' || s.kind === 'maintenance' || s.kind === 'production')
+      );
 
-      if (!spec) {
+      if (projectSpecs.length === 0) {
         const removal = await caddyManager.removeRoute(projectId);
         this.publishedIds.delete(removal.id);
         const match = state.skipped.find(s => s.projectId === projectId);
@@ -706,15 +795,29 @@ class IngressManager {
         return { applied: true, action: removal.removed ? 'removed' : 'noop', routeId: removal.id, reason };
       }
 
+      if (projectSpecs.length > 1) {
+        // Múltiples políticas por dominio en el mismo proyecto: reconciliar atómicamente para mantener orden
+        const rec = await caddyManager.reconcile(state.specs);
+        this.publishedIds = new Set(rec.applied);
+        return {
+          applied: true,
+          action: 'updated',
+          routeId: caddyManager.routeId(projectId),
+          hostnames: projectSpecs.flatMap((s) => s.hostnames),
+          upstreams: projectSpecs[0].upstreams || []
+        };
+      }
+
+      const spec = projectSpecs[0];
       const result = await caddyManager.upsertRoute(spec);
       this.publishedIds.add(result.id);
-      this.log('SUCCESS', `${result.created ? 'Alta' : 'Actualización'} de ${spec.hostnames.join(', ')} → ${spec.upstreams.join(', ')}`);
+      this.log('SUCCESS', `${result.created ? 'Alta' : 'Actualización'} de ${spec.hostnames.join(', ')} → ${(spec.upstreams || ['mantenimiento 503']).join(', ')}`);
       return {
         applied: true,
         action: result.created ? 'created' : 'updated',
         routeId: result.id,
         hostnames: spec.hostnames,
-        upstreams: spec.upstreams
+        upstreams: spec.upstreams || []
       };
     });
   }
@@ -749,7 +852,8 @@ class IngressManager {
       const result = await caddyManager.reconcile(state.specs);
       /** @type {any} */
       let tlsResult = null;
-      if (this.wildcardPolicies.length > 0 || getSslManager().listCaddyLoadFiles().length > 0) {
+      // Sincronizar siempre apps.tls (salvo Caddy con TLS ajeno) para reflejar cambios de acmeEmail o borrado del último PEM
+      if (!this._hasForeignTls) {
         try {
           tlsResult = await this.reconcileTlsOnly();
         } catch (tlsErr) {
@@ -889,14 +993,14 @@ class IngressManager {
       return failRes;
     }
 
-    // Protección SSRF: bloquear sondeos TLS a IPs privadas/metadatos salvo dominios registrados, panel o dev local.
+    // Protección SSRF: bloquear sondeos TLS a IPs privadas/metadatos salvo dominios registrados, panel o loopback estricto.
     const isRegistered = Boolean(
       domainManager.getByHostname(raw) ||
       domainManager.getByHostname(root) ||
       (this.panelDomain && (raw === this.panelDomain || root === this.panelDomain))
     );
-    const isDevLocal = root === 'localhost' || root.endsWith('.sslip.io') || root.endsWith('.nip.io');
-    if (isMetadataIp(resolved.address) || (isPrivateIp(resolved.address) && !isRegistered && !isDevLocal)) {
+    const isStrictLoopback = resolved.address === '127.0.0.1' || resolved.address === '::1';
+    if (isMetadataIp(resolved.address) || (isPrivateIp(resolved.address) && !isRegistered && !isStrictLoopback)) {
       return { ...base, address: resolved.address, reachable: false, error: 'Dirección IP privada/interna bloqueada por protección SSRF' };
     }
 
@@ -931,10 +1035,14 @@ class IngressManager {
           const hasNotAfter = !Number.isNaN(notAfter.getTime());
           const sans = cert.subjectaltname ? cert.subjectaltname.split(', ').map(x => x.replace(/^DNS:/, '').toLowerCase()) : [];
           const coversWildcard = isWildcard ? sans.includes(`*.${root}`) : undefined;
+          const issuerName = (cert.issuer && (cert.issuer.O || cert.issuer.CN)) || null;
+          const issuerCN = (cert.issuer && cert.issuer.CN) || null;
+          const isCloudflareOriginCa = /cloudflare origin/i.test(`${issuerName || ''} ${issuerCN || ''}`);
           finish({
             reachable: true,
-            issuer: (cert.issuer && (cert.issuer.O || cert.issuer.CN)) || null,
-            issuerCN: (cert.issuer && cert.issuer.CN) || null,
+            issuer: issuerName,
+            issuerCN,
+            isCloudflareOriginCa,
             subject: (cert.subject && cert.subject.CN) || null,
             sans,
             ...(isWildcard ? { coversWildcard } : {}),
@@ -942,8 +1050,12 @@ class IngressManager {
             notAfter: hasNotAfter ? notAfter.toISOString() : null,
             daysRemaining: hasNotAfter ? Math.floor((notAfter.getTime() - Date.now()) / 86400000) : null,
             expired: hasNotAfter ? notAfter.getTime() <= Date.now() : null,
-            trusted: s.authorized === true,
-            trustError: s.authorized ? null : (s.authorizationError ? humanizeTlsError(String(s.authorizationError)) : null),
+            trusted: s.authorized === true || isCloudflareOriginCa,
+            trustError: s.authorized
+              ? null
+              : isCloudflareOriginCa
+                ? 'Certificado Cloudflare Origin CA (válido con Proxy naranja de Cloudflare activado)'
+                : (s.authorizationError ? humanizeTlsError(String(s.authorizationError)) : null),
             protocol: typeof s.getProtocol === 'function' ? s.getProtocol() : null,
             alpn: s.alpnProtocol || null
           });
@@ -1041,6 +1153,15 @@ class IngressManager {
       });
     }
 
+    const natOrFirewallBlocked = Boolean(
+      !tlsInfo.reachable &&
+      ingressStatus.available &&
+      route &&
+      upstreamReachable !== false &&
+      dnsInfo.hasDnsRecords &&
+      /tiempo de espera|443 no responde|bloqueado/i.test(String(tlsInfo.error || ''))
+    );
+
     checks.push({
       id: 'tls',
       title: 'Certificado HTTPS (TLS)',
@@ -1048,8 +1169,10 @@ class IngressManager {
         ? (hostname.startsWith('*.') && tlsInfo.coversWildcard === false ? 'warn' : 'ok')
         : (tlsInfo.reachable ? 'warn' : 'fail'),
       detail: tlsInfo.reachable && tlsInfo.trusted && !tlsInfo.expired
-        ? `Válido (${tlsInfo.issuer || 'CA verificada'}, ${tlsInfo.daysRemaining ?? '?'} días restantes${hostname.startsWith('*.') && tlsInfo.coversWildcard === false ? ' — aviso: el certificado servido no incluye SAN comodín' : ''}).`
-        : (tlsInfo.trustError || tlsInfo.error || 'Certificado aún pendiente de emisión.')
+        ? `Válido (${tlsInfo.isCloudflareOriginCa ? 'Cloudflare Origin CA' : (tlsInfo.issuer || 'CA verificada')}, ${tlsInfo.daysRemaining ?? '?'} días restantes${hostname.startsWith('*.') && tlsInfo.coversWildcard === false ? ' — aviso: el certificado servido no incluye SAN comodín' : ''}).`
+        : natOrFirewallBlocked
+          ? 'Tu servidor parece estar detrás de NAT/CGNAT o con los puertos 80/443 cerrados (Caddy y tu app sí están sanos en local). Usa un Túnel de Cloudflare (sin abrir puertos) o abre 80/443 en tu router/VPS.'
+          : (tlsInfo.trustError || tlsInfo.error || 'Certificado aún pendiente de emisión.')
     });
 
     if (targetUpstream) {
@@ -1120,7 +1243,8 @@ class IngressManager {
       if (!live) continue;
       const liveHosts = JSON.stringify(((live.match && live.match[0] && live.match[0].host) || []).slice().sort());
       const desHosts = JSON.stringify((s.hostnames || []).slice().sort());
-      const liveUps = JSON.stringify(((live.handle && live.handle[0] && live.handle[0].upstreams) || []).map((u) => u.dial));
+      const proxyH = caddyManager.extractProxyHandler(live);
+      const liveUps = JSON.stringify(((proxyH && proxyH.upstreams) || []).map((u) => u.dial));
       const desUps = JSON.stringify(s.upstreams || []);
       if (liveHosts !== desHosts || (s.kind !== 'redirect' && s.kind !== 'maintenance' && liveUps !== desUps)) {
         modified.push(id);
@@ -1133,7 +1257,8 @@ class IngressManager {
       modified
     };
 
-    const hostSet = new Set((domainManager.domains || []).map(d => d.hostname));
+    // Excluir dominios deshabilitados para no malgastar slots de MAX_TLS_PROBES
+    const hostSet = new Set((domainManager.domains || []).filter(d => d && d.status !== 'disabled').map(d => d.hostname));
     if (this.panelDomain) hostSet.add(this.panelDomain);
     const hostnames = Array.from(hostSet).slice(0, MAX_TLS_PROBES);
     const tlsProbes = probe && hostnames.length
@@ -1154,14 +1279,17 @@ class IngressManager {
         : `Ingress no disponible: ${detection.reason}. Culkibo sigue funcionando, pero ningún dominio se sirve desde aquí.`,
       routesManaged: liveRoutes.length,
       routesError,
-      routes: liveRoutes.map(r => ({
-        id: r['@id'],
-        hosts: (r.match && r.match[0] && r.match[0].host) || [],
-        upstreams: ((r.handle && r.handle[0] && r.handle[0].upstreams) || []).map(u => u.dial),
-        weights: (r.handle && r.handle[0] && r.handle[0].load_balancing
-          && r.handle[0].load_balancing.selection_policy
-          && r.handle[0].load_balancing.selection_policy.weights) || null
-      })),
+      routes: liveRoutes.map(r => {
+        const proxyH = caddyManager.extractProxyHandler(r);
+        return {
+          id: r['@id'],
+          hosts: (r.match && r.match[0] && r.match[0].host) || [],
+          upstreams: ((proxyH && proxyH.upstreams) || []).map(u => u.dial),
+          weights: (proxyH && proxyH.load_balancing
+            && proxyH.load_balancing.selection_policy
+            && proxyH.load_balancing.selection_policy.weights) || null
+        };
+      }),
       desired: state.specs.map(s => ({
         id: caddyManager.routeId(s.projectId),
         kind: s.kind,
@@ -1174,10 +1302,89 @@ class IngressManager {
       drift,
       inSync: detection.available && !routesError && drift.missing.length === 0 && drift.unexpected.length === 0 && drift.modified.length === 0,
       lastReconcile: this.lastReconcile,
+      lastTlsAudit: this.lastTlsAudit,
       tlsProbed: Boolean(probe),
       tls: tlsProbes,
       checkedAt: new Date().toISOString()
     };
+  }
+
+  /**
+   * Watchdog automático de caducidad TLS (<14 días o caducado):
+   * audita certificados PEM en disco (Origin CA / corporativos) y dominios activos en vivo,
+   * enviando alertas deduplicadas 1 vez/día vía notificationService.
+   */
+  async checkCertificateExpiry({ warnDays = 14, probeLive = true } = {}) {
+    const sslManager = getSslManager();
+    const now = Date.now();
+    const DAY_MS = 24 * 3600 * 1000;
+    /** @type {Array<{ hostname: string, source: string, daysRemaining: number | null, expiresAt: string | null, issuer: string | null }>} */
+    const expired = [];
+    /** @type {Array<{ hostname: string, source: string, daysRemaining: number | null, expiresAt: string | null, issuer: string | null }>} */
+    const expiring = [];
+
+    // 1. Certificados PEM propios en disco (no se renuevan solos)
+    for (const c of (sslManager.listCertificates() || [])) {
+      if (c.managedBy !== 'on_disk') continue;
+      if (c.isExpired) {
+        expired.push({ hostname: c.domain, source: 'on_disk', daysRemaining: c.daysRemaining ?? 0, expiresAt: c.expiresAt || null, issuer: c.issuer || null });
+      } else if (c.daysRemaining != null && c.daysRemaining <= warnDays) {
+        expiring.push({ hostname: c.domain, source: 'on_disk', daysRemaining: c.daysRemaining, expiresAt: c.expiresAt || null, issuer: c.issuer || null });
+      }
+    }
+
+    // 2. Dominios activos en vivo (lotes de 4 para no saturar el event loop)
+    if (probeLive) {
+      const det = await caddyManager.detect();
+      if (det && det.available) {
+        const targets = Array.from(new Set([
+          ...(domainManager.domains || []).filter((d) => d && d.status !== 'disabled' && !d.isWildcard).map((d) => d.hostname),
+          ...(this.panelDomain ? [this.panelDomain] : [])
+        ])).slice(0, MAX_TLS_PROBES);
+
+        for (let i = 0; i < targets.length; i += 4) {
+          const batch = targets.slice(i, i + 4);
+          const results = await Promise.all(batch.map((h) => this.probeTls(h, { timeoutMs: 3500, fresh: true })));
+          for (const r of results) {
+            if (!r || !r.reachable) continue;
+            if (r.expired) {
+              expired.push({ hostname: r.hostname, source: 'live', daysRemaining: r.daysRemaining ?? 0, expiresAt: r.notAfter || null, issuer: r.issuer || null });
+            } else if (r.daysRemaining != null && r.daysRemaining <= warnDays) {
+              expiring.push({ hostname: r.hostname, source: 'live', daysRemaining: r.daysRemaining, expiresAt: r.notAfter || null, issuer: r.issuer || null });
+            }
+          }
+        }
+      }
+    }
+
+    // Notificar con deduplicación 24h por hostname
+    /** @type {any} */
+    let ns = null;
+    try { ns = require('./notificationService'); } catch (e) {}
+    if (ns && typeof ns.notify === 'function') {
+      for (const item of [...expired, ...expiring]) {
+        const lastAlert = this._tlsAlertSentAt.get(item.hostname) || 0;
+        if (now - lastAlert < DAY_MS) continue;
+        this._tlsAlertSentAt.set(item.hostname, now);
+        const isExp = expired.includes(item);
+        ns.notify({
+          event: 'tls_expiring',
+          level: isExp || (item.daysRemaining != null && item.daysRemaining <= 3) ? 'error' : 'warning',
+          title: isExp ? `Certificado TLS caducado: ${item.hostname}` : `Certificado TLS próximo a caducar: ${item.hostname}`,
+          message: isExp
+            ? `El certificado de ${item.hostname} (${item.source === 'on_disk' ? 'PEM en disco' : 'en vivo'}) ha caducado. Renuévalo desde Dominios.`
+            : `El certificado de ${item.hostname} caduca en ${item.daysRemaining} día(s) (${item.expiresAt ? item.expiresAt.slice(0, 10) : 'próximamente'}).`
+        }).catch(() => {});
+      }
+    }
+
+    this.lastTlsAudit = {
+      checkedAt: new Date(now).toISOString(),
+      warnDays,
+      expired,
+      expiring
+    };
+    return this.lastTlsAudit;
   }
 }
 

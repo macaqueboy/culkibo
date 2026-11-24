@@ -1,8 +1,13 @@
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
 
-const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'cloudflare-config.json');
+const DATA_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
+  : path.resolve(__dirname, '..', '..', 'data');
+const CONFIG_FILE = path.join(DATA_DIR, 'cloudflare-config.json');
+const TMP_DIR = path.join(DATA_DIR, '.tmp');
 const CF_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
 function assertCfId(value, label = 'ID de Cloudflare') {
@@ -119,7 +124,7 @@ class CloudflareService {
           apiToken: token,
           accountId: stored.accountId || process.env.CLOUDFLARE_ACCOUNT_ID || '',
           isConfigured: isReal,
-          useMock: stored.useMock === true ? !isReal : !isReal
+          useMock: !isReal || stored.useMock === true
         };
       }
     } catch (e) {
@@ -286,7 +291,12 @@ class CloudflareService {
         totalPages = Number(data.result_info?.total_pages) || 1;
         page++;
       }
-      return { success: true, zones: allZones, count: allZones.length, isMock: false };
+      // Autodetección sin fricción de Account ID desde la primera zona activa si todavía está vacío
+      if (!this.config.accountId && allZones[0]?.account?.id && CF_ID_RE.test(String(allZones[0].account.id))) {
+        this.config.accountId = String(allZones[0].account.id);
+        try { atomicWriteJsonSync(CONFIG_FILE, this.config, 0o600); } catch (e) {}
+      }
+      return { success: true, zones: allZones, count: allZones.length, isMock: false, accountId: this.config.accountId || '' };
     } catch (err) {
       return { success: false, error: err.message, zones: [] };
     }
@@ -503,7 +513,7 @@ class CloudflareService {
     }
 
     try {
-      const accountId = this.config.accountId;
+      const accountId = await this.ensureAccountId();
       if (!accountId) {
         return { success: false, error: 'Cloudflare Account ID required to list tunnels', tunnels: [] };
       }
@@ -545,7 +555,7 @@ class CloudflareService {
     }
 
     try {
-      const accountId = this.config.accountId;
+      const accountId = await this.ensureAccountId();
       if (!accountId) throw new Error('Cloudflare Account ID required');
       const safeAccount = assertCfId(accountId, 'Account ID');
       const res = await fetch(`${this.apiBase}/accounts/${safeAccount}/cfd_tunnel`, {
@@ -563,11 +573,238 @@ class CloudflareService {
       /** @type {any} */
       const data = await res.json();
       if (data.success) {
-        return { success: true, tunnel: data.result, isMock: false };
+        return { success: true, tunnel: data.result, token: data.result?.token || null, isMock: false };
       }
       return { success: false, errors: data.errors };
     } catch (err) {
       return { success: false, error: err.message };
+    }
+  }
+
+  /** Garantiza un `accountId` real consultando `/zones` o `/accounts` cuando aún no se guardó. */
+  async ensureAccountId() {
+    if (this.config.accountId) return this.config.accountId;
+    if (this.config.useMock || !this.config.apiToken || this.isSimulatedToken(this.config.apiToken)) {
+      return 'mock_account_id';
+    }
+    const zonesRes = await this.listZones();
+    if (this.config.accountId) return this.config.accountId;
+    if (zonesRes.zones && zonesRes.zones[0]?.account?.id) {
+      this.config.accountId = String(zonesRes.zones[0].account.id);
+      try { atomicWriteJsonSync(CONFIG_FILE, this.config, 0o600); } catch (e) {}
+      return this.config.accountId;
+    }
+    try {
+      const res = await fetch(`${this.apiBase}/accounts?per_page=5`, {
+        signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${this.config.apiToken}`, 'Content-Type': 'application/json' }
+      });
+      /** @type {any} */
+      const data = await res.json();
+      if (data.success && Array.isArray(data.result) && data.result[0]?.id) {
+        this.config.accountId = String(data.result[0].id);
+        try { atomicWriteJsonSync(CONFIG_FILE, this.config, 0o600); } catch (e) {}
+        return this.config.accountId;
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  /** Obtiene el token de conector `cloudflared` para un túnel existente. */
+  async getTunnelToken(tunnelId) {
+    if (this.config.useMock || !this.config.apiToken || this.isSimulatedToken(this.config.apiToken)) {
+      return { success: true, tunnelId, token: 'eyJhIjoiY2YtYWNjb3VudC1kZW1vLXNpbXVsYXRlZCJ9...', isMock: true };
+    }
+    try {
+      const accountId = await this.ensureAccountId();
+      if (!accountId) throw new Error('Cloudflare Account ID requerido');
+      const safeAcc = assertCfId(accountId, 'Account ID');
+      const safeTun = assertCfId(tunnelId, 'Tunnel ID');
+      const res = await fetch(`${this.apiBase}/accounts/${safeAcc}/cfd_tunnel/${safeTun}/token`, {
+        signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${this.config.apiToken}`, 'Content-Type': 'application/json' }
+      });
+      /** @type {any} */
+      const data = await res.json();
+      if (data.success) return { success: true, tunnelId, token: String(data.result || ''), isMock: false };
+      return { success: false, errors: data.errors };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  /** Lee la configuración remota de ingress del túnel. */
+  async getTunnelConfig(tunnelId) {
+    if (this.config.useMock || !this.config.apiToken || this.isSimulatedToken(this.config.apiToken)) {
+      const t = this.mockTunnels.find((x) => x.id === tunnelId);
+      const ingress = [...((t && t.routes) || []), { service: 'http_status:404' }];
+      return { success: true, config: { ingress }, isMock: true };
+    }
+    try {
+      const accountId = await this.ensureAccountId();
+      if (!accountId) throw new Error('Cloudflare Account ID requerido');
+      const safeAcc = assertCfId(accountId, 'Account ID');
+      const safeTun = assertCfId(tunnelId, 'Tunnel ID');
+      const res = await fetch(`${this.apiBase}/accounts/${safeAcc}/cfd_tunnel/${safeTun}/configurations`, {
+        signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${this.config.apiToken}`, 'Content-Type': 'application/json' }
+      });
+      /** @type {any} */
+      const data = await res.json();
+      if (data.success) return { success: true, config: data.result?.config || { ingress: [] }, isMock: false };
+      return { success: false, errors: data.errors };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  /** Actualiza las reglas de ingress remotas del túnel garantizando el fallback `http_status:404`. */
+  async updateTunnelIngress(tunnelId, ingressRules) {
+    const cleanRules = (Array.isArray(ingressRules) ? ingressRules : [])
+      .filter((r) => r && typeof r === 'object' && r.service && r.hostname);
+    const finalIngress = [...cleanRules, { service: 'http_status:404' }];
+
+    if (this.config.useMock || !this.config.apiToken || this.isSimulatedToken(this.config.apiToken)) {
+      const t = this.mockTunnels.find((x) => x.id === tunnelId);
+      if (t) t.routes = cleanRules;
+      return { success: true, ingress: finalIngress, isMock: true };
+    }
+    try {
+      const accountId = await this.ensureAccountId();
+      if (!accountId) throw new Error('Cloudflare Account ID requerido');
+      const safeAcc = assertCfId(accountId, 'Account ID');
+      const safeTun = assertCfId(tunnelId, 'Tunnel ID');
+      const res = await fetch(`${this.apiBase}/accounts/${safeAcc}/cfd_tunnel/${safeTun}/configurations`, {
+        method: 'PUT',
+        signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${this.config.apiToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: { ingress: finalIngress } })
+      });
+      /** @type {any} */
+      const data = await res.json();
+      if (data.success) return { success: true, ingress: finalIngress, isMock: false };
+      return { success: false, errors: data.errors };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  /** Flujo atómico 1 clic: conecta un hostname al túnel (CNAME proxied + regla de ingress remota). */
+  async routeHostnameToTunnel({ tunnelId, zoneId = null, hostname, serviceUrl }) {
+    const cleanHost = String(hostname || '').trim().toLowerCase();
+    const cleanService = String(serviceUrl || '').trim();
+    if (!cleanHost || !/^[a-z0-9.-]+\.[a-z0-9-]{2,}$/.test(cleanHost)) {
+      throw new Error(`Hostname inválido para túnel: ${hostname}`);
+    }
+    if (!/^https?:\/\/[a-zA-Z0-9._:-]+$/.test(cleanService)) {
+      throw new Error(`Destino serviceUrl inválido: ${serviceUrl}`);
+    }
+
+    const currentCfg = await this.getTunnelConfig(tunnelId);
+    const existing = Array.isArray(currentCfg.config?.ingress) ? currentCfg.config.ingress : [];
+    const nextRules = [
+      ...existing.filter((r) => r && r.hostname && String(r.hostname).toLowerCase() !== cleanHost),
+      { hostname: cleanHost, service: cleanService }
+    ];
+    const ingRes = await this.updateTunnelIngress(tunnelId, nextRules);
+    if (!ingRes.success) return { ...ingRes, success: false, step: 'ingress' };
+
+    const resolvedZoneId = zoneId || await this.findZoneForDomain(cleanHost);
+    /** @type {any} */
+    let dnsRes = { success: false, skipped: true };
+    if (resolvedZoneId) {
+      dnsRes = await this.upsertDnsRecord(resolvedZoneId, {
+        type: 'CNAME',
+        name: cleanHost,
+        content: `${tunnelId}.cfargotunnel.com`,
+        proxied: true,
+        ttl: 1,
+        comment: `Túnel Cloudflare gestionado por Culkibo (${tunnelId})`
+      });
+    }
+    return {
+      success: true,
+      hostname: cleanHost,
+      serviceUrl: cleanService,
+      tunnelId,
+      ingress: ingRes.ingress,
+      dns: dnsRes,
+      isMock: Boolean(ingRes.isMock)
+    };
+  }
+
+  async deleteTunnel(tunnelId) {
+    if (this.config.useMock || !this.config.apiToken || this.isSimulatedToken(this.config.apiToken)) {
+      this.mockTunnels = this.mockTunnels.filter((t) => t.id !== tunnelId);
+      return { success: true, deletedId: tunnelId, isMock: true };
+    }
+    try {
+      const accountId = await this.ensureAccountId();
+      if (!accountId) throw new Error('Cloudflare Account ID requerido');
+      const safeAcc = assertCfId(accountId, 'Account ID');
+      const safeTun = assertCfId(tunnelId, 'Tunnel ID');
+      const res = await fetch(`${this.apiBase}/accounts/${safeAcc}/cfd_tunnel/${safeTun}`, {
+        method: 'DELETE',
+        signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${this.config.apiToken}`, 'Content-Type': 'application/json' }
+      });
+      /** @type {any} */
+      const data = await res.json();
+      if (data.success) return { success: true, deletedId: tunnelId, isMock: false };
+      return { success: false, errors: data.errors };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  /**
+   * Arranca el conector oficial `cloudflared` en Docker pasando el token por --env-file 0600 (nunca en argv).
+   * @param {{ tunnelToken?: string, containerName?: string }} [opts]
+   */
+  async startCloudflaredDocker({ tunnelToken = '', containerName = 'culkibo-cloudflared' } = {}) {
+    const cleanToken = String(tunnelToken || '').trim();
+    if (!cleanToken || /[\r\n\0\s]/.test(cleanToken)) {
+      throw new Error('Token de túnel Cloudflare inválido');
+    }
+    const cleanName = String(containerName || 'culkibo-cloudflared').trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(cleanName)) {
+      throw new Error(`Nombre de contenedor inválido: ${cleanName}`);
+    }
+
+    fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
+    const envFile = path.join(TMP_DIR, `cf-tunnel-${Date.now()}.env`);
+    fs.writeFileSync(envFile, `TUNNEL_TOKEN=${cleanToken}\n`, { mode: 0o600 });
+
+    const runDocker = (args) => new Promise((resolve) => {
+      const child = spawn('docker', args, { shell: false, windowsHide: true });
+      let err = '';
+      child.stderr.on('data', (d) => { err += d.toString(); });
+      child.on('error', (e) => resolve({ code: -1, stderr: e.message }));
+      child.on('close', (code) => resolve({ code: code ?? -1, stderr: err.trim() }));
+    });
+
+    try {
+      await runDocker(['rm', '-f', cleanName]);
+      const args = [
+        'run', '-d',
+        '--name', cleanName,
+        '--restart', 'unless-stopped',
+        '--label', 'culkibo.managed=true',
+        '--env-file', envFile
+      ];
+      if (process.platform === 'linux') {
+        args.push('--network', 'host');
+      } else {
+        args.push('--add-host', 'host.docker.internal:host-gateway');
+      }
+      args.push('cloudflare/cloudflared:latest', 'tunnel', '--no-autoupdate', 'run');
+      const res = await runDocker(args);
+      if (res.code !== 0) {
+        return { started: false, error: res.stderr || `docker run falló (código ${res.code})` };
+      }
+      return { started: true, containerName: cleanName };
+    } finally {
+      try { fs.unlinkSync(envFile); } catch (e) {}
     }
   }
 }

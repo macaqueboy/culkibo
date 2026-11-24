@@ -24,7 +24,7 @@ import { CreateProjectModal } from './CreateProjectModal';
 import { OnboardingChecklist } from './OnboardingChecklist';
 
 interface ProjectListProps {
-  onSelectProject: (id: string) => void;
+  onSelectProject: (id: string, tab?: string | null) => void;
   onImportCoolify: () => void;
   onOpenWordPress?: () => void;
   onOpenCatalog?: () => void;
@@ -35,6 +35,60 @@ interface ProjectListProps {
   onRefreshProjects?: () => void;
   onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void;
   externalCreateTrigger?: number;
+  checklistRestoreTick?: number;
+}
+
+function isProjectActuallyActive(p: Project): boolean {
+  return Boolean(!p.maintenanceMode && ((p.lastDeployedAt && p.status === 'active') || p.localRunning));
+}
+
+function getHonestStatus(p: Project): {
+  label: string;
+  pillClass: string;
+  dotClass: string;
+  isMaintenance?: boolean;
+} {
+  if (p.maintenanceMode) {
+    return {
+      label: 'Mantenimiento',
+      pillClass: 'bg-amber-50 text-amber-800 border-amber-200',
+      dotClass: 'bg-amber-500',
+      isMaintenance: true,
+    };
+  }
+  if (p.lastDeployedAt && p.status === 'active') {
+    return {
+      label: 'En producción',
+      pillClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      dotClass: 'bg-emerald-500',
+    };
+  }
+  if (p.localRunning) {
+    return {
+      label: p.localPort ? `En local :${p.localPort}` : 'En local',
+      pillClass: 'bg-amber-50 text-amber-800 border-amber-200',
+      dotClass: 'bg-amber-500',
+    };
+  }
+  if (p.status === 'hibernated') {
+    return {
+      label: 'Hibernado',
+      pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
+      dotClass: 'bg-slate-400',
+    };
+  }
+  if (p.status === 'stopped') {
+    return {
+      label: 'Detenido',
+      pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
+      dotClass: 'bg-slate-400',
+    };
+  }
+  return {
+    label: 'Sin iniciar',
+    pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
+    dotClass: 'bg-slate-400',
+  };
 }
 
 interface ProjectMetadata {
@@ -92,6 +146,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   onRefreshProjects,
   onNotify,
   externalCreateTrigger,
+  checklistRestoreTick = 0,
 }) => {
   const [localProjects, setLocalProjects] = useState<Project[]>(() => (Array.isArray(parentProjects) ? parentProjects : []));
   const [loading, setLoading] = useState<boolean>(() => !Array.isArray(parentProjects));
@@ -213,7 +268,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
 
   const stats = useMemo(() => {
     const total = projects.length;
-    const active = projects.filter((p) => p.status === 'active').length;
+    const active = projects.filter(isProjectActuallyActive).length;
     const inactive = total - active;
     const local = projects.filter((p) => p.localRunning).length;
     const totalDomains = projects.reduce((acc, p) => acc + (p.domains?.length || 0), 0);
@@ -224,8 +279,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
     const q = deferredSearch.trim().toLowerCase();
     return projects
       .filter((p) => {
-        if (filter === 'active' && p.status !== 'active') return false;
-        if (filter === 'hibernated' && p.status === 'active') return false;
+        if (filter === 'active' && !isProjectActuallyActive(p)) return false;
+        if (filter === 'hibernated' && isProjectActuallyActive(p)) return false;
         if (filter === 'local' && !p.localRunning) return false;
 
         if (q) {
@@ -242,8 +297,10 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         if (sortBy === 'name') return a.name.localeCompare(b.name);
         if (sortBy === 'domains') return (b.domains?.length || 0) - (a.domains?.length || 0);
         if (sortBy === 'status') {
-          if (a.status === b.status) return 0;
-          return a.status === 'active' ? -1 : 1;
+          const aAct = isProjectActuallyActive(a);
+          const bAct = isProjectActuallyActive(b);
+          if (aAct === bAct) return 0;
+          return aAct ? -1 : 1;
         }
         return new Date(b.updatedAt || b.createdAt || 0).getTime() - new Date(a.updatedAt || a.createdAt || 0).getTime();
       });
@@ -299,6 +356,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         onOpenDomains={onOpenDomains || (() => {})}
         onOpenAi={onOpenAi || (() => {})}
         onNotify={onNotify}
+        restoreTick={checklistRestoreTick}
       />
 
       {/* Barra de búsqueda y filtros directa sobre el lienzo (solo cuando hay proyectos) */}
@@ -405,7 +463,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
           {filtered.map((p) => {
             const meta = metadataMap.get(p.id) || getProjectMetadata(p);
             const isStartingThisLocal = startingLocalId === p.id;
-            const inMaintenance = Boolean(p.maintenanceMode);
+            const statusMeta = getHonestStatus(p);
 
             return (
               <article
@@ -436,32 +494,28 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                               <GitBranch className="w-3 h-3 text-slate-400 shrink-0" />
                               <span className="truncate max-w-[170px]" title={meta.cleanGit}>{meta.cleanGit}</span>
                             </>
+                          ) : p.localPath ? (
+                            <span className="truncate max-w-[170px]" title={p.localPath}>{p.localPath}</span>
                           ) : (
-                            <span className="font-sans text-slate-400">Proyecto local / manual</span>
+                            <span className="font-sans text-slate-400">Carpeta local / sin Git</span>
                           )}
                         </span>
                       </span>
                     </button>
 
                     <span
-                      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border shrink-0 ${
-                        inMaintenance
-                          ? 'bg-amber-50 text-amber-800 border-amber-200'
-                          : p.status === 'active'
-                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                            : 'bg-slate-100 text-slate-600 border-slate-200'
-                      }`}
+                      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border shrink-0 tabular-nums ${statusMeta.pillClass}`}
                     >
-                      {inMaintenance ? (
+                      {statusMeta.isMaintenance ? (
                         <PauseCircle className="w-3 h-3 text-amber-600" />
                       ) : (
-                        <span className={`w-1.5 h-1.5 rounded-full ${p.status === 'active' ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                        <span className={`w-1.5 h-1.5 rounded-full ${statusMeta.dotClass}`} />
                       )}
-                      {inMaintenance ? 'Mantenimiento' : p.status === 'active' ? 'Activo' : 'Detenido'}
+                      {statusMeta.label}
                     </span>
                   </div>
 
-                  {/* Señal 2: Dominio o puerto local */}
+                  {/* Señal 2: Dominio conectado */}
                   <div className="min-h-[26px] flex items-center justify-between gap-2">
                     {p.domains && p.domains.length > 0 ? (
                       <div className="flex items-center gap-1.5 min-w-0">
@@ -482,21 +536,10 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                           </span>
                         )}
                       </div>
-                    ) : p.localRunning && p.localPort ? (
-                      <a
-                        href={`http://${previewHost}:${p.localPort}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-mono text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 tabular-nums"
-                      >
-                        <Zap className="w-3 h-3 text-amber-600" />
-                        <span>localhost:{p.localPort}</span>
-                        <ExternalLink className="w-2.5 h-2.5 opacity-60" />
-                      </a>
                     ) : (
                       <span className="inline-flex items-center gap-1.5 text-xs text-slate-400">
                         <Globe className="w-3.5 h-3.5 text-slate-300" />
-                        Sin dominio conectado
+                        {p.localRunning ? 'Solo vista previa local' : 'Sin dominio conectado'}
                       </span>
                     )}
                   </div>
@@ -606,15 +649,15 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         </div>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap">
-                        <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium border ${
-                          p.maintenanceMode
-                            ? 'bg-amber-50 text-amber-800 border-amber-200'
-                            : p.status === 'active'
-                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                              : 'bg-slate-100 text-slate-600 border-slate-200'
-                        }`}>
-                          {p.maintenanceMode ? 'Mantenimiento' : p.status === 'active' ? 'Activo' : 'Detenido'}
-                        </span>
+                        {(() => {
+                          const s = getHonestStatus(p);
+                          return (
+                            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium border tabular-nums ${s.pillClass}`}>
+                              <span className={`w-1.5 h-1.5 rounded-full ${s.dotClass}`} />
+                              {s.label}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap text-xs text-slate-600 tabular-nums">
                         {meta.summaryTag}
@@ -645,7 +688,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       ) : null}
 
       {/* Estado vacío calmado y enfocado */}
-      {!loading && filtered.length === 0 && (
+      {!isLoading && filtered.length === 0 && (
         <div className="bg-white border border-slate-200 rounded-xl p-10 text-center max-w-xl mx-auto">
           {projects.length === 0 ? (
             <div className="space-y-4">
@@ -711,9 +754,10 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       <CreateProjectModal
         isOpen={showCreateModal}
         onClose={() => setShowCreateModal(false)}
-        onSuccess={(createdId) => {
+        onNotify={onNotify}
+        onSuccess={(createdId, initialTab) => {
           fetchProjects();
-          if (createdId) onSelectProject(createdId);
+          if (createdId) onSelectProject(createdId, initialTab || null);
         }}
       />
     </div>

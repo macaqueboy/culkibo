@@ -1,10 +1,11 @@
 # Imagen oficial de Caddy compilada con el proveedor DNS-01 de Cloudflare
-# para emitir múltiples certificados Wildcard (*.dominio.com) automáticamente.
+# (múltiples Wildcard *.dominio.com) y limitador de tasa por dominio (caddy-ratelimit).
 # Uso: docker build -f Dockerfile.caddy -t culkibo-caddy:cloudflare .
 FROM caddy:2.11-builder-alpine AS builder
 
 RUN xcaddy build \
-  --with github.com/caddy-dns/cloudflare
+  --with github.com/caddy-dns/cloudflare \
+  --with github.com/mholt/caddy-ratelimit
 
 FROM caddy:2.11-alpine
 

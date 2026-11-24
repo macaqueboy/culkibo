@@ -14,6 +14,7 @@ import {
   Search,
   Zap,
   Check,
+  Terminal,
 } from 'lucide-react';
 import { CulkiboLogo } from './CulkiboLogo';
 
@@ -92,6 +93,11 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'catalog', label: 'Catálogo', icon: Package },
     { id: 'import', label: 'Importar', icon: Download },
     { id: 'ai', label: 'Agentes IA', icon: Bot },
+  ];
+
+  const mobileNavItems: Array<{ id: AppView; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+    ...navItems,
+    { id: 'global_logs', label: 'Registros', icon: Terminal },
   ];
 
   const triggerAction = (action: 'new_project' | 'wordpress' | 'import' | 'domain') => {
@@ -176,6 +182,7 @@ export const Header: React.FC<HeaderProps> = ({
                 <button
                   key={item.id}
                   type="button"
+                  aria-current={isActive ? 'page' : undefined}
                   onClick={() => setActiveView(item.id)}
                   className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[13px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
                     isActive
@@ -210,13 +217,14 @@ export const Header: React.FC<HeaderProps> = ({
 
             <button
               type="button"
-              onClick={() => setActiveView(aiPulseLabel ? 'ai' : 'global_logs')}
+              onClick={() => setActiveView('global_logs')}
+              aria-current={activeView === 'global_logs' && !activeProjectId ? 'page' : undefined}
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer ${
                 activeView === 'global_logs' && !activeProjectId
                   ? 'bg-slate-100 border-slate-300 text-slate-900'
                   : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700'
               }`}
-              title={aiPulseLabel ? `Última acción IA: ${aiPulseLabel}` : wsConnected ? 'En línea · abrir registros en vivo' : 'Reconectando con el servidor'}
+              title={wsConnected ? 'Conexión en tiempo real activa · abrir registros' : 'Reconectando con el servidor…'}
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${wsConnected ? 'bg-emerald-500' : 'bg-red-500'}`} />
               {activeSyncCount > 0 ? (
@@ -224,8 +232,6 @@ export const Header: React.FC<HeaderProps> = ({
                   <Zap className="w-3 h-3 text-amber-500" />
                   En vivo ({activeSyncCount})
                 </span>
-              ) : aiPulseLabel ? (
-                <span className="hidden sm:inline text-slate-900 font-semibold max-w-[100px] truncate">IA activa</span>
               ) : (
                 <span className="hidden sm:inline">{wsConnected ? 'Registros' : 'Reconectando…'}</span>
               )}
@@ -234,6 +240,7 @@ export const Header: React.FC<HeaderProps> = ({
             <button
               type="button"
               onClick={() => setActiveView('settings')}
+              aria-current={activeView === 'settings' && !activeProjectId ? 'page' : undefined}
               aria-label="Ajustes del servidor"
               title="Ajustes del servidor"
               className={`p-2 rounded-lg transition-colors cursor-pointer ${
@@ -321,15 +328,16 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Navegación móvil/tablet */}
         <nav aria-label="Navegación móvil" className="flex lg:hidden overflow-x-auto no-scrollbar py-2 gap-1 border-t border-slate-100">
-          {navItems.map((item) => {
+          {mobileNavItems.map((item) => {
             const Icon = item.icon;
             const isActive = activeView === item.id && !activeProjectId;
             return (
               <button
                 key={item.id}
                 type="button"
+                aria-current={isActive ? 'page' : undefined}
                 onClick={() => setActiveView(item.id)}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
                   isActive
                     ? 'bg-slate-100 text-slate-900'
                     : 'text-slate-600 hover:bg-slate-50'

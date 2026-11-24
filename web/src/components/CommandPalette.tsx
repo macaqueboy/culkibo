@@ -3,19 +3,25 @@ import {
   Activity,
   Bot,
   Boxes,
+  Database,
   FolderKanban,
   Globe,
+  HardDrive,
+  Keyboard,
+  ListChecks,
   Plus,
+  Rocket,
   Search,
   Settings,
   Terminal,
   Upload,
+  Zap,
 } from 'lucide-react';
 import type { Project } from '../lib/api';
 
 export interface CommandItem {
   id: string;
-  group: 'Proyectos' | 'Navegación' | 'Acciones rápidas';
+  group: 'Proyecto actual' | 'Acciones rápidas' | 'Proyectos' | 'Navegación';
   label: string;
   hint?: string;
   keywords?: string;
@@ -27,22 +33,28 @@ interface CommandPaletteProps {
   open: boolean;
   onClose: () => void;
   projects: Project[];
-  onNavigate: (view: string) => void;
-  onSelectProject: (id: string) => void;
+  activeProjectId?: string | null;
+  onNavigate: (view: string, subTab?: string | null) => void;
+  onSelectProject: (id: string, tab?: string | null) => void;
   onQuickCreateProject: () => void;
   onQuickConnectDomain: () => void;
   onQuickImport: (source?: 'wordpress' | 'compose' | 'git' | 'platform' | 'coolify') => void;
+  onOpenShortcuts?: () => void;
+  onRestoreChecklist?: () => void;
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
   open,
   onClose,
   projects,
+  activeProjectId,
   onNavigate,
   onSelectProject,
   onQuickCreateProject,
   onQuickConnectDomain,
   onQuickImport,
+  onOpenShortcuts,
+  onRestoreChecklist,
 }) => {
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
@@ -155,13 +167,64 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       },
     ];
 
+    const currentProj = activeProjectId ? projects.find((p) => p.id === activeProjectId) : null;
+    const contextItems: CommandItem[] = currentProj
+      ? [
+          {
+            id: 'ctx-deploy',
+            group: 'Proyecto actual',
+            label: `${currentProj.name} · Despliegues, Cron y Previews`,
+            hint: 'Producción, logs y rollback',
+            keywords: 'deploy despliegue cron preview logs rollback contenedor',
+            icon: <Rocket className="w-4 h-4 text-slate-600" />,
+            onSelect: () => onSelectProject(currentProj.id, 'deploy'),
+          },
+          {
+            id: 'ctx-live',
+            group: 'Proyecto actual',
+            label: `${currentProj.name} · En vivo (Live Sync)`,
+            hint: 'Sincronización y diffs en tiempo real',
+            keywords: 'live sync forge merkle carpeta local',
+            icon: <Zap className="w-4 h-4 text-slate-600" />,
+            onSelect: () => onSelectProject(currentProj.id, 'live'),
+          },
+          {
+            id: 'ctx-domains',
+            group: 'Proyecto actual',
+            label: `${currentProj.name} · Dominios HTTPS`,
+            hint: 'Rutas Caddy y TLS',
+            keywords: 'dominios ssl https url',
+            icon: <Globe className="w-4 h-4 text-slate-600" />,
+            onSelect: () => onSelectProject(currentProj.id, 'domains'),
+          },
+          {
+            id: 'ctx-databases',
+            group: 'Proyecto actual',
+            label: `${currentProj.name} · Bases de datos y copias`,
+            hint: 'PostgreSQL, MySQL, Redis, MongoDB',
+            keywords: 'base de datos db postgres mysql redis mongo backup',
+            icon: <Database className="w-4 h-4 text-slate-600" />,
+            onSelect: () => onSelectProject(currentProj.id, 'databases'),
+          },
+          {
+            id: 'ctx-settings',
+            group: 'Proyecto actual',
+            label: `${currentProj.name} · Configuración y Webhooks`,
+            hint: 'GitHub, GitLab, Gitea, Bitbucket, Deploy Hook',
+            keywords: 'configuracion webhook git hooks predeploy',
+            icon: <Settings className="w-4 h-4 text-slate-600" />,
+            onSelect: () => onSelectProject(currentProj.id, 'settings'),
+          },
+        ]
+      : [];
+
     const quickItems: CommandItem[] = [
       {
         id: 'act-new-project',
         group: 'Acciones rápidas',
         label: 'Crear nuevo proyecto',
-        hint: 'Desde GitHub, URL Git o vacío',
-        keywords: 'crear nuevo proyecto app',
+        hint: 'Desde GitHub, URL Git o carpeta local',
+        keywords: 'crear nuevo proyecto app carpeta local',
         icon: <Plus className="w-4 h-4 text-slate-500" />,
         onSelect: onQuickCreateProject,
       },
@@ -169,10 +232,19 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         id: 'act-connect-domain',
         group: 'Acciones rápidas',
         label: 'Conectar un dominio HTTPS',
-        hint: 'Asistente paso a paso',
-        keywords: 'conectar dominio ssl wildcard',
+        hint: 'Asistente paso a paso (Proxy, DNS, Wildcard o Túnel)',
+        keywords: 'conectar dominio ssl wildcard tunel cloudflare',
         icon: <Globe className="w-4 h-4 text-slate-500" />,
         onSelect: onQuickConnectDomain,
+      },
+      {
+        id: 'act-backups-dr',
+        group: 'Acciones rápidas',
+        label: 'Backups, S3 y recuperación (DR)',
+        hint: 'Snapshot completo cifrado y bucket remoto',
+        keywords: 'backup snapshot dr recuperacion s3 r2 restaurar',
+        icon: <HardDrive className="w-4 h-4 text-slate-500" />,
+        onSelect: () => onNavigate('settings', 'backups'),
       },
       {
         id: 'act-wp',
@@ -192,10 +264,36 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         icon: <Upload className="w-4 h-4 text-slate-500" />,
         onSelect: () => onQuickImport('compose'),
       },
+      ...(onOpenShortcuts
+        ? [
+            {
+              id: 'act-shortcuts',
+              group: 'Acciones rápidas' as const,
+              label: 'Ver atajos de teclado (?)',
+              hint: 'Navegación rápida sin ratón',
+              keywords: 'atajos teclado ayuda shortcuts ?',
+              icon: <Keyboard className="w-4 h-4 text-slate-500" />,
+              onSelect: onOpenShortcuts,
+            },
+          ]
+        : []),
+      ...(onRestoreChecklist
+        ? [
+            {
+              id: 'act-restore-checklist',
+              group: 'Acciones rápidas' as const,
+              label: 'Restaurar guía de primeros pasos',
+              hint: 'Volver a mostrar la lista inicial en Proyectos',
+              keywords: 'primeros pasos checklist guia tutorial ayuda',
+              icon: <ListChecks className="w-4 h-4 text-slate-500" />,
+              onSelect: onRestoreChecklist,
+            },
+          ]
+        : []),
     ];
 
-    return [...quickItems, ...projectItems, ...navItems];
-  }, [projects, onNavigate, onSelectProject, onQuickCreateProject, onQuickConnectDomain, onQuickImport]);
+    return [...contextItems, ...quickItems, ...projectItems, ...navItems];
+  }, [projects, activeProjectId, onNavigate, onSelectProject, onQuickCreateProject, onQuickConnectDomain, onQuickImport, onOpenShortcuts, onRestoreChecklist]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -230,7 +328,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onClose();
   };
 
-  const groups: Array<CommandItem['group']> = ['Acciones rápidas', 'Proyectos', 'Navegación'];
+  const groups: Array<CommandItem['group']> = ['Proyecto actual', 'Acciones rápidas', 'Proyectos', 'Navegación'];
 
   return (
     <div

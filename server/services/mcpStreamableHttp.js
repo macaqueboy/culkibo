@@ -286,7 +286,11 @@ async function _handlePostInner(req, res) {
 
 async function respondJson(res, body) {
   try {
-    const envelope = await mcpServer.handleModernRpc(body, { transport: `Streamable HTTP ${PROTOCOL_VERSION}` });
+    const clientInfo = body?.params?._meta?.['io.modelcontextprotocol/clientInfo'] || null;
+    const envelope = await mcpServer.handleModernRpc(body, {
+      transport: `Streamable HTTP ${PROTOCOL_VERSION}`,
+      clientInfo
+    });
     res.status(200).json(envelope);
   } catch (err) {
     res.status(500).json(jsonRpcError(body.id, ERROR_CODES.INTERNAL_ERROR,
@@ -320,8 +324,12 @@ async function respondStreaming(req, res, body) {
   // del POST se ha leído entero, que es siempre y de inmediato, así que
   // escucharlo ahí cancelaba todas las peticiones antes de empezar. `res`
   // también emite 'close' al terminar bien, de ahí el `writableEnded`.
+  const ac = new AbortController();
   res.on('close', () => {
-    if (!res.writableEnded) cancelled = true;
+    if (!res.writableEnded) {
+      cancelled = true;
+      try { ac.abort(); } catch (e) {}
+    }
     stopTimers();
   });
 
@@ -334,25 +342,24 @@ async function respondStreaming(req, res, body) {
   timers.push(kaTimer);
 
   const progressToken = body.params && body.params._meta ? body.params._meta.progressToken : undefined;
+  const startedAt = Date.now();
+  let lastProgress = 0;
+  const emitProgress = (message) => {
+    if (progressToken === undefined || !alive()) return;
+    const elapsed = Math.max(lastProgress + 1, Math.round((Date.now() - startedAt) / 1000));
+    lastProgress = elapsed;
+    writeSseMessage(res, {
+      jsonrpc: '2.0',
+      method: 'notifications/progress',
+      params: { progressToken, progress: elapsed, message }
+    });
+  };
+
   if (progressToken !== undefined) {
-    const startedAt = Date.now();
-    let lastProgress = 0;
     const progTimer = setInterval(() => {
       if (!alive()) return;
-      // `progress` cuenta segundos transcurridos y `total` se omite a
-      // propósito: no sabemos cuánto tarda una emisión ACME ni un despliegue,
-      // y un porcentaje inventado sería peor que no dar ninguno.
       const elapsed = Math.max(lastProgress + 1, Math.round((Date.now() - startedAt) / 1000));
-      lastProgress = elapsed;
-      writeSseMessage(res, {
-        jsonrpc: '2.0',
-        method: 'notifications/progress',
-        params: {
-          progressToken,
-          progress: elapsed,
-          message: `Culkibo sigue ejecutando '${body.params && body.params.name ? body.params.name : body.method}' (${elapsed} s).`
-        }
-      });
+      emitProgress(`Culkibo sigue ejecutando '${body.params && body.params.name ? body.params.name : body.method}' (${elapsed} s).`);
     }, PROGRESS_INTERVAL_MS);
     if (progTimer.unref) progTimer.unref();
     timers.push(progTimer);
@@ -360,9 +367,13 @@ async function respondStreaming(req, res, body) {
 
   let envelope;
   try {
+    const clientInfo = body?.params?._meta?.['io.modelcontextprotocol/clientInfo'] || null;
     envelope = await mcpServer.handleModernRpc(body, {
       transport: `Streamable HTTP ${PROTOCOL_VERSION} (SSE)`,
-      isCancelled: () => cancelled
+      clientInfo,
+      isCancelled: () => cancelled,
+      signal: ac.signal,
+      onProgress: emitProgress
     });
   } catch (err) {
     envelope = jsonRpcError(body.id, ERROR_CODES.INTERNAL_ERROR,

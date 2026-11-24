@@ -407,7 +407,7 @@ class CaddyManager {
           pushWildcardPolicy({
             rootDomain: root,
             tokenEnv: cloudflareDnsTokenEnv,
-            includeApex: cleanSet.has(root) || true
+            includeApex: cleanSet.has(root)
           });
         }
       }
@@ -522,6 +522,7 @@ class CaddyManager {
         source: 'static',
         ranges: CLOUDFLARE_CIDRS
       },
+      client_ip_headers: ['CF-Connecting-IP', 'X-Forwarded-For'],
       ...(automaticHttps
         ? { protocols: ['h1', 'h2', 'h3'] }
         : { automatic_https: { disable: true } })
@@ -591,11 +592,28 @@ class CaddyManager {
     return 1000 - Math.min(900, maxLen);
   }
 
+  /** Extrae el handler `reverse_proxy` de una ruta (aunque tenga auth, request_body o subroute IP allowlist). */
+  extractProxyHandler(route) {
+    if (!route || !Array.isArray(route.handle)) return null;
+    for (const h of route.handle) {
+      if (!h) continue;
+      if (h.handler === 'reverse_proxy') return h;
+      if (h.handler === 'subroute' && Array.isArray(h.routes)) {
+        for (const sub of h.routes) {
+          const nested = this.extractProxyHandler(sub);
+          if (nested) return nested;
+        }
+      }
+    }
+    return null;
+  }
+
   /**
    * Construye una ruta de Caddy:
    * - `kind === 'redirect'`: redirección canónica 301/308 (`www` ↔ apex)
    * - `kind === 'maintenance'`: modo mantenimiento atómico 503 sin detener el contenedor
-   * - por defecto: `reverse_proxy` con drenaje de WebSockets, keep-alive, canario opcional y cabeceras
+   * - por defecto: `reverse_proxy` con drenaje de WebSockets, keep-alive, canario opcional,
+   *   cabeceras de seguridad/personalizadas, Basic Auth bcrypt nativo, IP Allowlist y maxBodySize.
    *
    * @param {{
    *   projectId: string,
@@ -606,7 +624,12 @@ class CaddyManager {
    *   redirectTo?: string,
    *   redirectStatus?: number,
    *   securityHeaders?: boolean,
-   *   customHeaders?: { response?: Record<string, string>, request?: Record<string, string> } | null
+   *   framePolicy?: 'DENY' | 'SAMEORIGIN' | 'ALLOW' | null,
+   *   customHeaders?: { response?: Record<string, string>, request?: Record<string, string> } | null,
+   *   basicAuth?: { enabled?: boolean, realm?: string, accounts?: Array<{ username: string, passwordHash: string }> } | null,
+   *   ipAllowlist?: string[] | null,
+   *   maxBodySizeMb?: number | null,
+   *   rateLimit?: { enabled?: boolean, requests?: number, windowSeconds?: number } | null
    * }} spec
    */
   buildRoute(spec) {
@@ -619,7 +642,12 @@ class CaddyManager {
       redirectTo = null,
       redirectStatus = 301,
       securityHeaders = false,
-      customHeaders = null
+      framePolicy = null,
+      customHeaders = null,
+      basicAuth = null,
+      ipAllowlist = null,
+      maxBodySizeMb = null,
+      rateLimit = null
     } = spec;
 
     if (!Array.isArray(hostnames) || hostnames.length === 0) {
@@ -668,9 +696,6 @@ class CaddyManager {
     const handler = {
       handler: 'reverse_proxy',
       upstreams: upstreams.map(u => ({ dial: String(u) })),
-      // Sin esto, recargar la configuración corta las peticiones en streaming
-      // —incluidos los WebSockets del HMR— y cada promoción rompería la tubería
-      // que el producto entero promete mantener viva.
       stream_close_delay: 5000000000, // 5 s, en nanosegundos
       transport: {
         protocol: 'http',
@@ -687,8 +712,7 @@ class CaddyManager {
       };
     }
 
-    // Cabeceras de seguridad y personalizadas integradas dentro del propio
-    // `reverse_proxy` (mantiene `handle[0].handler === 'reverse_proxy'`).
+    const HOP_BY_HOP = /^(host|content-length|transfer-encoding|connection|keep-alive|upgrade|proxy-authenticate|proxy-authorization|te|trailer)$/i;
     /** @type {Record<string, string[]>} */
     const respSet = {};
     /** @type {string[]} */
@@ -697,21 +721,32 @@ class CaddyManager {
       respSet['X-Content-Type-Options'] = ['nosniff'];
       respSet['Referrer-Policy'] = ['strict-origin-when-cross-origin'];
       respSet['Strict-Transport-Security'] = ['max-age=31536000; includeSubDomains'];
+      if (framePolicy === 'DENY' || framePolicy === 'SAMEORIGIN') {
+        respSet['X-Frame-Options'] = [framePolicy];
+      }
       respDel.push('Server', 'X-Powered-By');
+    } else if (framePolicy === 'DENY' || framePolicy === 'SAMEORIGIN') {
+      respSet['X-Frame-Options'] = [framePolicy];
     }
     if (customHeaders && customHeaders.response && typeof customHeaders.response === 'object') {
+      let count = 0;
       for (const [k, v] of Object.entries(customHeaders.response)) {
-        if (/^[A-Za-z0-9-]+$/.test(k) && typeof v === 'string') {
-          respSet[k] = [v];
+        if (count >= 20) break;
+        if (/^[A-Za-z0-9-]+$/.test(k) && !HOP_BY_HOP.test(k) && typeof v === 'string') {
+          respSet[k] = [v.replace(/[\r\n\0]/g, '').slice(0, 1024)];
+          count++;
         }
       }
     }
     /** @type {Record<string, string[]>} */
     const reqSet = {};
     if (customHeaders && customHeaders.request && typeof customHeaders.request === 'object') {
+      let count = 0;
       for (const [k, v] of Object.entries(customHeaders.request)) {
-        if (/^[A-Za-z0-9-]+$/.test(k) && typeof v === 'string') {
-          reqSet[k] = [v];
+        if (count >= 20) break;
+        if (/^[A-Za-z0-9-]+$/.test(k) && !HOP_BY_HOP.test(k) && typeof v === 'string') {
+          reqSet[k] = [v.replace(/[\r\n\0]/g, '').slice(0, 1024)];
+          count++;
         }
       }
     }
@@ -728,16 +763,93 @@ class CaddyManager {
       }
     }
 
-    // Comprobaciones pasivas: un destino que falla deja de recibir tráfico sin
-    // que nadie tenga que sondearlo activamente.
     handler.health_checks = {
       passive: { fail_duration: 10000000000, max_fails: 3 } // 10 s
     };
 
+    /** @type {any[]} */
+    const chain = [];
+
+    // 1. Límite de tamaño de petición nativo (`request_body`)
+    const maxMb = Number(maxBodySizeMb);
+    if (Number.isFinite(maxMb) && maxMb > 0 && maxMb <= 10240) {
+      chain.push({ handler: 'request_body', max_size: Math.round(maxMb * 1024 * 1024) });
+    }
+
+    // 2. HTTP Basic Auth nativo de Caddy v2.11 con bcrypt + hash_cache en memoria
+    if (basicAuth && basicAuth.enabled && Array.isArray(basicAuth.accounts) && basicAuth.accounts.length > 0) {
+      const validAccounts = basicAuth.accounts
+        .filter((a) => a && typeof a.username === 'string' && a.username.trim() && typeof a.passwordHash === 'string' && a.passwordHash.startsWith('$2'))
+        .map((a) => ({ username: a.username.trim(), password: a.passwordHash }));
+      if (validAccounts.length > 0) {
+        chain.push({
+          handler: 'authentication',
+          providers: {
+            http_basic: {
+              realm: String(basicAuth.realm || 'Acceso protegido').replace(/[\r\n\0"]/g, '').slice(0, 80),
+              hash: { algorithm: 'bcrypt' },
+              hash_cache: {},
+              accounts: validAccounts
+            }
+          }
+        });
+      }
+    }
+
+    // 3. Rate limiting por dominio (solo si el binario de Caddy incluye caddy-ratelimit)
+    if (
+      rateLimit &&
+      rateLimit.enabled &&
+      this._capabilitiesCache &&
+      this._capabilitiesCache.data &&
+      this._capabilitiesCache.data.hasRateLimitPlugin === true
+    ) {
+      const maxEvents = Math.min(100000, Math.max(1, Math.round(Number(rateLimit.requests) || 120)));
+      const winSec = Math.min(3600, Math.max(1, Math.round(Number(rateLimit.windowSeconds) || 60)));
+      chain.push({
+        handler: 'rate_limit',
+        rate_limits: {
+          culkibo_edge_limit: {
+            key: '{http.request.remote.host}',
+            max_events: maxEvents,
+            window: winSec * 1e9
+          }
+        }
+      });
+    }
+
+    chain.push(handler);
+
+    // 4. IP Allowlist nativo con `subroute` + `not.client_ip` (cero plugins extra)
+    const cleanAllowlist = Array.isArray(ipAllowlist)
+      ? ipAllowlist.map((x) => String(x || '').trim()).filter(Boolean)
+      : [];
+    /** @type {any[]} */
+    const finalHandle = cleanAllowlist.length > 0
+      ? [{
+          handler: 'subroute',
+          routes: [
+            {
+              match: [{ not: [{ client_ip: { ranges: cleanAllowlist } }] }],
+              handle: [{
+                handler: 'static_response',
+                status_code: '403',
+                headers: { 'Content-Type': ['text/plain; charset=utf-8'] },
+                body: 'Acceso restringido por política de IPs permitidas (Culkibo Edge).'
+              }],
+              terminal: true
+            },
+            {
+              handle: chain
+            }
+          ]
+        }]
+      : chain;
+
     return {
       '@id': this.routeId(projectId),
       match: [{ host: hostnames }],
-      handle: [handler],
+      handle: finalHandle,
       terminal: true
     };
   }
@@ -806,7 +918,7 @@ class CaddyManager {
       }
     }
 
-    // Si el fast-path indicó que no existe, vamos directo a POST /routes (sin GET /id redundante).
+    // Si el fast-path indicó que no existe, insertar respetando orden de especificidad (evita que un wildcard eclipse subdominios nuevos)
     const routesPath = '/config/apps/http/servers/culkibo/routes';
     const result = await this.mutate(async () => {
       const current = await this.getWithEtag(routesPath);
@@ -817,6 +929,22 @@ class CaddyManager {
           await this.write('PATCH', `/id/${id}`, route, { etag: existing.etag });
           return { created: false, id, route };
         }
+      }
+      const hasWildcardExisting = list.some((r) =>
+        r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX) &&
+        Array.isArray(r.match?.[0]?.host) && r.match[0].host.some((h) => String(h).startsWith('*.'))
+      );
+      if (hasWildcardExisting && !spec.hostnames.some((h) => String(h).startsWith('*.'))) {
+        const foreign = list.filter((r) => !(r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX)));
+        const managed = list.filter((r) => r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX));
+        managed.push(route);
+        managed.sort((a, b) => {
+          const ra = this.routeSpecificityRank({ hostnames: a.match?.[0]?.host || [], kind: a.handle?.[0]?.handler === 'static_response' ? 'redirect' : 'proxy' });
+          const rb = this.routeSpecificityRank({ hostnames: b.match?.[0]?.host || [], kind: b.handle?.[0]?.handler === 'static_response' ? 'redirect' : 'proxy' });
+          return ra - rb;
+        });
+        await this.write('PATCH', routesPath, [...foreign, ...managed], { etag: current.etag });
+        return { created: true, id, route };
       }
       await this.write('POST', routesPath, route, { etag: current.etag });
       return { created: true, id, route };
@@ -952,11 +1080,12 @@ class CaddyManager {
       return this._capabilitiesCache.data;
     }
     const detection = await this.detect({ force });
-    /** @type {{ available: boolean, version: string | null, hasCloudflareDnsPlugin: boolean | null, hasCfTokenEnv: boolean, containerized: boolean, containerName: string }} */
+    /** @type {{ available: boolean, version: string | null, hasCloudflareDnsPlugin: boolean | null, hasRateLimitPlugin: boolean | null, hasCfTokenEnv: boolean, containerized: boolean, containerName: string }} */
     const caps = {
       available: detection.available,
       version: detection.version || null,
       hasCloudflareDnsPlugin: null,
+      hasRateLimitPlugin: null,
       hasCfTokenEnv: Boolean(process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN),
       containerized: this.isContainerized,
       containerName: this.containerName
@@ -980,11 +1109,16 @@ class CaddyManager {
       let modulesOut = await runListModules('docker', ['exec', this.containerName, 'caddy', 'list-modules']);
       if (modulesOut !== null) {
         caps.containerized = true;
+        if (!caps.hasCfTokenEnv) {
+          const cfEnvVal = await runListModules('docker', ['exec', this.containerName, 'printenv', 'CF_API_TOKEN']);
+          if (cfEnvVal && cfEnvVal.trim()) caps.hasCfTokenEnv = true;
+        }
       } else {
         modulesOut = await runListModules('caddy', ['list-modules']);
       }
       if (modulesOut !== null) {
         caps.hasCloudflareDnsPlugin = modulesOut.includes('dns.providers.cloudflare');
+        caps.hasRateLimitPlugin = modulesOut.includes('http.handlers.rate_limit');
       }
     }
 
@@ -1120,7 +1254,7 @@ class CaddyManager {
    * `CADDY_ADMIN=0.0.0.0:2019` en Desktop.
    */
   async startWithDocker({
-    image = 'caddy:2-alpine',
+    image = '',
     containerName = 'culkibo-caddy',
     httpPort = 80,
     httpsPort = 443,
@@ -1128,7 +1262,20 @@ class CaddyManager {
     network = null,
     cfApiToken = null
   } = {}) {
-    const cleanImage = String(image || 'caddy:2-alpine').trim();
+    let cleanImage = String(image || '').trim();
+    if (!cleanImage) {
+      // Si el usuario construyó la imagen local con Cloudflare DNS-01 + ratelimit, preferirla automáticamente
+      const hasCustomImg = await new Promise((resolve) => {
+        try {
+          const probe = spawn('docker', ['image', 'inspect', 'culkibo-caddy:cloudflare'], { shell: false, windowsHide: true });
+          const t = setTimeout(() => { try { probe.kill(); } catch (e) {} resolve(false); }, 2000);
+          if (t.unref) t.unref();
+          probe.on('error', () => { clearTimeout(t); resolve(false); });
+          probe.on('close', (c) => { clearTimeout(t); resolve(c === 0); });
+        } catch (e) { resolve(false); }
+      });
+      cleanImage = hasCustomImg ? 'culkibo-caddy:cloudflare' : 'caddy:2.11-alpine';
+    }
     const cleanName = String(containerName || 'culkibo-caddy').trim();
     const pHttp = Number(httpPort);
     const pHttps = Number(httpsPort);
@@ -1160,9 +1307,9 @@ class CaddyManager {
     let envFile = null;
     const effectiveCfToken = cfApiToken || process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN || '';
     if (effectiveCfToken && !String(effectiveCfToken).includes('\n')) {
-      const tmpDir = path.join(__dirname, '..', '..', 'data', 'tmp');
+      const tmpDir = path.join(__dirname, '..', '..', 'data', '.tmp');
       try {
-        fs.mkdirSync(tmpDir, { recursive: true });
+        fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
         envFile = path.join(tmpDir, `caddy-env-${Date.now()}.env`);
         fs.writeFileSync(envFile, `CF_API_TOKEN=${effectiveCfToken}\n`, { mode: 0o600 });
       } catch (e) {
@@ -1191,7 +1338,7 @@ class CaddyManager {
       '-v', 'culkibo_caddy_config:/config',
       '-v', `${certsHostDir}:/etc/culkibo-certs:ro`,
       cleanImage,
-      'caddy', 'run', '--config', '/dev/null', '--adapter', 'caddyfile'
+      'caddy', 'run', '--resume', '--config', '/dev/null', '--adapter', 'caddyfile'
     );
 
     return new Promise((resolve) => {

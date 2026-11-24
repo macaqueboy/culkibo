@@ -2,10 +2,12 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 // Este módulo NO ejecuta procesos: sólo construye la especificación argv del
-// volcado (`buildDbDumpSpec`) para que la ejecute quien corresponda.
+// volcado (`buildDbDumpSpec`) y gestiona exportación/importación de configuración.
 const projectManager = require('./projectManager');
 const domainManager = require('./domainManager');
 const { assertContainedPath, atomicWriteJsonSync } = require('./ssrfGuard');
+
+const MAX_PROJECT_BACKUP_BYTES = 10 * 1024 * 1024;
 
 /** Rechaza valores con guion inicial para impedir inyección de flags en CLI (p. ej. `-o`, `--eval`). */
 function assertSafeCliArg(value, field) {
@@ -19,9 +21,73 @@ function assertSafeCliArg(value, field) {
   return s;
 }
 
+/** Cifra un objeto JSON con AES-256-GCM + scrypt (cero dependencias) usando una frase de paso. */
+function encryptSnapshotPayload(obj, passphrase) {
+  const pwd = String(passphrase || '');
+  if (pwd.length < 8) throw new Error('La contraseña de cifrado debe tener al menos 8 caracteres');
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = crypto.scryptSync(pwd, salt, 32, { N: 16384, r: 8, p: 1 });
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plain = Buffer.from(JSON.stringify(obj), 'utf8');
+  const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
+  return {
+    encrypted: true,
+    kdf: 'scrypt',
+    cipher: 'aes-256-gcm',
+    salt: salt.toString('base64'),
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    ciphertext: enc.toString('base64')
+  };
+}
+
+/** Descifra un sobre cifrado por `encryptSnapshotPayload`. */
+function decryptSnapshotPayload(envelope, passphrase) {
+  const pwd = String(passphrase || '');
+  if (!pwd) throw new Error('Este snapshot está cifrado; proporciona la contraseña (passphrase)');
+  const salt = Buffer.from(String(envelope.salt || ''), 'base64');
+  const iv = Buffer.from(String(envelope.iv || ''), 'base64');
+  const tag = Buffer.from(String(envelope.tag || ''), 'base64');
+  const data = Buffer.from(String(envelope.ciphertext || ''), 'base64');
+  const key = crypto.scryptSync(pwd, salt, 32, { N: 16384, r: 8, p: 1 });
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  try {
+    const plain = Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+    return JSON.parse(plain);
+  } catch (e) {
+    throw new Error('Contraseña incorrecta o snapshot cifrado corrupto');
+  }
+}
+
+/** Redacta secretos de un proyecto para exportación segura sin fugas accidentales. */
+function redactProjectForExport(proj) {
+  const envKeys = Object.keys(proj.envVars || {});
+  /** @type {Record<string, string>} */
+  const placeholderEnv = {};
+  for (const k of envKeys) placeholderEnv[k] = '';
+  return {
+    ...proj,
+    envVars: placeholderEnv,
+    redactedEnvKeys: envKeys,
+    webhookSecret: '',
+    deployHookToken: '',
+    fileMounts: (proj.fileMounts || []).map((fm) => ({ ...fm, content: '' })),
+    resources: (proj.resources || []).map((r) => ({
+      ...r,
+      envVars: undefined,
+      credentials: undefined
+    }))
+  };
+}
+
 class DbBackupManager {
   constructor() {
-    this.backupsDir = path.join(__dirname, '..', '..', 'data', 'backups');
+    const rootBase = process.env.CULKIBO_DATA_DIR
+      ? path.resolve(process.env.CULKIBO_DATA_DIR)
+      : path.resolve(__dirname, '..', '..');
+    this.backupsDir = path.join(rootBase, 'data', 'backups');
     this.ensureDir(this.backupsDir);
   }
 
@@ -33,13 +99,7 @@ class DbBackupManager {
 
   /**
    * Construye la especificación ejecutable de un volcado: programa, argumentos
-   * como array y secretos en el entorno.
-   *
-   * Nunca se devuelve una cadena de shell. Concatenar `host`, `user` o `dbName`
-   * —valores que vienen del usuario— dentro de un comando es exactamente la
-   * clase que ha producido 21 avisos críticos en Coolify y 34 en Dokploy. Con
-   * argv no hay shell en la que inyectar, y con la contraseña en el entorno no
-   * aparece en la salida de `ps`.
+   * como array y secretos en el entorno (sin shell).
    *
    * @returns {{program:string, args:string[], env:Object, secretInArgs:boolean}}
    */
@@ -66,9 +126,11 @@ class DbBackupManager {
       case 'mariadb':
         return {
           program: 'mysqldump',
-          args: ['-h', safeHost, '-P', String(port || 3306), '-u', safeUser,
-                 '--single-transaction', '--quick', `--result-file=${safeOut}`, safeDb],
-          // MYSQL_PWD evita que la contraseña aparezca en la línea de comandos.
+          args: [
+            '-h', safeHost, '-P', String(port || 3306), '-u', safeUser,
+            '--single-transaction', '--quick', '--routines', '--triggers', '--events', '--hex-blob',
+            `--result-file=${safeOut}`, safeDb
+          ],
           env: password ? { MYSQL_PWD: password } : {},
           secretInArgs: false
         };
@@ -90,9 +152,6 @@ class DbBackupManager {
                  `--db=${safeDb}`, `--archive=${safeOut}`, '--gzip',
                  ...(password ? [`--password=${password}`] : [])],
           env: {},
-          // mongodump no ofrece variable de entorno para la contraseña; la
-          // alternativa es un fichero --config temporal. Marcado para que quien
-          // ejecute sepa que este caso sí expone el secreto en `ps`.
           secretInArgs: Boolean(password)
         };
 
@@ -103,7 +162,6 @@ class DbBackupManager {
 
   /**
    * Representación legible del comando, con los secretos ocultos.
-   * Es lo único que sale por la API o llega a un log: nunca la contraseña.
    */
   generateDbDumpCommand(dbType, options = {}) {
     const spec = this.buildDbDumpSpec(dbType, options);
@@ -115,14 +173,14 @@ class DbBackupManager {
 
   /**
    * Realiza una exportación completa de un proyecto (metadata, volúmenes, envs, dominios).
+   * Soporta `includeSecrets: false` para compartir configuraciones sin exponer secretos.
    */
-  async exportProject(projectId) {
+  async exportProject(projectId, { includeSecrets = true } = {}) {
     const project = projectManager.getById(projectId);
     if (!project) {
       throw new Error(`Proyecto ${projectId} no encontrado`);
     }
 
-    // P1-27: asociar dominios reales por projectId o project.domains (no por puerto genérico 3001/8080)
     const projHosts = new Set((project.domains || []).map((h) => String(h).toLowerCase()));
     const domains = domainManager.listDomains().filter(
       (d) => d.projectId === project.id || projHosts.has(String(d.hostname || '').toLowerCase())
@@ -132,14 +190,16 @@ class DbBackupManager {
     const backupFileName = `backup_${project.id}_${timestamp}.json`;
     const backupFilePath = path.join(this.backupsDir, backupFileName);
 
+    const exportedProj = includeSecrets ? project : redactProjectForExport(project);
     const bundleBody = {
       version: '1.0.0',
       exportedAt: new Date().toISOString(),
       source: 'Culkibo Orchestrator',
-      project: project,
+      secretsRedacted: !includeSecrets,
+      project: exportedProj,
       domains: domains,
       volumes: project.volumes || [],
-      fileMounts: project.fileMounts || []
+      fileMounts: includeSecrets ? (project.fileMounts || []) : (project.fileMounts || []).map((f) => ({ ...f, content: '' }))
     };
     const sha256 = crypto.createHash('sha256').update(JSON.stringify(bundleBody)).digest('hex');
     const exportBundle = { ...bundleBody, checksum: `sha256:${sha256}` };
@@ -152,6 +212,7 @@ class DbBackupManager {
       fullPath: backupFilePath,
       exportedAt: exportBundle.exportedAt,
       checksum: exportBundle.checksum,
+      secretsRedacted: !includeSecrets,
       projectId: project.id,
       projectName: project.name,
       resourcesCount: (project.resources || []).length,
@@ -161,10 +222,8 @@ class DbBackupManager {
 
   /**
    * Importa y restaura un proyecto desde un archivo de backup JSON.
-   * Por seguridad, desde API/MCP el archivo debe estar contenido en `this.backupsDir`;
-   * la CLI local puede pasar `{ allowExternalPath: true }`.
    */
-  async restoreProject(backupFilePathOrName, { allowExternalPath = false } = {}) {
+  async restoreProject(backupFilePathOrName, { allowExternalPath = false, allowUnsigned = false } = {}) {
     const rawInput = String(backupFilePathOrName || '').trim();
     if (!rawInput || rawInput.includes('\0')) {
       throw new Error('Ruta de backup inválida');
@@ -175,7 +234,7 @@ class DbBackupManager {
     } else if (path.isAbsolute(rawInput)) {
       const resolved = path.resolve(rawInput);
       const rel = path.relative(path.resolve(this.backupsDir), resolved);
-      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      if (!rel || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
         throw new Error('Ruta de backup fuera del directorio permitido (data/backups)');
       }
       filePath = resolved;
@@ -187,14 +246,18 @@ class DbBackupManager {
       throw new Error(`Archivo de backup no encontrado: ${path.basename(filePath)}`);
     }
 
-    // Impedir escapes por symlink fuera de data/backups cuando no se permite ruta externa
     if (!allowExternalPath) {
       const realRoot = fs.realpathSync(this.backupsDir);
       const realFile = fs.realpathSync(filePath);
       const relReal = path.relative(realRoot, realFile);
-      if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+      if (!relReal || relReal === '.' || relReal.startsWith('..') || path.isAbsolute(relReal)) {
         throw new Error('Ruta de backup fuera del directorio permitido (symlink bloqueado)');
       }
+    }
+
+    const stat = await fs.promises.stat(filePath);
+    if (!stat.isFile() || stat.size > MAX_PROJECT_BACKUP_BYTES) {
+      throw new Error(`El archivo de backup supera el tamaño máximo permitido (${MAX_PROJECT_BACKUP_BYTES / (1024 * 1024)} MB)`);
     }
 
     const raw = await fs.promises.readFile(filePath, 'utf8');
@@ -204,56 +267,356 @@ class DbBackupManager {
       throw new Error('Estructura de backup inválida o dañada');
     }
 
-    // Verificar checksum real sha256 si el backup lo trae en el nuevo formato `sha256:<hex>`
     if (typeof bundle.checksum === 'string' && /^sha256:[a-f0-9]{64}$/.test(bundle.checksum)) {
       const { checksum, ...bodyWithoutChecksum } = bundle;
       const expected = `sha256:${crypto.createHash('sha256').update(JSON.stringify(bodyWithoutChecksum)).digest('hex')}`;
       if (checksum !== expected) {
         throw new Error('El checksum SHA-256 del archivo de backup no coincide (archivo modificado o corrupto)');
       }
+    } else if (!allowUnsigned && bundle.version !== '0.9.0' && bundle.checksum !== undefined) {
+      throw new Error('Formato de checksum SHA-256 inválido en el archivo de backup');
     }
 
-    // Comprobar si ya existe el ID, si existe asignar nuevo o actualizar
     let targetProject = { ...bundle.project };
     const existing = projectManager.getById(targetProject.id);
     if (existing) {
-      targetProject.id = `restored_${Date.now().toString(36)}`;
+      targetProject.id = `restored_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
       targetProject.name = `${targetProject.name} (Restaurado)`;
     }
 
     const restored = projectManager.create(targetProject);
 
-    // Restaurar dominios asociados vinculados explícitamente a `restored.id`
+    /** @type {string[]} */
+    const restoredDomains = [];
+    /** @type {Array<{ hostname: string, error: string }>} */
+    const skippedDomains = [];
     if (bundle.domains && Array.isArray(bundle.domains)) {
       for (const d of bundle.domains) {
         try {
-          await domainManager.addDomain({
+          const added = await domainManager.addDomain({
             hostname: d.hostname,
             projectId: restored.id,
             targetPod: d.targetPod || 'citadel',
             targetPort: d.targetPort || restored.citadelPort,
             cloudflareProxied: d.cloudflareProxied,
-            canonicalRedirect: d.canonicalRedirect || 'none'
+            cloudflareZoneId: d.cloudflareZoneId || null,
+            routingMode: d.routingMode || 'reverse_proxy',
+            canonicalRedirect: d.canonicalRedirect || 'none',
+            securityHeaders: d.securityHeaders !== false,
+            customHeaders: d.customHeaders || null
           });
+          restoredDomains.push(added.hostname);
         } catch (e) {
-          // Ignorar duplicados de dominio
+          skippedDomains.push({ hostname: d.hostname, error: e.message });
         }
       }
     }
 
-    // P0-6: garantizar escritura atómica en disco antes de devolver éxito (CLI restore)
     await projectManager.flushToDisk();
+    try {
+      const ingressManager = require('./ingressManager');
+      await ingressManager.reconcile().catch(() => {});
+    } catch (e) {}
 
     return {
       success: true,
       restoredProjectId: restored.id,
       restoredName: restored.name,
+      restoredDomains,
+      skippedDomains,
       restoredAt: new Date().toISOString()
     };
   }
 
   /**
-   * Lista todos los backups existentes en el disco.
+   * Exporta un Snapshot Completo de Instancia Culkibo (v2.0.0) con proyectos,
+   * dominios, políticas de ingress/wildcard, metadatos/horarios de BDs, S3 no secreto,
+   * notificaciones y tareas cron. JAMÁS exporta `auth.json` ni `.databases.key`.
+   */
+  async exportInstanceSnapshot({ includeSecrets = false, passphrase = '', persist = true, uploadToS3 = false } = {}) {
+    const ingressManager = require('./ingressManager');
+    const databaseManager = require('./databaseManager');
+    const notificationService = require('./notificationService');
+    const cronManager = require('./cronManager');
+
+    const rawProjects = projectManager.getAll();
+    const projects = includeSecrets ? rawProjects : rawProjects.map(redactProjectForExport);
+    const domains = domainManager.listDomains();
+    const ingress = {
+      panelDomain: ingressManager.panelDomain || null,
+      acmeEmail: ingressManager.acmeEmail || null,
+      wildcardPolicies: ingressManager.listWildcardPolicies ? ingressManager.listWildcardPolicies() : []
+    };
+    const databases = (databaseManager.list ? databaseManager.list() : []).map((d) => ({
+      id: d.id,
+      projectId: d.projectId,
+      name: d.name,
+      engine: d.engine,
+      image: d.image,
+      dbName: d.dbName,
+      username: d.username,
+      memoryMb: d.memoryMb,
+      cpus: d.cpus,
+      exposure: d.exposure,
+      schedule: d.schedule,
+      retention: d.retention
+    }));
+    const s3Public = databaseManager.getS3Config ? databaseManager.getS3Config() : { configured: false };
+    const s3 = s3Public.configured
+      ? {
+          endpoint: s3Public.endpoint,
+          region: s3Public.region,
+          bucket: s3Public.bucket,
+          prefix: s3Public.prefix,
+          pathStyle: s3Public.pathStyle
+        }
+      : null;
+    const notifCfg = notificationService.getConfig ? notificationService.getConfig() : null;
+    const notifications = notifCfg
+      ? { enabled: Boolean(notifCfg.enabled), events: notifCfg.events || {} }
+      : null;
+    const crons = (cronManager.list ? cronManager.list() : []).map((c) => ({
+      projectId: c.projectId,
+      name: c.name,
+      schedule: c.schedule,
+      enabled: c.enabled,
+      mode: c.mode,
+      command: c.command,
+      workdir: c.workdir,
+      httpPath: c.httpPath,
+      httpMethod: c.httpMethod,
+      timeoutMs: c.timeoutMs
+    }));
+
+    const payloadBody = {
+      projects,
+      domains,
+      ingress,
+      databases,
+      s3,
+      notifications,
+      crons
+    };
+
+    const useEncryption = Boolean(passphrase && String(passphrase).trim().length > 0);
+    const dataSection = useEncryption
+      ? encryptSnapshotPayload(payloadBody, String(passphrase).trim())
+      : payloadBody;
+
+    const envelopeBody = {
+      version: '2.0.0',
+      type: 'culkibo-instance-snapshot',
+      exportedAt: new Date().toISOString(),
+      source: 'Culkibo Orchestrator',
+      secretsRedacted: !includeSecrets,
+      encrypted: useEncryption,
+      counts: {
+        projects: projects.length,
+        domains: domains.length,
+        wildcardPolicies: ingress.wildcardPolicies.length,
+        databases: databases.length,
+        crons: crons.length
+      },
+      data: dataSection
+    };
+    const checksum = `sha256:${crypto.createHash('sha256').update(JSON.stringify(envelopeBody)).digest('hex')}`;
+    const snapshot = { ...envelopeBody, checksum };
+
+    /** @type {string | null} */
+    let fileName = null;
+    /** @type {string | null} */
+    let fullPath = null;
+    /** @type {string | null} */
+    let remoteKey = null;
+    if (persist) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      fileName = `instance_snapshot_${stamp}.json`;
+      fullPath = path.join(this.backupsDir, fileName);
+      atomicWriteJsonSync(fullPath, snapshot, 0o600);
+      if (uploadToS3 && databaseManager.s3ClientFor) {
+        const s3Client = databaseManager.s3ClientFor();
+        if (s3Client) {
+          remoteKey = `${databaseManager.s3Prefix()}instance-snapshots/${fileName}`;
+          await s3Client.uploadFile(remoteKey, fullPath, { contentType: 'application/json' });
+        }
+      }
+    }
+
+    return {
+      success: true,
+      fileName,
+      fullPath,
+      remoteKey,
+      checksum,
+      encrypted: useEncryption,
+      secretsRedacted: !includeSecrets,
+      counts: envelopeBody.counts,
+      snapshot
+    };
+  }
+
+  /**
+   * Importa un Snapshot Completo de Instancia Culkibo (v2.0.0) con soporte `dryRun`
+   * (previsualización de diferencias sin mutar) y copia de seguridad previa automática.
+   * @param {{ snapshot?: any, fileName?: string | null, mode?: 'merge' | 'replace' | 'overwrite', dryRun?: boolean, passphrase?: string | null }} [opts]
+   */
+  async importInstanceSnapshot({ snapshot = null, fileName = null, mode = 'merge', dryRun = true, passphrase = '' } = {}) {
+    const effectiveMode = mode === 'replace' ? 'overwrite' : mode;
+    void effectiveMode;
+    if (!snapshot && fileName) {
+      const p = this.resolveDownloadPath(fileName);
+      snapshot = JSON.parse(fs.readFileSync(p, 'utf8'));
+    }
+    if (!snapshot || typeof snapshot !== 'object') {
+      throw new Error('Snapshot JSON inválido o vacío');
+    }
+    if (snapshot.type !== 'culkibo-instance-snapshot') {
+      throw new Error('El archivo no es un snapshot de instancia de Culkibo v2');
+    }
+
+    if (typeof snapshot.checksum === 'string' && /^sha256:[a-f0-9]{64}$/.test(snapshot.checksum)) {
+      const { checksum, ...without } = snapshot;
+      const expected = `sha256:${crypto.createHash('sha256').update(JSON.stringify(without)).digest('hex')}`;
+      if (checksum !== expected) {
+        throw new Error('Checksum SHA-256 inválido: el snapshot ha sido alterado o está corrupto');
+      }
+    }
+
+    let payload = snapshot.data;
+    if (snapshot.encrypted || (payload && payload.encrypted)) {
+      payload = decryptSnapshotPayload(payload, passphrase);
+    }
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('Contenido del snapshot dañado');
+    }
+
+    const incomingProjects = Array.isArray(payload.projects) ? payload.projects : [];
+    const incomingDomains = Array.isArray(payload.domains) ? payload.domains : [];
+    const incomingWildcards = Array.isArray(payload.ingress?.wildcardPolicies) ? payload.ingress.wildcardPolicies : [];
+    const incomingCrons = Array.isArray(payload.crons) ? payload.crons : [];
+
+    const existingIds = new Set(projectManager.getAll().map((p) => p.id));
+    const existingHosts = new Set((domainManager.domains || []).map((d) => d.hostname));
+
+    const plan = {
+      dryRun: Boolean(dryRun),
+      mode,
+      secretsRedacted: Boolean(snapshot.secretsRedacted),
+      projectsToAdd: incomingProjects.filter((p) => p && p.id && !existingIds.has(p.id)).map((p) => ({ id: p.id, name: p.name })),
+      projectsToUpdate: mode === 'overwrite'
+        ? incomingProjects.filter((p) => p && p.id && existingIds.has(p.id)).map((p) => ({ id: p.id, name: p.name }))
+        : [],
+      projectsToSkip: mode !== 'overwrite'
+        ? incomingProjects.filter((p) => p && p.id && existingIds.has(p.id)).map((p) => ({ id: p.id, name: p.name }))
+        : [],
+      domainsToAdd: incomingDomains.filter((d) => d && d.hostname && !existingHosts.has(d.hostname)).map((d) => d.hostname),
+      wildcardPoliciesCount: incomingWildcards.length,
+      cronsCount: incomingCrons.length,
+      redactedEnvKeys: incomingProjects.reduce((acc, p) => {
+        if (Array.isArray(p?.redactedEnvKeys) && p.redactedEnvKeys.length > 0) {
+          acc[p.name || p.id] = p.redactedEnvKeys;
+        }
+        return acc;
+      }, /** @type {Record<string, string[]>} */ ({}))
+    };
+
+    if (dryRun) {
+      return { success: true, applied: false, plan };
+    }
+
+    // Guardar copia de seguridad automática del estado actual antes de aplicar cambios
+    const safety = await this.exportInstanceSnapshot({ includeSecrets: false, persist: true }).catch(() => null);
+
+    let addedProjects = 0;
+    let updatedProjects = 0;
+    for (const p of incomingProjects) {
+      if (!p || !p.id) continue;
+      if (projectManager.getById(p.id)) {
+        if (mode === 'overwrite') {
+          const { id, createdAt, ...rest } = p;
+          projectManager.update(id, rest);
+          updatedProjects++;
+        }
+      } else {
+        projectManager.create(p);
+        addedProjects++;
+      }
+    }
+
+    let addedDomains = 0;
+    for (const d of incomingDomains) {
+      if (!d || !d.hostname || domainManager.getByHostname(d.hostname)) continue;
+      try {
+        await domainManager.addDomain({
+          hostname: d.hostname,
+          projectId: d.projectId || null,
+          targetPod: d.targetPod || 'citadel',
+          targetPort: d.targetPort || 8080,
+          cloudflareProxied: Boolean(d.cloudflareProxied),
+          cloudflareZoneId: d.cloudflareZoneId || null,
+          routingMode: d.routingMode || 'reverse_proxy',
+          canonicalRedirect: d.canonicalRedirect || 'none',
+          securityHeaders: d.securityHeaders !== false,
+          customHeaders: d.customHeaders || null
+        });
+        addedDomains++;
+      } catch (e) {}
+    }
+
+    const ingressManager = require('./ingressManager');
+    if (payload.ingress) {
+      if (payload.ingress.acmeEmail) {
+        try { ingressManager.setAcmeEmail(payload.ingress.acmeEmail); } catch (e) {}
+      }
+      for (const wp of incomingWildcards) {
+        if (wp && wp.rootDomain) {
+          try {
+            await ingressManager.addWildcardPolicy({
+              rootDomain: wp.rootDomain,
+              provider: wp.provider || 'cloudflare',
+              tokenEnv: wp.tokenEnv || 'CF_API_TOKEN',
+              includeApex: wp.includeApex !== false
+            });
+          } catch (e) {}
+        }
+      }
+    }
+
+    const cronManager = require('./cronManager');
+    let addedCrons = 0;
+    for (const c of incomingCrons) {
+      if (!c || !c.projectId || !c.name) continue;
+      const dup = cronManager.list(c.projectId).some((ex) => ex.name === c.name && ex.schedule === c.schedule);
+      if (!dup) {
+        try { cronManager.create(c.projectId, c); addedCrons++; } catch (e) {}
+      }
+    }
+
+    await projectManager.flushToDisk();
+    await ingressManager.reconcile().catch(() => {});
+
+    return {
+      success: true,
+      applied: true,
+      preImportSafetyFile: safety?.fileName || null,
+      result: { addedProjects, updatedProjects, addedDomains, addedCrons },
+      plan
+    };
+  }
+
+  /** Resuelve de forma segura una ruta descargable dentro de `data/backups/`. */
+  resolveDownloadPath(fileName) {
+    const clean = path.basename(String(fileName || '').trim());
+    if (!clean || !clean.endsWith('.json')) {
+      throw new Error('Nombre de archivo de backup inválido');
+    }
+    const full = assertContainedPath(this.backupsDir, clean);
+    if (!fs.existsSync(full)) throw new Error('Archivo de backup no encontrado');
+    return full;
+  }
+
+  /**
+   * Lista todos los backups existentes en el disco (ordenados por `mtimeMs` fiable en Linux/overlayfs).
    */
   async listBackups() {
     this.ensureDir(this.backupsDir);
@@ -265,19 +628,20 @@ class DbBackupManager {
         try {
           const filePath = path.join(this.backupsDir, file);
           const stats = await fs.promises.stat(filePath);
+          if (!stats.isFile()) continue;
           backups.push({
             fileName: file,
+            kind: file.startsWith('instance_snapshot_') ? 'instance' : 'project',
             sizeBytes: stats.size,
-            createdAt: stats.birthtime,
-            modifiedAt: stats.mtime
+            createdAt: stats.mtime,
+            modifiedAt: stats.mtime,
+            mtimeMs: stats.mtimeMs
           });
-        } catch (e) {
-          // Ignorar ficheros eliminados concurrentemente durante el listado
-        }
+        } catch (e) {}
       }
     }
 
-    return backups.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return backups.sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0));
   }
 }
 

@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
 const WebSocket = require('ws');
@@ -9,10 +10,13 @@ const { computeMerkleTree, diffMerkleTrees, sha256 } = require('./liveSyncEngine
  *
  * Acumula cambios de disco en una ventana corta de quiescencia (`quiescenceMs`)
  * para enviarlos como un único Commit Frame atómico sobre un WebSocket
- * persistente autenticado, con verificación Merkle inicial y auto-reparación.
+ * persistente autenticado, con verificación Merkle delta y auto-reconexión.
  */
 
-const IGNORED_SEGMENT_RE = /(^|[\\/])(\.git|node_modules|\.next|\.nuxt|\.culkibo|dist|build|coverage|__pycache__|\.venv|venv)([\\/]|$)/;
+const IGNORED_SEGMENT_RE = /(^|[\\/])(\.git|node_modules|\.next|\.nuxt|\.turbo|\.svelte-kit|\.output|\.astro|\.cache|\.culkibo|dist|build|coverage|__pycache__|\.venv|venv|target|vendor)([\\/]|$)/;
+const MAX_CLIENT_FILE_BYTES = 10 * 1024 * 1024;
+const CHUNK_MAX_FILES = 250;
+const CHUNK_MAX_BYTES = 8 * 1024 * 1024;
 
 class LiveSyncClient extends EventEmitter {
   /**
@@ -23,6 +27,8 @@ class LiveSyncClient extends EventEmitter {
    *   token?: string | null,
    *   quiescenceMs?: number,
    *   autoWatch?: boolean,
+   *   autoReconnect?: boolean,
+   *   clientName?: string,
    *   targetDir?: string | null
    * }} options
    */
@@ -34,6 +40,8 @@ class LiveSyncClient extends EventEmitter {
     this.token = options.token || null;
     this.quiescenceMs = typeof options.quiescenceMs === 'number' ? options.quiescenceMs : 12;
     this.autoWatch = options.autoWatch !== false;
+    this.autoReconnect = options.autoReconnect !== false;
+    this.clientName = options.clientName || os.hostname();
     this.targetDir = options.targetDir || null;
 
     /** @type {any} */
@@ -45,6 +53,12 @@ class LiveSyncClient extends EventEmitter {
     this.seq = 0;
     this.connected = false;
     this.closed = false;
+    this._reconnectAttempt = 0;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    this._reconnectTimer = null;
+    this._reconciling = false;
+    /** @type {Array<{ resolve: (v: any) => void, reject: (e: any) => void, timer: ReturnType<typeof setTimeout> }>} */
+    this._verifyWaiters = [];
 
     /** @type {Map<string, 'upsert' | 'delete'>} */
     this.pending = new Map();
@@ -136,7 +150,6 @@ class LiveSyncClient extends EventEmitter {
         else resolve(val);
       };
 
-      // Listener permanente de errores para evitar crash por 'error' tras 'open' (P1-15)
       ws.on('error', (err) => {
         if (!handshakeDone) {
           finishConnect(err, null);
@@ -156,6 +169,9 @@ class LiveSyncClient extends EventEmitter {
           type: 'hello',
           projectId: this.projectId,
           targetDir: this.targetDir,
+          clientName: this.clientName,
+          sourceDir: this.sourceDir,
+          pid: process.pid,
           clientDigest: localTree.rootDigest,
           fileCount: localTree.fileCount
         }));
@@ -178,6 +194,7 @@ class LiveSyncClient extends EventEmitter {
 
         if (msg.type === 'hello_ack') {
           this.connected = true;
+          this._reconnectAttempt = 0;
           this.seq = msg.lastSeq || 0;
           this.initialInSync = Boolean(msg.inSync);
           this.binaryFramesSupported = Boolean(msg.binaryFramesSupported);
@@ -186,7 +203,6 @@ class LiveSyncClient extends EventEmitter {
             for (const [k, v] of Object.entries(this.initialLocalTree.files)) {
               this.lastSentHashes.set(k, v);
             }
-            // Retener solo el digest y liberar el mapa completo si ya estamos sincronizados
             this.initialLocalTree = { rootDigest: this.initialLocalTree.rootDigest, fileCount: this.initialLocalTree.fileCount, files: {} };
           }
           this.emit('ready', msg);
@@ -202,11 +218,27 @@ class LiveSyncClient extends EventEmitter {
             waiter.resolve({ ...msg, rttMs });
           }
           this.emit('frame_ack', msg);
+          if (msg.reconcileRequired && !this._reconciling) {
+            this.reconcileDelta().catch((err) => this.emit('sync_error', err));
+          }
           return;
         }
 
         if (msg.type === 'verify_ack') {
+          const waiter = this._verifyWaiters.shift();
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(msg);
+          }
           this.emit('verify_ack', msg);
+          return;
+        }
+
+        if (msg.type === 'rollback_notice') {
+          if (Array.isArray(msg.restoredFiles)) {
+            for (const f of msg.restoredFiles) this.lastSentHashes.delete(String(f));
+          }
+          this.emit('rollback_notice', msg);
           return;
         }
 
@@ -238,9 +270,116 @@ class LiveSyncClient extends EventEmitter {
           waiter.reject(new Error('Conexión de sincronización cerrada'));
         }
         this.inflight.clear();
+        while (this._verifyWaiters.length) {
+          const w = this._verifyWaiters.shift();
+          if (w) {
+            clearTimeout(w.timer);
+            w.reject(new Error('Conexión de sincronización cerrada'));
+          }
+        }
         this.emit('close');
+        if (!this.closed && this.autoReconnect) {
+          this._scheduleReconnect();
+        }
       });
     });
+  }
+
+  /** Reconexión automática con backoff exponencial (500ms → 15s) y reconciliación Merkle delta al reconectar. */
+  _scheduleReconnect() {
+    if (this.closed || this._reconnectTimer) return;
+    const delayMs = Math.min(15000, Math.round(500 * Math.pow(2, this._reconnectAttempt)));
+    this._reconnectAttempt = Math.min(this._reconnectAttempt + 1, 6);
+    this.emit('reconnecting', { attempt: this._reconnectAttempt, delayMs });
+    this._reconnectTimer = setTimeout(async () => {
+      this._reconnectTimer = null;
+      if (this.closed) return;
+      try {
+        await this.connect();
+        this.emit('reconnected', { projectId: this.projectId });
+        if (!this.initialInSync) {
+          await this.reconcileDelta().catch(() => this.reconcileFull().catch(() => {}));
+        }
+        if (this.pending.size > 0) {
+          await this.flushNow().catch(() => {});
+        }
+      } catch (err) {
+        this.emit('sync_error', err);
+        if (!this.closed && this.autoReconnect) this._scheduleReconnect();
+      }
+    }, delayMs);
+    if (this._reconnectTimer.unref) this._reconnectTimer.unref();
+  }
+
+  /** Pide al servidor la diferencia Merkle exacta enviando sólo rutas+hashes y recibe `verify_ack`. */
+  verifyWithServer(localFiles) {
+    if (!this.ws || this.ws.readyState !== 1) {
+      return Promise.reject(new Error('El WebSocket de sincronización no está conectado'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this._verifyWaiters.findIndex((w) => w.timer === timer);
+        if (idx !== -1) this._verifyWaiters.splice(idx, 1);
+        reject(new Error('Tiempo de espera agotado en verificación Merkle'));
+      }, 15000);
+      if (timer.unref) timer.unref();
+      this._verifyWaiters.push({ resolve, reject, timer });
+      this.ws.send(JSON.stringify({
+        type: 'verify',
+        projectId: this.projectId,
+        targetDir: this.targetDir,
+        clientFiles: localFiles
+      }));
+    });
+  }
+
+  /** Lee un archivo con reintentos cortos ante EBUSY/EPERM transitorios de editores en Windows. */
+  async _readFileSafe(abs) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const st = fs.statSync(abs);
+        if (st.isDirectory()) return { kind: 'dir' };
+        if (st.size > MAX_CLIENT_FILE_BYTES) {
+          return { kind: 'too_large', size: st.size };
+        }
+        return { kind: 'file', buffer: fs.readFileSync(abs) };
+      } catch (e) {
+        if (e && e.code === 'ENOENT') return { kind: 'missing' };
+        if (e && (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES') && attempt < 4) {
+          await new Promise((r) => setTimeout(r, 25 * attempt));
+          continue;
+        }
+        return { kind: 'error', error: e };
+      }
+    }
+    return { kind: 'error' };
+  }
+
+  /** Envía un array de ficheros troceado en lotes seguros (<=250 ficheros y <=8 MiB por Commit Frame). */
+  async sendChunked(files) {
+    /** @type {any} */
+    let lastAck = null;
+    let framesSent = 0;
+    /** @type {typeof files} */
+    let batch = [];
+    let batchBytes = 0;
+
+    for (const f of files) {
+      const fSize = f.buffer ? f.buffer.length : 0;
+      if (batch.length > 0 && (batch.length >= CHUNK_MAX_FILES || batchBytes + fSize > CHUNK_MAX_BYTES)) {
+        lastAck = await this.sendFrame(batch);
+        framesSent++;
+        batch = [];
+        batchBytes = 0;
+      }
+      batch.push(f);
+      batchBytes += fSize;
+    }
+    if (batch.length > 0) {
+      lastAck = await this.sendFrame(batch);
+      framesSent++;
+    }
+    return { lastAck, framesSent };
   }
 
   /** @param {string} absPath @param {'upsert' | 'delete'} op */
@@ -315,7 +454,7 @@ class LiveSyncClient extends EventEmitter {
     }, this.quiescenceMs);
   }
 
-  /** Envía inmediatamente todos los ficheros acumulados como un Commit Frame atómico. */
+  /** Envía inmediatamente todos los ficheros acumulados como uno o varios Commit Frames atómicos. */
   async flushNow() {
     if (!this.ws || this.ws.readyState !== 1 || this.pending.size === 0) return null;
 
@@ -330,24 +469,24 @@ class LiveSyncClient extends EventEmitter {
         files.push({ path: rel, op: 'delete' });
       } else {
         const abs = path.join(this.sourceDir, rel);
-        try {
-          const buf = fs.readFileSync(abs);
-          const h = sha256(buf);
+        const res = await this._readFileSafe(abs);
+        if (res.kind === 'file' && res.buffer) {
+          const h = sha256(res.buffer);
           if (this.lastSentHashes.get(rel) === h) continue;
           this.lastSentHashes.set(rel, h);
-          files.push({ path: rel, op: 'upsert', buffer: buf, sha256: h });
-        } catch (e) {
-          if (e && e.code === 'ENOENT') {
-            this.lastSentHashes.delete(rel);
-            files.push({ path: rel, op: 'delete' });
-          }
-          // Ignorar EISDIR / EPERM transitorios de directorio
+          files.push({ path: rel, op: 'upsert', buffer: res.buffer, sha256: h });
+        } else if (res.kind === 'missing') {
+          this.lastSentHashes.delete(rel);
+          files.push({ path: rel, op: 'delete' });
+        } else if (res.kind === 'too_large') {
+          this.emit('file_skipped', { path: rel, size: res.size, limit: MAX_CLIENT_FILE_BYTES });
         }
       }
     }
 
     if (files.length === 0) return null;
-    return this.sendFrame(files);
+    const { lastAck } = await this.sendChunked(files);
+    return lastAck;
   }
 
   /**
@@ -414,13 +553,58 @@ class LiveSyncClient extends EventEmitter {
     });
   }
 
-  /** Reconciliación completa basada en árbol de Merkle con troceado automático (soporta >500 ficheros y repos grandes). */
+  /** Reconciliación Merkle delta real: consulta `verify` al servidor y transfiere sólo los archivos divergentes. */
+  async reconcileDelta() {
+    if (this._reconciling) return { reconciled: false, skipped: true };
+    this._reconciling = true;
+    try {
+      const localTree = computeMerkleTree(this.sourceDir);
+      const verified = await this.verifyWithServer(localTree.files);
+      const cmp = verified && verified.comparison;
+      if (!cmp || cmp.inSync) {
+        this.lastSentHashes.clear();
+        for (const [k, v] of Object.entries(localTree.files)) this.lastSentHashes.set(k, v);
+        return { reconciled: true, changed: 0, framesSent: 0, rootDigest: localTree.rootDigest };
+      }
+
+      /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string }>} */
+      const files = [];
+      for (const rel of [...(cmp.missingOnServer || []), ...(cmp.staleOnServer || [])]) {
+        const res = await this._readFileSafe(path.join(this.sourceDir, rel));
+        if (res.kind === 'file' && res.buffer) {
+          const h = sha256(res.buffer);
+          this.lastSentHashes.set(rel, h);
+          files.push({ path: rel, op: 'upsert', buffer: res.buffer, sha256: h });
+        }
+      }
+      for (const rel of (cmp.extraOnServer || [])) {
+        this.lastSentHashes.delete(rel);
+        files.push({ path: rel, op: 'delete' });
+      }
+      if (files.length === 0) {
+        return { reconciled: true, changed: 0, framesSent: 0, rootDigest: localTree.rootDigest };
+      }
+      const { lastAck, framesSent } = await this.sendChunked(files);
+      return { reconciled: true, changed: files.length, framesSent, rootDigest: localTree.rootDigest, ack: lastAck };
+    } finally {
+      this._reconciling = false;
+    }
+  }
+
+  /** Reconciliación basada en árbol de Merkle con delta automático y troceado. */
   async reconcileFull(serverFilesMap = null) {
     if (!serverFilesMap && this.initialInSync && this.initialLocalTree) {
       this.initialInSync = false;
       const digest = this.initialLocalTree.rootDigest;
       this.initialLocalTree = null;
       return { reconciled: true, changed: 0, rootDigest: digest };
+    }
+    if (!serverFilesMap) {
+      try {
+        return await this.reconcileDelta();
+      } catch (e) {
+        // Fallback a reconciliación completa si el servidor no soporta verify delta
+      }
     }
     const localTree = this.initialLocalTree && !serverFilesMap && Object.keys(this.initialLocalTree.files || {}).length > 0
       ? this.initialLocalTree
@@ -451,37 +635,16 @@ class LiveSyncClient extends EventEmitter {
 
     if (files.length === 0) return { reconciled: true, changed: 0, rootDigest: localTree.rootDigest };
 
-    // Trocear en lotes <= 250 ficheros y <= 8 MiB por Commit Frame para jamás exceder MAX_FILES_PER_FRAME ni maxPayload
-    const CHUNK_MAX_FILES = 250;
-    const CHUNK_MAX_BYTES = 8 * 1024 * 1024;
-    /** @type {any} */
-    let lastAck = null;
-    let framesSent = 0;
-    /** @type {typeof files} */
-    let batch = [];
-    let batchBytes = 0;
-
-    for (const f of files) {
-      const fSize = f.buffer ? f.buffer.length : 0;
-      if (batch.length > 0 && (batch.length >= CHUNK_MAX_FILES || batchBytes + fSize > CHUNK_MAX_BYTES)) {
-        lastAck = await this.sendFrame(batch);
-        framesSent++;
-        batch = [];
-        batchBytes = 0;
-      }
-      batch.push(f);
-      batchBytes += fSize;
-    }
-    if (batch.length > 0) {
-      lastAck = await this.sendFrame(batch);
-      framesSent++;
-    }
-
+    const { lastAck, framesSent } = await this.sendChunked(files);
     return { reconciled: true, changed: files.length, framesSent, rootDigest: localTree.rootDigest, ack: lastAck };
   }
 
   async stop() {
     this.closed = true;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this.coalesceTimer) {
       clearTimeout(this.coalesceTimer);
       this.coalesceTimer = null;

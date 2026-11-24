@@ -9,18 +9,20 @@ import {
   RefreshCw,
   CheckCircle2,
   Check,
-  Terminal,
+  FolderOpen,
 } from 'lucide-react';
 import { api, type GitHubStatus, type GitHubRepo, type GitHubBranch, type GitHubAutoDetectResult } from '../lib/api';
 import { Modal } from './Modal';
+import { HelpTip } from './HelpTip';
 
 interface CreateProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSuccess: (createdProjectId?: string) => void;
+  onSuccess: (createdProjectId?: string, initialTab?: string | null) => void;
+  onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }
 
-export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, onClose, onSuccess }) => {
+export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, onClose, onSuccess, onNotify }) => {
   const [tab, setTab] = useState<'giturl' | 'github' | 'manual'>('giturl');
 
   // Estado URL Git pública
@@ -29,13 +31,16 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
   const [inspectingUrl, setInspectingUrl] = useState(false);
   const [inspectedUrl, setInspectedUrl] = useState<any>(null);
 
-  // Formulario común / manual
+  // Formulario común / carpeta local
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [localPath, setLocalPath] = useState('');
   const [forgePort, setForgePort] = useState(3000);
   const [startCommand, setStartCommand] = useState('npm start');
   const [buildCommand, setBuildCommand] = useState('');
   const [deployOnCreate, setDeployOnCreate] = useState(false);
+  const [startLocalOnCreate, setStartLocalOnCreate] = useState(false);
+  const [dockerAvailable, setDockerAvailable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(false);
 
   // Estado GitHub
@@ -60,10 +65,12 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
   const resetForm = () => {
     setName('');
     setDescription('');
+    setLocalPath('');
     setForgePort(3000);
     setStartCommand('npm start');
     setBuildCommand('');
     setDeployOnCreate(false);
+    setStartLocalOnCreate(false);
     setSelectedRepo(null);
     setDetectedStack(null);
     setRepoSearch('');
@@ -115,6 +122,9 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
+    api.getDbDockerStatus()
+      .then((res) => { if (active) setDockerAvailable(Boolean(res?.available)); })
+      .catch(() => { if (active) setDockerAvailable(false); });
     api.getGitHubStatus()
       .then((status) => {
         if (!active) return;
@@ -244,6 +254,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
         domains: [],
         envVars: detectedStack?.envVars || {},
         source: isGitHub ? 'github' : isPublicGit ? `${inspectedUrl?.provider || 'git'}-import` : 'manual',
+        localPath: tab === 'manual' && localPath.trim() ? localPath.trim() : null,
         startCommand,
         buildCommand,
         gitRepo: isGitHub && selectedRepo ? selectedRepo.clone_url : isPublicGit ? (inspectedUrl?.cloneUrl || publicGitUrl.trim()) : '',
@@ -255,13 +266,21 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
       };
 
       const created = await api.createProject(projectPayload);
+      let openTab: string | null = tab === 'manual' ? 'live' : null;
       if (created && created.id) {
         await api.activateProject(created.id);
-        if (deployOnCreate && projectPayload.gitRepo) {
-          void api.startDeploy(created.id).catch(() => {});
+        if (deployOnCreate && dockerAvailable && projectPayload.gitRepo) {
+          openTab = 'deployments';
+          api.startDeploy(created.id).catch((err: any) => {
+            onNotify?.(err?.message || 'Proyecto creado, pero no se pudo iniciar el despliegue en Docker', 'error');
+          });
+        } else if (startLocalOnCreate) {
+          api.startLocal(created.id).catch((err: any) => {
+            onNotify?.(err?.message || 'Proyecto creado, pero falló la vista previa local', 'error');
+          });
         }
       }
-      onSuccess(created?.id);
+      onSuccess(created?.id, openTab);
       resetForm();
       onClose();
     } catch (err: any) {
@@ -276,7 +295,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
       open={isOpen}
       onClose={handleClose}
       title="Nuevo proyecto"
-      subtitle="Importa un repositorio Git o configura un proyecto vacío."
+      subtitle="Conecta un repositorio Git o vincula una carpeta local sin configuraciones complejas."
       maxWidthClass="max-w-xl"
       closeDisabled={loading}
     >
@@ -318,8 +337,8 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
               : 'text-slate-600 hover:text-slate-900'
           }`}
         >
-          <Terminal className="w-3.5 h-3.5" />
-          Manual
+          <FolderOpen className="w-3.5 h-3.5" />
+          Carpeta local
         </button>
       </div>
 
@@ -665,9 +684,19 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
           </div>
         )}
 
-        {/* Pestaña Manual */}
+        {/* Pestaña Carpeta local / Live Sync */}
         {tab === 'manual' && (
           <div className="space-y-4">
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-600 leading-relaxed flex items-start justify-between gap-2">
+              <p>
+                Ideal si tienes el código en tu equipo sin subir a Git todavía. Indica una ruta local para ejecutarlo directo, o déjala vacía y sincroniza en milisegundos con <code className="font-mono text-slate-800">culkibo sync</code>.
+              </p>
+              <HelpTip title="Carpeta local y Live Sync" align="right">
+                <p>Si indicas una carpeta de este equipo, Culkibo puede arrancar tu proyecto desde ahí sin clonar nada.</p>
+                <p>Si trabajas desde otro ordenador, déjala vacía y usa la pestaña <strong>En vivo</strong> tras crear el proyecto.</p>
+              </HelpTip>
+            </div>
+
             <div>
               <span className="block text-xs font-medium text-slate-700 mb-1.5">Plantillas rápidas</span>
               <div className="flex gap-1.5 flex-wrap">
@@ -675,7 +704,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
                   { label: 'Node.js API', port: 3000, start: 'node index.js', build: '' },
                   { label: 'React / Vite', port: 5173, start: 'npm run dev', build: 'npm run build' },
                   { label: 'Python FastAPI', port: 8000, start: 'uvicorn main:app --reload', build: 'pip install -r requirements.txt' },
-                  { label: 'Contenedor Docker', port: 8080, start: 'npm start', build: '' },
+                  { label: 'Web estática', port: 8080, start: 'npx serve .', build: '' },
                 ].map((tpl) => (
                   <button
                     key={tpl.label}
@@ -706,6 +735,20 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
                 required
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
                 placeholder="mi-aplicacion"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="projectLocalPath" className="block text-xs font-medium text-slate-700 mb-1">
+                Ruta de la carpeta local (opcional)
+              </label>
+              <input
+                id="projectLocalPath"
+                type="text"
+                value={localPath}
+                onChange={(e) => setLocalPath(e.target.value)}
+                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono"
+                placeholder="C:\proyectos\mi-app o /home/usuario/mi-app"
               />
             </div>
 
@@ -755,17 +798,42 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
 
       {/* Pie del modal */}
       <div className="px-5 py-3.5 border-t border-slate-200 bg-slate-50/70 flex flex-wrap items-center justify-between gap-2">
-        {tab !== 'manual' ? (
-          <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={deployOnCreate}
-              onChange={(e) => setDeployOnCreate(e.target.checked)}
-              className="rounded border-slate-300 accent-slate-900"
-            />
-            <span>Desplegar al crear</span>
-          </label>
-        ) : <span />}
+        <div className="flex flex-wrap items-center gap-3">
+          {tab !== 'manual' ? (
+            dockerAvailable === false ? (
+              <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={startLocalOnCreate}
+                  onChange={(e) => setStartLocalOnCreate(e.target.checked)}
+                  className="rounded border-slate-300 accent-slate-900"
+                />
+                <span>Iniciar en local al crear</span>
+                <span className="text-[11px] text-amber-700">(Docker apagado)</span>
+              </label>
+            ) : (
+              <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={deployOnCreate}
+                  onChange={(e) => setDeployOnCreate(e.target.checked)}
+                  className="rounded border-slate-300 accent-slate-900"
+                />
+                <span>Desplegar en Docker al crear</span>
+              </label>
+            )
+          ) : (
+            <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={startLocalOnCreate}
+                onChange={(e) => setStartLocalOnCreate(e.target.checked)}
+                className="rounded border-slate-300 accent-slate-900"
+              />
+              <span>Iniciar vista previa local al crear</span>
+            </label>
+          )}
+        </div>
         <div className="flex items-center gap-2 ml-auto">
         <button
           type="button"
@@ -786,8 +854,10 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
               <RefreshCw className="w-3.5 h-3.5 animate-spin" />
               {tab === 'github' ? 'Importando…' : 'Creando…'}
             </>
-          ) : deployOnCreate && tab !== 'manual' ? (
+          ) : deployOnCreate && dockerAvailable && tab !== 'manual' ? (
             'Crear y desplegar'
+          ) : startLocalOnCreate ? (
+            'Crear e iniciar local'
           ) : tab === 'github' ? (
             'Importar proyecto'
           ) : (

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const EventEmitter = require('events');
 const { assertSafeUrl, safeFetch, atomicWriteJsonSync } = require('./ssrfGuard');
 
@@ -13,11 +14,17 @@ const DEFAULT_CONFIG = {
   // Qué eventos disparan un aviso. Coinciden con los tipos usados en notify().
   events: {
     service_down: true,
+    service_failed: true,
+    deploy_started: false,
     deploy_failed: true,
     deploy_succeeded: false,
     rollback: true,
     backup_failed: true,
+    backup_succeeded: false,
     production_unhealthy: true,
+    tls_expiring: true,
+    disk_warning: true,
+    cron_failed: true,
     ssl_issued: false,
     project_stopped: false
   },
@@ -177,7 +184,8 @@ class NotificationService extends EventEmitter {
   /**
    * Envía una alerta por todos los canales activos.
    * @param {{event?:string, level?:string, title?:string, message?:string,
-   *          projectId?:string | null, projectName?:string | null, url?:string | null, force?:boolean}} [payload]
+   *          projectId?:string | null, projectName?:string | null, url?:string | null,
+   *          force?:boolean, cooldownMs?:number}} [payload]
    */
   async notify(payload = {}) {
     const {
@@ -188,8 +196,11 @@ class NotificationService extends EventEmitter {
       projectId = null,
       projectName = null,
       url = null,
-      force = false
+      force = false,
+      cooldownMs
     } = payload;
+
+    const effectiveWindowMs = typeof cooldownMs === 'number' && cooldownMs >= 0 ? cooldownMs : this.dedupeWindowMs;
 
     try {
       /** @type {string | null} */
@@ -202,7 +213,7 @@ class NotificationService extends EventEmitter {
         dedupeKey = `${event}:${projectId || ''}:${title}`;
         dedupeNow = Date.now();
         const last = this.lastSentAt.get(dedupeKey) || 0;
-        if (dedupeNow - last < this.dedupeWindowMs) {
+        if (effectiveWindowMs > 0 && dedupeNow - last < effectiveWindowMs) {
           return { sent: false, reason: 'deduplicated' };
         }
         if (this.lastSentAt.size > 500) {
@@ -329,7 +340,7 @@ class NotificationService extends EventEmitter {
     if (name === 'webhook') {
       const { url: target, secretHeader } = this.config.channels.webhook;
       const { url: parsed } = await assertSafeUrl(target, { requireHttps: true });
-      return this.post(parsed.toString(), {
+      const bodyObj = {
         source: 'culkibo',
         level,
         title: heading,
@@ -337,7 +348,16 @@ class NotificationService extends EventEmitter {
         projectName,
         url,
         timestamp: new Date().toISOString()
-      }, secretHeader ? { 'X-Culkibo-Secret': secretHeader } : {});
+      };
+      const rawJson = JSON.stringify(bodyObj);
+      /** @type {Record<string, string>} */
+      const extraHeaders = {};
+      if (secretHeader) {
+        extraHeaders['X-Culkibo-Secret'] = secretHeader;
+        const hmac = crypto.createHmac('sha256', String(secretHeader)).update(rawJson).digest('hex');
+        extraHeaders['X-Culkibo-Signature-256'] = `sha256=${hmac}`;
+      }
+      return this.post(parsed.toString(), rawJson, extraHeaders);
     }
 
     throw new Error(`Canal desconocido: ${name}`);
@@ -359,7 +379,7 @@ class NotificationService extends EventEmitter {
     const res = await safeFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...extraHeaders },
-      body: JSON.stringify(body),
+      body: typeof body === 'string' ? body : JSON.stringify(body),
       requireHttps: true,
       maxRedirects: 0,
       timeoutMs: 8000

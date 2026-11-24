@@ -12,10 +12,15 @@ import {
   Radio,
   Terminal,
   Loader2,
+  ChevronDown,
+  ChevronRight,
+  KeyRound,
+  FolderOpen,
 } from 'lucide-react';
-import { api, type LiveSyncStatus, type LiveSyncRecentFrame } from '../lib/api';
+import { api, type LiveSyncStatus, type LiveSyncRecentFrame, type LiveSyncFrameDiff } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
+import { HelpTip } from './HelpTip';
 
 interface LiveForgePanelProps {
   projectId: string;
@@ -40,11 +45,15 @@ function formatFrameTime(frame: LiveSyncRecentFrame & { appliedAt?: string }): s
 export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, projectName, onNotify }) => {
   const [status, setStatus] = useState<LiveSyncStatus | null>(null);
   const [frames, setFrames] = useState<LiveSyncRecentFrame[]>([]);
-  const [merkle, setMerkle] = useState<{ inSync: boolean; serverDigest: string; fileCount: number } | null>(null);
+  const [merkle, setMerkle] = useState<{ inSync: boolean; verifiedAgainstClient: boolean; serverDigest: string; fileCount: number } | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busyAction, setBusyAction] = useState<'verify' | 'rollback' | 'promote' | null>(null);
+  const [busyAction, setBusyAction] = useState<'verify' | 'rollback' | 'promote' | 'token' | null>(null);
   const [cmdMode, setCmdMode] = useState<'local' | 'remote'>('local');
   const [copiedCmd, setCopiedCmd] = useState(false);
+  const [tempToken, setTempToken] = useState<{ ticket: string; wsUrl: string; expiresAt: string } | null>(null);
+  const [expandedSeq, setExpandedSeq] = useState<number | null>(null);
+  const [frameDiffs, setFrameDiffs] = useState<Record<number, LiveSyncFrameDiff | null>>({});
+  const [loadingDiffSeq, setLoadingDiffSeq] = useState<number | null>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadStatus = useCallback(async () => {
@@ -119,7 +128,45 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
   const host = window.location.port === '5173' ? '127.0.0.1:3030' : window.location.host;
   const syncCommand = cmdMode === 'local'
     ? `npx culkibo sync ${projectId}`
-    : `npx culkibo sync ${projectId} --url ${wsProto}//${host}/ws/sync --token TU_CULKIBO_TOKEN`;
+    : tempToken
+      ? `npx culkibo sync ${projectId} --url ${tempToken.wsUrl} --token ${tempToken.ticket}`
+      : `npx culkibo sync ${projectId} --url ${wsProto}//${host}/ws/sync --token TU_CULKIBO_TOKEN`;
+
+  const displaySyncCommand = cmdMode === 'remote' && tempToken
+    ? `npx culkibo sync ${projectId} --url ${tempToken.wsUrl} --token ${tempToken.ticket.slice(0, 8)}••••••••`
+    : syncCommand;
+
+  const handleGenerateSyncToken = async () => {
+    setBusyAction('token');
+    try {
+      const res = await api.createSyncToken(projectId);
+      setTempToken({ ticket: res.ticket, wsUrl: res.wsUrl, expiresAt: res.expiresAt });
+      setCmdMode('remote');
+      onNotify('Token temporal de Live Sync generado (caduca en 60 s)', 'success');
+    } catch (err: any) {
+      onNotify(err?.message || 'No se pudo generar el token temporal', 'error');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const toggleFrameDiff = async (seq: number) => {
+    if (expandedSeq === seq) {
+      setExpandedSeq(null);
+      return;
+    }
+    setExpandedSeq(seq);
+    if (frameDiffs[seq] !== undefined) return;
+    setLoadingDiffSeq(seq);
+    try {
+      const diff = await api.getSyncFrameDiff(projectId, seq);
+      setFrameDiffs((prev) => ({ ...prev, [seq]: diff }));
+    } catch {
+      setFrameDiffs((prev) => ({ ...prev, [seq]: null }));
+    } finally {
+      setLoadingDiffSeq(null);
+    }
+  };
 
   const handleCopyCmd = async () => {
     const ok = await copyToClipboard(syncCommand);
@@ -137,15 +184,19 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
     try {
       const res = await api.verifyProjectSync(projectId);
       const count = res.fileCount || 0;
+      const verifiedAgainstClient = Boolean(res.verifiedAgainstClient);
       setMerkle({
         inSync: Boolean(res.inSync),
+        verifiedAgainstClient,
         serverDigest: res.serverDigest || '',
         fileCount: count,
       });
       onNotify(
-        res.inSync
-          ? `Integridad verificada (${count} ${count === 1 ? 'archivo' : 'archivos'})`
-          : `Se detectaron diferencias al comprobar ${count} ${count === 1 ? 'archivo' : 'archivos'}`,
+        verifiedAgainstClient
+          ? (res.inSync
+            ? `Integridad cliente↔servidor verificada (${count} ${count === 1 ? 'archivo' : 'archivos'})`
+            : `Se detectaron diferencias al comprobar ${count} ${count === 1 ? 'archivo' : 'archivos'}`)
+          : `Árbol Merkle del servidor calculado (${count} ${count === 1 ? 'archivo' : 'archivos'})`,
         res.inSync ? 'success' : 'info'
       );
     } catch (err: any) {
@@ -175,11 +226,11 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
   const handlePromote = async () => {
     setBusyAction('promote');
     try {
-      const res = await api.promoteForge(projectId);
+      const res = await api.promoteForge(projectId, { async: true });
       onNotify(
         res.promoted
           ? `${projectName} promocionado a producción sin cortes.`
-          : 'Promoción iniciada. Revisa el avance en la pestaña Despliegues.',
+          : 'Promoción encolada. Sigue el avance en tiempo real en la pestaña Despliegues.',
         'success'
       );
     } catch (err: any) {
@@ -214,6 +265,10 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
             <div>
               <div className="flex items-center gap-2 flex-wrap">
                 <h3 className="text-sm font-semibold text-slate-900">Sincronización en vivo</h3>
+                <HelpTip title="Cómo funciona Live Sync">
+                  <p>Cada vez que guardas en tu editor local, solo viajan los archivos cambiados por WebSocket binario en menos de 10 ms.</p>
+                  <p>Cuando te guste el resultado, pulsa <strong>Promocionar a producción</strong> para compilar exactamente lo que probaste sin hacer git push.</p>
+                </HelpTip>
                 <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border tabular-nums ${
                   connected
                     ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
@@ -291,6 +346,25 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
           </div>
         </div>
 
+        {status?.targetDir && (
+          <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 rounded-lg bg-slate-50 border border-slate-200 text-[11px] text-slate-600">
+            <span className="inline-flex items-center gap-1.5 min-w-0">
+              <FolderOpen className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              <span className="text-slate-500">Carpeta de destino en servidor:</span>
+              <code className="font-mono text-slate-800 truncate">{status.targetDir}</code>
+            </span>
+            {Array.isArray(status.clients) && status.clients.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {status.clients.map((c, i) => (
+                  <span key={c.id || i} className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 font-mono text-[10px]">
+                    {c.clientName || 'CLI'}{c.sourceDir ? ` · ${c.sourceDir}` : ''}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {merkle && (
           <div
             className={`p-3.5 rounded-xl border text-xs flex items-center justify-between gap-3 flex-wrap ${
@@ -306,7 +380,9 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
                 <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
               )}
               <span>
-                {merkle.inSync ? 'Integridad verificada' : 'Diferencias detectadas'} ({merkle.fileCount}{' '}
+                {merkle.verifiedAgainstClient
+                  ? (merkle.inSync ? 'Integridad cliente↔servidor verificada' : 'Diferencias detectadas')
+                  : 'Árbol Merkle del servidor calculado'} ({merkle.fileCount}{' '}
                 {merkle.fileCount === 1 ? 'archivo' : 'archivos'})
               </span>
             </div>
@@ -323,26 +399,37 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
               <Terminal className="w-3.5 h-3.5 text-slate-500" />
               Conecta tu carpeta local con este servidor:
             </span>
-            <div className="flex items-center gap-1 bg-white p-0.5 rounded-lg border border-slate-200 text-[11px]">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
-                onClick={() => setCmdMode('local')}
-                className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${cmdMode === 'local' ? 'bg-slate-900 text-white' : 'text-slate-600'}`}
+                onClick={() => void handleGenerateSyncToken()}
+                disabled={busyAction !== null}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-white hover:bg-slate-100 border border-slate-200 text-[11px] font-medium text-slate-700 cursor-pointer disabled:opacity-50"
               >
-                Este equipo
+                {busyAction === 'token' ? <Loader2 className="w-3 h-3 animate-spin" /> : <KeyRound className="w-3 h-3 text-slate-500" />}
+                <span>{tempToken ? 'Renovar ticket' : 'Generar ticket temporal'}</span>
               </button>
-              <button
-                type="button"
-                onClick={() => setCmdMode('remote')}
-                className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${cmdMode === 'remote' ? 'bg-slate-900 text-white' : 'text-slate-600'}`}
-              >
-                Servidor remoto (VPS)
-              </button>
+              <div className="flex items-center gap-1 bg-white p-0.5 rounded-lg border border-slate-200 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => setCmdMode('local')}
+                  className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${cmdMode === 'local' ? 'bg-slate-900 text-white' : 'text-slate-600'}`}
+                >
+                  Este equipo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCmdMode('remote')}
+                  className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${cmdMode === 'remote' ? 'bg-slate-900 text-white' : 'text-slate-600'}`}
+                >
+                  Servidor remoto (VPS)
+                </button>
+              </div>
             </div>
           </div>
 
           <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-3 py-2">
-            <code className="flex-1 text-xs font-mono text-slate-800 overflow-x-auto whitespace-nowrap">{syncCommand}</code>
+            <code className="flex-1 text-xs font-mono text-slate-800 overflow-x-auto whitespace-nowrap">{displaySyncCommand}</code>
             <button
               type="button"
               onClick={() => void handleCopyCmd()}
@@ -355,12 +442,12 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
         </div>
       </div>
 
-      {/* Historial de envíos en vivo */}
+      {/* Historial de envíos en vivo con inspector de diff */}
       <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
         <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
           <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
             <Radio className="w-3.5 h-3.5 text-slate-500" />
-            <span>Últimos envíos recibidos</span>
+            <span>Últimos envíos recibidos (haz clic para ver diff)</span>
           </div>
           <button
             type="button"
@@ -380,25 +467,67 @@ export const LiveForgePanel: React.FC<LiveForgePanelProps> = ({ projectId, proje
           </div>
         ) : (
           <div className="divide-y divide-slate-100 text-xs">
-            {frames.map((f, idx) => (
-              <div key={`${f.seq}-${f.at || idx}`} className="px-5 py-3 flex items-center justify-between gap-3 hover:bg-slate-50/70">
-                <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
-                  <span className="font-mono font-semibold text-slate-800 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded tabular-nums">
-                    #{f.seq}
-                  </span>
-                  <span className="text-slate-700 tabular-nums">
-                    <strong>{f.written}</strong> escritos · <strong>{f.deleted}</strong> borrados · {f.dedupSkipped} sin cambios
-                  </span>
-                  <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200 text-[10px] font-medium">
-                    {f.mode === 'path_b_hot' ? 'En caliente' : f.mode === 'path_c_restart' ? 'Reinicio' : f.mode}
-                  </span>
+            {frames.map((f, idx) => {
+              const isOpen = expandedSeq === f.seq;
+              const diff = frameDiffs[f.seq];
+              return (
+                <div key={`${f.seq}-${f.at || idx}`}>
+                  <button
+                    type="button"
+                    onClick={() => void toggleFrameDiff(f.seq)}
+                    className="w-full px-5 py-3 flex items-center justify-between gap-3 hover:bg-slate-50/70 text-left cursor-pointer"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
+                      {isOpen ? <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
+                      <span className="font-mono font-semibold text-slate-800 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded tabular-nums">
+                        #{f.seq}
+                      </span>
+                      <span className="text-slate-700 tabular-nums">
+                        <strong>{f.written}</strong> escritos · <strong>{f.deleted}</strong> borrados · {f.dedupSkipped} sin cambios
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200 text-[10px] font-medium">
+                        {f.mode === 'path_b_hot' ? 'En caliente' : f.mode === 'path_c_restart' ? 'Reinicio' : f.mode}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0 font-mono text-slate-500 tabular-nums">
+                      <span className="text-emerald-700 font-medium">{f.applyMs} ms</span>
+                      <span>{formatFrameTime(f)}</span>
+                    </div>
+                  </button>
+                  {isOpen && (
+                    <div className="px-5 pb-4 pt-2 bg-slate-50/70 border-t border-slate-100 space-y-2.5">
+                      {loadingDiffSeq === f.seq ? (
+                        <div className="text-slate-500 flex items-center gap-1.5 py-2">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" /> Cargando diferencias del frame #{f.seq}…
+                        </div>
+                      ) : diff && Array.isArray(diff.files) && diff.files.length > 0 ? (
+                        diff.files.map((file) => (
+                          <div key={file.path} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+                            <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 font-mono text-[11px]">
+                              <span className="text-slate-800 truncate">{file.path}</span>
+                              <span className="text-slate-500 shrink-0">{file.action}</span>
+                            </div>
+                            {file.diff ? (
+                              <pre className="p-3 text-[11px] font-mono text-slate-700 overflow-x-auto max-h-56 leading-relaxed whitespace-pre">
+                                {file.diff}
+                              </pre>
+                            ) : (
+                              <div className="px-3 py-2 text-[11px] text-slate-400">
+                                {file.binary ? 'Archivo binario sincronizado' : 'Sin diff textual disponible en memoria.'}
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-slate-500 py-1">
+                          Este frame ya salió de la ventana de memoria de diffs o no tuvo cambios de contenido.
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <div className="flex items-center gap-3 shrink-0 font-mono text-slate-500 tabular-nums">
-                  <span className="text-emerald-700 font-medium">{f.applyMs} ms</span>
-                  <span>{formatFrameTime(f)}</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

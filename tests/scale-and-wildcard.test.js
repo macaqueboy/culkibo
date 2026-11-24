@@ -287,10 +287,10 @@ async function testScaleAndWildcard() {
     maintenanceMode: false
   });
   try {
-    // Verify 52 MCP tools registered including new ones
+    // Verify 72 MCP tools registered including new ones
     const listedTools = await mcpServer.handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     const toolNames = (listedTools.result?.tools || []).map((t) => t.name);
-    assert.strictEqual(toolNames.length, 52, `Expected 52 MCP tools, got ${toolNames.length}`);
+    assert.strictEqual(toolNames.length, 72, `Expected 72 MCP tools, got ${toolNames.length}`);
     assert.ok(toolNames.includes('culkibo_link_database'));
     assert.ok(toolNames.includes('culkibo_toggle_maintenance'));
     assert.ok(toolNames.includes('culkibo_get_deploy_queue'));
@@ -316,7 +316,7 @@ async function testScaleAndWildcard() {
     const qPayload = qRes.result?.structuredContent || JSON.parse(qRes.result?.content?.[0]?.text || '{}');
     assert.strictEqual(typeof qPayload.maxConcurrentBuilds, 'number');
     assert.strictEqual(typeof qPayload.activeBuilds, 'number');
-    console.log('  ✓ MCP secret redaction verified & all 52 tools (incl. queue/link/maintenance) active');
+    console.log('  ✓ MCP secret redaction verified & all 72 tools (incl. queue/link/maintenance) active');
   } finally {
     projectManager.delete(secretProj.id);
     await projectManager.flushToDisk();

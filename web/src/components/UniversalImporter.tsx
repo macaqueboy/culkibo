@@ -84,9 +84,19 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
   const [platformEnvText, setPlatformEnvText] = useState('');
   const [platformGitUrl, setPlatformGitUrl] = useState('');
   const [platformName, setPlatformName] = useState('');
+  const [platformBuildCmd, setPlatformBuildCmd] = useState('');
+  const [platformStartCmd, setPlatformStartCmd] = useState('');
+  const [platformPort, setPlatformPort] = useState(3000);
   const [platformParsed, setPlatformParsed] = useState<PlatformParseResult | null>(null);
   const [platformBusy, setPlatformBusy] = useState(false);
   const [platformError, setPlatformError] = useState<string | null>(null);
+
+  const switchSource = (next: 'wordpress' | 'coolify' | 'compose' | 'git' | 'platforms') => {
+    setSource(next);
+    setComposeError(null);
+    setGitError(null);
+    setPlatformError(null);
+  };
 
   const cards = [
     { id: 'wordpress' as const, title: 'WordPress', subtitle: 'Analiza y migra tu web o WooCommerce', icon: Globe },
@@ -185,8 +195,11 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
         envText: platformEnvText,
       });
       setPlatformParsed(res);
-      if (res.name && !platformName) setPlatformName(res.name);
-      if (res.gitRepo && !platformGitUrl) setPlatformGitUrl(res.gitRepo);
+      setPlatformName(res.name || '');
+      setPlatformGitUrl(res.gitRepo || '');
+      setPlatformBuildCmd(res.buildCommand || '');
+      setPlatformStartCmd(res.startCommand || '');
+      setPlatformPort(res.port || 3000);
     } catch (err: any) {
       setPlatformError(err?.message || 'No se pudo leer la configuración');
     } finally {
@@ -205,11 +218,11 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
         source: `${platformParsed.platform}-import`,
         gitRepo: platformGitUrl.trim() || platformParsed.gitRepo,
         gitBranch: platformParsed.gitBranch || 'main',
-        buildCommand: platformParsed.buildCommand,
-        startCommand: platformParsed.startCommand,
+        buildCommand: platformBuildCmd.trim(),
+        startCommand: platformStartCmd.trim(),
         baseDirectory: platformParsed.baseDirectory || '/',
         healthPath: platformParsed.healthPath || '/',
-        port: platformParsed.port || 3000,
+        port: Number(platformPort) || platformParsed.port || 3000,
         envVars: platformParsed.envVars,
         domains: platformParsed.domains,
       });
@@ -243,7 +256,7 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
                 type="button"
                 role="tab"
                 aria-selected={active}
-                onClick={() => setSource(c.id)}
+                onClick={() => switchSource(c.id)}
                 className={`inline-flex items-center gap-2 px-3.5 py-2.5 text-sm font-medium border-b-2 transition-colors cursor-pointer whitespace-nowrap ${
                   active
                     ? 'border-slate-900 text-slate-900'
@@ -585,18 +598,20 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
                 </span>
               </div>
 
-              {(platformParsed.buildCommand || platformParsed.startCommand) && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
-                  <div className="bg-white border border-slate-200 rounded-lg px-3 py-2">
-                    <span className="text-slate-400 block">Compilación</span>
-                    <code className="font-mono text-slate-800">{platformParsed.buildCommand || '—'}</code>
-                  </div>
-                  <div className="bg-white border border-slate-200 rounded-lg px-3 py-2">
-                    <span className="text-slate-400 block">Inicio</span>
-                    <code className="font-mono text-slate-800">{platformParsed.startCommand || '—'}</code>
-                  </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Compilación</label>
+                  <input value={platformBuildCmd} onChange={(e) => setPlatformBuildCmd(e.target.value)} placeholder="npm run build" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
                 </div>
-              )}
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Inicio</label>
+                  <input value={platformStartCmd} onChange={(e) => setPlatformStartCmd(e.target.value)} placeholder="npm start" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Puerto interno</label>
+                  <input type="number" value={platformPort} onChange={(e) => setPlatformPort(Number(e.target.value))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono tabular-nums" />
+                </div>
+              </div>
 
               {platformParsed.recommendedDatabases.length > 0 && (
                 <div className="p-3 rounded-lg bg-white border border-slate-200 text-slate-700">

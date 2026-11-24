@@ -75,16 +75,38 @@ program
 program
   .command('status')
   .description('Muestra el estado operativo del demonio de Culkibo')
-  .action(async () => {
+  .option('-p, --port <port>', 'Puerto del daemon', process.env.PORT || '3030')
+  .action(async (options) => {
+    const port = parseInt(options.port, 10) || 3030;
     try {
-      const res = await fetch('http://localhost:3030/api/health');
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
       if (res.ok) {
-        console.log('\x1b[32m✅ Culkibo está en ejecución y saludable (Código HTTP 200).\x1b[0m');
+        console.log(`\x1b[32m✅ Culkibo está en ejecución y saludable en http://127.0.0.1:${port} (HTTP 200).\x1b[0m`);
       } else {
-        console.log('\x1b[33m⚠️ Culkibo responde pero reporta anomalías.\x1b[0m');
+        console.log(`\x1b[33m⚠️ Culkibo responde en :${port} pero reporta estado HTTP ${res.status}.\x1b[0m`);
       }
     } catch (err) {
-      console.log('\x1b[31m❌ Culkibo está detenido o inalcanzable en el puerto 3030.\x1b[0m');
+      console.log(`\x1b[31m❌ Culkibo está detenido o inalcanzable en el puerto ${port}.\x1b[0m`);
+    }
+  });
+
+// Comando token (rotación / verificación segura por SSH)
+const tokenCmd = program.command('token').description('Gestiona el token maestro del plano de control');
+tokenCmd
+  .command('rotate')
+  .description('Rota de forma atómica el token maestro en data/auth.json')
+  .action(() => {
+    try {
+      const { rotateToken } = require('../server/middleware/auth');
+      const res = rotateToken();
+      console.log('\x1b[32m✅ Token maestro rotado correctamente.\x1b[0m');
+      console.log(`   Origen:     ${res.tokenSource}`);
+      console.log(`   Rotado en:  ${res.rotatedAt}`);
+      console.log(`   Nuevo token: ${res.token}`);
+      console.log('   Nota: Si el daemon está corriendo en otro proceso, reinícialo o rota desde el panel web.\n');
+    } catch (err) {
+      console.error(`\x1b[31m❌ No se pudo rotar el token:\x1b[0m ${err.message}`);
+      process.exit(1);
     }
   });
 
@@ -96,73 +118,43 @@ program
     console.log('\x1b[33m🛑 Para detener el servidor, presione Ctrl+C en la terminal activa o termine el proceso de Node con Stop-Process / kill.\x1b[0m');
   });
 
-// Comando doctor (diagnóstico integral del sistema)
+// Comando doctor (reutiliza systemDoctor.runDoctor() con opción --fix)
 program
   .command('doctor')
-  .description('Ejecuta un chequeo de diagnóstico integral del entorno y dependencias')
-  .action(async () => {
+  .description('Ejecuta el diagnóstico real completo del sistema (Node, Docker, Caddy, disco, RAM, TLS, seguridad)')
+  .option('--fix <action>', 'Ejecuta una remediación automática (reconcile_caddy | start_caddy | clean_tmp | clean_orphans | prune_buildkit)')
+  .action(async (options) => {
+    const systemDoctor = require('../server/services/systemDoctor');
+    if (options.fix) {
+      try {
+        const fixRes = await systemDoctor.applyFix(options.fix);
+        console.log(`\x1b[32m✅ ${fixRes.message}\x1b[0m`);
+      } catch (err) {
+        console.error(`\x1b[31m❌ Error ejecutando remediación "${options.fix}":\x1b[0m ${err.message}`);
+        process.exit(1);
+      }
+      return;
+    }
+
     console.log('\n\x1b[36m🩺 DIAGNÓSTICO INTEGRAL DE CULKIBO\x1b[0m');
     console.log('==================================================');
-
-    // 1. Node.js version
-    const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
-    if (nodeMajor >= 18) {
-      console.log(`\x1b[32m  ✓ Node.js:\x1b[0m ${process.version} (Cumple requisito mínimo >= v18)`);
-    } else {
-      console.log(`\x1b[31m  ✗ Node.js:\x1b[0m ${process.version} (Se recomienda actualizar a >= v20)`);
-    }
-
-    // 2. Docker Daemon
-    const dockerStatus = await svc.dockerManager.checkDockerStatus(true);
-    if (dockerStatus.available) {
-      console.log(`\x1b[32m  ✓ Motor Docker:\x1b[0m Activo (${dockerStatus.serverVersion}) — Modo Nativo`);
-    } else {
-      console.log(`\x1b[33m  ⚠️ Motor Docker:\x1b[0m Inactivo o no detectado. Modo Sandbox de Procesos activado`);
-    }
-
-    // 2b. Caddy (Plano de datos)
-    const caddyStatus = await svc.caddyManager.detect({ force: true });
-    if (caddyStatus.available) {
-      console.log(`\x1b[32m  ✓ Plano de datos Caddy:\x1b[0m Activo en ${caddyStatus.adminUrl}`);
-    } else {
-      console.log(`\x1b[33m  ⚠️ Plano de datos Caddy:\x1b[0m No detectado (${caddyStatus.reason}). El panel sigue operativo sin ingress real.`);
-    }
-
-    // 3. Permisos de disco
-    const dirsToCheck = ['./data', './projects', './data/backups'];
-    dirsToCheck.forEach(d => {
-      try {
-        if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-        const testFile = path.join(d, '.write_test');
-        fs.writeFileSync(testFile, 'ok');
-        fs.unlinkSync(testFile);
-        console.log(`\x1b[32m  ✓ Directorio ${d}:\x1b[0m Permisos de lectura/escritura correctos`);
-      } catch (e) {
-        console.log(`\x1b[31m  ✗ Directorio ${d}:\x1b[0m Error de permisos: ${e.message}`);
+    const report = await systemDoctor.runDoctor();
+    for (const c of report.checks) {
+      const badge = c.status === 'ok'
+        ? '\x1b[32m  ✓\x1b[0m'
+        : c.status === 'warn'
+          ? '\x1b[33m  ⚠\x1b[0m'
+          : '\x1b[31m  ✗\x1b[0m';
+      console.log(`${badge} \x1b[1m${c.name}:\x1b[0m ${c.summary}`);
+      if (c.status !== 'ok') {
+        console.log(`      ${c.detail}`);
+        if (c.fixAction) {
+          console.log(`      \x1b[36m→ Solución 1 clic:\x1b[0m culkibo doctor --fix ${c.fixAction}`);
+        }
       }
-    });
-
-    // 4. Cloudflare
-    const cfConfig = svc.cloudflareService.config;
-    if (cfConfig.apiToken) {
-      console.log(`\x1b[32m  ✓ Cloudflare API:\x1b[0m Token configurado correctamente`);
-    } else {
-      console.log(`\x1b[33m  ⚠️ Cloudflare API:\x1b[0m Token no configurado (usando emulador local de zonas)`);
     }
-
-    // 5. Verificación de puertos
-    const checkPort = (port) => new Promise(resolve => {
-      const tester = net.createServer()
-        .once('error', (/** @type {any} */ err) => resolve({ port, free: false, error: err.code }))
-        .once('listening', () => tester.once('close', () => resolve({ port, free: true })).close())
-        .listen(port, '0.0.0.0');
-    });
-
-    const port3030 = await checkPort(3030);
-    console.log(`  • Puerto 3030 (Panel/API): ${port3030.free ? '\x1b[32mDisponible\x1b[0m' : '\x1b[36mEn uso (demonio activo)\x1b[0m'}`);
-
     console.log('==================================================');
-    console.log('\x1b[32m✨ Diagnóstico finalizado con éxito.\x1b[0m\n');
+    console.log(`Resumen: ${report.summary.ok} OK · ${report.summary.warn} avisos · ${report.summary.fail} fallos (${report.durationMs} ms)\n`);
   });
 
 // Comando watch
@@ -544,31 +536,102 @@ catalogCmd
     })));
   });
 
-// Auto-actualización limpia sin shell
+// Auto-actualización atómica sin shell con respaldo y rollback automático si algo falla
 program
   .command('update')
-  .description('Actualiza Culkibo desde GitHub (git pull --ff-only + dependencias + panel web)')
-  .action(async () => {
+  .description('Actualiza Culkibo desde GitHub con respaldo previo y rollback automático en caso de error')
+  .option('--branch <branch>', 'Rama de origen', 'main')
+  .option('--keep-web-deps', 'Conservar web/node_modules tras compilar el panel')
+  .action(async (options) => {
     const rootDir = path.resolve(__dirname, '..');
-    console.log('\n🔄 Actualizando Culkibo desde origin/main...');
+    const dataDir = path.join(rootDir, 'data');
+    const webDist = path.join(rootDir, 'web', 'dist');
+    const webDistBak = path.join(rootDir, 'web', '.dist.bak');
+    const branch = String(options.branch || 'main').replace(/[^a-zA-Z0-9._/-]/g, '') || 'main';
+
+    const captureGit = (args) => new Promise((resolve, reject) => {
+      const child = spawn('git', args, { cwd: rootDir, shell: false, windowsHide: true });
+      let out = '';
+      let err = '';
+      child.stdout.on('data', (d) => { out += d.toString(); });
+      child.stderr.on('data', (d) => { err += d.toString(); });
+      child.on('error', reject);
+      child.on('close', (code) => code === 0 ? resolve(out.trim()) : reject(new Error(err.trim() || `git ${args[0]} code ${code}`)));
+    });
+
+    console.log(`\n🔄 Actualizando Culkibo desde origin/${branch} (con protección de rollback)...`);
+    let prevSha = '';
     try {
-      await runSpawnStep('git', ['pull', '--ff-only'], rootDir);
-      await runSpawnStep('npm', ['install', '--no-audit', '--no-fund'], rootDir);
+      // 1. Verificar espacio libre mínimo (>= 512 MB)
+      if (typeof fs.statfsSync === 'function') {
+        const st = fs.statfsSync(rootDir);
+        const freeMb = Math.round((st.bavail * st.bsize) / (1024 * 1024));
+        if (freeMb < 512) {
+          throw new Error(`Espacio libre insuficiente (${freeMb} MB; mínimo 512 MB para actualizar con seguridad)`);
+        }
+      }
+      prevSha = await captureGit(['rev-parse', 'HEAD']);
+
+      // 2. Snapshot de configuración data/*.json + copia de seguridad de web/dist
+      const preUpdateDir = path.join(dataDir, 'backups', `pre-update-${Date.now()}`);
+      if (fs.existsSync(dataDir)) {
+        fs.mkdirSync(preUpdateDir, { recursive: true, mode: 0o700 });
+        for (const f of fs.readdirSync(dataDir)) {
+          if (f.endsWith('.json')) {
+            try { fs.copyFileSync(path.join(dataDir, f), path.join(preUpdateDir, f)); } catch (e) {}
+          }
+        }
+      }
+      if (fs.existsSync(webDist)) {
+        fs.rmSync(webDistBak, { recursive: true, force: true });
+        fs.cpSync(webDist, webDistBak, { recursive: true });
+      }
+
+      // 3. Descargar y aplicar cambios sin instalar devDependencies pesadas en el servidor
+      await runSpawnStep('git', ['fetch', '--depth', '1', 'origin', branch], rootDir);
+      await runSpawnStep('git', ['merge', '--ff-only', 'FETCH_HEAD'], rootDir);
+      await runSpawnStep('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund'], rootDir).catch(() =>
+        runSpawnStep('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'], rootDir)
+      );
       await runSpawnStep('npm', ['--prefix', 'web', 'ci', '--no-audit', '--no-fund'], rootDir);
       await runSpawnStep('npm', ['run', 'web:build'], rootDir);
-      console.log('\x1b[32m✅ Culkibo actualizado. Reinicia el servicio (p. ej. systemctl restart culkibo) para aplicar cambios.\x1b[0m\n');
+
+      // 4. Verificación de integridad antes de confirmar
+      if (!fs.existsSync(path.join(webDist, 'index.html'))) {
+        throw new Error('La compilación del panel no generó web/dist/index.html');
+      }
+      await runSpawnStep(process.execPath, ['--check', path.join(rootDir, 'server', 'index.js')], rootDir);
+
+      fs.rmSync(webDistBak, { recursive: true, force: true });
+      if (!options.keepWebDeps && process.env.NODE_ENV === 'production') {
+        fs.rmSync(path.join(rootDir, 'web', 'node_modules'), { recursive: true, force: true });
+      }
+      console.log('\x1b[32m✅ Culkibo actualizado y verificado. Reinicia el servicio (p. ej. systemctl restart culkibo) para aplicar cambios.\x1b[0m\n');
     } catch (err) {
       console.error(`\x1b[31m❌ Error al actualizar Culkibo:\x1b[0m ${err.message}`);
+      if (prevSha) {
+        console.log(`\x1b[33m↩️  Revirtiendo automáticamente al commit estable ${prevSha.slice(0, 7)}...\x1b[0m`);
+        try {
+          await runSpawnStep('git', ['reset', '--hard', prevSha], rootDir);
+          if (fs.existsSync(webDistBak)) {
+            fs.rmSync(webDist, { recursive: true, force: true });
+            fs.renameSync(webDistBak, webDist);
+          }
+          await runSpawnStep('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund'], rootDir).catch(() => {});
+          console.log('\x1b[32m✅ Estado anterior restaurado limpiamente.\x1b[0m\n');
+        } catch (rbErr) {
+          console.error(`\x1b[31m❌ Fallo durante la reversión:\x1b[0m ${rbErr.message}`);
+        }
+      }
       process.exit(1);
     }
   });
 
-// Transporte stdio MCP
+// Transporte stdio MCP (con puente HTTP automático hacia VPS remoto cuando CULKIBO_API_URL está definido)
 program
   .command('mcp')
-  .description('Ejecuta el servidor MCP sobre entrada/salida estándar (stdio)')
+  .description('Ejecuta el servidor MCP sobre entrada/salida estándar (stdio local o puente remoto HTTP)')
   .action(() => {
-    // En transporte MCP stdio, stdout está reservado 100% a tramas JSON-RPC: redirigir logs de servicios a stderr.
     const toStderr = (...args) => {
       try { process.stderr.write(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') + '\n'); } catch (e) {}
     };
@@ -576,7 +639,10 @@ program
     console.info = toStderr;
     console.warn = toStderr;
 
-    const mcpServer = svc.mcpServer;
+    const remoteApiUrl = (process.env.CULKIBO_API_URL || '').trim().replace(/\/+$/, '');
+    const remoteToken = (process.env.CULKIBO_TOKEN || '').trim();
+    const mcpServer = remoteApiUrl ? null : svc.mcpServer;
+
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -587,9 +653,42 @@ program
       try {
         if (!line.trim()) return;
         const request = JSON.parse(line);
-        // Las notificaciones JSON-RPC (sin `id`) no llevan respuesta según especificación.
         if (!('id' in request) || request.id === undefined) return;
-        const response = await mcpServer.handleJsonRpc(request);
+
+        if (remoteApiUrl) {
+          const headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'MCP-Protocol-Version': '2026-07-28',
+            ...(request.method ? { 'Mcp-Method': String(request.method) } : {}),
+            ...(request.params?.name ? { 'Mcp-Name': String(request.params.name) } : {}),
+            ...(remoteToken ? { 'Authorization': `Bearer ${remoteToken}` } : {})
+          };
+          const endpoint = remoteApiUrl.endsWith('/api/mcp') ? remoteApiUrl : `${remoteApiUrl}/api/mcp`;
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(request)
+          });
+          const bodyText = await res.text();
+          if (bodyText.trim()) {
+            process.stdout.write(bodyText.trim() + '\n');
+          } else {
+            process.stdout.write(JSON.stringify({
+              jsonrpc: '2.0',
+              id: request.id,
+              error: { code: -32000, message: `Servidor remoto MCP respondió HTTP ${res.status}` }
+            }) + '\n');
+          }
+          return;
+        }
+
+        if (!mcpServer) return;
+        const useModern = request.method === 'server/discover'
+          || request._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28';
+        const response = useModern && typeof mcpServer.handleModernRpc === 'function'
+          ? await mcpServer.handleModernRpc(request, { transport: 'stdio' })
+          : await mcpServer.handleJsonRpc(request);
         process.stdout.write(JSON.stringify(response) + '\n');
       } catch (err) {
         process.stdout.write(JSON.stringify({
@@ -600,8 +699,11 @@ program
       }
     });
 
-    // P0-6: garantizar escritura atómica en disco al cerrar stdin del transporte MCP stdio
     rl.on('close', () => {
+      if (remoteApiUrl) {
+        process.exit(0);
+        return;
+      }
       Promise.resolve(svc.projectManager.flushToDisk()).catch(() => {}).finally(() => {
         process.exit(0);
       });

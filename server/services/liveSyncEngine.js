@@ -29,13 +29,20 @@ const IGNORED_DIRS = new Set([
   'node_modules',
   '.next',
   '.nuxt',
+  '.turbo',
+  '.svelte-kit',
+  '.output',
+  '.astro',
+  '.cache',
   '.culkibo',
   'dist',
   'build',
   'coverage',
   '__pycache__',
   '.venv',
-  'venv'
+  'venv',
+  'target',
+  'vendor'
 ]);
 
 const IGNORED_FILES = new Set(['.DS_Store', 'Thumbs.db']);
@@ -228,13 +235,22 @@ function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
     if (ensuredDirs) ensuredDirs.add(dir);
   }
   if (process.platform === 'win32') {
-    const fd = fs.openSync(absPath, 'w');
-    try {
-      if (buffer.length > 0) fs.writeSync(fd, buffer, 0, buffer.length, 0);
-      const st = fs.fstatSync(fd);
-      return { mtimeMs: st.mtimeMs, size: st.size };
-    } finally {
-      fs.closeSync(fd);
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const fd = fs.openSync(absPath, 'w');
+        try {
+          if (buffer.length > 0) fs.writeSync(fd, buffer, 0, buffer.length, 0);
+          const st = fs.fstatSync(fd);
+          return { mtimeMs: st.mtimeMs, size: st.size };
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch (err) {
+        const transient = err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES');
+        if (!transient || attempt === maxAttempts) throw err;
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); } catch (e) {}
+      }
     }
   }
   const tempPath = `${absPath}.culkibo-sync-${process.pid}-${++tempSeq}.tmp`;
@@ -441,6 +457,18 @@ class LiveSyncEngine extends EventEmitter {
       /** @type {any} */ (err).code = 'INVALID_PROJECT_ID';
       throw err;
     }
+    // Respetar `project.localPath` si está configurado en ProjectManager y existe como directorio real
+    try {
+      const pm = require('./projectManager');
+      const project = pm && typeof pm.getById === 'function' ? pm.getById(cleanId) : null;
+      const lp = typeof project?.localPath === 'string' ? project.localPath.trim() : '';
+      if (lp && !lp.includes('\0')) {
+        const resolved = path.resolve(lp);
+        if (resolved !== path.parse(resolved).root && fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+          return resolved;
+        }
+      }
+    } catch (e) {}
     return path.join(ROOT_BASE_DIR, 'projects', cleanId);
   }
 
@@ -457,6 +485,7 @@ class LiveSyncEngine extends EventEmitter {
         projectId,
         lastSeq: 0,
         connectedClients: 0,
+        clients: /** @type {Map<string, { id: string, clientName: string, sourceDir: string | null, pid: number | null, connectedAt: string }>} */ (new Map()),
         framesApplied: 0,
         filesWritten: 0,
         filesDeleted: 0,
@@ -506,18 +535,30 @@ class LiveSyncEngine extends EventEmitter {
     return evicted;
   }
 
-  registerClient(projectId) {
+  /** @param {string} projectId @param {{ id?: string, clientName?: string | null, sourceDir?: string | null, pid?: number | null }} [meta] */
+  registerClient(projectId, meta = {}) {
     const s = this.getOrCreateSession(projectId);
     s.connectedClients++;
-    this.emit('sync_client', { projectId, connectedClients: s.connectedClients });
+    if (meta && meta.id) {
+      s.clients.set(meta.id, {
+        id: meta.id,
+        clientName: String(meta.clientName || 'cli').slice(0, 80),
+        sourceDir: meta.sourceDir ? String(meta.sourceDir).slice(0, 300) : null,
+        pid: typeof meta.pid === 'number' ? meta.pid : null,
+        connectedAt: new Date().toISOString()
+      });
+    }
+    this.emit('sync_client', { projectId, connectedClients: s.connectedClients, clients: Array.from(s.clients.values()) });
     return s;
   }
 
-  unregisterClient(projectId) {
+  /** @param {string} projectId @param {string | null} [clientId] */
+  unregisterClient(projectId, clientId = null) {
     const s = this.sessions.get(projectId);
     if (!s) return;
+    if (clientId && s.clients) s.clients.delete(clientId);
     s.connectedClients = Math.max(0, s.connectedClients - 1);
-    this.emit('sync_client', { projectId, connectedClients: s.connectedClients });
+    this.emit('sync_client', { projectId, connectedClients: s.connectedClients, clients: Array.from((s.clients || new Map()).values()) });
   }
 
   /** Emite el evento `sync_applied` (permite enviarlo tras `frame_ack` en /ws/sync). */
@@ -691,7 +732,11 @@ class LiveSyncEngine extends EventEmitter {
           }
           undoEntries.push({ rel: entry.rel, abs: entry.abs, existed: true, prevBuffer });
           if (prevBuffer) undoBytes += prevBuffer.length;
-          fs.unlinkSync(entry.abs);
+          if (entry.stat && entry.stat.isDirectory()) {
+            fs.rmSync(entry.abs, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(entry.abs);
+          }
           const prevCached = cache.get(entry.abs);
           if (prevCached) {
             session.fileCacheBytes = Math.max(0, session.fileCacheBytes - prevCached.buf.length);
@@ -726,17 +771,26 @@ class LiveSyncEngine extends EventEmitter {
     const appliedAt = new Date().toISOString();
 
     if (undoEntries.length > 0) {
+      const afterByRel = new Map();
+      let afterBytes = 0;
+      for (const p of prepared) {
+        if (p.op === 'upsert' && p.buffer && p.buffer.length <= 32 * 1024 && !p.buffer.includes(0)) {
+          afterByRel.set(p.rel, p.buffer);
+          afterBytes += p.buffer.length;
+        }
+      }
       const patch = {
         patchId: `patch_${seq}_${Date.now()}`,
         seq,
         appliedAt,
         files: changedPaths,
         classification: classification.path,
-        byteSize: undoBytes,
-        undoEntries
+        byteSize: undoBytes + afterBytes,
+        undoEntries,
+        afterByRel
       };
       session.patchHistory.unshift(patch);
-      session.patchHistoryBytes = (session.patchHistoryBytes || 0) + undoBytes;
+      session.patchHistoryBytes = (session.patchHistoryBytes || 0) + patch.byteSize;
       while (
         session.patchHistory.length > MAX_PATCH_HISTORY ||
         (session.patchHistory.length > 1 && session.patchHistoryBytes > MAX_PATCH_HISTORY_BYTES)
@@ -855,6 +909,53 @@ class LiveSyncEngine extends EventEmitter {
   }
 
   /**
+   * Devuelve una vista compacta del diff de un Commit Frame concreto en el historial de sesión.
+   * @param {string} projectId
+   * @param {number} seq
+   */
+  getFrameDiff(projectId, seq) {
+    const session = this.getOrCreateSession(projectId);
+    const numSeq = Number(seq);
+    const patch = (session.patchHistory || []).find((p) => Number(p.seq) === numSeq);
+    if (!patch) return null;
+
+    const files = (patch.undoEntries || []).map((u) => {
+      const beforeBuf = u.prevBuffer;
+      const afterBuf = patch.afterByRel ? patch.afterByRel.get(u.rel) : null;
+      const isBinary = (beforeBuf && beforeBuf.includes(0)) || (afterBuf && afterBuf.includes(0));
+      if (isBinary) {
+        return {
+          path: u.rel,
+          binary: true,
+          existedBefore: Boolean(u.existed),
+          beforeBytes: beforeBuf ? beforeBuf.length : 0,
+          afterBytes: afterBuf ? afterBuf.length : 0
+        };
+      }
+      const beforeText = beforeBuf ? beforeBuf.toString('utf8').slice(0, 16384) : '';
+      const afterText = afterBuf ? afterBuf.toString('utf8').slice(0, 16384) : (u.existed && !afterBuf ? '' : '');
+      const status = !u.existed ? 'added' : (!afterBuf && !fs.existsSync(u.abs) ? 'deleted' : 'modified');
+      return {
+        path: u.rel,
+        status,
+        binary: false,
+        before: beforeText,
+        after: afterText,
+        truncated: (beforeBuf && beforeBuf.length > 16384) || (afterBuf && afterBuf.length > 16384)
+      };
+    });
+
+    return {
+      projectId,
+      seq: patch.seq,
+      patchId: patch.patchId,
+      appliedAt: patch.appliedAt,
+      mode: patch.classification,
+      files
+    };
+  }
+
+  /**
    * Verifica la integridad del árbol de archivos del servidor contra un digest
    * o mapa de hashes del cliente.
    *
@@ -869,9 +970,11 @@ class LiveSyncEngine extends EventEmitter {
 
     /** @type {any} */
     let comparison = null;
+    let verifiedAgainstClient = false;
     if (opts.clientFiles && typeof opts.clientFiles === 'object') {
       comparison = diffMerkleTrees(opts.clientFiles, tree.files);
       session.driftDetected = !comparison.inSync;
+      verifiedAgainstClient = true;
     } else if (opts.clientDigest) {
       const inSync = opts.clientDigest === tree.rootDigest;
       comparison = {
@@ -882,9 +985,14 @@ class LiveSyncEngine extends EventEmitter {
         extraOnServer: /** @type {string[]} */ ([])
       };
       session.driftDetected = !inSync;
+      verifiedAgainstClient = true;
     } else {
       session.driftDetected = false;
     }
+
+    const inSyncVal = comparison
+      ? comparison.inSync
+      : (session.connectedClients > 0 ? !session.driftDetected : null);
 
     return {
       projectId,
@@ -892,7 +1000,13 @@ class LiveSyncEngine extends EventEmitter {
       serverDigest: tree.rootDigest,
       fileCount: tree.fileCount,
       totalBytes: tree.totalBytes,
-      inSync: comparison ? comparison.inSync : !session.driftDetected,
+      inSync: inSyncVal,
+      verifiedAgainstClient,
+      message: verifiedAgainstClient
+        ? (inSyncVal ? 'Árbol Merkle idéntico entre cliente y servidor.' : 'Se detectaron diferencias respecto al cliente.')
+        : (session.connectedClients === 0
+          ? 'Árbol local verificado en disco (sin cliente Live Sync conectado para comparar).'
+          : 'Árbol local verificado en disco.'),
       comparison,
       verifyMs: Number((Number(process.hrtime.bigint() - startedNs) / 1e6).toFixed(2)),
       lastSeq: session.lastSeq,
@@ -911,6 +1025,7 @@ class LiveSyncEngine extends EventEmitter {
       projectId,
       targetDir: this.resolveTargetDir(projectId),
       connectedClients: s.connectedClients,
+      clients: Array.from((s.clients || new Map()).values()),
       lastSeq: s.lastSeq,
       framesApplied: s.framesApplied,
       filesWritten: s.filesWritten,

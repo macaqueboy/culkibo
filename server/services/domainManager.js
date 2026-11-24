@@ -1,6 +1,8 @@
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
+const { hashBcrypt, isBcryptHash } = require('./bcryptHash');
 
 /** Carga perezosa: evita arrastrar dns/ssl/cloudflare en el arranque en frío. */
 /** @type {any} */
@@ -39,13 +41,49 @@ const UPDATABLE_DOMAIN_FIELDS = new Set([
   'routingMode',
   'canonicalRedirect',
   'securityHeaders',
+  'framePolicy',
   'customHeaders',
+  'basicAuth',
+  'ipAllowlist',
+  'maxBodySizeMb',
+  'rateLimit',
   'status',
   'serviceId',
   'serviceName',
   'lastCheckedAt',
   'migrationSource'
 ]);
+
+const HOP_BY_HOP_HEADER_RE = /^(host|content-length|transfer-encoding|connection|keep-alive|upgrade|proxy-authenticate|proxy-authorization|te|trailer)$/i;
+
+/** Valida una IP o CIDR IPv4/IPv6 para la lista blanca de Caddy `client_ip`. */
+function isValidCidrOrIp(entry) {
+  const clean = String(entry || '').trim();
+  if (!clean) return false;
+  const parts = clean.split('/');
+  if (parts.length > 2) return false;
+  const ipKind = net.isIP(parts[0]);
+  if (ipKind !== 4 && ipKind !== 6) return false;
+  if (parts.length === 2) {
+    if (!/^\d{1,3}$/.test(parts[1])) return false;
+    const prefix = Number(parts[1]);
+    const maxBits = ipKind === 4 ? 32 : 128;
+    if (prefix < 0 || prefix > maxBits) return false;
+  }
+  return true;
+}
+
+/** Oculta los hashes bcrypt antes de exponer un dominio en API/JSON público. */
+function sanitizeBasicAuthForPublic(basicAuth) {
+  if (!basicAuth || typeof basicAuth !== 'object') return null;
+  const accounts = Array.isArray(basicAuth.accounts) ? basicAuth.accounts : [];
+  return {
+    enabled: Boolean(basicAuth.enabled && accounts.length > 0),
+    realm: String(basicAuth.realm || 'Acceso protegido'),
+    usernames: accounts.map((a) => a.username),
+    accountCount: accounts.length
+  };
+}
 
 /** Rangos CIDR IPv4 oficiales de Cloudflare (parseados a [networkInt, maskInt]). */
 const CF_IPV4_RANGES = [
@@ -211,6 +249,7 @@ class DomainManager {
       const cert = sslManager.matchCertificate(d.hostname, certs);
       return {
         ...d,
+        ...(d.basicAuth ? { basicAuth: sanitizeBasicAuthForPublic(d.basicAuth) } : {}),
         projectId: d.projectId || null,
         certClaim: cert ? {
           verified: false,
@@ -538,9 +577,162 @@ class DomainManager {
     if (safeUpdates.cloudflareProxied !== undefined) {
       safeUpdates.cloudflareProxied = Boolean(safeUpdates.cloudflareProxied);
     }
+
+    const effectiveHostname = safeUpdates.hostname || this.domains[idx].hostname;
+    const effectiveWildcard = effectiveHostname.startsWith('*.');
+
+    // Validar redirección canónica (evita estados no-op silenciosos en Caddy)
+    if (safeUpdates.canonicalRedirect !== undefined) {
+      const mode = String(safeUpdates.canonicalRedirect || 'none');
+      if (!['none', 'www_to_apex', 'apex_to_www'].includes(mode)) {
+        throw new Error(`Modo de redirección canónica inválido: ${mode}`);
+      }
+      if (mode !== 'none' && effectiveWildcard) {
+        throw new Error('La redirección canónica www ↔ raíz no aplica a dominios comodín (*.dominio)');
+      }
+      if (mode === 'www_to_apex' && effectiveHostname.startsWith('www.')) {
+        throw new Error('Usa "www → raíz" en el dominio raíz (sin www.), no en www.*');
+      }
+      if (mode === 'apex_to_www' && !effectiveHostname.startsWith('www.')) {
+        throw new Error('Usa "raíz → www" en el dominio www.*, no en el dominio raíz');
+      }
+      if (mode !== 'none') {
+        const companion = mode === 'www_to_apex' ? `www.${effectiveHostname}` : effectiveHostname.slice(4);
+        const dup = this.domains.find((d, i) => i !== idx && d.hostname === companion);
+        if (dup) {
+          throw new Error(`El dominio acompañante ${companion} ya está registrado por separado en Culkibo`);
+        }
+      }
+      safeUpdates.canonicalRedirect = mode;
+    }
+
+    // Validar framePolicy
+    if (safeUpdates.framePolicy !== undefined) {
+      const fp = safeUpdates.framePolicy ? String(safeUpdates.framePolicy).toUpperCase() : null;
+      if (fp && !['DENY', 'SAMEORIGIN', 'ALLOW'].includes(fp)) {
+        throw new Error(`framePolicy inválido: ${fp}`);
+      }
+      safeUpdates.framePolicy = fp;
+    }
+
+    // Validar y sanear customHeaders (sin CRLF ni hop-by-hop)
+    if (safeUpdates.customHeaders !== undefined) {
+      if (safeUpdates.customHeaders === null) {
+        safeUpdates.customHeaders = null;
+      } else if (typeof safeUpdates.customHeaders === 'object') {
+        /** @type {{ response?: Record<string, string>, request?: Record<string, string> }} */
+        const cleanHeaders = {};
+        for (const section of ['response', 'request']) {
+          const src = safeUpdates.customHeaders[section];
+          if (!src || typeof src !== 'object') continue;
+          /** @type {Record<string, string>} */
+          const map = {};
+          let count = 0;
+          for (const [hk, hv] of Object.entries(src)) {
+            if (count >= 20) break;
+            const k = String(hk).trim();
+            if (!/^[A-Za-z0-9-]+$/.test(k) || HOP_BY_HOP_HEADER_RE.test(k)) continue;
+            map[k] = String(hv == null ? '' : hv).replace(/[\r\n\0]/g, '').slice(0, 1024);
+            count++;
+          }
+          if (Object.keys(map).length > 0) cleanHeaders[section] = map;
+        }
+        safeUpdates.customHeaders = (cleanHeaders.response || cleanHeaders.request) ? cleanHeaders : null;
+      }
+    }
+
+    // Validar y cifrar con bcrypt las cuentas de HTTP Basic Auth (nunca guardar texto plano)
+    if (safeUpdates.basicAuth !== undefined) {
+      if (!safeUpdates.basicAuth || safeUpdates.basicAuth.enabled === false) {
+        safeUpdates.basicAuth = { enabled: false, realm: 'Acceso protegido', accounts: [] };
+      } else if (typeof safeUpdates.basicAuth === 'object') {
+        const prevAccounts = new Map(
+          ((this.domains[idx].basicAuth && this.domains[idx].basicAuth.accounts) || []).map((a) => [a.username, a.passwordHash])
+        );
+        const rawList = Array.isArray(safeUpdates.basicAuth.accounts)
+          ? safeUpdates.basicAuth.accounts
+          : (Array.isArray(safeUpdates.basicAuth.users) ? safeUpdates.basicAuth.users : []);
+        /** @type {Array<{ username: string, passwordHash: string }>} */
+        const hashedAccounts = [];
+        for (const item of rawList.slice(0, 20)) {
+          if (!item || typeof item !== 'object') continue;
+          const username = String(item.username || '').trim();
+          if (!username || !/^[A-Za-z0-9._@+-]{1,64}$/.test(username)) {
+            throw new Error(`Usuario de Basic Auth inválido: "${username.slice(0, 30)}"`);
+          }
+          let passwordHash = '';
+          if (typeof item.password === 'string' && item.password.length > 0) {
+            passwordHash = isBcryptHash(item.password) ? item.password : hashBcrypt(item.password, 10);
+          } else if (typeof item.passwordHash === 'string' && isBcryptHash(item.passwordHash)) {
+            passwordHash = item.passwordHash;
+          } else if (prevAccounts.has(username)) {
+            passwordHash = prevAccounts.get(username);
+          } else {
+            throw new Error(`Debes indicar una contraseña para el usuario "${username}"`);
+          }
+          hashedAccounts.push({ username, passwordHash });
+        }
+        if (hashedAccounts.length === 0) {
+          throw new Error('Activar Basic Auth requiere al menos un usuario con contraseña');
+        }
+        safeUpdates.basicAuth = {
+          enabled: true,
+          realm: String(safeUpdates.basicAuth.realm || 'Acceso protegido').replace(/[\r\n\0"]/g, '').slice(0, 80),
+          accounts: hashedAccounts
+        };
+      }
+    }
+
+    // Validar IP Allowlist (CIDRs / IPs IPv4 e IPv6)
+    if (safeUpdates.ipAllowlist !== undefined) {
+      if (safeUpdates.ipAllowlist === null || (Array.isArray(safeUpdates.ipAllowlist) && safeUpdates.ipAllowlist.length === 0)) {
+        safeUpdates.ipAllowlist = [];
+      } else if (Array.isArray(safeUpdates.ipAllowlist)) {
+        const cleanIps = [];
+        for (const rawIp of safeUpdates.ipAllowlist.slice(0, 64)) {
+          const s = String(rawIp || '').trim();
+          if (!s) continue;
+          if (!isValidCidrOrIp(s)) {
+            throw new Error(`IP o rango CIDR inválido en lista blanca: "${s.slice(0, 48)}"`);
+          }
+          cleanIps.push(s);
+        }
+        safeUpdates.ipAllowlist = Array.from(new Set(cleanIps));
+      } else {
+        throw new Error('ipAllowlist debe ser un array de direcciones IP o rangos CIDR');
+      }
+    }
+
+    // Validar maxBodySizeMb
+    if (safeUpdates.maxBodySizeMb !== undefined) {
+      if (safeUpdates.maxBodySizeMb === null || safeUpdates.maxBodySizeMb === '') {
+        safeUpdates.maxBodySizeMb = null;
+      } else {
+        const mb = Number(safeUpdates.maxBodySizeMb);
+        if (!Number.isFinite(mb) || mb < 1 || mb > 10240) {
+          throw new Error('maxBodySizeMb debe estar entre 1 y 10240 MB');
+        }
+        safeUpdates.maxBodySizeMb = Math.round(mb);
+      }
+    }
+
+    // Validar rateLimit por dominio
+    if (safeUpdates.rateLimit !== undefined) {
+      if (!safeUpdates.rateLimit || safeUpdates.rateLimit.enabled === false) {
+        safeUpdates.rateLimit = { enabled: false, requests: 120, windowSeconds: 60 };
+      } else if (typeof safeUpdates.rateLimit === 'object') {
+        safeUpdates.rateLimit = {
+          enabled: true,
+          requests: Math.min(100000, Math.max(1, Math.round(Number(safeUpdates.rateLimit.requests) || 120))),
+          windowSeconds: Math.min(3600, Math.max(1, Math.round(Number(safeUpdates.rateLimit.windowSeconds) || 60)))
+        };
+      }
+    }
+
     this.domains[idx] = { ...this.domains[idx], ...safeUpdates, updatedAt: new Date().toISOString() };
     this.saveDomains();
-    return this.domains[idx];
+    const updated = this.domains[idx];
+    return updated.basicAuth ? { ...updated, basicAuth: sanitizeBasicAuthForPublic(updated.basicAuth) } : updated;
   }
 
   async toggleProxy(id) {
@@ -549,29 +741,36 @@ class DomainManager {
     const dom = this.domains[idx];
     const nextProxied = !dom.cloudflareProxied;
 
-    // Sincronizar realmente con Cloudflare API cuando hay credenciales reales y zona asociada
+    // Sincronizar realmente con Cloudflare API cuando hay credenciales reales (auto-resolviendo zona si falta)
     const cloudflareService = getCloudflareService();
     const cfStatus = cloudflareService.getConfigStatus();
     let cloudflareSynced = false;
     /** @type {string | null} */
     let cloudflareError = null;
-    if (!cfStatus.useMock && dom.cloudflareZoneId && !dom.hostname.endsWith('.sslip.io') && !dom.hostname.endsWith('.nip.io')) {
+    if (!cfStatus.useMock && !dom.hostname.endsWith('.sslip.io') && !dom.hostname.endsWith('.nip.io')) {
       try {
-        let recId = dom.cloudflareRecordId || null;
-        if (!recId) {
-          const listed = await cloudflareService.listDnsRecords(dom.cloudflareZoneId);
-          const match = (listed.records || []).find(
-            (r) => String(r.name || '').toLowerCase() === dom.hostname && ['A', 'AAAA', 'CNAME'].includes(String(r.type || '').toUpperCase())
-          );
-          if (match && match.id) recId = match.id;
+        let zoneId = dom.cloudflareZoneId || null;
+        if (!zoneId) {
+          zoneId = await cloudflareService.findZoneForDomain(dom.hostname);
+          if (zoneId) dom.cloudflareZoneId = zoneId;
         }
-        if (recId) {
-          const upd = await cloudflareService.updateDnsRecord(dom.cloudflareZoneId, recId, { proxied: nextProxied });
-          if (upd && upd.success) {
-            dom.cloudflareRecordId = recId;
-            cloudflareSynced = true;
-          } else {
-            cloudflareError = upd?.error || (Array.isArray(upd?.errors) && upd.errors[0]?.message) || 'Cloudflare no pudo cambiar el proxy';
+        if (zoneId) {
+          let recId = dom.cloudflareRecordId || null;
+          if (!recId) {
+            const listed = await cloudflareService.listDnsRecords(zoneId);
+            const match = (listed.records || []).find(
+              (r) => String(r.name || '').toLowerCase() === dom.hostname && ['A', 'AAAA', 'CNAME'].includes(String(r.type || '').toUpperCase())
+            );
+            if (match && match.id) recId = match.id;
+          }
+          if (recId) {
+            const upd = await cloudflareService.updateDnsRecord(zoneId, recId, { proxied: nextProxied });
+            if (upd && upd.success) {
+              dom.cloudflareRecordId = recId;
+              cloudflareSynced = true;
+            } else {
+              cloudflareError = upd?.error || (Array.isArray(upd?.errors) && upd.errors[0]?.message) || 'Cloudflare no pudo cambiar el proxy';
+            }
           }
         }
       } catch (err) {

@@ -24,8 +24,13 @@ function formatLogTime(ts: string): string {
   return TIME_FORMATTER.format(d);
 }
 
+function stripAnsi(input: string): string {
+  // eslint-disable-next-line no-control-regex
+  return String(input || '').replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
+}
+
 function formatPodLabel(pod: string): string {
-  if (pod === 'forge') return 'Des';
+  if (pod === 'forge') return 'Local';
   if (pod === 'citadel') return 'Prod';
   if (pod === 'edge') return 'Caddy';
   return pod || 'Sistema';
@@ -40,8 +45,13 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [pausedBuffered, setPausedBuffered] = useState<number>(0);
   const [copiedAi, setCopiedAi] = useState<boolean>(false);
+  const [stickToBottom, setStickToBottom] = useState<boolean>(true);
+  const containerRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const isPausedRef = useRef<boolean>(false);
+  const stickRef = useRef<boolean>(true);
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  const pausedQueueRef = useRef<LogEntry[]>([]);
   const pendingRef = useRef<LogEntry[]>([]);
   const rafRef = useRef<number | null>(null);
 
@@ -55,29 +65,63 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
     if (projectId) params.projectId = projectId;
     api.getLogs(params)
       .then((res) => {
-        if (active) setLogs(res.logs || []);
+        if (!active) return;
+        // El backend devuelve recientes primero; ordenamos cronológicamente (antiguo → nuevo)
+        const ordered = [...(res.logs || [])].reverse();
+        const nextSeen = new Set<string>();
+        const unique: LogEntry[] = [];
+        for (const item of ordered) {
+          if (item.id && nextSeen.has(item.id)) continue;
+          if (item.id) nextSeen.add(item.id);
+          unique.push(item);
+        }
+        seenIdsRef.current = nextSeen;
+        setLogs(unique.slice(-MAX_RENDERED_LOGS));
       })
       .catch(() => {});
     return () => { active = false; };
   }, [projectId]);
 
+  const flushPending = () => {
+    const batch = pendingRef.current;
+    pendingRef.current = [];
+    if (batch.length === 0) return;
+    setLogs((prev) => {
+      const next = [...prev, ...batch];
+      return next.length > MAX_RENDERED_LOGS ? next.slice(next.length - MAX_RENDERED_LOGS) : next;
+    });
+    if (stickRef.current && terminalEndRef.current) {
+      terminalEndRef.current.scrollIntoView({ block: 'end' });
+    }
+  };
+
   const enqueueLog = (entry: LogEntry) => {
     if (projectId && entry.projectId !== projectId) {
       return;
     }
-    if (isPausedRef.current) {
-      setPausedBuffered((c) => c + 1);
+    if (entry.id && seenIdsRef.current.has(entry.id)) {
       return;
     }
-    pendingRef.current.unshift(entry);
+    if (entry.id) {
+      seenIdsRef.current.add(entry.id);
+      if (seenIdsRef.current.size > MAX_RENDERED_LOGS * 3) {
+        const keep = Array.from(seenIdsRef.current).slice(-MAX_RENDERED_LOGS);
+        seenIdsRef.current = new Set(keep);
+      }
+    }
+    if (isPausedRef.current) {
+      pausedQueueRef.current.push(entry);
+      if (pausedQueueRef.current.length > MAX_RENDERED_LOGS) {
+        pausedQueueRef.current = pausedQueueRef.current.slice(-MAX_RENDERED_LOGS);
+      }
+      setPausedBuffered(pausedQueueRef.current.length);
+      return;
+    }
+    pendingRef.current.push(entry);
     if (rafRef.current === null) {
       rafRef.current = window.requestAnimationFrame(() => {
         rafRef.current = null;
-        const batch = pendingRef.current;
-        pendingRef.current = [];
-        if (batch.length > 0) {
-          setLogs((prev) => [...batch, ...prev].slice(0, MAX_RENDERED_LOGS));
-        }
+        flushPending();
       });
     }
   };
@@ -105,14 +149,21 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
     return logs.filter((log) => {
       if (selectedPod !== 'all' && log.pod !== selectedPod) return false;
       if (selectedLevel !== 'all' && log.level !== upperLevel) return false;
-      if (q && !log.message.toLowerCase().includes(q)) return false;
+      if (q && !stripAnsi(log.message).toLowerCase().includes(q)) return false;
       return true;
     });
   }, [logs, selectedPod, selectedLevel, deferredSearch]);
 
   const handleTogglePause = () => {
     setIsPaused((prev) => {
-      if (prev) setPausedBuffered(0);
+      if (prev) {
+        const buffered = pausedQueueRef.current;
+        pausedQueueRef.current = [];
+        setPausedBuffered(0);
+        if (buffered.length > 0) {
+          setLogs((curr) => [...curr, ...buffered].slice(-MAX_RENDERED_LOGS));
+        }
+      }
       return !prev;
     });
   };
@@ -278,7 +329,16 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
           </div>
         </div>
 
-        <div className="flex-1 p-3 overflow-y-auto bg-white font-mono text-xs leading-relaxed">
+        <div
+          ref={containerRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+            stickRef.current = atBottom;
+            setStickToBottom(atBottom);
+          }}
+          className="flex-1 p-3 overflow-y-auto bg-white font-mono text-xs leading-relaxed relative"
+        >
           {filteredLogs.length === 0 ? (
             <div className="flex h-full items-center justify-center text-slate-400 font-sans text-xs">
               Todavía no hay registros que coincidan con este filtro.
@@ -288,20 +348,35 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               {filteredLogs.map((log) => (
                 <div
                   key={log.id}
-                  className="flex items-start gap-2.5 hover:bg-slate-50 px-2 py-1 rounded transition-colors"
+                  className="flex flex-col sm:flex-row sm:items-start gap-1 sm:gap-2.5 hover:bg-slate-50 px-2 py-1.5 sm:py-1 rounded transition-colors"
                 >
-                  <span className="text-slate-400 shrink-0 select-none w-16 tabular-nums">{formatLogTime(log.timestamp)}</span>
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border shrink-0 w-16 text-center ${getLevelBadge(log.level)}`}>
-                    {log.level}
-                  </span>
-                  <span className="text-slate-500 shrink-0 font-medium w-16 truncate" title={log.pod}>
-                    [{formatPodLabel(log.pod)}]
-                  </span>
-                  <span className="break-all text-slate-800">{log.message}</span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-slate-400 shrink-0 select-none w-16 tabular-nums">{formatLogTime(log.timestamp)}</span>
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border shrink-0 w-16 text-center ${getLevelBadge(log.level)}`}>
+                      {log.level}
+                    </span>
+                    <span className="text-slate-500 shrink-0 font-medium w-16 truncate" title={log.pod}>
+                      [{formatPodLabel(log.pod)}]
+                    </span>
+                  </div>
+                  <span className="whitespace-pre-wrap break-words text-slate-800 min-w-0 flex-1">{stripAnsi(log.message)}</span>
                 </div>
               ))}
               <div ref={terminalEndRef} />
             </div>
+          )}
+          {!stickToBottom && filteredLogs.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                stickRef.current = true;
+                setStickToBottom(true);
+                terminalEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+              }}
+              className="sticky bottom-2 float-right px-2.5 py-1 rounded-full bg-slate-900 text-white text-[11px] font-sans font-medium shadow-md hover:bg-slate-800 cursor-pointer"
+            >
+              Ir al final ↓
+            </button>
           )}
         </div>
       </div>

@@ -21,6 +21,11 @@ import {
   Link2,
   Unlink,
   Rocket,
+  Download,
+  Upload,
+  Stethoscope,
+  Wrench,
+  RotateCcw,
 } from 'lucide-react';
 import {
   api,
@@ -29,16 +34,25 @@ import {
   type DbBackup,
   type DbCredentials,
   type DbStorageConfig,
+  type DbInspectResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
+import { HelpTip } from './HelpTip';
 
 interface Props {
   projectId: string;
   linkedDatabaseIds?: string[];
   onProjectChanged?: () => void;
   onOpenDeployments?: () => void;
+  onOpenBackupSettings?: () => void;
   onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
+}
+
+function getEnvVarKeyForEngine(engine: string): string {
+  if (engine === 'valkey' || engine === 'redis') return 'REDIS_URL';
+  if (engine === 'mongodb') return 'MONGODB_URI';
+  return 'DATABASE_URL';
 }
 
 const HEALTH_STYLE: Record<string, { dot: string; label: string }> = {
@@ -72,6 +86,7 @@ export const DatabasesPanel: React.FC<Props> = ({
   linkedDatabaseIds = [],
   onProjectChanged,
   onOpenDeployments,
+  onOpenBackupSettings,
   onNotify,
 }) => {
   const [databases, setDatabases] = useState<ManagedDatabase[]>([]);
@@ -82,27 +97,25 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [dockerReason, setDockerReason] = useState<string | null>(null);
   const [creating, setCreating] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busyKeys, setBusyKeys] = useState<Set<string>>(() => new Set());
+  const isBusy = (key: string) => busyKeys.has(key);
 
   const [creds, setCreds] = useState<Record<string, DbCredentials>>({});
   const [backups, setBackups] = useState<Record<string, DbBackup[]>>({});
+  const [inspectResults, setInspectResults] = useState<Record<string, DbInspectResult>>({});
+  const [undoRestore, setUndoRestore] = useState<{ dbId: string; dbName: string; safetyBackupId: string } | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
 
   // Confirmaciones destructivas en Modal (P0-11)
   const [confirmRestore, setConfirmRestore] = useState<{ db: ManagedDatabase; backup: DbBackup } | null>(null);
+  const [createSafetySnapshot, setCreateSafetySnapshot] = useState(true);
   const [confirmDelete, setConfirmDelete] = useState<{ db: ManagedDatabase; destroyData: boolean } | null>(null);
-  const [confirmDisconnectS3, setConfirmDisconnectS3] = useState(false);
 
   const [storage, setStorage] = useState<DbStorageConfig>({ configured: false });
-  const [showStorageForm, setShowStorageForm] = useState(false);
-  const [storageForm, setStorageForm] = useState({
-    endpoint: '',
-    region: 'auto',
-    bucket: '',
-    accessKeyId: '',
-    secretAccessKey: '',
-    prefix: 'culkibo/',
-  });
+  const databasesRef = React.useRef<ManagedDatabase[]>([]);
+  useEffect(() => {
+    databasesRef.current = databases;
+  }, [databases]);
 
   const load = useCallback(async () => {
     try {
@@ -145,26 +158,42 @@ export const DatabasesPanel: React.FC<Props> = ({
     return () => { active = false; };
   }, [projectId, onNotify]);
 
+  const needsHealthPoll = databases.some((d) => d.health === 'starting' || d.health === 'unknown');
   useEffect(() => {
-    if (!databases.some((d) => d.health === 'starting' || d.health === 'unknown')) return;
+    if (!needsHealthPoll) return;
+    let disposed = false;
     const t = setInterval(async () => {
-      for (const d of databases.filter((x) => x.health === 'starting' || x.health === 'unknown')) {
+      const pending = databasesRef.current.filter((x) => x.health === 'starting' || x.health === 'unknown');
+      for (const d of pending) {
+        if (disposed) return;
         try { await api.refreshDatabaseHealth(d.id); } catch { /* silencio */ }
       }
+      if (disposed) return;
       const dbs = await api.getDatabases(projectId).catch(() => null);
-      if (dbs) setDatabases(dbs.databases);
+      if (!disposed && dbs) setDatabases(dbs.databases);
     }, 5000);
-    return () => clearInterval(t);
-  }, [databases, projectId]);
+    return () => {
+      disposed = true;
+      clearInterval(t);
+    };
+  }, [needsHealthPoll, projectId]);
 
   const guard = async (key: string, fn: () => Promise<void>) => {
-    setBusy(key);
+    setBusyKeys((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
     try {
       await fn();
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'Ha ocurrido un error', 'error');
     } finally {
-      setBusy(null);
+      setBusyKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
     }
   };
 
@@ -238,25 +267,55 @@ export const DatabasesPanel: React.FC<Props> = ({
     const c = creds[db.id] || await api.getDatabaseCredentials(db.id);
     if (!creds[db.id]) setCreds((prev) => ({ ...prev, [db.id]: c }));
     const project = await api.getProject(projectId);
-    const key = db.engine === 'valkey' || db.engine === 'redis' ? 'REDIS_URL' : 'DATABASE_URL';
+    const key = getEnvVarKeyForEngine(db.engine);
     const nextEnv = { ...(project.envVars || {}), [key]: c.internalConnectionString };
     await api.updateProject(projectId, { envVars: nextEnv });
     onNotify(`Variable ${key} inyectada en el proyecto`, 'success');
   });
 
-  const openStorageEditor = () => {
-    if (!showStorageForm && storage.configured) {
-      setStorageForm({
-        endpoint: storage.endpoint || '',
-        region: storage.region || 'auto',
-        bucket: storage.bucket || '',
-        prefix: storage.prefix || 'culkibo/',
-        accessKeyId: '',
-        secretAccessKey: '',
-      });
-    }
-    setShowStorageForm((v) => !v);
-  };
+  const handleInspectDb = (db: ManagedDatabase) => guard(`ins-${db.id}`, async () => {
+    const res = await api.inspectDatabase(db.id);
+    setInspectResults((prev) => ({ ...prev, [db.id]: res }));
+    setExpanded(db.id);
+    onNotify(
+      res.reachable
+        ? `${db.name} responde en ${res.latencyMs ?? 0} ms${res.version ? ` (${res.version})` : ''}`
+        : (res.error || `${db.name} no responde en este momento`),
+      res.reachable ? 'success' : 'error'
+    );
+  });
+
+  const handleRecoverDb = (db: ManagedDatabase) => guard(`rec-${db.id}`, async () => {
+    await api.recoverDatabase(db.id);
+    onNotify(`Contenedor de ${db.name} recreado conservando el volumen de datos`, 'success');
+    await load();
+  });
+
+  const handleDownloadBackup = (db: ManagedDatabase, b: DbBackup) => guard(`dl-${b.id}`, async () => {
+    const { blob, fileName } = await api.downloadDatabaseBackupBlob(db.id, b.id);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  const handleDeleteBackup = (db: ManagedDatabase, b: DbBackup) => guard(`delbk-${b.id}`, async () => {
+    await api.deleteDatabaseBackup(db.id, b.id, false);
+    onNotify('Copia local eliminada', 'info');
+    await load();
+    setBackups((prev) => ({ ...prev, [db.id]: (prev[db.id] || []).filter((x) => x.id !== b.id) }));
+  });
+
+  const handleUploadBackup = (db: ManagedDatabase, file: File) => guard(`up-${db.id}`, async () => {
+    await api.uploadDatabaseBackup(db.id, file, { restore: false });
+    onNotify(`Copia «${file.name}» subida y verificada. Ya puedes restaurarla abajo.`, 'success');
+    await load();
+    setBackups((prev) => ({ ...prev, [db.id]: [] }));
+    const refreshed = await api.getDatabaseBackups(db.id);
+    setBackups((prev) => ({ ...prev, [db.id]: refreshed.backups }));
+  });
 
   return (
     <div className="space-y-5">
@@ -342,10 +401,31 @@ export const DatabasesPanel: React.FC<Props> = ({
               </div>
 
               <div className="flex items-center gap-2 flex-wrap shrink-0">
+                {(db.status === 'missing' || db.health === 'unhealthy') && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRecoverDb(db)}
+                    disabled={isBusy(`rec-${db.id}`)}
+                    className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-amber-300 bg-amber-50 hover:bg-amber-100 text-amber-900 cursor-pointer disabled:opacity-50"
+                  >
+                    <Wrench className="w-3.5 h-3.5" />
+                    <span>{isBusy(`rec-${db.id}`) ? 'Recreando…' : 'Recrear contenedor'}</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void handleInspectDb(db)}
+                  disabled={isBusy(`ins-${db.id}`)}
+                  title="Probar conexión, versión y tamaño real de la base de datos"
+                  className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer disabled:opacity-50"
+                >
+                  <Stethoscope className="w-3.5 h-3.5 text-slate-500" />
+                  <span>{isBusy(`ins-${db.id}`) ? 'Probando…' : 'Inspeccionar'}</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => void handleToggleLink(db)}
-                  disabled={busy === `lnk-${db.id}`}
+                  disabled={isBusy(`lnk-${db.id}`)}
                   className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border cursor-pointer disabled:opacity-50 ${
                     isLinked
                       ? 'bg-white hover:bg-slate-50 text-slate-600 border-slate-200'
@@ -374,7 +454,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                     await api.controlDatabase(db.id, db.status === 'running' ? 'stop' : 'start');
                     await load();
                   })}
-                  disabled={busy === `ctl-${db.id}`}
+                  disabled={isBusy(`ctl-${db.id}`)}
                   aria-label={db.status === 'running' ? 'Detener base de datos' : 'Iniciar base de datos'}
                   className="p-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 disabled:opacity-50 cursor-pointer"
                   title={db.status === 'running' ? 'Detener' : 'Iniciar'}
@@ -394,7 +474,7 @@ export const DatabasesPanel: React.FC<Props> = ({
             {recentlyLinkedId === db.id && isLinked && (
               <div className="px-5 py-2.5 bg-emerald-50/70 border-t border-emerald-200 flex flex-wrap items-center justify-between gap-2 text-xs text-emerald-900">
                 <span>
-                  Red aislada y variable <code className="font-mono">{db.engine === 'valkey' || db.engine === 'redis' ? 'REDIS_URL' : 'DATABASE_URL'}</code> preparadas en runtime (sin guardar contraseñas en disco).
+                  Red aislada y variable <code className="font-mono">{getEnvVarKeyForEngine(db.engine)}</code> preparadas en runtime (sin guardar contraseñas en disco).
                 </span>
                 {onOpenDeployments && (
                   <button
@@ -408,12 +488,77 @@ export const DatabasesPanel: React.FC<Props> = ({
               </div>
             )}
 
+            {undoRestore && undoRestore.dbId === db.id && (
+              <div className="px-5 py-2.5 bg-amber-50 border-t border-amber-200 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-900">
+                <span>Restauración aplicada. Se creó un snapshot de seguridad previo por si necesitas volver atrás.</span>
+                <button
+                  type="button"
+                  disabled={isBusy(`res-${db.id}`)}
+                  onClick={() => void guard(`res-${db.id}`, async () => {
+                    await api.restoreDatabase(db.id, { backupId: undoRestore.safetyBackupId, createSafetySnapshot: false });
+                    setUndoRestore(null);
+                    onNotify('Estado previo restaurado desde el snapshot de seguridad', 'success');
+                    await load();
+                  })}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-white border border-amber-300 text-amber-950 font-medium hover:bg-amber-100 cursor-pointer shrink-0"
+                >
+                  <RotateCcw className="w-3 h-3" /> Deshacer restauración
+                </button>
+              </div>
+            )}
+
             {open && (
               <div className="border-t border-slate-200 bg-slate-50/60 p-5 space-y-5">
+                {inspectResults[db.id] && (
+                  <section className="bg-white border border-slate-200 rounded-xl p-4 space-y-2.5 text-xs">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="font-semibold text-slate-900 flex items-center gap-1.5">
+                        <Stethoscope className="w-3.5 h-3.5 text-slate-500" />
+                        Inspección en directo
+                      </span>
+                      <span className={`px-2 py-0.5 rounded-full text-[11px] font-medium border tabular-nums ${
+                        inspectResults[db.id].reachable
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-red-50 text-red-700 border-red-200'
+                      }`}>
+                        {inspectResults[db.id].reachable ? `Conectada · ${inspectResults[db.id].latencyMs ?? 0} ms` : 'Sin respuesta'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+                      <div>
+                        <div className="text-slate-400">Versión</div>
+                        <div className="font-mono text-slate-800 truncate">{inspectResults[db.id].version || '—'}</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-400">Tamaño BD</div>
+                        <div className="font-mono text-slate-800 tabular-nums">{inspectResults[db.id].databaseSizeHuman || '—'}</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-400">Volumen en disco</div>
+                        <div className="font-mono text-slate-800 tabular-nums">{inspectResults[db.id].volumeSizeHuman || '—'}</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-400">Tablas / Claves</div>
+                        <div className="font-mono text-slate-800 tabular-nums">
+                          {inspectResults[db.id].keyCount != null
+                            ? `${inspectResults[db.id].keyCount} claves`
+                            : inspectResults[db.id].topTables
+                              ? `${inspectResults[db.id].topTables?.length} tablas`
+                              : '—'}
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                )}
+
                 {/* Conexión */}
                 <section>
                   <h4 className="font-semibold text-slate-800 text-xs mb-1.5 flex items-center gap-1.5">
                     <Server className="w-3.5 h-3.5 text-slate-500" /> Conexión interna
+                    <HelpTip title="Enlazar vs Inyectar variable">
+                      <p><strong>Enlazar al proyecto:</strong> conecta la red Docker e inyecta la URL automáticamente en cada despliegue sin guardar contraseñas en texto claro.</p>
+                      <p><strong>Inyectar variable:</strong> copia la cadena directamente a la pestaña Variables si necesitas editarla o usarla en pruebas locales.</p>
+                    </HelpTip>
                   </h4>
                   <p className="text-xs text-slate-500 mb-2">
                     Accesible por nombre de contenedor en la red <code className="font-mono">{db.networkName}</code>. La contraseña solo se descifra al pedirla.
@@ -426,7 +571,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                       <button
                         type="button"
                         onClick={() => void toggleCredentials(db)}
-                        disabled={busy === `creds-${db.id}`}
+                        disabled={isBusy(`creds-${db.id}`)}
                         aria-label={creds[db.id] ? 'Ocultar credenciales' : 'Mostrar credenciales'}
                         className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 disabled:opacity-50 cursor-pointer"
                         title={creds[db.id] ? 'Ocultar credenciales' : 'Mostrar credenciales'}
@@ -447,10 +592,10 @@ export const DatabasesPanel: React.FC<Props> = ({
                       <button
                         type="button"
                         onClick={() => void handleInjectEnv(db)}
-                        disabled={busy === `inj-${db.id}`}
+                        disabled={isBusy(`inj-${db.id}`)}
                         className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium shrink-0 cursor-pointer disabled:opacity-50"
                       >
-                        {busy === `inj-${db.id}` ? 'Inyectando…' : `Inyectar ${db.engine === 'valkey' || db.engine === 'redis' ? 'REDIS_URL' : 'DATABASE_URL'}`}
+                        {isBusy(`inj-${db.id}`) ? 'Inyectando…' : `Inyectar ${getEnvVarKeyForEngine(db.engine)}`}
                       </button>
                     </div>
                   </div>
@@ -468,7 +613,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                     <button
                       type="button"
                       onClick={() => void handleExpose(db, !db.exposure.enabled)}
-                      disabled={busy === `exp-${db.id}`}
+                      disabled={isBusy(`exp-${db.id}`)}
                       className={`shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border disabled:opacity-50 cursor-pointer ${
                         db.exposure.enabled
                           ? 'border-slate-200 text-slate-700 bg-white hover:bg-slate-50'
@@ -507,7 +652,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                           await api.setDatabaseSchedule(db.id, { enabled: !db.schedule.enabled, cron: db.schedule.cron });
                           await load();
                         })}
-                        disabled={busy === `sch-${db.id}`}
+                        disabled={isBusy(`sch-${db.id}`)}
                         className={`text-xs font-medium px-3 py-1.5 rounded-lg border disabled:opacity-50 cursor-pointer ${
                           db.schedule.enabled
                             ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
@@ -525,16 +670,20 @@ export const DatabasesPanel: React.FC<Props> = ({
 
                     <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-slate-100">
                       <span className="text-xs text-slate-500">Conservar</span>
-                      {(['daily', 'weekly'] as const).map((k) => (
+                      {([
+                        { k: 'hourly' as const, label: 'horarias', max: 168 },
+                        { k: 'daily' as const, label: 'diarias', max: 365 },
+                        { k: 'weekly' as const, label: 'semanales', max: 260 },
+                      ]).map(({ k, label, max }) => (
                         <label key={k} className="flex items-center gap-1.5 text-xs text-slate-600">
                           <input
                             type="number"
                             min={0}
-                            max={k === 'daily' ? 365 : 260}
-                            defaultValue={db.retention[k]}
+                            max={max}
+                            defaultValue={db.retention[k] ?? 0}
                             onBlur={(e) => {
                               const parsed = parseInt(e.target.value, 10) || 0;
-                              if (parsed === db.retention[k]) return;
+                              if (parsed === (db.retention[k] ?? 0)) return;
                               void guard(`ret-${db.id}`, async () => {
                                 await api.setDatabaseRetention(db.id, { ...db.retention, [k]: parsed });
                                 await load();
@@ -542,34 +691,51 @@ export const DatabasesPanel: React.FC<Props> = ({
                             }}
                             className="w-16 border border-slate-200 rounded-lg px-2 py-1 text-slate-700 font-mono tabular-nums"
                           />
-                          {k === 'daily' ? 'diarias' : 'semanales'}
+                          {label}
                         </label>
                       ))}
                     </div>
                   </div>
                 </section>
 
-                {/* Historial de copias */}
+                {/* Historial de copias + Subir / Descargar / Eliminar */}
                 <section>
-                  <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
                     <h4 className="font-semibold text-slate-800 text-xs flex items-center gap-1.5 tabular-nums">
                       <History className="w-3.5 h-3.5 text-slate-500" /> Copias ({db.backupsCount})
                     </h4>
-                    <button
-                      type="button"
-                      onClick={() => void guard(`run-${db.id}`, async () => {
-                        await api.runDatabaseBackup(db.id);
-                        onNotify('Copia de seguridad completada', 'success');
-                        await load();
-                        setBackups({ ...backups, [db.id]: (await api.getDatabaseBackups(db.id)).backups });
-                      })}
-                      disabled={busy === `run-${db.id}`}
-                      className="text-xs font-medium bg-slate-900 text-white px-3 py-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
-                    >
-                      {busy === `run-${db.id}`
-                        ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Copiando…</>
-                        : <><CloudUpload className="w-3.5 h-3.5" /> Copiar ahora</>}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <label className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg cursor-pointer">
+                        <Upload className="w-3.5 h-3.5 text-slate-500" />
+                        <span>{isBusy(`up-${db.id}`) ? 'Subiendo…' : 'Subir copia (.sql/.gz)'}</span>
+                        <input
+                          type="file"
+                          accept=".sql,.gz,.dump,.archive,.rdb,.bak,.zip"
+                          disabled={isBusy(`up-${db.id}`)}
+                          className="hidden"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) void handleUploadBackup(db, f);
+                            e.target.value = '';
+                          }}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => void guard(`run-${db.id}`, async () => {
+                          await api.runDatabaseBackup(db.id);
+                          onNotify('Copia de seguridad completada', 'success');
+                          await load();
+                          setBackups({ ...backups, [db.id]: (await api.getDatabaseBackups(db.id)).backups });
+                        })}
+                        disabled={isBusy(`run-${db.id}`)}
+                        className="text-xs font-medium bg-slate-900 text-white px-3 py-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
+                      >
+                        {isBusy(`run-${db.id}`)
+                          ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Copiando…</>
+                          : <><CloudUpload className="w-3.5 h-3.5" /> Copiar ahora</>}
+                      </button>
+                    </div>
                   </div>
                   <div className="border border-slate-200 rounded-xl overflow-x-auto bg-white">
                     <table className="w-full text-left border-collapse">
@@ -579,7 +745,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                           <th className="py-2.5 px-3">Tamaño</th>
                           <th className="py-2.5 px-3">Origen</th>
                           <th className="py-2.5 px-3">Destino</th>
-                          <th className="py-2.5 px-3.5 text-right">Acción</th>
+                          <th className="py-2.5 px-3.5 text-right">Acciones</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 text-xs">
@@ -593,22 +759,57 @@ export const DatabasesPanel: React.FC<Props> = ({
                               <td className="py-2.5 px-3.5 text-slate-700 tabular-nums whitespace-nowrap">{formatDate(b.createdAt)}</td>
                               <td className="py-2.5 px-3 text-slate-500 font-mono tabular-nums whitespace-nowrap">{formatBytes(b.sizeBytes)}</td>
                               <td className="py-2.5 px-3 text-slate-500 whitespace-nowrap">
-                                {b.trigger === 'scheduled' ? 'Programada' : b.trigger === 'catch-up' ? 'Recuperada' : 'Manual'}
+                                {b.trigger === 'scheduled'
+                                  ? 'Programada'
+                                  : b.trigger === 'catch-up'
+                                    ? 'Recuperada'
+                                    : b.trigger === 'pre-restore'
+                                      ? 'Seguridad'
+                                      : b.trigger === 'upload'
+                                        ? 'Subida'
+                                        : 'Manual'}
                               </td>
                               <td className="py-2.5 px-3 whitespace-nowrap">
                                 {b.localAvailable && <span className="text-slate-600">Disco</span>}
                                 {b.localAvailable && b.remoteAvailable && <span className="text-slate-300"> / </span>}
                                 {b.remoteAvailable && <span className="text-emerald-700">Bucket</span>}
                               </td>
-                              <td className="py-2.5 px-3.5 text-right">
-                                <button
-                                  type="button"
-                                  onClick={() => setConfirmRestore({ db, backup: b })}
-                                  disabled={busy === `res-${db.id}`}
-                                  className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-2.5 py-1 rounded-lg disabled:opacity-50 cursor-pointer"
-                                >
-                                  Restaurar
-                                </button>
+                              <td className="py-2.5 px-3.5 text-right whitespace-nowrap">
+                                <div className="inline-flex items-center gap-1.5">
+                                  {b.localAvailable && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleDownloadBackup(db, b)}
+                                      disabled={isBusy(`dl-${b.id}`)}
+                                      aria-label="Descargar copia"
+                                      title="Descargar copia al navegador"
+                                      className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer disabled:opacity-50"
+                                    >
+                                      <Download className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setCreateSafetySnapshot(true);
+                                      setConfirmRestore({ db, backup: b });
+                                    }}
+                                    disabled={isBusy(`res-${db.id}`)}
+                                    className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-2.5 py-1 rounded-lg disabled:opacity-50 cursor-pointer"
+                                  >
+                                    Restaurar
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleDeleteBackup(db, b)}
+                                    disabled={isBusy(`delbk-${b.id}`)}
+                                    aria-label="Eliminar copia local"
+                                    title="Eliminar copia local"
+                                    className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                           ))
@@ -627,7 +828,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                     <button
                       type="button"
                       onClick={() => setConfirmDelete({ db, destroyData: false })}
-                      disabled={busy === `del-${db.id}`}
+                      disabled={isBusy(`del-${db.id}`)}
                       className="text-xs font-medium text-slate-700 border border-slate-200 bg-white px-3 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
                     >
                       Eliminar contenedor
@@ -635,7 +836,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                     <button
                       type="button"
                       onClick={() => setConfirmDelete({ db, destroyData: true })}
-                      disabled={busy === `del-${db.id}`}
+                      disabled={isBusy(`del-${db.id}`)}
                       className="text-xs font-medium text-red-700 border border-red-200 bg-red-50 px-3 py-1.5 rounded-lg hover:bg-red-100 disabled:opacity-50 inline-flex items-center gap-1.5 cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" /> Eliminar y borrar datos
@@ -648,118 +849,52 @@ export const DatabasesPanel: React.FC<Props> = ({
         );
       })}
 
-      {/* Almacenamiento remoto S3 / R2 */}
-      <div className="bg-white p-5 rounded-xl border border-slate-200">
-        <div className="flex justify-between items-center mb-1">
-          <h3 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
-            <CloudUpload className="w-4 h-4 text-slate-600" /> Copias externas (S3 / R2)
-          </h3>
-          <button
-            type="button"
-            onClick={openStorageEditor}
-            className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-3 py-1.5 rounded-lg cursor-pointer"
-          >
-            {showStorageForm ? 'Cancelar' : storage.configured ? 'Cambiar' : 'Configurar'}
-          </button>
+      {/* Franja compacta de Almacenamiento S3 / R2 global (configuración unificada en Ajustes → Backups y DR) */}
+      <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-600 shrink-0">
+            <CloudUpload className="w-4 h-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="font-semibold text-slate-900">
+              {storage.configured
+                ? `Copias externas activas en S3 / R2 (${storage.bucket})`
+                : 'Copias externas S3 / R2 sin configurar'}
+            </div>
+            <p className="text-slate-500 truncate mt-0.5">
+              {storage.configured
+                ? `${storage.endpoint} · Región ${storage.region || 'auto'}`
+                : 'Ahora las copias se guardan en disco local. Configura un bucket S3/R2 global y snapshots completos en Ajustes.'}
+            </p>
+          </div>
         </div>
-        <p className="text-xs text-slate-500 mb-4">
-          Compatible con Cloudflare R2, MinIO, Backblaze B2 y AWS S3. La clave secreta se cifra en disco.
-        </p>
-
-        {storage.configured && !showStorageForm && (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-            <div>
-              <div className="text-slate-400">Endpoint</div>
-              <div className="font-mono text-slate-700 truncate mt-0.5">{storage.endpoint}</div>
-            </div>
-            <div>
-              <div className="text-slate-400">Bucket</div>
-              <div className="text-slate-700 mt-0.5">{storage.bucket}</div>
-            </div>
-            <div>
-              <div className="text-slate-400">Región</div>
-              <div className="text-slate-700 mt-0.5">{storage.region}</div>
-            </div>
-            <div>
-              <div className="text-slate-400">Clave de acceso</div>
-              <div className="font-mono text-slate-700 mt-0.5">{storage.accessKeyId}</div>
-            </div>
-            <div className="col-span-2 md:col-span-4 flex gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => void guard('s3test', async () => {
-                  const r = await api.testDbStorage();
-                  onNotify(`Conexión correcta con ${r.bucket}`, 'success');
-                })}
-                disabled={busy === 's3test'}
-                className="text-xs font-medium bg-slate-900 text-white px-3 py-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
-              >
-                Probar conexión
-              </button>
-              <button
-                type="button"
-                onClick={() => setConfirmDisconnectS3(true)}
-                className="text-xs font-medium text-slate-600 border border-slate-200 px-3 py-1.5 rounded-lg hover:bg-slate-50 cursor-pointer"
-              >
-                Desconectar
-              </button>
-            </div>
-          </div>
-        )}
-
-        {!storage.configured && !showStorageForm && (
-          <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3.5">
-            Sin configurar. Las copias se guardan solo en el disco local de este servidor.
-          </div>
-        )}
-
-        {showStorageForm && (
-          <form
-            className="grid grid-cols-1 md:grid-cols-2 gap-3"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void guard('s3save', async () => {
-                await api.setDbStorage(storageForm);
-                onNotify('Almacenamiento remoto guardado', 'success');
-                setShowStorageForm(false);
-                await load();
-              });
-            }}
-          >
-            {([
-              ['endpoint', 'Endpoint', 'https://<cuenta>.r2.cloudflarestorage.com'],
-              ['bucket', 'Bucket', 'culkibo-copias'],
-              ['region', 'Región', 'auto (R2) o eu-west-1'],
-              ['prefix', 'Prefijo', 'culkibo/'],
-              ['accessKeyId', 'Clave de acceso', ''],
-              ['secretAccessKey', 'Clave secreta', ''],
-            ] as const).map(([field, label, placeholder]) => (
-              <label key={field} className="block">
-                <span className="text-xs font-medium text-slate-600">{label}</span>
-                <input
-                  type={field === 'secretAccessKey' ? 'password' : 'text'}
-                  required={field !== 'prefix'}
-                  value={storageForm[field]}
-                  placeholder={placeholder}
-                  onChange={(e) => setStorageForm({ ...storageForm, [field]: e.target.value })}
-                  className="w-full border border-slate-200 rounded-lg px-3 py-2 mt-1 text-slate-800 font-mono text-xs bg-white"
-                />
-              </label>
-            ))}
-            <div className="md:col-span-2 flex justify-end">
-              <button
-                type="submit"
-                disabled={busy === 's3save'}
-                className="text-xs font-medium bg-slate-900 text-white px-4 py-2 rounded-lg hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
-              >
-                Guardar configuración
-              </button>
-            </div>
-          </form>
-        )}
+        <div className="flex items-center gap-2 shrink-0">
+          {storage.configured && (
+            <button
+              type="button"
+              onClick={() => void guard('s3test', async () => {
+                const r = await api.testDbStorage();
+                onNotify(`Conexión correcta con ${r.bucket}`, 'success');
+              })}
+              disabled={isBusy('s3test')}
+              className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+            >
+              Probar S3
+            </button>
+          )}
+          {onOpenBackupSettings && (
+            <button
+              type="button"
+              onClick={onOpenBackupSettings}
+              className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer"
+            >
+              {storage.configured ? 'Gestionar en Backups y DR' : 'Configurar S3 / Backups'}
+            </button>
+          )}
+        </div>
       </div>
 
-      {/* Modal: Confirmar restauración */}
+      {/* Modal: Confirmar restauración con snapshot previo automático */}
       <Modal
         open={Boolean(confirmRestore)}
         onClose={() => setConfirmRestore(null)}
@@ -775,9 +910,20 @@ export const DatabasesPanel: React.FC<Props> = ({
                 Copia del <strong>{formatDate(confirmRestore.backup.createdAt)}</strong> ({formatBytes(confirmRestore.backup.sizeBytes)})
               </div>
               <div className="text-amber-800">
-                Los cambios posteriores a esa fecha se perderán al restaurar el volcado.
+                Los cambios posteriores a esa fecha se sustituirán por el contenido de este volcado.
               </div>
             </div>
+            <label className="flex items-start gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={createSafetySnapshot}
+                onChange={(e) => setCreateSafetySnapshot(e.target.checked)}
+                className="mt-0.5 rounded border-slate-300 accent-slate-900"
+              />
+              <span>
+                Crear copia de seguridad automática antes de restaurar (recomendado para poder deshacer en 1 clic).
+              </span>
+            </label>
             <div className="flex justify-end gap-2">
               <button
                 type="button"
@@ -790,11 +936,24 @@ export const DatabasesPanel: React.FC<Props> = ({
                 type="button"
                 onClick={() => {
                   const target = confirmRestore;
+                  const withSafety = createSafetySnapshot;
                   setConfirmRestore(null);
                   void guard(`res-${target.db.id}`, async () => {
-                    await api.restoreDatabase(target.db.id, { backupId: target.backup.id });
-                    onNotify('Restauración completada', 'success');
+                    const res = await api.restoreDatabase(target.db.id, {
+                      backupId: target.backup.id,
+                      createSafetySnapshot: withSafety,
+                    });
+                    if (res?.safetyBackupId) {
+                      setUndoRestore({
+                        dbId: target.db.id,
+                        dbName: target.db.name,
+                        safetyBackupId: res.safetyBackupId,
+                      });
+                    }
+                    onNotify('Restauración completada correctamente', 'success');
                     await load();
+                    const refreshed = await api.getDatabaseBackups(target.db.id).catch(() => null);
+                    if (refreshed) setBackups((prev) => ({ ...prev, [target.db.id]: refreshed.backups }));
                   });
                 }}
                 className="px-4 py-2 text-xs font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg cursor-pointer"
@@ -859,44 +1018,6 @@ export const DatabasesPanel: React.FC<Props> = ({
             </div>
           </div>
         )}
-      </Modal>
-
-      {/* Modal: Desconectar S3 */}
-      <Modal
-        open={confirmDisconnectS3}
-        onClose={() => setConfirmDisconnectS3(false)}
-        title="Desconectar almacenamiento S3 / R2"
-        subtitle="Las futuras copias solo se guardarán localmente hasta que vuelvas a configurarlo."
-        maxWidthClass="max-w-md"
-      >
-        <div className="p-5 space-y-4">
-          <p className="text-xs text-slate-600">
-            Los archivos que ya subiste al bucket <code className="font-mono">{storage.bucket}</code> no se borran.
-          </p>
-          <div className="flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setConfirmDisconnectS3(false)}
-              className="px-3.5 py-2 text-xs font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-            >
-              Cancelar
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setConfirmDisconnectS3(false);
-                void guard('s3clear', async () => {
-                  await api.setDbStorage(null);
-                  onNotify('Almacenamiento remoto desconectado', 'info');
-                  await load();
-                });
-              }}
-              className="px-4 py-2 text-xs font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg cursor-pointer"
-            >
-              Desconectar
-            </button>
-          </div>
-        </div>
       </Modal>
     </div>
   );

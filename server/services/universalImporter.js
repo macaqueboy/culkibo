@@ -15,13 +15,15 @@ const { assertSafeUrl, isPrivateIp, isMetadataIp } = require('./ssrfGuard');
  */
 
 const DB_IMAGE_HINTS = [
-  { pattern: /^postgres(ql)?(\b|:|\/)/i, engine: 'postgres', label: 'PostgreSQL' },
-  { pattern: /\/postgres(\b|:)/i, engine: 'postgres', label: 'PostgreSQL' },
-  { pattern: /^mysql(\b|:)/i, engine: 'mysql', label: 'MySQL' },
-  { pattern: /^mariadb(\b|:)/i, engine: 'mariadb', label: 'MariaDB' },
-  { pattern: /^(redis|valkey)(\b|:|\/)/i, engine: 'valkey', label: 'Valkey / Redis' },
+  { pattern: /^(?:docker\.io\/library\/)?(?:postgres(?:ql)?|pgvector\/pgvector|postgis\/postgis|timescale\/timescaledb(?:-ha)?)(\b|:|\/)/i, engine: 'postgres', label: 'PostgreSQL' },
+  { pattern: /\/(postgres|pgvector|postgis|timescaledb)(\b|:)/i, engine: 'postgres', label: 'PostgreSQL' },
+  { pattern: /^(?:docker\.io\/library\/)?mysql(\b|:)/i, engine: 'mysql', label: 'MySQL' },
+  { pattern: /^(?:docker\.io\/library\/)?mariadb(\b|:)/i, engine: 'mariadb', label: 'MariaDB' },
+  { pattern: /^(?:docker\.io\/library\/)?(?:redis|valkey|valkey\/valkey|dragonflydb\/dragonfly|eqalpha\/keydb)(\b|:|\/)/i, engine: 'valkey', label: 'Valkey / Redis' },
   { pattern: /\/(redis|valkey)(\b|:)/i, engine: 'valkey', label: 'Valkey / Redis' },
-  { pattern: /^mongo(\b|:)/i, engine: 'mongodb', label: 'MongoDB' }
+  { pattern: /^(?:docker\.io\/library\/)?mongo(\b|:)/i, engine: 'mongodb', label: 'MongoDB' },
+  { pattern: /^(?:docker\.io\/)?clickhouse\/clickhouse-server(\b|:)/i, engine: 'clickhouse', label: 'ClickHouse' },
+  { pattern: /^(?:docker\.io\/)?qdrant\/qdrant(\b|:)/i, engine: 'qdrant', label: 'Qdrant' }
 ];
 
 function stripYamlComment(line) {
@@ -108,10 +110,64 @@ function parseEnvText(envText) {
   return { envVars, recommendedDatabases };
 }
 
+/** Parsea un array de flujo YAML inline como `["3000:3000", "8080:80"]` o `[db, redis]`. */
+function parseFlowArray(raw) {
+  const inner = String(raw || '').trim();
+  if (!inner.startsWith('[') || !inner.endsWith(']')) return null;
+  const body = inner.slice(1, -1).trim();
+  if (!body) return [];
+  const items = [];
+  let cur = '';
+  /** @type {string | null} */
+  let q = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (q) {
+      if (ch === q) q = null;
+      else cur += ch;
+    } else if (ch === '"' || ch === "'") {
+      q = ch;
+    } else if (ch === ',') {
+      if (cur.trim()) items.push(unquote(cur.trim()));
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.trim()) items.push(unquote(cur.trim()));
+  return items;
+}
+
+/** Parsea un mapa de flujo YAML inline como `{ NODE_ENV: production, PORT: "3000" }`. */
+function parseFlowMap(raw) {
+  const inner = String(raw || '').trim();
+  if (!inner.startsWith('{') || !inner.endsWith('}')) return null;
+  const body = inner.slice(1, -1).trim();
+  /** @type {Record<string, string>} */
+  const out = {};
+  if (!body) return out;
+  const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
+  const parts = parseFlowArray(`[${body}]`) || [];
+  for (const part of parts) {
+    const idx = part.indexOf(':');
+    if (idx > 0) {
+      const k = unquote(part.slice(0, idx).trim());
+      const v = unquote(part.slice(idx + 1).trim());
+      if (k && !UNSAFE.has(k)) out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** Sustituye expresiones `${VAR:-default}` o `${VAR-default}` por su valor por defecto para extraer puertos reales. */
+function expandComposeDefaults(str) {
+  return String(str || '').replace(/\$\{[A-Za-z0-9_]+:-?([^}]+)\}/g, '$1');
+}
+
 /**
  * Parser ligero de `docker-compose.yml` sin dependencias externas.
- * Extrae los servicios declarados en `services:`, sus imágenes, puertos,
- * variables de entorno, volúmenes, `depends_on`, `build`, y avisos útiles.
+ * Soporta listas con indentación cero, arrays/mapas inline (`[...]`, `{...}`),
+ * sintaxis larga de `ports:`/`volumes:`, `expose:`, `${PORT:-3000}` y `depends_on` corto/largo.
  */
 function parseDockerCompose(yamlText) {
   const text = String(yamlText || '');
@@ -130,6 +186,19 @@ function parseDockerCompose(yamlText) {
   /** @type {string | null} */
   let currentSection = null;
   let dependsOnIndent = -1;
+  /** @type {any} */
+  let longFormItem = null;
+
+  const flushLongForm = () => {
+    if (!longFormItem || !currentService) { longFormItem = null; return; }
+    if (longFormItem.section === 'ports' && longFormItem.target) {
+      const pub = longFormItem.published ? `${longFormItem.host_ip ? `${longFormItem.host_ip}:` : ''}${longFormItem.published}:` : '';
+      currentService.ports.push(`${pub}${longFormItem.target}`);
+    } else if (longFormItem.section === 'volumes' && longFormItem.target) {
+      currentService.volumes.push(`${longFormItem.source || currentService.name}:${longFormItem.target}`);
+    }
+    longFormItem = null;
+  };
 
   for (const rawLine of lines) {
     const line = stripYamlComment(rawLine);
@@ -138,6 +207,7 @@ function parseDockerCompose(yamlText) {
     const trimmed = line.trim();
 
     if (indent === 0) {
+      flushLongForm();
       if (/^services\s*:/.test(trimmed)) {
         inServices = true;
         servicesIndent = 0;
@@ -159,12 +229,14 @@ function parseDockerCompose(yamlText) {
     }
 
     if (indent === serviceIndent && /^[a-zA-Z0-9_.-]+\s*:$/.test(trimmed)) {
+      flushLongForm();
       const name = trimmed.slice(0, -1).trim();
       currentService = {
         name,
         image: '',
         build: null,
         ports: [],
+        expose: [],
         volumes: [],
         envVars: {},
         dependsOn: [],
@@ -184,7 +256,11 @@ function parseDockerCompose(yamlText) {
       propIndent = indent;
     }
 
-    if (indent === propIndent) {
+    // Listas con indentación cero respecto a su clave (p. ej. `ports:\n- "3000:3000"`)
+    const isZeroIndentSeq = indent === propIndent && trimmed.startsWith('-') && Boolean(currentSection);
+
+    if (indent === propIndent && !isZeroIndentSeq) {
+      flushLongForm();
       const m = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:(.*)$/);
       if (!m) continue;
       const key = m[1];
@@ -194,27 +270,80 @@ function parseDockerCompose(yamlText) {
 
       if (key === 'image' && rest) currentService.image = unquote(rest);
       else if (key === 'restart' && rest) currentService.restart = unquote(rest);
-      else if (key === 'command' && rest) currentService.command = unquote(rest);
-      else if (key === 'build' && rest) currentService.build = unquote(rest);
+      else if (key === 'command' && rest) {
+        const arr = parseFlowArray(rest);
+        currentService.command = arr ? arr.join(' ') : unquote(rest);
+      } else if (key === 'build' && rest) currentService.build = unquote(rest);
+      else if (key === 'ports' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.ports.push(...arr);
+      } else if (key === 'expose' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.expose.push(...arr);
+      } else if (key === 'volumes' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.volumes.push(...arr);
+      } else if (key === 'depends_on' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.dependsOn.push(...arr);
+      } else if (key === 'environment' && rest) {
+        const map = parseFlowMap(rest);
+        if (map) Object.assign(currentService.envVars, map);
+        else {
+          const arr = parseFlowArray(rest);
+          if (arr) {
+            for (const item of arr) {
+              const eq = item.indexOf('=');
+              if (eq > 0) currentService.envVars[item.slice(0, eq).trim()] = unquote(item.slice(eq + 1));
+            }
+          }
+        }
+      }
       continue;
     }
 
-    if (indent > propIndent && currentSection) {
+    if ((indent > propIndent || isZeroIndentSeq) && currentSection) {
       if (currentSection === 'build') {
         const ctx = trimmed.match(/^context\s*:\s*(.+)$/);
         if (ctx) currentService.build = unquote(ctx[1]);
-      } else if (currentSection === 'ports' && trimmed.startsWith('-')) {
+      } else if (currentSection === 'ports') {
+        if (trimmed.startsWith('-')) {
+          flushLongForm();
+          const item = trimmed.slice(1).trim();
+          const kv = item.match(/^(target|published|host_ip|protocol)\s*:\s*(.+)$/);
+          if (kv) {
+            longFormItem = { section: 'ports', [kv[1]]: unquote(kv[2]) };
+          } else {
+            const val = unquote(item);
+            if (val) currentService.ports.push(val);
+          }
+        } else if (longFormItem && longFormItem.section === 'ports') {
+          const kv = trimmed.match(/^(target|published|host_ip|protocol)\s*:\s*(.+)$/);
+          if (kv) longFormItem[kv[1]] = unquote(kv[2]);
+        }
+      } else if (currentSection === 'expose' && trimmed.startsWith('-')) {
         const val = unquote(trimmed.slice(1).trim());
-        if (val) currentService.ports.push(val);
-      } else if (currentSection === 'volumes' && trimmed.startsWith('-')) {
-        const val = unquote(trimmed.slice(1).trim());
-        if (val) currentService.volumes.push(val);
+        if (val) currentService.expose.push(val);
+      } else if (currentSection === 'volumes') {
+        if (trimmed.startsWith('-')) {
+          flushLongForm();
+          const item = trimmed.slice(1).trim();
+          const kv = item.match(/^(type|source|target|read_only)\s*:\s*(.+)$/);
+          if (kv) {
+            longFormItem = { section: 'volumes', [kv[1]]: unquote(kv[2]) };
+          } else {
+            const val = unquote(item);
+            if (val) currentService.volumes.push(val);
+          }
+        } else if (longFormItem && longFormItem.section === 'volumes') {
+          const kv = trimmed.match(/^(type|source|target|read_only)\s*:\s*(.+)$/);
+          if (kv) longFormItem[kv[1]] = unquote(kv[2]);
+        }
       } else if (currentSection === 'depends_on') {
         if (trimmed.startsWith('-')) {
           const dep = unquote(trimmed.slice(1).trim());
           if (dep) currentService.dependsOn.push(dep);
         } else {
-          // Forma larga: solo capturar claves al primer nivel bajo `depends_on:` (ignorar `condition:`, `restart:`)
           if (dependsOnIndent === -1) dependsOnIndent = indent;
           if (indent === dependsOnIndent) {
             const dm = trimmed.match(/^([a-zA-Z0-9_.-]+)\s*:/);
@@ -243,23 +372,22 @@ function parseDockerCompose(yamlText) {
       }
     }
   }
+  flushLongForm();
 
   if (services.length === 0) {
     throw new Error('No se encontró ningún servicio bajo la clave `services:` en el YAML proporcionado');
   }
 
-  // Enriquecer cada servicio con clasificación y avisos de producción.
   for (const svc of services) {
     const db = detectDbEngine(svc.image);
     svc.kind = db ? 'database' : 'app';
     svc.dbEngine = db ? db.engine : null;
     svc.dbLabel = db ? db.label : null;
 
-    // Extraer puerto interno principal y revisar exposición 0.0.0.0 antes del break (P1-22)
     /** @type {number | null} */
     let containerPort = null;
     for (const p of svc.ports) {
-      const clean = String(p).replace(/\/(tcp|udp)$/i, '');
+      const clean = expandComposeDefaults(String(p)).replace(/\/(tcp|udp)$/i, '');
       const parts = clean.split(':');
       if (parts.length === 2 && !parts[0].startsWith('127.0.0.1')) {
         svc.warnings.push(`El puerto ${p} se expondría en 0.0.0.0; en Culkibo se aislará tras Caddy.`);
@@ -273,9 +401,12 @@ function parseDockerCompose(yamlText) {
         }
       }
     }
+    if (containerPort === null && Array.isArray(svc.expose) && svc.expose.length > 0) {
+      const exp = parseInt(expandComposeDefaults(String(svc.expose[0])).replace(/\/(tcp|udp)$/i, ''), 10);
+      if (Number.isInteger(exp) && exp > 0 && exp < 65536) containerPort = exp;
+    }
     svc.containerPort = containerPort;
 
-    // Aviso de seguridad si el compose monta el socket de Docker o la raíz del host
     for (const vol of svc.volumes || []) {
       const vStr = String(vol || '');
       if (vStr.includes('/var/run/docker.sock') || vStr.startsWith('/:')) {
@@ -310,7 +441,8 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
 
   let detectedPlatform = String(platform || 'auto').toLowerCase();
   if (detectedPlatform === 'auto') {
-    if (raw.includes('[build]') || raw.includes('publish =')) detectedPlatform = 'netlify';
+    if (raw.includes('[deploy]') && (raw.includes('startCommand') || raw.includes('healthcheckPath') || raw.includes('builder'))) detectedPlatform = 'railway';
+    else if (raw.includes('[build]') || raw.includes('publish =')) detectedPlatform = 'netlify';
     else if (raw.includes('services:') && (raw.includes('buildCommand:') || raw.includes('startCommand:'))) detectedPlatform = 'render';
     else if (raw.startsWith('{')) {
       try {
@@ -341,7 +473,16 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
     notes: []
   };
 
-  if (raw && (detectedPlatform === 'vercel' || detectedPlatform === 'railway' || detectedPlatform === 'dokploy')) {
+  if (raw && detectedPlatform === 'railway' && !raw.startsWith('{')) {
+    // Soporte railway.toml
+    const buildM = raw.match(/^\s*buildCommand\s*=\s*["']([^"']+)["']/m);
+    const startM = raw.match(/^\s*startCommand\s*=\s*["']([^"']+)["']/m);
+    const healthM = raw.match(/^\s*healthcheckPath\s*=\s*["']([^"']+)["']/m);
+    if (buildM) result.buildCommand = buildM[1];
+    if (startM) result.startCommand = startM[1];
+    if (healthM) result.healthPath = healthM[1];
+    result.notes.push('Culkibo leyó tu railway.toml y aplica límites de memoria, healthchecks y despliegue sin cortes.');
+  } else if (raw && (detectedPlatform === 'vercel' || detectedPlatform === 'railway' || detectedPlatform === 'dokploy')) {
     let json;
     try {
       json = JSON.parse(raw);
@@ -353,6 +494,7 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
       result.framework = json.framework || null;
       result.buildCommand = json.buildCommand || 'npm run build';
       result.outputDirectory = json.outputDirectory || (json.framework === 'nextjs' ? '.next' : 'dist');
+      if (json.rootDirectory) result.baseDirectory = String(json.rootDirectory);
       result.port = json.framework === 'nextjs' ? 3000 : 80;
       if (json.env && typeof json.env === 'object') {
         Object.assign(result.envVars, json.env);
@@ -372,6 +514,8 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
       result.startCommand = json.startCommand || '';
       if (typeof json.env === 'string') {
         Object.assign(result.envVars, parseEnvText(json.env).envVars);
+      } else if (json.env && typeof json.env === 'object') {
+        Object.assign(result.envVars, json.env);
       }
       if (Array.isArray(json.domains)) {
         result.domains = json.domains.map(d => (typeof d === 'string' ? d : d?.host)).filter(Boolean);
@@ -385,7 +529,6 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
     if (pubMatch) result.outputDirectory = pubMatch[1];
     if (baseMatch) result.baseDirectory = baseMatch[1];
     result.port = 80;
-    // Extraer [build.environment]
     const envBlock = raw.match(/\[build\.environment\]([\s\S]*?)(\n\[|$)/);
     if (envBlock) {
       for (const m of envBlock[1].matchAll(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*["']?([^"'\r\n]+)["']?/gm)) {
@@ -398,10 +541,16 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
     const buildMatch = raw.match(/^\s*buildCommand\s*:\s*([^\r\n#]+)/m);
     const startMatch = raw.match(/^\s*startCommand\s*:\s*([^\r\n#]+)/m);
     const healthMatch = raw.match(/^\s*healthCheckPath\s*:\s*([^\r\n#]+)/m);
+    const rootMatch = raw.match(/^\s*rootDir\s*:\s*([^\r\n#]+)/m);
     if (nameMatch) result.name = unquote(nameMatch[1]);
     if (buildMatch) result.buildCommand = unquote(buildMatch[1]);
     if (startMatch) result.startCommand = unquote(startMatch[1]);
     if (healthMatch) result.healthPath = unquote(healthMatch[1]);
+    if (rootMatch) result.baseDirectory = unquote(rootMatch[1]);
+    // Extraer pares key/value dentro de envVars en render.yaml
+    for (const m of raw.matchAll(/-\s*key\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\r?\n\s*value\s*:\s*([^\r\n#]+)/g)) {
+      result.envVars[m[1]] = unquote(m[2]);
+    }
   }
 
   return { success: true, ...result };
@@ -431,10 +580,11 @@ class UniversalImporter {
     }
 
     const primaryApp = chosen.find(s => s.kind === 'app') || chosen[0];
-    const mergedEnv = {};
+    // Aislamiento de variables por servicio: sólo las variables de la app principal van al Project raíz
+    // (evita filtrar MYSQL_ROOT_PASSWORD o POSTGRES_PASSWORD de una BD hacia la app web).
+    const primaryEnv = { ...(primaryApp.envVars || {}) };
     const mergedVolumes = [];
     for (const svc of chosen) {
-      Object.assign(mergedEnv, svc.envVars || {});
       for (const vol of svc.volumes || []) {
         const [source, target] = String(vol).split(':');
         mergedVolumes.push({ name: source || svc.name, mount_path: target || source });
@@ -448,9 +598,9 @@ class UniversalImporter {
       source: 'compose-import',
       containerPort: primaryApp.containerPort || 8080,
       citadelPort: primaryApp.containerPort || 8080,
-      envVars: mergedEnv,
+      envVars: primaryEnv,
       volumes: mergedVolumes,
-      resources: chosen.map(svc => ({
+      resources: chosen.map((svc, idx) => ({
         id: `compose_${svc.name}`,
         type: svc.kind === 'database' ? 'database' : 'service',
         name: svc.name,
@@ -459,7 +609,8 @@ class UniversalImporter {
         ports: svc.ports.join(', '),
         envVars: svc.envVars,
         volumes: svc.volumes,
-        dockerCompose: yamlText,
+        // Guardar el YAML una única vez (en el recurso principal) para no multiplicar el tamaño de projects.json
+        ...(idx === 0 ? { dockerCompose: yamlText } : {}),
         warnings: svc.warnings,
         status: 'stopped'
       }))
@@ -497,7 +648,20 @@ class UniversalImporter {
       throw new Error('URL de repositorio bloqueada por protección SSRF');
     }
 
-    const segments = parsed.pathname.replace(/^\/+|\/+$/g, '').replace(/\.git$/, '').split('/').filter(Boolean);
+    let cleanPathname = parsed.pathname.replace(/^\/+|\/+$/g, '');
+    let extractedBranch = branch || '';
+    // Soportar URLs copiadas desde el navegador con `/tree/<branch>` (GitHub) o `/-/tree/<branch>` (GitLab)
+    const ghTreeM = cleanPathname.match(/^([^/]+\/[^/]+)\/tree\/([^/?#]+)(?:\/.*)?$/);
+    const glTreeM = cleanPathname.match(/^(.+?)\/-\/tree\/([^/?#]+)(?:\/.*)?$/);
+    if (glTreeM) {
+      cleanPathname = glTreeM[1];
+      if (!extractedBranch) extractedBranch = decodeURIComponent(glTreeM[2]);
+    } else if (ghTreeM) {
+      cleanPathname = ghTreeM[1];
+      if (!extractedBranch) extractedBranch = decodeURIComponent(ghTreeM[2]);
+    }
+
+    const segments = cleanPathname.replace(/\.git$/, '').split('/').filter(Boolean);
     const owner = segments[0] || '';
     const repo = segments[segments.length - 1] || 'app';
 
@@ -507,6 +671,7 @@ class UniversalImporter {
     else if (host === 'bitbucket.org') provider = 'bitbucket';
     else if (host.includes('codeberg.org') || host.includes('gitea')) provider = 'gitea';
 
+    const cleanRepoUrl = `${parsed.origin}/${cleanPathname.replace(/\.git$/, '')}.git`;
     /** @type {any} */
     const info = {
       success: true,
@@ -515,8 +680,8 @@ class UniversalImporter {
       owner,
       repo,
       suggestedName: repo,
-      cloneUrl: parsed.toString().endsWith('.git') ? parsed.toString() : `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}.git`,
-      defaultBranch: branch || 'main',
+      cloneUrl: cleanRepoUrl,
+      defaultBranch: extractedBranch || 'main',
       description: '',
       language: null,
       isPrivate: false,
@@ -605,8 +770,8 @@ class UniversalImporter {
     } else if (names.has('vite.config.ts') || names.has('vite.config.js') || names.has('vite.config.mjs')) {
       info.framework = 'Vite / React';
       info.buildCommand = 'npm run build';
-      info.startCommand = 'npm run preview';
-      info.port = 5173;
+      info.startCommand = 'npx vite preview --host 0.0.0.0 --port 4173';
+      info.port = 4173;
       info.icon = '⚡';
     } else if (names.has('package.json')) {
       info.framework = 'Node.js';

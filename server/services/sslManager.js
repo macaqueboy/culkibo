@@ -168,14 +168,23 @@ class SslManager {
    * `data/certs/`: nunca se toca nada fuera del directorio que gestionamos.
    */
   deleteFabricatedFiles(entry) {
+    /** @type {Set<string>} */
+    const parentDirs = new Set();
+    const certsRoot = path.resolve(CERTS_DIR);
     for (const p of [entry.certPath, entry.keyPath]) {
       if (!p) continue;
       const resolved = path.resolve(String(p));
-      if (!resolved.startsWith(path.resolve(CERTS_DIR) + path.sep)) continue;
+      if (!resolved.startsWith(certsRoot + path.sep)) continue;
       try {
         if (fs.existsSync(resolved)) fs.unlinkSync(resolved);
+        parentDirs.add(path.dirname(resolved));
       } catch (e) {
         console.warn(`[SSL] No se pudo borrar el PEM fabricado ${resolved}: ${e.message}`);
+      }
+    }
+    for (const dir of parentDirs) {
+      if (dir !== certsRoot && dir.startsWith(certsRoot + path.sep)) {
+        try { fs.rmdirSync(dir); } catch (e) {}
       }
     }
   }
@@ -224,7 +233,7 @@ class SslManager {
         subject: this.extractName(x509.subject),
         sans: (x509.subjectAltName || '')
           .split(',')
-          .map(s => s.trim().replace(/^DNS:/, ''))
+          .map(s => s.trim().replace(/^DNS:/i, '').toLowerCase())
           .filter(Boolean),
         notBefore: Number.isNaN(notBefore.getTime()) ? null : notBefore.toISOString(),
         notAfter: Number.isNaN(notAfter.getTime()) ? null : notAfter.toISOString(),
@@ -485,16 +494,46 @@ class SslManager {
       throw new Error('La clave privada no coincide con la clave pública del certificado X.509');
     }
 
+    const notAfter = new Date(x509.validTo);
+    const notBefore = new Date(x509.validFrom);
+    if (!Number.isNaN(notAfter.getTime()) && notAfter.getTime() <= Date.now()) {
+      throw new Error(`El certificado X.509 ya está caducado (expiró el ${notAfter.toISOString().slice(0, 10)})`);
+    }
+
     const sans = x509.subjectAltName
       ? x509.subjectAltName.split(/,\s*/).map((s) => s.replace(/^DNS:/i, '').trim().toLowerCase()).filter(Boolean)
       : [];
     const subjectCnMatch = String(x509.subject || '').match(/CN=([^\n,]+)/);
-    const detectedDomain = String(domain || '').trim().toLowerCase()
-      || sans[0]
-      || (subjectCnMatch ? subjectCnMatch[1].trim().toLowerCase() : '');
+    const subjectCn = subjectCnMatch ? subjectCnMatch[1].trim().toLowerCase() : '';
+    const explicitDomain = String(domain || '').trim().toLowerCase();
+    const detectedDomain = explicitDomain || sans[0] || subjectCn;
     if (!detectedDomain) {
       throw new Error('No se pudo determinar el dominio del certificado (indícalo explícitamente)');
     }
+    const DOMAIN_RE = /^(?:\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+    if (!DOMAIN_RE.test(detectedDomain) && detectedDomain !== 'localhost') {
+      throw new Error(`Dominio del certificado inválido (RFC 1123): ${detectedDomain}`);
+    }
+
+    // Si el usuario indicó un dominio explícito, comprobar que el certificado realmente lo cubre
+    const certPatterns = Array.from(new Set([...sans, ...(subjectCn ? [subjectCn] : [])]));
+    if (explicitDomain && certPatterns.length > 0) {
+      const covers = certPatterns.some((pat) => {
+        if (pat === explicitDomain) return true;
+        if (pat.startsWith('*.') && !explicitDomain.startsWith('*.')) {
+          const suffix = pat.slice(1); // .ejemplo.com
+          if (explicitDomain.endsWith(suffix)) {
+            const left = explicitDomain.slice(0, explicitDomain.length - suffix.length);
+            return Boolean(left && !left.includes('.'));
+          }
+        }
+        return false;
+      });
+      if (!covers) {
+        throw new Error(`El certificado no cubre el dominio "${explicitDomain}" (SANs en el certificado: ${certPatterns.slice(0, 5).join(', ')})`);
+      }
+    }
+
     const rootDomain = detectedDomain.replace(/^\*\./, '');
     const safeSlug = rootDomain.replace(/[^a-z0-9.-]/g, '_');
     const certDir = path.join(CERTS_DIR, `custom_${safeSlug}_${Date.now()}`);
@@ -505,8 +544,6 @@ class SslManager {
     fs.writeFileSync(certPath, `${cleanCert}\n`, { mode: 0o600 });
     fs.writeFileSync(keyPath, `${cleanKey}\n`, { mode: 0o600 });
 
-    const notAfter = new Date(x509.validTo);
-    const notBefore = new Date(x509.validFrom);
     const issuerMatch = String(x509.issuer || '').match(/(?:O|CN)=([^\n,]+)/);
     const record = {
       id: `cert_custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -528,10 +565,16 @@ class SslManager {
       registeredAt: new Date().toISOString()
     };
 
-    this.registry.unshift(record);
+    // Reemplazar certificados PEM previos del mismo dominio (evita duplicados acumulados en disco y en Caddy)
+    const replaced = this.registry.filter((c) => c.managedBy === 'on_disk' && c.domain === detectedDomain);
+    for (const old of replaced) {
+      this.deleteFabricatedFiles(old);
+    }
+    this.registry = [record, ...this.registry.filter((c) => !(c.managedBy === 'on_disk' && c.domain === detectedDomain))];
     this.saveRegistry();
     return {
       success: true,
+      replacedCount: replaced.length,
       cert: this.listCertificates().find((c) => c.id === record.id) || record
     };
   }

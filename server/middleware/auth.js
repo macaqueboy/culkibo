@@ -110,17 +110,30 @@ function resolveToken() {
   return cachedToken;
 }
 
+/** @type {Set<() => void>} */
+const tokenRotatedListeners = new Set();
+
+/** Permite suscribirse a rotaciones del token maestro para revocar sesiones WS/SSE activas. */
+function onTokenRotated(listener) {
+  if (typeof listener === 'function') tokenRotatedListeners.add(listener);
+  return () => tokenRotatedListeners.delete(listener);
+}
+
 /** Rota el token maestro de forma atómica (si no viene fijado por variable de entorno). */
 function rotateToken() {
   if (process.env.CULKIBO_TOKEN) {
     throw new Error('El token está fijado por la variable de entorno CULKIBO_TOKEN. Cámbiala y reinicia el servicio.');
   }
   const nextToken = crypto.randomBytes(32).toString('hex');
-  atomicWriteJsonSync(AUTH_FILE, { token: nextToken, rotatedAt: new Date().toISOString() }, 0o600);
+  const rotatedAt = new Date().toISOString();
+  atomicWriteJsonSync(AUTH_FILE, { token: nextToken, rotatedAt }, 0o600);
   cachedToken = nextToken;
   cachedTokenBuf = Buffer.from(nextToken, 'utf8');
   wsTickets.clear();
-  return { token: nextToken, rotatedAt: new Date().toISOString(), tokenSource: 'data/auth.json' };
+  for (const fn of tokenRotatedListeners) {
+    try { fn(); } catch (e) {}
+  }
+  return { rotated: true, token: nextToken, rotatedAt, tokenSource: 'data/auth.json' };
 }
 
 /** @type {string | null} */
@@ -226,9 +239,11 @@ function consumeWsTicket(ticket, req) {
   if (!entry) return false;
   wsTickets.delete(ticket);
   if (entry.expiresAt < Date.now()) return false;
-  const ip = clientIp(req);
-  if (entry.ip && ip && entry.ip !== ip && !LOOPBACK.has(entry.ip) && !LOOPBACK.has(ip)) {
-    return false;
+  if (req) {
+    const ip = clientIp(req);
+    if (entry.ip && ip && entry.ip !== ip && !(LOOPBACK.has(entry.ip) && LOOPBACK.has(ip))) {
+      return false;
+    }
   }
   return true;
 }
@@ -303,11 +318,29 @@ const PUBLIC_PATHS = new Set([
   '/api/auth/session',
   '/api/auth/verify',
   '/api/webhooks/github',
+  '/api/webhooks/gitlab',
+  '/api/webhooks/gitea',
+  '/api/webhooks/bitbucket',
   '/api/ingress/ask'
 ]);
+const DEPLOY_HOOK_PATH_RE = /^\/api\/webhooks\/deploy\/[a-zA-Z0-9_-]{1,80}$/;
 
 function isPublicPath(reqPath) {
-  return PUBLIC_PATHS.has(reqPath);
+  return PUBLIC_PATHS.has(reqPath) || DEPLOY_HOOK_PATH_RE.test(reqPath);
+}
+
+/** Estadísticas actuales de bloqueos anti fuerza bruta (para health-summary). */
+function getBruteForceStats() {
+  const now = Date.now();
+  let activeBlocks = 0;
+  let trackedIps = 0;
+  for (const entry of authFailMap.values()) {
+    if (entry.resetAt > now) {
+      trackedIps++;
+      if (entry.count >= AUTH_FAIL_MAX) activeBlocks++;
+    }
+  }
+  return { activeBlocks, trackedIps };
 }
 
 function checkAuthBruteForce(req) {
@@ -426,7 +459,9 @@ function corsOptions(req = null) {
     },
     credentials: false,
     allowedHeaders: [
-      'Content-Type', 'Authorization', 'X-Culkibo-Token', 'X-Hub-Signature-256', 'X-GitHub-Event',
+      'Content-Type', 'Authorization', 'X-Culkibo-Token', 'X-Hub-Signature-256', 'X-Hub-Signature',
+      'X-GitHub-Event', 'X-Gitlab-Token', 'X-Gitlab-Event', 'X-Gitea-Signature', 'X-Forgejo-Signature',
+      'X-Deploy-Token', 'X-Backup-Filename',
       'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name'
     ]
   };
@@ -439,9 +474,17 @@ function corsDelegate(req, callback) {
 
 /** Resumen para el arranque y para /api/system/status. Nunca devuelve el token. */
 function authStatus() {
+  let tokenRotatedAt = null;
+  try {
+    if (!process.env.CULKIBO_TOKEN && fs.existsSync(AUTH_FILE)) {
+      const stored = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+      tokenRotatedAt = stored.rotatedAt || stored.createdAt || null;
+    }
+  } catch (e) {}
   return {
     tokenConfigured: Boolean(cachedToken || process.env.CULKIBO_TOKEN || fs.existsSync(AUTH_FILE)),
     tokenSource: process.env.CULKIBO_TOKEN ? 'env' : 'data/auth.json',
+    tokenRotatedAt,
     requireTokenAlways: process.env.CULKIBO_REQUIRE_TOKEN === '1',
     allowedOrigins: Array.from(allowedOrigins())
   };
@@ -454,6 +497,7 @@ module.exports = {
   corsDelegate,
   resolveToken,
   rotateToken,
+  onTokenRotated,
   createWsTicket,
   consumeWsTicket,
   authStatus,
@@ -462,7 +506,9 @@ module.exports = {
   tokenMatches,
   isLoopback,
   isPrivateProxyPeer,
+  clientIp,
   checkAuthBruteForce,
   recordAuthFailure,
-  resetAuthRateLimit
+  resetAuthRateLimit,
+  getBruteForceStats
 };

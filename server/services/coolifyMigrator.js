@@ -19,7 +19,11 @@ class CoolifyMigrator {
         timeoutMs: 30000
       });
       if (!response.ok) {
-        const httpErr = new Error(`Coolify respondió HTTP ${response.status}`);
+        const httpErr = new Error(
+          response.status === 401 || response.status === 403
+            ? `Token de API de Coolify rechazado (HTTP ${response.status}). Verifica que el token tiene permisos de lectura.`
+            : `Coolify respondió HTTP ${response.status}`
+        );
         /** @type {any} */ (httpErr).status = response.status;
         throw httpErr;
       }
@@ -27,6 +31,9 @@ class CoolifyMigrator {
       return rawText ? JSON.parse(rawText) : [];
     } catch (err) {
       if (err && /SSRF|inválida|protocolo|metadatos|privada/i.test(String(err.message || ''))) {
+        throw err;
+      }
+      if (err && (err.status === 401 || err.status === 403)) {
         throw err;
       }
       console.error(`Coolify fetch error on ${endpoint}:`, err.message);
@@ -118,32 +125,79 @@ class CoolifyMigrator {
     };
   }
 
+  /** Extrae hostnames limpios desde un campo `fqdn` de Coolify (lista CSV de URLs o dominios). */
+  parseFqdnHosts(fqdn) {
+    if (!fqdn) return [];
+    const hosts = [];
+    for (const raw of String(fqdn).split(',')) {
+      const token = raw.trim();
+      if (!token) continue;
+      try {
+        const parsed = new URL(/^https?:\/\//i.test(token) ? token : `https://${token}`);
+        const host = parsed.hostname.toLowerCase();
+        if (host && host.includes('.')) hosts.push(host);
+      } catch (e) {
+        const clean = token.replace(/^https?:\/\//i, '').replace(/[:/].*$/, '').toLowerCase();
+        if (clean && clean.includes('.')) hosts.push(clean);
+      }
+    }
+    return Array.from(new Set(hosts));
+  }
+
+  /** Normaliza estados compuestos de Coolify v4 (`running:healthy`, `running:unknown`, `exited:unhealthy`). */
+  normalizeCoolifyStatus(status) {
+    return String(status || '').toLowerCase().startsWith('running') ? 'active' : 'stopped';
+  }
+
+  /** Parsea límites de memoria de Coolify (`512m`, `1g`, `536870912`) a MB enteros. */
+  parseMemoryMb(raw) {
+    if (!raw || raw === '0') return null;
+    const s = String(raw).trim().toLowerCase();
+    const m = s.match(/^(\d+(?:\.\d+)?)\s*(b|k|kb|m|mb|g|gb)?$/);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    const unit = m[2] || 'b';
+    if (unit === 'g' || unit === 'gb') return Math.round(n * 1024);
+    if (unit === 'm' || unit === 'mb') return Math.round(n);
+    if (unit === 'k' || unit === 'kb') return Math.max(64, Math.round(n / 1024));
+    return n > 1024 * 1024 ? Math.round(n / (1024 * 1024)) : Math.round(n);
+  }
+
   async executeMigration(apiUrl, apiToken, options = {}) {
     return this.migrate(
       apiUrl,
       apiToken,
-      options.apps || [],
-      options.dbs || [],
-      options.services || []
+      options.apps !== undefined ? options.apps : null,
+      options.dbs !== undefined ? options.dbs : null,
+      options.services !== undefined ? options.services : null
     );
   }
 
-  async migrate(apiUrl, apiToken, selectedApps = [], selectedDbs = [], selectedServices = []) {
+  /**
+   * @param {string} apiUrl
+   * @param {string} apiToken
+   * @param {string[] | null} [selectedApps]
+   * @param {string[] | null} [selectedDbs]
+   * @param {string[] | null} [selectedServices]
+   */
+  async migrate(apiUrl, apiToken, selectedApps = null, selectedDbs = null, selectedServices = null) {
     const apps = await this.fetchApplications(apiUrl, apiToken);
     const databases = await this.fetchDatabases(apiUrl, apiToken);
     const services = await this.fetchServices(apiUrl, apiToken);
     const projects = await this.fetchProjects(apiUrl, apiToken);
-    
+
     const results = {
       importedApps: 0,
       importedDbs: 0,
       importedServices: 0,
+      domainsLinked: 0,
       errors: /** @type {string[]} */ ([])
     };
 
-    const appsToImport = selectedApps.length > 0 ? apps.filter(app => selectedApps.includes(app.uuid)) : apps;
-    const dbsToImport = selectedDbs.length > 0 ? databases.filter(db => selectedDbs.includes(db.uuid)) : databases;
-    const servicesToImport = selectedServices.length > 0 ? services.filter(svc => selectedServices.includes(svc.uuid)) : services;
+    // Semántica estricta: null/undefined = importar todos; array explícito (incluido []) = sólo los seleccionados.
+    const appsToImport = Array.isArray(selectedApps) ? apps.filter(app => selectedApps.includes(app.uuid)) : apps;
+    const dbsToImport = Array.isArray(selectedDbs) ? databases.filter(db => selectedDbs.includes(db.uuid)) : databases;
+    const servicesToImport = Array.isArray(selectedServices) ? services.filter(svc => selectedServices.includes(svc.uuid)) : services;
 
     const culkiboProjects = new Map();
 
@@ -151,7 +205,7 @@ class CoolifyMigrator {
         let projectName = 'Importado de Coolify';
         let projectDesc = 'Recursos migrados de Coolify';
         let projectId = 'coolify_import';
-        
+
         if (resource.environment && resource.environment.project) {
            projectName = resource.environment.project.name || projectName;
            projectDesc = resource.environment.project.description || projectDesc;
@@ -164,7 +218,7 @@ class CoolifyMigrator {
              projectId = p.uuid || p.id || projectId;
            }
         }
-        
+
         const key = projectId;
         if (!culkiboProjects.has(key)) {
             culkiboProjects.set(key, {
@@ -176,23 +230,33 @@ class CoolifyMigrator {
                 source: 'coolify-import',
                 resources: [],
                 domains: [],
-                envVars: {}
+                pendingHosts: [],
+                envVars: {},
+                volumes: []
             });
         }
         return culkiboProjects.get(key);
     };
 
     const extractCommonFields = (res) => {
+        /** @type {Record<string, string>} */
         const envVars = {};
+        /** @type {Record<string, string>} */
+        const previewEnvVars = {};
         if (res.environment_variables && Array.isArray(res.environment_variables)) {
              res.environment_variables.forEach(ev => {
-                 envVars[ev.key] = ev.value;
+                 if (!ev || !ev.key) return;
+                 if (ev.is_preview) {
+                   previewEnvVars[ev.key] = ev.value ?? '';
+                 } else {
+                   envVars[ev.key] = ev.value ?? '';
+                 }
              });
         }
 
         const volumes = res.local_persistent_volumes || res.persistent_volumes || res.volumes || [];
         const fileMounts = res.local_file_volumes || [];
-        
+
         const resourceLimits = {
             limits_memory: res.limits_memory,
             limits_cpus: res.limits_cpus,
@@ -218,13 +282,13 @@ class CoolifyMigrator {
             custom_labels: res.custom_labels
         };
 
-        return { envVars, volumes, fileMounts, resourceLimits, healthCheck, networkConfig };
+        return { envVars, previewEnvVars, volumes, fileMounts, resourceLimits, healthCheck, networkConfig };
     };
 
     // 1. Migrate Apps
     for (const app of appsToImport) {
       try {
-        const domains = app.fqdn ? app.fqdn.split(',').map(d => d.trim()) : [];
+        const hosts = this.parseFqdnHosts(app.fqdn);
         const common = extractCommonFields(app);
 
         const buildConfig = {
@@ -243,6 +307,9 @@ class CoolifyMigrator {
             post_deployment_command: app.post_deployment_command
         };
 
+        const imageName = app.docker_registry_image_name
+          ? (app.docker_registry_image_tag ? `${app.docker_registry_image_name}:${app.docker_registry_image_tag}` : app.docker_registry_image_name)
+          : '';
         const gitDetails = {
             git_full_url: app.git_full_url,
             git_commit_sha: app.git_commit_sha,
@@ -252,27 +319,34 @@ class CoolifyMigrator {
         };
 
         const proj = getProjectForResource(app);
-        // Coolify v4 deja por defecto `git_repository: "coollabsio/coolify"` en apps de tipo
-        // `dockerimage` (sin repo Git real). Jamás debemos importarlo como código fuente del proyecto.
         const rawRepo = String(app.git_repository || app.git_full_url || '').trim();
         const isCoolifyDummyRepo = app.build_pack === 'dockerimage'
           || (Boolean(app.docker_registry_image_name) && /^(?:https?:\/\/github\.com\/)?coollabsio\/coolify(?:\.git)?$/i.test(rawRepo));
         const effectiveGitRepo = isCoolifyDummyRepo ? '' : rawRepo;
 
-        if (!proj.gitRepo && effectiveGitRepo) {
-            proj.gitRepo = effectiveGitRepo;
+        const firstPort = parseInt(String(app.ports_exposes || app.port || '').split(',')[0], 10);
+        if (!proj.gitRepo && effectiveGitRepo) proj.gitRepo = effectiveGitRepo;
+        if (!proj.gitBranch && app.git_branch) proj.gitBranch = app.git_branch;
+        if (!proj.buildCommand && app.build_command) proj.buildCommand = app.build_command;
+        if (!proj.startCommand && app.start_command) proj.startCommand = app.start_command;
+        if (!proj.baseDirectory && app.base_directory) proj.baseDirectory = app.base_directory;
+        if (!proj.preDeployCommand && app.pre_deployment_command) proj.preDeployCommand = app.pre_deployment_command;
+        if (!proj.postDeployCommand && app.post_deployment_command) proj.postDeployCommand = app.post_deployment_command;
+        if (!proj.healthPath && app.health_check_path) proj.healthPath = app.health_check_path;
+        if (!proj.containerPort && Number.isInteger(firstPort) && firstPort > 0 && firstPort < 65536) {
+          proj.containerPort = firstPort;
+          proj.citadelPort = firstPort;
         }
-        if (!proj.gitBranch && app.git_branch) {
-            proj.gitBranch = app.git_branch;
+        const memMb = this.parseMemoryMb(app.limits_memory);
+        if (!proj.memoryLimitMb && memMb) proj.memoryLimitMb = memMb;
+        if (!proj.cpuLimit && app.limits_cpus && Number(app.limits_cpus) > 0) proj.cpuLimit = Number(app.limits_cpus);
+
+        // Propagar variables de entorno y volúmenes de la app principal al proyecto raíz
+        if (Object.keys(proj.envVars).length === 0 && Object.keys(common.envVars).length > 0) {
+          Object.assign(proj.envVars, common.envVars);
         }
-        if (!proj.buildCommand && app.build_command) {
-            proj.buildCommand = app.build_command;
-        }
-        if (!proj.startCommand && app.start_command) {
-            proj.startCommand = app.start_command;
-        }
-        if (!proj.baseDirectory && app.base_directory) {
-            proj.baseDirectory = app.base_directory;
+        if (Array.isArray(common.volumes) && common.volumes.length > 0 && proj.volumes.length === 0) {
+          proj.volumes.push(...common.volumes);
         }
 
         proj.resources.push({
@@ -281,8 +355,10 @@ class CoolifyMigrator {
             name: app.name || 'Coolify App',
             description: app.description || `App migrada de Coolify (${app.uuid})`,
             gitRepo: effectiveGitRepo,
-            domains: domains,
+            image: imageName || undefined,
+            domains: hosts,
             envVars: common.envVars,
+            previewEnvVars: common.previewEnvVars,
             volumes: common.volumes,
             fileMounts: common.fileMounts,
             resourceLimits: common.resourceLimits,
@@ -292,25 +368,13 @@ class CoolifyMigrator {
             deployCommands: deployCommands,
             gitDetails: gitDetails,
             ports: app.ports_exposes || app.ports_mappings || app.port || '',
-            status: app.status === 'running' ? 'active' : 'stopped',
+            status: this.normalizeCoolifyStatus(app.status),
             rawMeta: app
         });
 
-        for (const domain of domains) {
-          const host = domain.replace(/^https?:\/\//, '');
-          try {
-            await domainManager.addDomain({
-              hostname: host,
-              targetPod: 'citadel',
-              cloudflareProxied: false,
-              sslStatus: 'pending_migration',
-              sslProvider: 'lets_encrypt',
-              migrationSource: 'coolify'
-            });
-            proj.domains.push(host);
-          } catch (e) {
-            // ignore domain already exists
-          }
+        for (const host of hosts) {
+          proj.pendingHosts.push(host);
+          proj.domains.push(host);
         }
         results.importedApps++;
       } catch (e) {
@@ -318,23 +382,33 @@ class CoolifyMigrator {
       }
     }
 
-    // 2. Migrate DBs
+    // 2. Migrate DBs (soporta standalone-postgresql, mysql, mariadb, redis, keydb, dragonfly, clickhouse, mongodb)
     for (const db of dbsToImport) {
       try {
         const proj = getProjectForResource(db);
         const common = extractCommonFields(db);
+        const rawType = String(db.database_type || db.type || 'database').toLowerCase();
+        const dbEngine = rawType.includes('postgres') ? 'postgres'
+          : rawType.includes('mariadb') ? 'mariadb'
+          : rawType.includes('mysql') ? 'mysql'
+          : (rawType.includes('redis') || rawType.includes('keydb') || rawType.includes('dragonfly')) ? 'valkey'
+          : rawType.includes('mongo') ? 'mongodb'
+          : rawType.includes('clickhouse') ? 'clickhouse'
+          : rawType;
 
         proj.resources.push({
             id: db.uuid,
             type: 'database',
+            engine: dbEngine,
+            image: db.image || undefined,
             name: db.name || 'Coolify DB',
-            description: db.description || `Base de datos (${db.database_type || 'DB'}). Importada de Coolify.`,
-            status: db.status === 'running' ? 'active' : 'stopped',
+            description: db.description || `Base de datos (${db.database_type || db.type || 'DB'}). Importada de Coolify.`,
+            status: this.normalizeCoolifyStatus(db.status),
             envVars: common.envVars,
             port: db.public_port || db.port || null,
             credentials: {
-                user: db.database_user || db.postgres_user || db.mysql_user || db.mariadb_user || db.mongo_initdb_root_username || '',
-                password: db.database_password || db.postgres_password || db.mysql_password || db.mariadb_password || db.mongo_initdb_root_password || '',
+                user: db.database_user || db.postgres_user || db.mysql_user || db.mariadb_user || db.mongo_initdb_root_username || db.clickhouse_admin_user || '',
+                password: db.database_password || db.postgres_password || db.mysql_password || db.mariadb_password || db.mongo_initdb_root_password || db.redis_password || db.keydb_password || db.dragonfly_password || db.clickhouse_admin_password || '',
                 rootPassword: db.database_root_password || db.mysql_root_password || db.mariadb_root_password || '',
                 dbName: db.database_name || db.postgres_db || db.mysql_database || db.mariadb_database || ''
             },
@@ -351,18 +425,26 @@ class CoolifyMigrator {
       }
     }
 
-    // 3. Migrate Services
+    // 3. Migrate Services (incluyendo dominios en svc.applications[].fqdn)
     for (const svc of servicesToImport) {
       try {
         const proj = getProjectForResource(svc);
         const common = extractCommonFields(svc);
+        const svcHosts = [...this.parseFqdnHosts(svc.fqdn)];
+        if (Array.isArray(svc.applications)) {
+          for (const subApp of svc.applications) {
+            svcHosts.push(...this.parseFqdnHosts(subApp?.fqdn));
+          }
+        }
+        const uniqueSvcHosts = Array.from(new Set(svcHosts));
 
         proj.resources.push({
             id: svc.uuid,
             type: 'service',
             name: svc.name || 'Coolify Service',
             description: svc.description || `Servicio Docker Compose migrado (${svc.uuid})`,
-            status: svc.status === 'running' ? 'active' : 'stopped',
+            status: this.normalizeCoolifyStatus(svc.status),
+            domains: uniqueSvcHosts,
             envVars: common.envVars,
             dockerCompose: svc.docker_compose || svc.docker_compose_raw || '',
             volumes: common.volumes,
@@ -372,18 +454,48 @@ class CoolifyMigrator {
             networkConfig: common.networkConfig,
             rawMeta: svc
         });
+        for (const host of uniqueSvcHosts) {
+          proj.pendingHosts.push(host);
+          proj.domains.push(host);
+        }
         results.importedServices++;
       } catch (e) {
         results.errors.push(`Service ${svc.name}: ${e.message}`);
       }
     }
 
-    // Save projects
+    // Save projects & link domains with the real created projectId
     for (const [key, projData] of culkiboProjects.entries()) {
         try {
-            // Remove duplicates from domains
-            projData.domains = [...new Set(projData.domains)];
+            const pendingHosts = Array.from(new Set(projData.pendingHosts || []));
+            delete projData.pendingHosts;
+            projData.domains = pendingHosts;
             const created = projectManager.create(projData);
+            const realProjectId = (created && created.id) || projData.id;
+            for (const host of pendingHosts) {
+              try {
+                await domainManager.addDomain({
+                  hostname: host,
+                  projectId: realProjectId,
+                  targetPod: 'citadel',
+                  targetPort: (created && created.citadelPort) || projData.citadelPort || 3000,
+                  cloudflareProxied: false,
+                  sslStatus: 'pending_migration',
+                  sslProvider: 'lets_encrypt',
+                  migrationSource: 'coolify'
+                });
+                results.domainsLinked++;
+              } catch (e) {
+                // Si el dominio ya existía, enlazarlo al proyecto migrado si no tenía propietario
+                try {
+                  const existing = domainManager.getByHostname ? domainManager.getByHostname(host) : null;
+                  if (existing && !existing.projectId) {
+                    await domainManager.updateDomain(existing.id, { projectId: realProjectId });
+                    results.domainsLinked++;
+                  }
+                } catch (_) {}
+              }
+            }
             if (created && created.gitRepo) {
                 localRunner.prepareProject(created).catch(() => {});
             }
@@ -395,6 +507,12 @@ class CoolifyMigrator {
     try {
       await projectManager.flushToDisk();
     } catch (e) {}
+
+    if (results.domainsLinked > 0) {
+      try {
+        await require('./ingressManager').reconcile();
+      } catch (e) {}
+    }
 
     return results;
   }

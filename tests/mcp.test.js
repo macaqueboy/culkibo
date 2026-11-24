@@ -146,7 +146,7 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 52, 'El catálogo debe tener 52 herramientas anotadas con paridad completa de escritura');
+  assert.strictEqual(tools.length, 72, 'El catálogo debe tener 72 herramientas anotadas con paridad completa de escritura');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -369,7 +369,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 52);
+    assert.strictEqual(list.result.tools.length, 72);
     console.log(`  ✓ tools/list sobre Streamable HTTP (${list.result.tools.length} herramientas)`);
 
     // 8. tools/call con salida estructurada.
@@ -440,17 +440,48 @@ async function testStreamableHttpTransport() {
     assert.strictEqual(deleteRes.status, 405);
     console.log('  ✓ GET y DELETE sobre el endpoint MCP responden 405 con Allow: POST');
 
-    // 12. Método desconocido -> 404 con -32601, que es lo que distingue a un
-    //     servidor moderno de un 404 de servidor legado.
-    const unknownRes = await post(
+    // 12. resources/list, resources/read, prompts/list, prompts/get + método desconocido -> 404 con -32601.
+    const resListHttp = await post(
       { 'MCP-Protocol-Version': V, 'Mcp-Method': 'resources/list' },
-      { jsonrpc: '2.0', id: 'unk-1', method: 'resources/list', params: { _meta: meta() } }
+      { jsonrpc: '2.0', id: 'res-1', method: 'resources/list', params: { _meta: meta() } }
+    );
+    assert.strictEqual(resListHttp.status, 200);
+    const resList = await resListHttp.json();
+    assert.ok(resList.result.resources.some((r) => r.uri === 'culkibo://projects'));
+
+    const resReadHttp = await post(
+      { 'MCP-Protocol-Version': V, 'Mcp-Method': 'resources/read', 'Mcp-Name': 'culkibo://pods' },
+      { jsonrpc: '2.0', id: 'res-2', method: 'resources/read', params: { uri: 'culkibo://pods', _meta: meta() } }
+    );
+    assert.strictEqual(resReadHttp.status, 200);
+    const resRead = await resReadHttp.json();
+    assert.ok(resRead.result.contents[0].text.includes('The Forge'));
+
+    const promptsListHttp = await post(
+      { 'MCP-Protocol-Version': V, 'Mcp-Method': 'prompts/list' },
+      { jsonrpc: '2.0', id: 'prm-1', method: 'prompts/list', params: { _meta: meta() } }
+    );
+    assert.strictEqual(promptsListHttp.status, 200);
+    const promptsList = await promptsListHttp.json();
+    assert.ok(promptsList.result.prompts.some((p) => p.name === 'debug-failed-deploy'));
+
+    const promptGetHttp = await post(
+      { 'MCP-Protocol-Version': V, 'Mcp-Method': 'prompts/get', 'Mcp-Name': 'audit-security-tls' },
+      { jsonrpc: '2.0', id: 'prm-2', method: 'prompts/get', params: { name: 'audit-security-tls', arguments: {}, _meta: meta() } }
+    );
+    assert.strictEqual(promptGetHttp.status, 200);
+    const promptGet = await promptGetHttp.json();
+    assert.ok(promptGet.result.messages[0].content.text.includes('culkibo_system_doctor'));
+
+    const unknownRes = await post(
+      { 'MCP-Protocol-Version': V, 'Mcp-Method': 'sampling/createMessage' },
+      { jsonrpc: '2.0', id: 'unk-1', method: 'sampling/createMessage', params: { _meta: meta() } }
     );
     assert.strictEqual(unknownRes.status, 404);
     const unknown = await unknownRes.json();
     assert.strictEqual(unknown.error.code, -32601);
     assert.ok(unknown.error.data.supported.includes('server/discover'));
-    console.log('  ✓ Método no implementado -> 404 con -32601 y la lista de métodos');
+    console.log('  ✓ resources/*, prompts/* y método no implementado (404 -32601) verificados');
 
     // 13. Respuesta SSE cuando el cliente pide progreso.
     const streamRes = await post(

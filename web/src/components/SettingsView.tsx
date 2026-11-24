@@ -17,25 +17,86 @@ import {
   Play,
   Loader2,
   Activity,
+  HardDrive,
+  Download,
+  Upload,
+  ShieldCheck,
+  ListChecks,
+  FileText,
 } from 'lucide-react';
-import { api, type GitHubStatus, type NotificationsConfig, type DbStorageConfig } from '../lib/api';
+import {
+  api,
+  type GitHubStatus,
+  type NotificationsConfig,
+  type NotificationHistoryItem,
+  type DbStorageConfig,
+  type RemoteS3Object,
+  type InstanceBackupItem,
+  type AuditLogEvent,
+} from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { Modal } from './Modal';
+import { HelpTip } from './HelpTip';
 
-type SettingsTab = 'remote' | 'integrations' | 'notifications' | 'system';
+type SettingsTab = 'remote' | 'integrations' | 'backups' | 'notifications' | 'system';
+
+function normalizeSettingsTab(raw?: string | null): SettingsTab {
+  if (!raw) return 'remote';
+  const k = raw.toLowerCase();
+  if (k === 'remote' || k === 'integrations' || k === 'backups' || k === 'notifications' || k === 'system') {
+    return k;
+  }
+  return 'remote';
+}
 
 interface SettingsViewProps {
   onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void;
   onOpenMetrics?: () => void;
+  initialTab?: string | null;
+  onTabChange?: (tab: string) => void;
+  onRestoreChecklist?: () => void;
 }
 
-export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetrics }) => {
-  const [tab, setTab] = useState<SettingsTab>('remote');
+export const SettingsView: React.FC<SettingsViewProps> = ({
+  onNotify,
+  onOpenMetrics,
+  initialTab,
+  onTabChange,
+  onRestoreChecklist,
+}) => {
+  const [tab, setTabState] = useState<SettingsTab>(() => normalizeSettingsTab(initialTab));
+  const setTab = (next: SettingsTab) => {
+    setTabState(next);
+    onTabChange?.(next);
+  };
+  const [prevInitialTab, setPrevInitialTab] = useState(initialTab);
+  if (initialTab !== prevInitialTab) {
+    setPrevInitialTab(initialTab);
+    if (initialTab) setTabState(normalizeSettingsTab(initialTab));
+  }
   const [sysStatus, setSysStatus] = useState<any>(null);
   const [dockerStatus, setDockerStatus] = useState<{ available: boolean; reason: string | null } | null>(null);
   const [caddyStatus, setCaddyStatus] = useState<{ available: boolean; adminUrl?: string; message?: string } | null>(null);
   const [pruning, setPruning] = useState(false);
   const [startingCaddy, setStartingCaddy] = useState(false);
+  const [auditEvents, setAuditEvents] = useState<AuditLogEvent[]>([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+
+  // Backups & DR (S3 Remote Browser + Instance Snapshot Export/Import)
+  const [s3Objects, setS3Objects] = useState<RemoteS3Object[]>([]);
+  const [s3ObjectsLoading, setS3ObjectsLoading] = useState(false);
+  const [instanceBackups, setInstanceBackups] = useState<InstanceBackupItem[]>([]);
+  const [exportIncludeSecrets, setExportIncludeSecrets] = useState(false);
+  const [exportPassphrase, setExportPassphrase] = useState('');
+  const [exportUploadS3, setExportUploadS3] = useState(false);
+  const [exportingSnapshot, setExportingSnapshot] = useState(false);
+  const [importPassphrase, setImportPassphrase] = useState('');
+  const [importMode, setImportMode] = useState<'merge' | 'overwrite'>('merge');
+  const [importSnapshotObj, setImportSnapshotObj] = useState<any>(null);
+  const [importFileName, setImportFileName] = useState<string>('');
+  const [importDryRunResult, setImportDryRunResult] = useState<any>(null);
+  const [importingSnapshot, setImportingSnapshot] = useState(false);
+  const [notifHistory, setNotifHistory] = useState<NotificationHistoryItem[]>([]);
 
   // GitHub
   const [githubStatus, setGithubStatus] = useState<GitHubStatus | null>(null);
@@ -205,13 +266,135 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
     e.preventDefault();
     setS3Busy(true);
     try {
-      await api.setDbStorage(s3Form);
+      const payload: Record<string, unknown> = {
+        endpoint: s3Form.endpoint.trim(),
+        bucket: s3Form.bucket.trim(),
+        region: s3Form.region.trim() || 'auto',
+        prefix: s3Form.prefix.trim(),
+      };
+      if (s3Form.accessKeyId.trim()) payload.accessKeyId = s3Form.accessKeyId.trim();
+      if (s3Form.secretAccessKey.trim()) payload.secretAccessKey = s3Form.secretAccessKey.trim();
+      await api.setDbStorage(payload);
+      setS3Form((prev) => ({ ...prev, accessKeyId: '', secretAccessKey: '' }));
       onNotify?.('Almacenamiento S3 / R2 guardado', 'success');
       void loadAll();
     } catch (err: any) {
       onNotify?.(err?.message || 'Error al guardar S3 / R2', 'error');
     } finally {
       setS3Busy(false);
+    }
+  };
+
+  const loadInstanceBackups = async () => {
+    const res = await api.listInstanceBackups().catch(() => ({ backups: [] }));
+    setInstanceBackups(res.backups || []);
+  };
+
+  const loadS3Objects = async () => {
+    setS3ObjectsLoading(true);
+    try {
+      const res = await api.listRemoteS3Objects();
+      setS3Objects(res.objects || []);
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudieron listar los objetos en S3', 'error');
+    } finally {
+      setS3ObjectsLoading(false);
+    }
+  };
+
+  const loadAudit = async () => {
+    setAuditLoading(true);
+    try {
+      const res = await api.getSystemAudit({ limit: 40 });
+      setAuditEvents(res.events || []);
+    } catch {
+      // ignorar
+    } finally {
+      setAuditLoading(false);
+    }
+  };
+
+  const loadNotifHistory = async () => {
+    const res = await api.getNotificationsHistory(20).catch(() => ({ notifications: [] }));
+    setNotifHistory(res.notifications || []);
+  };
+
+  useEffect(() => {
+    let active = true;
+    if (tab === 'backups') {
+      api.listInstanceBackups()
+        .then((res) => { if (active) setInstanceBackups(res.backups || []); })
+        .catch(() => {});
+    } else if (tab === 'system') {
+      api.getSystemAudit({ limit: 40 })
+        .then((res) => { if (active) setAuditEvents(res.events || []); })
+        .catch(() => {});
+    } else if (tab === 'notifications') {
+      api.getNotificationsHistory(20)
+        .then((res) => { if (active) setNotifHistory(res.notifications || []); })
+        .catch(() => {});
+    }
+    return () => { active = false; };
+  }, [tab]);
+
+  const handleExportInstance = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setExportingSnapshot(true);
+    try {
+      const res = await api.exportInstanceSnapshot({
+        includeSecrets: exportIncludeSecrets,
+        passphrase: exportPassphrase.trim() || '',
+        uploadToS3: exportUploadS3 && s3Config.configured,
+      });
+      onNotify?.(
+        res.fileName
+          ? `Snapshot completo creado: ${res.fileName}`
+          : 'Snapshot completo exportado correctamente',
+        'success'
+      );
+      await loadInstanceBackups();
+    } catch (err: any) {
+      onNotify?.(err?.message || 'Error al exportar snapshot', 'error');
+    } finally {
+      setExportingSnapshot(false);
+    }
+  };
+
+  const handleDownloadSnapshot = async (fileName: string) => {
+    try {
+      const { blob } = await api.downloadInstanceSnapshotBlob(fileName);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo descargar el snapshot', 'error');
+    }
+  };
+
+  const handleImportInstance = async (dryRun: boolean) => {
+    if (!importSnapshotObj) return;
+    setImportingSnapshot(true);
+    try {
+      const res = await api.importInstanceSnapshot({
+        snapshot: importSnapshotObj,
+        passphrase: importPassphrase.trim() || '',
+        dryRun,
+        mode: importMode,
+      });
+      setImportDryRunResult(res);
+      if (!dryRun) {
+        onNotify?.('Instancia Culkibo restaurada desde snapshot correctamente', 'success');
+        void loadAll();
+      } else {
+        onNotify?.('Simulación (dry-run) completada. Revisa los cambios antes de aplicar.', 'info');
+      }
+    } catch (err: any) {
+      onNotify?.(err?.message || 'Error al procesar el snapshot', 'error');
+    } finally {
+      setImportingSnapshot(false);
     }
   };
 
@@ -265,6 +448,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
       const saved = await api.saveNotificationsConfig(notif);
       setNotif(saved);
       const res = await api.testNotifications();
+      void loadNotifHistory();
       if (res.sent) {
         onNotify?.(`Alerta de prueba enviada a ${res.delivered} ${res.delivered === 1 ? 'canal' : 'canales'}`, 'success');
       } else {
@@ -323,6 +507,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
         {([
           { id: 'remote', label: 'Acceso remoto', icon: Globe },
           { id: 'integrations', label: 'Integraciones', icon: Plug },
+          { id: 'backups', label: 'Backups y DR', icon: HardDrive },
           { id: 'notifications', label: 'Notificaciones', icon: Bell },
           { id: 'system', label: 'Sistema', icon: Cpu },
         ] as const).map((t) => {
@@ -505,15 +690,42 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
             )}
           </div>
 
-          {/* S3 / R2 */}
+          {/* Enlace limpio a Backups y DR */}
+          <div className="bg-white rounded-xl border border-slate-200 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            <div>
+              <div className="font-semibold text-slate-900">Almacenamiento S3 / Cloudflare R2 y Snapshots de instancia</div>
+              <p className="text-slate-500 mt-0.5">
+                {s3Config.configured ? `Conectado al bucket ${s3Config.bucket}` : 'Configura tu bucket S3/R2 y exporta copias completas cifradas en Backups y DR.'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setTab('backups')}
+              className="px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0"
+            >
+              Abrir Backups y DR
+            </button>
+          </div>
+        </div>
+      )}
+
+      {tab === 'backups' && (
+        <div className="space-y-5">
+          {/* Almacenamiento S3 / R2 (soporta edición parcial sin reescribir claves) */}
           <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div>
-                <h2 className="text-sm font-semibold text-slate-900">Almacenamiento de copias S3 / Cloudflare R2</h2>
-                <p className="text-xs text-slate-500 mt-0.5">Copias externas cifradas para bases de datos gestionadas.</p>
+                <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-1.5">
+                  <span>Almacenamiento remoto S3 / Cloudflare R2</span>
+                  <HelpTip title="Backups externos S3 / R2">
+                    <p>Sube automáticamente cada copia de base de datos o snapshot completo fuera del servidor.</p>
+                    <p>Si ya está configurado, puedes cambiar el bucket o prefijo dejando las claves vacías para conservarlas.</p>
+                  </HelpTip>
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">Compatible con Cloudflare R2, AWS S3, Backblaze B2 y MinIO.</p>
               </div>
               {s3Config.configured && (
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
                     type="button"
                     onClick={() => void handleTestS3()}
@@ -521,6 +733,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
                     className="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700 cursor-pointer"
                   >
                     Probar conexión
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void loadS3Objects()}
+                    disabled={s3ObjectsLoading}
+                    className="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700 cursor-pointer"
+                  >
+                    {s3ObjectsLoading ? 'Cargando…' : 'Explorar bucket'}
                   </button>
                   <button
                     type="button"
@@ -575,23 +795,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
                 />
               </label>
               <label className="block">
-                <span className="font-medium text-slate-700">Clave de acceso (Access Key ID)</span>
+                <span className="font-medium text-slate-700">Access Key ID</span>
                 <input
                   value={s3Form.accessKeyId}
                   onChange={(e) => setS3Form({ ...s3Form, accessKeyId: e.target.value })}
-                  placeholder="Access Key ID"
-                  required
+                  placeholder={s3Config.configured ? `${s3Config.accessKeyId || '••••'} (vacío para conservar)` : 'Access Key ID'}
+                  required={!s3Config.configured}
                   className="mt-1 w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
                 />
               </label>
               <label className="block">
-                <span className="font-medium text-slate-700">Clave secreta (Secret Access Key)</span>
+                <span className="font-medium text-slate-700">Secret Access Key</span>
                 <input
                   type="password"
                   value={s3Form.secretAccessKey}
                   onChange={(e) => setS3Form({ ...s3Form, secretAccessKey: e.target.value })}
-                  placeholder="Secret Access Key"
-                  required
+                  placeholder={s3Config.configured ? '•••••••• (vacío para conservar)' : 'Secret Access Key'}
+                  required={!s3Config.configured}
                   className="mt-1 w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
                 />
               </label>
@@ -601,6 +821,192 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
                 </button>
               </div>
             </form>
+
+            {s3Objects.length > 0 && (
+              <div className="border border-slate-200 rounded-xl overflow-hidden text-xs">
+                <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 font-medium text-slate-700 tabular-nums">
+                  Objetos remotos en bucket ({s3Objects.length})
+                </div>
+                <div className="divide-y divide-slate-100 max-h-48 overflow-y-auto">
+                  {s3Objects.map((obj) => (
+                    <div key={obj.key} className="px-4 py-2 flex items-center justify-between gap-2">
+                      <span className="font-mono text-slate-700 truncate">{obj.key}</span>
+                      <span className="text-slate-400 font-mono tabular-nums shrink-0">
+                        {(obj.size / 1024).toFixed(1)} KB
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Snapshot completo de instancia (Disaster Recovery) */}
+          <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-5 text-xs">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-1.5">
+                <ShieldCheck className="w-4 h-4 text-slate-600" />
+                <span>Snapshot completo de instancia Culkibo (DR)</span>
+              </h2>
+              <p className="text-slate-500 mt-0.5">
+                Exporta o restaura en bloque todos tus proyectos, dominios, tareas cron, políticas TLS, notificaciones y metadatos con cifrado opcional AES-256-GCM.
+              </p>
+            </div>
+
+            <form onSubmit={handleExportInstance} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+              <div className="font-semibold text-slate-800">1. Exportar snapshot de este servidor</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={exportIncludeSecrets}
+                      onChange={(e) => setExportIncludeSecrets(e.target.checked)}
+                      className="rounded border-slate-300 accent-slate-900"
+                    />
+                    <span>Incluir variables de entorno y secretos (requiere contraseña de cifrado)</span>
+                  </label>
+                  {s3Config.configured && (
+                    <label className="flex items-center gap-2 text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={exportUploadS3}
+                        onChange={(e) => setExportUploadS3(e.target.checked)}
+                        className="rounded border-slate-300 accent-slate-900"
+                      />
+                      <span>Subir copia también al bucket S3 / R2</span>
+                    </label>
+                  )}
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">
+                    Contraseña de cifrado AES-256-GCM {exportIncludeSecrets ? '(obligatoria)' : '(opcional)'}
+                  </label>
+                  <input
+                    type="password"
+                    value={exportPassphrase}
+                    onChange={(e) => setExportPassphrase(e.target.value)}
+                    required={exportIncludeSecrets}
+                    placeholder="Frase segura para cifrar el archivo"
+                    className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
+                  />
+                </div>
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={exportingSnapshot}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {exportingSnapshot ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                  <span>{exportingSnapshot ? 'Exportando…' : 'Crear snapshot ahora'}</span>
+                </button>
+              </div>
+            </form>
+
+            {instanceBackups.length > 0 && (
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 font-medium text-slate-700">
+                  Snapshots disponibles en disco ({instanceBackups.length})
+                </div>
+                <div className="divide-y divide-slate-100 max-h-44 overflow-y-auto">
+                  {instanceBackups.map((bk) => (
+                    <div key={bk.fileName} className="px-4 py-2.5 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <span className="font-mono text-slate-800 truncate block">{bk.fileName}</span>
+                        {bk.createdAt && <span className="text-[11px] text-slate-400">{new Date(bk.createdAt).toLocaleString('es-ES')}</span>}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleDownloadSnapshot(bk.fileName)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer shrink-0"
+                      >
+                        <Download className="w-3 h-3" /> Descargar
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Importar Snapshot */}
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+              <div className="font-semibold text-slate-800">2. Restaurar o migrar desde un archivo snapshot (.json)</div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Archivo snapshot</label>
+                  <label className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 font-medium cursor-pointer">
+                    <Upload className="w-3.5 h-3.5" />
+                    <span className="truncate">{importFileName || 'Seleccionar archivo .json'}</span>
+                    <input
+                      type="file"
+                      accept=".json"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (!f) return;
+                        setImportFileName(f.name);
+                        setImportDryRunResult(null);
+                        f.text().then((txt) => {
+                          try {
+                            setImportSnapshotObj(JSON.parse(txt));
+                          } catch {
+                            onNotify?.('El archivo seleccionado no es un JSON válido', 'error');
+                          }
+                        });
+                        e.target.value = '';
+                      }}
+                    />
+                  </label>
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Modo de restauración</label>
+                  <select
+                    value={importMode}
+                    onChange={(e) => setImportMode(e.target.value as 'merge' | 'overwrite')}
+                    className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800"
+                  >
+                    <option value="merge">Combinar (añade sin borrar lo actual)</option>
+                    <option value="overwrite">Sobrescribir (reemplaza configuración)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Contraseña (si está cifrado)</label>
+                  <input
+                    type="password"
+                    value={importPassphrase}
+                    onChange={(e) => setImportPassphrase(e.target.value)}
+                    placeholder="Contraseña AES-256"
+                    className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
+                  />
+                </div>
+              </div>
+
+              {importDryRunResult && (
+                <div className="p-3 rounded-lg bg-white border border-slate-200 text-[11px] font-mono text-slate-700 overflow-x-auto">
+                  {JSON.stringify(importDryRunResult.summary || importDryRunResult.counts || importDryRunResult, null, 2)}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={!importSnapshotObj || importingSnapshot}
+                  onClick={() => void handleImportInstance(true)}
+                  className="px-3.5 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  Simular (Dry-Run)
+                </button>
+                <button
+                  type="button"
+                  disabled={!importSnapshotObj || importingSnapshot}
+                  onClick={() => void handleImportInstance(false)}
+                  className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {importingSnapshot ? 'Aplicando…' : 'Aplicar restauración'}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -641,14 +1047,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
               </label>
             </div>
 
-            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
               <div className="font-medium text-slate-800">Eventos que disparan alerta:</div>
-              <div className="flex flex-wrap gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
                 {([
                   ['service_down', 'Servicio caído'],
+                  ['service_failed', 'Error instalando servicio'],
+                  ['deploy_started', 'Despliegue iniciado'],
                   ['deploy_failed', 'Despliegue fallido'],
                   ['deploy_succeeded', 'Despliegue completado'],
+                  ['rollback', 'Reversión automática / manual'],
+                  ['production_unhealthy', 'Producción sin salud'],
                   ['ssl_issued', 'Certificado TLS emitido'],
+                  ['tls_expiring', 'Certificado TLS próximo a caducar'],
+                  ['backup_succeeded', 'Copia BD completada'],
+                  ['backup_failed', 'Copia BD fallida'],
+                  ['disk_warning', 'Alerta de espacio en disco'],
+                  ['cron_failed', 'Tarea Cron fallida'],
                   ['project_stopped', 'Proyecto detenido'],
                 ] as const).map(([key, label]) => (
                   <label key={key} className="inline-flex items-center gap-1.5 cursor-pointer text-slate-700">
@@ -746,8 +1161,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
                   placeholder="https://tu-endpoint.com/webhook"
                   className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
                 />
+                <input
+                  type="password"
+                  value={notif.channels.webhook.secretHeader || ''}
+                  onChange={(e) => setNotif({ ...notif, channels: { ...notif.channels, webhook: { ...notif.channels.webhook, secretHeader: e.target.value } } })}
+                  placeholder={notif.channels.webhook.hasSecretHeader ? '•••••••• (firma HMAC-SHA256 activa)' : 'Secreto HMAC-SHA256 (opcional)'}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
+                />
               </div>
             </div>
+
+            {notifHistory.length > 0 && (
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 font-medium text-slate-700">
+                  Últimas alertas enviadas ({notifHistory.length})
+                </div>
+                <div className="divide-y divide-slate-100 max-h-44 overflow-y-auto">
+                  {notifHistory.slice(0, 10).map((item) => (
+                    <div key={item.id} className="px-4 py-2 flex items-center justify-between gap-2 text-[11px]">
+                      <div className="min-w-0">
+                        <span className="font-medium text-slate-800">{item.title}</span>
+                        <span className="text-slate-400 ml-2 font-mono">{item.event}</span>
+                      </div>
+                      <span className="text-slate-400 shrink-0 tabular-nums">{new Date(item.at).toLocaleString('es-ES')}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
               <button
@@ -877,15 +1318,68 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onNotify, onOpenMetr
                 Elimina capas antiguas de compilación conservando 5 GB de caché reciente.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={() => void handlePruneCache()}
-              disabled={pruning}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-800 cursor-pointer disabled:opacity-50 shrink-0"
-            >
-              {pruning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5 text-slate-500" />}
-              <span>{pruning ? 'Podando…' : 'Podar caché BuildKit'}</span>
-            </button>
+            <div className="flex items-center gap-2 flex-wrap shrink-0">
+              {onRestoreChecklist && (
+                <button
+                  type="button"
+                  onClick={onRestoreChecklist}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700 cursor-pointer"
+                >
+                  <ListChecks className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Mostrar guía inicial</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void handlePruneCache()}
+                disabled={pruning}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-800 cursor-pointer disabled:opacity-50"
+              >
+                {pruning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5 text-slate-500" />}
+                <span>{pruning ? 'Podando…' : 'Podar caché BuildKit'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Registro de auditoría del servidor */}
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+            <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
+                <FileText className="w-3.5 h-3.5 text-slate-500" />
+                <span>Registro de auditoría de seguridad</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadAudit()}
+                disabled={auditLoading}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer"
+              >
+                <RefreshCw className={`w-3 h-3 ${auditLoading ? 'animate-spin' : ''}`} />
+                <span>Actualizar</span>
+              </button>
+            </div>
+            {auditEvents.length === 0 ? (
+              <div className="p-6 text-center text-xs text-slate-500">
+                No hay eventos de auditoría registrados todavía.
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 max-h-64 overflow-y-auto text-xs">
+                {auditEvents.map((ev, i) => (
+                  <div key={ev.id || `${ev.at}-${i}`} className="px-5 py-2.5 flex items-center justify-between gap-3">
+                    <div className="min-w-0 flex items-center gap-2 flex-wrap">
+                      <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
+                        {ev.source}
+                      </span>
+                      <span className="font-medium text-slate-900">{ev.action}</span>
+                      {ev.target && <span className="font-mono text-slate-500 truncate">{ev.target}</span>}
+                    </div>
+                    <span className="text-[11px] text-slate-400 tabular-nums shrink-0">
+                      {new Date(ev.at).toLocaleString('es-ES')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -23,34 +23,70 @@ const BOOT_START_MS = performance.now();
 const containerOrchestrator = require('./services/containerOrchestrator');
 const projectManager = require('./services/projectManager');
 const metricsCollector = require('./services/metricsCollector');
+const auditLogger = require('./services/auditLogger');
 const {
   authMiddleware,
   authorizeRequest,
   corsDelegate,
   resolveToken,
+  onTokenRotated,
   authStatus,
   isLoopback,
+  isPrivateProxyPeer,
   isOriginAllowed,
   addAllowedOrigin,
+  clientIp,
   checkAuthBruteForce,
   recordAuthFailure
 } = require('./middleware/auth');
+const { createRateLimiter } = require('./services/rateLimiter');
 
 const PORT = Number(process.env.PORT) || 3030;
 const MCP_PROTOCOL_VERSION = '2026-07-28';
 const MCP_LEGACY_PROTOCOL_VERSION = '2024-11-05';
-const DATA_DIR = path.join(__dirname, '..', 'data');
+const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.resolve(process.env.CULKIBO_DATA_DIR)
+  : path.resolve(__dirname, '..');
+const DATA_DIR = path.join(ROOT_BASE_DIR, 'data');
 const INGRESS_CONFIG_FILE = path.join(DATA_DIR, 'ingress.json');
 
+const fastProjectsLimiter = createRateLimiter({
+  windowMs: 60000,
+  max: 60,
+  bypassLoopback: true,
+  label: 'fast_projects_create',
+  onLimit: () => metricsCollector.recordSecurityEvent('rateLimited429')
+});
+const fastAskLimiter = createRateLimiter({
+  windowMs: 60000,
+  max: 240,
+  bypassLoopback: false,
+  label: 'ingress_ask',
+  onLimit: () => metricsCollector.recordSecurityEvent('rateLimited429')
+});
+
 // ---------------------------------------------------------------------------
-// Global crash barrier (supervisa procesos hijos, watchers y sockets).
+// Global crash barrier + circuit-breaker (evita estados zombi/deadlock en VPS).
 // ---------------------------------------------------------------------------
+/** @type {number[]} */
+const recentFatalTimestamps = [];
 function reportFatal(kind, err) {
   const detail = err && err.stack ? err.stack : String(err);
   console.error(`[Culkibo:${kind}]`, detail);
   try {
     containerOrchestrator.addLog('ERROR', 'edge', `[Daemon:${kind}] ${err && err.message ? err.message : String(err)}`);
   } catch (e) {}
+  if (kind === 'uncaughtException' && require.main === module) {
+    const now = Date.now();
+    recentFatalTimestamps.push(now);
+    while (recentFatalTimestamps.length > 0 && now - recentFatalTimestamps[0] > 10000) {
+      recentFatalTimestamps.shift();
+    }
+    if (recentFatalTimestamps.length >= 3) {
+      console.error('[Culkibo] Múltiples excepciones fatales en 10 s; iniciando cierre ordenado para reinicio limpio.');
+      shutdown('uncaughtException').finally(() => process.exit(1));
+    }
+  }
 }
 
 process.on('uncaughtException', (err) => reportFatal('uncaughtException', err));
@@ -111,6 +147,10 @@ function getService(name) {
       svc = require('./services/liveSyncEngine');
       svc.on('sync_applied', (data) => {
         broadcast('sync_applied', data);
+        if (containerOrchestrator.pods && containerOrchestrator.pods.forge) {
+          containerOrchestrator.pods.forge.hotReloadsCount = (containerOrchestrator.pods.forge.hotReloadsCount || 0) + 1;
+          containerOrchestrator.pods.forge.lastHotReloadMs = Number(data.applyMs || 0);
+        }
         containerOrchestrator.addLog(
           'HOT_SYNC',
           'forge',
@@ -118,9 +158,25 @@ function getService(name) {
           new Date(),
           data.projectId
         );
+        // Auto-reiniciar localRunner en Path C (package.json / .env / next.config / vite.config)
+        // o promocionar un fallback placeholder cuando llegan los primeros archivos del proyecto.
+        if (data.projectId && (data.mode === 'path_c_restart' || data.written > 0)) {
+          try {
+            const lr = loadedServices.localRunner || containerOrchestrator._localRunner;
+            if (lr && typeof lr.onLiveSyncApplied === 'function') {
+              lr.onLiveSyncApplied(data);
+            }
+          } catch (e) {}
+        }
       });
       svc.on('sync_rollback', (data) => {
         broadcast('sync_rollback', data);
+        // Notificar también a los clientes CLI conectados a `/ws/sync` para invalidar su hash cache
+        for (const ws of syncClients) {
+          if (ws.readyState === 1 && /** @type {any} */ (ws)._projectId === data.projectId) {
+            safeWsSend(ws, { type: 'rollback_notice', ...data });
+          }
+        }
         containerOrchestrator.addLog(
           'INFO',
           'forge',
@@ -129,6 +185,14 @@ function getService(name) {
           data.projectId
         );
       });
+      break;
+    case 'cronManager':
+      svc = require('./services/cronManager');
+      svc.on('cron_run', (data) => broadcast('cron_run', data));
+      break;
+    case 'previewManager':
+      svc = require('./services/previewManager');
+      svc.on('preview_event', (data) => broadcast('preview_event', data));
       break;
     default:
       throw new Error(`Servicio desconocido: ${name}`);
@@ -172,10 +236,26 @@ function applySecurityHeaders(req, res, isApiOrMetrics) {
 // ---------------------------------------------------------------------------
 const clients = new Set();
 const syncClients = new Set();
+/** @type {Set<any>} */
+const activeSseResponses = new Set();
 let activeSseClients = 0;
 let wsConnectionsTotal = 0;
 let wsBroadcastsTotal = 0;
 const MAX_SSE_CLIENTS = 50;
+
+// Revocar todas las sesiones WS, Live Sync y SSE al rotar el token maestro
+onTokenRotated(() => {
+  for (const ws of Array.from(clients)) {
+    try { ws.close(4001, 'Token rotated'); } catch (e) {}
+  }
+  for (const ws of Array.from(syncClients)) {
+    try { ws.close(4001, 'Token rotated'); } catch (e) {}
+  }
+  for (const res of Array.from(activeSseResponses)) {
+    try { res.end(); } catch (e) {}
+  }
+  activeSseResponses.clear();
+});
 
 /** @type {any} */
 let _wss = null;
@@ -283,7 +363,7 @@ function getInitialWsPayloadBuf() {
   return buf;
 }
 
-/** Valida si un targetDir explícito está permitido en /ws/sync (anti-escritura arbitraria). */
+/** Valida si un targetDir explícito está permitido en /ws/sync (anti-escritura arbitraria y anti-symlink). */
 function resolveAllowedSyncTargetDir(rawDir, req) {
   if (!rawDir) return null;
   if (process.env.CULKIBO_ALLOW_SYNC_TARGET_DIR === '1') {
@@ -295,12 +375,35 @@ function resolveAllowedSyncTargetDir(rawDir, req) {
     throw err;
   }
   const resolved = path.resolve(String(rawDir));
+  // Resolver realpath si existe (o de su directorio padre si todavía no se ha creado) para bloquear symlinks
+  let canonical = resolved;
+  try {
+    if (fs.existsSync(resolved)) {
+      canonical = fs.realpathSync(resolved);
+    } else {
+      const parent = path.dirname(resolved);
+      if (fs.existsSync(parent)) {
+        canonical = path.join(fs.realpathSync(parent), path.basename(resolved));
+      }
+    }
+  } catch (e) {}
+
   const dataRoot = process.env.CULKIBO_DATA_DIR
     ? path.resolve(process.env.CULKIBO_DATA_DIR)
     : path.resolve(__dirname, '..');
-  const allowedRoots = [path.resolve(dataRoot, 'projects'), path.resolve(process.cwd(), 'projects'), path.resolve(os.tmpdir())];
-  const inside = allowedRoots.some((root) => {
-    const rel = path.relative(root, resolved);
+  const rawAllowedRoots = [
+    path.resolve(dataRoot, 'projects'),
+    path.resolve(process.cwd(), 'projects'),
+    ...(process.env.NODE_ENV === 'test' ? [path.resolve(os.tmpdir())] : [])
+  ];
+  const allowedRoots = rawAllowedRoots.map((r) => {
+    try { return fs.existsSync(r) ? fs.realpathSync(r) : r; } catch (e) { return r; }
+  });
+  const tmpReal = (() => { try { return fs.realpathSync(os.tmpdir()); } catch (e) { return path.resolve(os.tmpdir()); } })();
+  const relFromTmp = path.relative(tmpReal, canonical);
+  const isCulkiboTempDir = Boolean(relFromTmp) && !relFromTmp.startsWith('..') && !path.isAbsolute(relFromTmp) && /^culkibo-(?:livesync|bench-sync)-[^\\/]+(?:[\\/]|$)/.test(relFromTmp);
+  const inside = isCulkiboTempDir || allowedRoots.some((root) => {
+    const rel = path.relative(root, canonical);
     return rel && rel !== '.' && !rel.startsWith('..') && !path.isAbsolute(rel);
   });
   if (!inside) {
@@ -308,7 +411,7 @@ function resolveAllowedSyncTargetDir(rawDir, req) {
     /** @type {any} */ (err).code = 'TARGET_DIR_FORBIDDEN';
     throw err;
   }
-  return resolved;
+  return canonical;
 }
 
 /**
@@ -363,11 +466,36 @@ function safeWsSend(ws, obj) {
   }
 }
 
+function selectSafeWsProtocol(protocols) {
+  // Nunca devolver culkibo-token.* ni culkibo-ticket.* en la cabecera 101 Sec-WebSocket-Protocol
+  if (!protocols) return false;
+  if (protocols.has('culkibo.v1')) return 'culkibo.v1';
+  for (const p of protocols) {
+    if (!p.startsWith('culkibo-token.') && !p.startsWith('culkibo-ticket.')) return p;
+  }
+  // Si el cliente solo envió el subprotocolo de ticket/token sin culkibo.v1, devolver el primero
+  // para mantener compatibilidad con navegadores que exigen coincidencia de subprotocolo.
+  const first = protocols.values().next().value;
+  return first || false;
+}
+
 function ensureWsServers() {
   if (_wss && _syncWss) return { wss: _wss, syncWss: _syncWss };
   const { WebSocketServer } = require('ws');
-  _wss = new WebSocketServer({ noServer: true, clientTracking: false, maxPayload: 64 * 1024, perMessageDeflate: false });
-  _syncWss = new WebSocketServer({ noServer: true, clientTracking: false, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
+  _wss = new WebSocketServer({
+    noServer: true,
+    clientTracking: false,
+    maxPayload: 64 * 1024,
+    perMessageDeflate: false,
+    handleProtocols: selectSafeWsProtocol
+  });
+  _syncWss = new WebSocketServer({
+    noServer: true,
+    clientTracking: false,
+    maxPayload: 16 * 1024 * 1024,
+    perMessageDeflate: false,
+    handleProtocols: selectSafeWsProtocol
+  });
 
   _syncWss.on('connection', (ws, req) => {
     syncClients.add(ws);
@@ -378,6 +506,7 @@ function ensureWsServers() {
     const liveSyncEngine = getService('liveSyncEngine');
     /** @type {string | null} */
     let boundProjectId = null;
+    const clientId = `sc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
     /** @type {{ rawDir: any, safeDir: string | null } | null} */
     let cachedDirCheck = null;
 
@@ -395,7 +524,7 @@ function ensureWsServers() {
         const prev = boundProjectId;
         boundProjectId = null;
         try {
-          liveSyncEngine.unregisterClient(prev);
+          liveSyncEngine.unregisterClient(prev, clientId);
           const status = liveSyncEngine.sessions.get(prev);
           broadcast('sync_client', { projectId: prev, connected: false, connectedClients: status ? status.connectedClients : 0 });
         } catch (e) {}
@@ -433,13 +562,20 @@ function ensureWsServers() {
             clientDigest: msg.clientDigest || null,
             targetDir: safeDir
           });
+          const clientMeta = {
+            id: clientId,
+            clientName: msg.clientName || null,
+            sourceDir: msg.sourceDir || null,
+            pid: typeof msg.pid === 'number' ? msg.pid : null
+          };
           let session;
           if (boundProjectId === nextPid) {
             session = liveSyncEngine.getOrCreateSession(nextPid);
           } else {
-            if (boundProjectId) liveSyncEngine.unregisterClient(boundProjectId);
+            if (boundProjectId) liveSyncEngine.unregisterClient(boundProjectId, clientId);
             boundProjectId = nextPid;
-            session = liveSyncEngine.registerClient(boundProjectId);
+            /** @type {any} */ (ws)._projectId = boundProjectId;
+            session = liveSyncEngine.registerClient(boundProjectId, clientMeta);
           }
           safeWsSend(ws, {
             type: 'hello_ack',
@@ -845,7 +981,9 @@ function tryServeStaticFastPath(req, res, pathname) {
   }
 
   // Comprobación 421 plano de control vs plano de datos antes de servir el panel SPA
-  const forwarded = req.headers['x-forwarded-host'] || req.headers['x-culkibo-host'];
+  // Solo confiar en X-Forwarded-Host / X-Culkibo-Host si el peer inmediato es un proxy de confianza
+  const trustProxyHost = isPrivateProxyPeer(req.socket?.remoteAddress || '');
+  const forwarded = trustProxyHost ? (req.headers['x-forwarded-host'] || req.headers['x-culkibo-host']) : null;
   const host = extractHostnameClean(forwarded || req.headers.host || '');
   const activePanelDomain = (loadedServices.ingressManager?.panelDomain || cachedPanelDomain || '').toLowerCase();
   const isPanelOrLocal = (activePanelDomain && host === activePanelDomain) || (MANAGEMENT_HOSTS_FAST.has(host) && !forwarded);
@@ -941,8 +1079,16 @@ function tryHandleFastPath(req, res) {
     const t0 = performance.now();
     containerOrchestrator.recordRequest();
 
+    const rl = fastProjectsLimiter.check(req);
+    if (!rl.allowed) {
+      res.setHeader('Retry-After', String(rl.retryAfterSec));
+      sendFastAuthError(req, res, { status: 429, error: 'Demasiadas peticiones. Espera unos segundos antes de reintentar.' }, pathname, t0);
+      return true;
+    }
+
     const bf = checkAuthBruteForce(req);
     if (bf.blocked) {
+      metricsCollector.recordSecurityEvent('authBlocked429');
       res.setHeader('Retry-After', String(bf.retryAfterSec));
       sendFastAuthError(req, res, { status: 429, error: 'Demasiados intentos de autenticación fallidos.' }, pathname, t0);
       return true;
@@ -950,8 +1096,10 @@ function tryHandleFastPath(req, res) {
 
     const decision = authorizeRequest(req);
     if (!decision.ok) {
+      if (decision.status === 403) metricsCollector.recordSecurityEvent('originRejected403');
       if (decision.status === 401 && (req.headers.authorization || req.headers['x-culkibo-token'])) {
         recordAuthFailure(req);
+        metricsCollector.recordSecurityEvent('authFailures');
       }
       sendFastAuthError(req, res, decision, pathname, t0);
       return true;
@@ -994,6 +1142,18 @@ function tryHandleFastPath(req, res) {
       }
       try {
         const project = projectManager.create(body);
+        auditLogger.record({
+          source: 'http',
+          action: 'project.create',
+          method: 'POST',
+          path: '/api/projects',
+          resourceId: project.id,
+          ip: clientIp(req),
+          authMethod: decision.method || null,
+          status: 201,
+          durationMs: performance.now() - t0,
+          detail: { name: project.name, source: project.source }
+        });
         if (project.gitRepo) {
           setImmediate(() => {
             try {
@@ -1058,6 +1218,17 @@ function tryHandleFastPath(req, res) {
   if (pathname === '/api/ingress/ask') {
     const t0 = performance.now();
     containerOrchestrator.recordRequest();
+    const askRl = fastAskLimiter.check(req);
+    if (!askRl.allowed) {
+      res.setHeader('Retry-After', String(askRl.retryAfterSec));
+      sendFastBuffer(req, res, 429, 'text/plain; charset=utf-8', Buffer.from('demasiadas consultas', 'utf8'), pathname, t0);
+      return true;
+    }
+    // P0: Caddy habla directamente con Culkibo sin cabeceras de proxy; rechazar tráfico reenviado desde internet vía panelDomain
+    if ((req.headers['x-forwarded-for'] || req.headers.forwarded) && process.env.NODE_ENV !== 'test') {
+      sendFastBuffer(req, res, 403, 'text/plain; charset=utf-8', ASK_FORBIDDEN_LOCAL_BUF, pathname, t0);
+      return true;
+    }
     const remoteIp = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
     const { isPrivateIp } = require('./services/ssrfGuard');
     const isLocalOrPrivate = remoteIp === '127.0.0.1' || remoteIp === '::1' || isPrivateIp(remoteIp);
@@ -1081,8 +1252,10 @@ function tryHandleFastPath(req, res) {
       return true;
     }
     const dm = getService('domainManager');
-    const route = dm.resolveRoute(domain);
-    if (route && route.status === 'disabled') {
+    // Solo bloquear por `disabled` cuando existe coincidencia exacta para ese hostname
+    // (evita que un wildcard *.ejemplo.com deshabilitado bloquee www.ejemplo.com de un redirect canónico activo)
+    const exactMatch = typeof dm.getByHostname === 'function' ? dm.getByHostname(domain) : null;
+    if (exactMatch && exactMatch.status === 'disabled') {
       sendFastBuffer(req, res, 403, 'text/plain; charset=utf-8', Buffer.from(`dominio deshabilitado: ${domain}`, 'utf8'), pathname, t0);
       return true;
     }
@@ -1188,7 +1361,7 @@ function tryHandleFastPath(req, res) {
     const dm = getService('domainManager');
     sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', dm.getAllWrappedSerialized(), pathname, t0, {
       cacheControl: 'private, no-cache',
-      etag: typeof dm.getEtag === 'function' ? dm.getEtag() : null,
+      etag: typeof dm.getWrappedEtag === 'function' ? dm.getWrappedEtag() : null,
       compress: true
     });
     return true;
@@ -1229,6 +1402,9 @@ function resolveBodyLimitBytes(reqPath) {
   }
   if (/^\/api\/projects\/[^/]+\/sync\/frame$/.test(reqPath)) {
     return 16 * 1024 * 1024; // 16 MB para Commit Frames HTTP
+  }
+  if (reqPath === '/api/backup/instance/import' || reqPath === '/api/backup/restore-upload') {
+    return 10 * 1024 * 1024; // 10 MB para snapshots completos de instancia
   }
   if (reqPath.startsWith('/api/import/compose')) {
     return 2 * 1024 * 1024;
@@ -1280,7 +1456,7 @@ function nativeBodyParser(req, res, next) {
   req.on('end', () => {
     if (aborted) return;
     const buf = total > 0 ? Buffer.concat(chunks, total) : Buffer.alloc(0);
-    if (rawPath.startsWith('/api/webhooks/github')) {
+    if (rawPath.startsWith('/api/webhooks/')) {
       req.rawBody = buf;
     }
     if (buf.length === 0) {
@@ -1424,6 +1600,7 @@ function getApp() {
     const mcpServer = getService('mcpServer');
     const mcpStreamableHttp = getService('mcpStreamableHttp');
     activeSseClients++;
+    activeSseResponses.add(res);
     mcpStreamableHttp.markLegacyTransport(res, 'GET /api/mcp/sse');
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -1439,6 +1616,7 @@ function getApp() {
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
+      activeSseResponses.delete(res);
       activeSseClients = Math.max(0, activeSseClients - 1);
       mcpServer.off('mcp_call', onMcp);
     };
@@ -1466,7 +1644,8 @@ function getApp() {
       return next();
     }
 
-    const forwarded = req.headers['x-forwarded-host'] || req.headers['x-culkibo-host'];
+    const trustProxyHost = isPrivateProxyPeer(req.socket?.remoteAddress || '');
+    const forwarded = trustProxyHost ? (req.headers['x-forwarded-host'] || req.headers['x-culkibo-host']) : null;
     const host = extractHostnameClean(forwarded || req.headers.host || '');
 
     // Acceso directo de gestión (localhost / IPv4 / IPv6 ::1) o dominio oficial del panel (P0-8)
@@ -1592,6 +1771,14 @@ function getApp() {
 const server = http.createServer(
   { noDelay: true, keepAlive: true, keepAliveInitialDelay: 30000 },
   (req, res) => {
+    if (shuttingDown) {
+      res.writeHead(503, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Connection': 'close'
+      });
+      res.end('{"error":"Servidor cerrándose ordenadamente"}');
+      return;
+    }
     if (tryHandleFastPath(req, res)) return;
     getApp()(req, res);
   }
@@ -1601,6 +1788,11 @@ server.headersTimeout = 66000;
 server.requestTimeout = 300000;
 
 server.on('upgrade', (req, socket, head) => {
+  if (shuttingDown) {
+    socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   const rawUrl = req.url || '/';
   const qIdx = rawUrl.indexOf('?');
   const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
@@ -1611,8 +1803,33 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
+  // P0: aplicar protección anti fuerza bruta también en upgrades WebSocket
+  const bf = checkAuthBruteForce(req);
+  if (bf.blocked) {
+    metricsCollector.recordSecurityEvent('authBlocked429');
+    metricsCollector.recordSecurityEvent('wsAuthRejected');
+    socket.write(`HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${bf.retryAfterSec}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
+
   const decision = authorizeRequest(req);
   if (!decision.ok) {
+    metricsCollector.recordSecurityEvent('wsAuthRejected');
+    if (decision.status === 403) {
+      metricsCollector.recordSecurityEvent('originRejected403');
+    } else if (decision.status === 401) {
+      recordAuthFailure(req);
+      metricsCollector.recordSecurityEvent('authFailures');
+      auditLogger.record({
+        source: 'ws',
+        action: 'ws.auth_rejected',
+        path: pathname,
+        ip: clientIp(req),
+        status: 401,
+        detail: { reason: decision.error }
+      });
+    }
     const code = decision.status === 403 ? '403 Forbidden' : '401 Unauthorized';
     socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`);
     socket.destroy();
@@ -1633,33 +1850,66 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 // ---------------------------------------------------------------------------
-// Arranque y apagado limpio
+// Arranque, watchdogs silenciosos y apagado limpio
 // ---------------------------------------------------------------------------
 function hasScheduledDatabaseBackups() {
   try {
     const dbFile = path.join(DATA_DIR, 'databases.json');
     if (!fs.existsSync(dbFile)) return false;
-    const raw = fs.readFileSync(dbFile, 'utf8');
-    return raw.includes('"enabled":true') || raw.includes('"enabled": true');
+    const parsed = JSON.parse(fs.readFileSync(dbFile, 'utf8'));
+    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.databases) ? parsed.databases : []);
+    return list.some((d) => Boolean(d && d.schedule && d.schedule.enabled));
+  } catch (e) {
+    return false;
+  }
+}
+
+function hasEnabledCronJobs() {
+  try {
+    const cronFile = path.join(DATA_DIR, 'crons.json');
+    if (!fs.existsSync(cronFile)) return false;
+    const parsed = JSON.parse(fs.readFileSync(cronFile, 'utf8'));
+    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.jobs) ? parsed.jobs : []);
+    return list.some((j) => Boolean(j && j.enabled));
   } catch (e) {
     return false;
   }
 }
 
 function sweepStaleTmpFiles() {
-  try {
-    const tmpDir = path.join(DATA_DIR, '.tmp');
-    if (!fs.existsSync(tmpDir)) return;
-    const cutoff = Date.now() - 3600 * 1000;
-    for (const f of fs.readdirSync(tmpDir)) {
-      try {
-        const p = path.join(tmpDir, f);
-        if (fs.statSync(p).mtimeMs < cutoff) {
-          fs.rmSync(p, { recursive: true, force: true });
-        }
-      } catch (e) {}
-    }
-  } catch (e) {}
+  const cutoff = Date.now() - 3600 * 1000;
+  const dirs = [
+    { dir: path.join(DATA_DIR, '.tmp'), prefix: null },
+    { dir: path.join(DATA_DIR, 'tmp'), prefix: null },
+    { dir: os.tmpdir(), prefix: 'culkibo-git-' }
+  ];
+  for (const { dir, prefix } of dirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      for (const f of fs.readdirSync(dir)) {
+        if (prefix && !f.startsWith(prefix)) continue;
+        try {
+          const p = path.join(dir, f);
+          if (fs.statSync(p).mtimeMs < cutoff) {
+            fs.rmSync(p, { recursive: true, force: true });
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+}
+
+/** @type {Array<ReturnType<typeof setInterval> | ReturnType<typeof setTimeout>>} */
+const backgroundTimers = [];
+/** @type {string | null} */
+let lastWatchdogAt = null;
+let lastDiskAlertAt = 0;
+let lastTlsAuditAt = 0;
+
+function trackTimer(t) {
+  if (t && typeof t.unref === 'function') t.unref();
+  backgroundTimers.push(t);
+  return t;
 }
 
 /**
@@ -1668,6 +1918,8 @@ function sweepStaleTmpFiles() {
  * @param {{ reconcileIngress?: boolean }} [options]
  */
 function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = process.env.CULKIBO_SKIP_RECONCILE !== '1' } = {}) {
+  shuttingDown = false;
+  shutdownPromise = null;
   return new Promise((resolve, reject) => {
     server.listen(port, host, () => {
       console.log(`\n========================================================`);
@@ -1692,10 +1944,9 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
       console.log(`========================================================\n`);
 
       // Tareas post-arranque no bloqueantes (no penalizan el tiempo al primer byte)
-      const warmWsTimer = setTimeout(() => {
+      trackTimer(setTimeout(() => {
         try { ensureWsServers(); } catch (e) {}
-      }, 100);
-      if (warmWsTimer.unref) warmWsTimer.unref();
+      }, 100));
 
       setImmediate(() => {
         sweepStaleTmpFiles();
@@ -1716,23 +1967,104 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
           }
         }
 
-        if (reconcileIngress) {
-          // `ingressManager.bootstrap()` ya incluye las rutas de despliegues (si existe data/deployments.json)
-          // sin arrastrar `deployManager` ni `repoSync` en arranques limpios.
+        if (hasEnabledCronJobs()) {
           try {
-            getService('ingressManager').bootstrap({ port }).catch((err) => {
+            getService('cronManager').startScheduler();
+          } catch (e) {
+            console.warn('[Cron] No se pudo arrancar el planificador cron:', e.message);
+          }
+        }
+
+        if (fs.existsSync(path.join(DATA_DIR, 'previews.json'))) {
+          try {
+            const pm = getService('previewManager');
+            pm.startReaper();
+            if (loadedServices.ingressManager) pm.hydrateIngressRoutes(loadedServices.ingressManager);
+          } catch (e) {}
+        }
+
+        if (reconcileIngress) {
+          try {
+            const im = getService('ingressManager');
+            if (fs.existsSync(path.join(DATA_DIR, 'previews.json'))) {
+              try { getService('previewManager').hydrateIngressRoutes(im); } catch (e) {}
+            }
+            im.bootstrap({ port }).catch((err) => {
               console.warn('[Edge:Ingress] La reconciliación de arranque falló:', err.message);
             });
           } catch (e) {}
         }
 
-        // Limpieza periódica no intrusiva de sesiones Live Sync inactivas (cada 5 min, unref'd)
-        const syncSweep = setInterval(() => {
+        // Limpieza periódica no intrusiva de sesiones Live Sync inactivas (cada 5 min)
+        trackTimer(setInterval(() => {
           if (loadedServices.liveSyncEngine && typeof loadedServices.liveSyncEngine.evictIdleSessions === 'function') {
             loadedServices.liveSyncEngine.evictIdleSessions();
           }
-        }, 5 * 60 * 1000);
-        if (syncSweep.unref) syncSweep.unref();
+        }, 5 * 60 * 1000));
+
+        // Watchdogs silenciosos de producción, disco, temporales y TLS (no activos en NODE_ENV=test)
+        if (process.env.NODE_ENV !== 'test') {
+          const runProdWatchdog = async () => {
+            lastWatchdogAt = new Date().toISOString();
+            try {
+              const hasDeployStore = Boolean(loadedServices.deployManager) || fs.existsSync(path.join(DATA_DIR, 'deployments.json'));
+              if (hasDeployStore) {
+                await getService('deployManager').checkProductionHealth();
+              }
+            } catch (e) {}
+            try {
+              if (loadedServices.caddyManager && loadedServices.caddyManager.lastDetection?.available && loadedServices.ingressManager) {
+                const det = await loadedServices.caddyManager.detect({ force: true });
+                if (det && det.available) {
+                  const st = await loadedServices.ingressManager.status();
+                  if (st && st.inSync === false && (st.drift?.missing?.length || 0) > 0) {
+                    await loadedServices.ingressManager.reconcile().catch(() => {});
+                  }
+                }
+              }
+            } catch (e) {}
+          };
+
+          const runSystemHygieneWatchdog = async () => {
+            sweepStaleTmpFiles();
+            const now = Date.now();
+            // 1. Alerta de disco bajo (cooldown 6 horas)
+            if (typeof fs.statfsSync === 'function' && (now - lastDiskAlertAt >= 6 * 3600 * 1000)) {
+              try {
+                const st = fs.statfsSync(DATA_DIR);
+                const totalGb = (st.blocks * st.bsize) / (1024 ** 3);
+                const freeGb = (st.bavail * st.bsize) / (1024 ** 3);
+                const usedPct = totalGb > 0 ? Math.round(((totalGb - freeGb) / totalGb) * 100) : 0;
+                if (freeGb < 5 || usedPct >= 85) {
+                  lastDiskAlertAt = now;
+                  const ns = /** @type {any} */ (require('./services/notificationService'));
+                  ns.notify({
+                    event: 'disk_warning',
+                    level: freeGb < 2 || usedPct >= 92 ? 'error' : 'warning',
+                    title: freeGb < 2 ? 'Disco crítico en el servidor' : 'Poco espacio libre en disco',
+                    message: `Quedan ${freeGb.toFixed(1)} GB libres (${usedPct}% usado). Ejecuta la limpieza de caché BuildKit desde Ajustes → Doctor.`,
+                    cooldownMs: 6 * 3600 * 1000
+                  }).catch(() => {});
+                }
+              } catch (e) {}
+            }
+            // 2. Auditoría de caducidad TLS cada 6 horas
+            if (now - lastTlsAuditAt >= 6 * 3600 * 1000) {
+              lastTlsAuditAt = now;
+              try {
+                const im = getService('ingressManager');
+                if (typeof im.checkCertificateExpiry === 'function') {
+                  await im.checkCertificateExpiry({ warnDays: 14 });
+                }
+              } catch (e) {}
+            }
+          };
+
+          trackTimer(setTimeout(() => { runProdWatchdog().catch(() => {}); }, 30000));
+          trackTimer(setInterval(() => { runProdWatchdog().catch(() => {}); }, 60000));
+          trackTimer(setTimeout(() => { runSystemHygieneWatchdog().catch(() => {}); }, 90000));
+          trackTimer(setInterval(() => { runSystemHygieneWatchdog().catch(() => {}); }, 15 * 60 * 1000));
+        }
       });
 
       resolve(server);
@@ -1744,52 +2076,97 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
 }
 
 let shuttingDown = false;
-async function shutdown(signal = 'SIGTERM') {
-  if (shuttingDown) return;
+/** @type {Promise<void> | null} */
+let shutdownPromise = null;
+
+function shutdown(signal = 'SIGTERM') {
+  if (shutdownPromise) return shutdownPromise;
   shuttingDown = true;
-  console.log(`\n[Culkibo] Recibida señal ${signal}; cerrando limpiamente...`);
-  try { if (heartbeatTimer) clearInterval(heartbeatTimer); } catch (e) {}
-  try { metricsCollector.stop(); } catch (e) {}
-  try { if (loadedServices.databaseManager) loadedServices.databaseManager.stopScheduler(); } catch (e) {}
-  try { await containerOrchestrator.stop(); } catch (e) {}
-  try {
-    if (containerOrchestrator._localRunner && containerOrchestrator._localRunner.activeRunners) {
-      const localRunner = containerOrchestrator._localRunner;
-      const stops = [];
-      for (const [pid, runner] of Array.from(localRunner.activeRunners.entries())) {
-        stops.push(localRunner.stop(pid, runner.port).catch(() => {}));
-      }
-      await Promise.allSettled(stops);
+  shutdownPromise = (async () => {
+    console.log(`\n[Culkibo] Recibida señal ${signal}; cerrando limpiamente...`);
+
+    // 1. Parar temporizadores, watchdogs y planificadores
+    for (const t of backgroundTimers) {
+      try { clearInterval(t); clearTimeout(t); } catch (e) {}
     }
-  } catch (e) {}
-  try {
-    for (const ws of [...clients, ...syncClients]) {
-      try { ws.close(1001, 'Server shutting down'); } catch (e) {}
-    }
-    if (_wss) _wss.close();
-    if (_syncWss) _syncWss.close();
-  } catch (e) {}
-  try {
-    const dm = loadedServices.deployManager;
-    if (dm) {
-      if (typeof dm.cancelAllDrains === 'function') dm.cancelAllDrains();
-      if (dm.drains && dm.drains.size > 0) {
-        await Promise.race([
-          Promise.allSettled(Array.from(dm.drains.values())),
-          new Promise((r) => setTimeout(r, 4000))
-        ]);
-      }
-    }
-  } catch (e) {}
-  try { await projectManager.flushToDisk(); } catch (e) {}
-  await new Promise((resolve) => {
+    backgroundTimers.length = 0;
+    try { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } } catch (e) {}
+    try { metricsCollector.stop(); } catch (e) {}
+    try { if (loadedServices.databaseManager) loadedServices.databaseManager.stopScheduler(); } catch (e) {}
+    try { if (loadedServices.cronManager) loadedServices.cronManager.stopScheduler(); } catch (e) {}
+    try { if (loadedServices.previewManager) loadedServices.previewManager.stopReaper(); } catch (e) {}
+
+    // 2. Dejar de aceptar nuevas conexiones y cerrar WS/SSE activos (sin cortar peticiones HTTP en vuelo)
+    const serverClosed = new Promise((resolve) => {
+      try {
+        server.close(() => resolve(undefined));
+        if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+      } catch (e) { resolve(undefined); }
+    });
+
     try {
-      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
-      server.close(() => resolve(undefined));
-      const t = setTimeout(() => resolve(undefined), 2000);
-      if (t.unref) t.unref();
-    } catch (e) { resolve(undefined); }
-  });
+      for (const ws of [...clients, ...syncClients]) {
+        try { ws.close(1001, 'Server shutting down'); } catch (e) {}
+      }
+      for (const res of Array.from(activeSseResponses)) {
+        try { res.end(); } catch (e) {}
+      }
+      activeSseResponses.clear();
+      if (_wss) _wss.close();
+      if (_syncWss) _syncWss.close();
+    } catch (e) {}
+
+    // 3. Drenar peticiones HTTP en vuelo (máx 4 s)
+    const drainDeadline = Date.now() + 4000;
+    while (metricsCollector.inFlight > 0 && Date.now() < drainDeadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    // 4. Parar orquestador, procesos locales y drenajes de despliegue (deteniendo contenedores salientes)
+    try { await containerOrchestrator.stop(); } catch (e) {}
+    try {
+      if (containerOrchestrator._localRunner && containerOrchestrator._localRunner.activeRunners) {
+        const localRunner = containerOrchestrator._localRunner;
+        const stops = [];
+        for (const [pid, runner] of Array.from(localRunner.activeRunners.entries())) {
+          stops.push(localRunner.stop(pid, runner.port).catch(() => {}));
+        }
+        await Promise.allSettled(stops);
+      }
+    } catch (e) {}
+    try {
+      const dm = loadedServices.deployManager;
+      if (dm) {
+        if (typeof dm.flushDrainsForShutdown === 'function') {
+          await dm.flushDrainsForShutdown({ timeoutMs: 3500 });
+        } else if (typeof dm.cancelAllDrains === 'function') {
+          dm.cancelAllDrains();
+        }
+      }
+    } catch (e) {}
+    try {
+      if (loadedServices.caddyManager && loadedServices.caddyManager.httpAgent) {
+        loadedServices.caddyManager.httpAgent.destroy();
+      }
+    } catch (e) {}
+
+    // 5. Volcado final atómico a disco (ya no pueden entrar mutaciones nuevas)
+    try { await projectManager.flushToDisk(); } catch (e) {}
+    try { auditLogger.flushSync(); } catch (e) {}
+
+    // 6. Cierre final de conexiones remanentes
+    await Promise.race([
+      serverClosed,
+      new Promise((resolve) => {
+        const t = setTimeout(() => {
+          try { if (typeof server.closeAllConnections === 'function') server.closeAllConnections(); } catch (e) {}
+          resolve(undefined);
+        }, 1500);
+        if (t.unref) t.unref();
+      })
+    ]);
+  })();
+  return shutdownPromise;
 }
 
 if (require.main === module) {
@@ -1799,12 +2176,26 @@ if (require.main === module) {
   });
   for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, () => {
+      const failsafe = setTimeout(() => process.exit(1), 25000);
+      if (failsafe.unref) failsafe.unref();
       shutdown(sig).finally(() => process.exit(0));
     });
   }
 }
 
-const exported = { server, broadcast, startServer, shutdown, getApp };
+const exported = {
+  server,
+  broadcast,
+  startServer,
+  shutdown,
+  getApp,
+  getRuntimeMeta: () => ({
+    lastWatchdogAt,
+    activeWsClients: clients.size,
+    activeSyncClients: syncClients.size,
+    activeSseClients
+  })
+};
 Object.defineProperty(exported, 'app', { get: getApp, enumerable: true });
 Object.defineProperty(exported, 'wss', { get: () => ensureWsServers().wss, enumerable: true });
 Object.defineProperty(exported, 'syncWss', { get: () => ensureWsServers().syncWss, enumerable: true });

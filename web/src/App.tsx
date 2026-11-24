@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
-import { X } from 'lucide-react';
+import { Keyboard, X } from 'lucide-react';
 import { Header, type AppView } from './components/Header';
 import { ProjectList } from './components/ProjectList';
 import { AuthGate } from './components/AuthGate';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { CommandPalette } from './components/CommandPalette';
+import { ShortcutsModal } from './components/ShortcutsModal';
 import { api, getAuthToken, setUnauthorizedHandler, type Project } from './lib/api';
 import { deployStream } from './lib/deployStream';
 import { liveEvents } from './lib/liveEvents';
@@ -32,24 +33,44 @@ const VALID_VIEWS: ReadonlySet<AppView> = new Set([
   'settings',
 ]);
 
-function parseHashRoute(): { view: AppView; projectId: string | null } {
+function parseHashRoute(): { view: AppView; projectId: string | null; subTab: string | null } {
   const raw = window.location.hash.replace(/^#\/?/, '').trim();
-  if (!raw) return { view: 'projects', projectId: null };
+  if (!raw) return { view: 'projects', projectId: null, subTab: null };
   const parts = raw.split('/').filter(Boolean);
   if (parts[0] === 'projects' && parts[1]) {
-    return { view: 'projects', projectId: decodeURIComponent(parts[1]) };
+    return {
+      view: 'projects',
+      projectId: decodeURIComponent(parts[1]),
+      subTab: parts[2] ? decodeURIComponent(parts[2]) : null,
+    };
   }
   const alias = parts[0] === 'logs' ? 'global_logs' : parts[0];
   if (VALID_VIEWS.has(alias as AppView)) {
-    return { view: alias as AppView, projectId: null };
+    return {
+      view: alias as AppView,
+      projectId: null,
+      subTab: parts[1] ? decodeURIComponent(parts[1]) : null,
+    };
   }
-  return { view: 'projects', projectId: null };
+  return { view: 'projects', projectId: null, subTab: null };
 }
 
-function toHash(view: AppView, projectId: string | null): string {
-  if (projectId) return `#/projects/${encodeURIComponent(projectId)}`;
+function toHash(view: AppView, projectId: string | null, subTab?: string | null): string {
+  if (projectId) {
+    return subTab
+      ? `#/projects/${encodeURIComponent(projectId)}/${encodeURIComponent(subTab)}`
+      : `#/projects/${encodeURIComponent(projectId)}`;
+  }
   if (view === 'global_logs') return '#/logs';
+  if (view === 'settings' && subTab) return `#/settings/${encodeURIComponent(subTab)}`;
   return `#/${view}`;
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  return target.isContentEditable || Boolean(target.closest('[contenteditable="true"]'));
 }
 
 const ViewFallback = () => (
@@ -65,6 +86,8 @@ export function App() {
 
   const [activeView, setActiveView] = useState<AppView>(initialRoute.view);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(initialRoute.projectId);
+  const [projectInitialTab, setProjectInitialTab] = useState<string | null>(initialRoute.projectId ? initialRoute.subTab : null);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<string | null>(initialRoute.view === 'settings' ? initialRoute.subTab : null);
   const [importInitialTab, setImportInitialTab] = useState<ImportSourceTab>('wordpress');
   const [importTabTrigger, setImportTabTrigger] = useState(0);
   const [domainWizardTrigger, setDomainWizardTrigger] = useState(0);
@@ -78,6 +101,8 @@ export function App() {
   const [catalogInitialTab, setCatalogInitialTab] = useState<'catalogo' | 'instalados'>('catalogo');
   const [catalogTabTrigger, setCatalogTabTrigger] = useState(0);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [checklistRestoreTick, setChecklistRestoreTick] = useState(0);
 
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [toasts, setToasts] = useState<Array<{ id: number; msg: string; kind: ToastKind }>>([]);
@@ -136,23 +161,90 @@ export function App() {
       const parsed = parseHashRoute();
       setActiveView(parsed.view);
       setActiveProjectId(parsed.projectId);
+      if (parsed.projectId) setProjectInitialTab(parsed.subTab);
+      if (parsed.view === 'settings') setSettingsInitialTab(parsed.subTab);
     };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
-  // Atajo global Cmd+K / Ctrl+K para la paleta de comandos
+  // Atajos globales: Cmd/Ctrl+K, ?, n, y acordes g+letra
   useEffect(() => {
     if (!authenticated) return;
+    let gPrefix = false;
+    let gTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearG = () => {
+      gPrefix = false;
+      if (gTimer) {
+        clearTimeout(gTimer);
+        gTimer = null;
+      }
+    };
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
+        setShortcutsOpen(false);
         setPaletteOpen((prev) => !prev);
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (isEditableTarget(e.target)) return;
+      if (paletteOpen) return;
+
+      const key = e.key;
+      if (key === '?') {
+        e.preventDefault();
+        setShortcutsOpen((v) => !v);
+        clearG();
+        return;
+      }
+      if (shortcutsOpen) return;
+
+      if (gPrefix) {
+        clearG();
+        const lower = key.toLowerCase();
+        const map: Record<string, AppView> = {
+          p: 'projects',
+          m: 'metrics',
+          d: 'domains',
+          c: 'catalog',
+          i: 'import',
+          a: 'ai',
+          l: 'global_logs',
+          s: 'settings',
+        };
+        if (map[lower]) {
+          e.preventDefault();
+          const targetView = map[lower];
+          setActiveView(targetView);
+          setActiveProjectId(null);
+          const nextHash = toHash(targetView, null);
+          if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
+        }
+        return;
+      }
+
+      if (key.toLowerCase() === 'g') {
+        gPrefix = true;
+        gTimer = setTimeout(clearG, 900);
+        return;
+      }
+
+      if (key.toLowerCase() === 'n') {
+        e.preventDefault();
+        setActiveProjectId(null);
+        setActiveView('projects');
+        const nextHash = toHash('projects', null);
+        if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
+        setCreateProjectTrigger((c) => c + 1);
       }
     };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [authenticated]);
+    return () => {
+      clearG();
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [authenticated, paletteOpen, shortcutsOpen]);
 
   const dismissToast = useCallback((id: number) => {
     const t = toastTimersRef.current.get(id);
@@ -199,7 +291,8 @@ export function App() {
     let active = true;
     api.getProjects()
       .then((data) => { if (active) setProjects(data); })
-      .catch((e) => console.error(e));
+      .catch((e) => console.error(e))
+      .finally(() => { if (active) setProjectsLoaded(true); });
     api.getSyncSummary()
       .then((summary) => {
         if (!active || !summary) return;
@@ -237,15 +330,14 @@ export function App() {
         let protocols: string[] | undefined;
         const storedToken = getAuthToken();
         if (storedToken) {
-          try {
-            const { ticket } = await api.getWsTicket();
-            if (ticket) protocols = [`culkibo-ticket.${ticket}`];
-          } catch {
-            protocols = [`culkibo-token.${storedToken}`];
-          }
+          const { ticket } = await api.getWsTicket();
+          if (!ticket) throw new Error('No se pudo emitir el ticket WebSocket');
+          protocols = ['culkibo.v1', `culkibo-ticket.${ticket}`];
+        } else {
+          protocols = ['culkibo.v1'];
         }
         if (disposed) return;
-        const ws = protocols ? new WebSocket(wsUrl, protocols) : new WebSocket(wsUrl);
+        const ws = new WebSocket(wsUrl, protocols);
         wsRef.current = ws;
 
         ws.onopen = () => {
@@ -307,6 +399,10 @@ export function App() {
                 setProjects((prev) => prev.filter((p) => p.id !== delId));
                 liveEvents.emitProjectChange({ action: 'deleted', id: delId });
               }
+            } else if (type === 'cron_run') {
+              liveEvents.emitCronRun(data);
+            } else if (type === 'preview_event') {
+              liveEvents.emitPreviewEvent(data);
             } else if (type === 'mcp_call') {
               liveEvents.emitMcpCall(data);
               if (data?.toolName) {
@@ -352,20 +448,47 @@ export function App() {
     };
   }, [authenticated, fetchProjects, showToast]);
 
-  const navigate = useCallback((rawView: AppView | 'logs') => {
+  const navigate = useCallback((rawView: AppView | 'logs', subTab?: string | null) => {
     const view: AppView = rawView === 'logs' ? 'global_logs' : rawView;
     setActiveView(view);
     setActiveProjectId(null);
-    const nextHash = toHash(view, null);
+    if (view === 'settings') setSettingsInitialTab(subTab || null);
+    const nextHash = toHash(view, null, view === 'settings' ? subTab : null);
     if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
   }, []);
 
-  const selectProject = useCallback((id: string | null) => {
+  const selectProject = useCallback((id: string | null, tab?: string | null) => {
     setActiveProjectId(id);
+    setProjectInitialTab(tab || null);
     if (id) setActiveView('projects');
-    const nextHash = toHash('projects', id);
+    const nextHash = toHash('projects', id, tab || null);
     if (window.location.hash !== nextHash) window.history.pushState(null, '', nextHash);
   }, []);
+
+  const handleProjectTabChange = useCallback((tab: string) => {
+    setProjectInitialTab(tab);
+    if (!activeProjectId) return;
+    const nextHash = toHash('projects', activeProjectId, tab);
+    if (window.location.hash !== nextHash) window.history.replaceState(null, '', nextHash);
+  }, [activeProjectId]);
+
+  const handleSettingsTabChange = useCallback((tab: string) => {
+    setSettingsInitialTab(tab);
+    const nextHash = toHash('settings', null, tab);
+    if (window.location.hash !== nextHash) window.history.replaceState(null, '', nextHash);
+  }, []);
+
+  const restoreQuickstartChecklist = useCallback(() => {
+    try {
+      window.localStorage.removeItem('culkibo_onboarding_dismissed_v1');
+      window.localStorage.removeItem('culkibo_quickstart_dismissed');
+    } catch {
+      // ignorar
+    }
+    setChecklistRestoreTick((t) => t + 1);
+    navigate('projects');
+    showToast('Guía de primeros pasos restaurada', 'info');
+  }, [navigate, showToast]);
 
   const openImport = useCallback((source: ImportSourceTab = 'wordpress') => {
     setActiveProjectId(null);
@@ -453,7 +576,7 @@ export function App() {
           {toasts.map((item) => (
             <div
               key={item.id}
-              role="status"
+              role={item.kind === 'error' ? 'alert' : 'status'}
               className={`culkibo-modal-enter pointer-events-auto max-w-sm flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg bg-white border text-xs font-medium shadow-lg ${
                 item.kind === 'error'
                   ? 'border-red-200 text-red-800'
@@ -502,7 +625,7 @@ export function App() {
                 projects={projects}
                 projectsLoading={!projectsLoaded}
                 onRefreshProjects={fetchProjects}
-                onSelectProject={(id) => selectProject(id)}
+                onSelectProject={(id, tab) => selectProject(id, tab)}
                 onImportCoolify={() => openImport('coolify')}
                 onOpenWordPress={() => openImport('wordpress')}
                 onOpenCatalog={() => openCatalog('catalogo')}
@@ -510,16 +633,20 @@ export function App() {
                 onOpenAi={() => navigate('ai')}
                 onNotify={showToast}
                 externalCreateTrigger={createProjectTrigger}
+                checklistRestoreTick={checklistRestoreTick}
               />
             )}
 
             {activeProjectId && (
               <ProjectDetail
                 projectId={activeProjectId}
+                initialTab={projectInitialTab}
+                onTabChange={handleProjectTabChange}
                 onBack={() => { selectProject(null); void fetchProjects(); }}
                 onNotify={showToast}
                 onProjectUpdate={fetchProjects}
                 onOpenCatalog={() => openCatalog('catalogo')}
+                onOpenBackupSettings={() => navigate('settings', 'backups')}
               />
             )}
 
@@ -573,7 +700,13 @@ export function App() {
             )}
 
             {activeView === 'settings' && !activeProjectId && (
-              <SettingsView onNotify={showToast} onOpenMetrics={() => navigate('metrics')} />
+              <SettingsView
+                onNotify={showToast}
+                onOpenMetrics={() => navigate('metrics')}
+                initialTab={settingsInitialTab}
+                onTabChange={handleSettingsTabChange}
+                onRestoreChecklist={restoreQuickstartChecklist}
+              />
             )}
           </Suspense>
         </ErrorBoundary>
@@ -583,12 +716,17 @@ export function App() {
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
         projects={projects}
-        onNavigate={(v) => navigate(v as AppView)}
-        onSelectProject={(id) => selectProject(id)}
+        activeProjectId={activeProjectId}
+        onNavigate={(v, subTab) => navigate(v as AppView, subTab)}
+        onSelectProject={(id, tab) => selectProject(id, tab)}
         onQuickCreateProject={() => handleQuickAction('new_project')}
         onQuickConnectDomain={() => handleQuickAction('domain')}
         onQuickImport={(src) => openImport(src || 'wordpress')}
+        onOpenShortcuts={() => setShortcutsOpen(true)}
+        onRestoreChecklist={restoreQuickstartChecklist}
       />
+
+      <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
 
       <footer className="border-t border-slate-200 py-4 bg-white mt-auto">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-2">
@@ -603,6 +741,16 @@ export function App() {
             <span>Live Sync</span>
             <span>·</span>
             <span>MCP 2026-07-28</span>
+            <span>·</span>
+            <button
+              type="button"
+              onClick={() => setShortcutsOpen(true)}
+              className="inline-flex items-center gap-1 text-slate-500 hover:text-slate-900 transition-colors cursor-pointer"
+              title="Ver atajos de teclado (?)"
+            >
+              <Keyboard className="w-3.5 h-3.5" />
+              <span>Atajos (?)</span>
+            </button>
           </div>
         </div>
       </footer>

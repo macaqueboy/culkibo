@@ -7,11 +7,17 @@ const metricsCollector = require('./metricsCollector');
 /**
  * Diagnóstico real en 1 clic del estado del sistema (`systemDoctor`).
  * Sin números inventados ni dependencias externas: ejecuta comprobaciones
- * verificables sobre Node, Docker, Caddy, memoria/disco, seguridad, TLS y BD.
+ * verificables sobre Node, Docker, Caddy, disco, memoria, seguridad, TLS,
+ * contenedores huérfanos, bases de datos y archivos temporales.
  */
 
-const DATA_DIR = path.resolve(__dirname, '..', '..', 'data');
+const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.resolve(process.env.CULKIBO_DATA_DIR)
+  : path.resolve(__dirname, '..', '..');
+const DATA_DIR = path.join(ROOT_BASE_DIR, 'data');
 const TMP_DIR = path.join(DATA_DIR, '.tmp');
+const LEGACY_TMP_DIR = path.join(DATA_DIR, 'tmp');
+const SAFE_TMP_AGE_MS = 3600 * 1000;
 
 function checkDiskSpace() {
   try {
@@ -21,34 +27,170 @@ function checkDiskSpace() {
       const freeGb = Number(((st.bavail * st.bsize) / (1024 ** 3)).toFixed(1));
       const usedPct = totalGb > 0 ? Math.round(((totalGb - freeGb) / totalGb) * 100) : 0;
       /** @type {'ok' | 'warn' | 'fail'} */
-      const status = freeGb < 2 ? 'fail' : freeGb < 5 ? 'warn' : 'ok';
+      const status = (freeGb < 2 || usedPct >= 92) ? 'fail' : (freeGb < 5 || usedPct >= 82) ? 'warn' : 'ok';
       return {
         id: 'disk_memory',
-        name: 'Memoria y espacio en disco',
+        name: 'Espacio en disco',
         status,
         summary: `Disco libre: ${freeGb} GB de ${totalGb} GB (${usedPct}% usado)`,
         detail: status === 'ok'
           ? 'Margen suficiente para imágenes Docker, copias de seguridad y cachés de BuildKit.'
           : 'Poco espacio libre en disco. Puedes limpiar cachés de BuildKit y archivos temporales con un clic.',
         fixAction: status !== 'ok' ? 'prune_buildkit' : null,
-        fixLabel: status !== 'ok' ? 'Limpiar caché BuildKit' : null
+        fixLabel: status !== 'ok' ? 'Limpiar caché BuildKit' : null,
+        metrics: { freeGb, totalGb, usedPct }
       };
     }
   } catch (e) {}
 
-  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
-  const freeMb = Math.round(os.freemem() / 1024 / 1024);
-  /** @type {'ok' | 'warn' | 'fail'} */
-  const status = freeMb < 128 ? 'warn' : 'ok';
   return {
     id: 'disk_memory',
-    name: 'Memoria del servidor',
-    status,
-    summary: `RAM libre: ${freeMb} MB de ${totalMb} MB`,
-    detail: 'Comprobación de memoria del host completada.',
+    name: 'Espacio en disco',
+    status: /** @type {'ok'} */ ('ok'),
+    summary: 'Estadística de disco no disponible en este runtime',
+    detail: 'Comprueba el espacio libre con df -h en tu servidor.',
     fixAction: null,
     fixLabel: null
   };
+}
+
+function checkHostMemory(snap) {
+  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
+  const freeMb = Math.round(os.freemem() / 1024 / 1024);
+  const freePct = totalMb > 0 ? Math.round((freeMb / totalMb) * 100) : 100;
+  /** @type {'ok' | 'warn' | 'fail'} */
+  const status = (freeMb < 128 || freePct < 6) ? 'fail' : (freeMb < 384 || freePct < 12) ? 'warn' : 'ok';
+  return {
+    id: 'host_memory',
+    name: 'Memoria RAM del servidor',
+    status,
+    summary: `RAM libre: ${freeMb} MB de ${totalMb} MB (${freePct}% libre) · Daemon ${snap.process.memoryMb} MB RSS`,
+    detail: status === 'ok'
+      ? 'Memoria disponible suficiente para contenedores, builds y procesos locales.'
+      : 'Memoria RAM ajustada. Limita despliegues simultáneos con CULKIBO_MAX_CONCURRENT_BUILDS=1 o añade swap.',
+    fixAction: null,
+    fixLabel: null,
+    metrics: { freeMb, totalMb, freePct, rssMb: snap.process.memoryMb }
+  };
+}
+
+function checkKeyFilePermissions() {
+  if (process.platform === 'win32') return { ok: true, issues: [] };
+  /** @type {string[]} */
+  const issues = [];
+  for (const name of ['auth.json', '.databases.key']) {
+    const filePath = path.join(DATA_DIR, name);
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const st = fs.statSync(filePath);
+      if ((st.mode & 0o077) !== 0) {
+        issues.push(`${name} (${(st.mode & 0o777).toString(8)})`);
+      }
+    } catch (e) {}
+  }
+  return { ok: issues.length === 0, issues };
+}
+
+/**
+ * @param {string} dirPath
+ * @param {number} cutoffMs
+ * @param {string | null} [prefix]
+ */
+function countStaleFilesInDir(dirPath, cutoffMs, prefix = null) {
+  let count = 0;
+  try {
+    if (!fs.existsSync(dirPath)) return 0;
+    for (const f of fs.readdirSync(dirPath)) {
+      if (prefix && !f.startsWith(prefix)) continue;
+      try {
+        const st = fs.statSync(path.join(dirPath, f));
+        if (st.mtimeMs < cutoffMs) count++;
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return count;
+}
+
+/**
+ * @param {string} dirPath
+ * @param {number} cutoffMs
+ * @param {string | null} [prefix]
+ */
+function removeStaleFilesInDir(dirPath, cutoffMs, prefix = null) {
+  let removed = 0;
+  try {
+    if (!fs.existsSync(dirPath)) return 0;
+    for (const f of fs.readdirSync(dirPath)) {
+      if (prefix && !f.startsWith(prefix)) continue;
+      try {
+        const full = path.join(dirPath, f);
+        const st = fs.statSync(full);
+        if (st.mtimeMs < cutoffMs) {
+          fs.rmSync(full, { recursive: true, force: true });
+          removed++;
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return removed;
+}
+
+/** Detecta contenedores `culkibo.managed=true` detenidos que ya no están referenciados por ningún servicio. */
+async function listOrphanedManagedContainers() {
+  try {
+    const deployManager = require('./deployManager');
+    const databaseManager = require('./databaseManager');
+    const catalogManager = /** @type {any} */ (require('./catalogManager'));
+    /** @type {any} */
+    let previewManager = null;
+    try { previewManager = require('./previewManager'); } catch (e) {}
+
+    const res = await deployManager.runDocker(
+      ['ps', '-a', '--filter', 'label=culkibo.managed=true', '--filter', 'status=exited', '--format', '{{.Names}}'],
+      { timeoutMs: 8000 }
+    );
+    if (res.code !== 0) return [];
+
+    /** @type {Set<string>} */
+    const known = new Set(['culkibo-caddy', 'culkibo-cloudflared']);
+    for (const st of Object.values(deployManager.store || {})) {
+      if (st?.current?.containerName) known.add(st.current.containerName);
+      if (st?.previous?.containerName) known.add(st.previous.containerName);
+    }
+    if (deployManager.inFlightContainers) {
+      for (const n of deployManager.inFlightContainers) known.add(n);
+    }
+    if (databaseManager && typeof databaseManager.list === 'function') {
+      for (const db of databaseManager.list()) {
+        if (db.containerName) known.add(db.containerName);
+      }
+    }
+    const installs = typeof catalogManager.list === 'function'
+      ? catalogManager.list()
+      : (typeof catalogManager.listInstallations === 'function' ? catalogManager.listInstallations() : []);
+    for (const inst of installs) {
+      if (inst.appContainer) known.add(inst.appContainer);
+      if (inst.dbContainer) known.add(inst.dbContainer);
+      if (Array.isArray(inst.containers)) {
+        for (const c of inst.containers) {
+          if (typeof c === 'string') known.add(c);
+          else if (c && c.name) known.add(c.name);
+        }
+      }
+    }
+    if (previewManager && typeof previewManager.list === 'function') {
+      for (const prev of previewManager.list()) {
+        if (prev.containerName) known.add(prev.containerName);
+      }
+    }
+
+    return (res.stdout || '')
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((name) => name && !known.has(name));
+  } catch (e) {
+    return [];
+  }
 }
 
 async function runDoctor() {
@@ -60,6 +202,7 @@ async function runDoctor() {
   const ingressManager = require('./ingressManager');
   const domainManager = require('./domainManager');
   const databaseManager = require('./databaseManager');
+  const sslManager = require('./sslManager');
   const { authStatus } = require('../middleware/auth');
 
   /** @type {Array<{ id: string, name: string, status: 'ok' | 'warn' | 'fail', summary: string, detail: string, fixAction: string | null, fixLabel: string | null }>} */
@@ -106,16 +249,18 @@ async function runDoctor() {
   /** @type {'ok' | 'warn' | 'fail'} */
   let caddyStatus = 'warn';
   let caddySummary = 'Caddy no detectado en :2019';
-  let caddyDetail = 'Sin Caddy activo no se sirven dominios públicos ni HTTPS automático. Arranca el plano de datos desde Dominios o con culkibo.';
+  let caddyDetail = 'Sin Caddy activo no se sirven dominios públicos ni HTTPS automático. Arranca el plano de datos con un clic o desde Dominios.';
   /** @type {string | null} */
-  let caddyFix = null;
+  let caddyFix = dockerAvail ? 'start_caddy' : null;
   /** @type {string | null} */
-  let caddyFixLabel = null;
+  let caddyFixLabel = dockerAvail ? 'Arrancar Caddy con Docker' : null;
   try {
     const det = await caddyManager.detect({ force: true });
     if (det && det.available) {
       const ing = await ingressManager.status();
-      const driftCount = (ing?.drift?.missing?.length || 0) + (ing?.drift?.unexpected?.length || 0);
+      const driftCount = (ing?.drift?.missing?.length || 0)
+        + (ing?.drift?.unexpected?.length || 0)
+        + (ing?.drift?.modified?.length || 0);
       if (ing && ing.inSync === false) {
         caddyStatus = 'warn';
         caddySummary = `Caddy activo con deriva de rutas (${driftCount} ${driftCount === 1 ? 'diferencia' : 'diferencias'})`;
@@ -127,6 +272,8 @@ async function runDoctor() {
         const count = Array.isArray(ing?.routes) ? ing.routes.length : 0;
         caddySummary = `Caddy activo · ${count} ${count === 1 ? 'ruta sincronizada' : 'rutas sincronizadas'}`;
         caddyDetail = 'Plano de datos sincronizado y listo para conmutaciones atómicas y TLS automático.';
+        caddyFix = null;
+        caddyFixLabel = null;
       }
     }
   } catch (e) {
@@ -142,8 +289,9 @@ async function runDoctor() {
     fixLabel: caddyFixLabel
   });
 
-  // 4. Memoria y Disco
+  // 4. Disco y Memoria del host (separados para no ocultar problemas de RAM)
   checks.push(checkDiskSpace());
+  checks.push(checkHostMemory(snap));
 
   // 5. Postura de Seguridad
   const auth = authStatus();
@@ -152,6 +300,7 @@ async function runDoctor() {
   const exposedDbs = (databaseManager.list ? databaseManager.list() : []).filter(
     (d) => d.exposure && d.exposure.enabled && d.exposure.bindAddress !== '127.0.0.1'
   );
+  const permCheck = checkKeyFilePermissions();
   /** @type {'ok' | 'warn' | 'fail'} */
   let secStatus = 'ok';
   let secSummary = `Token configurado (${auth.tokenSource}) · Escucha en ${bindHost}`;
@@ -160,6 +309,10 @@ async function runDoctor() {
     secStatus = 'warn';
     secSummary = 'Escuchando en 0.0.0.0 sin CULKIBO_REQUIRE_TOKEN=1';
     secDetail = 'En servidores expuestos a internet, define CULKIBO_REQUIRE_TOKEN=1 o escucha solo en 127.0.0.1 detrás de Caddy.';
+  } else if (!permCheck.ok) {
+    secStatus = 'warn';
+    secSummary = `Permisos demasiado abiertos en ${permCheck.issues.join(', ')}`;
+    secDetail = 'Los ficheros de claves deben tener modo 0600 (solo lectura/escritura para el propietario).';
   } else if (exposedDbs.length > 0) {
     secStatus = 'warn';
     secSummary = `${exposedDbs.length} ${exposedDbs.length === 1 ? 'base de datos expuesta' : 'bases de datos expuestas'} fuera de loopback`;
@@ -175,17 +328,38 @@ async function runDoctor() {
     fixLabel: null
   });
 
-  // 6. Dominios y TLS
+  // 6. Dominios y caducidad TLS real
   const domains = domainManager.listDomains();
   const wildcardCount = domains.filter((d) => d.isWildcard).length;
+  const certs = sslManager && typeof sslManager.listCertificates === 'function' ? sslManager.listCertificates() : [];
+  const expiredCerts = certs.filter((c) => c.isExpired);
+  const expiringCerts = certs.filter((c) => !c.isExpired && c.isExpiringSoon);
+  const lastTlsAudit = /** @type {any} */ (ingressManager)?.lastTlsAudit || null;
+  const liveExpiring = (lastTlsAudit && Array.isArray(lastTlsAudit.expiring)) ? lastTlsAudit.expiring : [];
+  const liveExpired = (lastTlsAudit && Array.isArray(lastTlsAudit.expired)) ? lastTlsAudit.expired : [];
+  /** @type {'ok' | 'warn' | 'fail'} */
+  let domStatus = 'ok';
+  let domSummary = `${domains.length} ${domains.length === 1 ? 'dominio' : 'dominios'} (${wildcardCount} ${wildcardCount === 1 ? 'comodín' : 'comodines'})`;
+  let domDetail = domains.length > 0
+    ? 'Usa el diagnóstico de 4 capas en Dominios para auditar DNS, rutas Caddy, comodines y TLS en directo.'
+    : 'Añade tu primer dominio o genera un dominio gratuito sslip.io en el asistente de Dominios.';
+  if (expiredCerts.length > 0 || liveExpired.length > 0) {
+    domStatus = 'fail';
+    const names = [...expiredCerts.map((c) => c.domain), ...liveExpired.map((c) => c.hostname)];
+    domSummary = `${names.length} certificado(s) TLS caducado(s): ${names.slice(0, 3).join(', ')}`;
+    domDetail = 'Renueva o sube un nuevo certificado PEM desde la pestaña Dominios para evitar avisos HTTPS en el navegador.';
+  } else if (expiringCerts.length > 0 || liveExpiring.length > 0) {
+    domStatus = 'warn';
+    const names = [...expiringCerts.map((c) => c.domain), ...liveExpiring.map((c) => c.hostname)];
+    domSummary = `${names.length} certificado(s) caducan en < 14 días: ${names.slice(0, 3).join(', ')}`;
+    domDetail = 'Revisa la renovación automática de Caddy o reemplaza los certificados PEM personalizados antes de su vencimiento.';
+  }
   checks.push({
     id: 'domains',
-    name: 'Dominios configurados',
-    status: 'ok',
-    summary: `${domains.length} ${domains.length === 1 ? 'dominio' : 'dominios'} (${wildcardCount} ${wildcardCount === 1 ? 'comodín' : 'comodines'})`,
-    detail: domains.length > 0
-      ? 'Usa la comprobación TLS en la vista de Dominios para auditar emisores y caducidad en directo.'
-      : 'Añade tu primer dominio o genera un dominio gratuito sslip.io en el asistente de Dominios.',
+    name: 'Dominios y caducidad TLS',
+    status: domStatus,
+    summary: domSummary,
+    detail: domDetail,
     fixAction: null,
     fixLabel: null
   });
@@ -193,42 +367,57 @@ async function runDoctor() {
   // 7. Bases de datos y copias de seguridad
   const dbs = databaseManager.list ? databaseManager.list() : [];
   const withSchedule = dbs.filter((d) => d.schedule && d.schedule.enabled).length;
-  const dbWarn = dbs.length > 0 && withSchedule === 0;
+  const failedBackups = dbs.filter((d) => d.schedule && d.schedule.lastStatus === 'error');
+  const dbStatus = failedBackups.length > 0 ? 'fail' : (dbs.length > 0 && withSchedule === 0) ? 'warn' : 'ok';
   checks.push({
     id: 'databases',
     name: 'Bases de datos y copias',
-    status: dbWarn ? 'warn' : 'ok',
+    status: dbStatus,
     summary: dbs.length === 0
       ? 'Sin bases de datos gestionadas'
-      : `${dbs.length} ${dbs.length === 1 ? 'base de datos' : 'bases de datos'} · ${withSchedule} con copia automática`,
-    detail: dbWarn
-      ? 'Tienes bases de datos activas sin copias programadas. Activa un horario cron desde el panel del proyecto.'
-      : 'Estado de almacenamiento y copias verificado.',
+      : failedBackups.length > 0
+        ? `${failedBackups.length} base(s) de datos con fallo en última copia`
+        : `${dbs.length} ${dbs.length === 1 ? 'base de datos' : 'bases de datos'} · ${withSchedule} con copia automática`,
+    detail: failedBackups.length > 0
+      ? `Revisa el historial de copias y destino S3/disco para: ${failedBackups.map((d) => d.name).join(', ')}.`
+      : dbStatus === 'warn'
+        ? 'Tienes bases de datos activas sin copias programadas. Activa un horario cron desde el panel del proyecto.'
+        : 'Estado de almacenamiento y copias verificado.',
     fixAction: null,
     fixLabel: null
   });
 
-  // 8. Archivos temporales huérfanos
-  let staleTmp = 0;
-  try {
-    if (fs.existsSync(TMP_DIR)) {
-      const cutoff = Date.now() - 3600 * 1000;
-      for (const f of fs.readdirSync(TMP_DIR)) {
-        try {
-          const st = fs.statSync(path.join(TMP_DIR, f));
-          if (st.mtimeMs < cutoff) staleTmp++;
-        } catch (e) {}
-      }
-    }
-  } catch (e) {}
+  // 8. Contenedores huérfanos (solo si Docker está disponible)
+  if (dockerAvail) {
+    const orphans = await listOrphanedManagedContainers();
+    checks.push({
+      id: 'orphaned_containers',
+      name: 'Contenedores huérfanos',
+      status: orphans.length > 0 ? 'warn' : 'ok',
+      summary: orphans.length > 0
+        ? `${orphans.length} contenedor(es) detenidos sin referencia activa`
+        : 'Sin contenedores huérfanos',
+      detail: orphans.length > 0
+        ? `Contenedores residuales detectados: ${orphans.slice(0, 4).join(', ')}${orphans.length > 4 ? '...' : ''}.`
+        : 'Todos los contenedores gestionados por Culkibo corresponden a servicios, despliegues o bases activas.',
+      fixAction: orphans.length > 0 ? 'clean_orphans' : null,
+      fixLabel: orphans.length > 0 ? 'Eliminar contenedores huérfanos' : null
+    });
+  }
+
+  // 9. Archivos temporales antiguos (> 1 hora)
+  const cutoff = Date.now() - SAFE_TMP_AGE_MS;
+  const staleTmp = countStaleFilesInDir(TMP_DIR, cutoff)
+    + countStaleFilesInDir(LEGACY_TMP_DIR, cutoff)
+    + countStaleFilesInDir(os.tmpdir(), cutoff, 'culkibo-git-');
   checks.push({
     id: 'tmp_hygiene',
     name: 'Higiene de archivos temporales',
     status: staleTmp > 0 ? 'warn' : 'ok',
-    summary: staleTmp > 0 ? `${staleTmp} archivos temporales antiguos en data/.tmp` : 'Directorio temporal limpio',
+    summary: staleTmp > 0 ? `${staleTmp} archivos temporales antiguos (>1 h)` : 'Directorio temporal limpio',
     detail: staleTmp > 0
-      ? 'Archivos residuales de despliegues interrumpidos que pueden eliminarse de forma segura.'
-      : 'Sin residuos temporales de despliegues anteriores.',
+      ? 'Archivos residuales de despliegues o clones interrumpidos (>1 hora) que pueden eliminarse de forma segura.'
+      : 'Sin residuos temporales antiguos de despliegues anteriores.',
     fixAction: staleTmp > 0 ? 'clean_tmp' : null,
     fixLabel: staleTmp > 0 ? 'Limpiar archivos temporales' : null
   });
@@ -255,43 +444,67 @@ async function runDoctor() {
  */
 async function applyFix(action) {
   if (action === 'reconcile_caddy') {
-    const ingressManager = require('./ingressManager');
-    const dm = require('./deployManager');
-    const ingRes = await ingressManager.reconcile();
-    const depRes = await dm.reconcileRoutes().catch(() => ({ applied: [] }));
+    const ing1 = require('./ingressManager');
+    // ingressManager.reconcile() ya incorpora deployments.json preservando mantenimiento, cabeceras y Basic Auth
+    const ingRes = await ing1.reconcile();
     return {
       ok: true,
       action,
       message: 'Rutas de Caddy reconciliadas correctamente.',
-      detail: { ingress: ingRes, deploy: depRes }
+      detail: { ingress: ingRes }
+    };
+  }
+
+  if (action === 'start_caddy') {
+    const cm = require('./caddyManager');
+    const ing2 = require('./ingressManager');
+    const started = await cm.startWithDocker();
+    const ingRes = await ing2.reconcile().catch(() => null);
+    return {
+      ok: Boolean(started && started.started !== false),
+      action,
+      message: 'Caddy arrancado y rutas reconciliadas.',
+      detail: { caddy: started, ingress: ingRes }
     };
   }
 
   if (action === 'clean_tmp') {
-    let removed = 0;
-    try {
-      if (fs.existsSync(TMP_DIR)) {
-        for (const f of fs.readdirSync(TMP_DIR)) {
-          try {
-            fs.rmSync(path.join(TMP_DIR, f), { recursive: true, force: true });
-            removed++;
-          } catch (e) {}
-        }
-      }
-    } catch (e) {}
+    // Jamás borra archivos <1h para no destruir env-files ni volcados de despliegues/restauraciones en curso
+    const cutoff = Date.now() - SAFE_TMP_AGE_MS;
+    const removed = removeStaleFilesInDir(TMP_DIR, cutoff)
+      + removeStaleFilesInDir(LEGACY_TMP_DIR, cutoff)
+      + removeStaleFilesInDir(os.tmpdir(), cutoff, 'culkibo-git-');
     return {
       ok: true,
       action,
       message: removed > 0
-        ? `Eliminados ${removed} archivos temporales residuales.`
-        : 'No había archivos temporales por limpiar.',
+        ? `Eliminados ${removed} archivos temporales antiguos (>1 h).`
+        : 'No había archivos temporales antiguos por limpiar (los archivos recientes en curso se protegen automáticamente).',
+      removed
+    };
+  }
+
+  if (action === 'clean_orphans') {
+    const dm1 = require('./deployManager');
+    const orphans = await listOrphanedManagedContainers();
+    let removed = 0;
+    for (const name of orphans) {
+      const r = await dm1.runDocker(['rm', '-f', name], { timeoutMs: 15000 }).catch(() => ({ code: 1 }));
+      if (r.code === 0) removed++;
+    }
+    return {
+      ok: true,
+      action,
+      message: removed > 0
+        ? `Eliminados ${removed} contenedor(es) huérfanos detenidos.`
+        : 'No había contenedores huérfanos por eliminar.',
       removed
     };
   }
 
   if (action === 'prune_buildkit') {
-    const deployManager = require('./deployManager');
-    const res = await deployManager.pruneBuildCache({ keepStorageGb: 2 });
+    const dm2 = require('./deployManager');
+    const res = await dm2.pruneBuildCache({ keepStorageGb: 2 });
     return {
       ok: true,
       action,
@@ -305,4 +518,4 @@ async function applyFix(action) {
   throw err;
 }
 
-module.exports = { runDoctor, applyFix };
+module.exports = { runDoctor, applyFix, checkDiskSpace, checkHostMemory, checkKeyFilePermissions, listOrphanedManagedContainers };

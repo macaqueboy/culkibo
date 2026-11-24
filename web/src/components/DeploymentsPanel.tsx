@@ -19,6 +19,14 @@ import {
   Undo2,
   Copy,
   Check,
+  Activity,
+  CalendarClock,
+  Eye,
+  Plus,
+  Trash2,
+  ExternalLink,
+  RefreshCw,
+  X,
 } from 'lucide-react';
 import {
   api,
@@ -27,10 +35,15 @@ import {
   type DeployGitInfo,
   type DeployLogLine,
   type DeployStrategyPreview,
+  type CronJobItem,
+  type CronRunItem,
+  type PreviewDeploymentItem,
 } from '../lib/api';
 import { deployStream } from '../lib/deployStream';
+import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
+import { HelpTip } from './HelpTip';
 
 interface Props {
   projectId: string;
@@ -96,8 +109,14 @@ function translateHealth(health: string): string {
 }
 
 function formatTrigger(trigger?: string): string {
-  if (trigger === 'webhook') return 'Push GitHub';
+  if (trigger === 'webhook' || trigger === 'github') return 'Webhook GitHub';
+  if (trigger === 'gitlab') return 'Webhook GitLab';
+  if (trigger === 'gitea') return 'Webhook Gitea';
+  if (trigger === 'bitbucket') return 'Webhook Bitbucket';
+  if (trigger === 'deploy_hook') return 'Deploy Hook CI/CD';
   if (trigger === 'forge_promote') return 'Promoción en vivo';
+  if (trigger === 'mcp') return 'Agente IA (MCP)';
+  if (trigger === 'rollback') return 'Reversión';
   return 'Manual';
 }
 
@@ -158,6 +177,31 @@ export const DeploymentsPanel: React.FC<Props> = ({ projectId, projectName, gitB
   const [visorEstado, setVisorEstado] = useState<string>('inactivo');
   const [abierto, setAbierto] = useState<string | null>(null);
   const [confirmarRollback, setConfirmarRollback] = useState(false);
+  const [subTab, setSubTab] = useState<'deploys' | 'runtime' | 'crons' | 'previews'>('deploys');
+
+  // Runtime stats, logs & safe exec
+  const [runtimeStats, setRuntimeStats] = useState<any>(null);
+  const [runtimeLogs, setRuntimeLogs] = useState<string>('');
+  const [runtimeLoading, setRuntimeLoading] = useState(false);
+  const [execCmd, setExecCmd] = useState('');
+  const [execBusy, setExecBusy] = useState(false);
+  const [execResult, setExecResult] = useState<{ exitCode: number; stdout: string; stderr: string; durationMs: number } | null>(null);
+
+  // Cron Jobs
+  const [crons, setCrons] = useState<CronJobItem[]>([]);
+  const [cronFormOpen, setCronFormOpen] = useState(false);
+  const [cronForm, setCronForm] = useState({ name: '', schedule: '0 3 * * *', command: '', timeoutSec: 120 });
+  const [cronBusyId, setCronBusyId] = useState<string | null>(null);
+  const [cronRunsOpenId, setCronRunsOpenId] = useState<string | null>(null);
+  const [cronRuns, setCronRuns] = useState<Record<string, CronRunItem[]>>({});
+
+  // Preview Deployments
+  const [previews, setPreviews] = useState<PreviewDeploymentItem[]>([]);
+  const [previewBranch, setPreviewBranch] = useState('');
+  const [previewPr, setPreviewPr] = useState('');
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewLogKey, setPreviewLogKey] = useState<string | null>(null);
+  const [previewLogText, setPreviewLogText] = useState('');
 
   const [detenidoOptimista, setDetenidoOptimista] = useState<boolean | null>(null);
   const [deshacerParada, setDeshacerParada] = useState(false);
@@ -294,11 +338,83 @@ export const DeploymentsPanel: React.FC<Props> = ({ projectId, projectName, gitB
     }
   };
 
-  const revertir = async () => {
+  const loadRuntime = useCallback(async () => {
+    setRuntimeLoading(true);
+    try {
+      const [st, lg] = await Promise.all([
+        api.getRuntimeStats(projectId).catch(() => null),
+        api.getRuntimeLogs(projectId, { tail: 200 }).catch(() => null),
+      ]);
+      setRuntimeStats(st);
+      setRuntimeLogs(lg?.output || (Array.isArray(lg?.lines) ? lg.lines.join('\n') : '') || '');
+    } finally {
+      setRuntimeLoading(false);
+    }
+  }, [projectId]);
+
+  const loadCrons = useCallback(async () => {
+    try {
+      const res = await api.getProjectCrons(projectId);
+      setCrons(res.jobs || []);
+    } catch {
+      // ignorar
+    }
+  }, [projectId]);
+
+  const loadPreviews = useCallback(async () => {
+    try {
+      const res = await api.getProjectPreviews(projectId);
+      setPreviews(res.previews || []);
+    } catch {
+      // ignorar
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    void loadCrons();
+    void loadPreviews();
+    const offCron = liveEvents.onCronRun((ev) => {
+      if (ev.projectId !== projectId) return;
+      void loadCrons();
+      if (ev.jobId) {
+        setCronRuns((prev) => ({
+          ...prev,
+          [ev.jobId]: [ev.run as CronRunItem, ...(prev[ev.jobId] || [])].slice(0, 20),
+        }));
+      }
+    });
+    const offPreview = liveEvents.onPreviewEvent((ev) => {
+      if (ev.projectId !== projectId) return;
+      void loadPreviews();
+    });
+    return () => {
+      offCron();
+      offPreview();
+    };
+  }, [projectId, loadCrons, loadPreviews]);
+
+  useEffect(() => {
+    if (subTab === 'runtime') void loadRuntime();
+  }, [subTab, loadRuntime]);
+
+  const cancelarBuild = async () => {
+    setOcupado('cancelar');
+    try {
+      const res = await api.cancelDeploy(projectId);
+      onNotify(res.cancelled ? 'Construcción cancelada correctamente' : (res.reason || 'No había ninguna construcción activa'), 'info');
+      await cargar();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'No se pudo cancelar el despliegue', 'error');
+    } finally {
+      setOcupado(null);
+    }
+  };
+
+  const revertir = async (targetDeploymentId?: string) => {
     setConfirmarRollback(false);
     setOcupado('revertir');
     try {
-      const resultado = await api.rollbackDeploy(projectId);
+      const resultado = await api.rollbackDeploy(projectId, targetDeploymentId ? { targetDeploymentId } : {});
       if (resultado.status === 'fallido') {
         onNotify(`No se pudo revertir: ${resultado.error || 'sin detalle'}`, 'error');
       } else {
@@ -534,6 +650,17 @@ export const DeploymentsPanel: React.FC<Props> = ({ projectId, projectName, gitB
                 : <><Rocket className="w-3.5 h-3.5" /> Desplegar</>}
             </button>
 
+            {enCurso && (
+              <button
+                type="button"
+                onClick={() => void cancelarBuild()}
+                disabled={ocupado === 'cancelar'}
+                className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" /> Cancelar build
+              </button>
+            )}
+
             <button
               type="button"
               onClick={() => setConfirmarRollback(true)}
@@ -629,6 +756,46 @@ export const DeploymentsPanel: React.FC<Props> = ({ projectId, projectName, gitB
         </div>
       </Modal>
 
+      {/* Sub-navegación limpia: Despliegues / Contenedor / Cron / Previews */}
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="inline-flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200 text-xs overflow-x-auto no-scrollbar">
+          {([
+            { id: 'deploys', label: 'Build e historial', icon: Terminal, count: historial.length },
+            { id: 'runtime', label: 'Contenedor en vivo', icon: Activity },
+            { id: 'crons', label: 'Tareas Cron', icon: CalendarClock, count: crons.length },
+            { id: 'previews', label: 'Vistas previas', icon: Eye, count: previews.length },
+          ] as Array<{ id: 'deploys' | 'runtime' | 'crons' | 'previews'; label: string; icon: React.ComponentType<{ className?: string }>; count?: number }>).map((item) => {
+            const Icon = item.icon;
+            const active = subTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setSubTab(item.id)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                  active ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                <span>{item.label}</span>
+                {typeof item.count === 'number' && item.count > 0 && (
+                  <span className="px-1.5 py-0.2 rounded-full bg-slate-100 text-slate-600 text-[10px] font-mono tabular-nums">
+                    {item.count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        <HelpTip title="Producción, Cron y Previews" align="right">
+          <p><strong>Contenedor en vivo:</strong> consulta CPU/RAM, logs reales del contenedor y ejecuta comandos puntuales (ej. migraciones).</p>
+          <p><strong>Tareas Cron:</strong> programa scripts periódicos dentro del contenedor de producción.</p>
+          <p><strong>Vistas previas:</strong> despliega ramas o PRs aislados con URL propia para probar antes de fusionar.</p>
+        </HelpTip>
+      </div>
+
+      {subTab === 'deploys' && (
+      <>
       {/* Consola de construcción */}
       <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 border-b border-slate-200 gap-3 flex-wrap">
@@ -748,6 +915,17 @@ export const DeploymentsPanel: React.FC<Props> = ({ projectId, projectName, gitB
                     >
                       Registro
                     </button>
+                    {d.status === 'activo' && actual && d.id !== actual.deploymentId && (
+                      <button
+                        type="button"
+                        onClick={() => void revertir(d.id)}
+                        disabled={ocupado !== null || enCurso}
+                        title="Revertir a esta versión concreta"
+                        className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-2.5 py-1 rounded-lg shrink-0 bg-slate-50 hover:bg-slate-100 disabled:opacity-40 cursor-pointer"
+                      >
+                        Restaurar
+                      </button>
+                    )}
                   </div>
 
                   {desplegado && (
@@ -785,6 +963,423 @@ export const DeploymentsPanel: React.FC<Props> = ({ projectId, projectName, gitB
           </div>
         )}
       </div>
+      </>
+      )}
+
+      {subTab === 'runtime' && (
+        <div className="space-y-4">
+          <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">Estadísticas y logs del contenedor</h3>
+                <p className="text-xs text-slate-500 mt-0.5">Lectura directa de Docker sin agentes externos.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadRuntime()}
+                disabled={runtimeLoading}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${runtimeLoading ? 'animate-spin' : ''}`} />
+                Actualizar
+              </button>
+            </div>
+
+            {runtimeStats?.ok ? (
+              <div className="bg-slate-50/70 border border-slate-200 rounded-xl grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 text-xs">
+                <div className="p-3.5">
+                  <div className="text-slate-500">CPU</div>
+                  <div className="font-mono font-semibold text-slate-900 text-sm mt-1 tabular-nums">
+                    {runtimeStats.cpuPercent != null ? `${runtimeStats.cpuPercent}%` : '—'}
+                  </div>
+                </div>
+                <div className="p-3.5">
+                  <div className="text-slate-500">Memoria</div>
+                  <div className="font-mono font-semibold text-slate-900 text-sm mt-1 tabular-nums">
+                    {runtimeStats.memoryUsage || '—'}
+                  </div>
+                </div>
+                <div className="p-3.5">
+                  <div className="text-slate-500">Red (E/S)</div>
+                  <div className="font-mono font-semibold text-slate-900 text-sm mt-1 tabular-nums">
+                    {runtimeStats.netIO || '—'}
+                  </div>
+                </div>
+                <div className="p-3.5">
+                  <div className="text-slate-500">Procesos (PIDs)</div>
+                  <div className="font-mono font-semibold text-slate-900 text-sm mt-1 tabular-nums">
+                    {runtimeStats.pids || '—'}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-500">
+                {runtimeStats?.error || 'No hay ningún contenedor de producción en ejecución para este proyecto.'}
+              </div>
+            )}
+
+            <div className="border border-slate-200 rounded-xl overflow-hidden">
+              <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-700">
+                Salida reciente (stdout / stderr)
+              </div>
+              <pre className="p-3.5 h-56 overflow-y-auto bg-white font-mono text-xs text-slate-800 whitespace-pre-wrap break-words leading-relaxed">
+                {runtimeLogs || 'Sin salida disponible todavía.'}
+              </pre>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-3">
+            <h4 className="text-xs font-semibold text-slate-900">Ejecutar comando puntual en el contenedor</h4>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!execCmd.trim()) return;
+                setExecBusy(true);
+                try {
+                  const res = await api.execRuntimeCommand(projectId, { command: execCmd.trim() });
+                  setExecResult(res);
+                  onNotify(res.exitCode === 0 ? 'Comando ejecutado correctamente' : `El comando terminó con código ${res.exitCode}`, res.exitCode === 0 ? 'success' : 'error');
+                } catch (err: any) {
+                  onNotify(err?.message || 'Error al ejecutar el comando', 'error');
+                } finally {
+                  setExecBusy(false);
+                }
+              }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                value={execCmd}
+                onChange={(e) => setExecCmd(e.target.value)}
+                placeholder="Ej. npx prisma migrate status"
+                className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono"
+              />
+              <button
+                type="submit"
+                disabled={execBusy || !execCmd.trim() || !actual}
+                className="px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium disabled:opacity-50 cursor-pointer shrink-0"
+              >
+                {execBusy ? 'Ejecutando…' : 'Ejecutar'}
+              </button>
+            </form>
+            {execResult && (
+              <div className="border border-slate-200 rounded-lg overflow-hidden text-xs">
+                <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between text-[11px] font-mono">
+                  <span className={execResult.exitCode === 0 ? 'text-emerald-700' : 'text-red-700'}>
+                    exit {execResult.exitCode}
+                  </span>
+                  <span className="text-slate-500 tabular-nums">{execResult.durationMs} ms</span>
+                </div>
+                <pre className="p-3 bg-white font-mono text-[11px] text-slate-800 whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
+                  {[execResult.stdout, execResult.stderr].filter(Boolean).join('\n') || '(sin salida)'}
+                </pre>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {subTab === 'crons' && (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900">Tareas programadas (Cron)</h3>
+              <p className="text-xs text-slate-500">Se ejecutan de forma segura dentro del contenedor de producción.</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setCronFormOpen((v) => !v)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" /> {cronFormOpen ? 'Cerrar' : 'Nueva tarea'}
+            </button>
+          </div>
+
+          {cronFormOpen && (
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                try {
+                  await api.createProjectCron(projectId, cronForm);
+                  setCronForm({ name: '', schedule: '0 3 * * *', command: '', timeoutSec: 120 });
+                  setCronFormOpen(false);
+                  onNotify('Tarea cron creada', 'success');
+                  await loadCrons();
+                } catch (err: any) {
+                  onNotify(err?.message || 'Error al crear tarea cron', 'error');
+                }
+              }}
+              className="p-4 bg-slate-50/70 border-b border-slate-200 grid grid-cols-1 sm:grid-cols-4 gap-2.5 text-xs"
+            >
+              <input
+                required
+                value={cronForm.name}
+                onChange={(e) => setCronForm({ ...cronForm, name: e.target.value })}
+                placeholder="Nombre (ej. Limpiar sesiones)"
+                className="px-3 py-2 bg-white border border-slate-200 rounded-lg"
+              />
+              <input
+                required
+                value={cronForm.schedule}
+                onChange={(e) => setCronForm({ ...cronForm, schedule: e.target.value })}
+                placeholder="0 3 * * * o @daily"
+                className="px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
+              />
+              <input
+                required
+                value={cronForm.command}
+                onChange={(e) => setCronForm({ ...cronForm, command: e.target.value })}
+                placeholder="Comando (ej. node scripts/cleanup.js)"
+                className="px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
+              />
+              <button
+                type="submit"
+                className="px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer"
+              >
+                Guardar tarea
+              </button>
+            </form>
+          )}
+
+          {crons.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-500">
+              No hay tareas cron configuradas todavía. Úsalas para limpiezas, reportes o sincronizaciones periódicas.
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-100 text-xs">
+              {crons.map((job) => {
+                const isOpen = cronRunsOpenId === job.id;
+                const runs = cronRuns[job.id] || [];
+                return (
+                  <div key={job.id} className="p-4 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-semibold text-slate-900">{job.name}</span>
+                          <span className="font-mono text-[11px] bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded text-slate-700">
+                            {job.schedule}
+                          </span>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium border ${
+                            job.enabled ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-slate-100 text-slate-500 border-slate-200'
+                          }`}>
+                            {job.enabled ? 'Activa' : 'Pausada'}
+                          </span>
+                        </div>
+                        <div className="font-mono text-[11px] text-slate-500 mt-1 truncate">{job.command}</div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          disabled={cronBusyId === job.id}
+                          onClick={async () => {
+                            setCronBusyId(job.id);
+                            try {
+                              await api.runProjectCron(projectId, job.id);
+                              onNotify(`Tarea «${job.name}» ejecutada`, 'success');
+                              const r = await api.getProjectCronRuns(projectId, job.id);
+                              setCronRuns((prev) => ({ ...prev, [job.id]: r.runs || [] }));
+                              setCronRunsOpenId(job.id);
+                              await loadCrons();
+                            } catch (err: any) {
+                              onNotify(err?.message || 'Error al ejecutar cron', 'error');
+                            } finally {
+                              setCronBusyId(null);
+                            }
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                        >
+                          {cronBusyId === job.id ? 'Ejecutando…' : 'Ejecutar ahora'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await api.updateProjectCron(projectId, job.id, { enabled: !job.enabled });
+                            await loadCrons();
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer"
+                        >
+                          {job.enabled ? 'Pausar' : 'Activar'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            if (isOpen) {
+                              setCronRunsOpenId(null);
+                              return;
+                            }
+                            setCronRunsOpenId(job.id);
+                            const r = await api.getProjectCronRuns(projectId, job.id).catch(() => ({ runs: [] }));
+                            setCronRuns((prev) => ({ ...prev, [job.id]: r.runs || [] }));
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer"
+                        >
+                          Historial
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Eliminar tarea ${job.name}`}
+                          onClick={async () => {
+                            await api.deleteProjectCron(projectId, job.id);
+                            onNotify('Tarea eliminada', 'info');
+                            await loadCrons();
+                          }}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                    {isOpen && (
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg divide-y divide-slate-200/70">
+                        {runs.length === 0 ? (
+                          <div className="p-3 text-slate-500">Sin ejecuciones registradas todavía.</div>
+                        ) : (
+                          runs.slice(0, 8).map((r) => (
+                            <div key={r.id} className="p-2.5 flex items-center justify-between gap-2 text-[11px]">
+                              <span className={r.status === 'ok' || r.exitCode === 0 ? 'text-emerald-700 font-medium' : 'text-red-700 font-medium'}>
+                                {r.status} (exit {r.exitCode ?? '—'})
+                              </span>
+                              <span className="font-mono text-slate-500 truncate flex-1">{r.output || '—'}</span>
+                              <span className="text-slate-400 tabular-nums shrink-0">{formatDuracion(r.durationMs)}</span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {subTab === 'previews' && (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900">Vistas previas por rama o PR</h3>
+              <p className="text-xs text-slate-500">Contenedores temporales aislados con limpieza automática y protección frente a forks.</p>
+            </div>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!previewBranch.trim() && !previewPr.trim()) return;
+                setPreviewBusy(true);
+                try {
+                  await api.deployProjectPreview(projectId, {
+                    branch: previewBranch.trim() || undefined,
+                    prNumber: previewPr.trim() ? Number(previewPr.trim()) : null,
+                  });
+                  setPreviewBranch('');
+                  setPreviewPr('');
+                  onNotify('Vista previa desplegada', 'success');
+                  await loadPreviews();
+                } catch (err: any) {
+                  onNotify(err?.message || 'Error al desplegar vista previa', 'error');
+                } finally {
+                  setPreviewBusy(false);
+                }
+              }}
+              className="flex items-center gap-2 flex-wrap"
+            >
+              <input
+                type="text"
+                value={previewBranch}
+                onChange={(e) => setPreviewBranch(e.target.value)}
+                placeholder="Rama (ej. feat/login)"
+                className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono w-48 sm:w-52"
+              />
+              <input
+                type="number"
+                value={previewPr}
+                onChange={(e) => setPreviewPr(e.target.value)}
+                placeholder="PR #"
+                className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono w-20"
+              />
+              <button
+                type="submit"
+                disabled={previewBusy || (!previewBranch.trim() && !previewPr.trim())}
+                className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium disabled:opacity-50 cursor-pointer"
+              >
+                {previewBusy ? 'Desplegando…' : 'Lanzar preview'}
+              </button>
+            </form>
+          </div>
+
+          {previews.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-500">
+              No hay vistas previas activas. Lanza una arriba indicando una rama o número de Pull Request.
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-100 text-xs">
+              {previews.map((pv) => (
+                <div key={pv.key} className="p-4 space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                      <span className="font-mono font-semibold text-slate-900">{pv.branch}</span>
+                      {pv.prNumber && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[11px]">
+                          PR #{pv.prNumber}
+                        </span>
+                      )}
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium border ${
+                        pv.status === 'active' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-slate-100 text-slate-600 border-slate-200'
+                      }`}>
+                        {pv.status}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {pv.url && (
+                        <a
+                          href={pv.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium"
+                        >
+                          Abrir <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (previewLogKey === pv.key) {
+                            setPreviewLogKey(null);
+                            return;
+                          }
+                          setPreviewLogKey(pv.key);
+                          const res = await api.getProjectPreviewLogs(projectId, pv.key).catch(() => ({ output: 'Sin registros.' }));
+                          setPreviewLogText(res.output || 'Sin registros.');
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer"
+                      >
+                        Logs
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await api.destroyProjectPreview(projectId, pv.key);
+                          onNotify(`Vista previa ${pv.branch} eliminada`, 'info');
+                          await loadPreviews();
+                        }}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 cursor-pointer"
+                        aria-label={`Eliminar vista previa ${pv.branch}`}
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                  {previewLogKey === pv.key && (
+                    <pre className="p-3 bg-slate-50 border border-slate-200 rounded-lg font-mono text-[11px] text-slate-700 max-h-48 overflow-y-auto whitespace-pre-wrap">
+                      {previewLogText}
+                    </pre>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };

@@ -98,6 +98,7 @@
 // o Title Case es una falta de ortografía según la RAE, y a 11 px las tildes
 // desaparecen. La jerarquía se hace con peso tipográfico.
 const CATEGORIES = [
+  { id: 'ia', label: 'Inteligencia artificial' },
   { id: 'automatizacion', label: 'Automatización' },
   { id: 'analitica', label: 'Analítica' },
   { id: 'contenido', label: 'Contenido' },
@@ -147,7 +148,7 @@ const TEMPLATES = [
         N8N_ENCRYPTION_KEY: '{{secret.N8N_ENCRYPTION_KEY}}',
         N8N_HOST: '{{domain}}',
         N8N_PORT: '5678',
-        N8N_PROTOCOL: 'https',
+        N8N_PROTOCOL: '{{protocol}}',
         WEBHOOK_URL: '{{url}}/',
         N8N_EDITOR_BASE_URL: '{{url}}',
         GENERIC_TIMEZONE: 'Europe/Madrid',
@@ -786,6 +787,337 @@ const TEMPLATES = [
     notes: [
       'La imagen arranca una JVM con LibreOffice detrás: cuenta con 2 GB de memoria y un minuto largo de arranque.'
     ]
+  },
+
+  // -------------------------------------------------------------------------
+  // Stack 2026: Inteligencia artificial, BaaS, búsqueda, observabilidad y correo dev
+  // -------------------------------------------------------------------------
+  {
+    id: 'open-webui',
+    name: 'Open WebUI',
+    category: 'ia',
+    summary: 'Interfaz web de chat con modelos locales (Ollama) y APIs OpenAI/Anthropic/Gemini.',
+    description:
+      'Interfaz completa estilo ChatGPT en tu propio servidor con soporte RAG, documentos, búsqueda web, ' +
+      'usuarios con roles y conexión directa a Ollama o a cualquier pasarela compatible con OpenAI.',
+    website: 'https://openwebui.com',
+    licence: 'Open WebUI License (BSD-3 modificado con cláusula de marca)',
+    tags: ['ia', 'llm', 'chat', 'ollama', 'rag'],
+    database: null,
+    secrets: {
+      WEBUI_SECRET_KEY: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'ghcr.io/open-webui/open-webui:0.6.5',
+      port: 8080,
+      memoryMb: 1024,
+      cpus: 2,
+      env: {
+        WEBUI_SECRET_KEY: '{{secret.WEBUI_SECRET_KEY}}',
+        WEBUI_URL: '{{url}}',
+        ENABLE_SIGNUP: 'true',
+        DEFAULT_LOCALE: 'es-ES'
+      },
+      volumes: [{ name: 'data', path: '/app/backend/data' }],
+      readiness: { path: '/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y crea la primera cuenta, que pasará a ser administradora.',
+      'En Ajustes → Conexiones añade tu instancia de Ollama o tu clave de API.'
+    ],
+    notes: [
+      'El primer arranque descarga modelos ligeros de embeddings; dale ~60 segundos antes de abrirlo.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'ollama',
+    name: 'Ollama',
+    category: 'ia',
+    summary: 'Motor local para ejecutar modelos de lenguaje abiertos (Llama, Qwen, Mistral, DeepSeek).',
+    description:
+      'Sirve modelos de IA locales mediante API HTTP compatible con OpenAI en una red privada. ' +
+      'Se integra de forma nativa con Open WebUI, n8n y LiteLLM sin enviar datos fuera de tu servidor.',
+    website: 'https://ollama.com',
+    licence: 'MIT',
+    tags: ['ia', 'llm', 'modelos', 'inferencia'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'ollama/ollama:0.6.2',
+      port: 11434,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        OLLAMA_HOST: '0.0.0.0:11434',
+        OLLAMA_KEEP_ALIVE: '5m'
+      },
+      volumes: [{ name: 'models', path: '/root/.ollama' }],
+      readiness: { path: '/api/tags', expect: [200] }
+    },
+    nextSteps: [
+      'Descarga un modelo ligero dentro del contenedor (p. ej. `ollama pull qwen2.5:3b`).',
+      'Mantén el dominio protegido con Basic Auth o úsalo solo en red local.'
+    ],
+    notes: [
+      'Sin GPU los modelos corren en CPU: calcula al menos 4 GB de RAM libres para modelos de 3B-7B.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'qdrant',
+    name: 'Qdrant',
+    category: 'ia',
+    summary: 'Base de datos vectorial en Rust de muy baja latencia para RAG y búsqueda semántica.',
+    description:
+      'Motor vectorial optimizado en Rust con filtrado avanzado por metadatos, cuantización y panel web ' +
+      'incorporado. Protegido desde el primer segundo con API Key aleatoria.',
+    website: 'https://qdrant.tech',
+    licence: 'Apache-2.0',
+    tags: ['ia', 'vectores', 'rag', 'busqueda', 'rust'],
+    database: null,
+    secrets: {
+      QDRANT__SERVICE__API_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'qdrant/qdrant:v1.13.4',
+      port: 6333,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        QDRANT__SERVICE__API_KEY: '{{secret.QDRANT__SERVICE__API_KEY}}'
+      },
+      volumes: [{ name: 'storage', path: '/qdrant/storage' }],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Consulta la API Key generada en «Credenciales» y pásala en la cabecera `api-key`.',
+      'Abre {{url}}/dashboard para inspeccionar colecciones y vectores.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'litellm',
+    name: 'LiteLLM Proxy',
+    category: 'ia',
+    summary: 'Pasarela unificada OpenAI para +100 proveedores LLM con control de costes y claves virtuales.',
+    description:
+      'Centraliza tus proveedores de IA (OpenAI, Anthropic, Gemini, Bedrock, Ollama) detrás de una única ' +
+      'API compatible con OpenAI, con presupuestos por equipo, fallback automático y registros en PostgreSQL.',
+    website: 'https://www.litellm.ai',
+    licence: 'MIT',
+    tags: ['ia', 'gateway', 'openai', 'proxy', 'costes'],
+    database: { engine: 'postgres', dbName: 'litellm', username: 'litellm', memoryMb: 512 },
+    secrets: {
+      LITELLM_MASTER_KEY: { bytes: 24, encoding: 'hex' },
+      LITELLM_SALT_KEY: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'ghcr.io/berriai/litellm:v1.63.11',
+      port: 4000,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        LITELLM_MASTER_KEY: 'sk-{{secret.LITELLM_MASTER_KEY}}',
+        LITELLM_SALT_KEY: '{{secret.LITELLM_SALT_KEY}}',
+        STORE_MODEL_IN_DB: 'True'
+      },
+      volumes: [],
+      readiness: { path: '/health/liveliness', expect: [200, 401], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/ui e inicia sesión con la clave maestra (`sk-...`) desde «Credenciales».',
+      'Añade tus proveedores de IA y genera claves virtuales con límite de gasto.'
+    ],
+    notes: [
+      'Guarda `LITELLM_SALT_KEY`: se usa para cifrar las claves de proveedores dentro de PostgreSQL.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'pocketbase',
+    name: 'PocketBase',
+    category: 'datos',
+    summary: 'Backend en un solo binario Go con SQLite en tiempo real, autenticación y almacenamiento.',
+    description:
+      'Alternativa ultraligera a Firebase y Supabase en menos de 40 MB de RAM: base SQLite integrada, ' +
+      'suscripciones en vivo, panel de administración y API REST lista al instante.',
+    website: 'https://pocketbase.io',
+    licence: 'MIT',
+    tags: ['baas', 'sqlite', 'auth', 'realtime', 'go'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'ghcr.io/muchobien/pocketbase:0.25.9',
+      port: 8090,
+      memoryMb: 256,
+      cpus: 1,
+      env: {
+        PB_ENCRYPTION_KEY: ''
+      },
+      volumes: [{ name: 'pb_data', path: '/pb_data' }],
+      readiness: { path: '/api/health', expect: [200] }
+    },
+    nextSteps: [
+      'Revisa los registros del contenedor para obtener el enlace de creación del superusuario (`/_/`).'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'directus',
+    name: 'Directus',
+    category: 'contenido',
+    summary: 'CMS headless y capa de datos instantánea sobre PostgreSQL con REST, GraphQL y flujos.',
+    description:
+      'Convierte cualquier esquema SQL en una API REST y GraphQL completa con panel editorial moderno, ' +
+      'permisos granulares, automatizaciones y gestión de archivos.',
+    website: 'https://directus.io',
+    licence: 'BSL 1.1 (código a la vista; libre para proyectos menores a 5M USD de ingresos)',
+    tags: ['cms', 'headless', 'api', 'graphql', 'datos'],
+    database: { engine: 'postgres', dbName: 'directus', username: 'directus', memoryMb: 512 },
+    secrets: {
+      DIRECTUS_SECRET: { bytes: 32, encoding: 'hex' },
+      ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'directus/directus:11.5.1',
+      port: 8055,
+      memoryMb: 768,
+      cpus: 1,
+      env: {
+        SECRET: '{{secret.DIRECTUS_SECRET}}',
+        DB_CLIENT: 'pg',
+        DB_HOST: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_DATABASE: '{{db.name}}',
+        DB_USER: '{{db.user}}',
+        DB_PASSWORD: '{{db.password}}',
+        ADMIN_EMAIL: 'admin@culkibo.local',
+        ADMIN_PASSWORD: '{{secret.ADMIN_PASSWORD}}',
+        PUBLIC_URL: '{{url}}',
+        WEBSOCKETS_ENABLED: 'true'
+      },
+      volumes: [{ name: 'uploads', path: '/directus/uploads' }],
+      readiness: { path: '/server/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} con `admin@culkibo.local` y la contraseña en «Credenciales».',
+      'Cambia el correo de administración desde el perfil de usuario tras entrar.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'meilisearch',
+    name: 'Meilisearch',
+    category: 'datos',
+    summary: 'Motor de búsqueda instantánea tolerante a erratas en Rust (alternativa libre a Algolia).',
+    description:
+      'Búsqueda full-text en menos de 50 ms con tolerancia a errores tipográficos, filtros facetados ' +
+      'y resaltado de resultados. Incluye clave maestra autogenerada.',
+    website: 'https://www.meilisearch.com',
+    licence: 'MIT',
+    tags: ['busqueda', 'algolia', 'rust', 'fulltext'],
+    database: null,
+    secrets: {
+      MEILI_MASTER_KEY: { bytes: 24, encoding: 'base64url' }
+    },
+    app: {
+      image: 'getmeili/meilisearch:v1.13.3',
+      port: 7700,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        MEILI_ENV: 'production',
+        MEILI_MASTER_KEY: '{{secret.MEILI_MASTER_KEY}}',
+        MEILI_NO_ANALYTICS: 'true'
+      },
+      volumes: [{ name: 'meili_data', path: '/meili_data' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Usa la clave maestra de «Credenciales» para generar claves de búsqueda de sólo lectura para el frontend.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'grafana',
+    name: 'Grafana',
+    category: 'monitorizacion',
+    summary: 'Paneles de métricas, alertas y observabilidad listos para conectar al `/metrics` de Culkibo.',
+    description:
+      'Visualiza Prometheus, Loki, PostgreSQL y métricas del propio daemon de Culkibo con cuadros de ' +
+      'mando profesionales, alertas y usuarios.',
+    website: 'https://grafana.com',
+    licence: 'AGPLv3',
+    tags: ['metricas', 'prometheus', 'dashboards', 'observabilidad'],
+    database: null,
+    secrets: {
+      GF_SECURITY_ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'grafana/grafana:11.5.2',
+      port: 3000,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        GF_SECURITY_ADMIN_USER: 'admin',
+        GF_SECURITY_ADMIN_PASSWORD: '{{secret.GF_SECURITY_ADMIN_PASSWORD}}',
+        GF_SERVER_ROOT_URL: '{{url}}',
+        GF_USERS_ALLOW_SIGN_UP: 'false'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/grafana' }],
+      readiness: { path: '/api/health', expect: [200] }
+    },
+    nextSteps: [
+      'Entra en {{url}} como `admin` con la contraseña generada en «Credenciales».',
+      'Añade tu servidor Prometheus o PostgreSQL como fuente de datos.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'mailpit',
+    name: 'Mailpit',
+    category: 'desarrollo',
+    summary: 'Bandeja SMTP de pruebas y depuración de correos con visor HTML, API y análisis de enlaces.',
+    description:
+      'Captura todos los correos salientes de tus entornos de staging y desarrollo sin enviar emails ' +
+      'reales a clientes. Interfaz web rápida, búsqueda y vista previa móvil/escritorio.',
+    website: 'https://mailpit.axllent.org',
+    licence: 'MIT',
+    tags: ['smtp', 'email', 'testing', 'staging'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'axllent/mailpit:v1.22.3',
+      port: 8025,
+      memoryMb: 256,
+      cpus: 1,
+      env: {
+        MP_DATABASE: '/data/mailpit.db',
+        MP_MAX_MESSAGES: '5000'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/livez', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para ver los correos capturados.',
+      'Apunta el cliente SMTP de tus apps de prueba al contenedor en el puerto 1025.'
+    ],
+    notes: []
   }
 ];
 

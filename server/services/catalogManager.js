@@ -188,6 +188,7 @@ function resolvePlaceholders(value, context) {
     const parts = expr.split('.');
 
     if (expr === 'domain') return context.domain || (context.hostPort ? `127.0.0.1:${context.hostPort}` : 'localhost');
+    if (expr === 'protocol') return context.domain ? 'https' : 'http';
     if (expr === 'url') return context.url || '';
     if (expr === 'install.id') return context.installId;
 
@@ -581,6 +582,16 @@ class CatalogManager extends EventEmitter {
       record.databaseId = provisioned.id;
       this.save();
 
+      // Esperar a que la BD esté realmente saludable (hasta 30s) antes de arrancar la app que depende de ella
+      const dbDeadline = Date.now() + 30000;
+      while (Date.now() < dbDeadline) {
+        try {
+          const st = await databaseManager.refreshHealth(provisioned.id);
+          if (st.health === 'healthy' || (st.status === 'running' && Date.now() > dbDeadline - 18000)) break;
+        } catch (e) {}
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+
       const creds = databaseManager.getCredentials(provisioned.id);
       const alias = tpl.database.engine;
       dbContext = {
@@ -842,16 +853,225 @@ class CatalogManager extends EventEmitter {
     return { ...last, attempts: attempt, checkedAt: new Date().toISOString() };
   }
 
-  /** Vuelve a sondear un servicio ya instalado y actualiza su estado. */
+  /** Vuelve a sondear un servicio ya instalado y actualiza su estado (recuperando `degraded` -> `running`). */
   async refreshHealth(id) {
     const record = this.mustGet(id);
     const tpl = this.getTemplate(record.templateId);
     const probe = await this.probeOnce(record.hostPort, tpl.app.readiness);
     record.health = probe.healthy ? 'healthy' : 'unhealthy';
+    if (probe.healthy && record.status === 'degraded') {
+      record.status = 'running';
+      record.lastError = null;
+    }
     record.lastProbe = { ...probe, attempts: 1, checkedAt: new Date().toISOString() };
     record.updatedAt = new Date().toISOString();
     this.save();
     return this.toPublic(record);
+  }
+
+  /** Desencripta variables de entorno personalizadas guardadas por el usuario en la instalación. */
+  decryptCustomEnv(record) {
+    /** @type {Record<string, string>} */
+    const out = {};
+    for (const [k, blob] of Object.entries(record.customEnvEnc || {})) {
+      try { out[k] = decryptSecret(blob, this.cryptoKey); } catch (e) {}
+    }
+    return out;
+  }
+
+  /** Reconstruye el contexto completo de plantilla (incluyendo BD, secretos y sidecars) para recrear el contenedor app. */
+  buildRuntimeContext(record, tpl) {
+    const secrets = this.decryptSecrets(record);
+    /** @type {any} */
+    let dbContext = null;
+    if (tpl.database && record.databaseId) {
+      const dm = getDbManager();
+      const creds = dm.getCredentials(record.databaseId);
+      const alias = tpl.database.engine;
+      dbContext = {
+        host: alias,
+        port: creds.port,
+        user: creds.username,
+        password: creds.password,
+        name: creds.dbName || '',
+        url: dm.buildConnectionString(dm.get(record.databaseId), creds.password, { host: alias })
+      };
+    }
+    return {
+      installId: record.id,
+      domain: record.domain,
+      hostPort: record.hostPort,
+      url: record.url,
+      secrets,
+      db: dbContext,
+      sidecarHosts: Object.fromEntries((record.sidecars || []).map((c) => [c.name, c.containerName]))
+    };
+  }
+
+  /** Devuelve las variables efectivas (con secretos redactados) + claves editables personalizadas. */
+  getEnv(id) {
+    const record = this.mustGet(id);
+    const tpl = this.getTemplate(record.templateId);
+    const customEnv = this.decryptCustomEnv(record);
+    const templateKeys = Object.keys(tpl.app.env || {});
+    return {
+      id: record.id,
+      templateKeys,
+      customEnv,
+      customKeys: Object.keys(customEnv)
+    };
+  }
+
+  /**
+   * Recrea el contenedor principal de una instalación aplicando nueva imagen o variables de entorno,
+   * con rollback automático al estado anterior si el nuevo arranque falla.
+   * @param {any} record
+   * @param {{ imageOverride?: string | null }} [opts]
+   */
+  async recreateAppContainer(record, { imageOverride = null } = {}) {
+    const tpl = this.getTemplate(record.templateId);
+    const context = this.buildRuntimeContext(record, tpl);
+    const customEnv = this.decryptCustomEnv(record);
+    const effectiveEnv = { ...resolveEnv(tpl.app.env, context), ...customEnv };
+    const targetImage = imageOverride || record.image || tpl.app.image;
+
+    try { await this.docker(['stop', '-t', '20', record.containerName], { timeout: 60000 }); } catch (e) {}
+    try { await this.docker(['rm', '-f', record.containerName], { timeout: 30000 }); } catch (e) {}
+
+    const containerId = await this.runContainer({
+      containerName: record.containerName,
+      image: targetImage,
+      networkName: record.networkName,
+      networkAlias: 'app',
+      env: effectiveEnv,
+      volumes: (tpl.app.volumes || []).map((v) => `${record.volumes[v.name]}:${v.path}`),
+      files: this.materialiseFiles(record.id, 'app', tpl.app.files || []),
+      memoryMb: record.memoryMb,
+      cpus: record.cpus,
+      command: tpl.app.command || null,
+      publish: `127.0.0.1:${record.hostPort}:${tpl.app.port}`,
+      labels: { 'culkibo.service': record.id, 'culkibo.role': 'app' }
+    });
+    record.containerId = containerId;
+    record.image = targetImage;
+    record.status = 'running';
+    record.updatedAt = new Date().toISOString();
+    this.save();
+    return containerId;
+  }
+
+  /** Actualiza variables personalizadas del servicio y recrea el contenedor con seguridad. */
+  async updateEnv(id, overrides = {}) {
+    if (this.inFlight.has(id)) {
+      const err = new Error('El servicio se está instalando ahora mismo');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
+    const record = this.mustGet(id);
+    if (!overrides || typeof overrides !== 'object') {
+      throw new Error('Debes indicar un objeto de variables de entorno');
+    }
+    const prevCustom = { ...(record.customEnvEnc || {}) };
+    /** @type {Record<string, string>} */
+    const nextEnc = { ...prevCustom };
+    for (const [rawKey, rawVal] of Object.entries(overrides)) {
+      const k = String(rawKey || '').trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,120}$/.test(k)) {
+        throw new Error(`Nombre de variable inválido: «${k}»`);
+      }
+      if (rawVal === null || rawVal === undefined) {
+        delete nextEnc[k];
+      } else {
+        const val = String(rawVal);
+        if (/[\r\n\0]/.test(val)) throw new Error(`La variable ${k} no puede contener saltos de línea ni bytes nulos`);
+        nextEnc[k] = encryptSecret(val, this.cryptoKey);
+      }
+    }
+    record.customEnvEnc = nextEnc;
+    this.save();
+
+    if (await this.isDockerAvailable()) {
+      try {
+        await this.recreateAppContainer(record);
+      } catch (err) {
+        record.customEnvEnc = prevCustom;
+        this.save();
+        try { await this.recreateAppContainer(record); } catch (e2) {}
+        throw err;
+      }
+    }
+    return { success: true, service: this.toPublic(record), customKeys: Object.keys(record.customEnvEnc || {}) };
+  }
+
+  /** Actualiza la etiqueta fijada de imagen del contenedor con rollback automático si no pasa la sonda. */
+  async updateImage(id, newImage) {
+    if (this.inFlight.has(id)) {
+      const err = new Error('El servicio se está instalando ahora mismo');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
+    const record = this.mustGet(id);
+    const img = String(newImage || '').trim();
+    const { IMAGE_RE } = require('./catalog/templates');
+    if (!IMAGE_RE.test(img) || /:(latest|stable|main|master|edge|nightly)$/i.test(img)) {
+      throw new Error('La nueva imagen debe llevar una etiqueta de versión fija (no :latest ni etiquetas móviles)');
+    }
+    if (!(await this.isDockerAvailable())) {
+      throw new Error('Docker no está disponible');
+    }
+    const prevImage = record.image;
+    const tpl = this.getTemplate(record.templateId);
+
+    await this.pullImage(img);
+    try {
+      await this.recreateAppContainer(record, { imageOverride: img });
+      const probe = await this.waitUntilReady(record, { ...tpl.app.readiness, timeoutMs: Math.min(tpl.app.readiness.timeoutMs || 60000, 60000) });
+      if (!probe.healthy) {
+        throw new Error(`La nueva imagen no respondió en ${tpl.app.readiness.path} (${probe.detail})`);
+      }
+      record.health = 'healthy';
+      record.lastProbe = probe;
+      record.lastError = null;
+      this.save();
+      return { success: true, previousImage: prevImage, image: img, service: this.toPublic(record) };
+    } catch (err) {
+      // Rollback automático a la imagen anterior
+      record.image = prevImage;
+      this.save();
+      try { await this.recreateAppContainer(record, { imageOverride: prevImage }); } catch (e2) {}
+      throw new Error(`Actualización revertida a ${prevImage}: ${err.message}`);
+    }
+  }
+
+  /** Estadísticas en vivo (`docker stats --no-stream`) del contenedor principal y auxiliares. */
+  async getStats(id) {
+    const record = this.mustGet(id);
+    if (!(await this.isDockerAvailable())) {
+      return { id: record.id, available: false, containers: [] };
+    }
+    const names = this.allContainerNames(record);
+    try {
+      const { stdout } = await this.docker([
+        'stats', '--no-stream', '--format',
+        '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.PIDs}}',
+        ...names
+      ], { timeout: 15000 });
+      const containers = (stdout || '').trim().split(/\r?\n/).filter(Boolean).map((line) => {
+        const [name, cpu, memUsage, memPerc, netIo, pids] = line.split('|');
+        return {
+          name,
+          role: name === record.containerName ? 'app' : (record.sidecars.find((c) => c.containerName === name)?.name || 'sidecar'),
+          cpuPercent: parseFloat(String(cpu || '0').replace('%', '')) || 0,
+          memoryUsage: memUsage || '',
+          memoryPercent: parseFloat(String(memPerc || '0').replace('%', '')) || 0,
+          netIo: netIo || '',
+          pids: parseInt(String(pids || '0'), 10) || 0
+        };
+      });
+      return { id: record.id, available: true, containers };
+    } catch (e) {
+      return { id: record.id, available: false, containers: [], error: e.message };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -899,9 +1119,6 @@ class CatalogManager extends EventEmitter {
       throw err;
     }
     const record = this.mustGet(id);
-    if (record.domainId) {
-      try { await require('./caddyManager').removeRoute(record.id); } catch (e) {}
-    }
     await this.docker(['stop', record.containerName], { timeout: 90000 });
     for (const car of record.sidecars) {
       try { await this.docker(['stop', car.containerName], { timeout: 90000 }); } catch (e) {}
@@ -910,6 +1127,10 @@ class CatalogManager extends EventEmitter {
     record.health = 'unknown';
     record.updatedAt = new Date().toISOString();
     this.save();
+    // Reconciliar Caddy DESPUÉS de marcar `stopped`: ingressManager omite servicios detenidos y limpia su ruta correctamente.
+    if (record.domainId) {
+      try { await getIngressManager().reconcile(); } catch (e) {}
+    }
     return this.toPublic(record);
   }
 
@@ -918,26 +1139,49 @@ class CatalogManager extends EventEmitter {
     return this.start(id);
   }
 
-  async logs(id, { lines = 200 } = {}) {
+  /** Devuelve registros del contenedor principal o de un auxiliar (`role`), con secretos redactados. */
+  async logs(id, { lines = 200, role = 'app' } = {}) {
     const record = this.mustGet(id);
     const count = Math.max(1, Math.min(2000, parseInt(String(lines), 10) || 200));
+    let targetContainer = record.containerName;
+    if (role && role !== 'app') {
+      const sidecar = (record.sidecars || []).find((c) => c.name === role);
+      if (!sidecar) throw new Error(`Auxiliar «${role}» no encontrado en esta instalación`);
+      targetContainer = sidecar.containerName;
+    }
     const { stdout, stderr } = await this.docker(
-      ['logs', '--tail', String(count), record.containerName],
+      ['logs', '--tail', String(count), targetContainer],
       { timeout: 20000 }
     );
-    const secrets = this.decryptSecrets(record);
+    /** @type {Record<string, any>} */
+    const secrets = { ...this.decryptSecrets(record), ...this.decryptCustomEnv(record) };
     if (record.databaseId) {
       try {
         const dbCreds = getDbManager().getCredentials(record.databaseId);
         if (dbCreds && dbCreds.password) secrets.__db_password = dbCreds.password;
       } catch (e) {}
     }
-    // P1-1: sin truncado a 600 caracteres para que el operador reciba todas las líneas solicitadas.
     return {
       id: record.id,
-      containerName: record.containerName,
+      role: role || 'app',
+      containerName: targetContainer,
       output: this.redact(`${stdout}${stderr}`, secrets, null)
     };
+  }
+
+  /** Sincroniza el dominio/URL cuando un dominio vinculado se edita o elimina desde DomainManager. */
+  syncDomainRemoved(domainId) {
+    let changed = false;
+    for (const inst of this.state.installations) {
+      if (inst.domainId === domainId) {
+        inst.domainId = null;
+        inst.domain = null;
+        inst.url = `http://127.0.0.1:${inst.hostPort}`;
+        inst.updatedAt = new Date().toISOString();
+        changed = true;
+      }
+    }
+    if (changed) this.save();
   }
 
   /** Conecta o actualiza un dominio HTTPS sobre un servicio ya instalado (p. ej. WordPress). */

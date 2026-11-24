@@ -25,61 +25,85 @@ const wordpressMigrator = require('../services/wordpressMigrator');
 const universalImporter = require('../services/universalImporter');
 const metricsCollector = require('../services/metricsCollector');
 const systemDoctor = require('../services/systemDoctor');
-const { authorizeRequest, authStatus, tokenMatches, addAllowedOrigin, createWsTicket, rotateToken } = require('../middleware/auth');
+const auditLogger = require('../services/auditLogger');
+const cronManager = require('../services/cronManager');
+const previewManager = require('../services/previewManager');
+const webhookService = require('../services/webhookService');
+const {
+  authorizeRequest,
+  authStatus,
+  tokenMatches,
+  addAllowedOrigin,
+  createWsTicket,
+  rotateToken,
+  clientIp,
+  checkAuthBruteForce,
+  recordAuthFailure,
+  getBruteForceStats
+} = require('../middleware/auth');
+const { createRateLimiter: createSharedLimiter } = require('../services/rateLimiter');
 const { isPrivateIp, assertContainedPath } = require('../services/ssrfGuard');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
-// In-memory rate limiting (O(1) Fixed Window with LRU eviction — never clear() active bans)
-const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW_MS = 60000;
-const MAX_REQUESTS_PER_WINDOW = 500;
+const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.resolve(process.env.CULKIBO_DATA_DIR)
+  : path.resolve(__dirname, '..', '..');
+
 const IS_TEST_ENV = process.env.NODE_ENV === 'test';
-
-function createRateLimiter({ max = MAX_REQUESTS_PER_WINDOW, windowMs = RATE_LIMIT_WINDOW_MS, prefix = 'global', bypassLoopback = true } = {}) {
+function createRateLimiter({ max = 500, windowMs = 60000, prefix = 'global', bypassLoopback = true } = {}) {
+  const shared = createSharedLimiter({
+    max,
+    windowMs,
+    bypassLoopback,
+    label: prefix,
+    onLimit: () => metricsCollector.recordSecurityEvent('rateLimited429')
+  });
   return function rateLimiterMiddleware(req, res, next) {
     if (IS_TEST_ENV || process.env.NODE_ENV === 'test') return next();
-    const peer = req?.socket?.remoteAddress || '';
-    if (bypassLoopback && (peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1') && !req?.headers?.['x-forwarded-for']) {
-      return next();
-    }
-    const ip = (req && (req.ip || peer)) || 'unknown';
-    const now = Date.now();
-    if (rateLimitMap.size > 4000) {
-      let removed = 0;
-      for (const [k, v] of rateLimitMap) {
-        if (now > v.resetAt) { rateLimitMap.delete(k); removed++; }
-        if (removed >= 500) break;
-      }
-      if (rateLimitMap.size > 4000) {
-        const oldest = rateLimitMap.keys().next().value;
-        if (oldest) rateLimitMap.delete(oldest);
-      }
-    }
-    const key = `${prefix}:${ip}`;
-    let entry = rateLimitMap.get(key);
-    if (!entry || now > entry.resetAt) {
-      entry = { count: 0, resetAt: now + windowMs };
-      rateLimitMap.set(key, entry);
-    }
-    entry.count++;
-    if (entry.count > max) {
-      const retrySec = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
-      res.setHeader('Retry-After', String(retrySec));
-      return res.status(429).json({ error: 'Demasiadas peticiones. Por favor, inténtalo de nuevo en un minuto.' });
-    }
-    next();
+    return shared(req, res, next);
   };
 }
 
 const rateLimiter = createRateLimiter();
 const authVerifyLimiter = createRateLimiter({ max: 15, windowMs: 60000, prefix: 'auth', bypassLoopback: false });
 const authSessionLimiter = createRateLimiter({ max: 60, windowMs: 60000, prefix: 'auth_sess', bypassLoopback: true });
+const sensitiveAuthLimiter = createRateLimiter({ max: 10, windowMs: 60000, prefix: 'auth_sensitive', bypassLoopback: false });
+const wsTicketLimiter = createRateLimiter({ max: 30, windowMs: 60000, prefix: 'ws_ticket', bypassLoopback: true });
 const webhookLimiter = createRateLimiter({ max: 60, windowMs: 60000, prefix: 'webhook', bypassLoopback: true });
-const askLimiter = createRateLimiter({ max: 120, windowMs: 60000, prefix: 'ask', bypassLoopback: true });
+const askLimiter = createRateLimiter({ max: 120, windowMs: 60000, prefix: 'ask', bypassLoopback: false });
 const importLimiter = createRateLimiter({ max: 30, windowMs: 60000, prefix: 'import', bypassLoopback: true });
+const sqlImportLimiter = createRateLimiter({ max: 4, windowMs: 60000, prefix: 'wp_sql', bypassLoopback: false });
+const heavyOpLimiter = createRateLimiter({ max: 15, windowMs: 60000, prefix: 'heavy_op', bypassLoopback: true });
+const execLimiter = createRateLimiter({ max: 20, windowMs: 60000, prefix: 'runtime_exec', bypassLoopback: false });
+const certAndAdminLimiter = createRateLimiter({ max: 30, windowMs: 60000, prefix: 'admin_ops', bypassLoopback: true });
 const mcpLimiter = createRateLimiter({ max: 180, windowMs: 60000, prefix: 'mcp', bypassLoopback: true });
 
+// Auditoría automática de todas las mutaciones del plano de control y lecturas de secretos
+router.use((req, res, next) => {
+  const isMutation = req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS';
+  const isSecretRead = req.method === 'GET' && (/\/credentials$/.test(req.path) || /\/secrets$/.test(req.path));
+  if (!isMutation && !isSecretRead) return next();
+  const t0 = Date.now();
+  res.once('finish', () => {
+    try {
+      auditLogger.record({
+        source: 'http',
+        action: `${req.method} ${req.path}`,
+        method: req.method,
+        path: req.path,
+        ip: clientIp(req),
+        status: res.statusCode,
+        durationMs: Date.now() - t0
+      });
+    } catch (e) {}
+  });
+  next();
+});
+
 router.use('/projects', rateLimiter);
+router.use('/import/wordpress/import-sql', sqlImportLimiter);
 router.use('/import', importLimiter);
 router.use('/migrate', importLimiter);
 router.use('/databases', rateLimiter);
@@ -88,11 +112,20 @@ router.use('/docker', rateLimiter);
 router.use('/github', rateLimiter);
 router.use('/cloudflare', rateLimiter);
 router.use('/backup', rateLimiter);
+router.use('/ssl', certAndAdminLimiter);
+router.use('/system', certAndAdminLimiter);
+router.use('/notifications', certAndAdminLimiter);
+router.use('/watcher', certAndAdminLimiter);
+router.use('/pods', certAndAdminLimiter);
+router.use('/deploy/prune-cache', heavyOpLimiter);
 router.use('/mcp', mcpLimiter);
 router.use('/auth/verify', authVerifyLimiter);
+router.use('/auth/rotate', sensitiveAuthLimiter);
+router.use('/auth/ws-ticket', wsTicketLimiter);
 router.use('/auth/session', authSessionLimiter);
-router.use('/webhooks/github', webhookLimiter);
+router.use('/webhooks', webhookLimiter);
 router.use('/ingress/ask', askLimiter);
+router.use('/ingress', certAndAdminLimiter);
 
 let _cachedPublicIp = { at: 0, ip: /** @type {string | null} */ (null) };
 const _askLogThrottle = new Map();
@@ -187,19 +220,36 @@ router.delete('/projects/:id', async (req, res) => {
 
     try { await localRunner.stop(projectId, existing.localPort); } catch (e) {}
     try { liveSyncEngine.resetSession(projectId); } catch (e) {}
+    try { cronManager.forgetProject(projectId); } catch (e) {}
+    try { await previewManager.destroyProjectPreviews(projectId); } catch (e) {}
 
     const attached = domainManager.listByProject(projectId);
     if (attached.length > 0) {
       domainManager.detachByProject(projectId);
     }
+    const projectDbs = databaseManager.list ? databaseManager.list({ projectId }) : [];
     projectManager.delete(projectId);
     await projectManager.flushToDisk(projectId);
     try { deployManager.forget(projectId); } catch (e) {}
     try { githubService.forgetDeliveries(projectId); } catch (e) {}
+
+    // Limpiar directorio clonado bajo projects/<id> (nunca tocar un localPath externo del usuario)
+    try {
+      const clonedDir = path.join(ROOT_BASE_DIR, 'projects', projectId);
+      if (fs.existsSync(clonedDir) && typeof localRunner.cleanDirectory === 'function') {
+        localRunner.cleanDirectory(clonedDir);
+      }
+    } catch (e) {}
+
     const ingress = attached.length > 0
       ? await ingressManager.reconcile()
       : await ingressManager.removeProject(projectId);
-    res.json({ success: true, detachedDomains: attached.map(d => d.hostname), ingress });
+    res.json({
+      success: true,
+      detachedDomains: attached.map(d => d.hostname),
+      remainingDatabases: projectDbs.map(d => ({ id: d.id, name: d.name, engine: d.engine })),
+      ingress
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -333,9 +383,15 @@ router.get('/projects/:id/deploy/strategy', async (req, res) => {
     const project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
-    const path = require('path');
-    const fs = require('fs');
-    const contextDir = path.join(process.cwd(), 'projects', project.id);
+    const rootDir = (project.localPath && fs.existsSync(project.localPath))
+      ? project.localPath
+      : path.join(ROOT_BASE_DIR, 'projects', project.id);
+    let contextDir = rootDir;
+    if (project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
+      try {
+        contextDir = assertContainedPath(rootDir, String(project.baseDirectory).replace(/^\/+/, ''));
+      } catch (e) {}
+    }
     if (!fs.existsSync(contextDir)) {
       return res.json({
         available: false,
@@ -359,46 +415,42 @@ router.get('/projects/:id/deploy/strategy', async (req, res) => {
 });
 
 /**
- * Lanza un despliegue. Responde en cuanto arranca, no al terminar: una build
- * puede tardar minutos y dejar colgada una petición HTTP tanto tiempo es una
- * forma garantizada de que un proxy intermedio la corte. El progreso va por
- * WebSocket (`deploy_event` y el flujo de logs normal).
+ * Lanza un despliegue. Responde en cuanto arranca con `deploymentId` preasignado.
  */
-router.post('/projects/:id/deploy', async (req, res) => {
+router.post('/projects/:id/deploy', heavyOpLimiter, async (req, res) => {
   try {
     const project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    // Comprobación síncrona antes de devolver 202 para que un doble clic reciba 409 inmediato.
     if (deployManager.locks.has(project.id)) {
       return res.status(409).json({ error: 'Ya hay un despliegue en curso para este proyecto' });
     }
 
-    const options = {};
+    const deploymentId = `dep_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const options = { deploymentId };
     if (req.body && typeof req.body === 'object') {
-      // Lista blanca explícita: nada de volcar el cuerpo de la petición dentro
-      // de las opciones del desplegador.
-      for (const key of ['healthTimeoutMs', 'drainTimeoutMs', 'healthIntervalMs', 'buildTimeoutMs', 'memoryMb', 'keepReleases']) {
+      for (const key of ['healthTimeoutMs', 'drainTimeoutMs', 'healthIntervalMs', 'buildTimeoutMs', 'keepReleases']) {
         const value = Number(req.body[key]);
         if (Number.isFinite(value) && value > 0) options[key] = value;
       }
+      if (req.body.memoryMb != null) {
+        const mem = Math.round(Number(req.body.memoryMb));
+        if (Number.isFinite(mem) && mem >= 32 && mem <= 65536) options.memoryMb = mem;
+      }
       if (typeof req.body.version === 'string') options.version = req.body.version;
-      // Redesplegar un commit concreto (reintentar un despliegue viejo sin
-      // tocar la rama). Se valida aquí y se vuelve a validar en repoSync.
       if (typeof req.body.commit === 'string' && /^[0-9a-f]{7,40}$/i.test(req.body.commit.trim())) {
         options.commit = req.body.commit.trim();
       }
       if (req.body.gitSync === false) options.gitSync = false;
+      if (req.body.skipHooks === true) options.skipHooks = true;
     }
     options.trigger = 'manual';
 
     const started = deployManager.deploy(project, options);
-    // Se registra el fallo pero no se deja escapar: el resultado ya queda en el
-    // historial del despliegue y en el flujo de logs.
     started.catch(() => {});
 
-    projectManager.update(project.id, { lastDeployedAt: new Date().toISOString() });
     res.status(202).json({
       accepted: true,
+      deploymentId,
       message: 'Despliegue iniciado. Sigue el progreso en los logs en vivo.',
       projectId: project.id
     });
@@ -407,11 +459,25 @@ router.post('/projects/:id/deploy', async (req, res) => {
   }
 });
 
+router.post('/projects/:id/deploy/cancel', (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const result = deployManager.cancelDeploy(project.id, {
+      reason: (req.body && req.body.reason) || 'Cancelado desde el panel'
+    });
+    if (!result.cancelled) {
+      return res.status(result.status || 404).json(result);
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/projects/:id/deployments', (req, res) => {
   try {
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
-    // Se devuelven sin las líneas de log: el historial completo con logs de
-    // veinte builds es del orden de megabytes por petición.
     const history = deployManager.listDeployments(req.params.id, limit)
       .map(({ logLines, ...rest }) => ({ ...rest, logLineCount: (logLines || []).length }));
     res.json({ deployments: history });
@@ -438,13 +504,217 @@ router.get('/projects/:id/deploy/status', async (req, res) => {
   }
 });
 
-router.post('/projects/:id/rollback', async (req, res) => {
+router.post('/projects/:id/rollback', heavyOpLimiter, async (req, res) => {
   try {
-    const result = await deployManager.rollback(req.params.id);
+    const opts = {};
+    if (req.body && typeof req.body.deploymentId === 'string' && req.body.deploymentId.trim()) {
+      opts.deploymentId = req.body.deploymentId.trim();
+    }
+    const result = await deployManager.rollback(req.params.id, opts);
     const { logLines, ...rest } = result;
     res.json({ ...rest, logLines });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// --- LOGS, STATS Y EXEC SEGURO DEL CONTENEDOR DE PRODUCCIÓN ---
+router.get('/projects/:id/runtime/logs', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const result = await deployManager.getRuntimeLogs(project.id, {
+      tail: req.query.tail,
+      since: req.query.since || null,
+      timestamps: req.query.timestamps !== '0',
+      target: req.query.target === 'previous' ? 'previous' : 'current'
+    });
+    if (!result.ok && result.status) return res.status(result.status).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/projects/:id/runtime/logs/stream', (req, res) => {
+  const project = projectManager.getById(req.params.id);
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  try {
+    res.setTimeout(0);
+    const stream = deployManager.streamRuntimeLogs(project.id, {
+      tail: req.query.tail || 100,
+      target: req.query.target === 'previous' ? 'previous' : 'current',
+      onLine: (payload) => {
+        if (!res.writableEnded && !res.destroyed) {
+          res.write(`event: log\ndata: ${JSON.stringify(payload)}\n\n`);
+        }
+      },
+      onEnd: () => {
+        clearInterval(ka);
+        clearTimeout(maxLife);
+        if (!res.writableEnded && !res.destroyed) {
+          res.write(`event: end\ndata: {"ended":true}\n\n`);
+          res.end();
+        }
+      }
+    });
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+    res.write(`event: ready\ndata: ${JSON.stringify({ containerName: stream.containerName })}\n\n`);
+    const ka = setInterval(() => {
+      if (!res.writableEnded && !res.destroyed) res.write(': keepalive\n\n');
+    }, 15000);
+    if (ka.unref) ka.unref();
+    const maxLife = setTimeout(() => { stream.close(); }, 30 * 60 * 1000);
+    if (maxLife.unref) maxLife.unref();
+    const stopAll = () => {
+      clearInterval(ka);
+      clearTimeout(maxLife);
+      stream.close();
+    };
+    req.on('close', stopAll);
+    res.on('error', stopAll);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+router.get('/projects/:id/runtime/stats', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const result = await deployManager.getRuntimeStats(project.id);
+    if (!result.ok && result.status) return res.status(result.status).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/projects/:id/runtime/exec', execLimiter, async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const { command, workdir, timeoutMs } = req.body || {};
+    const result = await deployManager.execInContainer(project.id, { command, workdir, timeoutMs });
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+// --- TAREAS PROGRAMADAS CRON POR PROYECTO ---
+router.get('/projects/:id/crons', (req, res) => {
+  const project = projectManager.getById(req.params.id);
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  res.json({ jobs: cronManager.list(project.id) });
+});
+
+router.post('/projects/:id/crons', (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const job = cronManager.create(project.id, req.body || {});
+    res.status(201).json(job);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.put('/projects/:id/crons/:jobId', (req, res) => {
+  try {
+    const existing = cronManager.getById(req.params.jobId);
+    if (!existing || existing.projectId !== req.params.id) {
+      return res.status(404).json({ error: 'Tarea cron no encontrada' });
+    }
+    const updated = cronManager.update(req.params.jobId, req.body || {});
+    res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/projects/:id/crons/:jobId', (req, res) => {
+  const existing = cronManager.getById(req.params.jobId);
+  if (!existing || existing.projectId !== req.params.id) {
+    return res.status(404).json({ error: 'Tarea cron no encontrada' });
+  }
+  cronManager.remove(req.params.jobId);
+  res.json({ deleted: true, id: req.params.jobId });
+});
+
+router.post('/projects/:id/crons/:jobId/run', heavyOpLimiter, async (req, res) => {
+  try {
+    const existing = cronManager.getById(req.params.jobId);
+    if (!existing || existing.projectId !== req.params.id) {
+      return res.status(404).json({ error: 'Tarea cron no encontrada' });
+    }
+    const run = await cronManager.runNow(req.params.jobId, { trigger: 'manual' });
+    res.json({ run });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+router.get('/projects/:id/crons/:jobId/runs', (req, res) => {
+  const existing = cronManager.getById(req.params.jobId);
+  if (!existing || existing.projectId !== req.params.id) {
+    return res.status(404).json({ error: 'Tarea cron no encontrada' });
+  }
+  res.json({ runs: cronManager.getRuns(req.params.jobId) });
+});
+
+// --- VISTAS PREVIAS (PREVIEW DEPLOYMENTS POR RAMA / PR) ---
+router.get('/projects/:id/previews', (req, res) => {
+  const project = projectManager.getById(req.params.id);
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  res.json({
+    config: project.previewDeployments,
+    previews: previewManager.list(project.id)
+  });
+});
+
+router.post('/projects/:id/previews', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const { branch, prNumber, commit, title } = req.body || {};
+    if (!branch && !prNumber) {
+      return res.status(400).json({ error: 'Indica una rama (branch) o un número de PR (prNumber)' });
+    }
+    const preview = await previewManager.deployPreview(project, {
+      branch: branch || project.gitBranch || 'main',
+      prNumber: prNumber ?? null,
+      commit: commit || null,
+      title: title || null
+    });
+    res.status(201).json(preview);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+router.delete('/projects/:id/previews/:key', async (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const result = await previewManager.destroyPreview(project.id, req.params.key);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/projects/:id/previews/:key/logs', async (req, res) => {
+  try {
+    const result = await previewManager.getLogs(req.params.id, req.params.key, req.query.tail);
+    res.json(result);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
   }
 });
 
@@ -520,7 +790,7 @@ router.post('/import/coolify/migrate-domain', async (req, res) => {
     if (autoCloudflare && serverIp) {
       zoneId = await cloudflareService.findZoneForDomain(hostname);
       if (zoneId) {
-        dnsResult = await cloudflareService.createDnsRecord(zoneId, {
+        dnsResult = await cloudflareService.upsertDnsRecord(zoneId, {
           type: 'A',
           name: hostname,
           content: serverIp,
@@ -570,7 +840,7 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
         if (autoCloudflare && serverIp) {
            zoneId = await cloudflareService.findZoneForDomain(hostname);
            if (zoneId) {
-             dnsResult = await cloudflareService.createDnsRecord(zoneId, {
+             dnsResult = await cloudflareService.upsertDnsRecord(zoneId, {
                type: 'A',
                name: hostname,
                content: serverIp,
@@ -629,11 +899,46 @@ router.post('/import/wordpress/provision', async (req, res) => {
 
 router.post('/import/wordpress/import-sql', async (req, res) => {
   try {
+    req.setTimeout(0);
+    res.setTimeout(0);
     const { installationId, sqlContent, oldDomain, newDomain } = req.body || {};
     if (!installationId || !sqlContent) {
       return res.status(400).json({ error: 'Se requieren installationId y el contenido SQL' });
     }
     const result = await wordpressMigrator.importSqlDump({ installationId, sqlContent, oldDomain, newDomain });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Subida directa binaria (.sql o .sql.gz hasta 50 MB) sin inflar JSON ni congelar el navegador
+router.post('/import/wordpress/import-sql/upload', heavyOpLimiter, async (req, res) => {
+  req.setTimeout(0);
+  res.setTimeout(0);
+  const installationId = String(req.query.installationId || req.headers['x-installation-id'] || '').trim();
+  const oldDomain = String(req.query.oldDomain || '').trim();
+  const newDomain = String(req.query.newDomain || '').trim();
+  if (!installationId) {
+    return res.status(400).json({ error: 'Falta el parámetro installationId' });
+  }
+  const MAX_BYTES = 50 * 1024 * 1024;
+  /** @type {Buffer[]} */
+  const chunks = [];
+  let total = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      req.on('data', (c) => {
+        total += c.length;
+        if (total > MAX_BYTES) return reject(new Error('El archivo SQL supera el límite de 50 MB'));
+        chunks.push(c);
+      });
+      req.on('error', reject);
+      req.on('aborted', () => reject(new Error('Subida cancelada')));
+      req.on('end', () => resolve(undefined));
+    });
+    const sqlBuffer = Buffer.concat(chunks);
+    const result = await wordpressMigrator.importSqlDump({ installationId, sqlBuffer, oldDomain, newDomain });
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -741,14 +1046,18 @@ router.get('/system/status', (req, res) => {
     const proc = metricsCollector.sampleProcess();
     res.json({
       name: 'Culkibo',
+      status: 'operational',
       version: '1.0.0',
       tagline: 'Orquestador cloud autohospedado',
+      platform: process.platform,
+      arch: process.arch,
       nodeVersion: process.version,
       uptimeSeconds: proc.uptimeSeconds,
       memoryUsageMb: proc.memoryMb,
       heapUsedMb: proc.heapUsedMb,
       cpuPercent: proc.cpuPercent,
       panelDomain: ingressManager.panelDomain || null,
+      auth: authStatus(),
       capabilities: {
         liveSyncBinary: true,
         merkleVerify: true,
@@ -757,6 +1066,98 @@ router.get('/system/status', (req, res) => {
         dockerAvailable: dockerManager.cachedStatus ? Boolean(dockerManager.cachedStatus.available) : null
       }
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/system/audit', (req, res) => {
+  try {
+    const events = auditLogger.query({
+      limit: req.query.limit ? parseInt(String(req.query.limit), 10) : 50,
+      source: req.query.source ? String(req.query.source) : '',
+      action: req.query.action ? String(req.query.action) : ''
+    });
+    res.json({ events });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+let _healthSummaryCache = { at: 0, data: /** @type {any} */ (null) };
+router.get('/system/health-summary', (req, res) => {
+  try {
+    const now = Date.now();
+    if (!req.query.fresh && _healthSummaryCache.data && (now - _healthSummaryCache.at) < 5000) {
+      return res.json(_healthSummaryCache.data);
+    }
+    const snap = metricsCollector.getSnapshot(false);
+    const disk = systemDoctor.checkDiskSpace();
+    const permCheck = systemDoctor.checkKeyFilePermissions();
+    const auth = authStatus();
+    const bf = getBruteForceStats();
+    const dbs = databaseManager.list ? databaseManager.list() : [];
+    const exposedDbs = dbs.filter((d) => d.exposure && d.exposure.enabled && d.exposure.bindAddress !== '127.0.0.1').length;
+    const failedBackups = dbs.filter((d) => d.schedule && d.schedule.lastStatus === 'error').length;
+    const certs = sslManager.listCertificates ? sslManager.listCertificates() : [];
+    const lastTlsAudit = /** @type {any} */ (ingressManager).lastTlsAudit || null;
+    const tlsExpiringSoon = certs.filter((c) => c.isExpired || c.isExpiringSoon).length
+      + (lastTlsAudit ? ((lastTlsAudit.expiring?.length || 0) + (lastTlsAudit.expired?.length || 0)) : 0);
+
+    const hostTotalMb = Math.round(os.totalmem() / 1024 / 1024);
+    const hostFreeMb = Math.round(os.freemem() / 1024 / 1024);
+    const hostMemUsedPct = hostTotalMb > 0 ? Math.round(((hostTotalMb - hostFreeMb) / hostTotalMb) * 100) : 0;
+
+    /** @type {{ lastWatchdogAt: string | null, activeWsClients: number, activeSyncClients: number, activeSseClients: number }} */
+    let runtimeMeta = { lastWatchdogAt: null, activeWsClients: 0, activeSyncClients: 0, activeSseClients: 0 };
+    try {
+      const idx = require('../index');
+      if (idx && typeof idx.getRuntimeMeta === 'function') runtimeMeta = idx.getRuntimeMeta();
+    } catch (e) {}
+
+    const summary = {
+      status: (disk.status === 'fail' || failedBackups > 0) ? 'degraded' : 'healthy',
+      timestamp: new Date(now).toISOString(),
+      version: '1.0.0',
+      uptimeSeconds: snap.uptimeSeconds,
+      resources: {
+        cpuPercent: snap.process.cpuPercent,
+        rssMb: snap.process.memoryMb,
+        hostMemUsedPct,
+        diskFreeGb: disk.metrics?.freeGb ?? null,
+        diskUsedPct: disk.metrics?.usedPct ?? null,
+        eventLoopLagP95Ms: snap.eventLoop.p95Ms ?? 0
+      },
+      security: {
+        bindHost: process.env.CULKIBO_BIND || process.env.HOST || process.env.CULKIBO_HOST || '127.0.0.1',
+        requireTokenAlways: auth.requireTokenAlways,
+        tokenSource: auth.tokenSource,
+        tokenRotatedAt: auth.tokenRotatedAt || null,
+        activeBruteForceBlocks: bf.activeBlocks,
+        authFailuresTotal: snap.security?.authFailures || 0,
+        rateLimitedTotal: snap.security?.rateLimited429 || 0,
+        originRejectedTotal: snap.security?.originRejected403 || 0,
+        exposedDatabases: exposedDbs,
+        keyFilePermissionsOk: permCheck.ok,
+        activeClients: {
+          ws: runtimeMeta.activeWsClients,
+          sync: runtimeMeta.activeSyncClients,
+          sse: runtimeMeta.activeSseClients
+        }
+      },
+      resilience: {
+        caddyAvailable: caddyManager.lastDetection ? Boolean(caddyManager.lastDetection.available) : null,
+        dockerAvailable: dockerManager.cachedStatus ? Boolean(dockerManager.cachedStatus.available) : null,
+        lastWatchdogAt: runtimeMeta.lastWatchdogAt,
+        tlsExpiringSoon,
+        failedBackups,
+        cronJobsEnabled: cronManager.list().filter((j) => j.enabled).length,
+        activePreviews: previewManager.list().filter((p) => p.status === 'active').length
+      },
+      recentAudit: auditLogger.query({ limit: 15 })
+    };
+    _healthSummaryCache = { at: now, data: summary };
+    res.json(summary);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -906,6 +1307,9 @@ router.delete('/domains/:id', async (req, res) => {
     const removed = await domainManager.deleteDomain(req.params.id);
     if (removed.projectId) {
       syncProjectDomainsList(removed.projectId, removed.hostname, 'remove');
+    }
+    if (typeof catalogManager.syncDomainRemoved === 'function') {
+      catalogManager.syncDomainRemoved(req.params.id);
     }
     const ingress = await ingressManager.reconcile();
     res.json({ success: true, removed, ingress });
@@ -1191,6 +1595,12 @@ router.post('/ssl/certificates/upload', async (req, res) => {
   try {
     const result = sslManager.uploadCustomCertificate(req.body || {});
     const ingress = await ingressManager.reconcile();
+    notificationService.notify({
+      event: 'ssl_issued',
+      level: 'success',
+      title: 'Certificado TLS instalado',
+      message: `Se instaló un certificado personalizado para ${result.cert?.domain || 'el dominio'} y se reconcilió Caddy.`
+    }).catch(() => {});
     res.status(201).json({ ...result, ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1295,6 +1705,59 @@ router.post('/cloudflare/tunnels', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/cloudflare/tunnels/:tunnelId/token', async (req, res) => {
+  try {
+    const result = await cloudflareService.getTunnelToken(req.params.tunnelId);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/cloudflare/tunnels/:tunnelId/config', async (req, res) => {
+  try {
+    const result = await cloudflareService.getTunnelConfig(req.params.tunnelId);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/cloudflare/tunnels/:tunnelId/route', async (req, res) => {
+  try {
+    const { hostname, serviceUrl, zoneId } = req.body || {};
+    const result = await cloudflareService.routeHostnameToTunnel({
+      tunnelId: req.params.tunnelId,
+      zoneId: zoneId || null,
+      hostname,
+      serviceUrl
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/cloudflare/tunnels/:tunnelId', async (req, res) => {
+  try {
+    const result = await cloudflareService.deleteTunnel(req.params.tunnelId);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/cloudflare/tunnels/connector/start', heavyOpLimiter, async (req, res) => {
+  try {
+    const { tunnelToken, containerName } = req.body || {};
+    const result = await cloudflareService.startCloudflaredDocker({ tunnelToken, containerName });
+    if (!result.started) return res.status(502).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -1454,7 +1917,9 @@ router.get('/docker/containers/:id/logs', async (req, res) => {
 // --- DATABASE & PROJECT BACKUP/RESTORE ---
 router.post('/backup/export/:projectId', async (req, res) => {
   try {
-    const result = await dbBackupManager.exportProject(req.params.projectId);
+    const result = await dbBackupManager.exportProject(req.params.projectId, {
+      includeSecrets: Boolean(req.body && req.body.includeSecrets)
+    });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1469,6 +1934,59 @@ router.post('/backup/restore', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/backup/instance/export', heavyOpLimiter, async (req, res) => {
+  try {
+    req.setTimeout(0);
+    res.setTimeout(0);
+    const { includeSecrets = false, passphrase = '', uploadToS3 = false } = req.body || {};
+    const result = await dbBackupManager.exportInstanceSnapshot({
+      includeSecrets: Boolean(includeSecrets),
+      passphrase: passphrase ? String(passphrase) : '',
+      uploadToS3: Boolean(uploadToS3)
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/backup/instance/import', heavyOpLimiter, async (req, res) => {
+  try {
+    req.setTimeout(0);
+    res.setTimeout(0);
+    const { snapshot = null, fileName = null, passphrase = '', dryRun = false, mode = 'merge' } = req.body || {};
+    const result = await dbBackupManager.importInstanceSnapshot({
+      snapshot,
+      fileName,
+      passphrase: passphrase ? String(passphrase) : '',
+      dryRun: Boolean(dryRun),
+      mode: (mode === 'replace' || mode === 'overwrite') ? 'overwrite' : 'merge'
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/backup/download/:fileName', (req, res) => {
+  try {
+    req.setTimeout(0);
+    res.setTimeout(0);
+    const filePath = dbBackupManager.resolveDownloadPath(req.params.fileName);
+    const stat = fs.statSync(filePath);
+    const safeName = path.basename(filePath).replace(/["\r\n]/g, '_');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', String(stat.size));
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    const rs = fs.createReadStream(filePath);
+    rs.on('error', () => { if (!res.headersSent) res.status(500).end(); else res.end(); });
+    rs.pipe(res);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
   }
 });
 
@@ -1532,6 +2050,16 @@ router.put('/databases/storage', (req, res) => {
 router.post('/databases/storage/test', async (req, res) => {
   try {
     res.json(await databaseManager.testS3());
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/databases/storage/objects', async (req, res) => {
+  try {
+    const prefix = req.query.prefix !== undefined ? String(req.query.prefix) : null;
+    const maxKeys = Math.min(500, Math.max(1, parseInt(String(req.query.maxKeys || '200'), 10) || 200));
+    res.json(await databaseManager.listRemoteObjects({ prefix, maxKeys }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -1642,23 +2170,138 @@ router.get('/databases/:id/backups', (req, res) => {
   }
 });
 
-router.post('/databases/:id/backups', async (req, res) => {
+router.post('/databases/:id/backups', heavyOpLimiter, async (req, res) => {
   try {
+    req.setTimeout(0);
+    res.setTimeout(0);
     res.json(await databaseManager.runBackup(req.params.id, { trigger: 'manual' }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-router.post('/databases/:id/restore', async (req, res) => {
+router.post('/databases/:id/inspect', async (req, res) => {
   try {
-    const { backupId, remoteKey } = req.body || {};
+    res.json(await databaseManager.inspectDatabase(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/recover', heavyOpLimiter, async (req, res) => {
+  try {
+    res.json(await databaseManager.recoverContainer(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/databases/:id/backups/:backupId/download', async (req, res) => {
+  try {
+    req.setTimeout(0);
+    res.setTimeout(0);
+    const { filePath, fileName, sizeBytes } = await databaseManager.getBackupFilePath(req.params.id, req.params.backupId);
+    const safeName = path.basename(fileName).replace(/["\r\n]/g, '_');
+    res.setHeader('Content-Type', 'application/gzip');
+    res.setHeader('Content-Length', String(sizeBytes));
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    const rs = fs.createReadStream(filePath);
+    rs.on('error', () => { if (!res.headersSent) res.status(500).end(); else res.end(); });
+    rs.pipe(res);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.delete('/databases/:id/backups/:backupId', async (req, res) => {
+  try {
+    const deleteRemote = req.query.deleteRemote === 'true' || req.query.deleteRemote === '1';
+    res.json(await databaseManager.deleteBackup(req.params.id, req.params.backupId, { deleteRemote }));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/databases/:id/backups/upload', heavyOpLimiter, async (req, res) => {
+  req.setTimeout(0);
+  res.setTimeout(0);
+  const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
+  const fileName = String(req.headers['x-backup-filename'] || req.query.fileName || 'uploaded.sql.gz');
+  const tmpDir = path.join(process.env.CULKIBO_DATA_DIR ? path.resolve(process.env.CULKIBO_DATA_DIR) : path.resolve(__dirname, '..', '..'), 'data', '.tmp');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const tempPath = path.join(tmpDir, `db_upload_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.bin`);
+
+  let totalBytes = 0;
+  let aborted = false;
+  const hash = crypto.createHash('sha256');
+  const ws = fs.createWriteStream(tempPath, { mode: 0o600 });
+
+  const cleanupTemp = () => {
+    try { ws.destroy(); } catch (e) {}
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
+  };
+
+  try {
+    await new Promise((resolve, reject) => {
+      req.on('data', (chunk) => {
+        if (aborted) return;
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_UPLOAD_BYTES) {
+          aborted = true;
+          reject(new Error('El archivo supera el límite máximo de 2 GiB'));
+          return;
+        }
+        hash.update(chunk);
+        if (!ws.write(chunk)) {
+          req.pause();
+          ws.once('drain', () => req.resume());
+        }
+      });
+      req.on('error', (err) => reject(err));
+      req.on('aborted', () => reject(new Error('Subida cancelada por el cliente')));
+      ws.on('error', (err) => reject(err));
+      req.on('end', () => {
+        ws.end(() => resolve(undefined));
+      });
+    });
+
+    const entry = await databaseManager.registerUploadedBackup(req.params.id, {
+      fileName,
+      tempPath,
+      sha256: hash.digest('hex'),
+      sizeBytes: totalBytes
+    });
+
+    if (req.query.restore === '1' || req.query.restore === 'true') {
+      const restored = await databaseManager.restore(req.params.id, {
+        backupId: entry.id,
+        createSafetySnapshot: req.query.safety !== '0'
+      });
+      return res.status(201).json({ success: true, backup: entry, restored });
+    }
+    res.status(201).json({ success: true, backup: entry });
+  } catch (err) {
+    cleanupTemp();
+    res.status(400).json({ error: err.message, safetyBackupId: err.safetyBackupId || null });
+  }
+});
+
+router.post('/databases/:id/restore', heavyOpLimiter, async (req, res) => {
+  try {
+    req.setTimeout(0);
+    res.setTimeout(0);
+    const { backupId, remoteKey, createSafetySnapshot } = req.body || {};
     if (!backupId && !remoteKey) {
       return res.status(400).json({ error: 'Indique backupId o remoteKey' });
     }
-    res.json(await databaseManager.restore(req.params.id, { backupId, remoteKey }));
+    res.json(await databaseManager.restore(req.params.id, {
+      backupId,
+      remoteKey,
+      createSafetySnapshot: createSafetySnapshot !== false
+    }));
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message, safetyBackupId: err.safetyBackupId || null });
   }
 });
 
@@ -1673,8 +2316,8 @@ router.put('/databases/:id/schedule', (req, res) => {
 
 router.put('/databases/:id/retention', (req, res) => {
   try {
-    const { daily, weekly } = req.body || {};
-    res.json(databaseManager.setRetention(req.params.id, { daily, weekly }));
+    const { hourly, daily, weekly } = req.body || {};
+    res.json(databaseManager.setRetention(req.params.id, { hourly, daily, weekly }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -1704,7 +2347,10 @@ router.post('/databases/:id/retention/apply', async (req, res) => {
 // revela si un dominio está configurado, que es información que cualquiera
 // puede deducir resolviendo el DNS.
 router.get('/ingress/ask', (req, res) => {
-  // Sólo Caddy (en loopback o red privada Docker bridge) puede consultar este endpoint.
+  // P0: Caddy habla directamente con Culkibo sin cabeceras proxy; rechazar peticiones reenviadas desde internet
+  if ((req.headers['x-forwarded-for'] || req.headers.forwarded) && process.env.NODE_ENV !== 'test') {
+    return res.status(403).type('text/plain').send('acceso restringido al plano de datos local');
+  }
   const remoteIp = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
   const isLocalOrPrivate = remoteIp === '127.0.0.1' || remoteIp === '::1' || isPrivateIp(remoteIp);
   if (!isLocalOrPrivate && process.env.NODE_ENV !== 'test') {
@@ -1723,10 +2369,11 @@ router.get('/ingress/ask', (req, res) => {
   if (!ingressManager.isHostnameAuthorizedForTls(domain)) {
     return res.status(403).type('text/plain').send(`dominio no configurado en Culkibo: ${domain}`);
   }
-  const route = domainManager.resolveRoute(domain);
-  if (route && route.status === 'disabled') {
+  const exactMatch = domainManager.getByHostname(domain);
+  if (exactMatch && exactMatch.status === 'disabled') {
     return res.status(403).type('text/plain').send(`dominio deshabilitado: ${domain}`);
   }
+  const route = domainManager.resolveRoute(domain);
 
   const now = Date.now();
   const lastLog = _askLogThrottle.get(domain) || 0;
@@ -1736,6 +2383,16 @@ router.get('/ingress/ask', (req, res) => {
     containerOrchestrator.addLog('INFO', 'edge', `[Edge:TLS] Certificado autorizado para ${domain} (regla: ${route ? route.hostname : 'panel/redirección/wildcard'})`);
   }
   return res.status(200).type('text/plain').send('ok');
+});
+
+router.post('/ingress/tls-audit', async (req, res) => {
+  try {
+    const warnDays = Math.min(90, Math.max(1, Number(req.body?.warnDays) || 14));
+    const audit = await ingressManager.checkCertificateExpiry({ warnDays, probeLive: req.body?.probeLive !== false });
+    res.json(audit);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Estado honesto del ingress.
@@ -2030,39 +2687,65 @@ router.post('/webhooks/github', async (req, res) => {
 
     const project = matchedProjects[0] || null;
 
-    // Verificación HMAC SHA-256 (acepta coincidencia con cualquiera de los proyectos vinculados o secreto global)
-    const secretsToCheck = Array.from(new Set(
-      [...matchedProjects.map(p => p?.webhookSecret), process.env.GITHUB_WEBHOOK_SECRET].filter(Boolean)
-    ));
-    if (secretsToCheck.length > 0) {
-      const anyValid = secretsToCheck.some(s => verifyHmac(s).ok);
-      if (!anyValid) {
-        const firstErr = verifyHmac(secretsToCheck[0]).error;
+    // Verificación HMAC SHA-256 estricta POR PROYECTO (evita que en un monorepo un hermano
+    // con otro secreto autorice el despliegue de un proyecto diferente).
+    const globalSecret = process.env.GITHUB_WEBHOOK_SECRET || null;
+    const globalValid = Boolean(globalSecret && verifyHmac(globalSecret).ok);
+    const hasAnySecret = Boolean(globalSecret) || matchedProjects.some((p) => Boolean(p?.webhookSecret));
+
+    if (hasAnySecret) {
+      matchedProjects = matchedProjects.filter((p) => {
+        if (p?.webhookSecret) return verifyHmac(p.webhookSecret).ok;
+        return globalValid;
+      });
+      if (matchedProjects.length === 0) {
+        const firstSecret = globalSecret || project?.webhookSecret || '';
+        const firstErr = firstSecret ? verifyHmac(firstSecret).error : 'Firma de webhook inválida';
         return res.status(401).json({ error: firstErr });
       }
     }
 
+    const authorizedProject = matchedProjects[0] || null;
+
     // Handle Ping event
     if (event === 'ping') {
-      if (project) {
-        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Conexión de webhook verificada con éxito para ${project.name}`, new Date(), project.id);
+      if (authorizedProject) {
+        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Conexión de webhook verificada con éxito para ${authorizedProject.name}`, new Date(), authorizedProject.id);
       }
       return res.json({
         success: true,
         message: 'Pong! Webhook de GitHub verificado correctamente.',
         zen: bodyData?.zen,
         hookId: bodyData?.hook_id,
-        projectId: project?.id || null
+        projectId: authorizedProject?.id || null
       });
+    }
+
+    // Handle Pull Request event -> Preview Deployments (con puerta anti-forks)
+    if (event === 'pull_request' && bodyData?.pull_request) {
+      if (!authorizedProject) {
+        return res.status(404).json({ error: 'No se encontró un proyecto asociado a este repositorio' });
+      }
+      const pr = bodyData.pull_request;
+      const isFork = Boolean(pr.head?.repo?.full_name && pr.base?.repo?.full_name && pr.head.repo.full_name !== pr.base.repo.full_name);
+      const out = await webhookService.dispatchPullRequest({
+        provider: 'github',
+        projects: matchedProjects,
+        action: String(bodyData.action || ''),
+        prNumber: pr.number,
+        branch: pr.head?.ref || '',
+        commitSha: pr.head?.sha || null,
+        isFork
+      });
+      return res.status(out.status).json(out.body);
     }
 
     // Handle Push event
     if (event === 'push') {
-      if (!project) {
+      if (!authorizedProject) {
         return res.status(404).json({ error: 'No se encontró un proyecto asociado a este repositorio' });
       }
 
-      // P1-28: ignorar eliminaciones de rama o eventos sin ref válido
       if (bodyData?.deleted === true || bodyData?.after === '0000000000000000000000000000000000000000') {
         return res.json({ success: true, deployed: false, reason: 'Eliminación de rama ignorada' });
       }
@@ -2074,148 +2757,71 @@ router.post('/webhooks/github', async (req, res) => {
         return res.json({ success: true, deployed: false, reason: 'Push sin rama (ref vacío) ignorado' });
       }
 
-      const branchProjects = matchedProjects.filter(p => (p.gitBranch || 'main') === pushedBranch);
-      if (branchProjects.length === 0) {
-        const configuredBranch = project.gitBranch || 'main';
-        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push ignorado en rama '${pushedBranch}'. El proyecto '${project.name}' está configurado para la rama '${configuredBranch}'.`, new Date(), project.id);
-        return res.json({
-          success: true,
-          deployed: false,
-          reason: `Rama '${pushedBranch}' no coincide con la rama configurada '${configuredBranch}'`
-        });
-      }
+      const commits = Array.isArray(bodyData?.commits) ? bodyData.commits : [];
+      const changedFiles = commits.flatMap((c) => [...(c?.added || []), ...(c?.modified || []), ...(c?.removed || [])]);
 
-      const eligibleProjects = branchProjects.filter(p => p.autoDeploy !== false);
-      if (eligibleProjects.length === 0) {
-        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push recibido pero el auto-despliegue está deshabilitado para '${branchProjects[0].name}'.`, new Date(), branchProjects[0].id);
-        return res.json({
-          success: true,
-          deployed: false,
-          reason: 'Auto-despliegue deshabilitado para este proyecto'
-        });
-      }
-
-      const commitSha = bodyData?.after || bodyData?.head_commit?.id || `c_${Date.now().toString(36)}`;
-      const shortSha = commitSha.substring(0, 7);
-      const commitMsg = bodyData?.head_commit?.message || 'Push automático desde GitHub';
-      const author = bodyData?.head_commit?.author?.name || bodyData?.pusher?.name || 'GitHub';
-      const now = new Date().toISOString();
-      const dockerProbe = await deployManager.detectDocker();
-
-      /** @type {any[]} */
-      const dispatched = [];
-      let allDuplicates = true;
-      /** @type {string | null} */
-      let lastDupReason = null;
-
-      for (const target of eligibleProjects) {
-        const repoName = payloadRepo?.full_name || target.gitRepo || target.name;
-        const claim = githubService.claimDelivery(target.id, {
-          deliveryId: req.headers['x-github-delivery'] || null,
-          commitSha
-        });
-        if (!claim.fresh) {
-          lastDupReason = claim.reason;
-          containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] ${claim.reason} (${shortSha}); no se relanza el despliegue.`, new Date(), target.id);
-          continue;
-        }
-        allDuplicates = false;
-
-        containerOrchestrator.addLog('INFO', 'citadel', `[GitHub:Webhook] Push recibido en ${repoName} (${pushedBranch}) por ${author}: "${commitMsg.trim()}" (${shortSha})`, new Date(), target.id);
-        containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Iniciando despliegue automatizado para ${target.name}...`, new Date(), target.id);
-
-        /** @type {{ dispatched: boolean, queued: boolean, reason: string | null }} */
-        let pipeline = { dispatched: false, queued: false, reason: null };
-        if (!target.gitRepo) {
-          pipeline.reason = 'El proyecto no tiene repositorio configurado';
-        } else if (!dockerProbe.available) {
-          pipeline.reason = dockerProbe.reason;
-        } else {
-          try {
-            const started = deployManager.enqueue(target, {
-              commit: /^[0-9a-f]{7,40}$/i.test(commitSha) ? commitSha : null,
-              version: `gh-${shortSha}`,
-              trigger: 'webhook'
-            });
-            pipeline = { dispatched: started.started, queued: started.queued, reason: null };
-          } catch (err) {
-            pipeline.reason = err.message;
-          }
-        }
-
-        if (pipeline.reason) {
-          containerOrchestrator.addLog('WARN', 'citadel', `[Citadel:Deploy] No se lanza la construcción de imagen: ${pipeline.reason}.`, new Date(), target.id);
-        } else if (pipeline.queued) {
-          containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Ya hay un despliegue en curso; ${shortSha} queda en cola y se construirá al terminar.`, new Date(), target.id);
-        }
-
-        const lastCommit = {
-          sha: shortSha,
-          message: commitMsg.trim(),
-          author,
-          timestamp: now
-        };
-        projectManager.update(target.id, {
-          lastDeployedAt: now,
-          lastCommit
-        });
-
-        containerOrchestrator.emit('github_deploy', {
-          projectId: target.id,
-          projectName: target.name,
-          branch: pushedBranch,
-          commit: shortSha,
-          author,
-          message: commitMsg.trim(),
-          timestamp: now
-        });
-
-        containerOrchestrator.addLog(
-          'SUCCESS',
-          'citadel',
-          pipeline.dispatched || pipeline.queued
-            ? `[GitHub:Webhook] Despliegue en curso para ${target.name} (${shortSha}); sigue el progreso en la pestaña Despliegues.`
-            : `[GitHub:Webhook] Despliegue completado para ${target.name} (${shortSha})`,
-          new Date(),
-          target.id
-        );
-
-        dispatched.push({
-          projectId: target.id,
-          pipeline: pipeline.dispatched ? 'building' : pipeline.queued ? 'queued' : 'registro',
-          pipelineReason: pipeline.reason
-        });
-      }
-
-      if (allDuplicates) {
-        return res.json({
-          success: true,
-          deployed: false,
-          duplicate: true,
-          projectId: eligibleProjects[0].id,
-          commit: shortSha,
-          reason: lastDupReason || 'Entrega duplicada'
-        });
-      }
-
-      const primary = dispatched[0];
-      return res.json({
-        success: true,
-        deployed: true,
-        projectId: primary.projectId,
-        matchedProjects: dispatched.length,
-        dispatched,
+      const out = await webhookService.dispatchPush({
+        provider: 'github',
+        projects: matchedProjects,
         branch: pushedBranch,
-        commit: shortSha,
-        deployedAt: now,
-        pipeline: primary.pipeline,
-        pipelineReason: primary.pipelineReason
+        commitSha: bodyData?.after || bodyData?.head_commit?.id || `c_${Date.now().toString(36)}`,
+        commitMsg: bodyData?.head_commit?.message || 'Push automático desde GitHub',
+        author: bodyData?.head_commit?.author?.name || bodyData?.pusher?.name || 'GitHub',
+        deliveryId: req.headers['x-github-delivery'] || null,
+        changedFiles
       });
+      return res.status(out.status).json(out.body);
     }
 
     res.json({ success: true, message: `Evento ${event} recibido sin acción requerida.` });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// --- MULTI-GIT WEBHOOKS (GITLAB, GITEA/FORGEJO, BITBUCKET) & CI/CD DEPLOY HOOK ---
+router.post('/webhooks/gitlab', async (req, res) => {
+  try {
+    const out = await webhookService.handleGitLabWebhook(req);
+    res.status(out.status).json(out.body);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/webhooks/gitea', async (req, res) => {
+  try {
+    const out = await webhookService.handleGiteaWebhook(req);
+    res.status(out.status).json(out.body);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/webhooks/bitbucket', async (req, res) => {
+  try {
+    const out = await webhookService.handleBitbucketWebhook(req);
+    res.status(out.status).json(out.body);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/webhooks/deploy/:projectId', heavyOpLimiter, async (req, res) => {
+  try {
+    const out = await webhookService.handleDeployHook(req);
+    res.status(out.status).json(out.body);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/projects/:id/deploy-hook/rotate', async (req, res) => {
+  try {
+    const result = await webhookService.rotateDeployHookToken(req.params.id);
+    res.json(result);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
   }
 });
 
@@ -2299,10 +2905,48 @@ router.get('/catalog/installations/:id/secrets', (req, res) => {
 router.get('/catalog/installations/:id/logs', async (req, res) => {
   try {
     const lines = Math.min(2000, Math.max(10, parseInt(String(req.query.lines || '200'), 10) || 200));
-    const output = await catalogManager.logs(req.params.id, { lines });
+    const role = req.query.role ? String(req.query.role) : 'app';
+    const output = await catalogManager.logs(req.params.id, { lines, role });
     res.json(typeof output === 'string' ? { output } : output);
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/catalog/installations/:id/env', (req, res) => {
+  try {
+    res.json(catalogManager.getEnv(req.params.id));
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+router.put('/catalog/installations/:id/env', heavyOpLimiter, async (req, res) => {
+  try {
+    const overrides = (req.body && (req.body.env || req.body.overrides || req.body)) || {};
+    res.json(await catalogManager.updateEnv(req.params.id, overrides));
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+router.get('/catalog/installations/:id/stats', async (req, res) => {
+  try {
+    res.json(await catalogManager.getStats(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/catalog/installations/:id/update', heavyOpLimiter, async (req, res) => {
+  try {
+    req.setTimeout(0);
+    res.setTimeout(0);
+    const image = req.body && req.body.image;
+    if (!image) return res.status(400).json({ error: 'Indica la nueva imagen fijada (p. ej. imagen:1.2.3)' });
+    res.json(await catalogManager.updateImage(req.params.id, image));
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
   }
 });
 
@@ -2371,8 +3015,16 @@ router.get('/auth/session', (req, res) => {
 });
 
 router.post('/auth/verify', (req, res) => {
+  const bf = checkAuthBruteForce(req);
+  if (bf.blocked) {
+    metricsCollector.recordSecurityEvent('authBlocked429');
+    res.setHeader('Retry-After', String(bf.retryAfterSec));
+    return res.status(429).json({ valid: false, error: 'Demasiados intentos de autenticación fallidos.' });
+  }
   const token = (req.body && req.body.token) || '';
   if (!tokenMatches(token)) {
+    recordAuthFailure(req);
+    metricsCollector.recordSecurityEvent('authFailures');
     return res.status(401).json({ valid: false, error: 'Token inválido' });
   }
   res.json({ valid: true });
@@ -2386,9 +3038,18 @@ router.post('/auth/ws-ticket', (req, res) => {
   }
 });
 
-router.post('/auth/rotate', (_req, res) => {
+router.post('/auth/rotate', (req, res) => {
   try {
-    res.json(rotateToken());
+    const rotated = rotateToken();
+    auditLogger.record({
+      source: 'auth',
+      action: 'auth.token_rotated',
+      method: 'POST',
+      path: '/api/auth/rotate',
+      ip: clientIp(req),
+      status: 200
+    });
+    res.json(rotated);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2439,16 +3100,61 @@ router.post('/projects/:id/sync/rollback', (req, res) => {
   }
 });
 
+router.get('/projects/:id/sync/frames/:seq/diff', (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const diff = liveSyncEngine.getFrameDiff(project.id, Number(req.params.seq));
+    if (!diff) return res.status(404).json({ error: 'Commit Frame no encontrado en el historial activo de memoria' });
+    res.json(diff);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/projects/:id/sync/token', (req, res) => {
+  try {
+    const project = projectManager.getById(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const ticket = createWsTicket(req);
+    const host = req.headers.host || '127.0.0.1:3030';
+    const proto = (req.socket && /** @type {any} */ (req.socket).encrypted) ? 'wss' : 'ws';
+    res.json({
+      projectId: project.id,
+      ticket: ticket.ticket,
+      expiresAt: ticket.expiresAt,
+      wsUrl: `${proto}://${host}/ws/sync`,
+      command: `culkibo sync --project ${project.id}`
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /**
  * D3 — Promoción de lo ya probado: construye y despliega en Citadel el árbol
  * exacto sincronizado en disco (sin requerir un `git push` previo).
+ * Con `?async=1` o `{ async: true }` devuelve 202 inmediatamente evitando timeouts HTTP.
  */
-router.post('/projects/:id/sync/promote', async (req, res) => {
+router.post('/projects/:id/sync/promote', heavyOpLimiter, async (req, res) => {
   try {
     const project = projectManager.getById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
     const targetDir = liveSyncEngine.resolveTargetDir(project.id);
     const verification = liveSyncEngine.verifySync(project.id);
+    const isAsync = req.query.async === '1' || req.query.async === 'true' || Boolean(req.body && req.body.async);
+    if (isAsync) {
+      const queued = deployManager.enqueue(project, {
+        contextDir: targetDir,
+        gitSync: false,
+        trigger: 'forge_promote'
+      });
+      return res.status(202).json({
+        accepted: true,
+        ...queued,
+        workspaceDigest: verification.serverDigest
+      });
+    }
     const deployment = await deployManager.deploy(project, {
       contextDir: targetDir,
       gitSync: false,

@@ -28,7 +28,7 @@ import {
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
 
-type WizardKind = 'custom' | 'wildcard' | 'sslip';
+type WizardKind = 'custom' | 'wildcard' | 'sslip' | 'tunnel';
 type DnsProvider = 'cloudflare' | 'godaddy' | 'namecheap' | 'ovh' | 'ionos' | 'dondominio' | 'otro';
 
 const MULTI_PART_TLDS = new Set([
@@ -158,6 +158,10 @@ export const DomainWizardModal: React.FC<DomainWizardModalProps> = ({
   const [cfTokenInput, setCfTokenInput] = useState('');
   const [cfSaving, setCfSaving] = useState(false);
   const [cfError, setCfError] = useState<string | null>(null);
+  const [tunnels, setTunnels] = useState<Array<{ id: string; name: string; status?: string }>>([]);
+  const [selectedTunnelId, setSelectedTunnelId] = useState('');
+  const [newTunnelName, setNewTunnelName] = useState('');
+  const [creatingTunnel, setCreatingTunnel] = useState(false);
 
   const [provider, setProvider] = useState<DnsProvider>('cloudflare');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -217,7 +221,8 @@ export const DomainWizardModal: React.FC<DomainWizardModalProps> = ({
       api.getIngressCapabilities().catch(() => null),
       fixedProjectId ? Promise.resolve([]) : api.getProjects().catch(() => []),
       fixedProjectId ? Promise.resolve({ installations: [] }) : api.getInstallations().catch(() => ({ installations: [] })),
-    ]).then(([ipRes, cfRes, capsRes, projList, instRes]) => {
+      api.getCloudflareTunnels().catch(() => ({ tunnels: [] })),
+    ]).then(([ipRes, cfRes, capsRes, projList, instRes, tunRes]) => {
       if (!active) return;
       if (ipRes?.ip) setServerIp(ipRes.ip);
       setCfConfigured(Boolean(cfRes?.isConfigured));
@@ -225,6 +230,9 @@ export const DomainWizardModal: React.FC<DomainWizardModalProps> = ({
       if (Array.isArray(projList)) setProjects(projList);
       const list = Array.isArray((instRes as any)?.installations) ? (instRes as any).installations : [];
       setServices(list);
+      const tunList = Array.isArray((tunRes as any)?.tunnels) ? (tunRes as any).tunnels : [];
+      setTunnels(tunList);
+      if (tunList.length > 0) setSelectedTunnelId((prev) => prev || tunList[0].id);
     });
     return () => { active = false; };
   }, [isOpen, fixedProjectId]);
@@ -316,6 +324,29 @@ export const DomainWizardModal: React.FC<DomainWizardModalProps> = ({
       const cleanIp = serverIp.trim() || null;
       const canonicalRedirect: 'none' | 'www_to_apex' =
         isApex && includeWwwRedirect ? 'www_to_apex' : 'none';
+
+      if (kind === 'tunnel') {
+        if (!selectedTunnelId) throw new Error('Selecciona o crea un túnel de Cloudflare antes de continuar');
+        const targetPort = selectedService
+          ? Number(selectedService.hostPort || customPort || 8080)
+          : selectedProjectId
+            ? Number(projects.find((p) => p.id === selectedProjectId)?.citadelPort || projects.find((p) => p.id === selectedProjectId)?.forgePort || 8080)
+            : (destinationKey === 'port' ? Math.max(1, Math.min(65535, Number(customPort) || 8080)) : 8080);
+        await api.routeCloudflareTunnel(selectedTunnelId, {
+          hostname: targetHostname,
+          serviceUrl: `http://127.0.0.1:${targetPort}`,
+        });
+        setActivationResult({
+          hostname: targetHostname,
+          ingressApplied: true,
+          ingressMessage: `Dominio conectado al túnel Cloudflare hacia http://127.0.0.1:${targetPort}. No necesitas abrir puertos en el router.`,
+          httpsReady: true,
+        });
+        setStep(3);
+        onComplete();
+        onNotify?.(`Dominio ${targetHostname} enrutado por Túnel Cloudflare`, 'success');
+        return;
+      }
 
       if (kind === 'sslip') {
         if (!cleanIp) throw new Error('Indica la dirección IPv4 del servidor para generar el host sslip.io');
@@ -498,7 +529,7 @@ export const DomainWizardModal: React.FC<DomainWizardModalProps> = ({
         {/* PASO 1 */}
         {step === 1 && (
           <div className="space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               {([
                 {
                   id: 'custom' as const,
@@ -511,6 +542,12 @@ export const DomainWizardModal: React.FC<DomainWizardModalProps> = ({
                   icon: ShieldCheck,
                   title: 'Comodín (*.dominio)',
                   desc: 'Un solo certificado cubre infinitos subdominios (DNS-01).',
+                },
+                {
+                  id: 'tunnel' as const,
+                  icon: Cloud,
+                  title: 'Túnel Cloudflare (sin puertos)',
+                  desc: 'Ideal en casa o detrás de NAT: publica sin abrir puertos 80/443.',
                 },
                 {
                   id: 'sslip' as const,
@@ -731,7 +768,73 @@ export const DomainWizardModal: React.FC<DomainWizardModalProps> = ({
         {/* PASO 2 */}
         {step === 2 && (
           <div className="space-y-4">
-            {kind === 'sslip' ? (
+            {kind === 'tunnel' ? (
+              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-3 text-xs">
+                <div className="font-semibold text-slate-900 flex items-center gap-1.5">
+                  <Cloud className="w-4 h-4 text-slate-600" />
+                  Elige el túnel de Cloudflare para {finalHostname}
+                </div>
+                <p className="text-slate-600 leading-relaxed">
+                  Cloudflare creará el CNAME del túnel y enviará el tráfico cifrado directamente hasta tu servidor sin abrir puertos en el firewall.
+                </p>
+                {!cfConfigured ? (
+                  <p className="text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-3">
+                    Primero conecta tu API Token de Cloudflare en <strong>Ajustes → Cloudflare</strong> (con permisos Cloudflare Tunnel: Edit y DNS: Edit).
+                  </p>
+                ) : (
+                  <>
+                    {tunnels.length > 0 && (
+                      <div>
+                        <label className="block font-medium text-slate-700 mb-1">Túnel existente</label>
+                        <select
+                          value={selectedTunnelId}
+                          onChange={(e) => setSelectedTunnelId(e.target.value)}
+                          className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs"
+                        >
+                          {tunnels.map((t) => (
+                            <option key={t.id} value={t.id}>{t.name} ({t.id.slice(0, 8)}…)</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={newTunnelName}
+                        onChange={(e) => setNewTunnelName(e.target.value)}
+                        placeholder="O crea uno nuevo (ej. culkibo-casa)"
+                        className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs"
+                      />
+                      <button
+                        type="button"
+                        disabled={creatingTunnel || !newTunnelName.trim()}
+                        onClick={async () => {
+                          setCreatingTunnel(true);
+                          try {
+                            const created = await api.createCloudflareTunnel(newTunnelName.trim());
+                            const id = created?.tunnel?.id || created?.id;
+                            const name = created?.tunnel?.name || newTunnelName.trim();
+                            if (id) {
+                              setTunnels((prev) => [{ id, name, status: 'active' }, ...prev]);
+                              setSelectedTunnelId(id);
+                            }
+                            setNewTunnelName('');
+                            onNotify?.('Túnel creado y seleccionado', 'success');
+                          } catch (err: any) {
+                            setActivationError(err?.message || 'No se pudo crear el túnel');
+                          } finally {
+                            setCreatingTunnel(false);
+                          }
+                        }}
+                        className="px-3 py-2 rounded-lg bg-slate-900 text-white font-medium cursor-pointer disabled:opacity-50"
+                      >
+                        {creatingTunnel ? 'Creando…' : 'Crear túnel'}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : kind === 'sslip' ? (
               <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 space-y-1.5">
                 <div className="font-semibold flex items-center gap-1.5">
                   <CheckCircle2 className="w-4 h-4 text-emerald-600" />

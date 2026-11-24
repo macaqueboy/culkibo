@@ -31,6 +31,9 @@ import {
   ArrowLeft,
   Activity,
   PauseCircle,
+  MoreHorizontal,
+  FolderOpen,
+  KeyRound,
 } from 'lucide-react';
 import { api, type Project } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
@@ -41,13 +44,40 @@ import { DatabasesPanel } from './DatabasesPanel';
 import { DeploymentsPanel } from './DeploymentsPanel';
 import { LiveForgePanel } from './LiveForgePanel';
 import { Modal } from './Modal';
+import { HelpTip } from './HelpTip';
+
+type ProjectTabId = 'general' | 'live' | 'deployments' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config';
+
+function normalizeProjectTab(raw?: string | null): ProjectTabId {
+  if (!raw) return 'general';
+  const map: Record<string, ProjectTabId> = {
+    general: 'general',
+    live: 'live',
+    sync: 'live',
+    deploy: 'deployments',
+    deployments: 'deployments',
+    logs: 'logs',
+    domains: 'domains',
+    databases: 'databases',
+    db: 'databases',
+    storage: 'storage',
+    vars: 'vars',
+    env: 'vars',
+    config: 'config',
+    settings: 'config',
+  };
+  return map[raw.toLowerCase()] || 'general';
+}
 
 interface ProjectDetailProps {
   projectId: string;
+  initialTab?: string | null;
+  onTabChange?: (tab: string) => void;
   onBack: () => void;
   onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
   onProjectUpdate?: () => void;
   onOpenCatalog?: () => void;
+  onOpenBackupSettings?: () => void;
   incomingLog?: any;
 }
 
@@ -88,17 +118,52 @@ function parseRawEnv(raw: string): Record<string, string> {
 
 export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   projectId,
+  initialTab,
+  onTabChange,
   onBack,
   onNotify,
   onProjectUpdate,
   onOpenCatalog,
+  onOpenBackupSettings,
   incomingLog,
 }) => {
   const [project, setProject] = useState<Project | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'general' | 'live' | 'deployments' | 'logs' | 'domains' | 'databases' | 'storage' | 'vars' | 'config'>('general');
+  const [activeTab, setActiveTabState] = useState<ProjectTabId>(() => normalizeProjectTab(initialTab));
   const [loading, setLoading] = useState(false);
   const [simulatingWebhook, setSimulatingWebhook] = useState(false);
+  const [webhookProvider, setWebhookProvider] = useState<'github' | 'gitlab' | 'gitea' | 'bitbucket' | 'deploy_hook'>('github');
+  const [rotatingHook, setRotatingHook] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  const [configDirty, setConfigDirty] = useState(false);
+
+  const setActiveTab = useCallback((next: ProjectTabId) => {
+    setActiveTabState(next);
+    onTabChange?.(next);
+  }, [onTabChange]);
+
+  const [prevInitialTab, setPrevInitialTab] = useState(initialTab);
+  if (initialTab !== prevInitialTab) {
+    setPrevInitialTab(initialTab);
+    if (initialTab) setActiveTabState(normalizeProjectTab(initialTab));
+  }
+
+  useEffect(() => {
+    if (!moreMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (moreMenuRef.current && !moreMenuRef.current.contains(e.target as Node)) setMoreMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMoreMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [moreMenuOpen]);
 
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [copiedSecret, setCopiedSecret] = useState(false);
@@ -427,17 +492,51 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     onNotify(ok ? message : 'No se pudo copiar al portapapeles', ok ? 'success' : 'error');
   };
 
-  const tabs = [
-    { id: 'general', label: 'General', icon: LayoutGrid },
-    { id: 'live', label: 'En vivo', icon: Zap },
-    { id: 'deployments', label: 'Despliegues', icon: Rocket },
-    { id: 'logs', label: 'Registros', icon: ScrollText },
-    { id: 'domains', label: 'Dominios', icon: Globe },
-    { id: 'databases', label: 'Bases de datos', icon: Database },
-    { id: 'storage', label: 'Almacenamiento', icon: Box },
-    { id: 'vars', label: 'Variables', icon: Variable },
-    { id: 'config', label: 'Configuración', icon: Settings },
-  ] as const;
+  const domainCount = (project.domains || []).length;
+  const dbCount = (project.linkedDatabaseIds || []).length;
+  const envCount = Object.keys(project.envVars || {}).length;
+
+  const envIsDirty = (() => {
+    const currentObj: Record<string, string> = {};
+    if (envMode === 'table') {
+      for (const r of envRows) {
+        if (r.key.trim()) currentObj[r.key.trim()] = r.value;
+      }
+    } else {
+      Object.assign(currentObj, parseRawEnv(envText));
+    }
+    return JSON.stringify(currentObj) !== JSON.stringify(project.envVars || {});
+  })();
+
+  const tabGroups: Array<{
+    group: string;
+    items: Array<{ id: ProjectTabId; label: string; icon: React.ComponentType<{ className?: string }>; count?: number }>;
+  }> = [
+    {
+      group: 'Operación',
+      items: [
+        { id: 'general', label: 'General', icon: LayoutGrid },
+        { id: 'deployments', label: 'Despliegues', icon: Rocket },
+        { id: 'live', label: 'En vivo', icon: Zap },
+        { id: 'logs', label: 'Registros', icon: ScrollText },
+      ],
+    },
+    {
+      group: 'Infraestructura',
+      items: [
+        { id: 'domains', label: 'Dominios', icon: Globe, count: domainCount },
+        { id: 'databases', label: 'Bases de datos', icon: Database, count: dbCount },
+        { id: 'storage', label: 'Almacenamiento', icon: Box },
+      ],
+    },
+    {
+      group: 'Ajustes',
+      items: [
+        { id: 'vars', label: 'Variables', icon: Variable, count: envCount },
+        { id: 'config', label: 'Configuración', icon: Settings },
+      ],
+    },
+  ];
 
   const handleToggleMaintenance = async () => {
     const nextEnabled = !project.maintenanceMode;
@@ -460,7 +559,6 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
   };
 
-  const domainCount = (project.domains || []).length;
   const monogramWords = (project.name || 'PR').replace(/[^a-zA-Z0-9\s-]/g, ' ').split(/[\s-]+/).filter(Boolean);
   const monogram = monogramWords.length >= 2
     ? `${monogramWords[0][0]}${monogramWords[1][0]}`.toUpperCase()
@@ -493,21 +591,34 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${
                   project.maintenanceMode
                     ? 'bg-amber-50 text-amber-800 border-amber-200'
-                    : project.status === 'active'
+                    : project.lastDeployedAt && project.status === 'active'
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                      : 'bg-slate-100 text-slate-600 border-slate-200'
+                      : project.localRunning
+                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : 'bg-slate-100 text-slate-600 border-slate-200'
                 }`}
               >
                 <span className={`w-1.5 h-1.5 rounded-full ${
-                  project.maintenanceMode ? 'bg-amber-500' : project.status === 'active' ? 'bg-emerald-500' : 'bg-slate-400'
+                  project.maintenanceMode
+                    ? 'bg-amber-500'
+                    : project.lastDeployedAt && project.status === 'active'
+                      ? 'bg-emerald-500'
+                      : project.localRunning
+                        ? 'bg-amber-500'
+                        : 'bg-slate-400'
                 }`} />
-                {project.maintenanceMode ? 'Mantenimiento (503)' : project.status === 'active' ? 'Activo' : project.status === 'hibernated' ? 'Hibernado' : 'Detenido'}
+                {project.maintenanceMode
+                  ? 'Mantenimiento (503)'
+                  : project.lastDeployedAt && project.status === 'active'
+                    ? 'En producción'
+                    : project.localRunning
+                      ? `En local${project.localPort ? ` :${project.localPort}` : ''}`
+                      : project.status === 'hibernated'
+                        ? 'Hibernado'
+                        : project.status === 'stopped'
+                          ? 'Detenido'
+                          : 'Sin iniciar'}
               </span>
-              {project.localRunning && project.localPort && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium bg-amber-50 text-amber-800 border border-amber-200 tabular-nums">
-                  <Zap className="w-3 h-3 text-amber-600" /> Local :{project.localPort}
-                </span>
-              )}
             </div>
             <p className="text-xs text-slate-500 mt-1">
               {project.description || 'Sin descripción configurada.'}
@@ -521,6 +632,18 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
         </div>
 
         <div className="flex items-center gap-2 flex-wrap shrink-0">
+          {project.maintenanceMode && (
+            <button
+              type="button"
+              onClick={() => void handleToggleMaintenance()}
+              disabled={togglingMaintenance}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <PauseCircle className="w-3.5 h-3.5 text-amber-600" />
+              Salir de mantenimiento
+            </button>
+          )}
+
           {project.localRunning && project.localPort ? (
             <a
               href={`http://${previewHost}:${project.localPort}`}
@@ -541,41 +664,16 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
             </button>
           )}
 
-          <button
-            type="button"
-            onClick={() => void handleToggleMaintenance()}
-            disabled={togglingMaintenance}
-            title="Activa o desactiva una página 503 atómica en Caddy en menos de 10 ms"
-            className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer disabled:opacity-50 ${
-              project.maintenanceMode
-                ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300'
-                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
-            }`}
-          >
-            <PauseCircle className={`w-3.5 h-3.5 ${project.maintenanceMode ? 'text-amber-600' : 'text-slate-500'}`} />
-            {project.maintenanceMode ? 'Salir de mantenimiento' : 'Mantenimiento'}
-          </button>
-
-          {project.status === 'active' || project.localRunning ? (
-            <>
-              <button
-                type="button"
-                onClick={handleStop}
-                disabled={loading}
-                className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-              >
-                <Square className="w-3 h-3 fill-red-600 text-red-600" /> Detener
-              </button>
-              <button
-                type="button"
-                onClick={handleHibernate}
-                disabled={loading}
-                className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-              >
-                <Moon className="w-3.5 h-3.5 text-slate-500" /> Hibernar
-              </button>
-            </>
-          ) : (
+          {project.localRunning ? (
+            <button
+              type="button"
+              onClick={handleStop}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <Square className="w-3 h-3 fill-red-600 text-red-600" /> Detener
+            </button>
+          ) : project.status !== 'active' ? (
             <button
               type="button"
               onClick={handleActivate}
@@ -584,7 +682,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
             >
               <Power className="w-3.5 h-3.5 text-emerald-600" /> Activar
             </button>
-          )}
+          ) : null}
 
           {project.domains && project.domains.length > 0 && (
             <a
@@ -596,25 +694,101 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               <Globe className="w-3.5 h-3.5 text-slate-500" /> Ver web
             </a>
           )}
+
+          {/* Menú Más: Mantenimiento, Hibernar, Detener */}
+          <div className="relative" ref={moreMenuRef}>
+            <button
+              type="button"
+              onClick={() => setMoreMenuOpen((v) => !v)}
+              aria-expanded={moreMenuOpen}
+              aria-haspopup="menu"
+              aria-label="Más acciones del proyecto"
+              className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+            >
+              <MoreHorizontal className="w-4 h-4" />
+            </button>
+            {moreMenuOpen && (
+              <div
+                role="menu"
+                className="culkibo-modal-enter absolute right-0 mt-1.5 w-56 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-40"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { setMoreMenuOpen(false); void handleToggleMaintenance(); }}
+                  disabled={togglingMaintenance}
+                  className="w-full px-3.5 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <PauseCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  <span>{project.maintenanceMode ? 'Salir de mantenimiento' : 'Modo mantenimiento (503)'}</span>
+                </button>
+                {project.status === 'active' && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => { setMoreMenuOpen(false); void handleHibernate(); }}
+                    disabled={loading}
+                    className="w-full px-3.5 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <Moon className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                    <span>Hibernar proyecto</span>
+                  </button>
+                )}
+                {(project.status === 'active' || project.localRunning) && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => { setMoreMenuOpen(false); void handleStop(); }}
+                    disabled={loading}
+                    className="w-full px-3.5 py-2 text-left text-xs text-red-700 hover:bg-red-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <Square className="w-3 h-3 fill-red-600 text-red-600 shrink-0" />
+                    <span>Detener procesos</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Pestañas */}
-      <div className="flex border-b border-slate-200 gap-4 px-1 overflow-x-auto no-scrollbar">
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => setActiveTab(t.id)}
-            className={`flex items-center gap-1.5 pb-3 text-xs font-medium border-b-2 transition-colors whitespace-nowrap cursor-pointer shrink-0 ${
-              activeTab === t.id
-                ? 'border-slate-900 text-slate-900'
-                : 'border-transparent text-slate-500 hover:text-slate-800'
-            }`}
-          >
-            <t.icon className={`w-3.5 h-3.5 ${activeTab === t.id ? 'text-slate-900' : 'text-slate-400'}`} />
-            {t.label}
-          </button>
+      {/* Pestañas agrupadas en 3 bloques con separador sutil */}
+      <div
+        role="tablist"
+        aria-label="Secciones del proyecto"
+        className="flex items-center border-b border-slate-200 gap-1 px-1 overflow-x-auto no-scrollbar"
+      >
+        {tabGroups.map((group, gIdx) => (
+          <React.Fragment key={group.group}>
+            {gIdx > 0 && <span aria-hidden="true" className="h-4 w-px bg-slate-200 mx-2 mb-2.5 shrink-0" />}
+            <div className="flex items-center gap-3.5 shrink-0">
+              {group.items.map((t) => {
+                const selected = activeTab === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    onClick={() => setActiveTab(t.id)}
+                    className={`flex items-center gap-1.5 pb-3 text-xs font-medium border-b-2 transition-colors whitespace-nowrap cursor-pointer shrink-0 ${
+                      selected
+                        ? 'border-slate-900 text-slate-900'
+                        : 'border-transparent text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <t.icon className={`w-3.5 h-3.5 ${selected ? 'text-slate-900' : 'text-slate-400'}`} />
+                    <span>{t.label}</span>
+                    {typeof t.count === 'number' && t.count > 0 && (
+                      <span className="px-1.5 py-0.2 rounded-full bg-slate-100 text-slate-600 text-[10px] font-mono tabular-nums">
+                        {t.count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </React.Fragment>
         ))}
       </div>
 
@@ -624,6 +798,56 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
         )}
 
         {activeTab === 'general' && (
+          <div className="space-y-5">
+            {!project.localRunning && !project.lastDeployedAt && (
+              <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900">¿Cómo quieres arrancar este proyecto?</h2>
+                    <p className="text-xs text-slate-500 mt-0.5">Elige según estés probando en tu equipo o publicando en un servidor.</p>
+                  </div>
+                  <HelpTip title="Local vs Docker vs Live Sync" align="right">
+                    <p><strong>Vista previa local:</strong> corre directo en tu ordenador sin Docker, ideal para probar rápido.</p>
+                    <p><strong>Desplegar con Docker:</strong> crea un contenedor aislado con cero cortes y rollback automático.</p>
+                    <p><strong>Live Sync:</strong> sincroniza tu editor en milisegundos sin hacer git push.</p>
+                  </HelpTip>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleStart}
+                    disabled={loading}
+                    className="p-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-left transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                      <Play className="w-3.5 h-3.5 text-slate-700" /> Iniciar en local
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1">Arranca rápido en localhost sin necesitar Docker.</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('deployments')}
+                    className="p-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                      <Rocket className="w-3.5 h-3.5 text-slate-700" /> Desplegar con Docker
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1">Compila imagen, verifica salud y publica detrás de Caddy.</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('live')}
+                    className="p-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                      <FolderOpen className="w-3.5 h-3.5 text-slate-700" /> Conectar carpeta / Live Sync
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1">Sincroniza cambios desde tu editor en menos de 10 ms.</p>
+                  </button>
+                </div>
+              </div>
+            )}
+
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
             <div className="lg:col-span-2 space-y-5">
               <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
@@ -631,6 +855,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   <h2 className="font-semibold text-sm text-slate-900 flex items-center gap-2">
                     <Box className="w-4 h-4 text-slate-600" />
                     Recursos y entornos
+                    <HelpTip title="Desarrollo y Producción">
+                      <p><strong>Desarrollo (The Forge):</strong> vista previa local rápida o sincronizada en vivo mientras editas.</p>
+                      <p><strong>Producción (The Citadel):</strong> contenedor Docker estable publicado por Caddy con HTTPS automático.</p>
+                    </HelpTip>
                   </h2>
                   <div className="flex items-center gap-2">
                     <button
@@ -840,6 +1068,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               </div>
             </div>
           </div>
+          </div>
         )}
 
         {activeTab === 'deployments' && (
@@ -873,6 +1102,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
             linkedDatabaseIds={project.linkedDatabaseIds || []}
             onProjectChanged={() => { void fetchProject(); }}
             onOpenDeployments={() => setActiveTab('deployments')}
+            onOpenBackupSettings={onOpenBackupSettings}
             onNotify={onNotify}
           />
         )}
@@ -883,6 +1113,11 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               <div>
                 <h2 className="font-semibold text-slate-900 text-base flex items-center gap-2">
                   <Variable className="w-4 h-4 text-slate-600" /> Variables de entorno
+                  {envIsDirty && (
+                    <span className="px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-[11px] font-medium">
+                      Cambios sin guardar
+                    </span>
+                  )}
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5">
                   Secretos y configuración inyectados en el entorno de ejecución y despliegue.
@@ -1169,24 +1404,38 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
         {activeTab === 'config' && (
           <div className="space-y-5">
             <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
-              <h2 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
-                <Settings className="w-4 h-4 text-slate-600" /> Configuración del proyecto
-              </h2>
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
+                  <Settings className="w-4 h-4 text-slate-600" /> Configuración del proyecto
+                </h2>
+                {configDirty && (
+                  <span className="px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-[11px] font-medium">
+                    Cambios sin guardar
+                  </span>
+                )}
+              </div>
               <form
                 key={project.id}
+                onChange={() => setConfigDirty(true)}
                 onSubmit={async (e) => {
                   e.preventDefault();
                   const formData = new FormData(e.currentTarget);
                   const wp = (formData.get('watchPaths') as string) || '';
                   const memRaw = Number(formData.get('memoryMb'));
                   const cpuRaw = String(formData.get('cpus') || '').trim();
+                  const localPathVal = String(formData.get('localPath') || '').trim();
+                  const preDeployVal = String(formData.get('preDeployCommand') || '').trim();
+                  const postDeployVal = String(formData.get('postDeployCommand') || '').trim();
                   const updates = {
                     name: formData.get('name'),
                     description: formData.get('description'),
                     gitRepo: formData.get('gitRepo'),
                     gitBranch: formData.get('gitBranch'),
+                    localPath: localPathVal || null,
                     buildCommand: formData.get('buildCommand'),
                     startCommand: formData.get('startCommand'),
+                    preDeployCommand: preDeployVal || null,
+                    postDeployCommand: postDeployVal || null,
                     baseDirectory: formData.get('baseDirectory'),
                     watchPaths: wp.split(',').map((s) => s.trim()).filter(Boolean),
                     ...(Number.isFinite(memRaw) && memRaw >= 64 ? { memoryMb: memRaw } : {}),
@@ -1195,6 +1444,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   };
                   try {
                     await api.updateProject(projectId, updates);
+                    setConfigDirty(false);
                     onNotify('Configuración guardada correctamente', 'success');
                     await fetchProject();
                     onProjectUpdate?.();
@@ -1221,6 +1471,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     <label className="block text-xs font-medium text-slate-700 mb-1">Rama</label>
                     <input name="gitBranch" defaultValue={project.gitBranch} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="main" />
                   </div>
+                  <div className="sm:col-span-2">
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Carpeta local vinculada (opcional)</label>
+                    <input name="localPath" defaultValue={project.localPath || ''} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="C:\proyectos\mi-app o /srv/mi-app" />
+                  </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">Directorio base</label>
                     <input name="baseDirectory" defaultValue={project.baseDirectory} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="/" />
@@ -1236,6 +1490,14 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">Comando de inicio</label>
                     <input name="startCommand" defaultValue={project.startCommand} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="npm start" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Hook pre-despliegue (migraciones)</label>
+                    <input name="preDeployCommand" defaultValue={project.preDeployCommand || ''} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="npx prisma migrate deploy" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Hook post-despliegue</label>
+                    <input name="postDeployCommand" defaultValue={project.postDeployCommand || ''} className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono" placeholder="npm run cache:warm" />
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">Límite de memoria (MB)</label>
@@ -1268,7 +1530,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               </form>
             </div>
 
-            {/* Webhook de GitHub */}
+            {/* Webhooks Multi-Git y Deploy Hook CI/CD */}
             <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
@@ -1276,9 +1538,15 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     <Webhook className="w-4 h-4" />
                   </div>
                   <div>
-                    <h2 className="font-semibold text-slate-900 text-sm">Webhook de GitHub</h2>
+                    <h2 className="font-semibold text-slate-900 text-sm flex items-center gap-1.5">
+                      <span>Webhooks Git y Deploy Hook CI/CD</span>
+                      <HelpTip title="Webhooks y Deploy Hooks">
+                        <p>Permiten desplegar automáticamente en cada <code className="font-mono">git push</code> desde GitHub, GitLab, Gitea o Bitbucket.</p>
+                        <p>Con <strong>Deploy Hook</strong> puedes lanzar un despliegue desde GitHub Actions o cualquier script con un simple <code className="font-mono">curl -X POST</code>.</p>
+                      </HelpTip>
+                    </h2>
                     <p className="text-xs text-slate-500">
-                      Despliega automáticamente al recibir un <code className="bg-slate-100 px-1 rounded font-mono">git push</code> en la rama configurada.
+                      Firma HMAC verificada, filtrado por rama y rutas de monorepo.
                     </p>
                   </div>
                 </div>
@@ -1306,20 +1574,104 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 </button>
               </div>
 
+              <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200 overflow-x-auto no-scrollbar text-xs">
+                {([
+                  { id: 'github', label: 'GitHub' },
+                  { id: 'gitlab', label: 'GitLab' },
+                  { id: 'gitea', label: 'Gitea / Forgejo' },
+                  { id: 'bitbucket', label: 'Bitbucket' },
+                  { id: 'deploy_hook', label: 'Deploy Hook (CI/CD)' },
+                ] as const).map((prov) => (
+                  <button
+                    key={prov.id}
+                    type="button"
+                    onClick={() => setWebhookProvider(prov.id)}
+                    className={`px-2.5 py-1.5 rounded-md font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                      webhookProvider === prov.id
+                        ? 'bg-white text-slate-900 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {prov.label}
+                  </button>
+                ))}
+              </div>
+
+              {webhookProvider === 'deploy_hook' ? (
+                <div className="space-y-3.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-slate-700">Endpoint firmado para CI/CD</span>
+                    <button
+                      type="button"
+                      disabled={rotatingHook}
+                      onClick={async () => {
+                        setRotatingHook(true);
+                        try {
+                          await api.rotateDeployHook(project.id);
+                          onNotify('Token de Deploy Hook rotado correctamente', 'success');
+                          await fetchProject();
+                        } catch (err: any) {
+                          onNotify(err?.message || 'No se pudo rotar el token', 'error');
+                        } finally {
+                          setRotatingHook(false);
+                        }
+                      }}
+                      className="text-xs text-slate-600 hover:text-slate-900 font-medium inline-flex items-center gap-1 underline cursor-pointer disabled:opacity-50"
+                    >
+                      <KeyRound className="w-3 h-3" /> {rotatingHook ? 'Rotando…' : project.deployHookToken ? 'Rotar token' : 'Generar token'}
+                    </button>
+                  </div>
+                  {project.deployHookToken ? (
+                    <>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          readOnly
+                          value={`${window.location.origin}/api/webhooks/deploy/${project.id}?token=${project.deployHookToken}`}
+                          className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 select-all"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void copyValue(`${window.location.origin}/api/webhooks/deploy/${project.id}?token=${project.deployHookToken}`, 'Deploy Hook copiado')}
+                          className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-lg text-xs inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+                        >
+                          <Copy className="w-3.5 h-3.5" /> Copiar
+                        </button>
+                      </div>
+                      <div className="p-3 bg-slate-900 text-slate-100 rounded-lg text-[11px] font-mono overflow-x-auto flex items-center justify-between gap-2">
+                        <code className="truncate">
+                          {`curl -X POST "${window.location.origin}/api/webhooks/deploy/${project.id}" -H "X-Deploy-Token: ${project.deployHookToken}"`}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => void copyValue(`curl -X POST "${window.location.origin}/api/webhooks/deploy/${project.id}" -H "X-Deploy-Token: ${project.deployHookToken}"`, 'Comando curl copiado')}
+                          className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 shrink-0 cursor-pointer"
+                        >
+                          Copiar curl
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500">
+                      Todavía no hay token de Deploy Hook generado para este proyecto. Pulsa «Generar token» arriba para activarlo.
+                    </div>
+                  )}
+                </div>
+              ) : (
               <div className="space-y-3.5">
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Payload URL</label>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Payload URL ({webhookProvider})</label>
                   <div className="flex gap-2">
                     <input
                       type="text"
                       readOnly
-                      value={`${window.location.origin}/api/webhooks/github?projectId=${project.id}`}
+                      value={`${window.location.origin}/api/webhooks/${webhookProvider}?projectId=${project.id}`}
                       className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 select-all"
                     />
                     <button
                       type="button"
                       onClick={() => {
-                        void copyValue(`${window.location.origin}/api/webhooks/github?projectId=${project.id}`, 'URL del webhook copiada');
+                        void copyValue(`${window.location.origin}/api/webhooks/${webhookProvider}?projectId=${project.id}`, 'URL del webhook copiada');
                         setCopiedUrl(true);
                         window.setTimeout(() => setCopiedUrl(false), 2000);
                       }}
@@ -1329,11 +1681,17 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                       {copiedUrl ? 'Copiado' : 'Copiar'}
                     </button>
                   </div>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    {webhookProvider === 'github' && 'Configura Content-Type como application/json y pega el secreto HMAC abajo.'}
+                    {webhookProvider === 'gitlab' && 'En GitLab → Settings → Webhooks, pega el secreto en el campo «Secret token» (X-Gitlab-Token).'}
+                    {webhookProvider === 'gitea' && 'En Gitea/Forgejo → Webhooks, usa formato JSON y pega el secreto (X-Gitea-Signature).'}
+                    {webhookProvider === 'bitbucket' && 'En Bitbucket → Webhooks, añade el secreto compartido (X-Hub-Signature).'}
+                  </p>
                 </div>
 
                 <div>
                   <div className="flex justify-between items-center mb-1">
-                    <label className="block text-xs font-medium text-slate-700">Secreto HMAC</label>
+                    <label className="block text-xs font-medium text-slate-700">Secreto compartido / HMAC</label>
                     <button
                       type="button"
                       onClick={async () => {
@@ -1423,10 +1781,11 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
 
                 {window.location.hostname === 'localhost' && (
                   <p className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3 leading-relaxed">
-                    En entornos locales, para recibir webhooks reales de GitHub publica el panel mediante un dominio HTTPS o un túnel de Cloudflare en Ajustes.
+                    En entornos locales, para recibir webhooks reales desde Git publica el panel mediante un dominio HTTPS o un túnel de Cloudflare en Ajustes.
                   </p>
                 )}
               </div>
+              )}
             </div>
 
             {/* Zona de peligro */}

@@ -50,15 +50,30 @@ function extractEmbeddedIPv4(cleanLower) {
       return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
     }
   }
-  // Forma expandida 0:0:0:0:0:ffff:xxxx:yyyy
+  // Forma expandida 0:0:0:0:0:ffff:xxxx:yyyy o SIIT ::ffff:0:xxxx:yyyy
   const expandedMapped = cleanLower.match(/^(?:0+:){5}ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
   if (expandedMapped) {
     const hi = parseInt(expandedMapped[1], 16);
     const lo = parseInt(expandedMapped[2], 16);
     return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
   }
-  // NAT64 well-known prefix 64:ff9b::/96
-  const nat64Hex = cleanLower.match(/^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  const siitMapped = cleanLower.match(/^::ffff:0:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (siitMapped) {
+    const hi = parseInt(siitMapped[1], 16);
+    const lo = parseInt(siitMapped[2], 16);
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+  }
+  // IPv4-compatible IPv6 deprecado ::xxxx:yyyy o ::a.b.c.d
+  const compatDot = cleanLower.match(/^::(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (compatDot && net.isIPv4(compatDot[1])) return compatDot[1];
+  const compatHex = cleanLower.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (compatHex && !(compatHex[1] === '0' && (compatHex[2] === '0' || compatHex[2] === '1'))) {
+    const hi = parseInt(compatHex[1], 16);
+    const lo = parseInt(compatHex[2], 16);
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+  }
+  // NAT64 well-known prefix 64:ff9b::/96 y RFC 8215 64:ff9b:1::/48
+  const nat64Hex = cleanLower.match(/^64:ff9b:(?:1:)?(?::|.*:)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
   if (nat64Hex) {
     const hi = parseInt(nat64Hex[1], 16);
     const lo = parseInt(nat64Hex[2], 16);
@@ -128,6 +143,7 @@ function isPrivateIp(ip) {
     if (/^(?:0+:){7}0*[01]$/.test(clean)) return true; // forma expandida :: o ::1
     if (clean.startsWith('fc') || clean.startsWith('fd')) return true; // ULA fc00::/7
     if (/^fe[89ab]/.test(clean)) return true; // link-local fe80::/10
+    if (clean.startsWith('2001:0:') || clean.startsWith('2001:0000:') || clean === '2001::') return true; // Teredo 2001::/32
     if (clean.startsWith('ff')) return true;  // multicast
     return false;
   }
@@ -214,7 +230,7 @@ async function assertSafeUrl(rawUrl, options = {}) {
   }
 
   // Bloquear siempre nombres de metadatos cloud conocidos
-  if (host === 'metadata.google.internal' || host === 'metadata' || host === 'instance-data') {
+  if (host === 'metadata.google.internal' || host === 'metadata.goog' || host === 'metadata' || host === 'instance-data') {
     throw new Error(`Host de metadatos bloqueado por seguridad: ${host}`);
   }
 
@@ -308,6 +324,10 @@ async function safeFetch(rawUrl, opts = {}) {
   let currentUrl = rawUrl;
   let currentMethod = String(method || 'GET').toUpperCase();
   let currentBody = body;
+  let currentHeaders = { ...headers };
+  const initialOrigin = (() => {
+    try { return new URL(String(rawUrl || '').trim()).origin; } catch (e) { return null; }
+  })();
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const { url: parsed, addresses } = await assertSafeUrl(currentUrl, {
@@ -333,7 +353,7 @@ async function safeFetch(rawUrl, opts = {}) {
         else resolve(val);
       };
 
-      const reqHeaders = { ...headers };
+      const reqHeaders = { ...currentHeaders };
       if (currentBody != null && !reqHeaders['Content-Length'] && !reqHeaders['content-length']) {
         reqHeaders['Content-Length'] = String(Buffer.byteLength(currentBody));
       }
@@ -388,8 +408,21 @@ async function safeFetch(rawUrl, opts = {}) {
       if (hop === maxRedirects) {
         throw new Error(`Demasiadas redirecciones (> ${maxRedirects})`);
       }
-      const nextUrl = new URL(String(resObj.headers.location), parsed).toString();
-      currentUrl = nextUrl;
+      let nextParsed;
+      try {
+        nextParsed = new URL(String(resObj.headers.location), parsed);
+      } catch (e) {
+        throw new Error('Redirección con cabecera Location malformada');
+      }
+      // Nunca filtrar credenciales ni tokens al cruzar a otro origen en una redirección
+      if (initialOrigin && nextParsed.origin !== initialOrigin) {
+        for (const k of Object.keys(currentHeaders)) {
+          if (/^(authorization|proxy-authorization|cookie|x-culkibo-token|x-culkibo-secret)$/i.test(k)) {
+            delete currentHeaders[k];
+          }
+        }
+      }
+      currentUrl = nextParsed.toString();
       if (resObj.status === 301 || resObj.status === 302 || resObj.status === 303) {
         currentMethod = 'GET';
         currentBody = null;

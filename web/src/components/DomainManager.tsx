@@ -37,6 +37,7 @@ import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { DomainWizardModal } from './DomainWizardModal';
 import { Modal } from './Modal';
+import { HelpTip } from './HelpTip';
 
 const formatDate = (iso?: string | null) => {
   if (!iso) return '—';
@@ -99,7 +100,18 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
   const [editPort, setEditPort] = useState<number>(8080);
   const [editRedirect, setEditRedirect] = useState<'none' | 'www_to_apex' | 'apex_to_www'>('none');
   const [editSecHeaders, setEditSecHeaders] = useState<boolean>(true);
+  const [editFramePolicy, setEditFramePolicy] = useState<'SAMEORIGIN' | 'DENY' | 'ALLOW'>('SAMEORIGIN');
+  const [editMaxBodyMb, setEditMaxBodyMb] = useState<string>('');
+  const [editIpAllowlist, setEditIpAllowlist] = useState<string>('');
+  const [editCustomHeaders, setEditCustomHeaders] = useState<string>('');
+  const [editBasicAuthEnabled, setEditBasicAuthEnabled] = useState<boolean>(false);
+  const [editBasicAuthUser, setEditBasicAuthUser] = useState<string>('');
+  const [editBasicAuthPass, setEditBasicAuthPass] = useState<string>('');
   const [savingEdit, setSavingEdit] = useState(false);
+
+  // Auditoría TLS
+  const [auditingTls, setAuditingTls] = useState(false);
+  const [tlsAuditSummary, setTlsAuditSummary] = useState<{ ok: number; expiring: number; expired: number; errors: number } | null>(null);
 
   // Wildcard DNS-01 & ACME email
   const [newWildcardRoot, setNewWildcardRoot] = useState('');
@@ -341,6 +353,17 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
     setEditPort(dom.targetPort || 8080);
     setEditRedirect(dom.canonicalRedirect || 'none');
     setEditSecHeaders(dom.securityHeaders !== false);
+    setEditFramePolicy(dom.framePolicy || 'SAMEORIGIN');
+    setEditMaxBodyMb(dom.maxBodySizeMb ? String(dom.maxBodySizeMb) : '');
+    setEditIpAllowlist(Array.isArray(dom.ipAllowlist) ? dom.ipAllowlist.join(', ') : '');
+    setEditCustomHeaders(
+      dom.customHeaders
+        ? Object.entries(dom.customHeaders).map(([k, v]) => `${k}: ${v}`).join('\n')
+        : ''
+    );
+    setEditBasicAuthEnabled(Boolean(dom.basicAuth?.enabled));
+    setEditBasicAuthUser(dom.basicAuth?.username || '');
+    setEditBasicAuthPass('');
   };
 
   const handleSaveEditDomain = async (e: React.FormEvent) => {
@@ -348,12 +371,38 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
     if (!editingDomain) return;
     setSavingEdit(true);
     try {
+      const parsedIps = editIpAllowlist
+        .split(/[\s,;]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const parsedHeaders: Record<string, string> = {};
+      for (const rawLine of editCustomHeaders.split(/\r?\n/)) {
+        const idx = rawLine.indexOf(':');
+        if (idx <= 0) continue;
+        const k = rawLine.slice(0, idx).trim();
+        const v = rawLine.slice(idx + 1).trim();
+        if (k && v) parsedHeaders[k] = v;
+      }
+      const maxMbNum = editMaxBodyMb.trim() ? Number(editMaxBodyMb.trim()) : null;
+      const basicAuthPayload = editBasicAuthEnabled
+        ? {
+            enabled: true,
+            username: editBasicAuthUser.trim() || 'admin',
+            ...(editBasicAuthPass ? { password: editBasicAuthPass } : {}),
+          }
+        : { enabled: false };
+
       await api.updateDomain(editingDomain.id, {
         projectId: editProjectId || null,
         targetPod: editPod,
         targetPort: Number(editPort) || editingDomain.targetPort,
         canonicalRedirect: editRedirect,
         securityHeaders: editSecHeaders,
+        framePolicy: editFramePolicy,
+        maxBodySizeMb: maxMbNum && Number.isFinite(maxMbNum) && maxMbNum > 0 ? maxMbNum : null,
+        ipAllowlist: parsedIps,
+        customHeaders: parsedHeaders,
+        basicAuth: basicAuthPayload,
       });
       onNotify?.(`Configuración de ${editingDomain.hostname} actualizada en Caddy`, 'success');
       setEditingDomain(null);
@@ -365,15 +414,47 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
     }
   };
 
+  const handleRunTlsAudit = async () => {
+    setAuditingTls(true);
+    try {
+      const res = await api.runTlsAudit({ warnDays: 14, probeLive: true });
+      const summary = {
+        ok: (res.ok || []).length,
+        expiring: (res.expiring || []).length,
+        expired: (res.expired || []).length,
+        errors: (res.errors || []).length,
+      };
+      setTlsAuditSummary(summary);
+      onNotify?.(
+        summary.expired > 0 || summary.expiring > 0
+          ? `Auditoría TLS: ${summary.expired} caducados, ${summary.expiring} próximos a caducar, ${summary.ok} vigentes`
+          : `Auditoría TLS completada: ${summary.ok} certificados vigentes`,
+        summary.expired > 0 ? 'error' : summary.expiring > 0 ? 'info' : 'success'
+      );
+      void loadData(false);
+    } catch (err: any) {
+      onNotify?.(err?.message || 'No se pudo auditar la caducidad TLS', 'error');
+    } finally {
+      setAuditingTls(false);
+    }
+  };
+
   const handleAddWildcardPolicy = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanRoot = newWildcardRoot.trim().toLowerCase().replace(/^\*\./, '');
     if (!cleanRoot || !cleanRoot.includes('.')) return;
     setAddingWildcard(true);
     try {
-      await api.configureWildcardDns01(cleanRoot);
+      const res = await api.configureWildcardDns01(cleanRoot);
       setNewWildcardRoot('');
-      onNotify?.(`Política Wildcard DNS-01 añadida para *.${cleanRoot}`, 'success');
+      if (res && res.applied === false) {
+        onNotify?.(
+          res.message || `Política *.${cleanRoot} guardada, pero pendiente de aplicar en Caddy`,
+          'info'
+        );
+      } else {
+        onNotify?.(`Política Wildcard DNS-01 aplicada para *.${cleanRoot}`, 'success');
+      }
       void loadData(false);
     } catch (err: any) {
       setErrorBanner(err?.message || 'No se pudo añadir la política Wildcard');
@@ -567,14 +648,15 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                     {ingress.routesManaged} {ingress.routesManaged === 1 ? 'ruta publicada' : 'rutas publicadas'}
                     {ingress.inSync
                       ? ' · sincronizado'
-                      : ` · ${ingress.drift.missing.length} sin publicar, ${ingress.drift.unexpected.length} sobrantes`}
+                      : ` · ${ingress.drift.missing.length} sin publicar, ${ingress.drift.unexpected.length} sobrantes${(ingress.drift.modified?.length || 0) > 0 ? `, ${ingress.drift.modified?.length} desactualizadas` : ''}`}
                     {probingTls ? ' · comprobando TLS…' : ''}
+                    {tlsAuditSummary && ` · Auditoría TLS: ${tlsAuditSummary.ok} OK${tlsAuditSummary.expiring ? `, ${tlsAuditSummary.expiring} por caducar` : ''}${tlsAuditSummary.expired ? `, ${tlsAuditSummary.expired} caducados` : ''}`}
                   </p>
                 )}
               </div>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-2 shrink-0 flex-wrap">
               {!ingress.available ? (
                 <button
                   type="button"
@@ -586,15 +668,26 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   <span>{startingCaddy ? 'Activando…' : 'Activar Caddy'}</span>
                 </button>
               ) : (
-                <button
-                  type="button"
-                  onClick={() => void handleReconcile()}
-                  disabled={reconciling}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
-                  <span>Reconciliar rutas</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void handleRunTlsAudit()}
+                    disabled={auditingTls}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    <ShieldCheck className={`w-3.5 h-3.5 ${auditingTls ? 'animate-pulse' : ''}`} />
+                    <span>{auditingTls ? 'Auditando TLS…' : 'Auditar TLS'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleReconcile()}
+                    disabled={reconciling}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
+                    <span>Reconciliar rutas</span>
+                  </button>
+                </>
               )}
             </div>
           </div>
@@ -676,6 +769,16 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         {domain.canonicalRedirect === 'apex_to_www' && (
                           <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
                             raíz → www
+                          </span>
+                        )}
+                        {domain.basicAuth?.enabled && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-900 text-white" title="Protegido con contraseña HTTP (Basic Auth)">
+                            Basic Auth
+                          </span>
+                        )}
+                        {Array.isArray(domain.ipAllowlist) && domain.ipAllowlist.length > 0 && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-700 border border-slate-200" title={`IPs permitidas: ${domain.ipAllowlist.join(', ')}`}>
+                            {domain.ipAllowlist.length} IPs
                           </span>
                         )}
                       </div>
@@ -1116,9 +1219,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
         open={Boolean(editingDomain)}
         onClose={() => setEditingDomain(null)}
         title={editingDomain ? `Configurar ${editingDomain.hostname}` : 'Configurar dominio'}
-        maxWidthClass="max-w-md"
+        maxWidthClass="max-w-lg"
       >
-        <form onSubmit={handleSaveEditDomain} className="p-5 space-y-4 text-xs">
+        <form onSubmit={handleSaveEditDomain} className="p-5 space-y-4 text-xs max-h-[78vh] overflow-y-auto">
           {!projectId && projects.length > 0 && editingDomain?.targetPod !== 'service' && (
             <div>
               <label className="block font-medium text-slate-700 mb-1">Proyecto asignado</label>
@@ -1161,7 +1264,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
             </div>
           </div>
 
-          {!editingDomain?.isWildcard && (
+          {!editingDomain?.isWildcard && !editingDomain?.hostname?.startsWith('www.') && (
             <div>
               <label className="block font-medium text-slate-700 mb-1">Redirección canónica 301 (www)</label>
               <select
@@ -1176,6 +1279,97 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
             </div>
           )}
 
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block font-medium text-slate-700 mb-1">Política de iframes</label>
+              <select
+                value={editFramePolicy}
+                onChange={(e) => setEditFramePolicy(e.target.value as 'SAMEORIGIN' | 'DENY' | 'ALLOW')}
+                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800"
+              >
+                <option value="SAMEORIGIN">SAMEORIGIN (recomendado)</option>
+                <option value="DENY">DENY (bloquear todos)</option>
+                <option value="ALLOW">ALLOW (permitir embebidos)</option>
+              </select>
+            </div>
+            <div>
+              <label className="block font-medium text-slate-700 mb-1">Límite de subida (MB)</label>
+              <input
+                type="number"
+                min={1}
+                max={10240}
+                value={editMaxBodyMb}
+                onChange={(e) => setEditMaxBodyMb(e.target.value)}
+                placeholder="Sin límite (ej. 50)"
+                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono tabular-nums"
+              />
+            </div>
+          </div>
+
+          {/* Protección Basic Auth (bcrypt nativo en Caddy) */}
+          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-2 font-medium text-slate-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={editBasicAuthEnabled}
+                  onChange={(e) => setEditBasicAuthEnabled(e.target.checked)}
+                  className="rounded border-slate-300 accent-slate-900"
+                />
+                <span>Proteger con contraseña (Basic Auth)</span>
+              </label>
+              <HelpTip title="Basic Auth en Caddy" align="right">
+                <p>Pide usuario y contraseña antes de dejar entrar al sitio (ideal para entornos de staging o paneles privados).</p>
+                <p>La contraseña se cifra con bcrypt y nunca se guarda en texto claro.</p>
+              </HelpTip>
+            </div>
+            {editBasicAuthEnabled && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                <input
+                  type="text"
+                  value={editBasicAuthUser}
+                  onChange={(e) => setEditBasicAuthUser(e.target.value)}
+                  placeholder="Usuario (ej. admin)"
+                  className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg font-mono"
+                />
+                <input
+                  type="password"
+                  value={editBasicAuthPass}
+                  onChange={(e) => setEditBasicAuthPass(e.target.value)}
+                  placeholder={editingDomain?.basicAuth?.enabled ? 'Nueva contraseña (opcional)' : 'Contraseña'}
+                  required={!editingDomain?.basicAuth?.enabled}
+                  className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg font-mono"
+                />
+              </div>
+            )}
+          </div>
+
+          <div>
+            <label className="block font-medium text-slate-700 mb-1">
+              Lista blanca de IPs / CIDR (opcional)
+            </label>
+            <input
+              type="text"
+              value={editIpAllowlist}
+              onChange={(e) => setEditIpAllowlist(e.target.value)}
+              placeholder="Ej. 203.0.113.5, 10.0.0.0/8 (vacío = abierto a todo el mundo)"
+              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono"
+            />
+          </div>
+
+          <div>
+            <label className="block font-medium text-slate-700 mb-1">
+              Cabeceras HTTP personalizadas (una por línea <code className="font-mono">Nombre: valor</code>)
+            </label>
+            <textarea
+              rows={2}
+              value={editCustomHeaders}
+              onChange={(e) => setEditCustomHeaders(e.target.value)}
+              placeholder="Cache-Control: public, max-age=3600"
+              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono text-[11px]"
+            />
+          </div>
+
           <label className="flex items-center gap-2 text-slate-700 cursor-pointer pt-1">
             <input
               type="checkbox"
@@ -1183,7 +1377,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
               onChange={(e) => setEditSecHeaders(e.target.checked)}
               className="rounded border-slate-300 accent-slate-900"
             />
-            <span>Añadir cabeceras de seguridad (HSTS, X-Frame-Options, nosniff)</span>
+            <span>Añadir cabeceras de seguridad (HSTS, nosniff, Referrer-Policy)</span>
           </label>
 
           <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
@@ -1239,8 +1433,32 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
             </div>
           </div>
 
+          {uploadProvider === 'cloudflare_origin_ca' && (
+            <ol className="list-decimal list-inside p-3 rounded-xl bg-slate-50 border border-slate-200 text-[11px] text-slate-600 space-y-1">
+              <li>En Cloudflare abre tu dominio → <strong>SSL/TLS → Origin Server → Create Certificate</strong>.</li>
+              <li>Deja los hostnames (<code className="font-mono">*.tudominio.com, tudominio.com</code>) y 15 años, y pulsa Create.</li>
+              <li>Pega o sube aquí los dos bloques PEM y activa modo <strong>Full (Strict)</strong> en Cloudflare.</li>
+            </ol>
+          )}
+
           <div>
-            <label className="block font-medium text-slate-700 mb-1">Certificado (PEM)</label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="block font-medium text-slate-700">Certificado (PEM)</label>
+              <label className="text-[11px] text-slate-600 hover:text-slate-900 underline cursor-pointer">
+                Cargar archivo .pem/.crt
+                <input
+                  type="file"
+                  accept=".pem,.crt,.cer,.txt"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (!f) return;
+                    f.text().then((txt) => setUploadCertPem(txt));
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+            </div>
             <textarea
               required
               rows={4}
@@ -1252,7 +1470,23 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
           </div>
 
           <div>
-            <label className="block font-medium text-slate-700 mb-1">Clave privada (PEM)</label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="block font-medium text-slate-700">Clave privada (PEM)</label>
+              <label className="text-[11px] text-slate-600 hover:text-slate-900 underline cursor-pointer">
+                Cargar archivo .key/.pem
+                <input
+                  type="file"
+                  accept=".key,.pem,.txt"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (!f) return;
+                    f.text().then((txt) => setUploadKeyPem(txt));
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+            </div>
             <textarea
               required
               rows={4}
