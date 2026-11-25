@@ -180,6 +180,9 @@ const DEFAULTS = {
   healthTimeoutMs: 30000,
   healthIntervalMs: 1000,
   healthPath: '/',
+  healthStartPeriodSec: 10,
+  healthRetries: 3,
+  healthyThreshold: 1,
   // Ventana durante la cual el contenedor viejo SIGUE VIVO después de que la
   // ruta ya apunte al nuevo. Es el apretón de manos que le falta a Coolify
   // (issue #8627): allí el contenedor viejo muere a la vez que se recarga el
@@ -563,6 +566,65 @@ function sanitizeNodeMajor(value) {
 function sanitizePort(value, fallback) {
   const port = parseInt(value, 10);
   return Number.isInteger(port) && port > 0 && port < 65536 ? port : fallback;
+}
+
+/** Entero acotado seguro para parámetros de healthcheck/reintentos. */
+function sanitizeBoundedInt(value, fallback, min, max) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const rounded = Math.round(n);
+  if (rounded < min) return min;
+  if (rounded > max) return max;
+  return rounded;
+}
+
+/**
+ * Normaliza y valida identificadores de secretos BuildKit (`--secret id=NAME,env=NAME`).
+ * Rechaza cualquier nombre que no sea POSIX válido o que esté en `HOST_HIJACK_ENV_BLOCKLIST`.
+ * Devuelve orden determinista deduplicado para preservar la caché de BuildKit.
+ * @param {any} namesOrMap
+ * @returns {string[]}
+ */
+function normalizeBuildSecretNames(namesOrMap) {
+  const rawNames = Array.isArray(namesOrMap)
+    ? namesOrMap
+    : (namesOrMap && typeof namesOrMap === 'object' ? Object.keys(namesOrMap) : []);
+  /** @type {Set<string>} */
+  const out = new Set();
+  for (const name of rawNames) {
+    if (typeof name !== 'string') continue;
+    if (!isValidEnvName(name)) continue;
+    if (HOST_HIJACK_ENV_BLOCKLIST.has(name.toUpperCase())) continue;
+    out.add(name);
+  }
+  return Array.from(out).sort();
+}
+
+/**
+ * Valida una ruta relativa de workspace en monorepo (ej. `apps/web`, `packages/api`).
+ * Rechaza traversal `..`, rutas absolutas, espacios y metacaracteres.
+ * @param {any} raw
+ * @returns {string | null}
+ */
+function sanitizeWorkspacePath(raw) {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  if (!cleaned || cleaned === '.' || cleaned.length > 200) return null;
+  const parts = cleaned.split('/');
+  if (parts.some((seg) => !seg || seg === '.' || seg === '..' || !/^[A-Za-z0-9._-]+$/.test(seg))) {
+    return null;
+  }
+  return parts.join('/');
+}
+
+/** Valida un nombre de paquete npm/workspace (`@scope/pkg` o `pkg`) para `--filter`. */
+function sanitizeWorkspacePackageName(raw) {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  if (!s || s.length > 120) return null;
+  if (!/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(s)) return null;
+  return s;
 }
 
 class DeployManager extends EventEmitter {
@@ -1389,36 +1451,78 @@ class DeployManager extends EventEmitter {
    *
    * @param {string} contextDir
    * @param {any} [project]
-   * @param {{ isRemote?: boolean }} [opts]
+   * @param {{ isRemote?: boolean, workspacePath?: string | null, workspaceTool?: string | null, workspacePackageName?: string | null }} [opts]
    */
-  async detectStrategy(contextDir, project = {}, { isRemote = false } = {}) {
-    const pkgPath = path.join(contextDir, 'package.json');
+  async detectStrategy(contextDir, project = {}, { isRemote = false, workspacePath = null, workspaceTool = null, workspacePackageName = null } = {}) {
+    const declaredPort = sanitizePort(project.containerPort, null);
+    const healthPath = sanitizeHealthPath(project.healthPath) || DEFAULTS.healthPath;
+
+    // Detección de monorepo (pnpm-workspace.yaml / turbo.json / nx.json / root workspaces)
+    // Cuando `baseDirectory` apunta a un paquete de monorepo, conservamos la raíz como contexto
+    // Docker para no cortar lockfiles ni paquetes hermanos (`packages/*`).
+    let effectiveWorkspacePath = sanitizeWorkspacePath(workspacePath);
+    let effectiveWorkspaceTool = workspaceTool || null;
+    let effectiveWorkspacePkg = sanitizeWorkspacePackageName(workspacePackageName);
+    /** @type {string | null} */
+    let rootPackageManager = null;
+    let scanDir = contextDir;
+
+    if (!effectiveWorkspacePath && project && project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
+      const mono = this.detectMonorepoContext(contextDir, project.baseDirectory);
+      if (mono) {
+        effectiveWorkspacePath = mono.workspacePath;
+        effectiveWorkspaceTool = mono.workspaceTool;
+        effectiveWorkspacePkg = mono.workspacePackageName;
+        rootPackageManager = mono.packageManager;
+        scanDir = mono.appDir;
+      }
+    } else if (effectiveWorkspacePath) {
+      try {
+        scanDir = assertContainedPath(contextDir, effectiveWorkspacePath);
+        const rootPkg = fs.existsSync(path.join(contextDir, 'package.json'))
+          ? this.readJson(path.join(contextDir, 'package.json'))
+          : null;
+        rootPackageManager = this.detectNodePackageManager(contextDir, rootPkg);
+      } catch (e) {
+        effectiveWorkspacePath = null;
+        scanDir = contextDir;
+      }
+    }
+
+    const pkgPath = path.join(scanDir, 'package.json');
     const pkg = fs.existsSync(pkgPath) ? this.readJson(pkgPath) : null;
     const deps = pkg ? { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) } : {};
     const scripts = (pkg && pkg.scripts) || {};
 
-    const declaredPort = sanitizePort(project.containerPort, null);
-    const healthPath = sanitizeHealthPath(project.healthPath) || DEFAULTS.healthPath;
-
     // --- Dockerfile del usuario: manda sobre todo lo demás ------------------
     const userDockerfile = ['Dockerfile', 'dockerfile'].find(
-      name => fs.existsSync(path.join(contextDir, name))
+      name => fs.existsSync(path.join(scanDir, name))
     );
     if (userDockerfile) {
+      const relDockerfile = effectiveWorkspacePath
+        ? path.posix.join(effectiveWorkspacePath, userDockerfile)
+        : userDockerfile;
       return {
         builder: 'dockerfile',
         stack: 'dockerfile',
-        dockerfile: userDockerfile,
-        containerPort: declaredPort || this.readExposedPort(path.join(contextDir, userDockerfile)) || DEFAULTS.containerPort,
+        dockerfile: relDockerfile,
+        containerPort: declaredPort || this.readExposedPort(path.join(scanDir, userDockerfile)) || DEFAULTS.containerPort,
         healthPath,
+        workspacePath: effectiveWorkspacePath,
         // Un Dockerfile ajeno puede traer su propio HEALTHCHECK; no lo pisamos.
         injectHealthcheck: false,
-        reason: `Se usará el ${userDockerfile} del repositorio`
+        reason: `Se usará el ${relDockerfile} del repositorio`
       };
     }
 
     // --- Detección del stack ------------------------------------------------
-    const detected = this.detectStack(contextDir, pkg, deps, scripts);
+    const detected = this.detectStack(scanDir, pkg, deps, scripts);
+    if (effectiveWorkspacePath) {
+      if (rootPackageManager) detected.packageManager = rootPackageManager;
+      if (fs.existsSync(path.join(contextDir, '.npmrc'))) detected.hasNpmrc = true;
+      if (fs.existsSync(path.join(contextDir, 'patches'))) detected.hasPatches = true;
+      if (fs.existsSync(path.join(contextDir, 'prisma'))) detected.hasPrisma = true;
+    }
 
     // --- Constructores externos, si están --------------------------------
     //
@@ -1441,6 +1545,7 @@ class DeployManager extends EventEmitter {
         dockerfile: null,
         containerPort: declaredPort || detected.containerPort,
         healthPath,
+        workspacePath: effectiveWorkspacePath,
         injectHealthcheck: false,
         reason: `No hay Dockerfile; se construirá con ${bin} (detectado en el PATH)`
       };
@@ -1464,15 +1569,82 @@ class DeployManager extends EventEmitter {
       hasPrisma: Boolean(detected.hasPrisma),
       hasNpmrc: Boolean(detected.hasNpmrc),
       hasPatches: Boolean(detected.hasPatches),
+      workspacePath: effectiveWorkspacePath,
+      workspaceTool: effectiveWorkspaceTool,
+      workspacePackageName: effectiveWorkspacePkg,
       goBuildTarget: detected.goBuildTarget || '.',
       startCommand: detected.startCommand,
       buildScript: detected.buildScript,
       outputDir: detected.outputDir,
       pythonEntry: detected.pythonEntry,
       pythonStartCmd: detected.pythonStartCmd || null,
+      pythonPackageManager: detected.pythonPackageManager || 'pip',
+      rustBinary: detected.rustBinary || null,
+      denoEntry: detected.denoEntry || null,
+      phpDocRoot: detected.phpDocRoot || null,
+      isLaravel: Boolean(detected.isLaravel),
+      elixirApp: detected.elixirApp || null,
+      javaBuildTool: detected.javaBuildTool || null,
+      javaHasWrapper: Boolean(detected.javaHasWrapper),
       reason: detected.stack === 'desconocido'
         ? 'No se ha podido identificar el stack; no hay Dockerfile ni railpack/nixpacks instalados'
-        : `No hay Dockerfile; se generará uno para ${detected.stack}`
+        : `No hay Dockerfile; se generará uno para ${detected.stack}${effectiveWorkspacePath ? ` (monorepo ${effectiveWorkspaceTool || 'workspace'}: ${effectiveWorkspacePath})` : ''}`
+    };
+  }
+
+  /**
+   * Detecta si `rootDir` es la raíz de un monorepo (pnpm/yarn/npm/bun workspaces, Turborepo o Nx)
+   * que contiene la aplicación en `baseDirectory`.
+   * @param {string} rootDir
+   * @param {any} baseDirectory
+   */
+  detectMonorepoContext(rootDir, baseDirectory) {
+    const wsPath = sanitizeWorkspacePath(baseDirectory);
+    if (!wsPath) return null;
+    let appDir;
+    try {
+      appDir = assertContainedPath(rootDir, wsPath);
+    } catch (e) {
+      return null;
+    }
+    if (!fs.existsSync(appDir)) return null;
+
+    const hasPnpmWs = fs.existsSync(path.join(rootDir, 'pnpm-workspace.yaml'));
+    const hasTurbo = fs.existsSync(path.join(rootDir, 'turbo.json'));
+    const hasNx = fs.existsSync(path.join(rootDir, 'nx.json'));
+    const rootPkg = fs.existsSync(path.join(rootDir, 'package.json'))
+      ? this.readJson(path.join(rootDir, 'package.json'))
+      : null;
+    const hasPkgWorkspaces = Boolean(
+      rootPkg && (
+        (Array.isArray(rootPkg.workspaces) && rootPkg.workspaces.length > 0) ||
+        (rootPkg.workspaces && Array.isArray(rootPkg.workspaces.packages) && rootPkg.workspaces.packages.length > 0)
+      )
+    );
+    if (!hasPnpmWs && !hasTurbo && !hasNx && !hasPkgWorkspaces) return null;
+
+    const rootDeps = rootPkg ? { ...(rootPkg.dependencies || {}), ...(rootPkg.devDependencies || {}) } : {};
+    const packageManager = this.detectNodePackageManager(rootDir, rootPkg);
+    const workspaceTool = (hasTurbo || rootDeps.turbo)
+      ? 'turbo'
+      : (hasNx || rootDeps.nx)
+        ? 'nx'
+        : hasPnpmWs
+          ? 'pnpm'
+          : packageManager;
+    const appPkg = fs.existsSync(path.join(appDir, 'package.json'))
+      ? this.readJson(path.join(appDir, 'package.json'))
+      : null;
+    const workspacePackageName = sanitizeWorkspacePackageName(appPkg && appPkg.name);
+
+    return {
+      isMonorepo: true,
+      rootDir,
+      appDir,
+      workspacePath: wsPath,
+      workspaceTool,
+      workspacePackageName,
+      packageManager
     };
   }
 
@@ -1513,7 +1685,23 @@ class DeployManager extends EventEmitter {
     return null;
   }
 
-  /** Clasificación del stack a partir de lo que hay en disco (Nixpacks/Railpack provider precedence). */
+  /** Detecta si un proyecto Astro está configurado en modo SSR (`@astrojs/node` o `output: 'server'|'hybrid'`). */
+  detectAstroSsr(contextDir, deps) {
+    if (deps && deps['@astrojs/node']) return true;
+    for (const name of ['astro.config.mjs', 'astro.config.ts', 'astro.config.js', 'astro.config.cjs']) {
+      const full = path.join(contextDir, name);
+      if (!fs.existsSync(full)) continue;
+      try {
+        const src = fs.readFileSync(full, 'utf8');
+        if (/output\s*:\s*['"](?:server|hybrid)['"]/.test(src) || /@astrojs\/node/.test(src)) {
+          return true;
+        }
+      } catch (e) {}
+    }
+    return false;
+  }
+
+  /** Clasificación del stack a partir de lo que hay en disco (Railpack/Nixpacks provider precedence). */
   detectStack(contextDir, pkg, deps, scripts) {
     const exists = (...p) => fs.existsSync(path.join(contextDir, ...p));
     let nodeMajor = pkg && pkg.engines ? sanitizeNodeMajor(pkg.engines.node) : null;
@@ -1534,6 +1722,62 @@ class DeployManager extends EventEmitter {
         deps.express || deps.fastify || deps.vite || deps['react-scripts'] || deps.astro
       )
     );
+    const isPrimaryNodeServer = Boolean(
+      pkg && (
+        deps.next || deps.nuxt || deps['@sveltejs/kit'] || deps['@nestjs/core'] ||
+        deps.express || deps.fastify || deps.astro
+      )
+    );
+
+    // PHP / Laravel tiene prioridad incluso con Vite auxiliar para compilar assets Blade
+    if (exists('composer.json') && !isPrimaryNodeServer) {
+      const composer = this.readJson(path.join(contextDir, 'composer.json')) || {};
+      const phpReq = { ...(composer.require || {}), ...(composer['require-dev'] || {}) };
+      const isLaravel = exists('artisan') || Boolean(phpReq['laravel/framework']);
+      const phpDocRoot = (isLaravel || exists('public', 'index.php')) ? 'public' : '.';
+      return { stack: 'php', containerPort: 8000, phpDocRoot, isLaravel };
+    }
+
+    // Rust (Cargo.toml)
+    if (exists('Cargo.toml') && !isPrimaryNodeFramework) {
+      /** @type {string | null} */
+      let rustBinary = null;
+      try {
+        const cargo = fs.readFileSync(path.join(contextDir, 'Cargo.toml'), 'utf8');
+        const pkgSection = cargo.match(/\[package\][\s\S]*?(?=\n\[|$)/);
+        const nameMatch = (pkgSection ? pkgSection[0] : cargo).match(/^\s*name\s*=\s*["']([^"']+)["']/m);
+        if (nameMatch && /^[A-Za-z0-9_-]{1,64}$/.test(nameMatch[1])) {
+          rustBinary = nameMatch[1];
+        }
+      } catch (e) {}
+      return { stack: 'rust', containerPort: 8080, rustBinary };
+    }
+
+    // Deno (deno.json / deno.jsonc)
+    if ((exists('deno.json') || exists('deno.jsonc')) && !isPrimaryNodeFramework) {
+      const candidateEntries = ['main.ts', 'server.ts', 'src/main.ts', 'src/server.ts', 'index.ts', 'mod.ts'];
+      const denoEntry = candidateEntries.find((f) => exists(...f.split('/'))) || 'main.ts';
+      return { stack: 'deno', containerPort: 8000, denoEntry };
+    }
+
+    // Elixir (mix.exs)
+    if (exists('mix.exs') && !isPrimaryNodeFramework) {
+      let elixirApp = 'app';
+      try {
+        const mixSrc = fs.readFileSync(path.join(contextDir, 'mix.exs'), 'utf8');
+        const m = mixSrc.match(/app:\s*:([a-z][a-z0-9_]{0,63})/);
+        if (m) elixirApp = m[1];
+      } catch (e) {}
+      return { stack: 'elixir', containerPort: 4000, elixirApp };
+    }
+
+    // Java (Gradle / Maven)
+    if ((exists('build.gradle') || exists('build.gradle.kts') || exists('pom.xml')) && !isPrimaryNodeFramework) {
+      const isGradle = exists('build.gradle') || exists('build.gradle.kts');
+      const javaBuildTool = isGradle ? 'gradle' : 'maven';
+      const javaHasWrapper = isGradle ? exists('gradlew') : exists('mvnw');
+      return { stack: 'java', containerPort: 8080, javaBuildTool, javaHasWrapper };
+    }
 
     // Go / Python con package.json auxiliar de assets tienen prioridad salvo framework Node primario
     if (exists('go.mod') && !isPrimaryNodeFramework) {
@@ -1548,21 +1792,40 @@ class DeployManager extends EventEmitter {
       return { stack: 'go', containerPort: 8080, goBuildTarget };
     }
 
-    if ((exists('requirements.txt') || exists('pyproject.toml') || exists('manage.py')) && !isPrimaryNodeFramework) {
+    if ((exists('uv.lock') || exists('poetry.lock') || exists('requirements.txt') || exists('pyproject.toml') || exists('manage.py')) && !isPrimaryNodeFramework) {
       const entry = ['main.py', 'app.py', 'wsgi.py', 'manage.py'].find(f => exists(f)) || null;
       let pyDeps = '';
+      let pyprojectRaw = '';
       try { if (exists('requirements.txt')) pyDeps += fs.readFileSync(path.join(contextDir, 'requirements.txt'), 'utf8').toLowerCase(); } catch (e) {}
-      try { if (exists('pyproject.toml')) pyDeps += '\n' + fs.readFileSync(path.join(contextDir, 'pyproject.toml'), 'utf8').toLowerCase(); } catch (e) {}
+      try {
+        if (exists('pyproject.toml')) {
+          pyprojectRaw = fs.readFileSync(path.join(contextDir, 'pyproject.toml'), 'utf8');
+          pyDeps += '\n' + pyprojectRaw.toLowerCase();
+        }
+      } catch (e) {}
+      const pythonPackageManager = exists('uv.lock')
+        ? 'uv'
+        : (exists('poetry.lock') || /\[tool\.poetry\]/i.test(pyprojectRaw))
+          ? 'poetry'
+          : 'pip';
       /** @type {string[] | null} */
       let pythonStartCmd = null;
       if (/\bfastapi\b/.test(pyDeps) && /\buvicorn\b/.test(pyDeps) && (entry === 'main.py' || entry === 'app.py')) {
         const mod = entry.replace(/\.py$/, '');
         pythonStartCmd = ['uvicorn', `${mod}:app`, '--host', '0.0.0.0', '--port', String(8000)];
+      } else if (/\bdjango\b/.test(pyDeps) && /\bgunicorn\b/.test(pyDeps) && exists('manage.py')) {
+        try {
+          const dirs = fs.readdirSync(contextDir, { withFileTypes: true });
+          const wsgiPkg = dirs.find((d) => d.isDirectory() && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(d.name) && exists(d.name, 'wsgi.py'));
+          if (wsgiPkg) {
+            pythonStartCmd = ['gunicorn', '--bind', '0.0.0.0:8000', `${wsgiPkg.name}.wsgi:application`];
+          }
+        } catch (e) {}
       } else if (/\bflask\b/.test(pyDeps) && /\bgunicorn\b/.test(pyDeps) && (entry === 'app.py' || entry === 'wsgi.py' || entry === 'main.py')) {
         const mod = entry.replace(/\.py$/, '');
         pythonStartCmd = ['gunicorn', '--bind', '0.0.0.0:8000', `${mod}:app`];
       }
-      return { stack: 'python', containerPort: 8000, pythonEntry: entry, pythonStartCmd };
+      return { stack: 'python', containerPort: 8000, pythonEntry: entry, pythonStartCmd, pythonPackageManager };
     }
 
     if (pkg) {
@@ -1579,16 +1842,36 @@ class DeployManager extends EventEmitter {
         return { stack: 'next', containerPort: 3000, nodeMajor, packageManager, nextOutput, hasPrisma, hasNpmrc, hasPatches, buildScript: 'build', startCommand: null };
       }
 
+      // Nuxt 3/4 SSR standalone (Nitro `.output/server/index.mjs`)
+      if (deps.nuxt || /\bnuxt\s+build\b/.test(scripts.build || '')) {
+        return { stack: 'nuxt', containerPort: 3000, nodeMajor, packageManager, hasPrisma, hasNpmrc, hasPatches, buildScript: 'build', startCommand: null };
+      }
+
+      // SvelteKit SSR (`@sveltejs/adapter-node` -> `build/index.js`) vs static (`@sveltejs/adapter-static`)
+      if (deps['@sveltejs/kit']) {
+        if (deps['@sveltejs/adapter-static'] && !deps['@sveltejs/adapter-node']) {
+          return { stack: 'vite', containerPort: 80, nodeMajor, packageManager, hasPrisma, hasNpmrc, hasPatches, buildScript: 'build', outputDir: 'build' };
+        }
+        return { stack: 'sveltekit', containerPort: 3000, nodeMajor, packageManager, hasPrisma, hasNpmrc, hasPatches, buildScript: 'build', startCommand: null };
+      }
+
+      // Astro SSR (`@astrojs/node` / `output: 'server'|'hybrid'` -> `dist/server/entry.mjs`) vs Astro static
+      if (deps.astro || /\bastro\s+build\b/.test(scripts.build || '')) {
+        if (this.detectAstroSsr(contextDir, deps)) {
+          return { stack: 'astro-ssr', containerPort: 4321, nodeMajor, packageManager, hasPrisma, hasNpmrc, hasPatches, buildScript: 'build', startCommand: null };
+        }
+        return { stack: 'vite', containerPort: 80, nodeMajor, packageManager, hasPrisma, hasNpmrc, hasPatches, buildScript: 'build', outputDir: 'dist' };
+      }
+
       // Excluir frameworks SSR o servidores HTTP explícitos de la clasificación estática `vite` (Nixpacks/Railpack)
       const isSsrOrServer = Boolean(
-        deps['@sveltejs/kit'] || deps.nuxt || deps['@remix-run/node'] ||
-        deps['@react-router/node'] || deps['@astrojs/node'] || deps['@tanstack/react-start'] ||
+        deps['@remix-run/node'] || deps['@react-router/node'] || deps['@tanstack/react-start'] ||
         deps.express || deps.fastify || deps['@nestjs/core'] || deps.hono || deps.koa ||
         (scripts.start && !/vite\s+preview|serve\s+-s|http-server/i.test(scripts.start))
       );
       const buildsStatic = !isSsrOrServer && (
         deps.vite || deps['@vitejs/plugin-react'] || deps['react-scripts'] ||
-        /vite\s+build|react-scripts\s+build|ng\s+build|astro\s+build/.test(scripts.build || '')
+        /vite\s+build|react-scripts\s+build|ng\s+build/.test(scripts.build || '')
       );
       if (buildsStatic) {
         const outputDir = deps['react-scripts'] ? 'build' : 'dist';
@@ -1613,7 +1896,7 @@ class DeployManager extends EventEmitter {
 
     if (exists('requirements.txt') || exists('pyproject.toml')) {
       const entry = ['main.py', 'app.py', 'wsgi.py', 'manage.py'].find(f => exists(f)) || null;
-      return { stack: 'python', containerPort: 8000, pythonEntry: entry, pythonStartCmd: null };
+      return { stack: 'python', containerPort: 8000, pythonEntry: entry, pythonStartCmd: null, pythonPackageManager: 'pip' };
     }
 
     if (exists('index.html') || exists('public', 'index.html')) {
@@ -1632,7 +1915,7 @@ class DeployManager extends EventEmitter {
    * Solo excluye `dist`/`build` en stacks que los recompilan (evita romper apps estáticas o repos con `build/`).
    */
   defaultDockerignore(stack = null) {
-    const excludeCompiledDirs = stack === 'vite' || stack === 'next' || stack === 'node';
+    const excludeCompiledDirs = stack === 'vite' || stack === 'next' || stack === 'node' || stack === 'nuxt' || stack === 'sveltekit' || stack === 'astro-ssr';
     return [
       '# Generado por Culkibo para acelerar el contexto de construcción.',
       '.git',
@@ -1640,7 +1923,14 @@ class DeployManager extends EventEmitter {
       '.culkibo',
       'node_modules',
       '.next',
+      '.nuxt',
+      '.output',
+      '.svelte-kit',
       ...(excludeCompiledDirs ? ['dist', 'build'] : []),
+      ...(stack === 'rust' || stack === 'java' ? ['target'] : []),
+      ...(stack === 'java' ? ['.gradle'] : []),
+      ...(stack === 'elixir' ? ['_build', 'deps'] : []),
+      ...(stack === 'php' ? ['vendor'] : []),
       'coverage',
       '.env',
       '.env.*',
@@ -1656,6 +1946,8 @@ class DeployManager extends EventEmitter {
 
   /**
    * Devuelve el texto del Dockerfile que construiría este proyecto.
+   * Soporta BuildKit `--mount=type=cache`, `--mount=type=secret` (sin fugas a capas/historial),
+   * monorepos (pnpm/yarn/turbo/nx), Bun nativo, SSR standalone y 12+ stacks.
    */
   generateDockerfile(strategy) {
     const port = sanitizePort(strategy.containerPort, DEFAULTS.containerPort);
@@ -1664,44 +1956,102 @@ class DeployManager extends EventEmitter {
       ? strategy.packageManager
       : 'npm';
     const baseImage = pm === 'bun' ? 'oven/bun:1-alpine' : nodeTag;
+    const jsRuntimeBin = pm === 'bun' ? 'bun' : 'node';
     const outputDir = /^[A-Za-z0-9._-]+$/.test(String(strategy.outputDir || '')) ? strategy.outputDir : 'dist';
     const cacheScope = safeSlug(strategy.projectSlug || 'default', 'app');
+    const wsPath = sanitizeWorkspacePath(strategy.workspacePath);
+    const wsPkg = sanitizeWorkspacePackageName(strategy.workspacePackageName);
+    const wsTool = strategy.workspaceTool || (wsPath ? pm : null);
+
     const buildArgDecls = Array.isArray(strategy.buildArgNames)
       ? strategy.buildArgNames.filter(isValidEnvName).map((k) => `ARG ${k}`)
       : [];
+    const secretNames = normalizeBuildSecretNames(strategy.secretNames || []);
+    const secretMountStr = secretNames.map((id) => `--mount=type=secret,id=${id}`).join(' ');
+    const secretMountPrefix = secretMountStr ? `${secretMountStr} ` : '';
+
+    /** Envoltura en memoria para secretos BuildKit en un único RUN (jamás persiste en la capa). */
+    const wrapNodeSecretCmd = (cmd) => {
+      if (!secretNames.includes('NPM_TOKEN')) return cmd;
+      if (strategy.hasNpmrc) {
+        return `NPM_TOKEN="$(cat /run/secrets/NPM_TOKEN)" ${cmd}`;
+      }
+      return `NPM_TOKEN="$(cat /run/secrets/NPM_TOKEN)" sh -c 'printf "//registry.npmjs.org/:_authToken=%s\\n" "$NPM_TOKEN" > /tmp/.ck-npmrc; NPM_CONFIG_USERCONFIG=/tmp/.ck-npmrc ${cmd}; st=$?; rm -f /tmp/.ck-npmrc; exit $st'`;
+    };
+    const wrapInlineSecrets = (cmd, allowedIds) => {
+      const active = allowedIds.filter((id) => secretNames.includes(id));
+      if (active.length === 0) return cmd;
+      const exports = active.map((id) => `${id}="$(cat /run/secrets/${id})"`).join(' ');
+      return `${exports} ${cmd}`;
+    };
 
     const copyManifestLines = [
       pm === 'pnpm' ? 'COPY package.json pnpm-lock.yam[l] pnpm-workspace.yam[l] ./'
         : pm === 'yarn' ? 'COPY package.json yarn.loc[k] .yarnrc.ym[l] ./'
         : pm === 'bun' ? 'COPY package.json bun.loc[k] bun.lock[b] ./'
         : 'COPY package*.json ./',
+      ...(wsPath ? [`COPY ${wsPath}/package.json ./${wsPath}/package.json`] : []),
+      ...(wsTool === 'turbo' ? ['COPY turbo.jso[n] ./'] : []),
+      ...(wsTool === 'nx' ? ['COPY nx.jso[n] ./'] : []),
       ...(strategy.hasNpmrc ? ['COPY .npmrc ./'] : []),
       ...(strategy.hasPatches ? ['COPY patches ./patches'] : []),
       ...(strategy.hasPrisma ? ['COPY prisma ./prisma'] : [])
     ];
     const enableCorepack = (pm === 'pnpm' || pm === 'yarn') ? ['RUN corepack enable'] : [];
-    const installAllCmd = pm === 'pnpm'
-      ? 'RUN --mount=type=cache,id=culkibo-pnpm,sharing=locked,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile || pnpm install'
+    const rawInstallAll = pm === 'pnpm'
+      ? 'pnpm install --frozen-lockfile || pnpm install'
       : pm === 'yarn'
-      ? 'RUN --mount=type=cache,id=culkibo-yarn,sharing=locked,target=/usr/local/share/.cache/yarn yarn install --frozen-lockfile || yarn install'
+      ? 'yarn install --frozen-lockfile || yarn install'
       : pm === 'bun'
-      ? 'RUN --mount=type=cache,id=culkibo-bun,sharing=locked,target=/root/.bun/install/cache bun install --frozen-lockfile || bun install'
-      : 'RUN --mount=type=cache,id=culkibo-npm,sharing=locked,target=/root/.npm npm ci --include=dev --no-audit --no-fund || npm install --include=dev --no-audit --no-fund';
-    const installProdCmd = pm === 'pnpm'
-      ? 'RUN --mount=type=cache,id=culkibo-pnpm,sharing=locked,target=/root/.local/share/pnpm/store pnpm install --prod --ignore-scripts --frozen-lockfile || pnpm install --prod --ignore-scripts'
+      ? 'bun install --frozen-lockfile || bun install'
+      : 'npm ci --include=dev --no-audit --no-fund || npm install --include=dev --no-audit --no-fund';
+    const rawInstallProd = pm === 'pnpm'
+      ? 'pnpm install --prod --ignore-scripts --frozen-lockfile || pnpm install --prod --ignore-scripts'
       : pm === 'yarn'
-      ? 'RUN --mount=type=cache,id=culkibo-yarn,sharing=locked,target=/usr/local/share/.cache/yarn yarn install --production --ignore-scripts --frozen-lockfile || yarn install --production --ignore-scripts'
+      ? 'yarn install --production --ignore-scripts --frozen-lockfile || yarn install --production --ignore-scripts'
       : pm === 'bun'
-      ? 'RUN --mount=type=cache,id=culkibo-bun,sharing=locked,target=/root/.bun/install/cache bun install --production --ignore-scripts'
-      : 'RUN --mount=type=cache,id=culkibo-npm,sharing=locked,target=/root/.npm npm ci --omit=dev --ignore-scripts --no-audit --no-fund || npm install --omit=dev --ignore-scripts --no-audit --no-fund';
-    const runBuildCmd = pm === 'pnpm' ? 'pnpm run build' : pm === 'yarn' ? 'yarn build' : pm === 'bun' ? 'bun run build' : 'npm run build';
+      ? 'bun install --production --ignore-scripts'
+      : 'npm ci --omit=dev --ignore-scripts --no-audit --no-fund || npm install --omit=dev --ignore-scripts --no-audit --no-fund';
+    const pmCacheMount = pm === 'pnpm'
+      ? '--mount=type=cache,id=culkibo-pnpm,sharing=locked,target=/root/.local/share/pnpm/store'
+      : pm === 'yarn'
+      ? '--mount=type=cache,id=culkibo-yarn,sharing=locked,target=/usr/local/share/.cache/yarn'
+      : pm === 'bun'
+      ? '--mount=type=cache,id=culkibo-bun,sharing=locked,target=/root/.bun/install/cache'
+      : '--mount=type=cache,id=culkibo-npm,sharing=locked,target=/root/.npm';
+
+    const installAllCmd = `RUN ${pmCacheMount} ${secretMountPrefix}${wrapNodeSecretCmd(rawInstallAll)}`;
+    const installProdCmd = `RUN ${pmCacheMount} ${secretMountPrefix}${wrapNodeSecretCmd(rawInstallProd)}`;
+
+    let runBuildCmd;
+    if (wsPath) {
+      if (wsTool === 'turbo' && wsPkg) {
+        const execPrefix = pm === 'pnpm' ? 'pnpm exec' : pm === 'yarn' ? 'yarn' : pm === 'bun' ? 'bunx' : 'npx';
+        runBuildCmd = `${execPrefix} turbo run build --filter=${wsPkg}...`;
+      } else if (wsTool === 'nx' && wsPkg) {
+        const execPrefix = pm === 'pnpm' ? 'pnpm exec' : pm === 'yarn' ? 'yarn' : pm === 'bun' ? 'bunx' : 'npx';
+        runBuildCmd = `${execPrefix} nx build ${wsPkg}`;
+      } else if (pm === 'pnpm') {
+        runBuildCmd = `pnpm --filter ${wsPkg || `./${wsPath}`} run build`;
+      } else if (pm === 'yarn') {
+        runBuildCmd = `yarn --cwd ${wsPath} build`;
+      } else if (pm === 'bun') {
+        runBuildCmd = `bun --cwd ${wsPath} run build`;
+      } else {
+        runBuildCmd = `npm --workspace=${wsPath} run build`;
+      }
+    } else {
+      runBuildCmd = pm === 'pnpm' ? 'pnpm run build' : pm === 'yarn' ? 'yarn build' : pm === 'bun' ? 'bun run build' : 'npm run build';
+    }
     const startArgv = pm === 'pnpm' ? '["pnpm", "run", "start"]' : pm === 'yarn' ? '["yarn", "start"]' : pm === 'bun' ? '["bun", "run", "start"]' : '["npm", "run", "start"]';
+    const appBase = wsPath ? `/app/${wsPath}` : '/app';
 
     // Configuración de nginx para SPA/estático respetando siempre `strategy.containerPort`
     const spaConf = `RUN printf 'server {\\n  listen ${port};\\n  root /usr/share/nginx/html;\\n  index index.html;\\n  location / { try_files $uri $uri/ /index.html; }\\n}\\n' > /etc/nginx/conf.d/default.conf`;
 
     if (strategy.stack === 'next') {
       const isStandalone = strategy.nextOutput === 'standalone';
+      const standaloneEntry = wsPath ? `${wsPath}/server.js` : 'server.js';
       return [
         '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
@@ -1709,7 +2059,7 @@ class DeployManager extends EventEmitter {
         'RUN apk add --no-cache libc6-compat',
         'WORKDIR /app',
         ...enableCorepack,
-        ...copyManifestLines,
+        ...(wsPath ? ['COPY . .'] : copyManifestLines),
         installAllCmd,
         '',
         `FROM ${baseImage} AS build`,
@@ -1720,7 +2070,7 @@ class DeployManager extends EventEmitter {
         'COPY --from=deps /app/node_modules ./node_modules',
         'COPY . .',
         'ENV NEXT_TELEMETRY_DISABLED=1',
-        `RUN --mount=type=cache,id=culkibo-next-${cacheScope},sharing=locked,target=/app/.next/cache ${runBuildCmd}`,
+        `RUN --mount=type=cache,id=culkibo-next-${cacheScope},sharing=locked,target=${appBase}/.next/cache ${secretMountPrefix}${runBuildCmd}`,
         '',
         `FROM ${baseImage} AS runtime`,
         'RUN apk add --no-cache libc6-compat',
@@ -1732,14 +2082,87 @@ class DeployManager extends EventEmitter {
         'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
         ...(isStandalone
           ? [
-              'COPY --from=build --chown=culkibo:culkibo /app/.next/standalone ./',
-              'COPY --from=build --chown=culkibo:culkibo /app/.next/static ./.next/static',
-              'COPY --from=build --chown=culkibo:culkibo /app/public ./public'
+              `COPY --from=build --chown=culkibo:culkibo ${appBase}/.next/standalone ./`,
+              `COPY --from=build --chown=culkibo:culkibo ${appBase}/.next/static ./${wsPath ? `${wsPath}/` : ''}.next/static`,
+              `COPY --from=build --chown=culkibo:culkibo ${appBase}/public ./${wsPath ? `${wsPath}/` : ''}public`
             ]
           : ['COPY --from=build --chown=culkibo:culkibo /app ./']),
+        ...(!isStandalone && wsPath ? [`WORKDIR /app/${wsPath}`] : []),
         'USER culkibo',
         `EXPOSE ${port}`,
-        isStandalone ? 'CMD ["node", "server.js"]' : `CMD ${startArgv}`,
+        isStandalone ? `CMD ["${jsRuntimeBin}", "${standaloneEntry}"]` : `CMD ${startArgv}`,
+        ''
+      ].join('\n');
+    }
+
+    if (strategy.stack === 'nuxt') {
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        `FROM ${baseImage} AS build`,
+        'WORKDIR /app',
+        ...enableCorepack,
+        ...(wsPath ? ['COPY . .'] : copyManifestLines),
+        installAllCmd,
+        ...buildArgDecls,
+        ...(!wsPath ? ['COPY . .'] : []),
+        `RUN --mount=type=cache,id=culkibo-nuxt-${cacheScope},sharing=locked,target=${appBase}/.nuxt ${secretMountPrefix}${runBuildCmd}`,
+        '',
+        `FROM ${baseImage} AS runtime`,
+        'WORKDIR /app',
+        'ENV NODE_ENV=production',
+        'ENV NITRO_HOST=0.0.0.0',
+        `ENV NITRO_PORT=${port}`,
+        'ENV HOST=0.0.0.0',
+        `ENV PORT=${port}`,
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        `COPY --from=build --chown=culkibo:culkibo ${appBase}/.output ./.output`,
+        'USER culkibo',
+        `EXPOSE ${port}`,
+        `CMD ["${jsRuntimeBin}", ".output/server/index.mjs"]`,
+        ''
+      ].join('\n');
+    }
+
+    if (strategy.stack === 'sveltekit' || strategy.stack === 'astro-ssr') {
+      const isAstro = strategy.stack === 'astro-ssr';
+      const artifactDir = isAstro ? 'dist' : 'build';
+      const entryFile = isAstro ? 'dist/server/entry.mjs' : 'build/index.js';
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        `FROM ${baseImage} AS deps`,
+        'WORKDIR /app',
+        ...enableCorepack,
+        ...(wsPath ? ['COPY . .'] : copyManifestLines),
+        installAllCmd,
+        '',
+        `FROM ${baseImage} AS prod-deps`,
+        'WORKDIR /app',
+        ...enableCorepack,
+        ...(wsPath ? ['COPY . .'] : copyManifestLines),
+        installProdCmd,
+        '',
+        `FROM ${baseImage} AS build`,
+        'WORKDIR /app',
+        ...enableCorepack,
+        ...buildArgDecls,
+        'COPY --from=deps /app/node_modules ./node_modules',
+        'COPY . .',
+        `RUN --mount=type=cache,id=culkibo-${strategy.stack}-${cacheScope},sharing=locked,target=${appBase}/node_modules/.vite ${secretMountPrefix}${runBuildCmd}`,
+        '',
+        `FROM ${baseImage} AS runtime`,
+        'WORKDIR /app',
+        'ENV NODE_ENV=production',
+        'ENV HOST=0.0.0.0',
+        `ENV PORT=${port}`,
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        `COPY --from=build --chown=culkibo:culkibo ${appBase}/${artifactDir} ./${artifactDir}`,
+        `COPY --from=build --chown=culkibo:culkibo ${appBase}/package.json ./package.json`,
+        'COPY --from=prod-deps --chown=culkibo:culkibo /app/node_modules ./node_modules',
+        'USER culkibo',
+        `EXPOSE ${port}`,
+        `CMD ["${jsRuntimeBin}", "${entryFile}"]`,
         ''
       ].join('\n');
     }
@@ -1751,16 +2174,16 @@ class DeployManager extends EventEmitter {
         `FROM ${baseImage} AS build`,
         'WORKDIR /app',
         ...enableCorepack,
-        ...copyManifestLines,
+        ...(wsPath ? ['COPY . .'] : copyManifestLines),
         installAllCmd,
         // Declarar build args DESPUÉS de instalar dependencias para no invalidar la caché de `npm ci`
         ...buildArgDecls,
-        'COPY . .',
-        `RUN --mount=type=cache,id=culkibo-vite-${cacheScope},sharing=locked,target=/app/node_modules/.vite ${runBuildCmd}`,
+        ...(!wsPath ? ['COPY . .'] : []),
+        `RUN --mount=type=cache,id=culkibo-vite-${cacheScope},sharing=locked,target=${appBase}/node_modules/.vite ${secretMountPrefix}${runBuildCmd}`,
         '',
         'FROM nginx:1.27-alpine AS runtime',
         spaConf,
-        `COPY --from=build /app/${outputDir} /usr/share/nginx/html`,
+        `COPY --from=build ${appBase}/${outputDir} /usr/share/nginx/html`,
         `EXPOSE ${port}`,
         'CMD ["nginx", "-g", "daemon off;"]',
         ''
@@ -1768,23 +2191,23 @@ class DeployManager extends EventEmitter {
     }
 
     if (strategy.stack === 'node') {
-      const buildStep = strategy.buildScript ? `RUN ${runBuildCmd}` : '# sin script de build';
+      const buildStep = strategy.buildScript ? `RUN ${secretMountPrefix}${runBuildCmd}` : '# sin script de build';
       const startCmd = strategy.startCommand
         ? `CMD ${startArgv}`
-        : (pm === 'bun' ? 'CMD ["bun", "."]' : 'CMD ["node", "."]');
+        : `CMD ["${jsRuntimeBin}", "."]`;
       return [
         '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
         `FROM ${baseImage} AS deps`,
         'WORKDIR /app',
         ...enableCorepack,
-        ...copyManifestLines,
+        ...(wsPath ? ['COPY . .'] : copyManifestLines),
         installAllCmd,
         '',
         `FROM ${baseImage} AS prod-deps`,
         'WORKDIR /app',
         ...enableCorepack,
-        ...copyManifestLines,
+        ...(wsPath ? ['COPY . .'] : copyManifestLines),
         installProdCmd,
         ...(strategy.hasPrisma ? ['RUN npx prisma generate || true'] : []),
         '',
@@ -1806,6 +2229,7 @@ class DeployManager extends EventEmitter {
         'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
         'COPY --from=build --chown=culkibo:culkibo /app ./',
         'COPY --from=prod-deps --chown=culkibo:culkibo /app/node_modules ./node_modules',
+        ...(wsPath ? [`WORKDIR /app/${wsPath}`] : []),
         'USER culkibo',
         `EXPOSE ${port}`,
         startCmd,
@@ -1823,9 +2247,9 @@ class DeployManager extends EventEmitter {
         'WORKDIR /app',
         ...buildArgDecls,
         'COPY go.mod go.su[m] ./',
-        'RUN --mount=type=cache,id=culkibo-gomod,sharing=locked,target=/go/pkg/mod go mod download',
+        `RUN --mount=type=cache,id=culkibo-gomod,sharing=locked,target=/go/pkg/mod ${secretMountPrefix}${wrapInlineSecrets('go mod download', ['GITHUB_TOKEN', 'GIT_AUTH_TOKEN'])}`,
         'COPY . .',
-        `RUN --mount=type=cache,id=culkibo-gomod,sharing=locked,target=/go/pkg/mod --mount=type=cache,id=culkibo-gobuild-${cacheScope},sharing=locked,target=/root/.cache/go-build CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /app/server ${goTarget}`,
+        `RUN --mount=type=cache,id=culkibo-gomod,sharing=locked,target=/go/pkg/mod --mount=type=cache,id=culkibo-gobuild-${cacheScope},sharing=locked,target=/root/.cache/go-build ${secretMountPrefix}CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /app/server ${goTarget}`,
         '',
         'FROM alpine:3.21 AS runtime',
         'RUN apk add --no-cache ca-certificates tzdata',
@@ -1840,11 +2264,203 @@ class DeployManager extends EventEmitter {
       ].join('\n');
     }
 
+    if (strategy.stack === 'rust') {
+      const rustBin = /^[A-Za-z0-9_-]{1,64}$/.test(String(strategy.rustBinary || '')) ? strategy.rustBinary : null;
+      const copyBinCmd = rustBin
+        ? `cp /app/target/release/${rustBin} /app/server`
+        : 'find /app/target/release -maxdepth 1 -type f -executable ! -name "*.so" ! -name "*.d" -exec cp {} /app/server \\; -quit';
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        'FROM rust:1.85-alpine AS build',
+        'RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static',
+        'WORKDIR /app',
+        ...buildArgDecls,
+        'COPY Cargo.toml Cargo.loc[k] ./',
+        'COPY . .',
+        `RUN --mount=type=cache,id=culkibo-cargo-reg,sharing=locked,target=/usr/local/cargo/registry --mount=type=cache,id=culkibo-cargo-git,sharing=locked,target=/usr/local/cargo/git --mount=type=cache,id=culkibo-rust-target-${cacheScope},sharing=locked,target=/app/target ${secretMountPrefix}${wrapInlineSecrets('cargo build --release --locked || cargo build --release', ['CARGO_REGISTRY_TOKEN', 'CARGO_REGISTRIES_CRATES_IO_TOKEN'])} && ${copyBinCmd}`,
+        '',
+        'FROM alpine:3.21 AS runtime',
+        'RUN apk add --no-cache ca-certificates tzdata libgcc',
+        'WORKDIR /app',
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        'COPY --from=build --chown=culkibo:culkibo /app/server /app/server',
+        'USER culkibo',
+        `ENV PORT=${port}`,
+        `EXPOSE ${port}`,
+        'CMD ["/app/server"]',
+        ''
+      ].join('\n');
+    }
+
+    if (strategy.stack === 'deno') {
+      const rawEntry = String(strategy.denoEntry || 'main.ts');
+      const denoEntry = (!rawEntry.includes('..') && /^[A-Za-z0-9._/-]{1,128}\.(?:ts|tsx|js|mjs)$/.test(rawEntry))
+        ? rawEntry
+        : 'main.ts';
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        'FROM denoland/deno:alpine-2.2.4 AS runtime',
+        'WORKDIR /app',
+        ...buildArgDecls,
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        'COPY --chown=culkibo:culkibo . .',
+        `RUN --mount=type=cache,id=culkibo-deno,sharing=locked,target=/deno-dir ${secretMountPrefix}deno cache ${denoEntry}`,
+        'USER culkibo',
+        `ENV PORT=${port}`,
+        `EXPOSE ${port}`,
+        `CMD ["deno", "run", "--allow-net", "--allow-env", "--allow-read", "${denoEntry}"]`,
+        ''
+      ].join('\n');
+    }
+
+    if (strategy.stack === 'php') {
+      const docRoot = strategy.phpDocRoot === 'public' ? '/app/public' : '/app';
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        'FROM composer:2.8 AS deps',
+        'WORKDIR /app',
+        'COPY composer.json composer.loc[k] ./',
+        `RUN --mount=type=cache,id=culkibo-composer,sharing=locked,target=/tmp/cache ${secretMountPrefix}${wrapInlineSecrets('composer install --no-dev --no-interaction --no-scripts --prefer-dist --optimize-autoloader', ['COMPOSER_AUTH'])}`,
+        '',
+        'FROM dunglas/frankenphp:1-php8.3-alpine AS runtime',
+        'WORKDIR /app',
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        'COPY --chown=culkibo:culkibo . .',
+        'COPY --from=deps --chown=culkibo:culkibo /app/vendor ./vendor',
+        ...(strategy.isLaravel ? ['RUN mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views bootstrap/cache && chown -R culkibo:culkibo storage bootstrap/cache'] : []),
+        `ENV SERVER_NAME=:${port}`,
+        `ENV PORT=${port}`,
+        'USER culkibo',
+        `EXPOSE ${port}`,
+        `CMD ["frankenphp", "php-server", "--listen", ":${port}", "--root", "${docRoot}"]`,
+        ''
+      ].join('\n');
+    }
+
+    if (strategy.stack === 'elixir') {
+      const appName = /^[a-z][a-z0-9_]{0,63}$/.test(String(strategy.elixirApp || '')) ? strategy.elixirApp : 'app';
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        'FROM elixir:1.17-otp-27-alpine AS build',
+        'RUN apk add --no-cache build-base git',
+        'ENV MIX_ENV=prod',
+        'WORKDIR /app',
+        ...buildArgDecls,
+        'RUN mix local.hex --force && mix local.rebar --force',
+        'COPY mix.exs mix.loc[k] ./',
+        `RUN --mount=type=cache,id=culkibo-hex,sharing=locked,target=/root/.hex --mount=type=cache,id=culkibo-mix,sharing=locked,target=/root/.mix ${secretMountPrefix}mix deps.get --only prod && mix deps.compile`,
+        'COPY . .',
+        `RUN --mount=type=cache,id=culkibo-hex,sharing=locked,target=/root/.hex ${secretMountPrefix}mix compile && mix release ${appName}`,
+        '',
+        'FROM alpine:3.21 AS runtime',
+        'RUN apk add --no-cache libstdc++ openssl ncurses-libs ca-certificates tzdata',
+        'WORKDIR /app',
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        `COPY --from=build --chown=culkibo:culkibo /app/_build/prod/rel/${appName} ./`,
+        'USER culkibo',
+        `ENV PORT=${port}`,
+        `EXPOSE ${port}`,
+        `CMD ["/app/bin/${appName}", "start"]`,
+        ''
+      ].join('\n');
+    }
+
+    if (strategy.stack === 'java') {
+      const isGradle = strategy.javaBuildTool === 'gradle';
+      const buildImage = isGradle
+        ? (strategy.javaHasWrapper ? 'eclipse-temurin:21-jdk-alpine' : 'gradle:8.12-jdk21-alpine')
+        : (strategy.javaHasWrapper ? 'eclipse-temurin:21-jdk-alpine' : 'maven:3.9-eclipse-temurin-21-alpine');
+      const cacheFlag = isGradle
+        ? '--mount=type=cache,id=culkibo-gradle,sharing=locked,target=/root/.gradle'
+        : '--mount=type=cache,id=culkibo-m2,sharing=locked,target=/root/.m2';
+      const compileCmd = isGradle
+        ? (strategy.javaHasWrapper ? 'chmod +x ./gradlew && ./gradlew build -x test --no-daemon' : 'gradle build -x test --no-daemon')
+        : (strategy.javaHasWrapper ? 'chmod +x ./mvnw && ./mvnw package -DskipTests -B' : 'mvn package -DskipTests -B');
+      const jarGlob = isGradle ? 'build/libs/*.jar' : 'target/*.jar';
+      return [
+        '# syntax=docker/dockerfile:1.7',
+        '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+        `FROM ${buildImage} AS build`,
+        'WORKDIR /app',
+        ...buildArgDecls,
+        'COPY . .',
+        `RUN ${cacheFlag} ${secretMountPrefix}${compileCmd} && sh -c 'JAR=$(ls -S ${jarGlob} | grep -v "plain\\.jar$" | head -n 1); cp "$JAR" /app/app.jar'`,
+        '',
+        'FROM eclipse-temurin:21-jre-alpine AS runtime',
+        'RUN apk add --no-cache ca-certificates tzdata',
+        'WORKDIR /app',
+        'RUN addgroup -S culkibo && adduser -S culkibo -G culkibo',
+        'COPY --from=build --chown=culkibo:culkibo /app/app.jar /app/app.jar',
+        'USER culkibo',
+        `ENV PORT=${port}`,
+        'ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"',
+        `EXPOSE ${port}`,
+        'CMD ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]',
+        ''
+      ].join('\n');
+    }
+
     if (strategy.stack === 'python') {
       const entry = /^[A-Za-z0-9._-]+\.py$/.test(String(strategy.pythonEntry || '')) ? strategy.pythonEntry : 'main.py';
+      const pyPm = strategy.pythonPackageManager === 'uv' || strategy.pythonPackageManager === 'poetry'
+        ? strategy.pythonPackageManager
+        : 'pip';
       const startCmdLine = Array.isArray(strategy.pythonStartCmd) && strategy.pythonStartCmd.length > 0
         ? `CMD ${JSON.stringify(strategy.pythonStartCmd.map((tok) => tok === '8000' ? String(port) : tok.replace(':8000', `:${port}`)))}`
         : `CMD ["python", "${entry}"]`;
+      const pySecretKeys = ['PIP_INDEX_URL', 'PIP_EXTRA_INDEX_URL', 'UV_INDEX_URL', 'UV_EXTRA_INDEX_URL', 'UV_INDEX_PRIVATE_PASSWORD'];
+
+      if (pyPm === 'uv') {
+        return [
+          '# syntax=docker/dockerfile:1.7',
+          '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+          'FROM python:3.12-slim AS runtime',
+          'COPY --from=ghcr.io/astral-sh/uv:0.6 /uv /uvx /usr/local/bin/',
+          'WORKDIR /app',
+          'ENV PYTHONUNBUFFERED=1',
+          `ENV PORT=${port}`,
+          'ENV PATH="/app/.venv/bin:$PATH"',
+          ...buildArgDecls,
+          'RUN useradd --create-home --shell /usr/sbin/nologin culkibo',
+          'COPY pyproject.toml uv.lock ./',
+          `RUN --mount=type=cache,id=culkibo-uv,sharing=locked,target=/root/.cache/uv ${secretMountPrefix}${wrapInlineSecrets('uv sync --frozen --no-dev --no-install-project', pySecretKeys)}`,
+          'COPY --chown=culkibo:culkibo . .',
+          `RUN --mount=type=cache,id=culkibo-uv,sharing=locked,target=/root/.cache/uv ${secretMountPrefix}${wrapInlineSecrets('uv sync --frozen --no-dev', pySecretKeys)} && chown -R culkibo:culkibo /app/.venv`,
+          'USER culkibo',
+          `EXPOSE ${port}`,
+          startCmdLine,
+          ''
+        ].join('\n');
+      }
+
+      if (pyPm === 'poetry') {
+        return [
+          '# syntax=docker/dockerfile:1.7',
+          '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
+          'FROM python:3.12-slim AS runtime',
+          'WORKDIR /app',
+          'ENV PYTHONUNBUFFERED=1',
+          'ENV POETRY_VIRTUALENVS_IN_PROJECT=true',
+          'ENV POETRY_NO_INTERACTION=1',
+          `ENV PORT=${port}`,
+          'ENV PATH="/app/.venv/bin:$PATH"',
+          ...buildArgDecls,
+          'RUN useradd --create-home --shell /usr/sbin/nologin culkibo && pip install --no-cache-dir poetry',
+          'COPY pyproject.toml poetry.loc[k] ./',
+          `RUN --mount=type=cache,id=culkibo-poetry,sharing=locked,target=/root/.cache/pypoetry ${secretMountPrefix}${wrapInlineSecrets('poetry install --only main --no-root', pySecretKeys)}`,
+          'COPY --chown=culkibo:culkibo . .',
+          'RUN chown -R culkibo:culkibo /app/.venv',
+          'USER culkibo',
+          `EXPOSE ${port}`,
+          startCmdLine,
+          ''
+        ].join('\n');
+      }
+
       return [
         '# syntax=docker/dockerfile:1.7',
         '# Generado por Culkibo. Editable: cópialo a ./Dockerfile y tendrá prioridad.',
@@ -1852,11 +2468,12 @@ class DeployManager extends EventEmitter {
         'WORKDIR /app',
         'ENV PYTHONUNBUFFERED=1',
         `ENV PORT=${port}`,
+        ...buildArgDecls,
         'RUN useradd --create-home --shell /usr/sbin/nologin culkibo',
         'COPY requirements.tx[t] pyproject.tom[l] ./',
-        'RUN --mount=type=cache,id=culkibo-pip,sharing=locked,target=/root/.cache/pip if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi',
+        `RUN --mount=type=cache,id=culkibo-pip,sharing=locked,target=/root/.cache/pip ${secretMountPrefix}${wrapInlineSecrets('if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi', pySecretKeys)}`,
         'COPY --chown=culkibo:culkibo . .',
-        'RUN --mount=type=cache,id=culkibo-pip,sharing=locked,target=/root/.cache/pip if [ ! -f requirements.txt ] && [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi',
+        `RUN --mount=type=cache,id=culkibo-pip,sharing=locked,target=/root/.cache/pip ${secretMountPrefix}${wrapInlineSecrets('if [ ! -f requirements.txt ] && [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi', pySecretKeys)}`,
         'USER culkibo',
         `EXPOSE ${port}`,
         startCmdLine,
@@ -1892,15 +2509,22 @@ class DeployManager extends EventEmitter {
     const port = sanitizePort(strategy.containerPort, DEFAULTS.containerPort);
     const p = sanitizeHealthPath(strategy.healthPath) || '/';
     const url = `http://127.0.0.1:${port}${p}`;
-    if (strategy.stack === 'vite' || strategy.stack === 'static' || strategy.stack === 'go') {
-      // Aceptar cualquier estado HTTP < 500 (igual que waitForHealth), incluso 401/404 en APIs Go
+    if (
+      strategy.stack === 'vite' || strategy.stack === 'static' || strategy.stack === 'go' ||
+      strategy.stack === 'rust' || strategy.stack === 'php' || strategy.stack === 'elixir' || strategy.stack === 'java'
+    ) {
+      // Aceptar cualquier estado HTTP < 500 (igual que waitForHealth), incluso 401/404 en APIs
       return `wget --spider -S ${url} 2>&1 | awk '/HTTP\\//{c=$2} END{exit !(c>=100 && c<500)}'`;
+    }
+    if (strategy.stack === 'deno') {
+      return `deno eval "fetch('${url}').then(r=>Deno.exit(r.status<500?0:1)).catch(()=>Deno.exit(1))"`;
     }
     if (strategy.stack === 'python') {
       // P1-31: capturar HTTPError para que APIs que devuelven 401/404 en '/' se consideren sanas (< 500)
       return `python -c "import urllib.request,urllib.error,sys\ntry:\n r=urllib.request.urlopen('${url}')\n sys.exit(0 if r.status<500 else 1)\nexcept urllib.error.HTTPError as e:\n sys.exit(0 if e.code<500 else 1)"`;
     }
-    return `node -e "fetch('${url}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"`;
+    const jsBin = strategy.packageManager === 'bun' ? 'bun' : 'node';
+    return `${jsBin} -e "fetch('${url}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"`;
   }
 
   // -------------------------------------------------------------------------
@@ -1915,10 +2539,10 @@ class DeployManager extends EventEmitter {
    * Ese es el fallo #7040 de Coolify y la prueba lo vigila.
    */
   /**
-   * @param {{imageTag: string, contextDir: string, dockerfile?: string | null, buildArgNames?: string[], labels?: Record<string, any>}} spec
+   * @param {{imageTag: string, contextDir: string, dockerfile?: string | null, buildArgNames?: string[], secretNames?: string[], labels?: Record<string, any>}} spec
    * @returns {string[]}
    */
-  buildArgs({ imageTag, contextDir, dockerfile = null, buildArgNames = [], labels = {} }) {
+  buildArgs({ imageTag, contextDir, dockerfile = null, buildArgNames = [], secretNames = [], labels = {} }) {
     const args = ['build', '--progress=plain', '-t', imageTag];
 
     if (dockerfile) {
@@ -1929,6 +2553,12 @@ class DeployManager extends EventEmitter {
     // que un secreto de build nunca aparece en `ps` ni en el log de build.
     for (const name of buildArgNames) {
       if (isValidEnvName(name)) args.push('--build-arg', name);
+    }
+
+    // Secretos BuildKit (`--secret id=NAME,env=NAME`): nunca entran en capas ni
+    // en `docker history`, y el valor viaja solo en el entorno del hijo.
+    for (const name of normalizeBuildSecretNames(secretNames)) {
+      args.push('--secret', `id=${name},env=${name}`);
     }
 
     // Las etiquetas se escriben en la configuración de la imagen al final; no
@@ -1983,7 +2613,7 @@ class DeployManager extends EventEmitter {
   /**
    * @param {{containerName: string, imageTag: string, hostPort: number, containerPort: number,
    *   envNames?: string[], envFile?: string | null, network?: string | null, memoryMb?: number, cpus?: string | number,
-   *   pidsLimit?: number, healthCmd?: string | null, labels?: Record<string, any>}} spec
+   *   pidsLimit?: number, healthCmd?: string | null, healthStartPeriodSec?: number, healthRetries?: number, labels?: Record<string, any>}} spec
    * @returns {string[]}
    */
   runArgs({
@@ -1998,6 +2628,8 @@ class DeployManager extends EventEmitter {
     cpus = DEFAULTS.cpus,
     pidsLimit = DEFAULTS.pidsLimit,
     healthCmd = null,
+    healthStartPeriodSec = DEFAULTS.healthStartPeriodSec,
+    healthRetries = DEFAULTS.healthRetries,
     labels = {}
   }) {
     const args = [
@@ -2036,7 +2668,15 @@ class DeployManager extends EventEmitter {
     }
 
     if (healthCmd) {
-      args.push('--health-cmd', healthCmd, '--health-interval', '10s', '--health-timeout', '3s', '--health-retries', '3', '--health-start-period', '10s');
+      const startPeriod = sanitizeBoundedInt(healthStartPeriodSec, DEFAULTS.healthStartPeriodSec, 0, 300);
+      const retries = sanitizeBoundedInt(healthRetries, DEFAULTS.healthRetries, 1, 10);
+      args.push(
+        '--health-cmd', healthCmd,
+        '--health-interval', '10s',
+        '--health-timeout', '3s',
+        '--health-retries', String(retries),
+        '--health-start-period', `${startPeriod}s`
+      );
     }
 
     for (const [key, value] of Object.entries(labels)) {
@@ -2224,6 +2864,7 @@ class DeployManager extends EventEmitter {
       startedAt: deployment.startedAt || null,
       finishedAt: deployment.finishedAt || null,
       durationMs: deployment.durationMs || null,
+      phaseTimings: deployment.phaseTimings || null,
       error: deployment.error || null
     });
   }
@@ -2240,19 +2881,42 @@ class DeployManager extends EventEmitter {
   /**
    * Espera a que el destino nuevo responda antes de mandarle tráfico.
    *
-   * Éste es el punto en el que un despliegue deja de ser «arranco y cruzo los
-   * dedos». Dos condiciones de parada, no una:
+   * Usa `http.request` nativo (`_smokeHttpRequest`) para transmitir la cabecera `Host`
+   * real (que `fetch()`/undici ignora como cabecera prohibida), respeta periodo de gracia
+   * de arranque (`healthStartPeriodSec`) y exige `healthyThreshold` respuestas sanas
+   * consecutivas antes de dar luz verde al tráfico.
    *
-   *   a) el sondeo HTTP devuelve algo por debajo de 500 — el proceso escucha y
-   *      enruta (un 404 en `/` es una app viva; un 502 no lo es);
-   *   b) el contenedor deja de estar en ejecución — un crash-loop se detecta en
-   *      el primer ciclo en vez de consumir los 30 s completos.
+   * Dos condiciones de parada, no una:
+   *   a) el sondeo HTTP alcanza `healthyThreshold` respuestas consecutivas válidas;
+   *   b) el contenedor deja de estar en ejecución o entra en crash-loop — falla rápido
+   *      sin desperdiciar el timeout completo.
    */
   /**
-   * @param {{ hostPort?: number | null, containerPort?: number | null, healthPath: string, containerName?: string | null, hostHeader?: string | null, timeoutMs: number, intervalMs: number, onProgress?: ((msg: string) => void) | null, signal?: AbortSignal | null, isRemote?: boolean, dockerEnv?: any }} spec
+   * @param {{ hostPort?: number | null, containerPort?: number | null, healthPath: string, containerName?: string | null, hostHeader?: string | null, timeoutMs: number, intervalMs: number, healthStartPeriodSec?: number, healthGraceMs?: number | null, healthyThreshold?: number, onProgress?: ((msg: string) => void) | null, signal?: AbortSignal | null, isRemote?: boolean, dockerEnv?: any }} spec
    */
-  async waitForHealth({ hostPort, containerPort = null, healthPath, containerName, hostHeader = null, timeoutMs, intervalMs, onProgress = null, signal = null, isRemote = false, dockerEnv = undefined }) {
-    const deadline = Date.now() + timeoutMs;
+  async waitForHealth({
+    hostPort,
+    containerPort = null,
+    healthPath,
+    containerName,
+    hostHeader = null,
+    timeoutMs,
+    intervalMs,
+    healthStartPeriodSec = 0,
+    healthGraceMs = null,
+    healthyThreshold = DEFAULTS.healthyThreshold,
+    onProgress = null,
+    signal = null,
+    isRemote = false,
+    dockerEnv = undefined
+  }) {
+    const startAt = Date.now();
+    const graceMs = healthGraceMs != null
+      ? Math.min(300000, Math.max(0, Number(healthGraceMs) || 0))
+      : sanitizeBoundedInt(healthStartPeriodSec, 0, 0, 300) * 1000;
+    const threshold = sanitizeBoundedInt(healthyThreshold, DEFAULTS.healthyThreshold, 1, 5);
+    const effectiveTimeoutMs = graceMs > 0 ? Math.max(timeoutMs, graceMs + Math.min(5000, timeoutMs)) : timeoutMs;
+    const deadline = startAt + effectiveTimeoutMs;
     const isContainerized = !isRemote && fs.existsSync('/.dockerenv');
     const probeUrls = [];
     if (isContainerized && containerName && containerPort) {
@@ -2265,10 +2929,12 @@ class DeployManager extends EventEmitter {
       return { healthy: false, attempts: 0, reason: 'No hay puerto ni contenedor configurado para sondeo de salud' };
     }
     const isCustomHealthPath = Boolean(healthPath && healthPath !== '/');
-    const probeHeaders = hostHeader && /^[a-z0-9.-]+$/i.test(String(hostHeader))
+    /** @type {Record<string, string>} */
+    const probeHeaders = hostHeader && /^[a-z0-9.-]+(?::\d{1,5})?$/i.test(String(hostHeader))
       ? { Host: String(hostHeader) }
-      : undefined;
+      : {};
     let attempts = 0;
+    let consecutiveOk = 0;
     let lastError = 'sin respuesta';
     const backoff = [100, 150, 250, 500];
 
@@ -2278,28 +2944,53 @@ class DeployManager extends EventEmitter {
       }
       attempts++;
 
-      // Sondeo HTTP primero: si el servicio ya está listo ahorra un `docker inspect` por intento.
+      // Sondeo HTTP nativo (transmite `Host` real y nunca sigue redirecciones).
+      let attemptPassed = false;
+      let passedStatus = 0;
       for (const url of probeUrls) {
         try {
-          const reqTimeout = AbortSignal.timeout(Math.min(5000, Math.max(1000, intervalMs * 4)));
-          const combinedSignal = (signal && typeof AbortSignal.any === 'function')
-            ? AbortSignal.any([signal, reqTimeout])
-            : reqTimeout;
-          const res = await fetch(url, { redirect: 'manual', headers: probeHeaders, signal: combinedSignal });
-          const ok = isCustomHealthPath ? (res.status >= 200 && res.status < 400) : (res.status < 500);
+          const reqTimeoutMs = Math.min(5000, Math.max(500, intervalMs * 4));
+          const res = await this._smokeHttpRequest(url, {
+            method: 'GET',
+            headers: probeHeaders,
+            timeoutMs: reqTimeoutMs,
+            signal,
+            needBody: false
+          });
+          const ok = isCustomHealthPath ? (res.status >= 200 && res.status < 400) : (res.status >= 100 && res.status < 500);
           if (ok) {
-            return { healthy: true, attempts, status: res.status };
+            attemptPassed = true;
+            passedStatus = res.status;
+            break;
           }
           lastError = `respondió ${res.status}`;
         } catch (err) {
           if (signal && signal.aborted) {
             return { healthy: false, attempts, reason: 'Verificación de salud cancelada', aborted: true };
           }
-          lastError = err.name === 'TimeoutError' ? 'tiempo de espera agotado' : 'conexión rechazada';
+          lastError = err && err.name === 'TimeoutError' ? 'tiempo de espera agotado' : 'conexión rechazada';
         }
       }
 
-      // Solo comprobar si el contenedor murió o entró en crash-loop (`State.Restarting`) cuando el HTTP aún no responde.
+      if (attemptPassed) {
+        consecutiveOk++;
+        if (consecutiveOk >= threshold) {
+          return { healthy: true, attempts, status: passedStatus, consecutiveOk };
+        }
+        const confirmWaitMs = Math.min(intervalMs, 150);
+        await new Promise((r) => {
+          const t = setTimeout(r, confirmWaitMs);
+          if (signal) {
+            const onAb = () => { clearTimeout(t); r(undefined); };
+            signal.addEventListener('abort', onAb, { once: true });
+          }
+        });
+        continue;
+      }
+
+      consecutiveOk = 0;
+
+      // Comprobar si el contenedor murió o entró en crash-loop (`State.Restarting`) cuando el HTTP aún no responde.
       if (containerName) {
         const state = await this.runDocker(
           ['inspect', '-f', '{{.State.Running}}|{{.State.Restarting}}|{{.RestartCount}}', containerName],
@@ -2323,8 +3014,11 @@ class DeployManager extends EventEmitter {
         }
       }
 
+      const inGrace = graceMs > 0 && (Date.now() - startAt) < graceMs;
       if (onProgress && attempts % 5 === 0) {
-        onProgress(`Esperando a que el servicio responda en ${healthPath} (intento ${attempts}: ${lastError})`);
+        onProgress(
+          `Esperando a que el servicio responda en ${healthPath} (intento ${attempts}: ${lastError}${inGrace ? ' — en periodo de gracia de arranque' : ''})`
+        );
       }
       const waitMs = attempts <= backoff.length ? Math.min(intervalMs, backoff[attempts - 1]) : intervalMs;
       await new Promise((r) => {
@@ -2336,7 +3030,7 @@ class DeployManager extends EventEmitter {
       });
     }
 
-    return { healthy: false, attempts, reason: `No respondió en ${Math.round(timeoutMs / 1000)} s (${lastError})` };
+    return { healthy: false, attempts, reason: `No respondió en ${Math.round(effectiveTimeoutMs / 1000)} s (${lastError})` };
   }
 
   /**
@@ -3053,6 +3747,7 @@ class DeployManager extends EventEmitter {
       ...(options._freezeOverride ? { freezeOverride: options._freezeOverride } : {}),
       smokeTestResults: null,
       canaryResult: null,
+      phaseTimings: {},
       previous: state.current ? { ...state.current } : null,
       startedAt: new Date().toISOString(),
       finishedAt: null,
@@ -3060,10 +3755,15 @@ class DeployManager extends EventEmitter {
       error: null,
       logLines: []
     };
-    // No se persiste: solo sirve para redactar la salida en vivo (envVars + buildArgs + BDs vinculadas + vault).
+    const buildSecretsMap = {
+      ...(project.buildSecrets && typeof project.buildSecrets === 'object' ? project.buildSecrets : {}),
+      ...(options.buildSecrets && typeof options.buildSecrets === 'object' ? options.buildSecrets : {})
+    };
+    // No se persiste: solo sirve para redactar la salida en vivo (envVars + buildArgs + buildSecrets + BDs vinculadas + vault).
     const allSecretValues = [
       ...Object.values(envVars),
       ...Object.values(project.buildArgs || {}),
+      ...Object.values(buildSecretsMap),
       ...linkedDb.secretValues,
       ...vaultSecrets
     ];
@@ -3079,15 +3779,37 @@ class DeployManager extends EventEmitter {
     };
     this._activeOps.set(project.id, activeOp);
 
-    const setStage = (stage) => {
-      activeOp.stage = stage;
-      this.setStatus(deployment, stage);
-    };
-
     state.history.unshift(deployment);
     if (state.history.length > 20) state.history.pop();
 
     const started = Date.now();
+    /** @type {{ name: string, startedAtMs: number } | null} */
+    let currentPhase = null;
+    const closeCurrentPhase = (nowMs = Date.now()) => {
+      if (!currentPhase) return;
+      const entry = deployment.phaseTimings[currentPhase.name];
+      if (entry && entry.finishedAt === null) {
+        entry.finishedAt = new Date(nowMs).toISOString();
+        entry.durationMs = Math.max(0, nowMs - currentPhase.startedAtMs);
+      }
+      currentPhase = null;
+    };
+    const setStage = (stage) => {
+      const nowMs = Date.now();
+      if (!currentPhase || currentPhase.name !== stage) {
+        closeCurrentPhase(nowMs);
+        if (NON_TERMINAL_STATUSES.has(stage)) {
+          deployment.phaseTimings[stage] = {
+            startedAt: new Date(nowMs).toISOString(),
+            finishedAt: null,
+            durationMs: null
+          };
+          currentPhase = { name: stage, startedAtMs: nowMs };
+        }
+      }
+      activeOp.stage = stage;
+      this.setStatus(deployment, stage);
+    };
     /** @param {string} status @param {string | null} [error] */
     const finish = (status, error = null) => {
       deployment.finishedAt = new Date().toISOString();
@@ -3143,8 +3865,26 @@ class DeployManager extends EventEmitter {
       }
     }
 
-    // Preflight específico para nodos remotos (Fleet SSH): rechazar bind mounts locales y BDs locales privadas
+    // Preflight específico para nodos remotos (Fleet SSH): cordón de mantenimiento/drenaje, bind mounts locales y BDs locales privadas
     if (isRemote) {
+      const fleetCheck = typeof this._getFleetManager === 'function' ? this._getFleetManager() : getServerFleetManager();
+      if (fleetCheck) {
+        /** @type {any} */
+        let srv = null;
+        try {
+          if (typeof fleetCheck.getServer === 'function') srv = fleetCheck.getServer(serverId);
+          else if (typeof fleetCheck.listServers === 'function') {
+            srv = (fleetCheck.listServers() || []).find((s) => s && s.id === serverId) || null;
+          }
+        } catch (e) {}
+        if (srv && srv.maintenanceState && srv.maintenanceState !== 'active') {
+          const msg = `El nodo remoto «${serverId}» está en modo «${srv.maintenanceState}» y no admite nuevos despliegues.`;
+          deployment.errorCode = 'SERVER_MAINTENANCE';
+          this.log(deployment, 'ERROR', msg);
+          this._activeOps.delete(project.id);
+          return finish('fallido', msg);
+        }
+      }
       const hostBindMounts = [
         ...(Array.isArray(project.volumes) ? project.volumes.filter((v) => typeof v === 'string' && (/^[./\\]|^[A-Za-z]:/.test(v.split(':')[0] || ''))) : []),
         ...(Array.isArray(project.fileMounts) ? project.fileMounts.filter(Boolean) : [])
@@ -3207,14 +3947,6 @@ class DeployManager extends EventEmitter {
 
         const rootContextDir = options.contextDir
           || (project.localPath && fs.existsSync(project.localPath) ? project.localPath : path.join(ROOT_BASE_DIR, 'projects', project.id));
-        let contextDir = rootContextDir;
-        if (!options.contextDir && project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
-          try {
-            contextDir = assertContainedPath(rootContextDir, String(project.baseDirectory).replace(/^\/+/, ''));
-          } catch (e) {
-            this.log(deployment, 'WARN', `baseDirectory inválido ignorado (${project.baseDirectory}): ${e.message}`);
-          }
-        }
 
         // --- 0.5. Código fuente ---------------------------------------------
         if (!options.contextDir && options.gitSync !== false && !project.localPath) {
@@ -3231,10 +3963,11 @@ class DeployManager extends EventEmitter {
 
           const sync = await repoSync.sync(project, {
             commit: options.commit || null,
+            signal: opController.signal,
             onLine: (line) => this.log(deployment, 'INFO', line)
           });
 
-          if (opController.signal.aborted || this._abortedProjects.has(project.id)) {
+          if (sync.aborted || opController.signal.aborted || this._abortedProjects.has(project.id)) {
             this.log(deployment, 'WARN', 'Despliegue cancelado durante la sincronización Git');
             return finish('cancelado', 'Despliegue cancelado');
           }
@@ -3271,6 +4004,22 @@ class DeployManager extends EventEmitter {
           }
         }
 
+        // Resolver contexto: si `baseDirectory` apunta a un paquete de monorepo, mantener
+        // la raíz del monorepo como contexto Docker para preservar lockfiles y `packages/*`.
+        let contextDir = rootContextDir;
+        /** @type {any} */
+        let monorepoCtx = null;
+        if (!options.contextDir && project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
+          monorepoCtx = this.detectMonorepoContext(rootContextDir, project.baseDirectory);
+          if (!monorepoCtx) {
+            try {
+              contextDir = assertContainedPath(rootContextDir, String(project.baseDirectory).replace(/^\/+/, ''));
+            } catch (e) {
+              this.log(deployment, 'WARN', `baseDirectory inválido ignorado (${project.baseDirectory}): ${e.message}`);
+            }
+          }
+        }
+
         if (!fs.existsSync(contextDir)) {
           const msg = `No hay código en ${contextDir}. Clona el repositorio del proyecto antes de desplegar.`;
           this.log(deployment, 'ERROR', msg);
@@ -3282,7 +4031,12 @@ class DeployManager extends EventEmitter {
         }
 
         // --- 1. Estrategia --------------------------------------------------
-        const strategy = await this.detectStrategy(contextDir, project, { isRemote });
+        const strategy = await this.detectStrategy(contextDir, project, {
+          isRemote,
+          workspacePath: monorepoCtx ? monorepoCtx.workspacePath : null,
+          workspaceTool: monorepoCtx ? monorepoCtx.workspaceTool : null,
+          workspacePackageName: monorepoCtx ? monorepoCtx.workspacePackageName : null
+        });
         deployment.strategy = {
           builder: strategy.builder,
           stack: strategy.stack,
@@ -3454,6 +4208,19 @@ class DeployManager extends EventEmitter {
             fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
           }
 
+          const healthStartPeriodSec = sanitizeBoundedInt(
+            options.healthStartPeriodSec !== undefined ? options.healthStartPeriodSec : project.healthStartPeriodSec,
+            opts.healthStartPeriodSec,
+            0,
+            300
+          );
+          const healthRetries = sanitizeBoundedInt(
+            options.healthRetries !== undefined ? options.healthRetries : project.healthRetries,
+            opts.healthRetries,
+            1,
+            10
+          );
+
           const runArgs = this.runArgs({
             containerName: deployment.containerName,
             imageTag: deployment.imageTag,
@@ -3466,6 +4233,8 @@ class DeployManager extends EventEmitter {
             cpus: safeCpus,
             pidsLimit: opts.pidsLimit,
             healthCmd: strategy.injectHealthcheck ? this.healthCommandFor(strategy) : null,
+            healthStartPeriodSec,
+            healthRetries,
             labels: {
               'culkibo.managed': 'true',
               'com.culkibo.project': safeSlug(project.id),
@@ -3512,14 +4281,31 @@ class DeployManager extends EventEmitter {
 
         // --- 4. Puerta de salud ---------------------------------------------
         setStage('verificando');
+        const primaryHostHeader = deployment.hostnames[0] || null;
+        const waitHealthStartSec = sanitizeBoundedInt(
+          options.healthStartPeriodSec !== undefined ? options.healthStartPeriodSec : project.healthStartPeriodSec,
+          0,
+          0,
+          300
+        );
+        const waitHealthyThreshold = sanitizeBoundedInt(
+          options.healthyThreshold !== undefined ? options.healthyThreshold : project.healthyThreshold,
+          opts.healthyThreshold,
+          1,
+          5
+        );
         const health = await this._withHealthTarget(serverId, fleet, hostPort, (probePort) =>
           this.waitForHealth({
             hostPort: probePort,
             containerPort: strategy.containerPort,
             healthPath: strategy.healthPath,
             containerName: deployment.containerName,
+            hostHeader: primaryHostHeader,
             timeoutMs: opts.healthTimeoutMs,
             intervalMs: opts.healthIntervalMs,
+            healthStartPeriodSec: waitHealthStartSec,
+            healthGraceMs: options.healthGraceMs !== undefined ? options.healthGraceMs : null,
+            healthyThreshold: waitHealthyThreshold,
             signal: opController.signal,
             isRemote,
             dockerEnv: dockerBaseEnv,
@@ -3551,7 +4337,6 @@ class DeployManager extends EventEmitter {
 
         // --- 4.5. Smoke Tests post-despliegue (solo si están configurados) ---
         const smokeCfg = normalizeSmokeConfig(options.smokeTests !== undefined ? options.smokeTests : project.smokeTests);
-        const primaryHostHeader = deployment.hostnames[0] || null;
         if (smokeCfg.enabled && smokeCfg.checks.length > 0) {
           setStage('smoke_test');
           this.log(deployment, 'INFO', `Ejecutando ${smokeCfg.checks.length} smoke test(s) antes de conmutar tráfico...`);
@@ -3996,12 +4781,38 @@ class DeployManager extends EventEmitter {
    */
   async runBuild(deployment, { strategy, contextDir, project, opts, envVars, signal = null, remoteDockerHost = null }) {
     const buildArgsMap = project.buildArgs || {};
-    const secrets = [...Object.values(envVars), ...Object.values(buildArgsMap)];
+    let buildSecretsMap = {
+      ...(project.buildSecrets && typeof project.buildSecrets === 'object' ? project.buildSecrets : {}),
+      ...(opts && opts.buildSecrets && typeof opts.buildSecrets === 'object' ? opts.buildSecrets : {})
+    };
+    if (Object.values(buildSecretsMap).some((v) => typeof v === 'string' && v.includes('${vault.'))) {
+      const envMgr = getEnvironmentManager();
+      if (envMgr && typeof envMgr.resolveEnvWithVault === 'function') {
+        try {
+          const resolved = envMgr.resolveEnvWithVault(buildSecretsMap);
+          if (resolved && typeof resolved === 'object') {
+            buildSecretsMap = resolved.env && typeof resolved.env === 'object' ? resolved.env : resolved;
+          }
+        } catch (e) {}
+      }
+    }
+    const secretNames = normalizeBuildSecretNames(buildSecretsMap);
+    const secrets = [...Object.values(envVars), ...Object.values(buildArgsMap), ...Object.values(buildSecretsMap)];
+    if (Array.isArray(deployment.__secrets)) {
+      for (const sv of Object.values(buildSecretsMap)) {
+        if (typeof sv === 'string' && sv.length >= 8 && !deployment.__secrets.includes(sv)) {
+          deployment.__secrets.push(sv);
+        }
+      }
+    } else {
+      Object.defineProperty(deployment, '__secrets', { value: [...secrets], enumerable: false, configurable: true });
+    }
     const onLine = (line) => this.log(deployment, 'INFO', line);
     const buildEnv = {
       ...process.env,
       DOCKER_BUILDKIT: '1',
       ...filterSafeHostEnv(buildArgsMap),
+      ...filterSafeHostEnv(buildSecretsMap),
       ...(remoteDockerHost ? { DOCKER_HOST: remoteDockerHost } : {})
     };
 
@@ -4033,7 +4844,7 @@ class DeployManager extends EventEmitter {
     const buildArgNames = Object.keys(buildArgsMap).filter(isValidEnvName);
     let dockerfile = strategy.dockerfile;
     if (strategy.builder === 'generated') {
-      const text = this.generateDockerfile({ ...strategy, projectSlug: safeSlug(project.id), buildArgNames });
+      const text = this.generateDockerfile({ ...strategy, projectSlug: safeSlug(project.id), buildArgNames, secretNames });
       if (!text) return { ok: false, error: 'No se ha podido generar un Dockerfile para este stack' };
       const genDir = path.join(contextDir, '.culkibo');
       fs.mkdirSync(genDir, { recursive: true });
@@ -4045,7 +4856,11 @@ class DeployManager extends EventEmitter {
         try { fs.unlinkSync(genIgnore); } catch (e) {}
       }
       dockerfile = path.join('.culkibo', 'Dockerfile');
-      this.log(deployment, 'INFO', `Dockerfile generado en .culkibo/Dockerfile (stack: ${strategy.stack}, BuildKit cache mounts aislados)`);
+      this.log(
+        deployment,
+        'INFO',
+        `Dockerfile generado en .culkibo/Dockerfile (stack: ${strategy.stack}, BuildKit cache mounts aislados${secretNames.length ? `, ${secretNames.length} secreto(s) BuildKit` : ''})`
+      );
     }
 
     const args = this.buildArgs({
@@ -4053,6 +4868,7 @@ class DeployManager extends EventEmitter {
       contextDir,
       dockerfile,
       buildArgNames,
+      secretNames,
       labels: {
         'com.culkibo.project': safeSlug(project.id),
         'com.culkibo.project_id': project.id,
@@ -4856,7 +5672,16 @@ class DeployManager extends EventEmitter {
    * `docker buildx prune` ese flag está deprecado a favor de
    * `--reserved-space`. Aquí se usa el primero, que es el del CLI base.
    */
-  async pruneBuildCache({ keepStorageGb = 10, untilHours = null } = {}) {
+  async pruneBuildCache({ keepStorageGb = 10, untilHours = null, force = false } = {}) {
+    if (!force && this._activeBuilds > 0) {
+      return {
+        ok: false,
+        busy: true,
+        activeBuilds: this._activeBuilds,
+        error: `No se puede podar la caché de BuildKit mientras hay ${this._activeBuilds} construcción(es) en curso`
+      };
+    }
+
     const docker = await this.detectDocker();
     if (!docker.available) return { ok: false, error: docker.reason };
 
@@ -5165,6 +5990,7 @@ class DeployManager extends EventEmitter {
     return [
       ...Object.values(project.envVars || {}),
       ...Object.values(project.buildArgs || {}),
+      ...Object.values(project.buildSecrets || {}),
       ...linked.secretValues
     ];
   }
@@ -5397,6 +6223,10 @@ instance.helpers = {
   sanitizeSmokePath,
   sanitizeNodeMajor,
   sanitizePort,
+  sanitizeBoundedInt,
+  normalizeBuildSecretNames,
+  sanitizeWorkspacePath,
+  sanitizeWorkspacePackageName,
   filterSafeHostEnv,
   HOST_HIJACK_ENV_BLOCKLIST,
   evaluateFreezeStatus,

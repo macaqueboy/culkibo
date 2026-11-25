@@ -1,13 +1,17 @@
-import React, { useState, useEffect, useRef, useDeferredValue, useMemo } from 'react';
-import { Play, Pause, Trash2, Download, Search, Terminal, Copy, Check } from 'lucide-react';
-import type { LogEntry } from '../lib/api';
-import { api } from '../lib/api';
+import React, { useState, useEffect, useRef, useDeferredValue, useMemo, useCallback } from 'react';
+import { Play, Pause, Trash2, Download, Search, Terminal, Copy, Check, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
+import type { LogEntry, Project } from '../lib/api';
+import { api, apiFetch } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 
 interface LiveLogsProps {
   incomingLog?: LogEntry | null;
   projectId?: string;
+}
+
+interface ExtendedLogEntry extends LogEntry {
+  fields?: Record<string, string | number | boolean>;
 }
 
 const MAX_RENDERED_LOGS = 1000;
@@ -36,51 +40,125 @@ function formatPodLabel(pod: string): string {
   return pod || 'Sistema';
 }
 
+function parseSinceMs(since: string): number | null {
+  const rel = since.match(/^(\d+)(m|h|d)$/);
+  if (!rel) return null;
+  const qty = Number(rel[1]);
+  const mult = rel[2] === 'm' ? 60000 : rel[2] === 'h' ? 3600000 : 86400000;
+  return Date.now() - qty * mult;
+}
+
+function compileClientSafeRegex(pattern: string): { regex: RegExp | null; error: string | null } {
+  if (!pattern) return { regex: null, error: null };
+  if (pattern.length > 160) return { regex: null, error: 'Regex demasiado larga (máx. 160 caracteres)' };
+  if (/\\[1-9]/.test(pattern) || /\(\?<[=!]/.test(pattern) || /\([^)]*[+*?}][^)]*\)\s*[+*{]/.test(pattern)) {
+    return { regex: null, error: 'Regex rechazada por seguridad (cuantificadores anidados)' };
+  }
+  try {
+    return { regex: new RegExp(pattern, 'i'), error: null };
+  } catch (e: any) {
+    return { regex: null, error: e?.message || 'Regex inválida' };
+  }
+}
+
+function tryParseJsonMessage(msg: string): Record<string, any> | null {
+  const clean = stripAnsi(msg).trim();
+  if (!clean.startsWith('{') || !clean.endsWith('}') || clean.length > 8192) return null;
+  try {
+    const parsed = JSON.parse(clean);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {}
+  return null;
+}
+
 export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) => {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [logs, setLogs] = useState<ExtendedLogEntry[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>(projectId || 'all');
   const [selectedPod, setSelectedPod] = useState<string>('all');
   const [selectedLevel, setSelectedLevel] = useState<string>('all');
+  const [sinceWindow, setSinceWindow] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [regexMode, setRegexMode] = useState<boolean>(false);
+  const [attrFilter, setAttrFilter] = useState<string>('');
+  const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const deferredSearch = useDeferredValue(searchQuery);
+  const deferredAttr = useDeferredValue(attrFilter);
+
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [pausedBuffered, setPausedBuffered] = useState<number>(0);
   const [copiedAi, setCopiedAi] = useState<boolean>(false);
+  const [exporting, setExporting] = useState<boolean>(false);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
   const [stickToBottom, setStickToBottom] = useState<boolean>(true);
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const isPausedRef = useRef<boolean>(false);
   const stickRef = useRef<boolean>(true);
   const seenIdsRef = useRef<Set<string>>(new Set());
-  const pausedQueueRef = useRef<LogEntry[]>([]);
-  const pendingRef = useRef<LogEntry[]>([]);
+  const pausedQueueRef = useRef<ExtendedLogEntry[]>([]);
+  const pendingRef = useRef<ExtendedLogEntry[]>([]);
   const rafRef = useRef<number | null>(null);
+
+  const effectiveProjectId = projectId || (selectedProjectId !== 'all' ? selectedProjectId : undefined);
 
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
 
   useEffect(() => {
+    if (projectId) return;
     let active = true;
-    const params: { limit: number; projectId?: string } = { limit: 150 };
-    if (projectId) params.projectId = projectId;
-    api.getLogs(params)
-      .then((res) => {
-        if (!active) return;
-        // El backend devuelve recientes primero; ordenamos cronológicamente (antiguo → nuevo)
-        const ordered = [...(res.logs || [])].reverse();
-        const nextSeen = new Set<string>();
-        const unique: LogEntry[] = [];
-        for (const item of ordered) {
-          if (item.id && nextSeen.has(item.id)) continue;
-          if (item.id) nextSeen.add(item.id);
-          unique.push(item);
-        }
-        seenIdsRef.current = nextSeen;
-        setLogs(unique.slice(-MAX_RENDERED_LOGS));
+    api.getProjects()
+      .then((list) => {
+        if (active && Array.isArray(list)) setProjects(list);
       })
       .catch(() => {});
     return () => { active = false; };
   }, [projectId]);
+
+  const fetchServerLogs = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const qs = new URLSearchParams({ limit: '400' });
+      if (effectiveProjectId) qs.set('projectId', effectiveProjectId);
+      if (selectedPod !== 'all') qs.set('pod', selectedPod);
+      if (selectedLevel !== 'all') qs.set('level', selectedLevel);
+      if (sinceWindow !== 'all') qs.set('since', sinceWindow);
+      if (attrFilter.trim()) qs.set('attr', attrFilter.trim());
+      if (searchQuery.trim()) {
+        if (regexMode) qs.set('regex', searchQuery.trim());
+        else qs.set('search', searchQuery.trim());
+      }
+      const res = await apiFetch(`/api/logs?${qs.toString()}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const ordered = [...((data.logs || []) as ExtendedLogEntry[])].reverse();
+      const nextSeen = new Set<string>();
+      const unique: ExtendedLogEntry[] = [];
+      for (const item of ordered) {
+        if (item.id && nextSeen.has(item.id)) continue;
+        if (item.id) nextSeen.add(item.id);
+        unique.push(item);
+      }
+      seenIdsRef.current = nextSeen;
+      setLogs(unique.slice(-MAX_RENDERED_LOGS));
+    } catch {
+      // Fallback to api.getLogs if custom query failed
+      api.getLogs({ limit: 250, projectId: effectiveProjectId })
+        .then((res) => {
+          const ordered = [...((res.logs || []) as ExtendedLogEntry[])].reverse();
+          setLogs(ordered.slice(-MAX_RENDERED_LOGS));
+        })
+        .catch(() => {});
+    } finally {
+      setRefreshing(false);
+    }
+  }, [effectiveProjectId, selectedPod, selectedLevel, sinceWindow, attrFilter, searchQuery, regexMode]);
+
+  useEffect(() => {
+    void fetchServerLogs();
+  }, [effectiveProjectId, sinceWindow]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const flushPending = () => {
     const batch = pendingRef.current;
@@ -95,8 +173,8 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
     }
   };
 
-  const enqueueLog = (entry: LogEntry) => {
-    if (projectId && entry.projectId !== projectId) {
+  const enqueueLog = (entry: ExtendedLogEntry) => {
+    if (effectiveProjectId && entry.projectId !== effectiveProjectId) {
       return;
     }
     if (entry.id && seenIdsRef.current.has(entry.id)) {
@@ -131,7 +209,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
       enqueueLog(entry);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
+  }, [effectiveProjectId]);
 
   useEffect(() => {
     if (!incomingLog) return;
@@ -143,16 +221,54 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
     if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
   }, []);
 
+  const regexCompiled = useMemo(
+    () => (regexMode ? compileClientSafeRegex(deferredSearch.trim()) : { regex: null, error: null }),
+    [regexMode, deferredSearch]
+  );
+
   const filteredLogs = useMemo(() => {
     const q = deferredSearch.trim().toLowerCase();
     const upperLevel = selectedLevel.toUpperCase();
+    const sinceMs = sinceWindow !== 'all' ? parseSinceMs(sinceWindow) : null;
+
+    const attrPairs: Array<[string, string]> = [];
+    if (deferredAttr.trim()) {
+      for (const tok of deferredAttr.trim().split(/\s+/)) {
+        const clean = tok.replace(/^@/, '');
+        const sep = clean.search(/[:=]/);
+        if (sep > 0) {
+          attrPairs.push([clean.slice(0, sep).trim().toLowerCase(), clean.slice(sep + 1).trim().toLowerCase()]);
+        }
+      }
+    }
+
     return logs.filter((log) => {
+      if (effectiveProjectId && log.projectId !== effectiveProjectId) return false;
       if (selectedPod !== 'all' && log.pod !== selectedPod) return false;
       if (selectedLevel !== 'all' && log.level !== upperLevel) return false;
-      if (q && !stripAnsi(log.message).toLowerCase().includes(q)) return false;
+      if (sinceMs !== null) {
+        const tsMs = Date.parse(log.timestamp);
+        if (Number.isFinite(tsMs) && tsMs < sinceMs) return false;
+      }
+      if (attrPairs.length > 0) {
+        const fields = log.fields || tryParseJsonMessage(log.message);
+        if (!fields) return false;
+        for (const [ak, av] of attrPairs) {
+          const fk = Object.keys(fields).find((k) => k.toLowerCase() === ak);
+          if (!fk || String(fields[fk]).toLowerCase() !== av) return false;
+        }
+      }
+      if (regexMode) {
+        if (regexCompiled.regex && !regexCompiled.regex.test(stripAnsi(log.message))) return false;
+      } else if (q) {
+        if (!stripAnsi(log.message).toLowerCase().includes(q)) return false;
+      }
       return true;
     });
-  }, [logs, selectedPod, selectedLevel, deferredSearch]);
+  }, [logs, effectiveProjectId, selectedPod, selectedLevel, sinceWindow, deferredSearch, deferredAttr, regexMode, regexCompiled]);
+
+  const errorCount = useMemo(() => filteredLogs.filter((l) => l.level === 'ERROR').length, [filteredLogs]);
+  const warnCount = useMemo(() => filteredLogs.filter((l) => l.level === 'WARN').length, [filteredLogs]);
 
   const handleTogglePause = () => {
     setIsPaused((prev) => {
@@ -168,29 +284,64 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
     });
   };
 
-  const handleDownload = () => {
-    const text = filteredLogs
-      .map((l) => `[${l.timestamp}] [${l.level}] [${formatPodLabel(l.pod)}] ${l.message}`)
-      .join('\n');
+  const handleDownload = async (format: 'log' | 'ndjson' = 'log') => {
+    setExporting(true);
+    try {
+      const qs = new URLSearchParams({ format, limit: '2000' });
+      if (effectiveProjectId) qs.set('projectId', effectiveProjectId);
+      if (selectedPod !== 'all') qs.set('pod', selectedPod);
+      if (selectedLevel !== 'all') qs.set('level', selectedLevel);
+      if (sinceWindow !== 'all') qs.set('since', sinceWindow);
+      if (attrFilter.trim()) qs.set('attr', attrFilter.trim());
+      if (searchQuery.trim()) {
+        if (regexMode) qs.set('regex', searchQuery.trim());
+        else qs.set('search', searchQuery.trim());
+      }
+
+      const res = await apiFetch(`/api/logs/export?${qs.toString()}`);
+      if (res.ok) {
+        const text = await res.text();
+        const blob = new Blob([text], { type: format === 'ndjson' ? 'application/x-ndjson' : 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `culkibo-logs-${Date.now()}.${format}`;
+        a.click();
+        URL.revokeObjectURL(url);
+        return;
+      }
+    } catch {
+      // Fallback below
+    } finally {
+      setExporting(false);
+    }
+
+    // Client-side fallback if server export route isn't active yet
+    const text = format === 'ndjson'
+      ? filteredLogs.map((l) => JSON.stringify(l)).join('\n')
+      : filteredLogs
+          .map((l) => `[${l.timestamp}] [${l.level}] [${formatPodLabel(l.pod)}] ${stripAnsi(l.message)}`)
+          .join('\n');
     const blob = new Blob([text], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `culkibo-logs-${Date.now()}.log`;
+    a.download = `culkibo-logs-${Date.now()}.${format}`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
+  // Fixed: slice(-30) takes the LATEST 30 errors/events instead of oldest 30!
   const handleCopyForAi = async () => {
     const problemLines = filteredLogs
       .filter((l) => l.level === 'ERROR' || l.level === 'WARN')
-      .slice(0, 30);
-    const sample = problemLines.length > 0 ? problemLines : filteredLogs.slice(0, 30);
+      .slice(-30);
+    const sample = problemLines.length > 0 ? problemLines : filteredLogs.slice(-30);
     const body = sample
-      .map((l) => `[${formatLogTime(l.timestamp)}] [${l.level}] [${formatPodLabel(l.pod)}] ${l.message}`)
+      .map((l) => `[${formatLogTime(l.timestamp)}] [${l.level}] [${formatPodLabel(l.pod)}] ${stripAnsi(l.message)}`)
       .join('\n');
     const prompt = [
-      `Estoy depurando ${projectId ? `el proyecto "${projectId}"` : 'el servidor'} en Culkibo.`,
+      `Estoy depurando ${effectiveProjectId ? `el proyecto "${effectiveProjectId}"` : 'el servidor'} en Culkibo.`,
       problemLines.length > 0
         ? 'Estos son los últimos errores y avisos registrados:'
         : 'Estos son los últimos eventos registrados:',
@@ -223,100 +374,193 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
 
   return (
     <div className="flex flex-col h-full space-y-3">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 p-2.5 rounded-xl bg-white border border-slate-200">
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label="Filtrar por origen"
-            value={selectedPod}
-            onChange={(e) => setSelectedPod(e.target.value)}
-            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
-          >
-            <option value="all">Todos los orígenes</option>
-            <option value="forge">Desarrollo (Live Sync)</option>
-            <option value="citadel">Producción</option>
-            <option value="edge">Enrutador (Caddy)</option>
-          </select>
+      <div className="flex flex-col gap-2.5 p-2.5 rounded-xl bg-white border border-slate-200">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            {!projectId && projects.length > 0 && (
+              <select
+                aria-label="Filtrar por proyecto"
+                value={selectedProjectId}
+                onChange={(e) => setSelectedProjectId(e.target.value)}
+                className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
+              >
+                <option value="all">Todos los proyectos</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            )}
 
-          <select
-            aria-label="Filtrar por nivel"
-            value={selectedLevel}
-            onChange={(e) => setSelectedLevel(e.target.value)}
-            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
-          >
-            <option value="all">Todos los niveles</option>
-            <option value="info">INFO</option>
-            <option value="hot_sync">HOT_SYNC</option>
-            <option value="success">SUCCESS</option>
-            <option value="warn">WARN</option>
-            <option value="error">ERROR</option>
-          </select>
+            <select
+              aria-label="Filtrar por origen"
+              value={selectedPod}
+              onChange={(e) => setSelectedPod(e.target.value)}
+              className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
+            >
+              <option value="all">Todos los orígenes</option>
+              <option value="forge">Desarrollo (Live Sync)</option>
+              <option value="citadel">Producción</option>
+              <option value="edge">Enrutador (Caddy)</option>
+            </select>
 
-          <div className="relative">
-            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" />
+            <select
+              aria-label="Filtrar por nivel"
+              value={selectedLevel}
+              onChange={(e) => setSelectedLevel(e.target.value)}
+              className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
+            >
+              <option value="all">Todos los niveles</option>
+              <option value="info">INFO</option>
+              <option value="hot_sync">HOT_SYNC</option>
+              <option value="success">SUCCESS</option>
+              <option value="warn">WARN</option>
+              <option value="error">ERROR</option>
+            </select>
+
+            <select
+              aria-label="Ventana de tiempo"
+              value={sinceWindow}
+              onChange={(e) => setSinceWindow(e.target.value)}
+              className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
+            >
+              <option value="all">Todo el historial</option>
+              <option value="5m">Últimos 5m</option>
+              <option value="15m">Últimos 15m</option>
+              <option value="1h">Última 1h</option>
+              <option value="6h">Últimas 6h</option>
+              <option value="24h">Últimas 24h</option>
+            </select>
+
+            <div className="relative flex items-center">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 pointer-events-none" />
+              <input
+                type="text"
+                placeholder={regexMode ? 'Regex p. ej. timeout|50[0-4]…' : 'Buscar en registros…'}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void fetchServerLogs();
+                }}
+                className="pl-8 pr-10 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-slate-800 placeholder-slate-400 w-52 sm:w-60 font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => setRegexMode((v) => !v)}
+                aria-label="Alternar búsqueda por expresión regular"
+                title="Activar/desactivar búsqueda Regex (protegida contra ReDoS)"
+                className={`absolute right-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold cursor-pointer border ${
+                  regexMode
+                    ? 'bg-slate-900 text-white border-slate-900'
+                    : 'bg-slate-50 text-slate-500 border-slate-200 hover:text-slate-900'
+                }`}
+              >
+                .*
+              </button>
+            </div>
+
             <input
               type="text"
-              placeholder="Buscar en registros…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-8 pr-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-slate-800 placeholder-slate-400 w-52 sm:w-60"
+              placeholder="@status:500 method=POST"
+              value={attrFilter}
+              onChange={(e) => setAttrFilter(e.target.value)}
+              aria-label="Filtrar por atributos JSON estructurados"
+              className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800 placeholder-slate-400 w-40"
+              title="Filtra campos JSON o key=value (ej. status=500)"
             />
+          </div>
+
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <button
+              type="button"
+              onClick={() => void fetchServerLogs()}
+              disabled={refreshing}
+              aria-label="Consultar historial en servidor"
+              title="Consultar historial persistente del servidor"
+              className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-slate-900 transition-colors cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void handleCopyForAi()}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 transition-colors cursor-pointer"
+              title="Copia los últimos 30 errores más recientes listos para pegar en un agente de IA"
+            >
+              {copiedAi ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-slate-500" />}
+              <span>{copiedAi ? 'Copiado para IA' : 'Copiar errores para IA'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleTogglePause}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer tabular-nums ${
+                isPaused
+                  ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
+                  : 'bg-white text-slate-700 hover:bg-slate-50 border-slate-200'
+              }`}
+            >
+              {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+              <span>{isPaused ? (pausedBuffered > 0 ? `Reanudar (+${pausedBuffered})` : 'Reanudar') : 'Pausar'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setLogs([])}
+              aria-label="Limpiar vista de registros"
+              className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
+              title="Limpiar vista"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              type="button"
+              disabled={exporting}
+              onClick={() => void handleDownload('log')}
+              aria-label="Exportar registros en formato .log"
+              className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-600 hover:text-slate-900 transition-colors cursor-pointer disabled:opacity-50"
+              title="Exportar historial filtrado (.log)"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>.log</span>
+            </button>
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 flex-wrap">
-          <button
-            type="button"
-            onClick={() => void handleCopyForAi()}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 transition-colors cursor-pointer"
-            title="Copia los últimos errores listos para pegar en un agente de IA"
-          >
-            {copiedAi ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-slate-500" />}
-            <span>{copiedAi ? 'Copiado para IA' : 'Copiar errores para IA'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={handleTogglePause}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer tabular-nums ${
-              isPaused
-                ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
-                : 'bg-white text-slate-700 hover:bg-slate-50 border-slate-200'
-            }`}
-          >
-            {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-            <span>{isPaused ? (pausedBuffered > 0 ? `Reanudar (+${pausedBuffered})` : 'Reanudar') : 'Pausar'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setLogs([])}
-            aria-label="Limpiar vista de registros"
-            className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
-            title="Limpiar vista"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-
-          <button
-            type="button"
-            onClick={handleDownload}
-            aria-label="Descargar archivo de registros"
-            className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-slate-900 transition-colors cursor-pointer"
-            title="Descargar archivo .log"
-          >
-            <Download className="w-3.5 h-3.5" />
-          </button>
-        </div>
+        {regexMode && regexCompiled.error && (
+          <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1">
+            {regexCompiled.error}
+          </div>
+        )}
       </div>
 
       <div className="flex-1 rounded-xl bg-white border border-slate-200 flex flex-col overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 border-b border-slate-200">
           <div className="flex items-center gap-2">
             <Terminal className="w-4 h-4 text-slate-500" />
-            <span className="text-xs font-semibold text-slate-800">Registros en tiempo real</span>
+            <span className="text-xs font-semibold text-slate-800">Explorador de registros estructurados</span>
           </div>
 
           <div className="flex items-center gap-3 text-xs text-slate-500">
+            {errorCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedLevel((l) => (l === 'error' ? 'all' : 'error'))}
+                className="px-1.5 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 font-mono text-[10px] font-semibold cursor-pointer tabular-nums"
+              >
+                {errorCount} ERR
+              </button>
+            )}
+            {warnCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedLevel((l) => (l === 'warn' ? 'all' : 'warn'))}
+                className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 font-mono text-[10px] font-semibold cursor-pointer tabular-nums"
+              >
+                {warnCount} WARN
+              </button>
+            )}
             <span className="tabular-nums">
               {filteredLogs.length} {filteredLogs.length === 1 ? 'evento' : 'eventos'}
             </span>
@@ -345,23 +589,65 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
             </div>
           ) : (
             <div className="space-y-0.5">
-              {filteredLogs.map((log) => (
-                <div
-                  key={log.id}
-                  className="flex flex-col sm:flex-row sm:items-start gap-1 sm:gap-2.5 hover:bg-slate-50 px-2 py-1.5 sm:py-1 rounded transition-colors"
-                >
-                  <div className="flex items-center gap-2 shrink-0">
-                    <span className="text-slate-400 shrink-0 select-none w-16 tabular-nums">{formatLogTime(log.timestamp)}</span>
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border shrink-0 w-16 text-center ${getLevelBadge(log.level)}`}>
-                      {log.level}
-                    </span>
-                    <span className="text-slate-500 shrink-0 font-medium w-16 truncate" title={log.pod}>
-                      [{formatPodLabel(log.pod)}]
-                    </span>
+              {filteredLogs.map((log) => {
+                const jsonObj = tryParseJsonMessage(log.message);
+                const fields = log.fields || jsonObj;
+                const isExpanded = Boolean(expandedIds[log.id]);
+                const fieldEntries = fields ? Object.entries(fields).slice(0, 5) : [];
+                return (
+                  <div
+                    key={log.id}
+                    className="hover:bg-slate-50 px-2 py-1.5 sm:py-1 rounded transition-colors"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-start gap-1 sm:gap-2.5">
+                      <div className="flex items-center gap-2 shrink-0">
+                        {jsonObj ? (
+                          <button
+                            type="button"
+                            onClick={() => setExpandedIds((prev) => ({ ...prev, [log.id]: !prev[log.id] }))}
+                            aria-label="Expandir JSON"
+                            className="text-slate-400 hover:text-slate-700 cursor-pointer"
+                          >
+                            {isExpanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                          </button>
+                        ) : (
+                          <span className="w-3.5 hidden sm:inline-block" />
+                        )}
+                        <span className="text-slate-400 shrink-0 select-none w-16 tabular-nums">{formatLogTime(log.timestamp)}</span>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border shrink-0 w-16 text-center ${getLevelBadge(log.level)}`}>
+                          {log.level}
+                        </span>
+                        <span className="text-slate-500 shrink-0 font-medium w-16 truncate" title={log.pod}>
+                          [{formatPodLabel(log.pod)}]
+                        </span>
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <span className="whitespace-pre-wrap break-words text-slate-800">{stripAnsi(log.message)}</span>
+                        {fieldEntries.length > 0 && !isExpanded && (
+                          <div className="flex flex-wrap items-center gap-1 mt-1">
+                            {fieldEntries.map(([k, v]) => (
+                              <button
+                                key={k}
+                                type="button"
+                                onClick={() => setAttrFilter(`${k}=${String(v)}`)}
+                                title={`Filtrar por ${k}=${String(v)}`}
+                                className="px-1.5 py-0.2 rounded bg-slate-100 hover:bg-slate-200 text-slate-600 text-[10px] font-mono cursor-pointer"
+                              >
+                                {k}={String(v).slice(0, 28)}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {jsonObj && isExpanded && (
+                          <pre className="mt-1.5 p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-[11px] text-slate-700 overflow-x-auto">
+                            {JSON.stringify(jsonObj, null, 2)}
+                          </pre>
+                        )}
+                      </div>
+                    </div>
                   </div>
-                  <span className="whitespace-pre-wrap break-words text-slate-800 min-w-0 flex-1">{stripAnsi(log.message)}</span>
-                </div>
-              ))}
+                );
+              })}
               <div ref={terminalEndRef} />
             </div>
           )}

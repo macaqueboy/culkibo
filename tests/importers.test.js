@@ -179,6 +179,196 @@ services:
   assert.deepStrictEqual(dokployRes.domains, ['app.example.com']);
   console.log('  ✓ Parseadores de Vercel, Netlify, Railway, Render, Dokploy y detección de BDs en .env verificados');
 
+  // 4b. Fly.io (`fly.toml`), Heroku (`Procfile` + `app.json`), Multi-service `render.yaml` y Compose v3 (`profiles`/`secrets`/`configs`/`env_file`/`healthcheck`/`deploy.resources.limits`)
+  const flyToml = [
+    'app = "billing-edge"',
+    'primary_region = "mad"',
+    '',
+    '[build]',
+    '  dockerfile = "Dockerfile.prod"',
+    '',
+    '[env]',
+    '  NODE_ENV = "production"',
+    '  LOG_LEVEL = "info"',
+    '',
+    '[http_service]',
+    '  internal_port = 8080',
+    '  force_https = true',
+    '',
+    '[[http_service.checks]]',
+    '  path = "/healthz"',
+    '  interval = "15s"',
+    '',
+    '[mounts]',
+    '  source = "billing_data"',
+    '  destination = "/app/data"',
+    '',
+    '[processes]',
+    '  app = "node dist/server.js"',
+    '  worker = "node dist/worker.js"',
+    '',
+    '[[vm]]',
+    '  memory = "1gb"',
+    '  cpus = 2'
+  ].join('\n');
+  const flyRes = universalImporter.parsePlatformConfig({ platform: 'auto', configText: flyToml });
+  assert.strictEqual(flyRes.platform, 'fly');
+  assert.strictEqual(flyRes.name, 'billing-edge');
+  assert.strictEqual(flyRes.region, 'mad');
+  assert.strictEqual(flyRes.port, 8080);
+  assert.strictEqual(flyRes.healthPath, '/healthz');
+  assert.strictEqual(flyRes.memoryMb, 1024);
+  assert.strictEqual(flyRes.cpus, 2);
+  assert.strictEqual(flyRes.startCommand, 'node dist/server.js');
+  assert.strictEqual(flyRes.volumes[0].mount_path, '/app/data');
+  assert.strictEqual(flyRes.envVars.LOG_LEVEL, 'info');
+
+  const herokuAppJson = JSON.stringify({
+    name: 'crm-heroku',
+    description: 'CRM SaaS',
+    repository: 'https://github.com/acme/crm',
+    scripts: { postdeploy: 'npm run db:seed' },
+    buildpacks: [{ url: 'heroku/nodejs' }],
+    addons: ['heroku-postgresql:essential-0', { plan: 'heroku-redis:mini' }],
+    env: {
+      SECRET_KEY_BASE: { description: 'Session signing secret', generator: 'secret' },
+      APP_MODE: { value: 'saas' }
+    }
+  });
+  const procfileText = 'release: npm run migrate\nweb: node server.js\nworker: node worker.js\n';
+  const herokuRes = universalImporter.parsePlatformConfig({ platform: 'auto', configText: herokuAppJson, procfileText });
+  assert.strictEqual(herokuRes.platform, 'heroku');
+  assert.strictEqual(herokuRes.name, 'crm-heroku');
+  assert.strictEqual(herokuRes.startCommand, 'node server.js');
+  assert.strictEqual(herokuRes.preDeployCommand, 'npm run migrate');
+  assert.strictEqual(herokuRes.postDeployCommand, 'npm run db:seed');
+  assert.strictEqual(herokuRes.workers.length, 1);
+  assert.strictEqual(herokuRes.workers[0].name, 'worker');
+  assert.strictEqual(herokuRes.envVars.SECRET_KEY_BASE, '${vault.SECRET_KEY_BASE}');
+  assert.ok(herokuRes.generatedSecrets.includes('SECRET_KEY_BASE'));
+  assert.ok(herokuRes.recommendedDatabases.some((d) => d.engine === 'postgres'));
+  assert.ok(herokuRes.recommendedDatabases.some((d) => d.engine === 'valkey'));
+
+  const procOnly = universalImporter.parsePlatformConfig({ platform: 'auto', configText: 'web: gunicorn app:app\nworker: celery -A app worker\n' });
+  assert.strictEqual(procOnly.platform, 'procfile');
+  assert.strictEqual(procOnly.startCommand, 'gunicorn app:app');
+
+  const multiRenderYaml = [
+    'previews:',
+    '  generation: automatic',
+    'services:',
+    '  - type: web',
+    '    name: render-web',
+    '    buildCommand: npm ci && npm run build',
+    '    startCommand: npm start',
+    '    healthCheckPath: /api/health',
+    '    envVars:',
+    '      - key: PORT',
+    '        value: "4000"',
+    '      - key: STRIPE_KEY',
+    '        sync: false',
+    '      - key: SESSION_SECRET',
+    '        generateValue: true',
+    '  - type: worker',
+    '    name: render-worker',
+    '    startCommand: node worker.js',
+    '  - type: cron',
+    '    name: nightly-report',
+    '    schedule: "0 2 * * *"',
+    '    startCommand: node scripts/report.js',
+    'databases:',
+    '  - name: render-pg',
+    '    databaseName: app_prod',
+    '    user: app_user',
+    '    postgresMajorVersion: 16'
+  ].join('\n');
+  const multiRenderRes = universalImporter.parsePlatformConfig({ platform: 'auto', configText: multiRenderYaml });
+  assert.strictEqual(multiRenderRes.platform, 'render');
+  assert.strictEqual(multiRenderRes.services.length, 2, 'Debe parsear web + worker');
+  assert.strictEqual(multiRenderRes.crons.length, 1, 'Debe parsear cron');
+  assert.strictEqual(multiRenderRes.databases.length, 1, 'Debe parsear databases:');
+  assert.strictEqual(multiRenderRes.databases[0].image, 'postgres:16-alpine');
+  assert.strictEqual(multiRenderRes.envVars.STRIPE_KEY, '${vault.STRIPE_KEY}');
+  assert.ok(multiRenderRes.secretEnvKeys.includes('STRIPE_KEY'));
+  assert.ok(multiRenderRes.generatedSecrets.includes('SESSION_SECRET'));
+  assert.strictEqual(multiRenderRes.previews.generation, 'automatic');
+
+  const composeV3Yaml = [
+    'services:',
+    '  web:',
+    '    image: node:22-alpine',
+    '    ports:',
+    '      - "3000:3000"',
+    '    env_file:',
+    '      - .env.prod',
+    '    secrets:',
+    '      - db_password',
+    '      - source: jwt_signing_key',
+    '        target: /run/secrets/jwt',
+    '    configs:',
+    '      - app_cfg',
+    '    healthcheck:',
+    '      test: ["CMD", "curl", "-f", "http://localhost:3000/ready"]',
+    '      interval: 15s',
+    '      timeout: 5s',
+    '      retries: 3',
+    '    deploy:',
+    '      resources:',
+    '        limits:',
+    '          memory: 768M',
+    '          cpus: "1.5"',
+    '  debug-ui:',
+    '    image: adminer:4.8.1',
+    '    profiles:',
+    '      - debug',
+    '    ports:',
+    '      - "8080:8080"',
+    'secrets:',
+    '  db_password:',
+    '    file: ./secrets/db_password.txt',
+    '  jwt_signing_key:',
+    '    external: true',
+    'configs:',
+    '  app_cfg:',
+    '    file: ./config/app.json'
+  ].join('\n');
+  const parsedV3 = universalImporter.parseDockerCompose(composeV3Yaml);
+  assert.deepStrictEqual(parsedV3.profilesDetected, ['debug']);
+  assert.ok(parsedV3.secrets.db_password && parsedV3.secrets.db_password.file === './secrets/db_password.txt');
+  assert.ok(parsedV3.configs.app_cfg && parsedV3.configs.app_cfg.file === './config/app.json');
+  const webSvc = parsedV3.services.find((s) => s.name === 'web');
+  assert.strictEqual(webSvc.healthPath, '/ready');
+  assert.strictEqual(webSvc.healthcheck.retries, 3);
+  assert.strictEqual(webSvc.resources.memoryMb, 768);
+  assert.strictEqual(webSvc.resources.cpus, 1.5);
+  assert.strictEqual(webSvc.secrets.length, 2);
+  assert.strictEqual(webSvc.configs.length, 1);
+  assert.deepStrictEqual(webSvc.envFile, ['.env.prod']);
+  const debugSvc = parsedV3.services.find((s) => s.name === 'debug-ui');
+  assert.deepStrictEqual(debugSvc.profiles, ['debug']);
+  assert.strictEqual(debugSvc.profileGated, true);
+
+  // importDockerCompose debe omitir debug-ui por defecto y respetar profiles: ['debug'] cuando se activa
+  const impDefault = await universalImporter.importDockerCompose({ yamlText: composeV3Yaml, projectName: 'ComposeV3 Default' });
+  try {
+    assert.strictEqual(impDefault.importedServices, 1, 'Servicio con profile debug debe omitirse por defecto');
+    assert.deepStrictEqual(impDefault.skippedProfileServices, ['debug-ui']);
+    assert.strictEqual(impDefault.project.healthPath, '/ready');
+    assert.strictEqual(impDefault.project.memoryMb, 768);
+  } finally {
+    projectManager.delete(impDefault.project.id);
+    await projectManager.flushToDisk();
+  }
+  const impDebug = await universalImporter.importDockerCompose({ yamlText: composeV3Yaml, projectName: 'ComposeV3 Debug', profiles: ['debug'] });
+  try {
+    assert.strictEqual(impDebug.importedServices, 2, 'Con profiles:["debug"] debe importar ambos servicios');
+    assert.deepStrictEqual(impDebug.skippedProfileServices, []);
+  } finally {
+    projectManager.delete(impDebug.project.id);
+    await projectManager.flushToDisk();
+  }
+  console.log('  ✓ Fly.io (fly.toml), Heroku (Procfile/app.json), Render multi-servicio y Compose v3 (profiles/secrets/configs/env_file/healthcheck/limits) verificados');
+
   // 5. Git URL inspector SSRF + protocol checks
   await assert.rejects(() => universalImporter.inspectGitUrl('file:///etc/passwd'), /protocolo|http|esquema|SSRF|bloquead/i);
   await assert.rejects(() => universalImporter.inspectGitUrl('http://127.0.0.1:3030/repo.git'), /SSRF|privad|bloquead/i);

@@ -872,6 +872,231 @@ async function testEnvironmentsGitops() {
     assert.ok(convertedRender.yaml.includes('${vault.DATABASE_URL}'));
     console.log('  ✓ convertExternalToCulkiboYaml: conversión segura desde docker-compose y render.yaml sin fugas de secretos');
 
+    // ========================================================================
+    // 7. JSON Schema, Importer Bridges (Fly/Heroku/Render Multi/Compose v3)
+    //    y Webhook GitOps Auto-Plan / Non-Destructive Apply + Async PR Dedupe
+    // ========================================================================
+    const schema = gitops.getJsonSchema();
+    assert.strictEqual(schema.$schema, 'https://json-schema.org/draft/2020-12/schema');
+    assert.strictEqual(schema.properties.version.const, 1);
+    assert.ok(schema.properties.projects && schema.properties.databases && schema.properties.domains && schema.properties.crons && schema.properties.monitors);
+
+    const expWithSchema = gitops.exportStack({ name: 'shop-stack', schemaUrl: 'https://panel.example.com/api/gitops/schema.json' });
+    assert.ok(expWithSchema.yaml.startsWith('# yaml-language-server: $schema=https://panel.example.com/api/gitops/schema.json\n'));
+    assert.strictEqual(parseSafeYaml(expWithSchema.yaml).version, 1);
+
+    // Bridge fly.toml -> culkibo.yaml
+    const flyYaml = gitops.convertExternalToCulkiboYaml('auto', 'app = "edge-api"\nprimary_region = "mad"\n[http_service]\ninternal_port = 8080\n[[http_service.checks]]\npath = "/up"\n[[vm]]\nmemory = "512mb"\ncpus = 1\n');
+    assert.strictEqual(flyYaml.platform, 'fly');
+    assert.strictEqual(flyYaml.manifest.projects[0].containerPort, 8080);
+    assert.strictEqual(flyYaml.manifest.projects[0].healthPath, '/up');
+    assert.strictEqual(flyYaml.manifest.projects[0].memoryMb, 512);
+
+    // Bridge Heroku app.json + Procfile -> culkibo.yaml (web + worker + addons + vaultRef)
+    const herokuYaml = gitops.convertExternalToCulkiboYaml(
+      'heroku',
+      JSON.stringify({ name: 'h-saas', addons: ['heroku-postgresql:mini'], env: { APP_SECRET: { generator: 'secret' } } }),
+      { procfileText: 'web: node web.js\nworker: node worker.js\n' }
+    );
+    assert.strictEqual(herokuYaml.manifest.projects.length, 2, 'Heroku web + worker debe generar 2 proyectos');
+    assert.strictEqual(herokuYaml.manifest.databases[0].engine, 'postgres');
+    assert.ok(herokuYaml.vaultRefs.includes('APP_SECRET'));
+
+    // Bridge multi-service render.yaml (web + worker + cron + databases + sync:false)
+    const multiRenderYaml = gitops.convertExternalToCulkiboYaml('render', [
+      'services:',
+      '  - type: web',
+      '    name: r-web',
+      '    startCommand: npm start',
+      '    envVars:',
+      '      - key: BILLING_KEY',
+      '        sync: false',
+      '  - type: worker',
+      '    name: r-worker',
+      '    startCommand: node worker.js',
+      '  - type: cron',
+      '    name: r-cron',
+      '    schedule: "0 4 * * *"',
+      '    startCommand: node scripts/cleanup.js',
+      'databases:',
+      '  - name: r_pg',
+      '    postgresMajorVersion: 16'
+    ].join('\n'));
+    assert.strictEqual(multiRenderYaml.manifest.projects.length, 2);
+    assert.strictEqual(multiRenderYaml.manifest.databases.length, 1);
+    assert.strictEqual(multiRenderYaml.manifest.crons.length, 1);
+    assert.ok(multiRenderYaml.vaultRefs.includes('BILLING_KEY'));
+
+    // Bridge Compose v3 (profiles excluidos por defecto, secrets -> ${vault.*}, healthcheck + limits)
+    const v3Converted = gitops.convertExternalToCulkiboYaml('docker-compose', [
+      'services:',
+      '  app:',
+      '    image: node:22-alpine',
+      '    ports: ["3000:3000"]',
+      '    secrets: [jwt_key]',
+      '    healthcheck:',
+      '      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]',
+      '    deploy:',
+      '      resources:',
+      '        limits:',
+      '          memory: 512M',
+      '          cpus: "0.5"',
+      '  dev-tools:',
+      '    image: adminer:4.8.1',
+      '    profiles: [debug]'
+    ].join('\n'));
+    assert.strictEqual(v3Converted.manifest.projects.length, 1, 'Servicio con profile debug debe omitirse por defecto');
+    assert.strictEqual(v3Converted.manifest.projects[0].healthPath, '/healthz');
+    assert.strictEqual(v3Converted.manifest.projects[0].memoryMb, 512);
+    assert.strictEqual(v3Converted.manifest.projects[0].cpus, 0.5);
+    assert.ok(v3Converted.vaultRefs.includes('JWT_KEY'));
+
+    // Webhook-triggered GitOps: off (fail-closed), plan (0 mutaciones) y apply (SIEMPRE prune:false)
+    const whDir = path.join(tmpRoot, 'wh-gitops');
+    const whRepoDir = path.join(tmpRoot, 'wh-repo');
+    fs.mkdirSync(whRepoDir, { recursive: true });
+    const whDeps = createIsolatedManagers();
+    const whEnvMgr = new EnvironmentManager({ dataDir: whDir, domainManager: whDeps.domainManager });
+    const whGitops = new GitOpsManager({
+      dataDir: whDir,
+      projectManager: whDeps.projectManager,
+      domainManager: whDeps.domainManager,
+      cronManager: whDeps.cronManager,
+      databaseManager: whDeps.databaseManager,
+      environmentManager: whEnvMgr,
+      uptimeMonitor: whDeps.uptimeMonitor
+    });
+    const whManifestYaml = [
+      'version: 1',
+      'name: wh-stack',
+      'projects:',
+      '  - id: proj_wh',
+      '    name: Webhook App',
+      '    containerPort: 3000',
+      '    memoryMb: 512',
+      'databases:',
+      '  - name: wh_pg',
+      '    engine: postgres',
+      '    projectId: proj_wh'
+    ].join('\n') + '\n';
+    fs.writeFileSync(path.join(whRepoDir, 'culkibo.yaml'), whManifestYaml, 'utf8');
+
+    // Traversal en readRepoManifestSafe bloqueado
+    assert.throws(() => whGitops.readRepoManifestSafe(whRepoDir, '../secret.yaml'), /inválida|Escape/i);
+
+    // 1) gitopsAutoSync: off -> fail-closed
+    const offRes = await whGitops.reconcileWebhookManifest({
+      project: { id: 'proj_wh', name: 'Webhook App', gitopsAutoSync: 'off' },
+      repoDir: whRepoDir
+    });
+    assert.strictEqual(offRes.skipped, true);
+    assert.strictEqual(whDeps.projectManager.getAll().length, 0);
+
+    // 2) gitopsAutoSync: plan -> dry-run puro (0 mutaciones)
+    const planRes = await whGitops.reconcileWebhookManifest({
+      project: { id: 'proj_wh', name: 'Webhook App', gitopsAutoSync: 'plan' },
+      repoDir: whRepoDir,
+      provider: 'github'
+    });
+    assert.strictEqual(planRes.mode, 'plan');
+    assert.strictEqual(planRes.applied, false);
+    assert.strictEqual(planRes.summary.create, 2);
+    assert.strictEqual(whDeps.projectManager.getAll().length, 0, 'Webhook plan JAMÁS muta estado vivo');
+
+    // 3) gitopsAutoSync: apply -> reconcilia proyecto+BD, y si un push posterior quita la BD, prune:false la PROTEGE
+    const applyRes = await whGitops.reconcileWebhookManifest({
+      project: { id: 'proj_wh', name: 'Webhook App', gitopsAutoSync: 'apply' },
+      repoDir: whRepoDir,
+      provider: 'github'
+    });
+    assert.strictEqual(applyRes.mode, 'apply');
+    assert.strictEqual(applyRes.applied, true);
+    assert.strictEqual(applyRes.prune, false);
+    assert.strictEqual(whDeps.projectManager.getAll().length, 1);
+    assert.strictEqual(whDeps.databaseManager.list().length, 1);
+
+    const yamlRemovingDb = 'version: 1\nname: wh-stack\nprojects:\n  - id: proj_wh\n    name: Webhook App\n    containerPort: 3000\n    memoryMb: 1024\n';
+    fs.writeFileSync(path.join(whRepoDir, 'culkibo.yaml'), yamlRemovingDb, 'utf8');
+    await whGitops.reconcileWebhookManifest({
+      project: { id: 'proj_wh', name: 'Webhook App', gitopsAutoSync: 'apply' },
+      repoDir: whRepoDir,
+      provider: 'github'
+    });
+    assert.strictEqual(whDeps.projectManager.getById('proj_wh').memoryMb, 1024, 'Debe aplicar cambio no destructivo');
+    assert.strictEqual(whDeps.databaseManager.list().length, 1, 'Webhook apply NUNCA debe borrar bases de datos (prune:false fijo)');
+
+    // 4) webhookService.dispatchPush + async non-blocking dispatchPullRequest con claimDelivery dedupe
+    const webhookService = require('../server/services/webhookService');
+    const githubService = require('../server/services/githubService');
+    const whProj = {
+      id: 'proj_wh_pr_test',
+      name: 'Async PR Test',
+      gitBranch: 'main',
+      autoDeploy: false,
+      gitopsAutoSync: 'plan',
+      localPath: whRepoDir,
+      previewDeployments: { enabled: true, allowForks: false }
+    };
+    githubService.forgetDeliveries(whProj.id);
+    const pushRes = await webhookService.dispatchPush({
+      provider: 'github',
+      projects: [whProj],
+      branch: 'main',
+      commitSha: 'a1b2c3d4e5f60708',
+      commitMsg: 'Update culkibo.yaml',
+      author: 'pablo',
+      deliveryId: 'deliv_gitops_1',
+      changedFiles: ['culkibo.yaml'],
+      gitopsManager: whGitops
+    });
+    assert.strictEqual(pushRes.status, 200);
+    assert.strictEqual(pushRes.body.dispatched[0].gitops.mode, 'plan');
+
+    // Async PR dispatch debe devolver 202 al instante SIN bloquear en un deployPreview lento de 500ms,
+    // y una segunda entrega idéntica debe deduplicarse vía claimDelivery.
+    let previewCalls = 0;
+    const slowPreviewMock = {
+      deployPreview: () => new Promise((resolve) => {
+        previewCalls++;
+        setTimeout(() => resolve({ key: 'pr-99' }), 150);
+      }),
+      destroyPreview: async () => ({ destroyed: true })
+    };
+    const t0 = Date.now();
+    const pr1 = await webhookService.dispatchPullRequest({
+      provider: 'github',
+      projects: [whProj],
+      action: 'opened',
+      prNumber: 99,
+      branch: 'feat/fast-webhook',
+      commitSha: 'deadbeef12345678',
+      isFork: false,
+      deliveryId: 'gh_pr_delivery_99',
+      previewManager: slowPreviewMock
+    });
+    const elapsedPrMs = Date.now() - t0;
+    assert.strictEqual(pr1.status, 202, 'dispatchPullRequest async debe responder 202 Accepted');
+    assert.strictEqual(pr1.body.results[0].action, 'preview_queued');
+    assert.ok(elapsedPrMs < 100, `dispatchPullRequest no debe bloquear esperando el build (${elapsedPrMs} ms)`);
+
+    const prDup = await webhookService.dispatchPullRequest({
+      provider: 'github',
+      projects: [whProj],
+      action: 'opened',
+      prNumber: 99,
+      branch: 'feat/fast-webhook',
+      commitSha: 'deadbeef12345678',
+      isFork: false,
+      deliveryId: 'gh_pr_delivery_99',
+      previewManager: slowPreviewMock
+    });
+    assert.strictEqual(prDup.status, 200);
+    assert.strictEqual(prDup.body.results[0].action, 'duplicate_skipped');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.strictEqual(previewCalls, 1, 'claimDelivery debe impedir la doble ejecución de deployPreview');
+    githubService.forgetDeliveries(whProj.id);
+    console.log('  ✓ JSON Schema, puentes Fly/Heroku/Render/Compose v3, webhook GitOps (plan/apply prune=false) y dispatchPullRequest async+dedupe verificados');
+
     // Confirmar cero dependencias npm nuevas
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
     assert.strictEqual(Object.keys(pkg.dependencies || {}).length, 6, 'package.json debe mantener exactamente 6 dependencias');

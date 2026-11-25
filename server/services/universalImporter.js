@@ -164,10 +164,35 @@ function expandComposeDefaults(str) {
   return String(str || '').replace(/\$\{[A-Za-z0-9_]+:-?([^}]+)\}/g, '$1');
 }
 
+/** Parsea tamaños de memoria (`512m`, `1g`, `256mb`, `536870912`) a MB enteros. */
+function parseMemoryLimitMb(raw) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const s = String(raw).trim().toLowerCase();
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(b|k|kb|ki|kib|m|mb|mi|mib|g|gb|gi|gib)?$/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = m[2] || 'b';
+  if (unit.startsWith('g')) return Math.round(n * 1024);
+  if (unit.startsWith('m')) return Math.round(n);
+  if (unit.startsWith('k')) return Math.max(1, Math.round(n / 1024));
+  return n > 1024 * 1024 ? Math.round(n / (1024 * 1024)) : Math.round(n);
+}
+
+/** Extrae una ruta HTTP de salud (`/health`, `/up`, etc.) desde un comando healthcheck de Compose. */
+function extractHealthPathFromTest(testStr) {
+  const s = String(testStr || '');
+  const m = s.match(/https?:\/\/[^/\s"']+(\/[A-Za-z0-9._~\-/]*)/i);
+  if (m && m[1] && !m[1].includes('..')) return m[1];
+  return null;
+}
+
 /**
- * Parser ligero de `docker-compose.yml` sin dependencias externas.
+ * Parser ligero de `docker-compose.yml` / Compose v3 sin dependencias externas.
  * Soporta listas con indentación cero, arrays/mapas inline (`[...]`, `{...}`),
- * sintaxis larga de `ports:`/`volumes:`, `expose:`, `${PORT:-3000}` y `depends_on` corto/largo.
+ * sintaxis larga de `ports:`/`volumes:`/`secrets:`/`configs:`/`env_file:`,
+ * `profiles:`, `healthcheck:`, `deploy.resources.limits`, `expose:`, `${PORT:-3000}`
+ * y `depends_on` corto/largo.
  */
 function parseDockerCompose(yamlText) {
   const text = String(yamlText || '');
@@ -175,35 +200,84 @@ function parseDockerCompose(yamlText) {
   if (text.length > 512 * 1024) throw new Error('El archivo Compose supera el límite de 512 KB');
 
   const lines = text.split(/\r?\n/);
+  const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
   // Pre-pasada ligera: capturar anclas de extensión de nivel raíz (`x-common: &common`)
-  // para resolver `<<: *common` dentro de los servicios sin dependencias YAML externas.
+  // y secciones top-level `secrets:` / `configs:` de Compose v3.
   /** @type {Map<string, Record<string, any>>} */
   const yamlAnchors = new Map();
+  /** @type {Record<string, { file?: string, external?: boolean, environment?: string, name?: string }>} */
+  const topSecrets = {};
+  /** @type {Record<string, { file?: string, external?: boolean, name?: string }>} */
+  const topConfigs = {};
   /** @type {string | null} */
   let curAnchor = null;
   let anchorPropIndent = -1;
   /** @type {string | null} */
   let anchorSection = null;
+  /** @type {'secrets' | 'configs' | null} */
+  let topSection = null;
+  let topItemIndent = -1;
+  /** @type {string | null} */
+  let curTopItem = null;
+
   for (const rawLine of lines) {
     const line = stripYamlComment(rawLine);
     if (!line.trim()) continue;
     const indent = line.search(/\S/);
     const trimmed = line.trim();
     if (indent === 0) {
+      curAnchor = null;
+      anchorSection = null;
+      topSection = null;
+      curTopItem = null;
+      topItemIndent = -1;
       const am = trimmed.match(/^x-[a-zA-Z0-9_-]+\s*:\s*&([a-zA-Z0-9_-]+)\s*$/);
       if (am && am[1]) {
         const anchorName = am[1];
         curAnchor = anchorName;
-        yamlAnchors.set(anchorName, { envVars: {}, restart: '', image: '', ports: [], volumes: [] });
+        yamlAnchors.set(anchorName, { envVars: {}, restart: '', image: '', ports: [], volumes: [], profiles: [], envFile: [] });
         anchorPropIndent = -1;
-        anchorSection = null;
-      } else {
-        curAnchor = null;
-        anchorSection = null;
+      } else if (/^secrets\s*:/.test(trimmed)) {
+        topSection = 'secrets';
+      } else if (/^configs\s*:/.test(trimmed)) {
+        topSection = 'configs';
       }
       continue;
     }
+
+    if (topSection) {
+      const store = topSection === 'secrets' ? topSecrets : topConfigs;
+      if (topItemIndent === -1) topItemIndent = indent;
+      if (indent === topItemIndent) {
+        const tm = trimmed.match(/^([a-zA-Z0-9_.-]+)\s*:(.*)$/);
+        if (tm && !UNSAFE_KEYS.has(tm[1])) {
+          const itemKey = tm[1];
+          curTopItem = itemKey;
+          store[itemKey] = {};
+          const inlineMap = parseFlowMap(tm[2].trim());
+          if (inlineMap) {
+            if (inlineMap.file) store[itemKey].file = inlineMap.file;
+            if (inlineMap.name) store[itemKey].name = inlineMap.name;
+            if (inlineMap.external === 'true') store[itemKey].external = true;
+            if (topSection === 'secrets' && inlineMap.environment) topSecrets[itemKey].environment = inlineMap.environment;
+          }
+        }
+      } else if (curTopItem && indent > topItemIndent) {
+        const itemKey = curTopItem;
+        const km = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:\s*(.*)$/);
+        if (km) {
+          const fk = km[1];
+          const fv = unquote(km[2].trim());
+          if (fk === 'file' && fv) store[itemKey].file = fv;
+          else if (fk === 'name' && fv) store[itemKey].name = fv;
+          else if (fk === 'external') store[itemKey].external = fv === '' || fv === 'true';
+          else if (fk === 'environment' && topSection === 'secrets' && fv) topSecrets[itemKey].environment = fv;
+        }
+      }
+      continue;
+    }
+
     if (!curAnchor) continue;
     const target = yamlAnchors.get(curAnchor);
     if (!target) continue;
@@ -215,7 +289,14 @@ function parseDockerCompose(yamlText) {
       const rest = m[2].trim();
       if (anchorSection === 'restart' && rest) target.restart = unquote(rest);
       else if (anchorSection === 'image' && rest) target.image = unquote(rest);
-      else if (anchorSection === 'environment' && rest) {
+      else if (anchorSection === 'profiles' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) target.profiles.push(...arr);
+      } else if (anchorSection === 'env_file' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) target.envFile.push(...arr);
+        else target.envFile.push(unquote(rest));
+      } else if (anchorSection === 'environment' && rest) {
         const map = parseFlowMap(rest);
         if (map) Object.assign(target.envVars, map);
       }
@@ -228,9 +309,15 @@ function parseDockerCompose(yamlText) {
         const eq = trimmed.indexOf(':');
         if (eq > 0) {
           const k = trimmed.slice(0, eq).trim();
-          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) target.envVars[k] = unquote(trimmed.slice(eq + 1).trim());
+          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) && !UNSAFE_KEYS.has(k)) target.envVars[k] = unquote(trimmed.slice(eq + 1).trim());
         }
       }
+    } else if (anchorSection === 'profiles' && trimmed.startsWith('-')) {
+      const p = unquote(trimmed.slice(1).trim());
+      if (p) target.profiles.push(p);
+    } else if (anchorSection === 'env_file' && trimmed.startsWith('-')) {
+      const ef = unquote(trimmed.slice(1).trim());
+      if (ef) target.envFile.push(ef);
     }
   }
 
@@ -247,6 +334,9 @@ function parseDockerCompose(yamlText) {
   let dependsOnIndent = -1;
   /** @type {any} */
   let longFormItem = null;
+  /** @type {Array<{ indent: number, key: string }>} */
+  let subPath = [];
+  let inHealthTestList = false;
 
   const flushLongForm = () => {
     if (!longFormItem || !currentService) { longFormItem = null; return; }
@@ -255,6 +345,19 @@ function parseDockerCompose(yamlText) {
       currentService.ports.push(`${pub}${longFormItem.target}`);
     } else if (longFormItem.section === 'volumes' && longFormItem.target) {
       currentService.volumes.push(`${longFormItem.source || currentService.name}:${longFormItem.target}`);
+    } else if (longFormItem.section === 'secrets' && longFormItem.source) {
+      currentService.secrets.push({
+        source: longFormItem.source,
+        ...(longFormItem.target ? { target: longFormItem.target } : {}),
+        ...(longFormItem.mode ? { mode: longFormItem.mode } : {})
+      });
+    } else if (longFormItem.section === 'configs' && longFormItem.source) {
+      currentService.configs.push({
+        source: longFormItem.source,
+        ...(longFormItem.target ? { target: longFormItem.target } : {})
+      });
+    } else if (longFormItem.section === 'env_file' && longFormItem.path) {
+      currentService.envFile.push(longFormItem.path);
     }
     longFormItem = null;
   };
@@ -267,6 +370,8 @@ function parseDockerCompose(yamlText) {
 
     if (indent === 0) {
       flushLongForm();
+      subPath = [];
+      inHealthTestList = false;
       if (/^services\s*:/.test(trimmed)) {
         inServices = true;
         servicesIndent = 0;
@@ -289,6 +394,8 @@ function parseDockerCompose(yamlText) {
 
     if (indent === serviceIndent && /^[a-zA-Z0-9_.-]+\s*:$/.test(trimmed)) {
       flushLongForm();
+      subPath = [];
+      inHealthTestList = false;
       const name = trimmed.slice(0, -1).trim();
       currentService = {
         name,
@@ -299,6 +406,13 @@ function parseDockerCompose(yamlText) {
         volumes: [],
         envVars: {},
         dependsOn: [],
+        profiles: [],
+        secrets: [],
+        configs: [],
+        envFile: [],
+        healthcheck: null,
+        healthPath: null,
+        resources: null,
         restart: '',
         command: '',
         warnings: []
@@ -320,6 +434,8 @@ function parseDockerCompose(yamlText) {
 
     if (indent === propIndent && !isZeroIndentSeq) {
       flushLongForm();
+      subPath = [];
+      inHealthTestList = false;
       const mergeMatch = trimmed.match(/^<<\s*:\s*\*([a-zA-Z0-9_-]+)$/);
       if (mergeMatch) {
         const anchor = yamlAnchors.get(mergeMatch[1]);
@@ -327,6 +443,8 @@ function parseDockerCompose(yamlText) {
           if (anchor.restart && !currentService.restart) currentService.restart = anchor.restart;
           if (anchor.image && !currentService.image) currentService.image = anchor.image;
           Object.assign(currentService.envVars, anchor.envVars);
+          if (anchor.profiles.length > 0 && currentService.profiles.length === 0) currentService.profiles.push(...anchor.profiles);
+          if (anchor.envFile.length > 0) currentService.envFile.push(...anchor.envFile);
         }
         continue;
       }
@@ -355,6 +473,20 @@ function parseDockerCompose(yamlText) {
       } else if (key === 'depends_on' && rest) {
         const arr = parseFlowArray(rest);
         if (arr) currentService.dependsOn.push(...arr);
+      } else if (key === 'profiles' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.profiles.push(...arr);
+        else currentService.profiles.push(unquote(rest));
+      } else if (key === 'secrets' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.secrets.push(...arr.map((s) => ({ source: s })));
+      } else if (key === 'configs' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.configs.push(...arr.map((c) => ({ source: c })));
+      } else if (key === 'env_file' && rest) {
+        const arr = parseFlowArray(rest);
+        if (arr) currentService.envFile.push(...arr);
+        else currentService.envFile.push(unquote(rest));
       } else if (key === 'environment' && rest) {
         const map = parseFlowMap(rest);
         if (map) Object.assign(currentService.envVars, map);
@@ -393,6 +525,97 @@ function parseDockerCompose(yamlText) {
       } else if (currentSection === 'expose' && trimmed.startsWith('-')) {
         const val = unquote(trimmed.slice(1).trim());
         if (val) currentService.expose.push(val);
+      } else if (currentSection === 'profiles' && trimmed.startsWith('-')) {
+        const val = unquote(trimmed.slice(1).trim());
+        if (val) currentService.profiles.push(val);
+      } else if (currentSection === 'env_file') {
+        if (trimmed.startsWith('-')) {
+          flushLongForm();
+          const item = trimmed.slice(1).trim();
+          const kv = item.match(/^(path|required)\s*:\s*(.+)$/);
+          if (kv) {
+            longFormItem = { section: 'env_file', [kv[1]]: unquote(kv[2]) };
+          } else {
+            const val = unquote(item);
+            if (val) currentService.envFile.push(val);
+          }
+        } else if (longFormItem && longFormItem.section === 'env_file') {
+          const kv = trimmed.match(/^(path|required)\s*:\s*(.+)$/);
+          if (kv) longFormItem[kv[1]] = unquote(kv[2]);
+        }
+      } else if (currentSection === 'secrets' || currentSection === 'configs') {
+        if (trimmed.startsWith('-')) {
+          flushLongForm();
+          const item = trimmed.slice(1).trim();
+          const kv = item.match(/^(source|target|uid|gid|mode)\s*:\s*(.+)$/);
+          if (kv) {
+            longFormItem = { section: currentSection, [kv[1]]: unquote(kv[2]) };
+          } else {
+            const val = unquote(item);
+            if (val) currentService[currentSection].push({ source: val });
+          }
+        } else if (longFormItem && longFormItem.section === currentSection) {
+          const kv = trimmed.match(/^(source|target|uid|gid|mode)\s*:\s*(.+)$/);
+          if (kv) longFormItem[kv[1]] = unquote(kv[2]);
+        }
+      } else if (currentSection === 'healthcheck') {
+        if (!currentService.healthcheck) currentService.healthcheck = {};
+        if (trimmed.startsWith('-') && inHealthTestList) {
+          const part = unquote(trimmed.slice(1).trim());
+          if (part && part !== 'CMD' && part !== 'CMD-SHELL') {
+            currentService.healthcheck.test = currentService.healthcheck.test
+              ? `${currentService.healthcheck.test} ${part}`
+              : part;
+          }
+        } else {
+          inHealthTestList = false;
+          const kv = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:(.*)$/);
+          if (kv) {
+            const hk = kv[1];
+            const hv = kv[2].trim();
+            if (hk === 'test') {
+              if (!hv) {
+                inHealthTestList = true;
+              } else {
+                const arr = parseFlowArray(hv);
+                currentService.healthcheck.test = arr
+                  ? arr.filter((x) => x !== 'CMD' && x !== 'CMD-SHELL').join(' ')
+                  : unquote(hv);
+              }
+            } else if (hk === 'interval' && hv) currentService.healthcheck.interval = unquote(hv);
+            else if (hk === 'timeout' && hv) currentService.healthcheck.timeout = unquote(hv);
+            else if (hk === 'start_period' && hv) currentService.healthcheck.startPeriod = unquote(hv);
+            else if (hk === 'retries' && hv) {
+              const r = parseInt(unquote(hv), 10);
+              if (Number.isInteger(r) && r > 0) currentService.healthcheck.retries = r;
+            } else if (hk === 'disable' && hv) {
+              currentService.healthcheck.disable = unquote(hv) === 'true';
+            }
+          }
+        }
+      } else if (currentSection === 'deploy') {
+        while (subPath.length > 0 && subPath[subPath.length - 1].indent >= indent) {
+          subPath.pop();
+        }
+        const kv = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:(.*)$/);
+        if (kv) {
+          const dk = kv[1];
+          const dv = kv[2].trim();
+          const pathKeys = subPath.map((s) => s.key);
+          if (!dv) {
+            subPath.push({ indent, key: dk });
+          } else if (pathKeys.includes('resources') && (pathKeys.includes('limits') || pathKeys.includes('reservations'))) {
+            if (!currentService.resources) currentService.resources = { memoryMb: null, cpus: null };
+            const isLimits = pathKeys.includes('limits');
+            if (dk === 'memory' && (isLimits || currentService.resources.memoryMb === null)) {
+              const mb = parseMemoryLimitMb(unquote(dv));
+              if (mb) currentService.resources.memoryMb = mb;
+            } else if (dk === 'cpus' && (isLimits || currentService.resources.cpus === null)) {
+              const c = parseFloat(unquote(dv));
+              if (Number.isFinite(c) && c > 0 && c <= 64) currentService.resources.cpus = c;
+            }
+          }
+        }
       } else if (currentSection === 'volumes') {
         if (trimmed.startsWith('-')) {
           flushLongForm();
@@ -420,7 +643,6 @@ function parseDockerCompose(yamlText) {
           }
         }
       } else if (currentSection === 'environment') {
-        const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
         if (trimmed.startsWith('-')) {
           const item = unquote(trimmed.slice(1).trim());
           const eq = item.indexOf('=');
@@ -447,11 +669,22 @@ function parseDockerCompose(yamlText) {
     throw new Error('No se encontró ningún servicio bajo la clave `services:` en el YAML proporcionado');
   }
 
+  /** @type {Set<string>} */
+  const allProfiles = new Set();
+
   for (const svc of services) {
     const db = detectDbEngine(svc.image);
     svc.kind = db ? 'database' : 'app';
     svc.dbEngine = db ? db.engine : null;
     svc.dbLabel = db ? db.label : null;
+    svc.profiles = Array.from(new Set(svc.profiles || []));
+    for (const pr of svc.profiles) allProfiles.add(pr);
+    svc.profileGated = svc.profiles.length > 0;
+
+    if (svc.healthcheck && svc.healthcheck.test && !svc.healthcheck.disable) {
+      svc.healthPath = extractHealthPathFromTest(svc.healthcheck.test);
+      svc.healthcheck.httpPath = svc.healthPath;
+    }
 
     /** @type {number | null} */
     let containerPort = null;
@@ -487,6 +720,17 @@ function parseDockerCompose(yamlText) {
       }
     }
 
+    if (svc.profiles.length > 0) {
+      svc.warnings.push(`Servicio condicionado a perfiles Compose (${svc.profiles.join(', ')}): omitido en despliegue por defecto salvo selección explícita.`);
+    }
+    if (svc.secrets.length > 0) {
+      const secNames = svc.secrets.map((s) => s.source).filter(Boolean);
+      svc.warnings.push(`Secretos Compose v3 detectados (${secNames.join(', ')}): se mapearán a referencias \${vault.*} en Culkibo.`);
+    }
+    if (svc.envFile.length > 0) {
+      svc.warnings.push(`env_file detectado (${svc.envFile.join(', ')}): carga esas variables en el entorno o Vault de Culkibo.`);
+    }
+
     if (svc.image && (/:latest$/i.test(svc.image) || !svc.image.includes(':'))) {
       svc.warnings.push(`La imagen «${svc.image}» no tiene versión fijada (evita :latest en producción).`);
     }
@@ -500,30 +744,323 @@ function parseDockerCompose(yamlText) {
     servicesCount: services.length,
     appsCount: services.filter(s => s.kind === 'app').length,
     databasesCount: services.filter(s => s.kind === 'database').length,
+    profilesDetected: Array.from(allProfiles).sort(),
+    secrets: topSecrets,
+    configs: topConfigs,
     services
   };
 }
 
+/** Parsea un `Procfile` de Heroku (`web: ...`, `worker: ...`, `release: ...`). */
+function parseProcfile(rawText) {
+  /** @type {Record<string, string>} */
+  const processes = {};
+  const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
+  for (const rawLine of String(rawText || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = line.match(/^([a-zA-Z][a-zA-Z0-9_-]{0,31})\s*:\s*(.+)$/);
+    if (m && !UNSAFE.has(m[1])) {
+      processes[m[1]] = m[2].trim();
+    }
+  }
+  return processes;
+}
+
+/** Parsea `fly.toml` (Fly.io) sin dependencias externas. */
+function parseFlyToml(raw, result) {
+  let section = '';
+  /** @type {Record<string, any> | null} */
+  let currentMount = null;
+  /** @type {Array<{ source: string, destination: string }>} */
+  const mounts = [];
+  /** @type {Record<string, string>} */
+  const processes = {};
+  /** @type {Record<string, string>} */
+  const buildArgs = {};
+  const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
+
+  const flushMount = () => {
+    if (currentMount && currentMount.destination) {
+      mounts.push({
+        source: String(currentMount.source || result.name || 'data'),
+        destination: String(currentMount.destination)
+      });
+    }
+    currentMount = null;
+  };
+
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = stripYamlComment(rawLine).trim();
+    if (!line) continue;
+    const arrSec = line.match(/^\[\[([a-zA-Z0-9_.-]+)\]\]$/);
+    if (arrSec) {
+      flushMount();
+      section = arrSec[1].toLowerCase();
+      if (section === 'mounts') currentMount = {};
+      continue;
+    }
+    const objSec = line.match(/^\[([a-zA-Z0-9_.-]+)\]$/);
+    if (objSec) {
+      flushMount();
+      section = objSec[1].toLowerCase();
+      if (section === 'mounts') currentMount = {};
+      continue;
+    }
+    const kv = line.match(/^([a-zA-Z0-9_.-]+)\s*=\s*(.+)$/);
+    if (!kv) continue;
+    const k = kv[1].trim();
+    const vRaw = kv[2].trim();
+    const v = unquote(vRaw);
+    if (UNSAFE.has(k)) continue;
+
+    if (section === '') {
+      if (k === 'app') result.name = v;
+      else if (k === 'primary_region') result.region = v;
+    } else if (section === 'build') {
+      if (k === 'dockerfile') result.dockerfile = v;
+      else if (k === 'image') result.image = v;
+      else if (k === 'builder') result.builder = v;
+    } else if (section === 'build.args') {
+      buildArgs[k] = v;
+    } else if (section === 'env') {
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) result.envVars[k] = v;
+    } else if (section === 'http_service' || section === 'services') {
+      if (k === 'internal_port') {
+        const p = parseInt(v, 10);
+        if (Number.isInteger(p) && p > 0 && p < 65536) result.port = p;
+      }
+    } else if (section === 'http_service.checks' || section === 'services.http_checks' || section === 'checks') {
+      if (k === 'path' && v.startsWith('/')) result.healthPath = v;
+    } else if (section === 'mounts') {
+      if (!currentMount) currentMount = {};
+      if (k === 'source' || k === 'destination') currentMount[k] = v;
+    } else if (section === 'processes') {
+      processes[k] = v;
+    } else if (section === 'vm') {
+      if (k === 'memory') {
+        const mb = parseMemoryLimitMb(v);
+        if (mb) result.memoryMb = mb;
+      } else if (k === 'memory_mb') {
+        const mb = parseInt(v, 10);
+        if (Number.isInteger(mb) && mb >= 64) result.memoryMb = mb;
+      } else if (k === 'cpus') {
+        const c = parseFloat(v);
+        if (Number.isFinite(c) && c > 0 && c <= 64) result.cpus = c;
+      }
+    }
+  }
+  flushMount();
+
+  if (!result.port || result.port === 3000) {
+    // Fly.io default internal_port is 8080 if not explicitly set
+    if (!/internal_port\s*=/.test(raw)) result.port = 8080;
+  }
+  if (mounts.length > 0) result.volumes = mounts.map((m) => ({ name: m.source, mount_path: m.destination }));
+  if (Object.keys(processes).length > 0) {
+    result.processes = processes;
+    result.startCommand = processes.app || processes.web || Object.values(processes)[0] || '';
+  }
+  if (Object.keys(buildArgs).length > 0) result.buildArgs = buildArgs;
+  result.notes.push('Culkibo importó tu fly.toml: puerto interno, healthchecks, volúmenes y límites de VM se mapean nativamente con TLS automático en Caddy.');
+}
+
+/** Parsea `render.yaml` completo (multi-servicio, crons, `databases:` y `sync: false`). */
+function parseRenderBlueprint(raw, result) {
+  /** @type {any} */
+  let doc = null;
+  try {
+    const { parseSafeYaml } = require('./gitopsManager');
+    doc = parseSafeYaml(raw);
+  } catch (e) {
+    doc = null;
+  }
+
+  /** @type {any[]} */
+  const parsedServices = [];
+  /** @type {any[]} */
+  const parsedDatabases = [];
+  /** @type {any[]} */
+  const parsedCrons = [];
+  /** @type {Set<string>} */
+  const secretEnvKeys = new Set();
+  /** @type {Set<string>} */
+  const generatedSecrets = new Set();
+
+  if (doc && typeof doc === 'object') {
+    if (doc.previews && typeof doc.previews === 'object') {
+      result.previews = { generation: String(doc.previews.generation || 'off') };
+    }
+    const rawServices = Array.isArray(doc.services) ? doc.services : [];
+    for (const svc of rawServices) {
+      if (!svc || typeof svc !== 'object') continue;
+      const type = String(svc.type || 'web').toLowerCase();
+      /** @type {Record<string, string>} */
+      const svcEnv = {};
+      /** @type {string[]} */
+      const svcSecretKeys = [];
+      for (const ev of Array.isArray(svc.envVars) ? svc.envVars : []) {
+        if (!ev || typeof ev !== 'object' || !ev.key) continue;
+        const k = String(ev.key).trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+        if (ev.sync === false) {
+          secretEnvKeys.add(k);
+          svcSecretKeys.push(k);
+          svcEnv[k] = `\${vault.${k}}`;
+        } else if (ev.generateValue === true) {
+          generatedSecrets.add(k);
+          secretEnvKeys.add(k);
+          svcSecretKeys.push(k);
+          svcEnv[k] = `\${vault.${k}}`;
+        } else if (ev.fromDatabase && typeof ev.fromDatabase === 'object') {
+          secretEnvKeys.add(k);
+          svcSecretKeys.push(k);
+          svcEnv[k] = `\${vault.${k}}`;
+        } else if (ev.value !== undefined && ev.value !== null) {
+          svcEnv[k] = String(ev.value);
+        }
+      }
+
+      if (type === 'cron') {
+        parsedCrons.push({
+          name: String(svc.name || 'render-cron'),
+          schedule: String(svc.schedule || '0 * * * *'),
+          command: String(svc.startCommand || svc.buildCommand || ''),
+          envVars: svcEnv
+        });
+        continue;
+      }
+
+      const isStatic = type === 'static' || Boolean(svc.staticPublishPath);
+      const port = isStatic ? 80 : (Number(svcEnv.PORT) || 3000);
+      parsedServices.push({
+        type,
+        name: String(svc.name || 'render-service'),
+        runtime: svc.runtime || svc.env || null,
+        gitRepo: svc.repo ? String(svc.repo) : '',
+        gitBranch: svc.branch ? String(svc.branch) : 'main',
+        baseDirectory: svc.rootDir ? String(svc.rootDir) : '/',
+        buildCommand: svc.buildCommand ? String(svc.buildCommand) : '',
+        startCommand: svc.startCommand ? String(svc.startCommand) : '',
+        outputDirectory: svc.staticPublishPath ? String(svc.staticPublishPath) : '',
+        healthPath: svc.healthCheckPath ? String(svc.healthCheckPath) : '/',
+        port,
+        disk: svc.disk && typeof svc.disk === 'object'
+          ? { name: String(svc.disk.name || 'data'), mountPath: String(svc.disk.mountPath || '/data'), sizeGB: Number(svc.disk.sizeGB) || 1 }
+          : null,
+        envVars: svcEnv,
+        secretEnvKeys: svcSecretKeys
+      });
+    }
+
+    const rawDbs = Array.isArray(doc.databases) ? doc.databases : [];
+    for (const db of rawDbs) {
+      if (!db || typeof db !== 'object') continue;
+      const major = db.postgresMajorVersion ? String(db.postgresMajorVersion).trim() : '16';
+      const dbRec = {
+        name: String(db.name || db.databaseName || 'render_pg'),
+        engine: 'postgres',
+        dbName: db.databaseName ? String(db.databaseName) : undefined,
+        username: db.user ? String(db.user) : undefined,
+        image: /^\d+$/.test(major) ? `postgres:${major}-alpine` : 'postgres:16-alpine'
+      };
+      parsedDatabases.push(dbRec);
+      if (!result.recommendedDatabases.some((d) => d.engine === 'postgres')) {
+        result.recommendedDatabases.push({ engine: 'postgres', label: 'PostgreSQL', envKey: 'DATABASE_URL' });
+      }
+    }
+  } else {
+    // Fallback regex si el render.yaml usa sintaxis YAML fuera del subconjunto seguro (p. ej. anclas)
+    const nameMatch = raw.match(/^\s*-?\s*name\s*:\s*([^\r\n#]+)/m);
+    const buildMatch = raw.match(/^\s*buildCommand\s*:\s*([^\r\n#]+)/m);
+    const startMatch = raw.match(/^\s*startCommand\s*:\s*([^\r\n#]+)/m);
+    const healthMatch = raw.match(/^\s*healthCheckPath\s*:\s*([^\r\n#]+)/m);
+    const rootMatch = raw.match(/^\s*rootDir\s*:\s*([^\r\n#]+)/m);
+    if (nameMatch) result.name = unquote(nameMatch[1]);
+    if (buildMatch) result.buildCommand = unquote(buildMatch[1]);
+    if (startMatch) result.startCommand = unquote(startMatch[1]);
+    if (healthMatch) result.healthPath = unquote(healthMatch[1]);
+    if (rootMatch) result.baseDirectory = unquote(rootMatch[1]);
+    for (const m of raw.matchAll(/-\s*key\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\r?\n\s*value\s*:\s*([^\r\n#]+)/g)) {
+      result.envVars[m[1]] = unquote(m[2]);
+    }
+    for (const m of raw.matchAll(/-\s*key\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\r?\n\s*sync\s*:\s*false/g)) {
+      secretEnvKeys.add(m[1]);
+      result.envVars[m[1]] = `\${vault.${m[1]}}`;
+    }
+  }
+
+  if (parsedServices.length > 0) {
+    const primary = parsedServices.find((s) => s.type === 'web') || parsedServices[0];
+    result.name = primary.name;
+    result.gitRepo = primary.gitRepo || result.gitRepo;
+    result.gitBranch = primary.gitBranch || result.gitBranch;
+    result.buildCommand = primary.buildCommand;
+    result.startCommand = primary.startCommand;
+    result.outputDirectory = primary.outputDirectory;
+    result.baseDirectory = primary.baseDirectory;
+    result.healthPath = primary.healthPath;
+    result.port = primary.port;
+    Object.assign(result.envVars, primary.envVars);
+    result.services = parsedServices;
+  }
+  if (parsedDatabases.length > 0) result.databases = parsedDatabases;
+  if (parsedCrons.length > 0) result.crons = parsedCrons;
+  if (secretEnvKeys.size > 0) result.secretEnvKeys = Array.from(secretEnvKeys).sort();
+  if (generatedSecrets.size > 0) result.generatedSecrets = Array.from(generatedSecrets).sort();
+  if (secretEnvKeys.size > 0) {
+    result.notes.push(`Variables Render sync:false / generateValue (${Array.from(secretEnvKeys).join(', ')}) mapeadas automáticamente a \${vault.*} sin exponer secretos.`);
+  }
+}
+
 /**
- * Parsea la configuración de plataformas externas (Vercel, Netlify, Railway, Render, Dokploy)
- * junto a variables `.env` opcionales.
+ * Parsea la configuración de plataformas externas (Vercel, Netlify, Railway, Render,
+ * Fly.io `fly.toml`, Heroku `Procfile`/`app.json`, Dokploy) junto a variables `.env` opcionales.
  */
-function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' } = {}) {
+function parsePlatformConfig({ platform = 'auto', configText = '', envText = '', procfileText = '' } = {}) {
   const raw = String(configText || '').trim();
+  const rawProcfile = String(procfileText || '').trim();
   const { envVars: pastedEnv, recommendedDatabases } = parseEnvText(envText);
 
   let detectedPlatform = String(platform || 'auto').toLowerCase();
+  if (detectedPlatform === 'fly.toml') detectedPlatform = 'fly';
+  if (detectedPlatform === 'app.json') detectedPlatform = 'heroku';
+
   if (detectedPlatform === 'auto') {
-    if (raw.includes('[deploy]') && (raw.includes('startCommand') || raw.includes('healthcheckPath') || raw.includes('builder'))) detectedPlatform = 'railway';
-    else if (raw.includes('[build]') || raw.includes('publish =')) detectedPlatform = 'netlify';
-    else if (raw.includes('services:') && (raw.includes('buildCommand:') || raw.includes('startCommand:'))) detectedPlatform = 'render';
-    else if (raw.startsWith('{')) {
+    if (
+      raw.includes('[http_service]') ||
+      raw.includes('[[services]]') ||
+      (/^\s*app\s*=\s*["'][^"']+["']/m.test(raw) && /^\s*(?:primary_region|internal_port|kill_signal)\s*=/m.test(raw))
+    ) {
+      detectedPlatform = 'fly';
+    } else if (raw.includes('[deploy]') && (raw.includes('startCommand') || raw.includes('healthcheckPath') || raw.includes('builder'))) {
+      detectedPlatform = 'railway';
+    } else if (raw.includes('[build]') || raw.includes('publish =')) {
+      detectedPlatform = 'netlify';
+    } else if (
+      (/^\s*services\s*:/m.test(raw) && (raw.includes('buildCommand:') || raw.includes('startCommand:') || /type\s*:\s*(?:web|worker|cron|pserv|static)/i.test(raw))) ||
+      (/^\s*databases\s*:/m.test(raw) && /postgresMajorVersion\s*:/i.test(raw))
+    ) {
+      detectedPlatform = 'render';
+    } else if (raw.startsWith('{')) {
       try {
         const obj = JSON.parse(raw);
         if (obj.rewrites || obj.builds || obj.outputDirectory || obj.framework) detectedPlatform = 'vercel';
         else if (obj.deploy || obj.build?.builder) detectedPlatform = 'railway';
-        else if (obj.repository || obj.applicationId || obj.domains) detectedPlatform = 'dokploy';
+        else if (
+          Array.isArray(obj.buildpacks) ||
+          Array.isArray(obj.addons) ||
+          obj.formation ||
+          obj.scripts?.postdeploy ||
+          (obj.env && typeof obj.env === 'object' && Object.values(obj.env).some((v) => v && typeof v === 'object' && ('generator' in v || 'description' in v || 'required' in v)))
+        ) {
+          detectedPlatform = 'heroku';
+        } else if (obj.repository || obj.applicationId || obj.domains) detectedPlatform = 'dokploy';
       } catch (e) {}
+    } else if (/^\s*(?:web|worker|release|clock|scheduler)\s*:\s*\S+/m.test(raw)) {
+      detectedPlatform = 'procfile';
+    } else if (!raw && rawProcfile) {
+      detectedPlatform = 'procfile';
     }
   }
 
@@ -546,7 +1083,88 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
     notes: []
   };
 
-  if (raw && detectedPlatform === 'railway' && !raw.startsWith('{')) {
+  if (raw && detectedPlatform === 'fly') {
+    parseFlyToml(raw, result);
+  } else if (detectedPlatform === 'procfile' || detectedPlatform === 'heroku') {
+    const isJson = raw.startsWith('{');
+    if (isJson) {
+      let json;
+      try {
+        json = JSON.parse(raw);
+      } catch (e) {
+        throw new Error('El archivo app.json de Heroku no es un JSON válido');
+      }
+      result.platform = 'heroku';
+      result.name = String(json.name || '').trim();
+      result.description = String(json.description || '').trim();
+      result.gitRepo = String(json.repository || '').trim();
+      if (json.scripts && typeof json.scripts === 'object') {
+        if (json.scripts.postdeploy) result.postDeployCommand = String(json.scripts.postdeploy);
+        if (json.scripts['pr-predestroy']) result.preDestroyCommand = String(json.scripts['pr-predestroy']);
+      }
+      if (Array.isArray(json.buildpacks)) {
+        result.buildpacks = json.buildpacks.map((b) => (typeof b === 'string' ? b : b?.url)).filter(Boolean);
+        const bpStr = result.buildpacks.join(' ').toLowerCase();
+        if (bpStr.includes('nodejs')) result.framework = 'Node.js';
+        else if (bpStr.includes('python')) result.framework = 'Python';
+        else if (bpStr.includes('ruby')) result.framework = 'Ruby';
+        else if (bpStr.includes('go')) result.framework = 'Go';
+      }
+      /** @type {string[]} */
+      const generatedSecrets = [];
+      if (json.env && typeof json.env === 'object') {
+        for (const [k, spec] of Object.entries(json.env)) {
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+          if (typeof spec === 'string') {
+            result.envVars[k] = spec;
+          } else if (spec && typeof spec === 'object') {
+            if (spec.generator === 'secret') {
+              generatedSecrets.push(k);
+              result.envVars[k] = `\${vault.${k}}`;
+            } else if (spec.value !== undefined && spec.value !== null) {
+              result.envVars[k] = String(spec.value);
+            } else if (spec.required !== false) {
+              result.envVars[k] = `\${vault.${k}}`;
+            }
+          }
+        }
+      }
+      if (generatedSecrets.length > 0) result.generatedSecrets = generatedSecrets.sort();
+      if (Array.isArray(json.addons)) {
+        const seen = new Set(result.recommendedDatabases.map((d) => d.engine));
+        for (const addon of json.addons) {
+          const plan = String(typeof addon === 'string' ? addon : (addon?.plan || '')).toLowerCase();
+          /** @type {{ engine: string, label: string, envKey: string } | null} */
+          let dbMatch = null;
+          if (plan.includes('postgres')) dbMatch = { engine: 'postgres', label: 'PostgreSQL', envKey: 'DATABASE_URL' };
+          else if (plan.includes('redis') || plan.includes('valkey')) dbMatch = { engine: 'valkey', label: 'Valkey (Redis)', envKey: 'REDIS_URL' };
+          else if (plan.includes('mysql') || plan.includes('jawsdb') || plan.includes('cleardb')) dbMatch = { engine: 'mysql', label: 'MySQL', envKey: 'MYSQL_URL' };
+          else if (plan.includes('mongo')) dbMatch = { engine: 'mongodb', label: 'MongoDB', envKey: 'MONGODB_URI' };
+          if (dbMatch && !seen.has(dbMatch.engine)) {
+            seen.add(dbMatch.engine);
+            result.recommendedDatabases.push(dbMatch);
+          }
+        }
+      }
+      if (json.formation && typeof json.formation === 'object') {
+        result.formation = json.formation;
+      }
+    }
+    const procSource = isJson ? rawProcfile : (raw || rawProcfile);
+    if (procSource) {
+      const processes = parseProcfile(procSource);
+      if (Object.keys(processes).length > 0) {
+        result.processes = processes;
+        if (processes.web) result.startCommand = processes.web;
+        if (processes.release) result.preDeployCommand = processes.release;
+        const workers = Object.entries(processes)
+          .filter(([k]) => k !== 'web' && k !== 'release')
+          .map(([name, command]) => ({ name, command }));
+        if (workers.length > 0) result.workers = workers;
+      }
+    }
+    result.notes.push('Culkibo tradujo tu configuración Heroku (Procfile/app.json): procesos web/worker/release y addons de BD se ejecutan sin dynos propietarios.');
+  } else if (raw && detectedPlatform === 'railway' && !raw.startsWith('{')) {
     // Soporte railway.toml
     const buildM = raw.match(/^\s*buildCommand\s*=\s*["']([^"']+)["']/m);
     const startM = raw.match(/^\s*startCommand\s*=\s*["']([^"']+)["']/m);
@@ -610,20 +1228,7 @@ function parsePlatformConfig({ platform = 'auto', configText = '', envText = '' 
     }
     result.notes.push('Los sitios estáticos de Netlify se empaquetan en Culkibo con Nginx + compresión + fallback SPA automático.');
   } else if (raw && detectedPlatform === 'render') {
-    const nameMatch = raw.match(/^\s*-?\s*name\s*:\s*([^\r\n#]+)/m);
-    const buildMatch = raw.match(/^\s*buildCommand\s*:\s*([^\r\n#]+)/m);
-    const startMatch = raw.match(/^\s*startCommand\s*:\s*([^\r\n#]+)/m);
-    const healthMatch = raw.match(/^\s*healthCheckPath\s*:\s*([^\r\n#]+)/m);
-    const rootMatch = raw.match(/^\s*rootDir\s*:\s*([^\r\n#]+)/m);
-    if (nameMatch) result.name = unquote(nameMatch[1]);
-    if (buildMatch) result.buildCommand = unquote(buildMatch[1]);
-    if (startMatch) result.startCommand = unquote(startMatch[1]);
-    if (healthMatch) result.healthPath = unquote(healthMatch[1]);
-    if (rootMatch) result.baseDirectory = unquote(rootMatch[1]);
-    // Extraer pares key/value dentro de envVars en render.yaml
-    for (const m of raw.matchAll(/-\s*key\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\r?\n\s*value\s*:\s*([^\r\n#]+)/g)) {
-      result.envVars[m[1]] = unquote(m[2]);
-    }
+    parseRenderBlueprint(raw, result);
   }
 
   return { success: true, ...result };
@@ -640,13 +1245,29 @@ class UniversalImporter {
 
   /**
    * Importa servicios de un `docker-compose.yml` como un proyecto Culkibo listo para gestionar.
-   * @param {{ yamlText?: string, projectName?: string, selectedServices?: string[] }} [opts]
+   * Respeta `profiles:` de Compose v3 (omite servicios con perfiles salvo `profiles: [...]`,
+   * `includeProfiled: true` o selección explícita en `selectedServices`).
+   * @param {{ yamlText?: string, projectName?: string, selectedServices?: string[], profiles?: string[], includeProfiled?: boolean }} [opts]
    */
-  async importDockerCompose({ yamlText = '', projectName = '', selectedServices = [] } = {}) {
+  async importDockerCompose({ yamlText = '', projectName = '', selectedServices = [], profiles = [], includeProfiled = false } = {}) {
     const parsed = parseDockerCompose(yamlText);
-    const chosen = Array.isArray(selectedServices) && selectedServices.length > 0
-      ? parsed.services.filter(s => selectedServices.includes(s.name))
-      : parsed.services;
+    const activeProfiles = new Set((Array.isArray(profiles) ? profiles : []).map((p) => String(p).trim()).filter(Boolean));
+    /** @type {string[]} */
+    const skippedProfileServices = [];
+
+    let chosen;
+    if (Array.isArray(selectedServices) && selectedServices.length > 0) {
+      chosen = parsed.services.filter(s => selectedServices.includes(s.name));
+    } else if (includeProfiled) {
+      chosen = parsed.services;
+    } else {
+      chosen = parsed.services.filter((s) => {
+        if (!Array.isArray(s.profiles) || s.profiles.length === 0) return true;
+        if (s.profiles.some((p) => activeProfiles.has(p))) return true;
+        skippedProfileServices.push(s.name);
+        return false;
+      });
+    }
 
     if (chosen.length === 0) {
       throw new Error('Selecciona al menos un servicio del archivo Compose para importar');
@@ -671,6 +1292,9 @@ class UniversalImporter {
       source: 'compose-import',
       containerPort: primaryApp.containerPort || 8080,
       citadelPort: primaryApp.containerPort || 8080,
+      ...(primaryApp.healthPath ? { healthPath: primaryApp.healthPath } : {}),
+      ...(primaryApp.resources?.memoryMb ? { memoryMb: primaryApp.resources.memoryMb } : {}),
+      ...(primaryApp.resources?.cpus ? { cpus: primaryApp.resources.cpus } : {}),
       envVars: primaryEnv,
       volumes: mergedVolumes,
       resources: chosen.map((svc, idx) => ({
@@ -682,6 +1306,12 @@ class UniversalImporter {
         ports: svc.ports.join(', '),
         envVars: svc.envVars,
         volumes: svc.volumes,
+        ...(svc.profiles?.length ? { profiles: svc.profiles } : {}),
+        ...(svc.secrets?.length ? { secrets: svc.secrets } : {}),
+        ...(svc.configs?.length ? { configs: svc.configs } : {}),
+        ...(svc.envFile?.length ? { envFile: svc.envFile } : {}),
+        ...(svc.healthcheck ? { healthcheck: svc.healthcheck } : {}),
+        ...(svc.resources ? { resources: svc.resources } : {}),
         // Guardar el YAML una única vez (en el recurso principal) para no multiplicar el tamaño de projects.json
         ...(idx === 0 ? { dockerCompose: yamlText } : {}),
         warnings: svc.warnings,
@@ -693,6 +1323,9 @@ class UniversalImporter {
       success: true,
       project,
       importedServices: chosen.length,
+      skippedProfileServices,
+      secretsDetected: Object.keys(parsed.secrets || {}),
+      configsDetected: Object.keys(parsed.configs || {}),
       databasesDetected: chosen.filter(s => s.kind === 'database').map(s => ({ name: s.name, engine: s.dbEngine, label: s.dbLabel })),
       warnings: chosen.flatMap(s => s.warnings.map(w => `[${s.name}] ${w}`))
     };
@@ -935,7 +1568,9 @@ const instance = Object.assign(new UniversalImporter(), {
   UniversalImporter,
   parseDockerCompose,
   parsePlatformConfig,
-  parseEnvText
+  parseEnvText,
+  parseProcfile,
+  parseMemoryLimitMb
 });
 
 module.exports = instance;

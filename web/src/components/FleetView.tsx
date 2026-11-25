@@ -19,6 +19,8 @@ import {
   Globe,
   Terminal,
   Box,
+  Wrench,
+  PauseCircle,
 } from 'lucide-react';
 import { api, type FleetServer, type FleetSshKey } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
@@ -29,8 +31,28 @@ interface FleetViewProps {
   onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }
 
+type MaintenanceState = 'active' | 'draining' | 'maintenance';
+type FleetServerWithMaintenance = FleetServer & {
+  maintenanceState?: MaintenanceState | string;
+  maintenanceReason?: string | null;
+  maintenanceSince?: string | null;
+};
+
 type FleetTab = 'nodes' | 'keys';
-type StatusFilter = 'all' | 'online' | 'degraded' | 'offline';
+type StatusFilter = 'all' | 'online' | 'degraded' | 'maintenance' | 'offline';
+
+const MAINTENANCE_META: Record<'draining' | 'maintenance', { label: string; badge: string; hint: string }> = {
+  draining: {
+    label: 'Drenando',
+    badge: 'bg-amber-50 text-amber-800 border-amber-200',
+    hint: 'Nuevos despliegues bloqueados; los contenedores existentes siguen atendiendo tráfico.',
+  },
+  maintenance: {
+    label: 'Mantenimiento',
+    badge: 'bg-slate-100 text-slate-700 border-slate-300',
+    hint: 'Nodo en mantenimiento; nuevos despliegues y programación automática deshabilitados.',
+  },
+};
 
 const STATUS_META: Record<string, { label: string; dot: string; badge: string }> = {
   online: {
@@ -85,7 +107,7 @@ function barColor(pct: number): string {
 
 export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
   const [tab, setTab] = useState<FleetTab>('nodes');
-  const [servers, setServers] = useState<FleetServer[]>([]);
+  const [servers, setServers] = useState<FleetServerWithMaintenance[]>([]);
   const [keys, setKeys] = useState<FleetSshKey[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -376,21 +398,24 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
   const filteredServers = useMemo(() => {
     const q = search.trim().toLowerCase();
     return servers.filter((s) => {
+      const mState = s.maintenanceState || 'active';
       if (statusFilter === 'online' && s.status !== 'online') return false;
       if (statusFilter === 'degraded' && s.status !== 'degraded' && s.status !== 'host_key_mismatch') return false;
+      if (statusFilter === 'maintenance' && mState !== 'draining' && mState !== 'maintenance') return false;
       if (statusFilter === 'offline' && s.status !== 'offline' && s.status !== 'unknown') return false;
       if (!q) return true;
-      const hay = `${s.name} ${s.host} ${s.region || ''} ${(s.tags || []).join(' ')}`.toLowerCase();
+      const hay = `${s.name} ${s.host} ${s.region || ''} ${mState} ${(s.tags || []).join(' ')}`.toLowerCase();
       return hay.includes(q);
     });
   }, [servers, search, statusFilter]);
 
   const kpis = useMemo(() => {
     const online = servers.filter((s) => s.status === 'online').length;
+    const cordoned = servers.filter((s) => s.maintenanceState === 'draining' || s.maintenanceState === 'maintenance').length;
     const totalCpus = servers.reduce((acc, s) => acc + ((s.probe || s.resources)?.cpus || 0), 0);
     const availRamMb = servers.reduce((acc, s) => acc + ((s.probe || s.resources)?.memoryAvailableMb || 0), 0);
     const totalRamMb = servers.reduce((acc, s) => acc + ((s.probe || s.resources)?.memoryTotalMb || 0), 0);
-    return { online, totalCpus, availRamMb, totalRamMb };
+    return { online, cordoned, totalCpus, availRamMb, totalRamMb };
   }, [servers]);
 
   if (loading) {
@@ -493,6 +518,11 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
           <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
             {kpis.online} <span className="text-sm font-normal text-slate-400">/ {servers.length}</span>
           </div>
+          {kpis.cordoned > 0 && (
+            <div className="text-[11px] text-amber-700 mt-0.5 tabular-nums">
+              {kpis.cordoned} en drenaje / mantenimiento
+            </div>
+          )}
         </div>
         <div className="bg-white p-4">
           <div className="text-xs text-slate-500">Núcleos totales</div>
@@ -532,6 +562,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                 { id: 'all', label: 'Todos' },
                 { id: 'online', label: 'En línea' },
                 { id: 'degraded', label: 'Alertas' },
+                { id: 'maintenance', label: 'Mantenimiento' },
                 { id: 'offline', label: 'Sin conexión' },
               ] as const).map((f) => (
                 <button
@@ -574,6 +605,10 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
               {filteredServers.map((srv) => {
                 const isLocal = Boolean(srv.isLocal || srv.id === 'local');
                 const st = STATUS_META[srv.status] || STATUS_META.unknown;
+                const mState = srv.maintenanceState === 'draining' || srv.maintenanceState === 'maintenance'
+                  ? srv.maintenanceState
+                  : null;
+                const mMeta = mState ? MAINTENANCE_META[mState] : null;
                 const metrics = srv.probe || srv.resources;
                 const errMsg = srv.lastError || srv.statusReason || metrics?.error;
                 const ramPct = percentUsed(metrics?.memoryTotalMb, metrics?.memoryAvailableMb);
@@ -584,7 +619,11 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                   <article
                     key={srv.id}
                     className={`bg-white border rounded-xl p-4 flex flex-col gap-3.5 transition-colors ${
-                      isMismatch ? 'border-red-300' : 'border-slate-200 hover:border-slate-300'
+                      isMismatch
+                        ? 'border-red-300'
+                        : mState
+                          ? 'border-amber-200 hover:border-amber-300'
+                          : 'border-slate-200 hover:border-slate-300'
                     }`}
                   >
                     {/* Top row */}
@@ -603,6 +642,19 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                               {srv.region}
                             </span>
                           )}
+                          {mMeta && mState && (
+                            <span
+                              title={srv.maintenanceReason || mMeta.hint}
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-medium ${mMeta.badge}`}
+                            >
+                              {mState === 'draining' ? (
+                                <PauseCircle className="w-3 h-3 shrink-0" />
+                              ) : (
+                                <Wrench className="w-3 h-3 shrink-0" />
+                              )}
+                              {mMeta.label}
+                            </span>
+                          )}
                         </div>
                         <div className="text-xs font-mono text-slate-500 mt-1 truncate">
                           {isLocal ? '127.0.0.1 (plano de control)' : `${srv.user}@${srv.host}:${srv.port || 22}`}
@@ -614,6 +666,21 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                         {st.label}
                       </span>
                     </div>
+
+                    {/* Aviso de drenaje / mantenimiento */}
+                    {mMeta && mState && (
+                      <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 flex items-start gap-2">
+                        {mState === 'draining' ? (
+                          <PauseCircle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                        ) : (
+                          <Wrench className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                        )}
+                        <div className="min-w-0 leading-snug">
+                          <span className="font-semibold">{mMeta.label}:</span>{' '}
+                          <span>{srv.maintenanceReason || mMeta.hint}</span>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Alerta de huella SSH modificada */}
                     {isMismatch && (

@@ -2,30 +2,21 @@
  * Banco de pruebas: cuánto tarda un cambio de ruta en estar SIRVIENDO.
  *
  * Por qué esta medida y no otra: es la que decide si una promoción es atómica.
- * Y es directamente comparable, porque los competidores publican su mecanismo
- * aunque no publiquen su número:
+ * Comparación honesta por mecanismo documentado del plano de datos:
  *
- *   Traefik, proveedor de fichero : throttle de 2 s  (providersThrottleDuration)
- *   Traefik, proveedor HTTP       : poll de 5 s      (pollInterval)
- *   Caddy, admin API              : síncrono, sin poll
+ *   Traefik · proveedor de fichero   : throttle por defecto de 2.000 ms (providersThrottleDuration)
+ *   Traefik · proveedor HTTP         : poll por defecto de 5.000 ms     (pollInterval)
+ *   Traefik · proveedor Docker       : dirigido por eventos Docker (sin poll HTTP)
+ *   Kamal Proxy (`kamal-proxy`)      : swap imperativo en memoria (< 1 ms tras healthcheck)
+ *   Culkibo · Caddy Admin API        : síncrono, atómico, sin poll (~5–50 ms medido)
  *
  * No medimos "lo que tarda la API en responder" —eso es trivial y engañoso—
  * sino el ciclo completo: pedir el cambio y comprobar, sondeando, en qué
  * momento el proxy empieza de verdad a servir el destino nuevo.
  *
- * METODOLOGÍA (publicada a propósito, para que cualquiera pueda rebatirla):
- *   1. Se levantan dos servidores HTTP locales que se identifican, A y B.
- *   2. Se crea una ruta en Caddy apuntando a A y se espera a que sirva A.
- *   3. Se cronometra: se pide el cambio a B y se sondea sin pausa hasta que la
- *      respuesta venga de B.
- *   4. Se repite N veces alternando destino, descartando el primer ciclo
- *      (calentamiento de conexiones).
- *   5. Se publican p50, p95, p99, mínimo y máximo. También los fallos.
- *
- * LO QUE ESTA CIFRA NO ES: no es la latencia de un despliegue. No incluye
- * construir una imagen, ni arrancar un contenedor, ni esperar a un health
- * check. Mide exclusivamente el conmutador. Cualquier comparación que lo
- * presente como "tiempo de despliegue" es deshonesta.
+ * LO QUE ESTA CIFRA NO ES: no es la latencia de un despliegue completo. No
+ * incluye construir una imagen, arrancar un contenedor ni esperar un health
+ * check. Mide exclusivamente el conmutador de ruta del ingress.
  */
 
 const http = require('http');
@@ -40,12 +31,12 @@ const PROJECT_ID = 'bench_route_swap';
 function percentile(sorted, p) {
   if (sorted.length === 0) return null;
   const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
-  return sorted[Math.max(0, idx)];
+  return Number(sorted[Math.max(0, idx)].toFixed(2));
 }
 
 function startIdentityServer(port, identity) {
   return new Promise((resolve) => {
-    const server = http.createServer((req, res) => {
+    const server = http.createServer((_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/plain', Connection: 'close' });
       res.end(identity);
     });
@@ -84,25 +75,37 @@ async function waitUntilServing(caddyHttpPort, expected, budgetMs = 15000) {
   return false;
 }
 
-async function run() {
+/**
+ * @param {{ silent?: boolean, iterations?: number }} [opts]
+ */
+async function run({ silent = false, iterations = ITERATIONS } = {}) {
   const caddyHttpPort = parseInt(process.env.BENCH_CADDY_HTTP_PORT || '18080', 10);
 
-  console.log('\n════════════════════════════════════════════════════════════');
-  console.log('  Culkibo · Banco de pruebas: conmutación de ruta');
-  console.log('════════════════════════════════════════════════════════════\n');
+  if (!silent) {
+    console.log('\n════════════════════════════════════════════════════════════');
+    console.log('  Culkibo · Banco de pruebas: conmutación de ruta');
+    console.log('════════════════════════════════════════════════════════════\n');
+  }
 
   const detection = await caddyManager.detect({ force: true });
   if (!detection.available) {
-    console.log(`  No hay Caddy escuchando: ${detection.reason}`);
-    console.log('  Arranca uno y repite. Ejemplo:');
-    console.log(`    caddy run\n`);
-    process.exit(0);
+    if (!silent) {
+      console.log(`  No hay Caddy escuchando: ${detection.reason}`);
+      console.log('  Arranca uno y repite. Ejemplo:');
+      console.log('    caddy run\n');
+    }
+    return {
+      skipped: true,
+      reason: detection.reason || 'Caddy no estaba escuchando en :2019'
+    };
   }
 
   const serverA = await startIdentityServer(PORT_A, 'DESTINO_A');
   const serverB = await startIdentityServer(PORT_B, 'DESTINO_B');
 
+  /** @type {number[]} */
   const samples = [];
+  /** @type {number[]} */
   const failures = [];
 
   try {
@@ -121,16 +124,21 @@ async function run() {
 
     await pointTo(PORT_A);
     if (!(await waitUntilServing(caddyHttpPort, 'DESTINO_A'))) {
-      console.log('  El proxy no llegó a servir el destino inicial. Abortado.');
-      console.log(`  Comprueba que Caddy escucha en :${caddyHttpPort} (BENCH_CADDY_HTTP_PORT).\n`);
-      return;
+      const reason = `El proxy no llegó a servir el destino inicial en :${caddyHttpPort}`;
+      if (!silent) {
+        console.log(`  ${reason}. Abortado.`);
+        console.log(`  Comprueba que Caddy escucha en :${caddyHttpPort} (BENCH_CADDY_HTTP_PORT).\n`);
+      }
+      return { skipped: true, reason };
     }
 
-    console.log(`  Caddy en ${detection.adminUrl} · proxy en :${caddyHttpPort}`);
-    console.log(`  Iteraciones: ${ITERATIONS} (se descarta la primera)\n`);
+    if (!silent) {
+      console.log(`  Caddy en ${detection.adminUrl} · proxy en :${caddyHttpPort}`);
+      console.log(`  Iteraciones: ${iterations} (se descarta la primera)\n`);
+    }
 
     let current = 'A';
-    for (let i = 0; i < ITERATIONS + 1; i++) {
+    for (let i = 0; i < iterations + 1; i++) {
       const next = current === 'A' ? 'B' : 'A';
       const nextPort = next === 'A' ? PORT_A : PORT_B;
       const expected = `DESTINO_${next}`;
@@ -143,52 +151,76 @@ async function run() {
       if (!served) {
         failures.push(i);
       } else if (i > 0) {
-        // El primer ciclo calienta conexiones y no representa el estado estable.
         samples.push(elapsedMs);
       }
       current = next;
     }
   } finally {
     try { await caddyManager.removeRoute(PROJECT_ID); } catch (e) {}
-    await new Promise(r => serverA.close(r));
-    await new Promise(r => serverB.close(r));
+    await new Promise((r) => serverA.close(r));
+    await new Promise((r) => serverB.close(r));
   }
 
   const sorted = [...samples].sort((a, b) => a - b);
-  const fmt = (v) => (v == null ? 'n/d' : `${v.toFixed(1)} ms`);
+  const summary = {
+    skipped: false,
+    adminUrl: detection.adminUrl,
+    httpPort: caddyHttpPort,
+    iterations: sorted.length,
+    failures: failures.length,
+    minMs: percentile(sorted, 0),
+    p50Ms: percentile(sorted, 50),
+    p95Ms: percentile(sorted, 95),
+    p99Ms: percentile(sorted, 99),
+    maxMs: percentile(sorted, 100),
+    competitorReference: {
+      traefikFileProviderDefaultThrottleMs: 2000,
+      traefikHttpProviderDefaultPollMs: 5000,
+      traefikDockerProviderNote: 'Event-driven via Docker daemon stream (no HTTP poll)',
+      kamalProxySwapNote: 'Imperative in-memory swap (<1ms post-healthcheck)',
+      scopeNote: 'Measures route-switch latency only — excludes build, container start, and healthcheck'
+    }
+  };
 
-  console.log('  ─────────────────────────────────────────────────────────');
-  console.log('   Petición de cambio → el proxy sirve el destino nuevo');
-  console.log('  ─────────────────────────────────────────────────────────');
-  console.log(`   muestras válidas   ${sorted.length}`);
-  console.log(`   fallos             ${failures.length}`);
-  console.log(`   mínimo             ${fmt(sorted[0])}`);
-  console.log(`   p50                ${fmt(percentile(sorted, 50))}`);
-  console.log(`   p95                ${fmt(percentile(sorted, 95))}`);
-  console.log(`   p99                ${fmt(percentile(sorted, 99))}`);
-  console.log(`   máximo             ${fmt(sorted[sorted.length - 1])}`);
-  console.log('  ─────────────────────────────────────────────────────────\n');
+  if (!silent) {
+    const fmt = (v) => (v == null ? 'n/d' : `${v.toFixed(1)} ms`);
+    console.log('  ─────────────────────────────────────────────────────────');
+    console.log('   Petición de cambio → el proxy sirve el destino nuevo');
+    console.log('  ─────────────────────────────────────────────────────────');
+    console.log(`   muestras válidas   ${summary.iterations}`);
+    console.log(`   fallos             ${summary.failures}`);
+    console.log(`   mínimo             ${fmt(summary.minMs)}`);
+    console.log(`   p50                ${fmt(summary.p50Ms)}`);
+    console.log(`   p95                ${fmt(summary.p95Ms)}`);
+    console.log(`   p99                ${fmt(summary.p99Ms)}`);
+    console.log(`   máximo             ${fmt(summary.maxMs)}`);
+    console.log('  ─────────────────────────────────────────────────────────\n');
 
-  const p50 = percentile(sorted, 50);
-  if (p50 != null) {
-    console.log('   Referencia del sector, por mecanismo documentado:');
-    console.log('     Traefik · proveedor de fichero   throttle de 2.000 ms');
-    console.log('     Traefik · proveedor HTTP         poll de 5.000 ms');
-    console.log(`     Culkibo · Caddy admin API        ${fmt(p50)} medido (p50)\n`);
-    console.log('   Nota honesta: esto mide SOLO el conmutador de ruta.');
-    console.log('   No incluye construir la imagen, arrancar el contenedor ni');
-    console.log('   esperar al health check. Presentarlo como "tiempo de');
-    console.log('   despliegue" sería mentir.\n');
+    if (summary.p50Ms != null) {
+      console.log('   Referencia del sector, por mecanismo documentado:');
+      console.log('     Traefik · proveedor de fichero   throttle por defecto 2.000 ms');
+      console.log('     Traefik · proveedor HTTP         poll por defecto 5.000 ms');
+      console.log('     Traefik · proveedor Docker       dirigido por eventos (sin poll)');
+      console.log('     Kamal Proxy (kamal-proxy)        swap imperativo (< 1 ms tras healthcheck)');
+      console.log(`     Culkibo · Caddy Admin API        ${fmt(summary.p50Ms)} medido (p50)\n`);
+      console.log('   Nota honesta: esto mide SOLO el conmutador de ruta.');
+      console.log('   No incluye construir la imagen, arrancar el contenedor ni');
+      console.log('   esperar al health check.\n');
+    }
+
+    console.log(`   Entorno: Node ${process.version} · ${process.platform} ${process.arch}`);
+    console.log(`   Fecha:   ${new Date().toISOString()}\n`);
   }
 
-  console.log(`   Entorno: Node ${process.version} · ${process.platform} ${process.arch}`);
-  console.log(`   Fecha:   ${new Date().toISOString()}\n`);
-
-  return { samples: sorted, failures: failures.length };
+  return summary;
 }
 
 if (require.main === module) {
-  run().then(() => process.exit(0)).catch((err) => {
+  const asJson = process.argv.includes('--json');
+  run({ silent: asJson }).then((res) => {
+    if (asJson) process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    process.exit(0);
+  }).catch((err) => {
     console.error('Fallo del banco de pruebas:', err.message);
     process.exit(1);
   });

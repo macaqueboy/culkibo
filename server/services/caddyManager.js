@@ -4,12 +4,308 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const metricsCollector = require('./metricsCollector');
+const { isMetadataIp } = require('./ssrfGuard');
 
 /** @type {typeof import('https') | null} */
 let _httpsMod = null;
 function getHttps() {
   if (!_httpsMod) _httpsMod = require('https');
   return _httpsMod;
+}
+
+const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]{0,63}$/;
+const HOP_BY_HOP_HEADER_RE = /^(host|content-length|transfer-encoding|connection|keep-alive|upgrade|proxy-authenticate|proxy-authorization|te|trailer)$/i;
+const HEADER_NAME_RE = /^[A-Za-z0-9-]+$/;
+const METADATA_HOSTS = new Set([
+  'metadata.google.internal',
+  'metadata.goog',
+  'metadata',
+  'instance-data',
+  '169.254.169.254',
+  '169.254.170.2',
+  '100.100.100.200',
+  'fd00:ec2::254'
+]);
+
+/**
+ * Esquema verificado de proveedores DNS-01 para módulos oficiales `caddy-dns/*` (2025–2026).
+ * Nota crítica: `caddy-dns/hetzner/v2` usa `auth_api_token` (ruptura Cloud API fines 2025; `api_token` devuelve HTTP 400).
+ * @type {Record<string, { id: string, label: string, caddyModule: string, xcaddyModule: string, primaryField: string, fields: Array<{ key: string, defaultEnv: string, required: boolean, label: string }> }>}
+ */
+const DNS_PROVIDERS = Object.freeze({
+  cloudflare: {
+    id: 'cloudflare',
+    label: 'Cloudflare',
+    caddyModule: 'dns.providers.cloudflare',
+    xcaddyModule: 'github.com/caddy-dns/cloudflare',
+    primaryField: 'api_token',
+    fields: [
+      { key: 'api_token', defaultEnv: 'CF_API_TOKEN', required: true, label: 'API Token (Zone:DNS:Edit)' }
+    ]
+  },
+  hetzner: {
+    id: 'hetzner',
+    label: 'Hetzner Cloud DNS (v2)',
+    caddyModule: 'dns.providers.hetzner',
+    xcaddyModule: 'github.com/caddy-dns/hetzner/v2',
+    primaryField: 'auth_api_token',
+    fields: [
+      { key: 'auth_api_token', defaultEnv: 'HETZNER_AUTH_API_TOKEN', required: true, label: 'Hetzner Console API Token (auth_api_token)' }
+    ]
+  },
+  digitalocean: {
+    id: 'digitalocean',
+    label: 'DigitalOcean',
+    caddyModule: 'dns.providers.digitalocean',
+    xcaddyModule: 'github.com/caddy-dns/digitalocean',
+    primaryField: 'auth_token',
+    fields: [
+      { key: 'auth_token', defaultEnv: 'DO_AUTH_TOKEN', required: true, label: 'Personal Access Token (auth_token)' }
+    ]
+  },
+  route53: {
+    id: 'route53',
+    label: 'AWS Route 53',
+    caddyModule: 'dns.providers.route53',
+    xcaddyModule: 'github.com/caddy-dns/route53',
+    primaryField: 'access_key_id',
+    fields: [
+      { key: 'access_key_id', defaultEnv: 'AWS_ACCESS_KEY_ID', required: true, label: 'AWS Access Key ID' },
+      { key: 'secret_access_key', defaultEnv: 'AWS_SECRET_ACCESS_KEY', required: true, label: 'AWS Secret Access Key' },
+      { key: 'region', defaultEnv: 'AWS_REGION', required: false, label: 'AWS Region (opcional)' },
+      { key: 'session_token', defaultEnv: 'AWS_SESSION_TOKEN', required: false, label: 'AWS Session Token (opcional)' }
+    ]
+  },
+  porkbun: {
+    id: 'porkbun',
+    label: 'Porkbun',
+    caddyModule: 'dns.providers.porkbun',
+    xcaddyModule: 'github.com/caddy-dns/porkbun',
+    primaryField: 'api_key',
+    fields: [
+      { key: 'api_key', defaultEnv: 'PORKBUN_API_KEY', required: true, label: 'Porkbun API Key' },
+      { key: 'api_secret_key', defaultEnv: 'PORKBUN_API_SECRET_KEY', required: true, label: 'Porkbun Secret API Key' }
+    ]
+  },
+  bunny: {
+    id: 'bunny',
+    label: 'Bunny.net',
+    caddyModule: 'dns.providers.bunny',
+    xcaddyModule: 'github.com/caddy-dns/bunny',
+    primaryField: 'access_key',
+    fields: [
+      { key: 'access_key', defaultEnv: 'BUNNY_ACCESS_KEY', required: true, label: 'Bunny Access Key' }
+    ]
+  },
+  duckdns: {
+    id: 'duckdns',
+    label: 'DuckDNS',
+    caddyModule: 'dns.providers.duckdns',
+    xcaddyModule: 'github.com/caddy-dns/duckdns',
+    primaryField: 'api_token',
+    fields: [
+      { key: 'api_token', defaultEnv: 'DUCKDNS_API_TOKEN', required: true, label: 'DuckDNS API Token' }
+    ]
+  }
+});
+
+/** Lista el esquema de proveedores DNS-01 soportados para la UI y la API. */
+function listDnsProviders() {
+  return Object.values(DNS_PROVIDERS).map((p) => ({
+    id: p.id,
+    label: p.label,
+    caddyModule: p.caddyModule,
+    xcaddyModule: p.xcaddyModule,
+    fields: p.fields.map((f) => ({ ...f }))
+  }));
+}
+
+/**
+ * Construye y valida el objeto JSON `provider` exacto para Caddy ACME DNS-01.
+ * Soporta tanto el atajo `tokenEnv`/`apiToken` (1 campo) como mapas `credentialsEnv`/`credentials` (multicampo).
+ *
+ * @param {string} [providerName]
+ * @param {{
+ *   tokenEnv?: string | null,
+ *   apiToken?: string | null,
+ *   credentialsEnv?: Record<string, string> | null,
+ *   credentials?: Record<string, string> | null
+ * }} [opts]
+ * @returns {{ providerConfig: Record<string, string>, schema: any, resolvedEnvMap: Record<string, string> }}
+ */
+function buildDnsProviderConfig(providerName = 'cloudflare', opts = {}) {
+  const cleanName = String(providerName || 'cloudflare').trim().toLowerCase();
+  const schema = DNS_PROVIDERS[cleanName];
+  if (!schema) {
+    throw new Error(`Proveedor DNS-01 no soportado: "${cleanName}". Soportados: ${Object.keys(DNS_PROVIDERS).join(', ')}`);
+  }
+
+  const credsEnv = (opts && opts.credentialsEnv && typeof opts.credentialsEnv === 'object') ? opts.credentialsEnv : {};
+  const inlineCreds = (opts && opts.credentials && typeof opts.credentials === 'object') ? opts.credentials : {};
+
+  // Validar que no haya claves desconocidas en credentialsEnv/credentials
+  const allowedKeys = new Set(schema.fields.map((f) => f.key));
+  for (const k of [...Object.keys(credsEnv), ...Object.keys(inlineCreds)]) {
+    if (!allowedKeys.has(k)) {
+      throw new Error(`Campo de credencial "${k}" inválido para el proveedor DNS-01 "${cleanName}"`);
+    }
+  }
+
+  /** @type {Record<string, string>} */
+  const providerConfig = { name: cleanName };
+  /** @type {Record<string, string>} */
+  const resolvedEnvMap = {};
+
+  for (const field of schema.fields) {
+    const isPrimary = field.key === schema.primaryField;
+    const rawInline = inlineCreds[field.key] !== undefined
+      ? inlineCreds[field.key]
+      : (isPrimary && opts && opts.apiToken ? opts.apiToken : null);
+
+    if (rawInline !== null && rawInline !== undefined && String(rawInline).trim() !== '') {
+      const val = String(rawInline).trim();
+      if (/[\r\n\0]/.test(val)) {
+        throw new Error(`Valor de credencial inválido para ${cleanName}.${field.key}`);
+      }
+      providerConfig[field.key] = val;
+      continue;
+    }
+
+    const explicitEnv = credsEnv[field.key] !== undefined
+      ? credsEnv[field.key]
+      : (isPrimary && opts && opts.tokenEnv ? opts.tokenEnv : null);
+
+    if (explicitEnv !== null && explicitEnv !== undefined && String(explicitEnv).trim() !== '') {
+      const cleanEnv = String(explicitEnv).trim();
+      if (!ENV_VAR_NAME_RE.test(cleanEnv)) {
+        throw new Error(`Nombre de variable de entorno inválido para ${cleanName}.${field.key}: ${explicitEnv}`);
+      }
+      providerConfig[field.key] = `{env.${cleanEnv}}`;
+      resolvedEnvMap[field.key] = cleanEnv;
+    } else if (field.required) {
+      providerConfig[field.key] = `{env.${field.defaultEnv}}`;
+      resolvedEnvMap[field.key] = field.defaultEnv;
+    }
+  }
+
+  return { providerConfig, schema, resolvedEnvMap };
+}
+
+/**
+ * Guardia anti-ReDoS para expresiones regulares de redirección de rutas (`path_regexp`).
+ * Rechaza cuantificadores anidados, retroreferencias, longitud excesiva o patrones inválidos.
+ * @param {string} pattern
+ * @returns {{ ok: boolean, error?: string }}
+ */
+function validateSafeRedirectRegex(pattern) {
+  const s = String(pattern || '');
+  if (!s || s.length > 200) {
+    return { ok: false, error: 'El patrón regex debe tener entre 1 y 200 caracteres' };
+  }
+  if (/[\r\n\0]/.test(s)) {
+    return { ok: false, error: 'El patrón regex no puede contener saltos de línea ni NUL' };
+  }
+  // Retroreferencias (\1..\9) no soportadas de forma segura/lineal en RE2/Go ni JS
+  if (/\\[1-9]/.test(s)) {
+    return { ok: false, error: 'Retroreferencias (\\1..\\9) no permitidas en regex de redirección' };
+  }
+  // Cuantificadores duplicados o anidados: (a+)+, (a*)+, (a|b+)*, a**, a++
+  if (/([+*?]{2,})/.test(s.replace(/\\[+*?]/g, ''))) {
+    return { ok: false, error: 'Cuantificadores consecutivos detectados (posible ReDoS)' };
+  }
+  if (/\([^)]*[+*][^)]*\)\s*[+*?{]/.test(s)) {
+    return { ok: false, error: 'Cuantificador anidado detectado (posible ReDoS)' };
+  }
+  const groupCount = (s.match(/(?<!\\)\(/g) || []).length;
+  if (groupCount > 8) {
+    return { ok: false, error: 'Demasiados grupos de captura en regex (máximo 8)' };
+  }
+  const altCount = (s.match(/(?<!\\)\|/g) || []).length;
+  if (altCount > 12) {
+    return { ok: false, error: 'Demasiadas alternancias en regex (máximo 12)' };
+  }
+  try {
+    // eslint-disable-next-line no-new
+    new RegExp(s);
+  } catch (err) {
+    return { ok: false, error: `Patrón regex inválido: ${err.message}` };
+  }
+  return { ok: true };
+}
+
+/** @param {string} str */
+function escapeRegexLiteral(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Valida y normaliza una dirección upstream (`host:port` o `http(s)://host:port`)
+ * bloqueando inyecciones y direcciones de metadatos cloud (SSRF).
+ * @param {string} raw
+ * @param {string} [label]
+ * @returns {string}
+ */
+function sanitizeUpstreamDial(raw, label = 'upstream') {
+  const s = String(raw || '').trim();
+  if (!s || /[\s\r\n\0]/.test(s)) {
+    throw new Error(`${label} inválido: contiene espacios o caracteres de control`);
+  }
+  let dial = s;
+  let hostname = '';
+  if (/^https?:\/\//i.test(s)) {
+    let parsed;
+    try {
+      parsed = new URL(s);
+    } catch (err) {
+      throw new Error(`${label} con URL inválida: ${s.slice(0, 80)}`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`Protocolo no permitido en ${label}: ${parsed.protocol}`);
+    }
+    const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+    hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    dial = parsed.hostname.includes(':') && !parsed.hostname.startsWith('[')
+      ? `[${parsed.hostname}]:${port}`
+      : `${parsed.hostname}:${port}`;
+  } else {
+    dial = s.replace(/\/+$/, '');
+    if (!/^[a-zA-Z0-9._\[\]:-]+$/.test(dial) || !dial.includes(':')) {
+      throw new Error(`Dirección ${label} inválida (esperado host:puerto): ${dial.slice(0, 80)}`);
+    }
+    const lastColon = dial.lastIndexOf(':');
+    const portNum = Number(dial.slice(lastColon + 1));
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      throw new Error(`Puerto inválido en ${label}: ${dial.slice(0, 80)}`);
+    }
+    hostname = dial.slice(0, lastColon).toLowerCase().replace(/^\[|\]$/g, '');
+  }
+  if (!hostname || METADATA_HOSTS.has(hostname) || isMetadataIp(hostname)) {
+    throw new Error(`${label} bloqueado por protección SSRF (metadatos cloud): ${hostname}`);
+  }
+  return dial;
+}
+
+/**
+ * Sanitiza y valida un origen CORS (`*` o `https?://host[:port]`).
+ * @param {string} raw
+ * @returns {string}
+ */
+function validateCorsOrigin(raw) {
+  const s = String(raw || '').trim();
+  if (s === '*') return '*';
+  if (!s || /[\s\r\n\0]/.test(s)) {
+    throw new Error(`Origen CORS inválido: "${s.slice(0, 60)}"`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(s);
+  } catch (err) {
+    throw new Error(`Origen CORS mal formado: "${s.slice(0, 60)}"`);
+  }
+  if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    throw new Error(`El origen CORS debe ser esquema://host[:puerto] sin ruta ni query: "${s.slice(0, 60)}"`);
+  }
+  return parsed.origin;
 }
 
 /** Rangos CIDR oficiales de Cloudflare para restaurar la IP real del visitante en `trusted_proxies`. */
@@ -99,13 +395,19 @@ class CaddyManager {
   }
 
   /**
+   * Resuelve el destino de la Admin API.
+   * Cuando `overrideAdminUrl` apunta a un túnel SSH efímero en loopback (`127.0.0.1:<puertoEfímero>`),
+   * sobreescribe las cabeceras `Host` y `Origin` a `127.0.0.1:<caddyAdminPort>` (2019 por defecto)
+   * para superar la protección DNS-rebinding del Caddy remoto (evita HTTP 403 en nodos de flota).
+   *
    * @param {string | null} [overrideAdminUrl]
+   * @param {{ caddyAdminPort?: number | null, remoteAdminPort?: number | null, adminHost?: string | null }} [opts]
    * @returns {{ url: string, dialHost: string, originHeader: string, hostHeader: string, port: number, isHttps: boolean, isOverride: boolean }}
    */
-  _getAdminTarget(overrideAdminUrl = null) {
+  _getAdminTarget(overrideAdminUrl = null, { caddyAdminPort = null, remoteAdminPort = null, adminHost = null } = {}) {
     const targetUrl = overrideAdminUrl ? String(overrideAdminUrl).trim() : this.adminUrl;
     const isOverride = Boolean(overrideAdminUrl && targetUrl !== this.adminUrl);
-    if (!isOverride && this._parsedAdmin && this._parsedAdmin.url === this.adminUrl) {
+    if (!isOverride && !caddyAdminPort && !remoteAdminPort && !adminHost && this._parsedAdmin && this._parsedAdmin.url === this.adminUrl) {
       return { ...this._parsedAdmin, isOverride: false };
     }
     const parsed = new URL(targetUrl);
@@ -116,16 +418,39 @@ class CaddyManager {
     const port = parsed.port ? Number(parsed.port) : (isHttps ? 443 : 80);
     // Evita DNS/Happy-Eyeballs ::1 vs 127.0.0.1 en Windows cuando adminUrl usa localhost
     const dialHost = parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname;
+    const isLoopback = parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '::1' || parsed.hostname === '[::1]';
+
+    let hostHeader = parsed.host;
+    let originHeader = `${parsed.protocol}//${parsed.host}`;
+
+    if (isOverride) {
+      const explicitHost = adminHost ? String(adminHost).trim() : '';
+      const queryPortRaw = parsed.searchParams.get('caddyAdminPort') || parsed.searchParams.get('remoteAdminPort');
+      const requestedRemotePort = caddyAdminPort ?? remoteAdminPort ?? (queryPortRaw ? Number(queryPortRaw) : null);
+      if (explicitHost && /^[a-zA-Z0-9._\[\]:-]+$/.test(explicitHost)) {
+        hostHeader = explicitHost;
+        originHeader = `${parsed.protocol}//${explicitHost}`;
+      } else if (requestedRemotePort !== null && Number.isInteger(Number(requestedRemotePort)) && Number(requestedRemotePort) >= 1 && Number(requestedRemotePort) <= 65535) {
+        hostHeader = `127.0.0.1:${Number(requestedRemotePort)}`;
+        originHeader = `${parsed.protocol}//${hostHeader}`;
+      } else if (isLoopback) {
+        // Túnel SSH efímero hacia el Caddy Admin remoto (escuchando en 127.0.0.1:2019 en el nodo destino)
+        const defaultRemotePort = 2019;
+        hostHeader = `127.0.0.1:${defaultRemotePort}`;
+        originHeader = `${parsed.protocol}//${hostHeader}`;
+      }
+    }
+
     const built = {
       url: targetUrl,
       dialHost,
-      originHeader: targetUrl.replace(/\/+$/, ''),
-      hostHeader: parsed.host,
+      originHeader,
+      hostHeader,
       port,
       isHttps,
       isOverride
     };
-    if (!isOverride) {
+    if (!isOverride && !caddyAdminPort && !remoteAdminPort && !adminHost) {
       this._parsedAdmin = {
         url: built.url,
         dialHost: built.dialHost,
@@ -141,18 +466,18 @@ class CaddyManager {
   /**
    * Petición HTTP persistente contra la Admin API de Caddy con keep-alive real,
    * `TCP_NODELAY` a nivel de agente y drenaje garantizado del cuerpo.
-   * Acepta `adminUrl` opcional para túneles SSH de flota sin mutar el singleton.
+   * Acepta `adminUrl` y `caddyAdminPort` opcionales para túneles SSH de flota sin mutar el singleton.
    *
    * @param {string} method
    * @param {string} reqPath
-   * @param {{ headers?: Record<string, string>, body?: string | null, timeoutMs?: number, readBody?: boolean, adminUrl?: string | null }} [opts]
+   * @param {{ headers?: Record<string, string>, body?: string | null, timeoutMs?: number, readBody?: boolean, adminUrl?: string | null, caddyAdminPort?: number | null, adminHost?: string | null }} [opts]
    * @returns {Promise<{ status: number, ok: boolean, headers: Record<string, any>, text: string }>}
    */
-  adminRequest(method, reqPath, { headers = {}, body = null, timeoutMs = 10000, readBody = true, adminUrl = null } = {}) {
+  adminRequest(method, reqPath, { headers = {}, body = null, timeoutMs = 10000, readBody = true, adminUrl = null, caddyAdminPort = null, adminHost = null } = {}) {
     return new Promise((resolve, reject) => {
       let admin;
       try {
-        admin = this._getAdminTarget(adminUrl);
+        admin = this._getAdminTarget(adminUrl, { caddyAdminPort, adminHost });
       } catch (err) {
         return reject(err);
       }
@@ -230,9 +555,9 @@ class CaddyManager {
   /**
    * ¿Hay un Caddy con el que hablar? 1 sola petición ligera keep-alive.
    * Si se pasa `adminUrl`, consulta ese destino remoto sin mutar el estado local del singleton.
-   * @param {{ force?: boolean, adminUrl?: string | null }} [opts]
+   * @param {{ force?: boolean, adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async detect({ force = false, adminUrl = null } = {}) {
+  async detect({ force = false, adminUrl = null, caddyAdminPort = null } = {}) {
     const effectiveAdminUrl = adminUrl ? String(adminUrl).trim() : this.adminUrl;
     const isOverride = Boolean(adminUrl && effectiveAdminUrl !== this.adminUrl);
     const now = Date.now();
@@ -246,7 +571,8 @@ class CaddyManager {
       const res = await this.adminRequest('GET', '/reverse_proxy/upstreams', {
         timeoutMs: 2000,
         readBody: false,
-        adminUrl: isOverride ? effectiveAdminUrl : null
+        adminUrl: isOverride ? effectiveAdminUrl : null,
+        caddyAdminPort
       });
       if (res.ok) {
         result = { available: true, adminUrl: effectiveAdminUrl, version: 'activo', reason: null };
@@ -255,7 +581,8 @@ class CaddyManager {
         const cfgRes = await this.adminRequest('GET', '/config/', {
           timeoutMs: 2000,
           readBody: false,
-          adminUrl: isOverride ? effectiveAdminUrl : null
+          adminUrl: isOverride ? effectiveAdminUrl : null,
+          caddyAdminPort
         });
         if (cfgRes.ok) {
           result = { available: true, adminUrl: effectiveAdminUrl, version: 'activo', reason: null };
@@ -282,15 +609,16 @@ class CaddyManager {
   /**
    * Estado en vivo de los upstreams HTTP (`GET /reverse_proxy/upstreams`):
    * devuelve dirección, número de peticiones activas y contador de fallos pasivos.
-   * @param {{ adminUrl?: string | null, timeoutMs?: number }} [opts]
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null, timeoutMs?: number }} [opts]
    * @returns {Promise<Array<{ address: string, numRequests: number, fails: number }>>}
    */
-  async getUpstreamsStatus({ adminUrl = null, timeoutMs = 3000 } = {}) {
+  async getUpstreamsStatus({ adminUrl = null, caddyAdminPort = null, timeoutMs = 3000 } = {}) {
     try {
       const res = await this.adminRequest('GET', '/reverse_proxy/upstreams', {
         timeoutMs,
         readBody: true,
-        adminUrl
+        adminUrl,
+        caddyAdminPort
       });
       if (!res.ok || !res.text) return [];
       const parsed = JSON.parse(res.text);
@@ -316,8 +644,11 @@ class CaddyManager {
     }
   }
 
-  async requireAvailable({ adminUrl = null } = {}) {
-    const detection = await this.detect({ adminUrl });
+  /**
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
+   */
+  async requireAvailable({ adminUrl = null, caddyAdminPort = null } = {}) {
+    const detection = await this.detect({ adminUrl, caddyAdminPort });
     if (!detection.available) {
       const err = new Error(`Caddy no está disponible: ${detection.reason}`);
       /** @type {any} */ (err).code = 'CADDY_UNAVAILABLE';
@@ -332,10 +663,10 @@ class CaddyManager {
 
   /**
    * @param {string} reqPath
-   * @param {{ adminUrl?: string | null }} [opts]
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async getWithEtag(reqPath, { adminUrl = null } = {}) {
-    const res = await this.adminRequest('GET', reqPath, { timeoutMs: 5000, readBody: true, adminUrl });
+  async getWithEtag(reqPath, { adminUrl = null, caddyAdminPort = null } = {}) {
+    const res = await this.adminRequest('GET', reqPath, { timeoutMs: 5000, readBody: true, adminUrl, caddyAdminPort });
     if (res.status === 404 || (res.status === 400 && /invalid traversal path/i.test(res.text || ''))) {
       return { found: false, value: null, etag: null };
     }
@@ -346,7 +677,7 @@ class CaddyManager {
 
   /**
    * @param {string} reqPath
-   * @param {{ adminUrl?: string | null }} [opts]
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
   async get(reqPath, opts = {}) {
     return (await this.getWithEtag(reqPath, opts)).value;
@@ -356,9 +687,9 @@ class CaddyManager {
    * @param {string} method
    * @param {string} reqPath
    * @param {any} body
-   * @param {{ etag?: string | null, retries?: number, adminUrl?: string | null }} [opts]
+   * @param {{ etag?: string | null, retries?: number, adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async write(method, reqPath, body, { etag = null, retries = 3, adminUrl = null } = {}) {
+  async write(method, reqPath, body, { etag = null, retries = 3, adminUrl = null, caddyAdminPort = null } = {}) {
     for (let attempt = 0; attempt <= retries; attempt++) {
       /** @type {Record<string, string>} */
       const headers = { 'Content-Type': 'application/json' };
@@ -369,7 +700,8 @@ class CaddyManager {
         body: body === undefined ? null : JSON.stringify(body),
         timeoutMs: 10000,
         readBody: false,
-        adminUrl
+        adminUrl,
+        caddyAdminPort
       });
 
       if (res.ok) return true;
@@ -448,14 +780,29 @@ class CaddyManager {
     /** @type {Set<string>} */
     const seenRoots = new Set();
 
-    /** @param {{ rootDomain: string, tokenEnv?: string, apiToken?: string | null, includeApex?: boolean }} pol */
+    /**
+     * @param {{
+     *   rootDomain: string,
+     *   provider?: string,
+     *   tokenEnv?: string,
+     *   apiToken?: string | null,
+     *   credentialsEnv?: Record<string, string> | null,
+     *   credentials?: Record<string, string> | null,
+     *   includeApex?: boolean
+     * }} pol
+     */
     const pushWildcardPolicy = (pol) => {
       const cleanRoot = String(pol.rootDomain || '').trim().toLowerCase().replace(/^\*\./, '');
       if (!cleanRoot || seenRoots.has(cleanRoot)) return;
       seenRoots.add(cleanRoot);
 
-      const cleanEnv = String(pol.tokenEnv || cloudflareDnsTokenEnv || 'CF_API_TOKEN').trim();
-      const apiTokenExpr = pol.apiToken ? String(pol.apiToken) : `{env.${cleanEnv}}`;
+      const providerName = String(pol.provider || 'cloudflare').trim().toLowerCase();
+      const { providerConfig } = buildDnsProviderConfig(providerName, {
+        tokenEnv: pol.tokenEnv || (providerName === 'cloudflare' ? cloudflareDnsTokenEnv : null),
+        apiToken: pol.apiToken || null,
+        credentialsEnv: pol.credentialsEnv || null,
+        credentials: pol.credentials || null
+      });
       const subjects = pol.includeApex === false ? [`*.${cleanRoot}`] : [`*.${cleanRoot}`, cleanRoot];
 
       /** @type {any} */
@@ -463,10 +810,7 @@ class CaddyManager {
         module: 'acme',
         challenges: {
           dns: {
-            provider: {
-              name: 'cloudflare',
-              api_token: apiTokenExpr
-            },
+            provider: providerConfig,
             resolvers: ['1.1.1.1', '8.8.8.8']
           }
         }
@@ -666,19 +1010,28 @@ class CaddyManager {
     };
   }
 
-  /** Carga la configuración base completa. Sobrescribe lo que hubiera. */
-  async loadBaseConfig(options) {
-    await this.requireAvailable();
+  /**
+   * Carga la configuración base completa. Sobrescribe lo que hubiera.
+   * @param {any} options
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [adminOpts]
+   */
+  async loadBaseConfig(options, { adminUrl = null, caddyAdminPort = null } = {}) {
+    const isOverride = Boolean(adminUrl && String(adminUrl).trim() !== this.adminUrl);
+    await this.requireAvailable({ adminUrl, caddyAdminPort });
     const config = this.buildBaseConfig(options);
     const res = await this.adminRequest('POST', '/load', {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
       timeoutMs: 15000,
-      readBody: false
+      readBody: false,
+      adminUrl: isOverride ? String(adminUrl).trim() : null,
+      caddyAdminPort
     });
     if (!res.ok) throw new Error(`No se pudo cargar la configuración base: ${res.status} ${res.text}`);
-    this._appliedRouteJson.clear();
-    this.lastKnownRouteCount = 0;
+    if (!isOverride) {
+      this._appliedRouteJson.clear();
+      this.lastKnownRouteCount = 0;
+    }
     return config;
   }
 
@@ -691,24 +1044,72 @@ class CaddyManager {
   }
 
   /**
+   * Detecta la clase lógica de una ruta ya construida de Caddy o de un spec
+   * (`redirect`, `maintenance`, `sleeping`, `proxy`) sin falsos positivos.
+   * @param {any} specOrRoute
+   * @returns {'redirect' | 'maintenance' | 'sleeping' | 'proxy'}
+   */
+  _classifyRouteKind(specOrRoute) {
+    if (!specOrRoute || typeof specOrRoute !== 'object') return 'proxy';
+    if (typeof specOrRoute.kind === 'string') {
+      if (specOrRoute.kind === 'redirect') return 'redirect';
+      if (specOrRoute.kind === 'maintenance') return 'maintenance';
+      if (specOrRoute.kind === 'sleeping') return 'sleeping';
+    }
+    const inspectHandlers = (handlers) => {
+      if (!Array.isArray(handlers)) return null;
+      for (const h of handlers) {
+        if (!h || typeof h !== 'object') continue;
+        if (h.handler === 'rewrite' && typeof h.uri === 'string' && h.uri.startsWith('/_culkibo/wake/')) {
+          return 'sleeping';
+        }
+        if (h.handler === 'static_response') {
+          const code = String(h.status_code || '');
+          if (code === '503') return 'maintenance';
+          if (code === '301' || code === '302' || code === '307' || code === '308') return 'redirect';
+        }
+        if (h.handler === 'subroute' && Array.isArray(h.routes)) {
+          for (const sub of h.routes) {
+            // Saltar la rama de bloqueo 403 de IP Allowlist o preflight OPTIONS 204
+            const subKind = inspectHandlers(sub && sub.handle);
+            if (subKind) return subKind;
+          }
+        }
+      }
+      return null;
+    };
+    return /** @type {'redirect' | 'maintenance' | 'sleeping' | 'proxy'} */ (inspectHandlers(specOrRoute.handle) || 'proxy');
+  }
+
+  /**
    * Orden determinista por especificidad para evitar que una ruta comodín
-   * (`*.empresa.com`) capture tráfico de un subdominio exacto (`tienda.empresa.com`).
+   * (`*.empresa.com`) capture tráfico de un subdominio exacto (`tienda.empresa.com`),
+   * y garantizando prioridad para redirecciones exactas, mantenimiento/sleeping y rutas con prefijo de path.
    *
    * 0: redirecciones exactas (www -> apex / apex -> www)
-   * 1: modo mantenimiento exacto
-   * 2: rutas con hostnames exactos
-   * 3: comodines ordenados por sufijo más largo primero (`*.sub.a.com` antes que `*.a.com`)
+   * 10: modo mantenimiento / sleeping exacto
+   * 20..100: rutas exactas con matcher de path (más largo primero)
+   * 200: rutas con hostnames exactos
+   * 1000..: comodines ordenados por sufijo más largo primero (`*.sub.a.com` antes que `*.a.com`)
    */
-  routeSpecificityRank(spec) {
-    const hosts = Array.isArray(spec.hostnames) ? spec.hostnames : [];
+  routeSpecificityRank(specOrRoute) {
+    const hosts = Array.isArray(specOrRoute?.hostnames)
+      ? specOrRoute.hostnames
+      : (Array.isArray(specOrRoute?.match?.[0]?.host) ? specOrRoute.match[0].host : []);
+    const kind = this._classifyRouteKind(specOrRoute);
     const hasWildcard = hosts.some((h) => String(h).startsWith('*.'));
+    const paths = Array.isArray(specOrRoute?.match?.[0]?.path) ? specOrRoute.match[0].path : [];
+    const maxPathLen = paths.length > 0 ? Math.max(...paths.map((p) => String(p).length), 0) : 0;
+
     if (!hasWildcard) {
-      if (spec.kind === 'redirect') return 0;
-      if (spec.kind === 'maintenance' || spec.kind === 'sleeping') return 1;
-      return 2;
+      if (kind === 'redirect') return 0;
+      if (kind === 'maintenance' || kind === 'sleeping') return 10;
+      if (maxPathLen > 0) return 100 - Math.min(80, maxPathLen);
+      return 200;
     }
     const maxLen = Math.max(...hosts.map((h) => String(h).length), 0);
-    return 1000 - Math.min(900, maxLen);
+    const kindOffset = kind === 'redirect' ? 0 : (kind === 'maintenance' || kind === 'sleeping' ? 1 : 2);
+    return (1000 - Math.min(900, maxLen)) * 10 + kindOffset;
   }
 
   /**
@@ -858,15 +1259,26 @@ class CaddyManager {
     };
   }
 
-  /** Extrae el handler `reverse_proxy` de una ruta (aunque tenga auth, request_body o subroute IP allowlist). */
+  /**
+   * Extrae el handler `reverse_proxy` principal de una ruta (ignorando sub-peticiones
+   * `forward_auth` con `handle_response`, y atravesando `subroute` de IP Allowlist/CORS/pathRoutes).
+   */
   extractProxyHandler(route) {
     if (!route || !Array.isArray(route.handle)) return null;
     for (const h of route.handle) {
       if (!h) continue;
-      if (h.handler === 'reverse_proxy') return h;
+      if (h.handler === 'reverse_proxy') {
+        const isForwardAuthCheck = Boolean(
+          Array.isArray(h.handle_response) &&
+          h.rewrite &&
+          h.rewrite.method === 'GET'
+        );
+        if (!isForwardAuthCheck) return h;
+      }
       if (h.handler === 'subroute' && Array.isArray(h.routes)) {
-        for (const sub of h.routes) {
-          const nested = this.extractProxyHandler(sub);
+        // Recorrer del final al inicio para preferir la ruta principal de aplicación sobre subrutas auxiliares
+        for (let i = h.routes.length - 1; i >= 0; i--) {
+          const nested = this.extractProxyHandler(h.routes[i]);
           if (nested) return nested;
         }
       }
@@ -875,12 +1287,424 @@ class CaddyManager {
   }
 
   /**
+   * Construye un bloque `reverse_proxy` reutilizable (para ruta principal o `pathRoutes[]`)
+   * con soporte para gRPC/h2c, SSE streaming, drenaje WebSocket, HSTS preload y cabeceras seguras.
+   * @param {any} opts
+   */
+  _buildReverseProxyHandler({
+    upstreams,
+    weights = null,
+    protocol = 'http',
+    streaming = false,
+    flushInterval = null,
+    streamCloseDelayMs = 5000,
+    dialTimeoutMs = 5000,
+    responseHeaderTimeoutMs = null,
+    securityHeaders = false,
+    hstsPreload = false,
+    hstsMaxAge = null,
+    permissionsPolicy = null,
+    csp = null,
+    framePolicy = null,
+    customHeaders = null,
+    activeHealthPath = null
+  }) {
+    const cleanProto = String(protocol || 'http').trim().toLowerCase();
+    if (!['http', 'grpc', 'h2c'].includes(cleanProto)) {
+      throw new Error(`Protocolo de upstream inválido: ${protocol} (usa http, grpc o h2c)`);
+    }
+    const isH2c = cleanProto === 'grpc' || cleanProto === 'h2c';
+    const isStreaming = Boolean(streaming) || flushInterval === -1;
+    const effectiveFlush = flushInterval !== null && flushInterval !== undefined
+      ? Number(flushInterval)
+      : (isStreaming ? -1 : null);
+
+    const safeStreamCloseMs = Number.isFinite(Number(streamCloseDelayMs))
+      ? Math.min(300000, Math.max(0, Math.round(Number(streamCloseDelayMs))))
+      : 5000;
+    const safeDialMs = Number.isFinite(Number(dialTimeoutMs))
+      ? Math.min(60000, Math.max(500, Math.round(Number(dialTimeoutMs))))
+      : 5000;
+
+    /** @type {any} */
+    const transport = {
+      protocol: 'http',
+      keep_alive: {
+        max_idle_conns_per_host: 64,
+        idle_timeout: 120000000000,
+        probe_interval: 30000000000
+      },
+      dial_timeout: safeDialMs * 1e6
+    };
+    if (isH2c) {
+      transport.versions = ['h2c'];
+    }
+    if (responseHeaderTimeoutMs !== null && responseHeaderTimeoutMs !== undefined && Number.isFinite(Number(responseHeaderTimeoutMs))) {
+      const safeRespMs = Math.min(600000, Math.max(1000, Math.round(Number(responseHeaderTimeoutMs))));
+      transport.response_header_timeout = safeRespMs * 1e6;
+    } else if (!isStreaming && !isH2c) {
+      transport.response_header_timeout = 60000000000;
+    }
+
+    /** @type {any} */
+    const handler = {
+      handler: 'reverse_proxy',
+      upstreams: upstreams.map((u) => ({ dial: String(u) })),
+      stream_close_delay: safeStreamCloseMs * 1e6,
+      ...(effectiveFlush !== null && Number.isFinite(effectiveFlush)
+        ? { flush_interval: effectiveFlush < 0 ? -1 : Math.round(effectiveFlush * 1e6) }
+        : {}),
+      transport
+    };
+
+    if (weights && weights.length === upstreams.length && upstreams.length > 1) {
+      handler.load_balancing = {
+        selection_policy: { policy: 'weighted_round_robin', weights }
+      };
+    }
+
+    /** @type {Record<string, string[]>} */
+    const respSet = {};
+    /** @type {string[]} */
+    const respDel = [];
+    if (securityHeaders) {
+      respSet['X-Content-Type-Options'] = ['nosniff'];
+      respSet['Referrer-Policy'] = ['strict-origin-when-cross-origin'];
+      if (hstsPreload) {
+        const age = Number.isFinite(Number(hstsMaxAge)) && Number(hstsMaxAge) >= 31536000
+          ? Math.min(63072000, Math.round(Number(hstsMaxAge)))
+          : 63072000;
+        respSet['Strict-Transport-Security'] = [`max-age=${age}; includeSubDomains; preload`];
+      } else {
+        const age = Number.isFinite(Number(hstsMaxAge)) && Number(hstsMaxAge) >= 0
+          ? Math.min(63072000, Math.round(Number(hstsMaxAge)))
+          : 31536000;
+        if (age > 0) {
+          respSet['Strict-Transport-Security'] = [`max-age=${age}; includeSubDomains`];
+        }
+      }
+      if (framePolicy === 'DENY' || framePolicy === 'SAMEORIGIN') {
+        respSet['X-Frame-Options'] = [framePolicy];
+      }
+      respDel.push('Server', 'X-Powered-By');
+    } else {
+      if (hstsPreload) {
+        respSet['Strict-Transport-Security'] = ['max-age=63072000; includeSubDomains; preload'];
+      }
+      if (framePolicy === 'DENY' || framePolicy === 'SAMEORIGIN') {
+        respSet['X-Frame-Options'] = [framePolicy];
+      }
+    }
+    if (typeof permissionsPolicy === 'string' && permissionsPolicy.trim()) {
+      respSet['Permissions-Policy'] = [permissionsPolicy.replace(/[\r\n\0]/g, '').trim().slice(0, 512)];
+    }
+    if (typeof csp === 'string' && csp.trim()) {
+      respSet['Content-Security-Policy'] = [csp.replace(/[\r\n\0]/g, '').trim().slice(0, 2048)];
+    }
+
+    if (customHeaders && customHeaders.response && typeof customHeaders.response === 'object') {
+      let count = 0;
+      for (const [k, v] of Object.entries(customHeaders.response)) {
+        if (count >= 20) break;
+        if (HEADER_NAME_RE.test(k) && !HOP_BY_HOP_HEADER_RE.test(k) && typeof v === 'string') {
+          respSet[k] = [v.replace(/[\r\n\0]/g, '').slice(0, 1024)];
+          count++;
+        }
+      }
+    }
+    /** @type {Record<string, string[]>} */
+    const reqSet = {};
+    if (customHeaders && customHeaders.request && typeof customHeaders.request === 'object') {
+      let count = 0;
+      for (const [k, v] of Object.entries(customHeaders.request)) {
+        if (count >= 20) break;
+        if (HEADER_NAME_RE.test(k) && !HOP_BY_HOP_HEADER_RE.test(k) && typeof v === 'string') {
+          reqSet[k] = [v.replace(/[\r\n\0]/g, '').slice(0, 1024)];
+          count++;
+        }
+      }
+    }
+    if (Object.keys(respSet).length > 0 || respDel.length > 0 || Object.keys(reqSet).length > 0) {
+      handler.headers = {};
+      if (Object.keys(respSet).length > 0 || respDel.length > 0) {
+        handler.headers.response = {
+          ...(Object.keys(respSet).length > 0 ? { set: respSet } : {}),
+          ...(respDel.length > 0 ? { delete: respDel } : {})
+        };
+      }
+      if (Object.keys(reqSet).length > 0) {
+        handler.headers.request = { set: reqSet };
+      }
+    }
+
+    handler.health_checks = {
+      passive: { fail_duration: 10000000000, max_fails: 3 } // 10 s
+    };
+    if (
+      typeof activeHealthPath === 'string' &&
+      /^\/[A-Za-z0-9._~\-/]*$/.test(activeHealthPath) &&
+      !activeHealthPath.includes('..')
+    ) {
+      handler.health_checks.active = {
+        path: activeHealthPath,
+        interval: 10000000000,
+        timeout: 3000000000
+      };
+    }
+
+    return handler;
+  }
+
+  /**
+   * Construye la cadena nativa de Caddy para ForwardAuth (Authelia / Authentik / Keycloak / Tinyauth):
+   * 1. ELIMINA primero cualquier cabecera `copyHeaders` suministrada por el cliente (anti-spoofing).
+   * 2. Ejecuta sub-petición GET al upstream de autenticación pasando X-Forwarded-Method/Uri/Proto/Host.
+   * 3. Si responde 2xx, copia las cabeceras verificadas (`{http.reverse_proxy.header.*}`) y continúa al backend;
+   *    cualquier 3xx/4xx (redirect al portal SSO o 401/403) se devuelve directamente al navegador.
+   *
+   * @param {{
+   *   enabled?: boolean,
+   *   upstream: string,
+   *   uri?: string,
+   *   copyHeaders?: string[],
+   *   dialTimeoutMs?: number,
+   *   responseTimeoutMs?: number
+   * }} forwardAuth
+   */
+  _buildForwardAuthHandlers(forwardAuth) {
+    const dial = sanitizeUpstreamDial(forwardAuth.upstream, 'forwardAuth.upstream');
+    const rawUri = String(forwardAuth.uri || '/api/verify').trim();
+    if (!rawUri.startsWith('/') || /[\s\r\n\0]/.test(rawUri) || rawUri.includes('..')) {
+      throw new Error(`URI de forwardAuth inválida: ${rawUri.slice(0, 80)}`);
+    }
+
+    const defaultHeaders = ['Remote-User', 'Remote-Groups', 'Remote-Name', 'Remote-Email'];
+    const rawCopy = Array.isArray(forwardAuth.copyHeaders) && forwardAuth.copyHeaders.length > 0
+      ? forwardAuth.copyHeaders
+      : defaultHeaders;
+    /** @type {string[]} */
+    const copyHeaders = [];
+    /** @type {Set<string>} */
+    const seenLower = new Set();
+    for (const h of rawCopy.slice(0, 20)) {
+      const clean = String(h || '').trim();
+      if (!HEADER_NAME_RE.test(clean) || HOP_BY_HOP_HEADER_RE.test(clean)) {
+        throw new Error(`Cabecera copyHeaders inválida en forwardAuth: "${clean.slice(0, 40)}"`);
+      }
+      const lower = clean.toLowerCase();
+      if (!seenLower.has(lower)) {
+        seenLower.add(lower);
+        copyHeaders.push(clean);
+      }
+    }
+
+    const dialTimeoutMs = Number.isFinite(Number(forwardAuth.dialTimeoutMs))
+      ? Math.min(30000, Math.max(500, Math.round(Number(forwardAuth.dialTimeoutMs))))
+      : 3000;
+    const responseTimeoutMs = Number.isFinite(Number(forwardAuth.responseTimeoutMs))
+      ? Math.min(30000, Math.max(500, Math.round(Number(forwardAuth.responseTimeoutMs))))
+      : 5000;
+
+    /** @type {Record<string, string[]>} */
+    const copySet = {};
+    for (const h of copyHeaders) {
+      copySet[h] = [`{http.reverse_proxy.header.${h}}`];
+    }
+
+    /** @type {any[]} */
+    const handlers = [
+      // Defensa anti-spoofing: purgar cualquier cabecera de identidad inyectada por el cliente antes del chequeo auth
+      {
+        handler: 'headers',
+        request: {
+          delete: copyHeaders
+        }
+      },
+      {
+        handler: 'reverse_proxy',
+        upstreams: [{ dial }],
+        rewrite: {
+          method: 'GET',
+          uri: rawUri
+        },
+        headers: {
+          request: {
+            set: {
+              'X-Forwarded-Method': ['{http.request.method}'],
+              'X-Forwarded-Uri': ['{http.request.uri}'],
+              'X-Forwarded-Proto': ['{http.request.scheme}'],
+              'X-Forwarded-Host': ['{http.request.host}']
+            }
+          }
+        },
+        transport: {
+          protocol: 'http',
+          dial_timeout: dialTimeoutMs * 1e6,
+          response_header_timeout: responseTimeoutMs * 1e6
+        },
+        handle_response: [
+          {
+            match: { status_code: [2] },
+            routes: [
+              {
+                handle: [
+                  {
+                    handler: 'headers',
+                    request: {
+                      set: copySet
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ];
+    return handlers;
+  }
+
+  /**
+   * Envuelve la cadena de handlers con política CORS nativa en Caddy JSON:
+   * - Rechaza estrictamente `allowCredentials: true` combinado con `'*'`.
+   * - Nunca refleja un `Origin` arbitrario: valida contra regex exacto de orígenes permitidos.
+   * - Responde preflight `OPTIONS` con 204 + `Vary: Origin` antes de auth.
+   *
+   * @param {{
+   *   enabled?: boolean,
+   *   allowedOrigins?: string[],
+   *   allowedMethods?: string[],
+   *   allowedHeaders?: string[],
+   *   exposedHeaders?: string[],
+   *   allowCredentials?: boolean,
+   *   maxAge?: number
+   * }} cors
+   * @param {any[]} innerChain
+   */
+  _wrapWithCors(cors, innerChain) {
+    const rawOrigins = Array.isArray(cors.allowedOrigins) ? cors.allowedOrigins : [];
+    const origins = Array.from(new Set(rawOrigins.map((o) => validateCorsOrigin(o))));
+    if (origins.length === 0) {
+      throw new Error('Activar CORS requiere al menos un origen en allowedOrigins');
+    }
+    const allowCredentials = Boolean(cors.allowCredentials);
+    const isWildcard = origins.includes('*');
+    if (allowCredentials && isWildcard) {
+      throw new Error('Política CORS insegura bloqueada: allowCredentials=true no puede combinarse con allowedOrigins=["*"]');
+    }
+
+    const allowedMethodsList = (Array.isArray(cors.allowedMethods) && cors.allowedMethods.length > 0
+      ? cors.allowedMethods
+      : ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+      .map((m) => String(m || '').trim().toUpperCase())
+      .filter((m) => /^[A-Z]{2,16}$/.test(m));
+    const allowedHeadersList = (Array.isArray(cors.allowedHeaders) && cors.allowedHeaders.length > 0
+      ? cors.allowedHeaders
+      : ['Authorization', 'Content-Type', 'X-Requested-With'])
+      .map((h) => String(h || '').trim())
+      .filter((h) => HEADER_NAME_RE.test(h));
+    const exposedHeadersList = (Array.isArray(cors.exposedHeaders) ? cors.exposedHeaders : [])
+      .map((h) => String(h || '').trim())
+      .filter((h) => HEADER_NAME_RE.test(h));
+    const maxAge = Number.isFinite(Number(cors.maxAge))
+      ? Math.min(86400, Math.max(0, Math.round(Number(cors.maxAge))))
+      : 3600;
+
+    const originValue = isWildcard ? '*' : '{http.request.header.Origin}';
+    const originMatcher = isWildcard
+      ? null
+      : {
+          header_regexp: {
+            Origin: `^(?:${origins.map((o) => escapeRegexLiteral(o)).join('|')})$`
+          }
+        };
+
+    /** @type {Record<string, string[]>} */
+    const preflightHeaders = {
+      'Access-Control-Allow-Origin': [originValue],
+      'Access-Control-Allow-Methods': [allowedMethodsList.join(', ')],
+      'Access-Control-Allow-Headers': [allowedHeadersList.join(', ')],
+      'Access-Control-Max-Age': [String(maxAge)],
+      Vary: ['Origin, Access-Control-Request-Method, Access-Control-Request-Headers']
+    };
+    if (allowCredentials) {
+      preflightHeaders['Access-Control-Allow-Credentials'] = ['true'];
+    }
+
+    /** @type {Record<string, string[]>} */
+    const respCorsHeaders = {
+      'Access-Control-Allow-Origin': [originValue],
+      Vary: ['Origin']
+    };
+    if (allowCredentials) {
+      respCorsHeaders['Access-Control-Allow-Credentials'] = ['true'];
+    }
+    if (exposedHeadersList.length > 0) {
+      respCorsHeaders['Access-Control-Expose-Headers'] = [exposedHeadersList.join(', ')];
+    }
+
+    /** @type {any[]} */
+    const corsRoutes = [
+      {
+        match: [
+          {
+            method: ['OPTIONS'],
+            ...(originMatcher || {})
+          }
+        ],
+        handle: [
+          {
+            handler: 'static_response',
+            status_code: '204',
+            headers: preflightHeaders
+          }
+        ],
+        terminal: true
+      }
+    ];
+
+    if (originMatcher) {
+      // Añadir cabeceras CORS solo cuando la cabecera Origin coincide exactamente con la lista blanca
+      corsRoutes.push({
+        match: [originMatcher],
+        handle: [
+          {
+            handler: 'headers',
+            response: {
+              set: respCorsHeaders
+            }
+          }
+        ]
+      });
+      corsRoutes.push({
+        handle: innerChain
+      });
+    } else {
+      corsRoutes.push({
+        handle: [
+          {
+            handler: 'headers',
+            response: {
+              set: respCorsHeaders
+            }
+          },
+          ...innerChain
+        ]
+      });
+    }
+
+    return [{ handler: 'subroute', routes: corsRoutes }];
+  }
+
+  /**
    * Construye una ruta de Caddy:
    * - `kind === 'redirect'`: redirección canónica 301/308 (`www` ↔ apex)
    * - `kind === 'maintenance'`: modo mantenimiento atómico 503 sin detener el contenedor
    * - `kind === 'sleeping'`: wake-on-request hacia Culkibo (Scale-to-Zero)
    * - por defecto: `reverse_proxy` con drenaje de WebSockets, keep-alive, canario opcional,
-   *   cabeceras de seguridad/personalizadas, Basic Auth bcrypt nativo, IP Allowlist y maxBodySize.
+   *   cabeceras de seguridad/HSTS preload/personalizadas, Basic Auth bcrypt nativo, ForwardAuth
+   *   (Authelia/Authentik), CORS, IP Allowlist, maxBodySize, pathRoutes/stripPrefix/pathRedirects,
+   *   gRPC/h2c y ajuste de streaming SSE/WS.
    *
    * @param {{
    *   projectId: string,
@@ -895,13 +1719,26 @@ class CaddyManager {
    *   activeHealthPath?: string | null,
    *   adminUrl?: string | null,
    *   securityHeaders?: boolean,
+   *   hstsPreload?: boolean,
+   *   hstsMaxAge?: number | null,
+   *   permissionsPolicy?: string | null,
+   *   csp?: string | null,
    *   framePolicy?: 'DENY' | 'SAMEORIGIN' | 'ALLOW' | null,
    *   customHeaders?: { response?: Record<string, string>, request?: Record<string, string> } | null,
    *   basicAuth?: { enabled?: boolean, realm?: string, accounts?: Array<{ username: string, passwordHash: string }> } | null,
+   *   forwardAuth?: { enabled?: boolean, upstream: string, uri?: string, copyHeaders?: string[], dialTimeoutMs?: number, responseTimeoutMs?: number } | null,
+   *   cors?: { enabled?: boolean, allowedOrigins?: string[], allowedMethods?: string[], allowedHeaders?: string[], exposedHeaders?: string[], allowCredentials?: boolean, maxAge?: number } | null,
+   *   pathRoutes?: Array<{ path: string, upstreams: string[], stripPrefix?: string | boolean, protocol?: string, streaming?: boolean, flushInterval?: number | null }> | null,
+   *   pathRedirects?: Array<{ pattern: string, target: string, status?: number, isRegex?: boolean }> | null,
    *   ipAllowlist?: string[] | null,
    *   maxBodySizeMb?: number | null,
    *   rateLimit?: { enabled?: boolean, requests?: number, windowSeconds?: number } | null,
-   *   flushInterval?: number | null
+   *   protocol?: string,
+   *   streaming?: boolean,
+   *   flushInterval?: number | null,
+   *   streamCloseDelayMs?: number | null,
+   *   dialTimeoutMs?: number | null,
+   *   responseHeaderTimeoutMs?: number | null
    * }} spec
    */
   buildRoute(spec) {
@@ -917,13 +1754,26 @@ class CaddyManager {
       wakeSecret = null,
       activeHealthPath = null,
       securityHeaders = false,
+      hstsPreload = false,
+      hstsMaxAge = null,
+      permissionsPolicy = null,
+      csp = null,
       framePolicy = null,
       customHeaders = null,
       basicAuth = null,
+      forwardAuth = null,
+      cors = null,
+      pathRoutes = null,
+      pathRedirects = null,
       ipAllowlist = null,
       maxBodySizeMb = null,
       rateLimit = null,
-      flushInterval = null
+      protocol = 'http',
+      streaming = false,
+      flushInterval = null,
+      streamCloseDelayMs = 5000,
+      dialTimeoutMs = 5000,
+      responseHeaderTimeoutMs = null
     } = spec;
 
     if (!Array.isArray(hostnames) || hostnames.length === 0) {
@@ -980,96 +1830,25 @@ class CaddyManager {
       throw new Error('Una ruta necesita al menos un destino');
     }
 
-    const isStreamingRoute = projectId === 'culkibo_panel' || flushInterval === -1;
-    /** @type {any} */
-    const handler = {
-      handler: 'reverse_proxy',
-      upstreams: upstreams.map(u => ({ dial: String(u) })),
-      stream_close_delay: 5000000000, // 5 s, en nanosegundos
-      ...(isStreamingRoute ? { flush_interval: -1 } : {}),
-      transport: {
-        protocol: 'http',
-        keep_alive: {
-          max_idle_conns_per_host: 64,
-          idle_timeout: 120000000000,
-          probe_interval: 30000000000
-        },
-        dial_timeout: 5000000000,
-        ...(!isStreamingRoute ? { response_header_timeout: 60000000000 } : {})
-      }
-    };
-
-    if (weights && weights.length === upstreams.length && upstreams.length > 1) {
-      handler.load_balancing = {
-        selection_policy: { policy: 'weighted_round_robin', weights }
-      };
-    }
-
-    const HOP_BY_HOP = /^(host|content-length|transfer-encoding|connection|keep-alive|upgrade|proxy-authenticate|proxy-authorization|te|trailer)$/i;
-    /** @type {Record<string, string[]>} */
-    const respSet = {};
-    /** @type {string[]} */
-    const respDel = [];
-    if (securityHeaders) {
-      respSet['X-Content-Type-Options'] = ['nosniff'];
-      respSet['Referrer-Policy'] = ['strict-origin-when-cross-origin'];
-      respSet['Strict-Transport-Security'] = ['max-age=31536000; includeSubDomains'];
-      if (framePolicy === 'DENY' || framePolicy === 'SAMEORIGIN') {
-        respSet['X-Frame-Options'] = [framePolicy];
-      }
-      respDel.push('Server', 'X-Powered-By');
-    } else if (framePolicy === 'DENY' || framePolicy === 'SAMEORIGIN') {
-      respSet['X-Frame-Options'] = [framePolicy];
-    }
-    if (customHeaders && customHeaders.response && typeof customHeaders.response === 'object') {
-      let count = 0;
-      for (const [k, v] of Object.entries(customHeaders.response)) {
-        if (count >= 20) break;
-        if (/^[A-Za-z0-9-]+$/.test(k) && !HOP_BY_HOP.test(k) && typeof v === 'string') {
-          respSet[k] = [v.replace(/[\r\n\0]/g, '').slice(0, 1024)];
-          count++;
-        }
-      }
-    }
-    /** @type {Record<string, string[]>} */
-    const reqSet = {};
-    if (customHeaders && customHeaders.request && typeof customHeaders.request === 'object') {
-      let count = 0;
-      for (const [k, v] of Object.entries(customHeaders.request)) {
-        if (count >= 20) break;
-        if (/^[A-Za-z0-9-]+$/.test(k) && !HOP_BY_HOP.test(k) && typeof v === 'string') {
-          reqSet[k] = [v.replace(/[\r\n\0]/g, '').slice(0, 1024)];
-          count++;
-        }
-      }
-    }
-    if (Object.keys(respSet).length > 0 || respDel.length > 0 || Object.keys(reqSet).length > 0) {
-      handler.headers = {};
-      if (Object.keys(respSet).length > 0 || respDel.length > 0) {
-        handler.headers.response = {
-          ...(Object.keys(respSet).length > 0 ? { set: respSet } : {}),
-          ...(respDel.length > 0 ? { delete: respDel } : {})
-        };
-      }
-      if (Object.keys(reqSet).length > 0) {
-        handler.headers.request = { set: reqSet };
-      }
-    }
-
-    handler.health_checks = {
-      passive: { fail_duration: 10000000000, max_fails: 3 } // 10 s
-    };
-    if (
-      typeof activeHealthPath === 'string' &&
-      /^\/[A-Za-z0-9._~\-/]*$/.test(activeHealthPath) &&
-      !activeHealthPath.includes('..')
-    ) {
-      handler.health_checks.active = {
-        path: activeHealthPath,
-        interval: 10000000000,
-        timeout: 3000000000
-      };
-    }
+    const isStreamingRoute = projectId === 'culkibo_panel' || Boolean(streaming) || flushInterval === -1;
+    const mainProxyHandler = this._buildReverseProxyHandler({
+      upstreams,
+      weights,
+      protocol,
+      streaming: isStreamingRoute,
+      flushInterval: flushInterval !== null && flushInterval !== undefined ? flushInterval : (projectId === 'culkibo_panel' ? -1 : null),
+      streamCloseDelayMs: streamCloseDelayMs ?? 5000,
+      dialTimeoutMs: dialTimeoutMs ?? 5000,
+      responseHeaderTimeoutMs,
+      securityHeaders,
+      hstsPreload,
+      hstsMaxAge,
+      permissionsPolicy,
+      csp,
+      framePolicy,
+      customHeaders,
+      activeHealthPath
+    });
 
     /** @type {any[]} */
     const chain = [];
@@ -1080,7 +1859,7 @@ class CaddyManager {
       chain.push({ handler: 'request_body', max_size: Math.round(maxMb * 1024 * 1024) });
     }
 
-    // 2. Rate limiting por dominio ANTES de Basic Auth (protege CPU bcrypt y usa IP real de visitante tras Cloudflare)
+    // 2. Rate limiting por dominio ANTES de Basic Auth / ForwardAuth (protege CPU bcrypt y usa IP real tras Cloudflare)
     if (
       rateLimit &&
       rateLimit.enabled &&
@@ -1129,9 +1908,134 @@ class CaddyManager {
       }
     }
 
-    chain.push(handler);
+    // 4. ForwardAuth nativo (Authelia / Authentik / Keycloak) con purga anti-spoofing previa
+    if (forwardAuth && forwardAuth.enabled) {
+      chain.push(...this._buildForwardAuthHandlers(forwardAuth));
+    }
 
-    // 4. IP Allowlist nativo con `subroute` + `not.client_ip` (cero plugins extra)
+    // 5. Path Redirects (regex ReDoS-safe o prefijo) + Path-Based Routing con strip_path_prefix
+    const validRedirects = Array.isArray(pathRedirects) ? pathRedirects.filter(Boolean) : [];
+    const validPathRoutes = Array.isArray(pathRoutes) ? pathRoutes.filter(Boolean) : [];
+    if (validRedirects.length > 0 || validPathRoutes.length > 0) {
+      /** @type {any[]} */
+      const dispatchRoutes = [];
+
+      validRedirects.slice(0, 32).forEach((rd, idx) => {
+        const pattern = String(rd.pattern || '').trim();
+        const target = String(rd.target || '').trim();
+        const isRegex = rd.isRegex !== false;
+        const codeNum = Number(rd.status);
+        const status = [301, 302, 307, 308].includes(codeNum) ? String(codeNum) : '301';
+
+        if (!pattern || !target || /[\r\n\0]/.test(target)) {
+          throw new Error(`Redirección de ruta inválida en índice ${idx}`);
+        }
+        if (/^(?:javascript|data|vbscript):/i.test(target)) {
+          throw new Error(`Esquema de destino de redirección bloqueado: ${target.slice(0, 40)}`);
+        }
+        if (!target.startsWith('/') && !/^https?:\/\//i.test(target)) {
+          throw new Error(`El destino de redirección debe empezar por "/" o http(s)://: ${target.slice(0, 60)}`);
+        }
+
+        let matchObj;
+        if (isRegex) {
+          const check = validateSafeRedirectRegex(pattern);
+          if (!check.ok) throw new Error(`Regex de redirección rechazado: ${check.error}`);
+          matchObj = { path_regexp: { name: `ck_redir_${idx}`, pattern } };
+        } else {
+          if (!pattern.startsWith('/') || /[\s\r\n\0]/.test(pattern)) {
+            throw new Error(`Ruta de redirección inválida: ${pattern.slice(0, 60)}`);
+          }
+          matchObj = { path: [pattern] };
+        }
+
+        dispatchRoutes.push({
+          match: [matchObj],
+          handle: [{
+            handler: 'static_response',
+            status_code: status,
+            headers: { Location: [target] }
+          }],
+          terminal: true
+        });
+      });
+
+      // Ordenar pathRoutes por prefijo más largo primero (`/api/v2/*` antes de `/api/*`)
+      const sortedPathRoutes = [...validPathRoutes.slice(0, 32)].sort((a, b) => {
+        const la = String(a.path || '').replace(/\*+$/, '').length;
+        const lb = String(b.path || '').replace(/\*+$/, '').length;
+        return lb - la;
+      });
+
+      for (const pr of sortedPathRoutes) {
+        const rawPath = String(pr.path || '').trim();
+        if (!rawPath.startsWith('/') || rawPath.length > 256 || /[\s\r\n\0]/.test(rawPath) || rawPath.includes('..')) {
+          throw new Error(`Prefijo de pathRoute inválido: "${rawPath.slice(0, 60)}"`);
+        }
+        if (!Array.isArray(pr.upstreams) || pr.upstreams.length === 0) {
+          throw new Error(`pathRoute "${rawPath}" necesita al menos un upstream`);
+        }
+        const safeUpstreams = pr.upstreams.map((u) => sanitizeUpstreamDial(u, `pathRoute(${rawPath}).upstream`));
+
+        /** @type {any[]} */
+        const subHandlers = [];
+        if (pr.stripPrefix) {
+          const prefixStr = typeof pr.stripPrefix === 'string'
+            ? pr.stripPrefix.trim()
+            : rawPath.replace(/\/\*+$/, '').replace(/\*+$/, '');
+          if (prefixStr && prefixStr !== '/') {
+            if (!prefixStr.startsWith('/') || /[\s\r\n\0]/.test(prefixStr) || prefixStr.includes('..')) {
+              throw new Error(`stripPrefix inválido en pathRoute "${rawPath}": "${prefixStr}"`);
+            }
+            subHandlers.push({
+              handler: 'rewrite',
+              strip_path_prefix: prefixStr
+            });
+          }
+        }
+        subHandlers.push(this._buildReverseProxyHandler({
+          upstreams: safeUpstreams,
+          protocol: pr.protocol || protocol,
+          streaming: pr.streaming !== undefined ? Boolean(pr.streaming) : isStreamingRoute,
+          flushInterval: pr.flushInterval !== undefined ? pr.flushInterval : flushInterval,
+          streamCloseDelayMs: streamCloseDelayMs ?? 5000,
+          dialTimeoutMs: dialTimeoutMs ?? 5000,
+          responseHeaderTimeoutMs,
+          securityHeaders,
+          hstsPreload,
+          hstsMaxAge,
+          permissionsPolicy,
+          csp,
+          framePolicy,
+          customHeaders
+        }));
+
+        dispatchRoutes.push({
+          match: [{ path: [rawPath] }],
+          handle: subHandlers,
+          terminal: true
+        });
+      }
+
+      // Ruta por defecto para el resto de paths del dominio
+      dispatchRoutes.push({
+        handle: [mainProxyHandler]
+      });
+
+      chain.push({
+        handler: 'subroute',
+        routes: dispatchRoutes
+      });
+    } else {
+      chain.push(mainProxyHandler);
+    }
+
+    // 6. Envoltura CORS (antes de BasicAuth / ForwardAuth para permitir preflight OPTIONS 204 sin 401)
+    const corsWrapped = (cors && cors.enabled)
+      ? this._wrapWithCors(cors, chain)
+      : chain;
+
+    // 7. IP Allowlist nativo con `subroute` + `not.client_ip` (capa más externa, cero plugins extra)
     const cleanAllowlist = Array.isArray(ipAllowlist)
       ? ipAllowlist.map((x) => String(x || '').trim()).filter(Boolean)
       : [];
@@ -1151,11 +2055,11 @@ class CaddyManager {
               terminal: true
             },
             {
-              handle: chain
+              handle: corsWrapped
             }
           ]
         }]
-      : chain;
+      : corsWrapped;
 
     return {
       '@id': this.routeId(projectId),
@@ -1168,10 +2072,10 @@ class CaddyManager {
   /**
    * ¿Existe ya la ruta de este proyecto?
    * @param {string} projectId
-   * @param {{ adminUrl?: string | null }} [opts]
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async getRoute(projectId, { adminUrl = null } = {}) {
-    const { found, value } = await this.getWithEtag(`/id/${this.routeId(projectId)}`, { adminUrl });
+  async getRoute(projectId, { adminUrl = null, caddyAdminPort = null } = {}) {
+    const { found, value } = await this.getWithEtag(`/id/${this.routeId(projectId)}`, { adminUrl, caddyAdminPort });
     return found ? value : null;
   }
 
@@ -1184,15 +2088,16 @@ class CaddyManager {
    * optimista `ETag`/`If-Match`. Esto reduce a la mitad la latencia de
    * conmutación en caliente (p50 en unos pocos milisegundos).
    *
-   * Acepta `adminUrl` opcional (en `opts.adminUrl` o `spec.adminUrl`) para nodos
+   * Acepta `adminUrl` y `caddyAdminPort` opcionales (en `opts` o `spec`) para nodos
    * remotos de flota sin mutar el estado local del singleton.
    *
    * @param {any} spec
-   * @param {{ adminUrl?: string | null }} [opts]
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
   async upsertRoute(spec, opts = {}) {
     const t0 = process.hrtime.bigint();
     const effectiveAdminUrl = (opts && opts.adminUrl) || (spec && spec.adminUrl) || null;
+    const caddyAdminPort = (opts && opts.caddyAdminPort) || (spec && spec.caddyAdminPort) || null;
     const isOverride = Boolean(effectiveAdminUrl && String(effectiveAdminUrl).trim() !== this.adminUrl);
     const targetAdminUrl = isOverride ? String(effectiveAdminUrl).trim() : null;
     const displayAdminUrl = targetAdminUrl || this.adminUrl;
@@ -1215,7 +2120,8 @@ class CaddyManager {
         body: routeJson,
         timeoutMs: 10000,
         readBody: false,
-        adminUrl: targetAdminUrl
+        adminUrl: targetAdminUrl,
+        caddyAdminPort
       });
     } catch (netErr) {
       if (!isOverride) {
@@ -1252,12 +2158,12 @@ class CaddyManager {
     // Si el fast-path indicó que no existe, insertar respetando orden de especificidad (evita que un wildcard eclipse subdominios nuevos)
     const routesPath = '/config/apps/http/servers/culkibo/routes';
     const result = await this.mutate(async () => {
-      const current = await this.getWithEtag(routesPath, { adminUrl: targetAdminUrl });
+      const current = await this.getWithEtag(routesPath, { adminUrl: targetAdminUrl, caddyAdminPort });
       const list = Array.isArray(current.value) ? current.value : [];
       if (list.some((r) => r && r['@id'] === id)) {
-        const existing = await this.getWithEtag(`/id/${id}`, { adminUrl: targetAdminUrl });
+        const existing = await this.getWithEtag(`/id/${id}`, { adminUrl: targetAdminUrl, caddyAdminPort });
         if (existing.found) {
-          await this.write('PATCH', `/id/${id}`, route, { etag: existing.etag, adminUrl: targetAdminUrl });
+          await this.write('PATCH', `/id/${id}`, route, { etag: existing.etag, adminUrl: targetAdminUrl, caddyAdminPort });
           return { created: false, id, route };
         }
       }
@@ -1269,15 +2175,11 @@ class CaddyManager {
         const foreign = list.filter((r) => !(r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX)));
         const managed = list.filter((r) => r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX));
         managed.push(route);
-        managed.sort((a, b) => {
-          const ra = this.routeSpecificityRank({ hostnames: a.match?.[0]?.host || [], kind: a.handle?.[0]?.handler === 'static_response' ? 'redirect' : 'proxy' });
-          const rb = this.routeSpecificityRank({ hostnames: b.match?.[0]?.host || [], kind: b.handle?.[0]?.handler === 'static_response' ? 'redirect' : 'proxy' });
-          return ra - rb;
-        });
-        await this.write('PATCH', routesPath, [...foreign, ...managed], { etag: current.etag, adminUrl: targetAdminUrl });
+        managed.sort((a, b) => this.routeSpecificityRank(a) - this.routeSpecificityRank(b));
+        await this.write('PATCH', routesPath, [...foreign, ...managed], { etag: current.etag, adminUrl: targetAdminUrl, caddyAdminPort });
         return { created: true, id, route };
       }
-      await this.write('POST', routesPath, route, { etag: current.etag, adminUrl: targetAdminUrl });
+      await this.write('POST', routesPath, route, { etag: current.etag, adminUrl: targetAdminUrl, caddyAdminPort });
       return { created: true, id, route };
     });
     if (!isOverride) {
@@ -1289,29 +2191,53 @@ class CaddyManager {
   }
 
   /**
-   * Configura o actualiza una política de certificados wildcard DNS-01 con
-   * Cloudflare directamente en Caddy SIN borrar otros wildcards activos.
+   * Configura o actualiza una política de certificados wildcard DNS-01 multiproveedor
+   * (Cloudflare, Hetzner v2, DigitalOcean, Route53, Porkbun, Bunny, DuckDNS)
+   * directamente en Caddy SIN borrar otros wildcards activos.
+   *
+   * @param {string} rootDomain
+   * @param {{
+   *   provider?: string,
+   *   tokenEnv?: string | null,
+   *   credentialsEnv?: Record<string, string> | null,
+   *   apiToken?: string | null,
+   *   credentials?: Record<string, string> | null,
+   *   includeApex?: boolean,
+   *   acmeEmail?: string | null,
+   *   adminUrl?: string | null,
+   *   caddyAdminPort?: number | null
+   * }} [opts]
    */
-  async configureWildcardDns01(rootDomain, { tokenEnv = 'CF_API_TOKEN', apiToken = null, includeApex = true, acmeEmail = null } = {}) {
+  async configureWildcardDns01(rootDomain, {
+    provider = 'cloudflare',
+    tokenEnv = null,
+    credentialsEnv = null,
+    apiToken = null,
+    credentials = null,
+    includeApex = true,
+    acmeEmail = null,
+    adminUrl = null,
+    caddyAdminPort = null
+  } = {}) {
     const cleanRoot = String(rootDomain || '').trim().toLowerCase().replace(/^\*\./, '');
     if (!cleanRoot || !/^[a-z0-9.-]+\.[a-z0-9-]{2,}$/.test(cleanRoot)) {
       throw new Error(`Dominio raíz inválido para wildcard DNS-01: ${rootDomain}`);
     }
-    const cleanEnv = String(tokenEnv || 'CF_API_TOKEN').trim();
-    if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(cleanEnv)) {
-      throw new Error(`Nombre de variable de entorno inválido para tokenEnv DNS-01: ${tokenEnv}`);
-    }
-    await this.requireAvailable();
+    const cleanProvider = String(provider || 'cloudflare').trim().toLowerCase();
+    const { providerConfig, schema, resolvedEnvMap } = buildDnsProviderConfig(cleanProvider, {
+      tokenEnv,
+      credentialsEnv,
+      apiToken,
+      credentials
+    });
+    await this.requireAvailable({ adminUrl, caddyAdminPort });
     const subjects = includeApex ? [`*.${cleanRoot}`, cleanRoot] : [`*.${cleanRoot}`];
     /** @type {any} */
     const acmeIssuer = {
       module: 'acme',
       challenges: {
         dns: {
-          provider: {
-            name: 'cloudflare',
-            api_token: apiToken ? String(apiToken) : `{env.${cleanEnv}}`
-          },
+          provider: providerConfig,
           resolvers: ['1.1.1.1', '8.8.8.8']
         }
       }
@@ -1323,7 +2249,7 @@ class CaddyManager {
     };
     const policiesPath = '/config/apps/tls/automation/policies';
     return this.mutate(async () => {
-      const current = await this.getWithEtag(policiesPath);
+      const current = await this.getWithEtag(policiesPath, { adminUrl, caddyAdminPort });
       const list = Array.isArray(current.value) ? current.value : [];
       // Preserva cualquier otro wildcard incluso si existía una política agrupada previa
       const nextExisting = [];
@@ -1338,19 +2264,26 @@ class CaddyManager {
         }
       }
       const next = [policy, ...nextExisting];
-      await this.write(current.found ? 'PATCH' : 'PUT', policiesPath, next, { etag: current.etag });
-      return { applied: true, subjects, provider: 'cloudflare', tokenEnv: cleanEnv };
+      await this.write(current.found ? 'PATCH' : 'PUT', policiesPath, next, { etag: current.etag, adminUrl, caddyAdminPort });
+      return {
+        applied: true,
+        subjects,
+        provider: cleanProvider,
+        caddyModule: schema.caddyModule,
+        tokenEnv: resolvedEnvMap[schema.primaryField] || null,
+        credentialsEnv: resolvedEnvMap
+      };
     });
   }
 
   /** Elimina una política wildcard específica preservando las demás y la política on_demand. */
-  async removeWildcardDns01(rootDomain) {
+  async removeWildcardDns01(rootDomain, { adminUrl = null, caddyAdminPort = null } = {}) {
     const cleanRoot = String(rootDomain || '').trim().toLowerCase().replace(/^\*\./, '');
     if (!cleanRoot) return { removed: false };
-    await this.requireAvailable();
+    await this.requireAvailable({ adminUrl, caddyAdminPort });
     const policiesPath = '/config/apps/tls/automation/policies';
     return this.mutate(async () => {
-      const current = await this.getWithEtag(policiesPath);
+      const current = await this.getWithEtag(policiesPath, { adminUrl, caddyAdminPort });
       const list = Array.isArray(current.value) ? current.value : [];
       let changed = false;
       const next = [];
@@ -1366,60 +2299,159 @@ class CaddyManager {
         }
       }
       if (!changed) return { removed: false };
-      await this.write('PATCH', policiesPath, next, { etag: current.etag });
+      await this.write('PATCH', policiesPath, next, { etag: current.etag, adminUrl, caddyAdminPort });
       return { removed: true, rootDomain: cleanRoot };
     });
   }
 
   /**
-   * Reconcilia `/config/apps/tls` completo (múltiples wildcards DNS-01 +
+   * Reconcilia `/config/apps/tls` completo (múltiples wildcards DNS-01 multiproveedor +
    * certificados propios `load_files` + `on_demand` con respaldo ZeroSSL).
-   * Si el binario de Caddy no incluye `dns.providers.cloudflare`, degrada de forma
-   * segura aplicando los certificados propios y `on_demand` sin romper HTTP.
+   * Si el binario de Caddy no incluye alguno de los módulos `dns.providers.<x>`, degrada
+   * de forma segura aplicando los certificados propios y `on_demand` sin romper HTTP.
+   *
+   * @param {any} tlsOpts
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [adminOpts]
    */
-  async reconcileTls(tlsOpts) {
-    await this.requireAvailable();
+  async reconcileTls(tlsOpts, { adminUrl = null, caddyAdminPort = null } = {}) {
+    await this.requireAvailable({ adminUrl, caddyAdminPort });
     const fullTls = this.buildTlsApp(tlsOpts);
     try {
-      const current = await this.getWithEtag('/config/apps/tls');
+      const current = await this.getWithEtag('/config/apps/tls', { adminUrl, caddyAdminPort });
       if (current.found && JSON.stringify(current.value) === JSON.stringify(fullTls)) {
         return { applied: true, unchanged: true, wildcardCount: (tlsOpts.wildcardPolicies || []).length };
       }
-      await this.write(current.found ? 'PATCH' : 'PUT', '/config/apps/tls', fullTls, { etag: current.etag });
+      await this.write(current.found ? 'PATCH' : 'PUT', '/config/apps/tls', fullTls, { etag: current.etag, adminUrl, caddyAdminPort });
       return { applied: true, unchanged: false, wildcardCount: (tlsOpts.wildcardPolicies || []).length };
     } catch (err) {
-      const missingPlugin = /dns\.providers\.cloudflare|module not registered/i.test(String(err.message || ''));
+      const msg = String(err.message || '');
+      const providerMatch = msg.match(/dns\.providers\.([a-z0-9_-]+)/i);
+      const missingPlugin = Boolean(providerMatch || /module not registered/i.test(msg));
       if (missingPlugin && Array.isArray(tlsOpts.wildcardPolicies) && tlsOpts.wildcardPolicies.length > 0) {
+        const missingProviders = providerMatch
+          ? [providerMatch[1].toLowerCase()]
+          : Array.from(new Set(tlsOpts.wildcardPolicies.map((p) => String(p?.provider || 'cloudflare').toLowerCase())));
         // Degrada limpiamente: mantiene on_demand + certificados propios sin perder HTTPS individual
         const fallbackTls = this.buildTlsApp({ ...tlsOpts, wildcardPolicies: [], wildcardDomains: [] });
         try {
-          const cur = await this.getWithEtag('/config/apps/tls');
-          await this.write(cur.found ? 'PATCH' : 'PUT', '/config/apps/tls', fallbackTls, { etag: cur.etag });
+          const cur = await this.getWithEtag('/config/apps/tls', { adminUrl, caddyAdminPort });
+          await this.write(cur.found ? 'PATCH' : 'PUT', '/config/apps/tls', fallbackTls, { etag: cur.etag, adminUrl, caddyAdminPort });
         } catch (e) {}
+        const xcaddyHints = missingProviders
+          .map((id) => DNS_PROVIDERS[id]?.xcaddyModule || `github.com/caddy-dns/${id}`)
+          .map((m) => `--with ${m}`)
+          .join(' ');
         return {
           applied: false,
-          missingCloudflarePlugin: true,
-          error: 'Tu binario actual de Caddy no incluye el módulo dns.providers.cloudflare necesario para certificados Wildcard (*.dominio). Compila con Dockerfile.caddy o usa imagen caddy-cloudflare.'
+          degraded: true,
+          missingDnsProviders: missingProviders,
+          missingCloudflarePlugin: missingProviders.includes('cloudflare'),
+          error: `Tu binario actual de Caddy no incluye el módulo DNS-01 (${missingProviders.map((p) => `dns.providers.${p}`).join(', ')}). Compila Caddy con: xcaddy build ${xcaddyHints}`
         };
       }
       throw err;
     }
   }
 
-  /** Detecta capacidades reales del Caddy activo (módulo Cloudflare DNS-01, versión, token). */
+  /**
+   * Comprueba de forma honesta el estado real de HTTP/3 (QUIC) en el Caddy activo:
+   * inspecciona `protocols`, `listen`, `automatic_https` en la Admin API y, si Caddy
+   * corre en Docker en modo bridge, verifica si el puerto UDP 443 está realmente publicado.
+   *
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null, checkDockerUdp?: boolean }} [opts]
+   */
+  async probeHttp3({ adminUrl = null, caddyAdminPort = null, checkDockerUdp = true } = {}) {
+    const isOverride = Boolean(adminUrl && String(adminUrl).trim() !== this.adminUrl);
+    /** @type {{ supported: boolean, configured: boolean, protocols: string[], automaticHttpsDisabled: boolean, udp443Published: boolean | null, listen: string[], reason: string | null }} */
+    const out = {
+      supported: false,
+      configured: false,
+      protocols: [],
+      automaticHttpsDisabled: false,
+      udp443Published: null,
+      listen: [],
+      reason: null
+    };
+
+    try {
+      const server = await this.get('/config/apps/http/servers/culkibo', { adminUrl, caddyAdminPort });
+      if (!server || typeof server !== 'object') {
+        out.reason = 'Servidor HTTP culkibo no configurado en Caddy';
+        return out;
+      }
+      out.listen = Array.isArray(server.listen) ? server.listen.map(String) : [];
+      out.automaticHttpsDisabled = Boolean(server.automatic_https && server.automatic_https.disable === true);
+      // En Caddy v2, si `protocols` se omite, el valor por defecto incluye h1, h2 y h3 (cuando HTTPS está activo)
+      out.protocols = Array.isArray(server.protocols)
+        ? server.protocols.map((p) => String(p).toLowerCase())
+        : (out.automaticHttpsDisabled ? ['h1', 'h2'] : ['h1', 'h2', 'h3']);
+      out.configured = out.protocols.includes('h3') && !out.automaticHttpsDisabled;
+
+      if (!out.configured) {
+        out.reason = out.automaticHttpsDisabled
+          ? 'automatic_https está desactivado: HTTP/3 (QUIC) requiere TLS activo'
+          : `El servidor no incluye "h3" en protocols (${out.protocols.join(', ')})`;
+        return out;
+      }
+
+      if (!isOverride && checkDockerUdp && this.isContainerized) {
+        const udpOut = await new Promise((resolve) => {
+          try {
+            const child = spawn('docker', ['port', this.containerName, '443/udp'], { shell: false, windowsHide: true });
+            let stdout = '';
+            const t = setTimeout(() => { try { child.kill(); } catch (e) {} resolve(null); }, 1500);
+            if (t.unref) t.unref();
+            child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+            child.on('error', () => { clearTimeout(t); resolve(null); });
+            child.on('close', (code) => { clearTimeout(t); resolve(code === 0 ? stdout.trim() : ''); });
+          } catch (e) {
+            resolve(null);
+          }
+        });
+        if (udpOut !== null) {
+          out.udp443Published = Boolean(udpOut && udpOut.length > 0);
+        }
+      }
+
+      out.supported = out.configured && out.udp443Published !== false;
+      if (!out.supported) {
+        out.reason = 'HTTP/3 está configurado en Caddy pero el puerto 443/udp no está publicado en Docker';
+      }
+      return out;
+    } catch (err) {
+      out.reason = err.message;
+      return out;
+    }
+  }
+
+  /** Detecta capacidades reales del Caddy activo (módulos DNS-01 multiproveedor, rate_limit, HTTP/3, tokens). */
   async probeCapabilities({ force = false } = {}) {
     const now = Date.now();
     if (!force && this._capabilitiesCache && (now - this._capabilitiesCache.checkedAt) < 30000) {
       return this._capabilitiesCache.data;
     }
     const detection = await this.detect({ force });
-    /** @type {{ available: boolean, version: string | null, hasCloudflareDnsPlugin: boolean | null, hasRateLimitPlugin: boolean | null, hasCfTokenEnv: boolean, containerized: boolean, containerName: string }} */
+    /** @type {{
+     *   available: boolean,
+     *   version: string | null,
+     *   hasCloudflareDnsPlugin: boolean | null,
+     *   installedDnsProviders: string[],
+     *   supportedDnsProviders: string[],
+     *   hasRateLimitPlugin: boolean | null,
+     *   hasCfTokenEnv: boolean,
+     *   http3: any,
+     *   containerized: boolean,
+     *   containerName: string
+     * }} */
     const caps = {
       available: detection.available,
       version: detection.version || null,
       hasCloudflareDnsPlugin: null,
+      installedDnsProviders: [],
+      supportedDnsProviders: Object.keys(DNS_PROVIDERS),
       hasRateLimitPlugin: null,
       hasCfTokenEnv: Boolean(process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN),
+      http3: null,
       containerized: this.isContainerized,
       containerName: this.containerName
     };
@@ -1450,9 +2482,13 @@ class CaddyManager {
         modulesOut = await runListModules('caddy', ['list-modules']);
       }
       if (modulesOut !== null) {
-        caps.hasCloudflareDnsPlugin = modulesOut.includes('dns.providers.cloudflare');
+        caps.installedDnsProviders = Object.values(DNS_PROVIDERS)
+          .filter((p) => modulesOut.includes(p.caddyModule))
+          .map((p) => p.id);
+        caps.hasCloudflareDnsPlugin = caps.installedDnsProviders.includes('cloudflare');
         caps.hasRateLimitPlugin = modulesOut.includes('http.handlers.rate_limit');
       }
+      caps.http3 = await this.probeHttp3({ checkDockerUdp: caps.containerized }).catch(() => null);
     }
 
     this._capabilitiesCache = { checkedAt: now, data: caps };
@@ -1461,11 +2497,11 @@ class CaddyManager {
 
   /**
    * Elimina la ruta de un proyecto en 1 RTT. Idempotente.
-   * Acepta `adminUrl` opcional para nodos remotos sin mutar el singleton local.
+   * Acepta `adminUrl` y `caddyAdminPort` opcionales para nodos remotos sin mutar el singleton local.
    * @param {string} projectId
-   * @param {{ adminUrl?: string | null }} [opts]
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async removeRoute(projectId, { adminUrl = null } = {}) {
+  async removeRoute(projectId, { adminUrl = null, caddyAdminPort = null } = {}) {
     const id = this.routeId(projectId);
     const isOverride = Boolean(adminUrl && String(adminUrl).trim() !== this.adminUrl);
     const targetAdminUrl = isOverride ? String(adminUrl).trim() : null;
@@ -1478,7 +2514,8 @@ class CaddyManager {
       res = await this.adminRequest('DELETE', `/id/${id}`, {
         timeoutMs: 10000,
         readBody: false,
-        adminUrl: targetAdminUrl
+        adminUrl: targetAdminUrl,
+        caddyAdminPort
       });
     } catch (netErr) {
       if (!isOverride) {
@@ -1501,12 +2538,13 @@ class CaddyManager {
 
   /**
    * Rutas que gestiona Culkibo, ignorando las que haya puesto otro (como `sys_encode`).
-   * @param {{ adminUrl?: string | null }} [opts]
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async listRoutes({ adminUrl = null } = {}) {
+  async listRoutes({ adminUrl = null, caddyAdminPort = null } = {}) {
     const isOverride = Boolean(adminUrl && String(adminUrl).trim() !== this.adminUrl);
     const routes = await this.get('/config/apps/http/servers/culkibo/routes', {
-      adminUrl: isOverride ? String(adminUrl).trim() : null
+      adminUrl: isOverride ? String(adminUrl).trim() : null,
+      caddyAdminPort
     });
     if (!Array.isArray(routes)) {
       if (!isOverride) this.lastKnownRouteCount = 0;
@@ -1520,12 +2558,16 @@ class CaddyManager {
   /**
    * Alta/actualización en lote (1 único PATCH con ETag en vez de N recargas).
    * Preserva todas las demás rutas existentes (propias y ajenas).
+   * @param {any[]} specs
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async upsertRoutesBatch(specs) {
+  async upsertRoutesBatch(specs, { adminUrl = null, caddyAdminPort = null } = {}) {
     if (!Array.isArray(specs) || specs.length === 0) {
       return { applied: [], unchanged: true };
     }
-    await this.requireAvailable();
+    const isOverride = Boolean(adminUrl && String(adminUrl).trim() !== this.adminUrl);
+    const targetAdminUrl = isOverride ? String(adminUrl).trim() : null;
+    await this.requireAvailable({ adminUrl: targetAdminUrl, caddyAdminPort });
     const sorted = [...specs].sort((a, b) => this.routeSpecificityRank(a) - this.routeSpecificityRank(b));
     const batchMap = new Map();
     for (const s of sorted) {
@@ -1535,24 +2577,24 @@ class CaddyManager {
     const routesPath = '/config/apps/http/servers/culkibo/routes';
 
     return this.mutate(async () => {
-      const current = await this.getWithEtag(routesPath);
+      const current = await this.getWithEtag(routesPath, { adminUrl: targetAdminUrl, caddyAdminPort });
       const existingAll = Array.isArray(current.value) ? current.value : [];
       const foreign = existingAll.filter((r) => !(r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX)));
       const keptManaged = existingAll.filter((r) => r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX) && !batchMap.has(r['@id']));
       const combinedManaged = [...keptManaged, ...Array.from(batchMap.values()).map((x) => x.route)];
-      combinedManaged.sort((a, b) => {
-        const ra = this.routeSpecificityRank({ hostnames: a.match?.[0]?.host || [], kind: a.handle?.[0]?.handler === 'static_response' ? 'redirect' : 'proxy' });
-        const rb = this.routeSpecificityRank({ hostnames: b.match?.[0]?.host || [], kind: b.handle?.[0]?.handler === 'static_response' ? 'redirect' : 'proxy' });
-        return ra - rb;
-      });
+      combinedManaged.sort((a, b) => this.routeSpecificityRank(a) - this.routeSpecificityRank(b));
       const nextRoutes = [...foreign, ...combinedManaged];
       if (JSON.stringify(existingAll) === JSON.stringify(nextRoutes)) {
-        for (const [id, entry] of batchMap.entries()) this._appliedRouteJson.set(id, entry.json);
+        if (!isOverride) {
+          for (const [id, entry] of batchMap.entries()) this._appliedRouteJson.set(id, entry.json);
+        }
         return { applied: Array.from(batchMap.keys()), unchanged: true };
       }
-      await this.write(current.found ? 'PATCH' : 'PUT', routesPath, nextRoutes, { etag: current.etag });
-      for (const [id, entry] of batchMap.entries()) this._appliedRouteJson.set(id, entry.json);
-      this.lastKnownRouteCount = combinedManaged.length;
+      await this.write(current.found ? 'PATCH' : 'PUT', routesPath, nextRoutes, { etag: current.etag, adminUrl: targetAdminUrl, caddyAdminPort });
+      if (!isOverride) {
+        for (const [id, entry] of batchMap.entries()) this._appliedRouteJson.set(id, entry.json);
+        this.lastKnownRouteCount = combinedManaged.length;
+      }
       return { applied: Array.from(batchMap.keys()), unchanged: false };
     });
   }
@@ -1560,9 +2602,13 @@ class CaddyManager {
   /**
    * Reconciliación atómica por diff en un único PUT/PATCH (en lugar de N+M recargas).
    * Ordena rutas por especificidad para que ningún comodín eclipse subdominios exactos.
+   * @param {any[]} desiredSpecs
+   * @param {{ adminUrl?: string | null, caddyAdminPort?: number | null }} [opts]
    */
-  async reconcile(desiredSpecs) {
-    await this.requireAvailable();
+  async reconcile(desiredSpecs, { adminUrl = null, caddyAdminPort = null } = {}) {
+    const isOverride = Boolean(adminUrl && String(adminUrl).trim() !== this.adminUrl);
+    const targetAdminUrl = isOverride ? String(adminUrl).trim() : null;
+    await this.requireAvailable({ adminUrl: targetAdminUrl, caddyAdminPort });
     const sortedSpecs = [...desiredSpecs].sort((a, b) => this.routeSpecificityRank(a) - this.routeSpecificityRank(b));
     const built = sortedSpecs.map((spec) => {
       const route = this.buildRoute(spec);
@@ -1573,7 +2619,7 @@ class CaddyManager {
     const routesPath = '/config/apps/http/servers/culkibo/routes';
 
     return this.mutate(async () => {
-      const current = await this.getWithEtag(routesPath);
+      const current = await this.getWithEtag(routesPath, { adminUrl: targetAdminUrl, caddyAdminPort });
       const existingAll = Array.isArray(current.value) ? current.value : [];
       const foreign = existingAll.filter((r) => !(r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX)));
       const existingCulkibo = existingAll.filter((r) => r && typeof r['@id'] === 'string' && r['@id'].startsWith(ID_PREFIX));
@@ -1585,16 +2631,20 @@ class CaddyManager {
 
       const nextRoutes = [...foreign, ...desiredRoutes];
       if (JSON.stringify(existingAll) === JSON.stringify(nextRoutes)) {
-        this._appliedRouteJson.clear();
-        for (const b of built) this._appliedRouteJson.set(b.id, b.json);
-        this.lastKnownRouteCount = desiredRoutes.length;
+        if (!isOverride) {
+          this._appliedRouteJson.clear();
+          for (const b of built) this._appliedRouteJson.set(b.id, b.json);
+          this.lastKnownRouteCount = desiredRoutes.length;
+        }
         return { applied, removed, unchanged: true };
       }
 
-      await this.write(current.found ? 'PATCH' : 'PUT', routesPath, nextRoutes, { etag: current.etag });
-      this._appliedRouteJson.clear();
-      for (const b of built) this._appliedRouteJson.set(b.id, b.json);
-      this.lastKnownRouteCount = desiredRoutes.length;
+      await this.write(current.found ? 'PATCH' : 'PUT', routesPath, nextRoutes, { etag: current.etag, adminUrl: targetAdminUrl, caddyAdminPort });
+      if (!isOverride) {
+        this._appliedRouteJson.clear();
+        for (const b of built) this._appliedRouteJson.set(b.id, b.json);
+        this.lastKnownRouteCount = desiredRoutes.length;
+      }
       return { applied, removed, unchanged: false };
     });
   }
@@ -1721,7 +2771,7 @@ class CaddyManager {
           this.isContainerized = !useHostNet;
           this.containerName = cleanName;
           this._capabilitiesCache = null;
-          return resolve({ started: true, containerName: cleanName, network: useHostNet ? 'host' : 'bridge', http3: true });
+          return resolve({ started: true, containerName: cleanName, network: useHostNet ? 'host' : 'bridge', http3: true, udp443Mapped: !useHostNet });
         }
         resolve({ started: false, error: stderr.join('').trim() || `docker run terminó con código ${code}` });
       });
@@ -1729,5 +2779,13 @@ class CaddyManager {
   }
 }
 
-const caddyManagerInstance = Object.assign(new CaddyManager(), { CaddyManager });
+const caddyManagerInstance = Object.assign(new CaddyManager(), {
+  CaddyManager,
+  DNS_PROVIDERS,
+  listDnsProviders,
+  buildDnsProviderConfig,
+  validateSafeRedirectRegex,
+  sanitizeUpstreamDial,
+  validateCorsOrigin
+});
 module.exports = caddyManagerInstance;

@@ -322,20 +322,27 @@ async function testCompetitorPrs() {
     fs.rmSync(buildTmp, { recursive: true, force: true });
   }
 
-  // 4f. PreviewManager: rechaza baseDomain no RFC-1123 y destroyPreview acepta objeto o clave
+  // 4f. PreviewManager: rechaza baseDomain no RFC-1123 (firma real) y destroyPreview acepta objeto o clave
   const pmTmp = makeTempDir('culkibo-pm-pr-');
   try {
-    const pm = new PreviewManager({ dataDir: pmTmp });
+    const pm = new PreviewManager(path.join(pmTmp, 'previews.json'));
     await assert.rejects(
-      () => pm.deployPreview({
-        project: { id: 'p1', name: 'Demo', gitRepo: 'https://github.com/a/b.git' },
-        branch: 'feat/test',
-        baseDomain: 'not valid domain!',
-      }),
-      /baseDomain|inválid|dominio/i
+      () => pm.deployPreview(
+        {
+          id: 'p1',
+          name: 'Demo',
+          gitRepo: 'https://github.com/a/b.git',
+          previewDeployments: { enabled: true, baseDomain: 'not valid domain!' }
+        },
+        { branch: 'feat/test' }
+      ),
+      /Dominio base de previews inválido|RFC-1123/i,
+      'deployPreview debe rechazar explícitamente baseDomain no RFC-1123 (no "Proyecto inválido")'
     );
-    const missing = await pm.destroyPreview('p1', { key: 'no-existe' });
-    assert.strictEqual(missing.removed, false);
+    const missingByObj = await pm.destroyPreview('p1', { branch: 'no-existe' });
+    assert.strictEqual(missingByObj.removed, false);
+    const missingByKey = await pm.destroyPreview('p1', 'pr-99999');
+    assert.strictEqual(missingByKey.removed, false);
   } finally {
     fs.rmSync(pmTmp, { recursive: true, force: true });
   }

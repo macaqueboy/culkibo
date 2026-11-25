@@ -3667,4 +3667,366 @@ export const api = {
       'No se pudo marcar el conflicto como resuelto'
     );
   },
+
+  // =====================================================================
+  // v1.1.0 — Adversarial Fuzz, CLI DX, Observability Alerts & Topology
+  // =====================================================================
+
+  // --- Adversarial Fuzz & Crash Recovery ---
+
+  async fuzzEndpoint(payload: {
+    path: string;
+    method?: string;
+    rounds?: number;
+    seed?: number;
+    payloadSizeKb?: number;
+  }): Promise<FuzzRunResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fuzz/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo ejecutar la sesión de fuzzing'
+    );
+  },
+
+  async getFuzzHistory(limit = 20): Promise<{ runs: FuzzRunResult[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fuzz/history?limit=${limit}`),
+      'No se pudo cargar el historial de fuzzing'
+    );
+  },
+
+  async getCrashRecoveryStatus(): Promise<CrashRecoveryStatus> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/crash-recovery`),
+      'No se pudo consultar el estado de crash recovery'
+    );
+  },
+
+  async triggerCrashRecovery(): Promise<{ recovered: boolean; actions: string[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/crash-recovery`, { method: 'POST' }),
+      'No se pudo ejecutar la recuperación tras fallo'
+    );
+  },
+
+  // --- CLI DX (init, up, logs, env, exec, releases, rollback) ---
+
+  async cliInit(payload: {
+    name: string;
+    template?: string;
+    directory?: string;
+  }): Promise<CliInitResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cli/init`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo inicializar el proyecto desde CLI'
+    );
+  },
+
+  async cliUp(projectId: string, opts: { attach?: boolean; build?: boolean } = {}): Promise<CliUpResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cli/up`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, ...opts }),
+      }),
+      'No se pudo levantar el proyecto desde CLI'
+    );
+  },
+
+  async cliLogs(projectId: string, opts: { tail?: number; follow?: boolean; since?: string } = {}): Promise<{ lines: string[] }> {
+    const qs = new URLSearchParams();
+    qs.set('projectId', projectId);
+    if (opts.tail) qs.set('tail', String(opts.tail));
+    if (opts.follow) qs.set('follow', '1');
+    if (opts.since) qs.set('since', opts.since);
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cli/logs?${qs.toString()}`),
+      'No se pudieron obtener los logs desde CLI'
+    );
+  },
+
+  async cliEnv(projectId: string, action: 'list' | 'set' | 'unset', payload?: { key?: string; value?: string }): Promise<CliEnvResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cli/env`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, action, ...payload }),
+      }),
+      'No se pudo gestionar las variables de entorno desde CLI'
+    );
+  },
+
+  async cliExec(projectId: string, command: string, opts: { timeoutMs?: number; workdir?: string } = {}): Promise<CliExecResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cli/exec`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, command, ...opts }),
+      }),
+      'No se pudo ejecutar el comando desde CLI'
+    );
+  },
+
+  async cliReleases(projectId: string, limit = 10): Promise<{ releases: CliRelease[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cli/releases?projectId=${encodeURIComponent(projectId)}&limit=${limit}`),
+      'No se pudieron listar las releases desde CLI'
+    );
+  },
+
+  async cliRollback(projectId: string, target?: string): Promise<{ success: boolean; deployment: Deployment }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cli/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, target }),
+      }),
+      'No se pudo hacer rollback desde CLI'
+    );
+  },
+
+  // --- Observability Alerts, Metrics History & Topology ---
+
+  async getAlertRules(): Promise<{ rules: AlertRule[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/alerts/rules`),
+      'No se pudieron cargar las reglas de alertas'
+    );
+    return Array.isArray(data) ? { rules: data } : { rules: data?.rules || [] };
+  },
+
+  async createAlertRule(payload: {
+    name: string;
+    metric: string;
+    condition: 'gt' | 'lt' | 'gte' | 'lte' | 'eq';
+    threshold: number;
+    windowSec?: number;
+    cooldownSec?: number;
+    channels?: string[];
+    projectId?: string;
+    enabled?: boolean;
+  }): Promise<AlertRule> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/alerts/rules`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo crear la regla de alerta'
+    );
+    return data?.rule || data;
+  },
+
+  async updateAlertRule(id: string, payload: Partial<AlertRule>): Promise<AlertRule> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/alerts/rules/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo actualizar la regla de alerta'
+    );
+    return data?.rule || data;
+  },
+
+  async deleteAlertRule(id: string): Promise<{ deleted?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/alerts/rules/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'No se pudo eliminar la regla de alerta'
+    );
+  },
+
+  async getAlertHistory(opts: { limit?: number; ruleId?: string; status?: string } = {}): Promise<{ alerts: AlertEvent[] }> {
+    const qs = new URLSearchParams();
+    if (opts.limit) qs.set('limit', String(opts.limit));
+    if (opts.ruleId) qs.set('ruleId', opts.ruleId);
+    if (opts.status) qs.set('status', opts.status);
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/alerts/history?${qs.toString()}`),
+      'No se pudo cargar el historial de alertas'
+    );
+  },
+
+  async getMetricsHistory(opts: {
+    metric?: string;
+    projectId?: string;
+    fromTs?: number;
+    toTs?: number;
+    stepSec?: number;
+  } = {}): Promise<{ series: MetricsHistorySeries[] }> {
+    const qs = new URLSearchParams();
+    if (opts.metric) qs.set('metric', opts.metric);
+    if (opts.projectId) qs.set('projectId', opts.projectId);
+    if (opts.fromTs) qs.set('from', String(opts.fromTs));
+    if (opts.toTs) qs.set('to', String(opts.toTs));
+    if (opts.stepSec) qs.set('step', String(opts.stepSec));
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/metrics/history?${qs.toString()}`),
+      'No se pudo cargar el historial de métricas'
+    );
+  },
+
+  async getTopology(): Promise<TopologyGraph> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/topology`),
+      'No se pudo cargar la topología del sistema'
+    );
+  },
 };
+
+// =====================================================================
+// v1.1.0 Types
+// =====================================================================
+
+// --- Adversarial Fuzz & Crash Recovery ---
+
+export interface FuzzRunResult {
+  id: string;
+  path: string;
+  method: string;
+  rounds: number;
+  seed: number;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  totalRequests: number;
+  crashesFound: number;
+  timeoutsFound: number;
+  unexpectedStatuses: number;
+  findings: Array<{
+    round: number;
+    statusCode: number;
+    error?: string | null;
+    payload?: string | null;
+    latencyMs: number;
+  }>;
+}
+
+export interface CrashRecoveryStatus {
+  healthy: boolean;
+  lastCrashAt: string | null;
+  lastRecoveryAt: string | null;
+  consecutiveCrashes: number;
+  watchdogEnabled: boolean;
+  autoRestart: boolean;
+  recoveryActions: string[];
+}
+
+// --- CLI DX ---
+
+export interface CliInitResult {
+  success: boolean;
+  projectId: string;
+  name: string;
+  directory: string;
+  template?: string;
+  configFile: string;
+}
+
+export interface CliUpResult {
+  success: boolean;
+  projectId: string;
+  status: string;
+  url?: string | null;
+  port?: number | null;
+  pid?: number | null;
+}
+
+export interface CliEnvResult {
+  success: boolean;
+  action: 'list' | 'set' | 'unset';
+  vars?: Record<string, string>;
+  key?: string;
+  value?: string;
+}
+
+export interface CliExecResult {
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+}
+
+export interface CliRelease {
+  id: string;
+  version: string;
+  imageTag: string;
+  status: string;
+  git: DeployGitInfo | null;
+  promotedAt: string;
+  current: boolean;
+}
+
+// --- Observability Alerts, Metrics History & Topology ---
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  metric: string;
+  condition: 'gt' | 'lt' | 'gte' | 'lte' | 'eq';
+  threshold: number;
+  windowSec: number;
+  cooldownSec: number;
+  channels: string[];
+  projectId?: string | null;
+  enabled: boolean;
+  lastTriggeredAt?: string | null;
+  lastValue?: number | null;
+  status?: 'ok' | 'firing' | 'pending' | string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface AlertEvent {
+  id: string;
+  ruleId: string;
+  ruleName: string;
+  metric: string;
+  value: number;
+  threshold: number;
+  condition: string;
+  status: 'firing' | 'resolved' | string;
+  firedAt: string;
+  resolvedAt?: string | null;
+  deliveredChannels?: string[];
+  projectId?: string | null;
+}
+
+export interface MetricsHistorySeries {
+  metric: string;
+  projectId?: string | null;
+  points: Array<{
+    ts: number;
+    value: number;
+  }>;
+}
+
+export interface TopologyNode {
+  id: string;
+  kind: 'project' | 'database' | 'service' | 'server' | 'ingress' | 'pod' | string;
+  label: string;
+  status: string;
+  health?: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface TopologyEdge {
+  from: string;
+  to: string;
+  label?: string;
+  kind?: 'depends_on' | 'routes_to' | 'linked_db' | 'deploys_on' | string;
+}
+
+export interface TopologyGraph {
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  generatedAt: string;
+}

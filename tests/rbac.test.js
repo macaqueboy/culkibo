@@ -1,12 +1,16 @@
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const express = require('express');
 
 const auth = require('../server/middleware/auth');
 const teamManagerMod = require('../server/services/teamManager');
-const { TeamManager, DEFAULT_TEAM_ID } = teamManagerMod;
+const { TeamManager, DEFAULT_TEAM_ID, generateTotpCode } = teamManagerMod;
+const { OidcService, verifyIdToken } = require('../server/services/oidcService');
 
 /** Helper mínimo de mock Express (req/res/next) para probar middlewares RBAC. */
 function runMiddleware(mw, req) {
@@ -808,6 +812,471 @@ async function testRbac() {
       fs.rmSync(envDataDir, { recursive: true, force: true });
     }
     console.log('  ✓ 10. Regresiones de auditoría (#36): requireRole API-token scopes, removeProjectAcl self-unblock, route fail-closed, cross-team disableUser & CULKIBO_DATA_DIR');
+
+    // 11. P0 Case-Sensitivity, Trailing-Slash, Double-Slash, Dot-Traversal & Audit Route RBAC Bypass Proofs (Real Express!)
+    {
+      const testApp = express();
+      testApp.use('/api', auth.authMiddleware, auth.requireRouteRbac({ teamManager: tm }));
+      testApp.get('/api/databases/:id/credentials', (_req, res) => res.json({ password: 'leaked' }));
+      testApp.get('/api/catalog/installations/:id/secrets', (_req, res) => res.json({ secret: 'leaked' }));
+      testApp.get('/api/vault', (_req, res) => res.json({ secrets: [] }));
+      testApp.post('/api/projects/:id/runtime/exec', (_req, res) => res.json({ executed: true }));
+      testApp.delete('/api/projects/:id', (_req, res) => res.json({ deleted: true }));
+      testApp.post('/api/projects/:id/acl', (_req, res) => res.json({ updated: true }));
+      testApp.post('/api/projects/:id/freeze-windows', (_req, res) => res.json({ frozen: true }));
+      testApp.get('/api/system/audit', (_req, res) => res.json({ events: [] }));
+      testApp.get('/api/system/audit/verify', (_req, res) => res.json({ valid: true }));
+      testApp.get('/api/system/health-summary', (_req, res) => res.json({ recentAudit: [] }));
+      testApp.get('/api/audit', (_req, res) => res.json({ events: [] }));
+
+      const srv = await new Promise((resolve) => {
+        const s = testApp.listen(0, '127.0.0.1', () => resolve(s));
+      });
+      const port = /** @type {any} */ (srv.address()).port;
+
+      const rawReq = (method, rawPath, token) => new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          method,
+          path: rawPath,
+          headers: {
+            host: 'panel.example.com',
+            authorization: `Bearer ${token}`
+          }
+        }, (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            let parsed = null;
+            try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) {}
+            resolve({ status: res.statusCode, body: parsed });
+          });
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      try {
+        const freshAdminLogin = tm.login({ email: 'admin@example.com', password: 'AdminPassword!2026', teamId: DEFAULT_TEAM_ID });
+        const devWriteOnlyTok = tm.createApiToken(devAgainPrincipal, {
+          name: 'Dev Write No Exec',
+          scopes: ['projects:read', 'projects:write']
+        });
+
+        // Viewer bloqueado en TODOS los intentos de bypass por mayúsculas, doble barra, traversal y rutas reales de auditoría
+        const viewerForbiddenPaths = [
+          ['GET', '/api/databases/db1/CREDENTIALS'],
+          ['GET', '/api/Databases/db1/Credentials'],
+          ['GET', '/api/catalog/installations/1/SECRETS'],
+          ['GET', '/api/projects/p1/SECRETS'],
+          ['GET', '/api/Vault'],
+          ['GET', '/api/system/audit'],
+          ['GET', '/api/SYSTEM/AUDIT'],
+          ['GET', '/api/system/audit/verify'],
+          ['GET', '/api/system/health-summary'],
+          ['GET', '/api/AUDIT'],
+          ['GET', '/api/projects/x/..%2F..%2Fdatabases/db1/credentials'],
+          ['GET', '/api/projects/..%2fsystem/audit']
+        ];
+        for (const [m, pth] of viewerForbiddenPaths) {
+          const r = await rawReq(m, pth, viewerLiveTok);
+          assert.strictEqual(r.status, 403, `Viewer debe recibir 403 en ${m} ${pth} (recibió ${r.status})`);
+        }
+
+        // Developer bloqueado en trailing-slash DELETE, double-slash ACL, uppercase ACL/FREEZE-WINDOWS y audit
+        const devForbiddenPaths = [
+          ['DELETE', '/api/projects/proj_alpha/'],
+          ['DELETE', '/api/projects//proj_alpha'],
+          ['POST', '/api/projects/proj_alpha/ACL'],
+          ['POST', '/api/projects//proj_alpha/acl'],
+          ['POST', '/api/projects/proj_alpha/FREEZE-WINDOWS'],
+          ['GET', '/api/system/audit'],
+          ['GET', '/api/system/health-summary']
+        ];
+        for (const [m, pth] of devForbiddenPaths) {
+          const r = await rawReq(m, pth, devAgainLogin.sessionToken);
+          assert.strictEqual(r.status, 403, `Developer debe recibir 403 en ${m} ${pth} (recibió ${r.status})`);
+        }
+
+        // Token projects:write sin runtime:exec bloqueado en Exec con mayúsculas o barra final
+        const execUpper = await rawReq('POST', '/api/projects/proj_alpha/runtime/Exec', devWriteOnlyTok.token);
+        assert.strictEqual(execUpper.status, 403, 'runtime/Exec en mayúsculas no debe degradar a projects:write');
+        const execSlash = await rawReq('POST', '/api/projects/proj_alpha/runtime/exec/', devWriteOnlyTok.token);
+        assert.strictEqual(execSlash.status, 403);
+
+        // Codificación URL malformada -> 400 INVALID_PATH (fail-closed)
+        const badEnc = await rawReq('GET', '/api/projects/%ZZinvalid', viewerLiveTok);
+        assert.strictEqual(badEnc.status, 400);
+
+        // Admin SÍ puede leer /api/system/audit, /api/system/audit/verify y /api/system/health-summary
+        assert.strictEqual((await rawReq('GET', '/api/system/audit', freshAdminLogin.sessionToken)).status, 200);
+        assert.strictEqual((await rawReq('GET', '/api/system/audit/verify', freshAdminLogin.sessionToken)).status, 200);
+        assert.strictEqual((await rawReq('GET', '/api/system/health-summary', freshAdminLogin.sessionToken)).status, 200);
+      } finally {
+        await new Promise((resolve) => srv.close(resolve));
+      }
+      console.log('  ✓ 11. Express HTTP real: bypasses case-sensitivity/trailing-slash/double-slash/traversal y /api/system/audit bloqueados');
+    }
+
+    // 12. SHA-256 constant-time equality sin fuga de longitud + CULKIBO_DATA_DIR en auth.js
+    {
+      const isolatedAuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-auth-envdir-'));
+      const prevEnvDataDir = process.env.CULKIBO_DATA_DIR;
+      const prevEnvTok = process.env.CULKIBO_TOKEN;
+      try {
+        delete process.env.CULKIBO_TOKEN;
+        process.env.CULKIBO_DATA_DIR = isolatedAuthDir;
+        auth._resetTokenCacheForTest();
+        const isoTok = auth.resolveToken();
+        assert.ok(fs.existsSync(path.join(isolatedAuthDir, 'auth.json')), 'auth.js debe respetar CULKIBO_DATA_DIR al crear auth.json');
+        assert.strictEqual(auth.tokenMatches(isoTok), true);
+        assert.strictEqual(auth.tokenMatches(''), false);
+        assert.strictEqual(auth.tokenMatches('x'), false);
+        assert.strictEqual(auth.tokenMatches(`${isoTok}extra`), false);
+        assert.strictEqual(auth.tokenMatches('a'.repeat(512)), false);
+        assert.strictEqual(auth.timingSafeEqualString('abc', 'abc'), true);
+        assert.strictEqual(auth.timingSafeEqualString('abc', 'abcdef'), false);
+        const rot = auth.rotateToken();
+        assert.strictEqual(rot.rotated, true);
+        assert.strictEqual(auth.tokenMatches(isoTok), false);
+        assert.strictEqual(auth.tokenMatches(rot.token), true);
+      } finally {
+        if (prevEnvDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+        else process.env.CULKIBO_DATA_DIR = prevEnvDataDir;
+        if (prevEnvTok === undefined) delete process.env.CULKIBO_TOKEN;
+        else process.env.CULKIBO_TOKEN = prevEnvTok;
+        auth._resetTokenCacheForTest();
+        fs.rmSync(isolatedAuthDir, { recursive: true, force: true });
+      }
+      console.log('  ✓ 12. auth.js: comparación constante HMAC-SHA256 (0 length leak) + aislamiento CULKIBO_DATA_DIR');
+    }
+
+    // 13. TOTP 2FA (RFC 6238 pure Node crypto) + 10 Recovery Codes HMAC + Anti-Replay + Team Policy
+    {
+      // Nota: 10d transfirió teamC y subió tokenVersion del owner; iniciamos sesión fresca de owner
+      const ownerFreshLogin = tm.login({ email: 'owner@example.com', password: 'OwnerSuperPassword!2026', teamId: DEFAULT_TEAM_ID });
+      const ownerFreshPrincipal = tm.verifySessionToken(ownerFreshLogin.sessionToken).principal;
+
+      // Vector oficial RFC 6238 Apéndice B (SHA-1, secreto ASCII "12345678901234567890", T=59s -> 94287082)
+      const rfcSecret = Buffer.from('12345678901234567890', 'ascii');
+      assert.strictEqual(generateTotpCode(rfcSecret, { timestampMs: 59000, digits: 8, algorithm: 'sha1' }).code, '94287082');
+      assert.strictEqual(generateTotpCode(rfcSecret, { timestampMs: 59000, digits: 6, algorithm: 'sha1' }).code, '287082');
+
+      // Setup TOTP para owner (semilla cifrada con AES-256-GCM en teams.json, jamás en claro)
+      const setup = tm.setupTotp(ownerFreshPrincipal, { issuer: 'CulkiboTest' });
+      assert.ok(setup.secretBase32.length >= 32);
+      assert.ok(setup.otpauthUri.startsWith('otpauth://totp/CulkiboTest%3Aowner%40example.com?secret='));
+      const diskAfterSetup = fs.readFileSync(path.join(tmpDir, 'teams.json'), 'utf8');
+      assert.ok(!diskAfterSetup.includes(setup.secretBase32), 'La semilla TOTP jamás debe persistirse en claro en teams.json');
+
+      const t0 = 1700000010000; // paso fijo determinista
+      const codeT0 = generateTotpCode(setup.secretBase32, { timestampMs: t0 }).code;
+      const enabled = tm.enableTotp(ownerFreshPrincipal, { code: codeT0, timestampMs: t0 });
+      assert.strictEqual(enabled.enabled, true);
+      assert.strictEqual(enabled.recoveryCodes.length, 10);
+      const diskAfterEnable = fs.readFileSync(path.join(tmpDir, 'teams.json'), 'utf8');
+      for (const rc of enabled.recoveryCodes) {
+        assert.ok(!diskAfterEnable.includes(rc), 'Los códigos de recuperación en claro jamás deben persistirse en disco');
+      }
+
+      // Login paso 1 -> exige MFA sin emitir cks_
+      const step1 = tm.login({ email: 'owner@example.com', password: 'OwnerSuperPassword!2026' });
+      assert.strictEqual(step1.mfaRequired, true);
+      assert.ok(step1.mfaChallengeToken.startsWith('ckm_'));
+      assert.strictEqual(step1.sessionToken, undefined);
+
+      // Anti-replay: reutilizar el mismo código TOTP usado en enableTotp dentro del mismo paso -> RECHAZADO
+      assert.throws(
+        () => tm.verifyMfaLogin({ mfaChallengeToken: step1.mfaChallengeToken, code: codeT0, timestampMs: t0 }),
+        (err) => err.status === 401 && err.code === 'TOTP_REPLAY_DETECTED'
+      );
+
+      // Siguiente intervalo (+30s): código fresco funciona y emite cks_
+      const t1 = t0 + 30000;
+      const codeT1 = generateTotpCode(setup.secretBase32, { timestampMs: t1 }).code;
+      const step2 = tm.verifyMfaLogin({ mfaChallengeToken: step1.mfaChallengeToken, code: codeT1, timestampMs: t1 });
+      assert.ok(step2.sessionToken.startsWith('cks_'));
+      assert.strictEqual(step2.usedRecoveryCode, false);
+      assert.strictEqual(tm.verifySessionToken(step2.sessionToken).ok, true);
+
+      // Replay del mismo challenge token ckm_ -> RECHAZADO
+      assert.throws(
+        () => tm.verifyMfaLogin({ mfaChallengeToken: step1.mfaChallengeToken, code: codeT1, timestampMs: t1 }),
+        (err) => err.status === 401 && err.code === 'MFA_CHALLENGE_REUSED'
+      );
+
+      // Código de recuperación single-use: funciona una vez y se consume (9 restantes)
+      const step1Rec = tm.login({ email: 'owner@example.com', password: 'OwnerSuperPassword!2026' });
+      const recRes = tm.verifyMfaLogin({ mfaChallengeToken: step1Rec.mfaChallengeToken, recoveryCode: enabled.recoveryCodes[0] });
+      assert.strictEqual(recRes.usedRecoveryCode, true);
+      assert.strictEqual(recRes.recoveryCodesRemaining, 9);
+
+      // Segundo uso del mismo código de recuperación -> RECHAZADO
+      const step1Rec2 = tm.login({ email: 'owner@example.com', password: 'OwnerSuperPassword!2026' });
+      assert.throws(
+        () => tm.verifyMfaLogin({ mfaChallengeToken: step1Rec2.mfaChallengeToken, recoveryCode: enabled.recoveryCodes[0] }),
+        (err) => err.status === 401 && err.code === 'INVALID_MFA_CODE'
+      );
+
+      // Política de equipo: exigir 2FA a admins -> admin sin 2FA recibe mfaEnrollmentRequired: true
+      tm.setTeamSecurityPolicy(ownerFreshPrincipal, DEFAULT_TEAM_ID, { require2faForAdmins: true });
+      const adminEnforceLogin = tm.login({ email: 'admin@example.com', password: 'AdminPassword!2026' });
+      assert.strictEqual(adminEnforceLogin.mfaEnrollmentRequired, true);
+      const adminEnforcePrincipal = tm.verifySessionToken(adminEnforceLogin.sessionToken).principal;
+      assert.strictEqual(tm.getTotpStatus(adminEnforcePrincipal).enrollmentRequired, true);
+
+      // API token (incluso wildcard owner) bloqueado en rutas /api/auth/2fa/*
+      assert.strictEqual(tm.authorizeHttpRoute(ownerWildcardPrincipal, 'POST', '/api/auth/2fa/setup').status, 403);
+
+      // Desactivar 2FA requiere contraseña + código válido
+      const t2 = t1 + 30000;
+      const codeT2 = generateTotpCode(setup.secretBase32, { timestampMs: t2 }).code;
+      assert.throws(
+        () => tm.disableTotp(ownerFreshPrincipal, { password: 'WrongPassword!', code: codeT2, timestampMs: t2 }),
+        (err) => err.status === 401
+      );
+      const disTotp = tm.disableTotp(ownerFreshPrincipal, { password: 'OwnerSuperPassword!2026', code: codeT2, timestampMs: t2 });
+      assert.strictEqual(disTotp.disabled, true);
+      console.log('  ✓ 13. TOTP 2FA (RFC 6238 vector + AES-256-GCM + 10 HMAC recovery codes + anti-replay + team enforcement)');
+    }
+
+    // 14. OIDC / OAuth2 PKCE + Pure Node JWKS RSA (RS256) & ECDSA (ES256) SSO
+    {
+      const tmpOidcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-oidc-test-'));
+      try {
+        const rsaPair = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+        const ecPair = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+        const rsaPubJwk = { ...rsaPair.publicKey.export({ format: 'jwk' }), kid: 'rsa-key-1', use: 'sig', alg: 'RS256' };
+        const ecPubJwk = { ...ecPair.publicKey.export({ format: 'jwk' }), kid: 'ec-key-1', use: 'sig', alg: 'ES256' };
+
+        const signJwt = (headerObj, payloadObj, keyObj, alg) => {
+          const h = Buffer.from(JSON.stringify(headerObj), 'utf8').toString('base64url');
+          const p = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64url');
+          const input = Buffer.from(`${h}.${p}`, 'ascii');
+          const sig = alg === 'ES256'
+            ? crypto.sign('sha256', input, { key: keyObj, dsaEncoding: 'ieee-p1363' })
+            : crypto.sign('sha256', input, keyObj);
+          return `${h}.${p}.${sig.toString('base64url')}`;
+        };
+
+        const oidc = new OidcService({ dataDir: tmpOidcDir });
+        // Jamás permitir defaultRole: 'owner'
+        assert.throws(
+          () => oidc.configureProvider({
+            id: 'evil-owner',
+            type: 'oidc',
+            issuerUrl: 'https://idp.example.com',
+            clientId: 'cid',
+            redirectUri: 'https://panel.example.com/api/auth/oidc/callback',
+            defaultRole: 'owner'
+          }),
+          (err) => err.status === 403 && err.code === 'OWNER_PROVISION_FORBIDDEN'
+        );
+
+        oidc.configureProvider({
+          id: 'authentik',
+          type: 'authentik',
+          name: 'Authentik Corp',
+          issuerUrl: 'https://auth.corp.example',
+          clientId: 'culkibo-client',
+          clientSecret: 'super_oidc_secret_xyz',
+          redirectUri: 'https://panel.example.com/api/auth/oidc/callback',
+          autoProvision: true,
+          defaultRole: 'developer',
+          allowedDomains: ['corp.example']
+        });
+
+        // Verificar clientSecret cifrado en disco (jamás en claro)
+        const oidcDisk = fs.readFileSync(path.join(tmpOidcDir, 'oidc.json'), 'utf8');
+        assert.ok(!oidcDisk.includes('super_oidc_secret_xyz'), 'clientSecret OIDC jamás debe guardarse en claro');
+        assert.ok(oidcDisk.includes('"v1:'), 'clientSecret OIDC debe cifrarse con AES-256-GCM');
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const makeMockFetch = (jwtFactory) => async (url, opts) => {
+          if (String(url).endsWith('/.well-known/openid-configuration')) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                issuer: 'https://auth.corp.example',
+                authorization_endpoint: 'https://auth.corp.example/authorize',
+                token_endpoint: 'https://auth.corp.example/token',
+                jwks_uri: 'https://auth.corp.example/jwks'
+              })
+            };
+          }
+          if (String(url).endsWith('/jwks')) {
+            return { ok: true, status: 200, json: async () => ({ keys: [rsaPubJwk, ecPubJwk] }) };
+          }
+          if (String(url).endsWith('/token')) {
+            const params = new URLSearchParams(String(opts.body || ''));
+            assert.ok(params.get('code_verifier'), 'El intercambio OIDC debe enviar PKCE code_verifier');
+            return { ok: true, status: 200, json: async () => ({ id_token: jwtFactory(), access_token: 'at_1' }) };
+          }
+          throw new Error(`Unexpected fetch URL: ${url}`);
+        };
+
+        // Flujo RS256 completo + auto-aprovisionamiento + loginWithOidc
+        const startRsa = await oidc.createAuthorizationUrl('authentik', {
+          ip: '203.0.113.10',
+          fetchImpl: makeMockFetch(() => '')
+        });
+        const startUrl = new URL(startRsa.url);
+        assert.strictEqual(startUrl.searchParams.get('code_challenge_method'), 'S256');
+        const rsaNonce = startUrl.searchParams.get('nonce');
+        assert.ok(rsaNonce && rsaNonce.length >= 20);
+
+        const idTokenRsa = signJwt(
+          { alg: 'RS256', typ: 'JWT', kid: 'rsa-key-1' },
+          {
+            iss: 'https://auth.corp.example',
+            sub: 'sub-alice-rs256',
+            aud: 'culkibo-client',
+            exp: nowSec + 300,
+            iat: nowSec,
+            nonce: rsaNonce,
+            email: 'sso-alice@corp.example',
+            email_verified: true,
+            name: 'Alice SSO'
+          },
+          rsaPair.privateKey,
+          'RS256'
+        );
+        const identRsa = await oidc.handleCallback({
+          state: startRsa.state,
+          code: 'auth_code_123',
+          ip: '203.0.113.10',
+          nowSec,
+          fetchImpl: makeMockFetch(() => idTokenRsa)
+        });
+        assert.strictEqual(identRsa.email, 'sso-alice@corp.example');
+        const oidcSess = tm.loginWithOidc(identRsa, { autoProvision: true, defaultRole: identRsa.defaultRole });
+        assert.strictEqual(oidcSess.provisioned, true);
+        assert.strictEqual(oidcSess.role, 'developer');
+        assert.ok(oidcSess.sessionToken.startsWith('cks_'));
+
+        // Replay de state -> 401 OIDC_INVALID_STATE
+        await assert.rejects(
+          () => oidc.handleCallback({ state: startRsa.state, code: 'auth_code_123', ip: '203.0.113.10', fetchImpl: makeMockFetch(() => idTokenRsa) }),
+          (err) => err.status === 401 && err.code === 'OIDC_INVALID_STATE'
+        );
+
+        // Flujo ES256 válido (ECDSA P-256 ieee-p1363)
+        const startEc = await oidc.createAuthorizationUrl('authentik', { fetchImpl: makeMockFetch(() => '') });
+        const ecNonce = new URL(startEc.url).searchParams.get('nonce');
+        const idTokenEc = signJwt(
+          { alg: 'ES256', typ: 'JWT', kid: 'ec-key-1' },
+          {
+            iss: 'https://auth.corp.example',
+            sub: 'sub-bob-es256',
+            aud: 'culkibo-client',
+            exp: nowSec + 300,
+            iat: nowSec,
+            nonce: ecNonce,
+            email: 'sso-bob@corp.example',
+            email_verified: true
+          },
+          ecPair.privateKey,
+          'ES256'
+        );
+        const identEc = await oidc.handleCallback({
+          state: startEc.state,
+          code: 'auth_code_ec',
+          nowSec,
+          fetchImpl: makeMockFetch(() => idTokenEc)
+        });
+        assert.strictEqual(identEc.email, 'sso-bob@corp.example');
+
+        // Ataques adversarios contra verifyIdToken: alg:none, alg:HS256 (key confusion), tampered, wrong nonce, expired
+        const jwksObj = { keys: [rsaPubJwk, ecPubJwk] };
+        const fakeNone = `${Buffer.from('{"alg":"none","typ":"JWT"}').toString('base64url')}.${Buffer.from(JSON.stringify({ iss: 'https://auth.corp.example', sub: 'x', aud: 'culkibo-client', exp: nowSec + 300 })).toString('base64url')}.sig`;
+        assert.throws(() => verifyIdToken(fakeNone, { jwks: jwksObj, expectedIssuer: 'https://auth.corp.example', expectedAudience: 'culkibo-client', nowSec }), (e) => e.code === 'OIDC_UNSUPPORTED_ALG');
+
+        const fakeHs256 = `${Buffer.from('{"alg":"HS256","kid":"rsa-key-1"}').toString('base64url')}.${Buffer.from(JSON.stringify({ iss: 'https://auth.corp.example', sub: 'x', aud: 'culkibo-client', exp: nowSec + 300 })).toString('base64url')}.sig`;
+        assert.throws(() => verifyIdToken(fakeHs256, { jwks: jwksObj, expectedIssuer: 'https://auth.corp.example', expectedAudience: 'culkibo-client', nowSec }), (e) => e.code === 'OIDC_UNSUPPORTED_ALG');
+
+        const tamperedParts = idTokenRsa.split('.');
+        const tamperedPayload = Buffer.from(JSON.stringify({ iss: 'https://auth.corp.example', sub: 'evil', aud: 'culkibo-client', exp: nowSec + 300, nonce: rsaNonce })).toString('base64url');
+        assert.throws(() => verifyIdToken(`${tamperedParts[0]}.${tamperedPayload}.${tamperedParts[2]}`, { jwks: jwksObj, expectedIssuer: 'https://auth.corp.example', expectedAudience: 'culkibo-client', expectedNonce: rsaNonce, nowSec }), (e) => e.code === 'OIDC_INVALID_SIGNATURE');
+
+        assert.throws(() => verifyIdToken(idTokenRsa, { jwks: jwksObj, expectedIssuer: 'https://auth.corp.example', expectedAudience: 'culkibo-client', expectedNonce: 'wrong-nonce', nowSec }), (e) => e.code === 'OIDC_NONCE_MISMATCH');
+        assert.throws(() => verifyIdToken(idTokenRsa, { jwks: jwksObj, expectedIssuer: 'https://auth.corp.example', expectedAudience: 'culkibo-client', expectedNonce: rsaNonce, nowSec: nowSec + 9999 }), (e) => e.code === 'OIDC_TOKEN_EXPIRED');
+
+        // Rechazar email_verified: false y dominio fuera de allowedDomains
+        const startUnver = await oidc.createAuthorizationUrl('authentik', { fetchImpl: makeMockFetch(() => '') });
+        const unverNonce = new URL(startUnver.url).searchParams.get('nonce');
+        const idTokenUnver = signJwt(
+          { alg: 'RS256', kid: 'rsa-key-1' },
+          { iss: 'https://auth.corp.example', sub: 'sub-unver', aud: 'culkibo-client', exp: nowSec + 300, nonce: unverNonce, email: 'unver@corp.example', email_verified: false },
+          rsaPair.privateKey,
+          'RS256'
+        );
+        await assert.rejects(
+          () => oidc.handleCallback({ state: startUnver.state, code: 'c', nowSec, fetchImpl: makeMockFetch(() => idTokenUnver) }),
+          (err) => err.status === 403 && err.code === 'OIDC_EMAIL_NOT_VERIFIED'
+        );
+
+        const startForeignDom = await oidc.createAuthorizationUrl('authentik', { fetchImpl: makeMockFetch(() => '') });
+        const fdNonce = new URL(startForeignDom.url).searchParams.get('nonce');
+        const idTokenForeign = signJwt(
+          { alg: 'RS256', kid: 'rsa-key-1' },
+          { iss: 'https://auth.corp.example', sub: 'sub-fd', aud: 'culkibo-client', exp: nowSec + 300, nonce: fdNonce, email: 'attacker@evil.org', email_verified: true },
+          rsaPair.privateKey,
+          'RS256'
+        );
+        await assert.rejects(
+          () => oidc.handleCallback({ state: startForeignDom.state, code: 'c', nowSec, fetchImpl: makeMockFetch(() => idTokenForeign) }),
+          (err) => err.status === 403 && err.code === 'OIDC_DOMAIN_NOT_ALLOWED'
+        );
+
+        // GitHub OAuth2 preset con selección exclusiva de correo verificado
+        oidc.configureProvider({
+          id: 'github',
+          type: 'github',
+          clientId: 'gh-cid',
+          clientSecret: 'gh-csec',
+          redirectUri: 'https://panel.example.com/api/auth/oidc/callback'
+        });
+        const ghStart = await oidc.createAuthorizationUrl('github');
+        const ghIdent = await oidc.handleCallback({
+          state: ghStart.state,
+          code: 'gh_code',
+          fetchImpl: async (url) => {
+            if (String(url).includes('/access_token')) return { ok: true, status: 200, json: async () => ({ access_token: 'gho_123' }) };
+            if (String(url).endsWith('/user')) return { ok: true, status: 200, json: async () => ({ id: 42, login: 'octodev', name: 'Octo Dev' }) };
+            if (String(url).endsWith('/user/emails')) {
+              return {
+                ok: true,
+                status: 200,
+                json: async () => [
+                  { email: 'unverified@evil.test', primary: true, verified: false },
+                  { email: 'octo@verified.dev', primary: false, verified: true }
+                ]
+              };
+            }
+            throw new Error(`Unexpected GH URL: ${url}`);
+          }
+        });
+        assert.strictEqual(ghIdent.email, 'octo@verified.dev');
+        assert.strictEqual(ghIdent.emailVerified, true);
+      } finally {
+        fs.rmSync(tmpOidcDir, { recursive: true, force: true });
+      }
+      console.log('  ✓ 14. OIDC/OAuth2 PKCE + JWKS RS256/ES256 + anti-confusion alg:none/HS256 + email_verified + GitHub');
+    }
+
+    // 15. ACL API compatibility (`getProjectAcl` + `setProjectAcl` objeto y firma posicional)
+    {
+      const ownerAclLogin = tm.login({ email: 'owner@example.com', password: 'OwnerSuperPassword!2026', teamId: DEFAULT_TEAM_ID });
+      const ownerAclPrincipal = tm.verifySessionToken(ownerAclLogin.sessionToken).principal;
+      tm.setProjectAcl(ownerAclPrincipal, projDefaultA.id, devAcc.user.id, 'viewer', DEFAULT_TEAM_ID);
+      const aclRead = tm.getProjectAcl(ownerAclPrincipal, projDefaultA.id, DEFAULT_TEAM_ID);
+      assert.strictEqual(aclRead.overrides[devAcc.user.id], 'viewer');
+      assert.strictEqual(tm.state.projectAcls[projDefaultA.id].overrides[devAcc.user.id], 'viewer');
+      tm.removeProjectAcl(ownerAclPrincipal, projDefaultA.id, devAcc.user.id, DEFAULT_TEAM_ID);
+      console.log('  ✓ 15. getProjectAcl() + setProjectAcl() (objeto y posicional) verificados');
+    }
 
     console.log('✅ RBAC, Teams & Multi-Tenant Auth Suite PASSED!\n');
   } finally {

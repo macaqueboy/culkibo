@@ -40,8 +40,35 @@ const EMAIL_FAIL_WINDOW_MS = 60 * 1000;
 const EMAIL_FAIL_MAX = 10;
 const EMAIL_FAIL_MAP_CAP = 2000;
 
-// Hash bcrypt sintético (coste 10) válido para mitigación timing en emails inexistentes
-const DUMMY_BCRYPT_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';
+// TOTP 2FA (RFC 6238) + Recovery Codes + MFA Challenge
+const TOTP_STEP_SECONDS = 30;
+const TOTP_DIGITS = 6;
+const TOTP_WINDOW_STEPS = 1;
+const RECOVERY_CODES_COUNT = 10;
+const MFA_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const USED_MFA_CHALLENGES_CAP = 2000;
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const RECOVERY_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+// Clave efímera por proceso para comparación constante libre de fuga de longitud
+const COMPARE_HMAC_KEY = crypto.randomBytes(32);
+
+// Caché perezosa de hashes bcrypt sintéticos por coste (evita delta de timing si cost != 10)
+/** @type {Map<number, string>} */
+const DUMMY_BCRYPT_BY_COST = new Map([
+  [10, '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy']
+]);
+
+/** @param {number} cost */
+function getDummyBcryptHash(cost) {
+  const c = Math.min(14, Math.max(4, Number(cost) || DEFAULT_BCRYPT_COST));
+  let h = DUMMY_BCRYPT_BY_COST.get(c);
+  if (!h) {
+    h = hashBcrypt('culkibo-dummy-timing-check', c);
+    DUMMY_BCRYPT_BY_COST.set(c, h);
+  }
+  return h;
+}
 
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,63}$/;
 const PROJECT_ID_RE = /^[a-zA-Z0-9_-]{1,80}$/;
@@ -333,20 +360,197 @@ function unwrapPrincipal(principalOrAuth) {
 }
 
 /**
- * Comparación constante de cadenas hex/UTF-8.
+ * Comparación en tiempo constante libre de fuga de longitud (HMAC-SHA256 32B + timingSafeEqual).
  * @param {string} a
  * @param {string} b
  */
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const ba = Buffer.from(a, 'utf8');
-  const bb = Buffer.from(b, 'utf8');
-  if (ba.length !== bb.length) return false;
+  const ha = crypto.createHmac('sha256', COMPARE_HMAC_KEY).update(a, 'utf8').digest();
+  const hb = crypto.createHmac('sha256', COMPARE_HMAC_KEY).update(b, 'utf8').digest();
   try {
-    return crypto.timingSafeEqual(ba, bb);
+    return crypto.timingSafeEqual(ha, hb);
   } catch (e) {
     return false;
   }
+}
+
+/**
+ * Canonicaliza una ruta HTTP para la política RBAC (cierra bypasses case-insensitive,
+ * trailing slash, `//`, segmentos `..` y doble codificación `%252f` — Portainer CVE-2026-72533).
+ * Devuelve `null` si la codificación URL está malformada o contiene bytes nulos.
+ * @param {string | null | undefined} rawUrl
+ * @returns {string | null}
+ */
+function canonicalizeHttpPath(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl) return '/';
+  const qIdx = rawUrl.indexOf('?');
+  const hIdx = rawUrl.indexOf('#');
+  let cut = rawUrl.length;
+  if (qIdx !== -1 && qIdx < cut) cut = qIdx;
+  if (hIdx !== -1 && hIdx < cut) cut = hIdx;
+  let s = rawUrl.slice(0, cut);
+  if (!s) return '/';
+  if (s.includes('\0')) return null;
+
+  for (let pass = 0; pass < 2; pass++) {
+    if (!s.includes('%')) break;
+    try {
+      const dec = decodeURIComponent(s);
+      if (dec === s) break;
+      s = dec;
+    } catch (e) {
+      return null;
+    }
+    if (s.includes('\0')) return null;
+  }
+
+  s = s.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  if (!s.startsWith('/')) s = `/${s}`;
+  let norm = path.posix.normalize(s);
+  if (!norm.startsWith('/')) norm = `/${norm}`;
+  if (norm.length > 1 && norm.endsWith('/')) {
+    norm = norm.replace(/\/+$/, '') || '/';
+  }
+  return norm.toLowerCase();
+}
+
+/**
+ * Codifica bytes en Base32 RFC 4648 sin padding (para secretos TOTP).
+ * @param {Buffer | Uint8Array} buf
+ * @returns {string}
+ */
+function base32Encode(buf) {
+  let bits = 0;
+  let value = 0;
+  let out = '';
+  for (let i = 0; i < buf.length; i++) {
+    value = (value << 8) | buf[i];
+    bits += 8;
+    while (bits >= 5) {
+      out += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    out += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return out;
+}
+
+/**
+ * Decodifica una cadena Base32 RFC 4648 (insensible a espacios/guiones/minúsculas).
+ * @param {string} input
+ * @returns {Buffer}
+ */
+function base32Decode(input) {
+  const clean = String(input || '').toUpperCase().replace(/[\s=-]+/g, '');
+  if (!clean) return Buffer.alloc(0);
+  let bits = 0;
+  let value = 0;
+  /** @type {number[]} */
+  const out = [];
+  for (let i = 0; i < clean.length; i++) {
+    const idx = BASE32_ALPHABET.indexOf(clean[i]);
+    if (idx === -1) {
+      throw httpError('Secreto Base32 TOTP inválido', 400, 'INVALID_TOTP_SECRET');
+    }
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+
+/**
+ * Genera un código TOTP conforme a RFC 6238 / RFC 4226 usando exclusivamente Node `crypto`.
+ * @param {Buffer | string} secret
+ * @param {{ timestampMs?: number, stepSec?: number, digits?: number, algorithm?: 'sha1' | 'sha256' | 'sha512' }} [opts]
+ * @returns {{ code: string, step: number }}
+ */
+function generateTotpCode(secret, opts = {}) {
+  const keyBuf = Buffer.isBuffer(secret) ? secret : base32Decode(String(secret));
+  const stepSec = Math.max(1, Number(opts.stepSec) || TOTP_STEP_SECONDS);
+  const digits = Math.min(8, Math.max(6, Number(opts.digits) || TOTP_DIGITS));
+  const alg = opts.algorithm === 'sha256' || opts.algorithm === 'sha512' ? opts.algorithm : 'sha1';
+  const ts = opts.timestampMs !== undefined && opts.timestampMs !== null ? Number(opts.timestampMs) : Date.now();
+  const step = Math.floor(ts / 1000 / stepSec);
+
+  const counterBuf = Buffer.alloc(8);
+  const hi = Math.floor(step / 0x100000000);
+  const lo = step >>> 0;
+  counterBuf.writeUInt32BE(hi, 0);
+  counterBuf.writeUInt32BE(lo, 4);
+
+  const hmac = crypto.createHmac(alg, keyBuf).update(counterBuf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const binCode =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  const mod = Math.pow(10, digits);
+  const code = String(binCode % mod).padStart(digits, '0');
+  return { code, step };
+}
+
+/**
+ * Verifica un código TOTP en ventana `±window` con protección anti-replay (`lastUsedStep`).
+ * Evalúa todos los pasos de la ventana sin cortocircuitar (tiempo constante).
+ * @param {Buffer | string} secret
+ * @param {string} providedCode
+ * @param {{ timestampMs?: number, stepSec?: number, window?: number, digits?: number, algorithm?: 'sha1' | 'sha256' | 'sha512', lastUsedStep?: number | null }} [opts]
+ * @returns {{ valid: boolean, matchedStep: number | null, replayed: boolean }}
+ */
+function verifyTotpCode(secret, providedCode, opts = {}) {
+  const digits = Math.min(8, Math.max(6, Number(opts.digits) || TOTP_DIGITS));
+  const cleanCode = String(providedCode || '').replace(/[\s-]+/g, '');
+  if (!/^\d+$/.test(cleanCode) || cleanCode.length !== digits) {
+    return { valid: false, matchedStep: null, replayed: false };
+  }
+  const stepSec = Math.max(1, Number(opts.stepSec) || TOTP_STEP_SECONDS);
+  const win = Math.min(3, Math.max(0, opts.window !== undefined ? Number(opts.window) : TOTP_WINDOW_STEPS));
+  const baseTs = opts.timestampMs !== undefined && opts.timestampMs !== null ? Number(opts.timestampMs) : Date.now();
+  const lastUsedStep = typeof opts.lastUsedStep === 'number' && Number.isFinite(opts.lastUsedStep) ? opts.lastUsedStep : null;
+
+  /** @type {number | null} */
+  let matchedStep = null;
+  for (let delta = -win; delta <= win; delta++) {
+    const gen = generateTotpCode(secret, {
+      timestampMs: baseTs + delta * stepSec * 1000,
+      stepSec,
+      digits,
+      algorithm: opts.algorithm
+    });
+    if (safeEqual(cleanCode, gen.code)) {
+      matchedStep = gen.step;
+    }
+  }
+  if (matchedStep === null) {
+    return { valid: false, matchedStep: null, replayed: false };
+  }
+  if (lastUsedStep !== null && matchedStep <= lastUsedStep) {
+    return { valid: false, matchedStep, replayed: true };
+  }
+  return { valid: true, matchedStep, replayed: false };
+}
+
+/** Genera un código de recuperación `XXXX-XXXX-XXXX` con 60 bits de entropía CSPRNG. */
+function generateRecoveryCode() {
+  const bytes = crypto.randomBytes(12);
+  let raw = '';
+  for (let i = 0; i < 12; i++) {
+    raw += RECOVERY_ALPHABET[bytes[i] & 31];
+  }
+  return `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+}
+
+/** @param {string} code */
+function normalizeRecoveryCode(code) {
+  return String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
 /** @param {string} name */
@@ -421,8 +625,15 @@ class TeamManager extends EventEmitter {
     this._signingKey = null;
     /** @type {Map<string, { count: number, resetAt: number }>} */
     this._emailFailMap = new Map();
+    /** @type {Set<string>} */
+    this._usedMfaChallenges = new Set();
     /** @type {number} */
     this._lastTokenTouchFlush = 0;
+  }
+
+  /** Alias de solo lectura hacia `_state` para compatibilidad con integradores HTTP. */
+  get state() {
+    return this._state;
   }
 
   /** Carga perezosa desde disco solo si existe `data/teams.json` o se requiere escritura. */
@@ -537,6 +748,141 @@ class TeamManager extends EventEmitter {
   _hmacHex(domain, value) {
     const key = this._ensureSigningKey();
     return crypto.createHmac('sha256', key).update(`${domain}:${value}`).digest('hex');
+  }
+
+  /** Clave AES-256-GCM derivada de `.rbac.key` para cifrar semillas TOTP en reposo. */
+  _deriveTotpEncKey() {
+    return crypto.createHmac('sha256', this._ensureSigningKey()).update('totp:aes256gcm:v1').digest();
+  }
+
+  /** @param {string} userId @param {Buffer} secretBuf */
+  _encryptTotpSecret(userId, secretBuf) {
+    const key = this._deriveTotpEncKey();
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    cipher.setAAD(Buffer.from(`totp:${userId}`, 'utf8'));
+    const ct = Buffer.concat([cipher.update(secretBuf), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `v1:${iv.toString('base64')}:${tag.toString('base64')}:${ct.toString('base64')}`;
+  }
+
+  /** @param {string} userId @param {string} encStr @returns {Buffer} */
+  _decryptTotpSecret(userId, encStr) {
+    if (typeof encStr !== 'string' || !encStr.startsWith('v1:')) {
+      throw httpError('Secreto TOTP corrupto en almacenamiento', 500, 'TOTP_SECRET_CORRUPT');
+    }
+    const parts = encStr.split(':');
+    if (parts.length !== 4) {
+      throw httpError('Secreto TOTP corrupto en almacenamiento', 500, 'TOTP_SECRET_CORRUPT');
+    }
+    const iv = Buffer.from(parts[1], 'base64');
+    const tag = Buffer.from(parts[2], 'base64');
+    const ct = Buffer.from(parts[3], 'base64');
+    const key = this._deriveTotpEncKey();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAAD(Buffer.from(`totp:${userId}`, 'utf8'));
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ct), decipher.final()]);
+  }
+
+  /** @param {any} team @param {string} role */
+  _isTeam2faEnforcedForRole(team, role) {
+    const pol = team && team.securityPolicy;
+    if (!pol || typeof pol !== 'object') return false;
+    if (pol.require2fa) return true;
+    if (pol.require2faForAdmins && hasMinRole(role, 'admin')) return true;
+    return false;
+  }
+
+  /**
+   * Emite un token de reto MFA efímero (`ckm_<payload>.<sig>`, 5 min, un solo uso)
+   * ligado a `uid`, `tid`, `tv` y `user.tokenKey` — NUNCA otorga acceso autenticado.
+   * @param {any} user
+   * @param {string} teamId
+   */
+  _issueMfaChallenge(user, teamId) {
+    const serverKey = this._ensureSigningKey();
+    const nowMs = Date.now();
+    const expMs = nowMs + MFA_CHALLENGE_TTL_MS;
+    const payload = {
+      v: 1,
+      typ: 'mfa_challenge',
+      jti: `mfa_${crypto.randomBytes(12).toString('hex')}`,
+      uid: user.id,
+      tid: teamId,
+      iat: nowMs,
+      exp: expMs,
+      tv: Number(user.tokenVersion) || 1
+    };
+    const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+    const derivedKey = crypto.createHmac('sha256', serverKey).update(`mfa:v1:${user.tokenKey}`).digest();
+    const sig = crypto.createHmac('sha256', derivedKey).update(encoded).digest('base64url');
+    return {
+      mfaChallengeToken: `ckm_${encoded}.${sig}`,
+      expiresAt: new Date(expMs).toISOString()
+    };
+  }
+
+  /** @param {string} jti */
+  _markMfaChallengeUsed(jti) {
+    if (this._usedMfaChallenges.size >= USED_MFA_CHALLENGES_CAP) {
+      const oldest = this._usedMfaChallenges.values().next().value;
+      if (oldest) this._usedMfaChallenges.delete(oldest);
+    }
+    this._usedMfaChallenges.add(jti);
+  }
+
+  /**
+   * Verifica y consume atómicamente un código de recuperación en tiempo constante.
+   * @param {any} user
+   * @param {string} rawCode
+   * @returns {boolean}
+   */
+  _consumeRecoveryCode(user, rawCode) {
+    if (!user || !user.totp || !Array.isArray(user.totp.recoveryCodeHashes) || user.totp.recoveryCodeHashes.length === 0) {
+      return false;
+    }
+    const norm = normalizeRecoveryCode(rawCode);
+    if (norm.length < 8) return false;
+    const candHash = this._hmacHex(`recovery:${user.id}`, norm);
+    let matchedIdx = -1;
+    for (let i = 0; i < user.totp.recoveryCodeHashes.length; i++) {
+      if (safeEqual(String(user.totp.recoveryCodeHashes[i] || ''), candHash)) {
+        matchedIdx = i;
+      }
+    }
+    if (matchedIdx === -1) return false;
+    user.totp.recoveryCodeHashes.splice(matchedIdx, 1);
+    return true;
+  }
+
+  /**
+   * Verifica un segundo factor (TOTP con anti-replay O código de recuperación single-use).
+   * @param {any} user
+   * @param {{ code?: string, recoveryCode?: string, timestampMs?: number }} factor
+   * @returns {{ ok: boolean, usedRecoveryCode: boolean, replayed: boolean, matchedStep: number | null }}
+   */
+  _verifyUserSecondFactor(user, factor = {}) {
+    if (!user || !user.totp || !user.totp.enabled || !user.totp.secretEnc) {
+      return { ok: false, usedRecoveryCode: false, replayed: false, matchedStep: null };
+    }
+    if (factor.recoveryCode && String(factor.recoveryCode).trim()) {
+      const consumed = this._consumeRecoveryCode(user, String(factor.recoveryCode));
+      return { ok: consumed, usedRecoveryCode: consumed, replayed: false, matchedStep: null };
+    }
+    if (factor.code && String(factor.code).trim()) {
+      const secretBuf = this._decryptTotpSecret(user.id, user.totp.secretEnc);
+      const res = verifyTotpCode(secretBuf, String(factor.code), {
+        timestampMs: factor.timestampMs,
+        lastUsedStep: user.totp.lastUsedStep ?? null
+      });
+      if (res.valid && res.matchedStep !== null) {
+        user.totp.lastUsedStep = res.matchedStep;
+        return { ok: true, usedRecoveryCode: false, replayed: false, matchedStep: res.matchedStep };
+      }
+      return { ok: false, usedRecoveryCode: false, replayed: res.replayed, matchedStep: res.matchedStep };
+    }
+    return { ok: false, usedRecoveryCode: false, replayed: false, matchedStep: null };
   }
 
   /**
@@ -655,6 +1001,11 @@ class TeamManager extends EventEmitter {
       name: user.name,
       status: user.status,
       mustRotatePassword: Boolean(user.mustRotatePassword),
+      totpEnabled: Boolean(user.totp && user.totp.enabled),
+      recoveryCodesRemaining: user.totp && user.totp.enabled && Array.isArray(user.totp.recoveryCodeHashes)
+        ? user.totp.recoveryCodeHashes.length
+        : 0,
+      oidcProviders: Array.isArray(user.oidcLinks) ? user.oidcLinks.map((l) => l.providerId) : [],
       activeSessionsCount: Array.isArray(user.sessions) ? user.sessions.length : 0,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
@@ -670,6 +1021,10 @@ class TeamManager extends EventEmitter {
       slug: team.slug,
       name: team.name,
       isDefault: Boolean(team.isDefault),
+      securityPolicy: {
+        require2fa: Boolean(team.securityPolicy && team.securityPolicy.require2fa),
+        require2faForAdmins: Boolean(team.securityPolicy && team.securityPolicy.require2faForAdmins)
+      },
       createdBy: team.createdBy || null,
       createdAt: team.createdAt,
       updatedAt: team.updatedAt || team.createdAt,
@@ -944,8 +1299,10 @@ class TeamManager extends EventEmitter {
   }
 
   /**
-   * Inicia sesión con correo + contraseña (protección timing constante + lockout por email).
-   * @param {{ email: string, password: string, teamId?: string, ip?: string, ua?: string }} input
+   * Inicia sesión con correo + contraseña (protección timing constante + lockout por email + TOTP 2FA).
+   * Si la cuenta tiene TOTP 2FA habilitado y no se entrega `totpCode`/`recoveryCode`,
+   * devuelve `{ mfaRequired: true, mfaChallengeToken }` sin emitir sesión `cks_`.
+   * @param {{ email: string, password: string, teamId?: string, totpCode?: string, recoveryCode?: string, timestampMs?: number, ip?: string, ua?: string }} input
    */
   login(input) {
     const normEmail = normalizeEmail(input && input.email);
@@ -962,9 +1319,9 @@ class TeamManager extends EventEmitter {
     const user = state && normEmail ? state.users.find((u) => u.email === normEmail) : null;
     const pwdBytes = Buffer.byteLength(rawPassword, 'utf8');
 
-    // Verificación en tiempo constante aunque el correo no exista o exceda 72 bytes
+    // Verificación en tiempo constante con mismo coste bcrypt aunque el correo no exista o exceda 72 bytes
     if (!user || user.status !== 'active' || pwdBytes < 1 || pwdBytes > MAX_PASSWORD_BYTES || rawPassword.includes('\0')) {
-      verifyBcrypt(rawPassword.slice(0, MAX_PASSWORD_BYTES) || 'dummy-check', DUMMY_BCRYPT_HASH);
+      verifyBcrypt(rawPassword.slice(0, MAX_PASSWORD_BYTES) || 'dummy-check', getDummyBcryptHash(this._bcryptCost));
       this._recordEmailFailure(normEmail);
       throw httpError('Credenciales inválidas', 401, 'INVALID_CREDENTIALS');
     }
@@ -974,8 +1331,6 @@ class TeamManager extends EventEmitter {
       this._recordEmailFailure(normEmail);
       throw httpError('Credenciales inválidas', 401, 'INVALID_CREDENTIALS');
     }
-
-    this._clearEmailFailure(normEmail);
 
     // Determinar equipo activo
     const memberships = (state ? state.teams : [])
@@ -997,14 +1352,571 @@ class TeamManager extends EventEmitter {
       if (def) chosen = def;
     }
 
+    const has2fa = Boolean(user.totp && user.totp.enabled);
+    if (has2fa) {
+      const hasInlineFactor = Boolean(
+        (input && input.totpCode && String(input.totpCode).trim()) ||
+        (input && input.recoveryCode && String(input.recoveryCode).trim())
+      );
+      if (!hasInlineFactor) {
+        const challenge = this._issueMfaChallenge(user, chosen.team.id);
+        return {
+          mfaRequired: true,
+          mfaChallengeToken: challenge.mfaChallengeToken,
+          expiresAt: challenge.expiresAt,
+          user: this.sanitizeUser(user),
+          team: this.sanitizeTeam(chosen.team),
+          role: chosen.member.role
+        };
+      }
+      const mfaCheck = this._verifyUserSecondFactor(user, {
+        code: input && input.totpCode,
+        recoveryCode: input && input.recoveryCode,
+        timestampMs: input && input.timestampMs
+      });
+      if (!mfaCheck.ok) {
+        this._recordEmailFailure(normEmail);
+        if (mfaCheck.replayed) {
+          throw httpError('Este código TOTP ya fue utilizado; espera al siguiente intervalo de 30 s', 401, 'TOTP_REPLAY_DETECTED');
+        }
+        throw httpError('Código 2FA o código de recuperación inválido', 401, 'INVALID_MFA_CODE');
+      }
+    }
+
+    this._clearEmailFailure(normEmail);
     user.lastLoginAt = new Date().toISOString();
     const issued = this._issueSessionForUser(user, chosen.team.id, { ip: input && input.ip, ua: input && input.ua });
     this._save();
+
+    const mfaEnrollmentRequired = !has2fa && this._isTeam2faEnforcedForRole(chosen.team, chosen.member.role);
 
     return {
       user: this.sanitizeUser(user),
       team: this.sanitizeTeam(chosen.team),
       role: chosen.member.role,
+      sessionToken: issued.token,
+      sessionId: issued.sessionId,
+      expiresAt: issued.expiresAt,
+      ...(mfaEnrollmentRequired ? { mfaEnrollmentRequired: true } : {})
+    };
+  }
+
+  /**
+   * Completa el segundo paso de inicio de sesión 2FA (TOTP RFC 6238 o código de recuperación single-use).
+   * @param {{ mfaChallengeToken: string, code?: string, recoveryCode?: string, timestampMs?: number, ip?: string, ua?: string }} input
+   */
+  verifyMfaLogin(input) {
+    const rawTok = typeof (input && input.mfaChallengeToken) === 'string' ? input.mfaChallengeToken.trim() : '';
+    if (!rawTok.startsWith('ckm_') || rawTok.length > 2048) {
+      throw httpError('Token de reto MFA inválido', 401, 'INVALID_MFA_CHALLENGE');
+    }
+    const body = rawTok.slice(4);
+    const dot = body.indexOf('.');
+    if (dot <= 0 || body.indexOf('.', dot + 1) !== -1) {
+      throw httpError('Token de reto MFA inválido', 401, 'INVALID_MFA_CHALLENGE');
+    }
+    const encoded = body.slice(0, dot);
+    const sig = body.slice(dot + 1);
+    /** @type {any} */
+    let payload;
+    try {
+      payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    } catch (e) {
+      throw httpError('Token de reto MFA malformado', 401, 'INVALID_MFA_CHALLENGE');
+    }
+    if (
+      !payload ||
+      payload.v !== 1 ||
+      payload.typ !== 'mfa_challenge' ||
+      typeof payload.jti !== 'string' ||
+      typeof payload.uid !== 'string' ||
+      typeof payload.tid !== 'string' ||
+      typeof payload.exp !== 'number' ||
+      typeof payload.tv !== 'number'
+    ) {
+      throw httpError('Token de reto MFA malformado', 401, 'INVALID_MFA_CHALLENGE');
+    }
+    if (Date.now() >= payload.exp) {
+      throw httpError('El reto MFA ha caducado; vuelve a iniciar sesión', 401, 'MFA_CHALLENGE_EXPIRED');
+    }
+    if (this._usedMfaChallenges.has(payload.jti)) {
+      throw httpError('Este reto MFA ya fue utilizado', 401, 'MFA_CHALLENGE_REUSED');
+    }
+
+    const state = this._ensureLoaded(false);
+    const user = state ? state.users.find((u) => u.id === payload.uid && u.status === 'active') : null;
+    if (!user || !user.totp || !user.totp.enabled) {
+      throw httpError('Reto MFA inválido', 401, 'INVALID_MFA_CHALLENGE');
+    }
+
+    const lock = this._checkEmailLockout(user.email);
+    if (lock.blocked) {
+      const err = httpError('Demasiados intentos fallidos para esta cuenta. Espera un minuto.', 429, 'EMAIL_LOCKED');
+      /** @type {any} */ (err).retryAfterSec = lock.retryAfterSec;
+      throw err;
+    }
+
+    const serverKey = this._ensureSigningKey();
+    const derivedKey = crypto.createHmac('sha256', serverKey).update(`mfa:v1:${user.tokenKey}`).digest();
+    const expectedSig = crypto.createHmac('sha256', derivedKey).update(encoded).digest('base64url');
+    if (!safeEqual(sig, expectedSig) || payload.tv !== (Number(user.tokenVersion) || 1)) {
+      this._recordEmailFailure(user.email);
+      throw httpError('Reto MFA inválido o revocado', 401, 'INVALID_MFA_CHALLENGE');
+    }
+
+    const team = state ? state.teams.find((t) => t.id === payload.tid) : null;
+    const member = team ? team.members.find((m) => m.userId === user.id) : null;
+    if (!team || !member) {
+      throw httpError('Membresía revocada', 403, 'TEAM_MEMBERSHIP_REVOKED');
+    }
+
+    const mfaCheck = this._verifyUserSecondFactor(user, {
+      code: input && input.code,
+      recoveryCode: input && input.recoveryCode,
+      timestampMs: input && input.timestampMs
+    });
+    if (!mfaCheck.ok) {
+      this._recordEmailFailure(user.email);
+      if (mfaCheck.replayed) {
+        throw httpError('Este código TOTP ya fue utilizado; espera al siguiente intervalo de 30 s', 401, 'TOTP_REPLAY_DETECTED');
+      }
+      throw httpError('Código 2FA o código de recuperación inválido', 401, 'INVALID_MFA_CODE');
+    }
+
+    // Consumo single-use del reto MFA + emisión de sesión completa
+    this._markMfaChallengeUsed(payload.jti);
+    this._clearEmailFailure(user.email);
+    user.lastLoginAt = new Date().toISOString();
+    const issued = this._issueSessionForUser(user, team.id, { ip: input && input.ip, ua: input && input.ua });
+    this._save();
+
+    return {
+      user: this.sanitizeUser(user),
+      team: this.sanitizeTeam(team),
+      role: member.role,
+      sessionToken: issued.token,
+      sessionId: issued.sessionId,
+      expiresAt: issued.expiresAt,
+      usedRecoveryCode: mfaCheck.usedRecoveryCode,
+      recoveryCodesRemaining: Array.isArray(user.totp.recoveryCodeHashes) ? user.totp.recoveryCodeHashes.length : 0
+    };
+  }
+
+  /**
+   * Inicia la configuración TOTP 2FA para el usuario de la sesión actual (sin habilitar aún).
+   * Guarda únicamente la semilla cifrada con AES-256-GCM en `user.totp.pendingSecretEnc`.
+   * @param {any} actorOrAuth
+   * @param {{ issuer?: string }} [opts]
+   */
+  setupTotp(actorOrAuth, opts = {}) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor || actor.kind !== 'session' || !actor.userId) {
+      throw httpError('Se requiere una sesión de usuario activa para configurar 2FA', 403, 'SESSION_REQUIRED');
+    }
+    if (!this.isPrincipalStillValid(actor)) {
+      throw httpError('Sesión revocada o caducada', 401, 'PRINCIPAL_REVOKED');
+    }
+    const state = this._ensureLoaded(true);
+    const user = state ? state.users.find((u) => u.id === actor.userId && u.status === 'active') : null;
+    if (!user) throw httpError('Usuario no encontrado', 404, 'USER_NOT_FOUND');
+
+    const secretBuf = crypto.randomBytes(20);
+    const secretBase32 = base32Encode(secretBuf);
+    const issuer = String(opts.issuer || 'Culkibo').replace(/[:\r\n]/g, '').trim().slice(0, 48) || 'Culkibo';
+
+    if (!user.totp || typeof user.totp !== 'object') {
+      user.totp = { enabled: false };
+    }
+    user.totp.pendingSecretEnc = this._encryptTotpSecret(user.id, secretBuf);
+    user.totp.pendingCreatedAt = new Date().toISOString();
+    user.updatedAt = new Date().toISOString();
+    this._save();
+
+    const label = encodeURIComponent(`${issuer}:${user.email}`);
+    const otpauthUri = `otpauth://totp/${label}?secret=${secretBase32}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_STEP_SECONDS}`;
+
+    return {
+      secretBase32,
+      otpauthUri,
+      issuer,
+      accountName: user.email,
+      digits: TOTP_DIGITS,
+      period: TOTP_STEP_SECONDS,
+      algorithm: 'SHA1'
+    };
+  }
+
+  /**
+   * Confirma el primer código TOTP y activa 2FA devolviendo 10 códigos de recuperación UNA SOLA VEZ.
+   * En disco solo se guardan los HMAC-SHA256 de los códigos de recuperación.
+   * @param {any} actorOrAuth
+   * @param {{ code: string, timestampMs?: number }} input
+   */
+  enableTotp(actorOrAuth, input) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor || actor.kind !== 'session' || !actor.userId) {
+      throw httpError('Se requiere una sesión de usuario activa para activar 2FA', 403, 'SESSION_REQUIRED');
+    }
+    if (!this.isPrincipalStillValid(actor)) {
+      throw httpError('Sesión revocada o caducada', 401, 'PRINCIPAL_REVOKED');
+    }
+    const state = this._ensureLoaded(false);
+    const user = state ? state.users.find((u) => u.id === actor.userId && u.status === 'active') : null;
+    if (!user) throw httpError('Usuario no encontrado', 404, 'USER_NOT_FOUND');
+    if (!user.totp || !user.totp.pendingSecretEnc) {
+      throw httpError('Ejecuta primero setupTotp() antes de activar 2FA', 400, 'TOTP_NOT_INITIALIZED');
+    }
+
+    const secretBuf = this._decryptTotpSecret(user.id, user.totp.pendingSecretEnc);
+    const verified = verifyTotpCode(secretBuf, String((input && input.code) || ''), {
+      timestampMs: input && input.timestampMs
+    });
+    if (!verified.valid || verified.matchedStep === null) {
+      throw httpError('Código TOTP de verificación inválido', 400, 'INVALID_TOTP_CODE');
+    }
+
+    /** @type {string[]} */
+    const recoveryCodes = [];
+    /** @type {string[]} */
+    const recoveryCodeHashes = [];
+    for (let i = 0; i < RECOVERY_CODES_COUNT; i++) {
+      const code = generateRecoveryCode();
+      recoveryCodes.push(code);
+      recoveryCodeHashes.push(this._hmacHex(`recovery:${user.id}`, normalizeRecoveryCode(code)));
+    }
+
+    const nowIso = new Date().toISOString();
+    user.totp = {
+      enabled: true,
+      secretEnc: user.totp.pendingSecretEnc,
+      enabledAt: nowIso,
+      lastUsedStep: verified.matchedStep,
+      recoveryCodeHashes
+    };
+    user.updatedAt = nowIso;
+    this._save();
+
+    return {
+      enabled: true,
+      enabledAt: nowIso,
+      recoveryCodes,
+      recoveryCodesRemaining: recoveryCodes.length
+    };
+  }
+
+  /**
+   * Desactiva 2FA del usuario autenticado exigiendo contraseña actual + código TOTP o recuperación.
+   * @param {any} actorOrAuth
+   * @param {{ password: string, code?: string, recoveryCode?: string, timestampMs?: number }} input
+   */
+  disableTotp(actorOrAuth, input) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor || actor.kind !== 'session' || !actor.userId) {
+      throw httpError('Se requiere una sesión de usuario activa para desactivar 2FA', 403, 'SESSION_REQUIRED');
+    }
+    if (!this.isPrincipalStillValid(actor)) {
+      throw httpError('Sesión revocada o caducada', 401, 'PRINCIPAL_REVOKED');
+    }
+    const state = this._ensureLoaded(false);
+    const user = state ? state.users.find((u) => u.id === actor.userId && u.status === 'active') : null;
+    if (!user) throw httpError('Usuario no encontrado', 404, 'USER_NOT_FOUND');
+    if (!user.totp || !user.totp.enabled) {
+      return { disabled: true, alreadyDisabled: true };
+    }
+
+    const lock = this._checkEmailLockout(user.email);
+    if (lock.blocked) {
+      const err = httpError('Demasiados intentos fallidos. Espera un minuto.', 429, 'EMAIL_LOCKED');
+      /** @type {any} */ (err).retryAfterSec = lock.retryAfterSec;
+      throw err;
+    }
+
+    const pwd = typeof (input && input.password) === 'string' ? input.password : '';
+    if (!pwd || Buffer.byteLength(pwd, 'utf8') > MAX_PASSWORD_BYTES || !verifyBcrypt(pwd, user.passwordHash)) {
+      this._recordEmailFailure(user.email);
+      throw httpError('La contraseña actual no es correcta', 401, 'INVALID_CURRENT_PASSWORD');
+    }
+
+    const mfaCheck = this._verifyUserSecondFactor(user, {
+      code: input && input.code,
+      recoveryCode: input && input.recoveryCode,
+      timestampMs: input && input.timestampMs
+    });
+    if (!mfaCheck.ok) {
+      this._recordEmailFailure(user.email);
+      throw httpError(
+        mfaCheck.replayed ? 'Este código TOTP ya fue utilizado' : 'Código 2FA o código de recuperación inválido',
+        401,
+        mfaCheck.replayed ? 'TOTP_REPLAY_DETECTED' : 'INVALID_MFA_CODE'
+      );
+    }
+
+    this._clearEmailFailure(user.email);
+    user.totp = { enabled: false };
+    user.updatedAt = new Date().toISOString();
+    this._save();
+    return { disabled: true };
+  }
+
+  /**
+   * Regenera los 10 códigos de recuperación single-use (exige contraseña + código TOTP vigente).
+   * @param {any} actorOrAuth
+   * @param {{ password: string, code: string, timestampMs?: number }} input
+   */
+  regenerateRecoveryCodes(actorOrAuth, input) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor || actor.kind !== 'session' || !actor.userId) {
+      throw httpError('Se requiere una sesión de usuario activa', 403, 'SESSION_REQUIRED');
+    }
+    if (!this.isPrincipalStillValid(actor)) {
+      throw httpError('Sesión revocada o caducada', 401, 'PRINCIPAL_REVOKED');
+    }
+    const state = this._ensureLoaded(false);
+    const user = state ? state.users.find((u) => u.id === actor.userId && u.status === 'active') : null;
+    if (!user || !user.totp || !user.totp.enabled) {
+      throw httpError('2FA no está activado en esta cuenta', 400, 'TOTP_NOT_ENABLED');
+    }
+    const pwd = typeof (input && input.password) === 'string' ? input.password : '';
+    if (!pwd || Buffer.byteLength(pwd, 'utf8') > MAX_PASSWORD_BYTES || !verifyBcrypt(pwd, user.passwordHash)) {
+      this._recordEmailFailure(user.email);
+      throw httpError('La contraseña actual no es correcta', 401, 'INVALID_CURRENT_PASSWORD');
+    }
+    const mfaCheck = this._verifyUserSecondFactor(user, {
+      code: input && input.code,
+      timestampMs: input && input.timestampMs
+    });
+    if (!mfaCheck.ok) {
+      this._recordEmailFailure(user.email);
+      throw httpError(
+        mfaCheck.replayed ? 'Este código TOTP ya fue utilizado' : 'Código TOTP inválido',
+        401,
+        mfaCheck.replayed ? 'TOTP_REPLAY_DETECTED' : 'INVALID_MFA_CODE'
+      );
+    }
+
+    /** @type {string[]} */
+    const recoveryCodes = [];
+    /** @type {string[]} */
+    const recoveryCodeHashes = [];
+    for (let i = 0; i < RECOVERY_CODES_COUNT; i++) {
+      const code = generateRecoveryCode();
+      recoveryCodes.push(code);
+      recoveryCodeHashes.push(this._hmacHex(`recovery:${user.id}`, normalizeRecoveryCode(code)));
+    }
+    user.totp.recoveryCodeHashes = recoveryCodeHashes;
+    user.updatedAt = new Date().toISOString();
+    this._save();
+    return { recoveryCodes, recoveryCodesRemaining: recoveryCodes.length };
+  }
+
+  /**
+   * Restablece 2FA de un subordinado bloqueado (solo owner/superadmin o admin respetando techo de rol).
+   * Rota `tokenKey` del usuario destino para invalidar sesiones previas.
+   * @param {any} actorOrAuth
+   * @param {string} targetUserId
+   * @param {string} [teamId]
+   */
+  adminResetUserTotp(actorOrAuth, targetUserId, teamId = DEFAULT_TEAM_ID) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor) throw httpError('Autenticación requerida', 401, 'UNAUTHENTICATED');
+    const resolvedTeamId = teamId || actor.teamId || DEFAULT_TEAM_ID;
+    const authz = this.authorizeAction(actor, 'team:write', { teamId: resolvedTeamId });
+    if (!authz.allowed) {
+      throw httpError('Sin permisos para restablecer 2FA de usuarios', authz.status, authz.reason);
+    }
+    const state = this._ensureLoaded(false);
+    const team = state ? state.teams.find((t) => t.id === resolvedTeamId) : null;
+    if (!team) throw httpError('Equipo no encontrado', 404, 'TEAM_NOT_FOUND');
+    const targetMember = team.members.find((m) => m.userId === targetUserId);
+    const targetUser = state ? state.users.find((u) => u.id === targetUserId) : null;
+    if (!targetMember || !targetUser) throw httpError('Miembro no encontrado', 404, 'MEMBER_NOT_FOUND');
+
+    if (!actor.isSuperAdmin) {
+      if (actor.userId === targetUserId) {
+        throw httpError('Usa disableTotp() para desactivar tu propio 2FA', 403, 'SELF_ACTION_FORBIDDEN');
+      }
+      if (roleRank(targetMember.role) >= roleRank(authz.effectiveRole)) {
+        throw httpError('No puedes restablecer 2FA de un miembro con rol igual o superior al tuyo', 403, 'ROLE_CEILING_EXCEEDED');
+      }
+    }
+
+    targetUser.totp = { enabled: false };
+    this._rotateUserTokenKey(targetUser);
+    this._save();
+    this._emitRevoked({ userId: targetUserId, teamId: resolvedTeamId, reason: 'totp_admin_reset' });
+    return { reset: true, userId: targetUserId };
+  }
+
+  /**
+   * Consulta el estado 2FA del usuario autenticado + si su equipo exige 2FA.
+   * @param {any} actorOrAuth
+   */
+  getTotpStatus(actorOrAuth) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor || !actor.userId) {
+      return { enabled: false, enabledAt: null, recoveryCodesRemaining: 0, teamEnforced: false, enrollmentRequired: false };
+    }
+    const state = this._ensureLoaded(false);
+    const user = state ? state.users.find((u) => u.id === actor.userId) : null;
+    if (!user) throw httpError('Usuario no encontrado', 404, 'USER_NOT_FOUND');
+    const team = state ? state.teams.find((t) => t.id === (actor.teamId || DEFAULT_TEAM_ID)) : null;
+    const member = team ? team.members.find((m) => m.userId === user.id) : null;
+    const enabled = Boolean(user.totp && user.totp.enabled);
+    const teamEnforced = Boolean(team && member && this._isTeam2faEnforcedForRole(team, member.role));
+    return {
+      enabled,
+      enabledAt: enabled ? (user.totp.enabledAt || null) : null,
+      recoveryCodesRemaining: enabled && Array.isArray(user.totp.recoveryCodeHashes) ? user.totp.recoveryCodeHashes.length : 0,
+      teamEnforced,
+      enrollmentRequired: !enabled && teamEnforced
+    };
+  }
+
+  /**
+   * Configura la política de obligatoriedad de 2FA de un equipo (solo `owner` o superadmin).
+   * @param {any} actorOrAuth
+   * @param {string} teamId
+   * @param {{ require2fa?: boolean, require2faForAdmins?: boolean }} policy
+   */
+  setTeamSecurityPolicy(actorOrAuth, teamId, policy = {}) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor) throw httpError('Autenticación requerida', 401, 'UNAUTHENTICATED');
+    const resolvedTeamId = teamId || actor.teamId || DEFAULT_TEAM_ID;
+    if (!actor.isSuperAdmin) {
+      const check = this.doesPrincipalSatisfyRole(actor, 'owner', resolvedTeamId);
+      if (!check.allowed) {
+        throw httpError('Solo el owner del equipo puede modificar la política de seguridad 2FA', check.status, check.reason);
+      }
+    }
+    const state = this._ensureLoaded(false);
+    const team = state ? state.teams.find((t) => t.id === resolvedTeamId) : null;
+    if (!team) throw httpError('Equipo no encontrado', 404, 'TEAM_NOT_FOUND');
+
+    if (!team.securityPolicy || typeof team.securityPolicy !== 'object') {
+      team.securityPolicy = { require2fa: false, require2faForAdmins: false };
+    }
+    if (typeof policy.require2fa === 'boolean') team.securityPolicy.require2fa = policy.require2fa;
+    if (typeof policy.require2faForAdmins === 'boolean') team.securityPolicy.require2faForAdmins = policy.require2faForAdmins;
+    team.updatedAt = new Date().toISOString();
+    this._save();
+    return { teamId: team.id, securityPolicy: { ...team.securityPolicy } };
+  }
+
+  /**
+   * Inicia sesión o aprovisiona un usuario tras una autenticación OIDC/OAuth2 verificada.
+   * Exige `emailVerified === true` y jamás auto-aprovisiona con rol `owner`.
+   * @param {{ providerId: string, subject: string, email: string, emailVerified: boolean, name?: string, enforceLocal2fa?: boolean }} identity
+   * @param {{ teamId?: string, autoProvision?: boolean, defaultRole?: string, ip?: string, ua?: string }} [opts]
+   */
+  loginWithOidc(identity, opts = {}) {
+    if (!identity || typeof identity !== 'object') {
+      throw httpError('Identidad OIDC inválida', 400, 'INVALID_OIDC_IDENTITY');
+    }
+    if (identity.emailVerified !== true) {
+      throw httpError('El proveedor SSO no verificó el correo electrónico; acceso denegado', 403, 'OIDC_EMAIL_NOT_VERIFIED');
+    }
+    const email = assertValidEmail(identity.email);
+    const providerId = String(identity.providerId || '').trim().slice(0, 64);
+    const subject = String(identity.subject || '').trim().slice(0, 200);
+    if (!providerId || !subject) {
+      throw httpError('Faltan providerId o subject en la identidad OIDC', 400, 'INVALID_OIDC_IDENTITY');
+    }
+
+    const state = this._ensureLoaded(true);
+    if (!state) throw httpError('Almacenamiento RBAC no disponible', 500, 'RBAC_INIT_ERROR');
+
+    const nowIso = new Date().toISOString();
+    // Buscar por vínculo `(providerId, subject)` o por correo verificado
+    let user = state.users.find(
+      (u) => Array.isArray(u.oidcLinks) && u.oidcLinks.some((l) => l.providerId === providerId && l.subject === subject)
+    ) || state.users.find((u) => u.email === email) || null;
+
+    const targetTeamId = opts.teamId || DEFAULT_TEAM_ID;
+    const team = state.teams.find((t) => t.id === targetTeamId);
+    if (!team) throw httpError('Equipo no encontrado', 404, 'TEAM_NOT_FOUND');
+
+    let provisioned = false;
+    if (!user) {
+      if (!opts.autoProvision) {
+        throw httpError('No existe una cuenta en Culkibo para este correo (solicita una invitación)', 403, 'OIDC_USER_NOT_PROVISIONED');
+      }
+      const defaultRole = String(opts.defaultRole || 'viewer').trim().toLowerCase();
+      if (defaultRole === 'owner') {
+        throw httpError('El auto-aprovisionamiento OIDC jamás puede asignar rol owner', 403, 'OWNER_PROVISION_FORBIDDEN');
+      }
+      if (!INVITABLE_ROLES.includes(/** @type {any} */ (defaultRole))) {
+        throw httpError(`Rol por defecto OIDC inválido: ${defaultRole}`, 400, 'INVALID_ROLE');
+      }
+      this._ensureSigningKey();
+      const randomUnusablePwd = crypto.randomBytes(32).toString('base64url');
+      user = {
+        id: `usr_${crypto.randomBytes(8).toString('hex')}`,
+        email,
+        name: String(identity.name || email.split('@')[0] || 'SSO User').trim().slice(0, 80),
+        passwordHash: hashBcrypt(randomUnusablePwd, this._bcryptCost),
+        status: 'active',
+        tokenKey: crypto.randomBytes(32).toString('hex'),
+        tokenVersion: 1,
+        tokensValidAfter: 0,
+        mustRotatePassword: false,
+        sessions: [],
+        oidcLinks: [{ providerId, subject, email, linkedAt: nowIso }],
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        lastLoginAt: nowIso
+      };
+      state.users.push(user);
+      team.members.push({
+        userId: user.id,
+        role: defaultRole,
+        projectIds: null,
+        addedAt: nowIso,
+        addedBy: `oidc:${providerId}`
+      });
+      team.updatedAt = nowIso;
+      provisioned = true;
+    } else {
+      if (user.status !== 'active') {
+        throw httpError('Esta cuenta está deshabilitada', 403, 'USER_DISABLED');
+      }
+      if (!Array.isArray(user.oidcLinks)) user.oidcLinks = [];
+      const existingLink = user.oidcLinks.find((l) => l.providerId === providerId);
+      if (existingLink && existingLink.subject !== subject) {
+        throw httpError('El identificador OIDC (sub) no coincide con el vinculado previamente a esta cuenta', 403, 'OIDC_SUBJECT_MISMATCH');
+      }
+      if (!existingLink) {
+        user.oidcLinks.push({ providerId, subject, email, linkedAt: nowIso });
+      }
+    }
+
+    const member = team.members.find((m) => m.userId === user.id);
+    if (!member) {
+      throw httpError('Tu cuenta no pertenece al equipo solicitado', 403, 'TEAM_ACCESS_DENIED');
+    }
+
+    if (identity.enforceLocal2fa && user.totp && user.totp.enabled) {
+      const challenge = this._issueMfaChallenge(user, team.id);
+      this._save();
+      return {
+        mfaRequired: true,
+        mfaChallengeToken: challenge.mfaChallengeToken,
+        expiresAt: challenge.expiresAt,
+        user: this.sanitizeUser(user),
+        team: this.sanitizeTeam(team),
+        role: member.role,
+        provisioned
+      };
+    }
+
+    user.lastLoginAt = nowIso;
+    const issued = this._issueSessionForUser(user, team.id, { ip: opts.ip, ua: opts.ua });
+    this._save();
+
+    return {
+      user: this.sanitizeUser(user),
+      team: this.sanitizeTeam(team),
+      role: member.role,
+      provisioned,
       sessionToken: issued.token,
       sessionId: issued.sessionId,
       expiresAt: issued.expiresAt
@@ -1201,10 +2113,19 @@ class TeamManager extends EventEmitter {
     const user = state.users.find((u) => u.id === userId);
     if (!user || user.status !== 'active') throw httpError('Usuario no encontrado', 404, 'USER_NOT_FOUND');
 
+    const lock = this._checkEmailLockout(user.email);
+    if (lock.blocked) {
+      const err = httpError('Demasiados intentos fallidos. Espera un minuto.', 429, 'EMAIL_LOCKED');
+      /** @type {any} */ (err).retryAfterSec = lock.retryAfterSec;
+      throw err;
+    }
+
     const currentPassword = typeof (input && input.currentPassword) === 'string' ? input.currentPassword : '';
     if (!currentPassword || Buffer.byteLength(currentPassword, 'utf8') > MAX_PASSWORD_BYTES || !verifyBcrypt(currentPassword, user.passwordHash)) {
+      this._recordEmailFailure(user.email);
       throw httpError('La contraseña actual no es correcta', 401, 'INVALID_CURRENT_PASSWORD');
     }
+    this._clearEmailFailure(user.email);
 
     const newPassword = validatePassword(input && input.newPassword);
     user.passwordHash = hashBcrypt(newPassword, this._bcryptCost);
@@ -1925,17 +2846,52 @@ class TeamManager extends EventEmitter {
   // ---------------------------------------------------------------------------
 
   /**
-   * Establece o actualiza un override ACL en un proyecto para un usuario.
+   * Consulta los overrides ACL de un proyecto para un principal autorizado.
    * @param {any} actorOrAuth
    * @param {string} projectId
-   * @param {{ teamId?: string, userId: string, role: 'none' | 'viewer' | 'developer' | 'admin' }} input
+   * @param {string} [teamId]
    */
-  setProjectAcl(actorOrAuth, projectId, input) {
+  getProjectAcl(actorOrAuth, projectId, teamId) {
     const actor = unwrapPrincipal(actorOrAuth);
     if (!actor) throw httpError('Autenticación requerida', 401, 'UNAUTHENTICATED');
     if (!PROJECT_ID_RE.test(String(projectId || ''))) {
       throw httpError('projectId inválido', 400, 'INVALID_PROJECT_ID');
     }
+    const resolvedTeamId = teamId || actor.teamId || DEFAULT_TEAM_ID;
+    const authz = this.authorizeProject(actor, projectId, 'projects:read', { id: projectId, teamId: resolvedTeamId });
+    if (!authz.allowed) {
+      throw httpError(authz.status === 404 ? 'Proyecto no encontrado' : 'Sin permisos', authz.status, authz.reason);
+    }
+    const state = this._ensureLoaded(false);
+    const acl = (state && state.projectAcls && state.projectAcls[projectId]) || null;
+    if (acl && acl.teamId !== resolvedTeamId && !actor.isSuperAdmin) {
+      throw httpError('Proyecto no encontrado', 404, 'PROJECT_NOT_FOUND');
+    }
+    return {
+      projectId,
+      teamId: (acl && acl.teamId) || resolvedTeamId,
+      overrides: acl && acl.overrides ? { ...acl.overrides } : {}
+    };
+  }
+
+  /**
+   * Establece o actualiza un override ACL en un proyecto para un usuario.
+   * Acepta formato objeto `{ teamId?, userId, role }` y firma posicional legada `(actor, projectId, userId, role, teamId)`.
+   * @param {any} actorOrAuth
+   * @param {string} projectId
+   * @param {{ teamId?: string, userId: string, role: 'none' | 'viewer' | 'developer' | 'admin' } | string} inputOrUserId
+   * @param {string} [legacyRole]
+   * @param {string} [legacyTeamId]
+   */
+  setProjectAcl(actorOrAuth, projectId, inputOrUserId, legacyRole, legacyTeamId) {
+    const actor = unwrapPrincipal(actorOrAuth);
+    if (!actor) throw httpError('Autenticación requerida', 401, 'UNAUTHENTICATED');
+    if (!PROJECT_ID_RE.test(String(projectId || ''))) {
+      throw httpError('projectId inválido', 400, 'INVALID_PROJECT_ID');
+    }
+    const input = (inputOrUserId && typeof inputOrUserId === 'object')
+      ? inputOrUserId
+      : { userId: String(inputOrUserId || ''), role: legacyRole, teamId: legacyTeamId };
     const teamId = (input && input.teamId) || actor.teamId || DEFAULT_TEAM_ID;
     const targetUserId = String((input && input.userId) || '').trim();
     const aclRole = String((input && input.role) || '').trim().toLowerCase();
@@ -2780,7 +3736,10 @@ class TeamManager extends EventEmitter {
     }
 
     const m = String(method || 'GET').toUpperCase();
-    const p = String(pathname || '/');
+    const p = canonicalizeHttpPath(pathname);
+    if (p === null) {
+      return { allowed: false, status: 400, reason: 'INVALID_PATH', effectiveRole: null };
+    }
     const isRead = m === 'GET' || m === 'HEAD' || m === 'OPTIONS';
 
     // Consulta propia y emisión de ticket WS permitidas para sesión o token válido
@@ -2791,8 +3750,14 @@ class TeamManager extends EventEmitter {
       return { allowed: true, status: 200, reason: 'SELF_AUTH_ROUTE', effectiveRole: principal.role };
     }
 
-    // Gestión de contraseña / sesiones: estrictamente `session` (nunca un token API `ckp_`)
-    if (p === '/api/auth/logout' || p === '/api/auth/logout-all' || p === '/api/auth/password') {
+    // Gestión de contraseña, sesiones y 2FA propio: estrictamente `session` (nunca un token API `ckp_`)
+    if (
+      p === '/api/auth/logout' ||
+      p === '/api/auth/logout-all' ||
+      p === '/api/auth/password' ||
+      p === '/api/auth/2fa' ||
+      p.startsWith('/api/auth/2fa/')
+    ) {
       if (!this.isPrincipalStillValid(principal)) {
         return { allowed: false, status: 401, reason: 'PRINCIPAL_REVOKED', effectiveRole: null };
       }
@@ -2802,34 +3767,59 @@ class TeamManager extends EventEmitter {
       return { allowed: true, status: 200, reason: 'SELF_AUTH_ROUTE', effectiveRole: principal.role };
     }
 
+    // Configuración OIDC/SSO: consulta de proveedores públicos permitida; administración solo owner (`instance:admin`)
+    if (p === '/api/auth/oidc' || p.startsWith('/api/auth/oidc/')) {
+      if (isRead && p === '/api/auth/oidc/providers') {
+        if (!this.isPrincipalStillValid(principal)) {
+          return { allowed: false, status: 401, reason: 'PRINCIPAL_REVOKED', effectiveRole: null };
+        }
+        return { allowed: true, status: 200, reason: 'PUBLIC_OIDC_PROVIDERS', effectiveRole: principal.role };
+      }
+      return this.authorizeAction(principal, 'instance:admin');
+    }
+
+    // Auditoría y resumen de seguridad/auditoría -> `audit:read` (estrictamente admin/owner)
+    if (
+      p === '/api/audit' ||
+      p.startsWith('/api/audit/') ||
+      p === '/api/system/audit' ||
+      p.startsWith('/api/system/audit/') ||
+      p === '/api/system/health-summary'
+    ) {
+      return this.authorizeAction(principal, 'audit:read');
+    }
+
     // Rutas críticas de host/instancia -> estrictamente `owner` (bloqueadas para developer, viewer y admin)
     if (
       p === '/api/auth/rotate' ||
-      p.startsWith('/api/docker') ||
-      p.startsWith('/api/ssl') ||
-      p.startsWith('/api/cloudflare') ||
-      p.startsWith('/api/backup/instance') ||
+      p === '/api/docker' || p.startsWith('/api/docker/') ||
+      p === '/api/ssl' || p.startsWith('/api/ssl/') ||
+      p === '/api/cloudflare' || p.startsWith('/api/cloudflare/') ||
+      p === '/api/backup/instance' || p.startsWith('/api/backup/instance/') ||
       p === '/api/system/panel-domain' ||
-      p.startsWith('/api/fleet/keys') ||
-      (!isRead && p.startsWith('/api/system')) ||
-      (!isRead && p.startsWith('/api/ingress')) ||
-      (!isRead && (p.startsWith('/api/deploy/freeze-windows') || p.includes('/freeze-windows')))
+      p === '/api/fleet/keys' || p.startsWith('/api/fleet/keys/') ||
+      (!isRead && (p === '/api/system' || p.startsWith('/api/system/'))) ||
+      (!isRead && (p === '/api/ingress' || p.startsWith('/api/ingress/'))) ||
+      (!isRead && (p.startsWith('/api/deploy/freeze-windows') || p.includes('/freeze-windows'))) ||
+      (!isRead && /^\/api\/teams\/[^/]+\/security-policy$/.test(p))
     ) {
       const permMap = p === '/api/auth/rotate'
         ? 'auth:rotate'
-        : p.startsWith('/api/docker')
+        : (p === '/api/docker' || p.startsWith('/api/docker/'))
           ? 'docker:write'
-          : p.startsWith('/api/ssl')
+          : (p === '/api/ssl' || p.startsWith('/api/ssl/'))
             ? 'ssl:write'
-            : p.startsWith('/api/cloudflare')
+            : (p === '/api/cloudflare' || p.startsWith('/api/cloudflare/'))
               ? 'cloudflare:write'
-              : p.startsWith('/api/backup/instance')
+              : (p === '/api/backup/instance' || p.startsWith('/api/backup/instance/'))
                 ? 'backup:instance'
-                : p.startsWith('/api/ingress')
+                : (p === '/api/ingress' || p.startsWith('/api/ingress/'))
                   ? 'ingress:write'
-                  : p.startsWith('/api/fleet/keys')
+                  : (p === '/api/fleet/keys' || p.startsWith('/api/fleet/keys/'))
                     ? 'fleet:ssh'
-                    : 'system:write';
+                    : /^\/api\/teams\/[^/]+\/security-policy$/.test(p)
+                      ? 'team:transfer'
+                      : 'system:write';
       return this.authorizeAction(principal, permMap);
     }
 
@@ -2846,33 +3836,33 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'runtime:exec');
     }
 
-    // Auditoría -> `audit:read` (admin/owner)
-    if (p.startsWith('/api/audit')) {
-      return this.authorizeAction(principal, 'audit:read');
+    // Escáner pre-despliegue de fugas de secretos
+    if (p === '/api/security/scan-secrets') {
+      return this.authorizeAction(principal, 'projects:write');
     }
 
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
-    if (p.startsWith('/api/servers') || p.startsWith('/api/fleet')) {
+    if (p === '/api/servers' || p.startsWith('/api/servers/') || p === '/api/fleet' || p.startsWith('/api/fleet/')) {
       return this.authorizeAction(principal, isRead ? 'fleet:read' : 'fleet:write');
     }
 
     // GitOps declarativo -> lectura `gitops:read`, plan/apply `gitops:write` (admin/owner)
-    if (p.startsWith('/api/gitops')) {
+    if (p === '/api/gitops' || p.startsWith('/api/gitops/')) {
       return this.authorizeAction(principal, isRead ? 'gitops:read' : 'gitops:write');
     }
 
     // Catálogo 1-clic -> lectura `catalog:read`, instalar/borrar `catalog:write` (admin/owner)
-    if (p.startsWith('/api/catalog')) {
+    if (p === '/api/catalog' || p.startsWith('/api/catalog/')) {
       return this.authorizeAction(principal, isRead ? 'catalog:read' : 'catalog:write');
     }
 
     // Gestión de equipos / invitaciones -> `team:read` / `team:write` (admin/owner)
-    if (p.startsWith('/api/teams')) {
+    if (p === '/api/teams' || p.startsWith('/api/teams/')) {
       return this.authorizeAction(principal, isRead ? 'team:read' : 'team:write');
     }
 
     // Tokens API -> `tokens:self` o `tokens:read`/`tokens:write` (bloquea viewer)
-    if (p.startsWith('/api/auth/tokens')) {
+    if (p === '/api/auth/tokens' || p.startsWith('/api/auth/tokens/')) {
       const selfCheck = this.authorizeAction(principal, 'tokens:self');
       if (selfCheck.allowed) return selfCheck;
       return this.authorizeAction(principal, isRead ? 'tokens:read' : 'tokens:write');
@@ -2889,42 +3879,42 @@ class TeamManager extends EventEmitter {
     }
 
     // Bases de datos gestionadas -> lectura `databases:read`, delete `databases:admin`, mutación `databases:write`
-    if (p.startsWith('/api/databases')) {
+    if (p === '/api/databases' || p.startsWith('/api/databases/')) {
       return this.authorizeAction(principal, isRead ? 'databases:read' : (m === 'DELETE' ? 'databases:admin' : 'databases:write'));
     }
 
     // Uptime & páginas de estado -> `uptime:read` / `uptime:write`
-    if (p.startsWith('/api/uptime') || p.startsWith('/api/status-pages')) {
+    if (p === '/api/uptime' || p.startsWith('/api/uptime/') || p === '/api/status-pages' || p.startsWith('/api/status-pages/')) {
       return this.authorizeAction(principal, isRead ? 'uptime:read' : 'uptime:write');
     }
 
     // Entornos / promoción -> `environments:read` / `environments:write`
-    if (p.startsWith('/api/environments')) {
+    if (p === '/api/environments' || p.startsWith('/api/environments/')) {
       return this.authorizeAction(principal, isRead ? 'environments:read' : 'environments:write');
     }
 
     // MCP -> `mcp:read` / `mcp:write`
-    if (p.startsWith('/api/mcp')) {
+    if (p === '/api/mcp' || p.startsWith('/api/mcp/')) {
       return this.authorizeAction(principal, isRead ? 'mcp:read' : 'mcp:write');
     }
 
     // Rutas de aplicación permitidas para developer+ en escritura
     if (
-      p.startsWith('/api/projects') ||
-      p.startsWith('/api/deploy') ||
-      p.startsWith('/api/sync') ||
-      p.startsWith('/api/domains') ||
-      p.startsWith('/api/crons') ||
-      p.startsWith('/api/previews') ||
-      p.startsWith('/api/sleep')
+      p === '/api/projects' || p.startsWith('/api/projects/') ||
+      p === '/api/deploy' || p.startsWith('/api/deploy/') ||
+      p === '/api/sync' || p.startsWith('/api/sync/') ||
+      p === '/api/domains' || p.startsWith('/api/domains/') ||
+      p === '/api/crons' || p.startsWith('/api/crons/') ||
+      p === '/api/previews' || p.startsWith('/api/previews/') ||
+      p === '/api/sleep' || p.startsWith('/api/sleep/')
     ) {
       if (isRead) return this.authorizeAction(principal, 'projects:read');
-      if (p.startsWith('/api/deploy')) return this.authorizeAction(principal, 'deployments:write');
-      if (p.startsWith('/api/sync')) return this.authorizeAction(principal, 'sync:write');
-      if (p.startsWith('/api/domains')) return this.authorizeAction(principal, 'domains:write');
-      if (p.startsWith('/api/crons')) return this.authorizeAction(principal, 'crons:write');
-      if (p.startsWith('/api/previews')) return this.authorizeAction(principal, 'previews:write');
-      if (p.startsWith('/api/sleep')) return this.authorizeAction(principal, 'sleep:write');
+      if (p === '/api/deploy' || p.startsWith('/api/deploy/')) return this.authorizeAction(principal, 'deployments:write');
+      if (p === '/api/sync' || p.startsWith('/api/sync/')) return this.authorizeAction(principal, 'sync:write');
+      if (p === '/api/domains' || p.startsWith('/api/domains/')) return this.authorizeAction(principal, 'domains:write');
+      if (p === '/api/crons' || p.startsWith('/api/crons/')) return this.authorizeAction(principal, 'crons:write');
+      if (p === '/api/previews' || p.startsWith('/api/previews/')) return this.authorizeAction(principal, 'previews:write');
+      if (p === '/api/sleep' || p.startsWith('/api/sleep/')) return this.authorizeAction(principal, 'sleep:write');
       return this.authorizeAction(principal, 'projects:write');
     }
 
@@ -2955,6 +3945,9 @@ module.exports = Object.assign(defaultInstance, {
   MAX_INVITE_TTL_HOURS,
   MIN_PASSWORD_BYTES,
   MAX_PASSWORD_BYTES,
+  TOTP_STEP_SECONDS,
+  TOTP_DIGITS,
+  RECOVERY_CODES_COUNT,
   roleRank,
   hasMinRole,
   getRolePermissions,
@@ -2963,5 +3956,11 @@ module.exports = Object.assign(defaultInstance, {
   normalizeProjectIds,
   intersectProjectIds,
   intersectScopesWithRole,
-  unwrapPrincipal
+  unwrapPrincipal,
+  canonicalizeHttpPath,
+  base32Encode,
+  base32Decode,
+  generateTotpCode,
+  verifyTotpCode,
+  safeEqual
 });

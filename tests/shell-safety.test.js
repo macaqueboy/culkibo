@@ -26,7 +26,7 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 
 /** Directorios y ficheros de código ejecutable del lado servidor. */
-const SCAN_ROOTS = ['server', 'bin', 'scripts', 'bench'];
+const SCAN_ROOTS = ['server', 'bin', 'scripts', 'bench', 'telemetry-collector'];
 
 /** Sólo JavaScript. Los .sh y .ps1 SON shell; no se les aplica esta regla. */
 const SCAN_EXT = new Set(['.js', '.cjs', '.mjs']);
@@ -45,12 +45,13 @@ const RULES = [
   {
     id: 'exec-template',
     what: 'exec() con plantilla de cadena',
-    re: /\bexec\s*\(\s*`/
+    // El lookbehind descarta métodos como `this.db.exec(\`SQL\`)` (SQLite) y `re.exec(...)`.
+    re: /(?<![.\w$])exec\s*\(\s*`/
   },
   {
     id: 'execsync-template',
     what: 'execSync() con plantilla de cadena',
-    re: /\bexecSync\s*\(\s*`/
+    re: /(?<![.\w$])execSync\s*\(\s*`/
   },
   {
     id: 'exec-literal',
@@ -62,6 +63,11 @@ const RULES = [
     what: 'exec()/execSync() con una variable',
     // El lookbehind descarta `regexp.exec(...)`, que no lanza nada.
     re: /(?<![.\w$])(?:exec|execSync)\s*\(\s*[A-Za-z_$][\w$]*\s*[,)]/
+  },
+  {
+    id: 'cp-member-exec',
+    what: 'child_process.exec()/execSync() directo o vía alias cp/childProcess',
+    re: /(?:require\s*\(\s*['"](?:node:)?child_process['"]\s*\)|\b(?:child_process|childProcess|cp))\s*\.\s*exec(?:Sync)?\s*\(/
   },
   {
     id: 'shell-true',
@@ -212,6 +218,7 @@ function testShellSafety() {
 
   // 4. Los módulos que más manipulan entrada del usuario no pueden ni siquiera
   //    importar exec/execSync: sin la función a mano, no hay descuido posible.
+  //    Detecta comillas simples/dobles, `node:child_process` y destructuring multilínea.
   const MUST_NOT_IMPORT_EXEC = [
     'server/services/dockerManager.js',
     'server/services/localRunner.js',
@@ -224,17 +231,35 @@ function testShellSafety() {
     'server/services/teamManager.js',
     'server/services/environmentManager.js',
     'server/services/gitopsManager.js',
-    'server/services/uptimeMonitor.js'
+    'server/services/uptimeMonitor.js',
+    'server/services/previewManager.js',
+    'server/services/repoSync.js',
+    'server/services/catalogManager.js',
+    'server/services/cronManager.js',
+    'server/services/universalImporter.js',
+    'server/services/wordpressMigrator.js',
+    'telemetry-collector/server.js',
+    'telemetry-collector/lib/storage.js'
   ];
+  const cpImportRe = /(?:const|let|var)\s+(\{[^}]*\}|\w+)\s*=\s*require\s*\(\s*['"](?:node:)?child_process['"]\s*\)/g;
   for (const rel of MUST_NOT_IMPORT_EXEC) {
-    const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
-    const importLine = src.split(/\r?\n/).find(l => l.includes("require('child_process')") && !isCommentLine(l));
-    if (!importLine) continue;
-    assert.ok(
-      !/\bexec\b/.test(importLine.replace(/execFile(Sync)?/g, '')) &&
-      !/\bexecSync\b/.test(importLine),
-      `${rel} importa exec/execSync de child_process. Usa execFile/spawn:\n    ${importLine.trim()}`
-    );
+    const abs = path.join(ROOT, rel);
+    if (!fs.existsSync(abs)) continue;
+    const src = fs.readFileSync(abs, 'utf8');
+    // Quitar comentarios de línea y bloque antes de inspeccionar imports
+    const stripped = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    let m;
+    cpImportRe.lastIndex = 0;
+    while ((m = cpImportRe.exec(stripped)) !== null) {
+      const binding = m[1];
+      const withoutExecFile = binding.replace(/\bexecFile(?:Sync)?\b/g, '');
+      assert.ok(
+        !/\bexec\b/.test(withoutExecFile) && !/\bexecSync\b/.test(withoutExecFile),
+        `${rel} importa exec/execSync de child_process. Usa execFile/spawn:\n    ${m[0].trim()}`
+      );
+    }
   }
 
   console.log(`  ✓ Ningún punto sin autorizar en ${SCAN_ROOTS.join(', ')} (${findings.length} coincidencias, todas conocidas)`);

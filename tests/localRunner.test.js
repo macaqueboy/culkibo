@@ -1,6 +1,7 @@
 const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const http = require('http');
 const localRunner = require('../server/services/localRunner');
 
@@ -92,128 +93,148 @@ async function testLocalRunner() {
   console.log(`  ✓ Port allocation and collision avoidance passed (ports: ${allocatedPort}, ${nextPort})`);
 
   // ----------------------------------------------------
-  // 3. Test Static Web Server Hosting
+  // 3. Test Static Web Server Hosting (isolated in os.tmpdir())
   // ----------------------------------------------------
   console.log('  3. Testing static web hosting mode...');
-  const testDir = path.join(process.cwd(), 'projects', 'test_static_app');
-  if (!fs.existsSync(testDir)) fs.mkdirSync(testDir, { recursive: true });
+  const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-localrunner-'));
+  const testDir = path.join(isolatedRoot, 'test_static_app');
+  const secretOutside = path.join(isolatedRoot, 'secret-outside.txt');
+  fs.mkdirSync(testDir, { recursive: true });
+  fs.writeFileSync(secretOutside, 'TOP_SECRET_OUTSIDE_ROOT_TOKEN_999', 'utf8');
   const testHtml = '<!DOCTYPE html><html><body><h1>Culkibo Test Static OK</h1></body></html>';
   fs.writeFileSync(path.join(testDir, 'index.html'), testHtml, 'utf8');
 
-  const testProject = {
-    id: 'test_static_app',
-    name: 'Test Static App',
-    localPort: allocatedPort
-  };
-
-  const staticResult = await localRunner.startStaticProject(testProject, testDir, allocatedPort);
-  assert.strictEqual(staticResult.success, true);
-  assert.strictEqual(localRunner.isRunning('test_static_app'), true);
-
-  // Fetch static server
-  const staticRes = await fetch(`http://localhost:${allocatedPort}/`);
-  const staticText = await staticRes.text();
-  assert.strictEqual(staticRes.status, 200);
-  assert.ok(staticText.includes('Culkibo Test Static OK'), 'Static server must serve index.html');
-
-  // Clean up static runner
-  await localRunner.stop('test_static_app');
-  assert.strictEqual(localRunner.isRunning('test_static_app'), false);
-  try { fs.rmSync(testDir, { recursive: true, force: true }); } catch(e) {}
-  console.log('  ✓ Static web hosting and graceful shutdown passed');
-
-  // ----------------------------------------------------
-  // 4. Test Fallback Sandbox Server
-  // ----------------------------------------------------
-  console.log('  4. Testing fallback sandbox server...');
-  const fallbackProject = {
-    id: 'test_fallback_app',
-    name: 'Fallback Sandbox',
-    icon: '📦'
-  };
-  const fbPort = allocatedPort + 2;
-  const fbResult = await localRunner.startFallbackServer(fallbackProject, testDir, fbPort);
-  assert.strictEqual(fbResult.success, true);
-  assert.strictEqual(localRunner.isRunning('test_fallback_app'), true);
-
-  const fbRes = await fetch(`http://localhost:${fbPort}/`);
-  const fbText = await fbRes.text();
-  assert.strictEqual(fbRes.status, 200);
-  assert.ok(fbText.includes('Fallback Sandbox'), 'Fallback server must display project title');
-  assert.ok(fbText.includes('Culkibo v1.0.0 Local Runner'), 'Fallback server must identify Culkibo');
-
-  await localRunner.stop('test_fallback_app');
-  assert.strictEqual(localRunner.isRunning('test_fallback_app'), false);
-  console.log('  ✓ Fallback sandbox server and stop passed');
-
-  // ----------------------------------------------------
-  // 4b. Regressions: path traversal, id collisions, Unicode names
-  // ----------------------------------------------------
-  console.log('  4b. Testing hardening regressions (traversal, ids, nombres Unicode)...');
-
-  const travPort = allocatedPort + 3;
-  const travProject = { id: 'test_traversal_app', name: 'Traversal Probe', icon: '🛡️' };
-  await localRunner.startStaticProject(travProject, testDir, travPort);
-
-  // A raw request target with `..` must never escape the served root.
-  const rawTraversal = await new Promise((resolve, reject) => {
-    const req = require('http').request(
-      { host: '127.0.0.1', port: travPort, method: 'GET', path: '/../../../package.json' },
-      (r) => {
-        let body = '';
-        r.on('data', (c) => { body += c; });
-        r.on('end', () => resolve({ status: r.statusCode, body }));
-      }
-    );
-    req.on('error', reject);
-    req.end();
-  });
-  assert.ok(
-    !rawTraversal.body.includes('"culkibo"') || rawTraversal.status === 403,
-    'Static server must not serve files outside its root via path traversal'
-  );
-
-  const encodedTraversal = await fetch(`http://127.0.0.1:${travPort}/%2e%2e%2f%2e%2e%2fpackage.json`);
-  const encodedBody = await encodedTraversal.text();
-  assert.ok(
-    !encodedBody.includes('"culkibo"'),
-    'Static server must not serve files outside its root via encoded traversal'
-  );
-  await localRunner.stop('test_traversal_app');
-  console.log('  ✓ Static server path traversal blocked (raw and percent-encoded)');
-
-  // Project ids created in the same millisecond must not collide.
-  const Project = require('../server/models/Project');
-  const ids = new Set();
-  for (let i = 0; i < 500; i++) ids.add(new Project({ name: `Bulk ${i}` }).id);
-  assert.strictEqual(ids.size, 500, 'Project ids must be unique even within one millisecond');
-  console.log('  ✓ Project id uniqueness under bulk creation passed (500/500 únicos)');
-
-  // Spanish names must survive sanitisation; markup must not.
-  const projectManager = require('../server/services/projectManager');
-  const payload = { name: 'Aplicación Núcleo ñandú 🚀 <script>alert(1)</script>' };
-  projectManager.validateProjectData(payload);
-  assert.ok(payload.name.includes('Aplicación'), 'Accents must be preserved');
-  assert.ok(payload.name.includes('Núcleo'), 'Accents must be preserved');
-  assert.ok(payload.name.includes('ñandú'), 'ñ must be preserved');
-  assert.ok(payload.name.includes('🚀'), 'Emoji must be preserved');
-  assert.ok(!payload.name.includes('<'), 'Angle brackets must be stripped');
-  assert.ok(!payload.name.includes('>'), 'Angle brackets must be stripped');
-  console.log(`  ✓ Unicode-safe name sanitisation passed ("${payload.name}")`);
-
-  // ----------------------------------------------------
-  // 5. Test Real Running Projects (ToolSuite / Calma)
-  // ----------------------------------------------------
-  console.log('  5. Testing real application live execution (ToolSuite on :7325)...');
   try {
-    const liveRes = await fetch('http://localhost:7325/', { signal: AbortSignal.timeout(5000) });
-    if (liveRes.status === 200) {
-      const liveText = await liveRes.text();
-      assert.ok(liveText.length > 500, 'Live application must serve complete page');
-      console.log(`  ✓ ToolSuite is actively running and serving real Next.js application (${liveText.length} bytes, HTTP 200)`);
+    const testProject = {
+      id: 'test_static_app',
+      name: 'Test Static App',
+      localPort: allocatedPort
+    };
+
+    const staticResult = await localRunner.startStaticProject(testProject, testDir, allocatedPort);
+    assert.strictEqual(staticResult.success, true);
+    assert.strictEqual(localRunner.isRunning('test_static_app'), true);
+
+    // Fetch static server
+    const staticRes = await fetch(`http://127.0.0.1:${allocatedPort}/`);
+    const staticText = await staticRes.text();
+    assert.strictEqual(staticRes.status, 200);
+    assert.ok(staticText.includes('Culkibo Test Static OK'), 'Static server must serve index.html');
+
+    // Clean up static runner
+    await localRunner.stop('test_static_app');
+    assert.strictEqual(localRunner.isRunning('test_static_app'), false);
+    console.log('  ✓ Static web hosting and graceful shutdown passed');
+
+    // ----------------------------------------------------
+    // 4. Test Fallback Sandbox Server
+    // ----------------------------------------------------
+    console.log('  4. Testing fallback sandbox server...');
+    const fallbackProject = {
+      id: 'test_fallback_app',
+      name: 'Fallback Sandbox',
+      icon: '📦'
+    };
+    const fbPort = await localRunner.getAvailablePort(allocatedPort + 2);
+    const fbResult = await localRunner.startFallbackServer(fallbackProject, testDir, fbPort);
+    assert.strictEqual(fbResult.success, true);
+    assert.strictEqual(localRunner.isRunning('test_fallback_app'), true);
+
+    const fbRes = await fetch(`http://127.0.0.1:${fbPort}/`);
+    const fbText = await fbRes.text();
+    assert.strictEqual(fbRes.status, 200);
+    assert.ok(fbText.includes('Fallback Sandbox'), 'Fallback server must display project title');
+    assert.ok(fbText.includes('Culkibo v1.0.0 Local Runner'), 'Fallback server must identify Culkibo');
+
+    await localRunner.stop('test_fallback_app');
+    assert.strictEqual(localRunner.isRunning('test_fallback_app'), false);
+    console.log('  ✓ Fallback sandbox server and stop passed');
+
+    // ----------------------------------------------------
+    // 4b. Regressions: path traversal (raw, encoded, backslash), id collisions, Unicode names
+    // ----------------------------------------------------
+    console.log('  4b. Testing hardening regressions (traversal, ids, nombres Unicode)...');
+
+    const travPort = await localRunner.getAvailablePort(fbPort + 1);
+    const travProject = { id: 'test_traversal_app', name: 'Traversal Probe', icon: '🛡️' };
+    await localRunner.startStaticProject(travProject, testDir, travPort);
+
+    const rawGet = (reqPath) => new Promise((resolve, reject) => {
+      const req = http.request(
+        { host: '127.0.0.1', port: travPort, method: 'GET', path: reqPath },
+        (r) => {
+          let body = '';
+          r.on('data', (c) => { body += c; });
+          r.on('end', () => resolve({ status: r.statusCode, body }));
+        }
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+    try {
+      const traversalVectors = [
+        '/../secret-outside.txt',
+        '/../../secret-outside.txt',
+        '/%2e%2e/secret-outside.txt',
+        '/%2e%2e%2fsecret-outside.txt',
+        '/%252e%252e%252fsecret-outside.txt',
+        '/..%5csecret-outside.txt',
+        '/..\\secret-outside.txt'
+      ];
+      for (const vec of traversalVectors) {
+        const resp = await rawGet(vec);
+        assert.ok(
+          !resp.body.includes('TOP_SECRET_OUTSIDE_ROOT_TOKEN_999'),
+          `Traversal vector ${vec} leaked outside file content!`
+        );
+        // Static server clamps traversal into root and serves either 400/403/404 or SPA index.html fallback (never outside files)
+        assert.ok(
+          resp.status === 400 || resp.status === 403 || resp.status === 404 || (resp.status === 200 && resp.body === testHtml),
+          `Traversal vector ${vec} returned unexpected response (${resp.status})`
+        );
+      }
+      // Null byte & malformed percent encoding must strictly return 400 Bad Request
+      const nullResp = await rawGet('/%00index.html');
+      assert.strictEqual(nullResp.status, 400, 'Null byte in static URL must return 400');
+      const badPctResp = await rawGet('/%ZZbad');
+      assert.strictEqual(badPctResp.status, 400, 'Malformed percent-encoding must return 400');
+    } finally {
+      await localRunner.stop('test_traversal_app');
     }
-  } catch(e) {
-    console.log(`  ℹ Note: ToolSuite check info: ${e.message}`);
+    console.log('  ✓ Static server path traversal blocked (raw, percent-encoded, double-encoded & backslash)');
+
+    // Project ids created in the same millisecond must not collide.
+    const Project = require('../server/models/Project');
+    const ids = new Set();
+    for (let i = 0; i < 500; i++) ids.add(new Project({ name: `Bulk ${i}` }).id);
+    assert.strictEqual(ids.size, 500, 'Project ids must be unique even within one millisecond');
+    console.log('  ✓ Project id uniqueness under bulk creation passed (500/500 únicos)');
+
+    // Spanish names must survive sanitisation; markup must not.
+    const projectManager = require('../server/services/projectManager');
+    const payload = { name: 'Aplicación Núcleo ñandú 🚀 <script>alert(1)</script>' };
+    projectManager.validateProjectData(payload);
+    assert.ok(payload.name.includes('Aplicación'), 'Accents must be preserved');
+    assert.ok(payload.name.includes('Núcleo'), 'Accents must be preserved');
+    assert.ok(payload.name.includes('ñandú'), 'ñ must be preserved');
+    assert.ok(payload.name.includes('🚀'), 'Emoji must be preserved');
+    assert.ok(!payload.name.includes('<'), 'Angle brackets must be stripped');
+    assert.ok(!payload.name.includes('>'), 'Angle brackets must be stripped');
+    console.log(`  ✓ Unicode-safe name sanitisation passed ("${payload.name}")`);
+
+    // ----------------------------------------------------
+    // 5. Hermetic stop() idempotence on unknown project
+    // ----------------------------------------------------
+    const stopUnknown = await localRunner.stop('nonexistent_runner_id_999');
+    assert.strictEqual(stopUnknown.success, true, 'Stopping an inactive/unknown runner should succeed idempotently');
+    assert.strictEqual(localRunner.isRunning('nonexistent_runner_id_999'), false);
+    console.log('  ✓ Hermetic stop() idempotence verified (zero external port dependencies)');
+  } finally {
+    await localRunner.stop('test_static_app').catch(() => {});
+    await localRunner.stop('test_fallback_app').catch(() => {});
+    await localRunner.stop('test_traversal_app').catch(() => {});
+    try { fs.rmSync(isolatedRoot, { recursive: true, force: true }); } catch (e) {}
   }
 
   console.log('✅ All Local Runner tests passed!\n');

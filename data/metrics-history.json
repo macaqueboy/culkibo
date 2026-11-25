@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-25T17:43:26.464Z",
+  "tier1m": [
+    {
+      "ts": 1795628605967,
+      "hostCpuPct": 18.8,
+      "hostRamPct": 87.9,
+      "hostRamUsedMb": 13756,
+      "hostRamTotalMb": 15652,
+      "diskUsedPct": 96.4,
+      "diskFreeGb": 33.3,
+      "rssMb": 64,
+      "heapMb": 11,
+      "elLagMs": 0,
+      "rps": 0,
+      "p50Ms": 0,
+      "p95Ms": 0,
+      "errorRatePct": 0,
+      "err5xxRatePct": 0,
+      "reqDelta": 0
+    }
+  ],
+  "tier15m": [
+    {
+      "ts": 1795627800000,
+      "hostCpuPct": 18.8,
+      "hostRamPct": 87.9,
+      "hostRamUsedMb": 13756,
+      "hostRamTotalMb": 15652,
+      "diskUsedPct": 96.4,
+      "diskFreeGb": 33.3,
+      "rssMb": 64,
+      "heapMb": 11,
+      "elLagMs": 0,
+      "rps": 0,
+      "p50Ms": 0,
+      "p95Ms": 0,
+      "errorRatePct": 0,
+      "err5xxRatePct": 0,
+      "reqDelta": 0,
+      "samples": 1,
+      "maxHostCpuPct": 18.8,
+      "maxHostRamPct": 87.9,
+      "maxP95Ms": 0
+    }
+  ],
+  "deployMarkers": []
+}

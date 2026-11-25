@@ -8,13 +8,15 @@
 const runControlPlane = require('./control-plane.bench');
 const runLiveSync = require('./live-sync.bench');
 const runRouteSwap = require('./route-swap.bench');
+const runSubsystems = require('./subsystems.bench');
 
-async function main() {
-  const asJson = process.argv.includes('--json');
+async function main({ silent = null } = {}) {
+  const asJson = silent === null ? process.argv.includes('--json') : Boolean(silent);
 
   const controlPlane = await runControlPlane({ silent: asJson });
   const liveSync = await runLiveSync({ silent: asJson });
-  const routeSwap = await runRouteSwap();
+  const routeSwap = await runRouteSwap({ silent: asJson });
+  const subsystems = await runSubsystems({ silent: asJson });
 
   const report = {
     timestamp: new Date().toISOString(),
@@ -25,10 +27,11 @@ async function main() {
     },
     controlPlane,
     liveSync,
-    routeSwap: routeSwap || { skipped: true, reason: 'Caddy no estaba escuchando en :2019' }
+    routeSwap: routeSwap || { skipped: true, reason: 'Caddy no estaba escuchando en :2019' },
+    subsystems
   };
 
-  if (asJson) {
+  if (require.main === module && asJson) {
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
   }
 

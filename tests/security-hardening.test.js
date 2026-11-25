@@ -1,10 +1,13 @@
 const assert = require('assert');
 const fs = require('fs');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 
 const { isLoopback, authorizeRequest } = require('../server/middleware/auth');
 const ssrfGuard = require('../server/services/ssrfGuard');
+const { AuditLogger } = require('../server/services/auditLogger');
+const secretScanner = require('../server/services/secretScanner');
 const Project = require('../server/models/Project');
 const projectManager = require('../server/services/projectManager');
 const localRunner = require('../server/services/localRunner');
@@ -237,6 +240,271 @@ async function testSecurityHardening() {
     await projectManager.flushToDisk();
   }
   console.log('  ✓ H8: ingressManager conserva rutas activas de producción al reconciliar');
+
+  // S1: Advanced SSRF Bypass Matrix (128-bit IPv6, NAT64, FQDN trailing dot, cross-origin redirect header strip)
+  {
+    const blockedIps = [
+      '0::1',
+      '0:0::1',
+      '::0:1',
+      '0000:0000:0000:0000:0000:0000:0000:0001',
+      '[0::1]',
+      '::ffff:169.254.169.254',
+      '::ffff:a9fe:a9fe',
+      '0::ffff:127.0.0.1',
+      '0:0:0:0:0:ffff:169.254.169.254',
+      '::ffff:0:127.0.0.1',
+      '64:ff9b::169.254.169.254',
+      '64:ff9b::a9fe:a9fe',
+      '2002:a9fe:a9fe::1',
+      'fe80::1%eth0',
+      '100::1',
+      'fd00:ec2::254',
+      'fd00:0ec2::0254',
+      '2001:0000::1',
+      '2001:db8::1'
+    ];
+    for (const ip of blockedIps) {
+      assert.strictEqual(ssrfGuard.isPrivateIp(ip), true, `IPv6/embebida privada debe bloquearse: ${ip}`);
+    }
+    assert.strictEqual(ssrfGuard.isMetadataIp('64:ff9b::169.254.169.254'), true);
+    assert.strictEqual(ssrfGuard.isMetadataIp('0:0:0:0:0:ffff:169.254.169.254'), true);
+    assert.strictEqual(ssrfGuard.isMetadataIp('fd00:0ec2::0254'), true);
+    assert.strictEqual(ssrfGuard.isPrivateIp('2606:4700:4700::1111'), false, 'IPv6 pública debe permitirse');
+    assert.strictEqual(ssrfGuard.isPrivateIp('2001:4860:4860::8888'), false, 'IPv6 pública debe permitirse');
+
+    // FQDN trailing dot & cloud metadata hostnames
+    await assert.rejects(() => ssrfGuard.assertSafeUrl('http://localhost./api'), /SSRF|privad|bloquead/i);
+    await assert.rejects(() => ssrfGuard.assertSafeUrl('http://metadata.google.internal./computeMetadata/v1/'), /metadatos|bloquead/i);
+    await assert.rejects(() => ssrfGuard.assertSafeUrl('http://metadata.azure.com./metadata/instance'), /metadatos|bloquead/i);
+
+    // Real HTTP redirect test: strip custom sensitive headers cross-origin + block redirect to metadata
+    let receivedHeadersAtB = null;
+    const srvB = await new Promise((resolve) => {
+      const s = http.createServer((req, res) => {
+        receivedHeadersAtB = { ...req.headers };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+      });
+      s.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const portB = /** @type {any} */ (srvB.address()).port;
+
+    const srvA = await new Promise((resolve) => {
+      const s = http.createServer((req, res) => {
+        if (req.url === '/to-b') {
+          res.writeHead(302, { Location: `http://127.0.0.1:${portB}/dest` });
+          return res.end();
+        }
+        res.writeHead(302, { Location: 'http://169.254.169.254/latest/meta-data/' });
+        res.end();
+      });
+      s.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const portA = /** @type {any} */ (srvA.address()).port;
+
+    try {
+      const resOk = await ssrfGuard.safeFetch(`http://127.0.0.1:${portA}/to-b`, {
+        allowLoopback: true,
+        headers: {
+          Authorization: 'Bearer secret_tok_123',
+          Cookie: 'culkibo_session=cks_secret',
+          'X-API-Key': 'api_key_secret',
+          'Private-Token': 'glpat-secret',
+          'X-Custom-Safe': 'keep-me'
+        }
+      });
+      assert.strictEqual(resOk.status, 200);
+      assert.strictEqual(receivedHeadersAtB.authorization, undefined, 'Authorization debe eliminarse en redirect cross-origin');
+      assert.strictEqual(receivedHeadersAtB.cookie, undefined, 'Cookie debe eliminarse en redirect cross-origin');
+      assert.strictEqual(receivedHeadersAtB['x-api-key'], undefined, 'X-API-Key debe eliminarse en redirect cross-origin');
+      assert.strictEqual(receivedHeadersAtB['private-token'], undefined, 'Private-Token debe eliminarse en redirect cross-origin');
+      assert.strictEqual(receivedHeadersAtB['x-custom-safe'], 'keep-me');
+
+      await assert.rejects(
+        () => ssrfGuard.safeFetch(`http://127.0.0.1:${portA}/to-meta`, { allowLoopback: true }),
+        /metadatos|SSRF|bloquead/i
+      );
+    } finally {
+      await new Promise((r) => srvA.close(r));
+      await new Promise((r) => srvB.close(r));
+    }
+    console.log('  ✓ S1: Matriz SSRF avanzada (128-bit IPv6, NAT64, trailing dot, strip cabeceras en redirect)');
+  }
+
+  // S2: realpathSync symlink escape & sensitive home dir guard in projectManager.validateProjectData
+  {
+    const symParent = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-sym-guard-'));
+    try {
+      const targetDataDir = path.resolve(path.dirname(projectManager.dataPath));
+      const linkPath = path.join(symParent, 'innocent-link');
+      fs.symlinkSync(targetDataDir, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+      assert.throws(
+        () => projectManager.validateProjectData({ localPath: linkPath }),
+        /interno|data\/|sensible/i,
+        'Un symlink/junction hacia data/ debe ser bloqueado por realpathSync'
+      );
+      assert.throws(
+        () => projectManager.validateProjectData({ localPath: path.join(os.homedir(), '.ssh') }),
+        /sensible/i,
+        '~/.ssh debe ser bloqueado como localPath'
+      );
+      assert.throws(
+        () => ssrfGuard.assertContainedPath(symParent, 'backup.json\0.txt'),
+        /inválida|nulos/i,
+        'assertContainedPath debe rechazar bytes nulos embebidos'
+      );
+    } finally {
+      fs.rmSync(symParent, { recursive: true, force: true });
+    }
+    console.log('  ✓ S2: projectManager bloquea symlinks/junctions hacia data/ y directorios sensibles (~/.ssh)');
+  }
+
+  // S3: Tamper-Evident SHA-256 Hash-Chained Audit Log + Rotation Anchor + Tamper Detection
+  {
+    const auditTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-audit-chain-'));
+    try {
+      const logger = new AuditLogger({ dataDir: auditTmp, maxFileBytes: 2500 });
+      for (let i = 0; i < 9; i++) {
+        logger.record({
+          source: 'http',
+          action: `project.action_${i}`,
+          method: 'POST',
+          path: `/api/projects/p${i}`,
+          ip: '203.0.113.5',
+          authMethod: 'session',
+          actor: { userId: 'usr_1', email: 'alice@example.com', role: 'admin', teamId: 'team_default', kind: 'session' },
+          status: 200,
+          detail: i === 0
+            ? { msg: 'AKIAIOSFODNN7EXAMPLE ' + 'sk_live' + '_TESTKEY00000000000000000 postgres://admin:TopSecret99@db/prod' }
+            : { index: i }
+        });
+        if (i === 5) logger.flushSync(); // 6 registros (~2.4 KB > 1800 B) -> rotación #1 + ancla audit.log_rotated
+      }
+      logger.flushSync(); // 3 registros adicionales (~1.2 KB < 1800 B) en audit.jsonl activo
+
+      // Verificar redacción de secretos y metadatos de actor
+      const queried = logger.query({ limit: 20, actor: 'alice@example.com', teamId: 'team_default' });
+      assert.strictEqual(queried.length, 9);
+      const allText = JSON.stringify(queried);
+      assert.ok(!allText.includes('AKIAIOSFODNN7EXAMPLE'), 'AWS key debe redactarse en auditLogger');
+      assert.ok(!allText.includes('sk_live' + '_TESTKEY00000000000000000'), 'Stripe key debe redactarse en auditLogger');
+      assert.ok(!allText.includes('TopSecret99'), 'Contraseña DB URI debe redactarse en auditLogger');
+
+      // Verificar cadena completa a través de la rotación (.1 + activa) y también solo activa (anchored)
+      assert.ok(fs.existsSync(path.join(auditTmp, 'audit.jsonl.1')), 'Debe haberse creado audit.jsonl.1 tras rotación');
+      const vFull = logger.verifyIntegrity({ includeRotated: true });
+      assert.strictEqual(vFull.valid, true, `Cadena completa debe ser válida: ${JSON.stringify(vFull)}`);
+      assert.strictEqual(vFull.checkedCount, 10, 'Debe incluir los 9 eventos + 1 registro ancla de rotación');
+      assert.strictEqual(vFull.anchored, false, 'Con .1 incluido la cadena arranca desde GENESIS_HASH');
+
+      const vActiveOnly = logger.verifyIntegrity({ includeRotated: false });
+      assert.strictEqual(vActiveOnly.valid, true);
+      assert.strictEqual(vActiveOnly.anchored, true, 'El archivo rotado activo debe reconocerse como anclado');
+
+      // Prueba de manipulación #1: alterar 1 carácter en audit.jsonl
+      const activeFile = path.join(auditTmp, 'audit.jsonl');
+      const originalActive = fs.readFileSync(activeFile, 'utf8');
+      const tampered1 = originalActive.replace('project.action_7', 'project.action_XX');
+      assert.notStrictEqual(tampered1, originalActive);
+      fs.writeFileSync(activeFile, tampered1, 'utf8');
+      const vTamper1 = logger.verifyIntegrity({ includeRotated: true });
+      assert.strictEqual(vTamper1.valid, false, 'Alterar 1 campo debe romper verifyIntegrity()');
+      assert.strictEqual(vTamper1.reason, 'ENTRY_HASH_TAMPERED');
+
+      // Prueba de manipulación #2: borrar una línea intermedia
+      const activeLines = originalActive.trim().split('\n');
+      activeLines.splice(2, 1);
+      fs.writeFileSync(activeFile, activeLines.join('\n') + '\n', 'utf8');
+      const vTamper2 = logger.verifyIntegrity({ includeRotated: true });
+      assert.strictEqual(vTamper2.valid, false, 'Borrar una línea debe detectarse como discontinuidad');
+      assert.ok(String(vTamper2.reason).includes('SEQ_DISCONTINUITY'));
+
+      // Restaurar -> vuelve a ser válido
+      fs.writeFileSync(activeFile, originalActive, 'utf8');
+      assert.strictEqual(logger.verifyIntegrity({ includeRotated: true }).valid, true);
+    } finally {
+      fs.rmSync(auditTmp, { recursive: true, force: true });
+    }
+    console.log('  ✓ S3: Audit log SHA-256 hash-chained (rotación anclada, actor, redacción y detección de tampering)');
+  }
+
+  // S4: Pre-Deploy Secret Leak Scanner (AWS, Stripe, GitHub, GitLab, OpenAI, GCP, Slack, PEM, DB URI, JWT, entropy)
+  {
+    const sampleAws = 'AKIAIOSFODNN7EXAMPLE';
+    const sampleStripe = 'sk_live' + '_TESTKEY000000000000000000000';
+    const sampleGh = 'ghp_1234567890abcdefABCDEF1234567890ab';
+    const sampleOpenAi = 'sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz123456';
+    const sampleGcp = 'AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe';
+    const sampleJwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwicm9sZSI6ImFkbWluIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+    const sampleCustom = 'Qz9!kL2#mN8$pR4%vW7&yB3*xD6^fH1@';
+
+    const report = secretScanner.scanDeploymentPayload({
+      envVars: {
+        AWS_ACCESS_KEY_ID: sampleAws,
+        STRIPE_SECRET_KEY: sampleStripe,
+        GITHUB_TOKEN: sampleGh,
+        OPENAI_API_KEY: sampleOpenAi,
+        GOOGLE_API_KEY: sampleGcp,
+        AUTH_JWT: sampleJwt,
+        CUSTOM_SIGNING_SECRET: sampleCustom,
+        SAFE_VAULT_REF: '${vault.STRIPE_SECRET_KEY}',
+        NODE_ENV: 'production',
+        APP_URL: 'https://app.example.com/health',
+        PLACEHOLDER_DB: 'postgres://user:changeme@localhost:5432/app'
+      },
+      composeYaml: [
+        'services:',
+        '  api:',
+        '    environment:',
+        '      DATABASE_URL: postgres://prod:UltraHardPass88!@db.internal:5432/app',
+        '      SLACK_BOT_TOKEN: xoxb-0000000fake-0000000fake00-TestOnlyNotARealSlackToken',
+        '      PRIVATE_KEY: |',
+        '        -----BEGIN RSA PRIVATE KEY-----',
+        '        MIIEowIBAAKCAQEA...',
+        '        -----END RSA PRIVATE KEY-----'
+      ].join('\n')
+    }, { mode: 'block' });
+
+    assert.strictEqual(report.clean, false);
+    assert.strictEqual(report.blocked, true);
+    const ruleIds = new Set(report.findings.map((f) => f.ruleId));
+    for (const expected of [
+      'aws-access-key-id',
+      'stripe-live-key',
+      'github-token',
+      'openai-anthropic-key',
+      'gcp-api-key',
+      'jwt-token',
+      'high-entropy-secret',
+      'db-uri-credentials',
+      'slack-token',
+      'private-key-pem'
+    ]) {
+      assert.ok(ruleIds.has(expected), `secretScanner debe detectar ${expected}`);
+    }
+
+    // Jamás debe reflejar secretos en claro en el reporte ni disparar falsos positivos en ${vault.*}/placeholders
+    const reportJson = JSON.stringify(report);
+    for (const raw of [sampleAws, sampleStripe, sampleGh, sampleOpenAi, sampleGcp, sampleJwt, sampleCustom, 'UltraHardPass88!']) {
+      assert.ok(!reportJson.includes(raw), `El reporte de secretScanner jamás puede incluir el secreto en claro: ${raw.slice(0, 6)}`);
+    }
+    assert.ok(!report.findings.some((f) => f.key === 'SAFE_VAULT_REF' || f.key === 'NODE_ENV' || f.key === 'APP_URL' || f.key === 'PLACEHOLDER_DB'));
+
+    // assertCleanForDeploy lanza HTTP 422 SECRET_LEAK_DETECTED
+    assert.throws(
+      () => secretScanner.assertCleanForDeploy({ envVars: { STRIPE: sampleStripe } }),
+      (err) => err.status === 422 && err.code === 'SECRET_LEAK_DETECTED'
+    );
+
+    // Payload limpio pasa sin falsos positivos
+    const cleanRep = secretScanner.assertCleanForDeploy({
+      envVars: { NODE_ENV: 'production', STRIPE_KEY: '${vault.STRIPE_KEY}', PORT: '3000' }
+    });
+    assert.strictEqual(cleanRep.clean, true);
+    assert.strictEqual(cleanRep.blocked, false);
+    console.log('  ✓ S4: Pre-deploy secretScanner detecta 10+ familias, enmascara salida y tiene 0 falsos positivos en ${vault.*}');
+  }
 
   console.log('✅ Security Hardening Suite PASSED!\n');
 }

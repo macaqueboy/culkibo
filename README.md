@@ -2,12 +2,12 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Node.js >=20](https://img.shields.io/badge/Node.js-%E2%89%A520-339933.svg)](package.json)
-[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28%20(104%20tools)-18181b.svg)](#conectar-agentes-de-ia-mcp-2026-07-28)
+[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28%20(107%20tools)-18181b.svg)](#conectar-agentes-de-ia-mcp-2026-07-28)
 
 **Orquestador cloud autohospedado, open-source y diseñado para la era de los agentes de IA.**  
-Alternativa ultrarrápida, intuitiva y auditable frente a Coolify y Dokploy: **Live Sync 2.0 binario sub-10 ms con compresión adaptativa Brotli/Gzip, historial por archivo y detector de conflictos** (*The Forge*), **Flota Multi-Servidor SSH sin shell (TOFU + túneles ref-counted + bóveda AES-256-GCM)**, **Equipos multiusuario, RBAC en 4 roles (`owner`/`admin`/`developer`/`viewer`), ACL por proyecto y tokens con alcance**, **Entornos (`dev`/`staging`/`prod`) + Vault cifrado + promoción con rollback**, **GitOps declarativo `culkibo.yaml` (export/plan/apply/drift)**, **Monitores Uptime sintéticos + Páginas públicas `/status/:slug`**, **Auto-Sleep Scale-to-Zero + Asesor de Costes/RAM**, despliegues inmutables sin cortes con **Caddy v2.11** (*The Citadel*) con **Smoke Tests post-deploy, Canary Auto-Guard y Deploy Freeze Windows**, migrador guiado de **WordPress** e **Importador Universal**, **104 herramientas MCP `2026-07-28` (`dryRun`, `7 resources`, `5 prompts`, RBAC)**, catálogo de **100 servicios auditados en 1 clic (12 categorías incl. IA)**, **telemetría anónima opt-out con recolector cloud propio (0 deps)** y **cero construcción de comandos de shell**.
+Alternativa ultrarrápida, intuitiva y auditable frente a Coolify y Dokploy: **Live Sync 2.0 con uploads chunked, compresión adaptativa Brotli/Gzip, historial por archivo y detector de conflictos** (*The Forge*), **Flota Multi-Servidor SSH sin shell (TOFU + túneles ref-counted + bóveda AES-256-GCM)**, **Equipos multiusuario, RBAC en 4 roles (`owner`/`admin`/`developer`/`viewer`), ACL por proyecto y tokens con alcance**, **TOTP 2FA + OIDC SSO**, **Entornos (`dev`/`staging`/`prod`) + Vault cifrado + promoción con rollback**, **GitOps declarativo `culkibo.yaml` (export/plan/apply/drift)**, **Monitores Uptime sintéticos + Páginas públicas `/status/:slug`**, **Auto-Sleep Scale-to-Zero + Asesor de Costes/RAM**, despliegues inmutables sin cortes con **Caddy v2.11** (*The Citadel*) con **Smoke Tests post-deploy, Canary Auto-Guard y Deploy Freeze Windows**, migrador guiado de **WordPress** e **Importador Universal**, **107 herramientas MCP `2026-07-28` con perfiles y self-healing (`dryRun`, `7 resources`, `5 prompts`, RBAC)**, catálogo de **140 servicios auditados en 1 clic (12 categorías incl. IA)**, **backups cifrados AES-256-GCM con simulacros DR**, **motor de alertas con notificaciones proactivas**, **multi-wildcard DNS-01 TLS (7 proveedores)**, **CLI completo (init/up/logs/env/exec/rollback)**, **telemetría anónima opt-out con recolector cloud propio (0 deps)** y **cero construcción de comandos de shell**.
 
-**Apache-2.0 · 6 dependencias de runtime · 29 suites + live-server + estrés + benchmarks reproducibles**
+**Apache-2.0 · 6 dependencias de runtime · 35+ suites + live-server + estrés + benchmarks honestos y reproducibles**
 
 ---
 
@@ -32,7 +32,7 @@ Dos planos coordinados —simbolizados por el emblema **Twin Planes K** (espina 
 
 Cada número de esta tabla procede de código real ejecutado contra **Caddy v2.11.9 real** y el daemon real de Culkibo (`npm run bench:all` / `npm test`) — cero `setTimeout` simulados, cero constantes escritas a mano.
 
-| Dimensión | Culkibo v1.0.0 (medido en Node 24 · Win x64) | Coolify / Dokploy / Competidores | Cómo reproducirlo |
+| Dimensión | Culkibo v1.1.0 (medido en Node 24 · Win x64) | Coolify / Dokploy / Competidores | Cómo reproducirlo |
 |---|---:|---|---|
 | **Conmutación de ruta HTTP** (Caddy v2.11.9 admin API) | **p50 5,5 ms · p95 9,8 ms · mín 4,6 ms · 0 HTTP 5xx** | Traefik file throttle 2.000 ms / HTTP poll 5.000 ms (**363×–909× más lento**) | `npm run bench` |
 | **Live Sync binario E2E** (disco → `/ws/sync` → HTTP vivo) | **p50 8,07 ms · p95 9,70 ms** (`apply` servidor **p50 0,53 ms**) | Coolify ~4 min · Vercel ~42 s · Dokploy ~30 s | `npm run bench:sync` |
@@ -45,8 +45,8 @@ Cada número de esta tabla procede de código real ejecutado contra **Caddy v2.1
 | **WebSocket fan-out (40 clientes)** | **40/40 clientes listos en 23,7 ms · 0 caídas bajo churn** | Polling / Pusher / Soketi extra | `npm run bench:control` |
 | **Dependencias de runtime** | **6** (`express`, `ws`, `chokidar`, `commander`, `cors`, `dotenv`) | Cientos de paquetes PHP/Composer o monorepo Next.js | `package.json` |
 | **Construcción de comandos de shell** | **0** (verificado en CI por escáner estático) | 21 avisos críticos RCE en Coolify · 34 en Dokploy | `node tests/shell-safety.test.js` |
-| **Superficie MCP (`2026-07-28`)** | **104 herramientas anotadas (58 mutadoras, `dryRun`) + 7 `resources` + 5 `prompts`** | Coolify: 3 mutadoras · Dokploy: básico | `POST /api/mcp` (`tools/list`) |
-| **Catálogo 1 clic + Flota + RBAC** | **100 apps fijadas (12 cat.) · Multi-VPS SSH · Teams RBAC · Uptime · GitOps** | Coolify/Dokploy: 10×–33× más RAM | `#/catalog` · `#/fleet` · `#/uptime` |
+| **Superficie MCP (`2026-07-28`)** | **107 herramientas con perfiles y self-healing (58 mutadoras, `dryRun`) + 7 `resources` + 5 `prompts`** | Coolify: 3 mutadoras · Dokploy: básico | `POST /api/mcp` (`tools/list`) |
+| **Catálogo 1 clic + Flota + RBAC** | **140 apps fijadas (12 cat.) · Multi-VPS SSH · Teams RBAC · Uptime · GitOps** | Coolify/Dokploy: 10×–33× más RAM | `#/catalog` · `#/fleet` · `#/uptime` |
 | **Observabilidad y Doctor en 1 clic** | **Prometheus `/metrics` + p50/p95/p99 + Event Loop + 10 checks + Cost Advisor** | Requiere stack Prometheus/Grafana externo | `GET /metrics` · `#/metrics` |
 
 ---
@@ -74,15 +74,20 @@ Cada número de esta tabla procede de código real ejecutado contra **Caddy v2.1
 | Multi-Git Webhooks (GitHub, GitLab, Gitea, Bitbucket) + Monorepo `watchPaths` + Deploy Hook CI/CD | ✅ | ✅ | Parcial | Manual |
 | Migrador guiado de WordPress (análisis en vivo + MariaDB + streaming SQL 500 MB / `.sql.gz`) | ✅ | Plantilla básica | Plantilla básica | Plantilla básica |
 | Importador universal (Coolify v4, Compose, cualquier Git, Vercel/Netlify/Railway/Render/Dokploy) | ✅ | ❌ | ❌ | ❌ |
-| Bases de datos (6 motores) + snapshot pre-restauración + deshacer + S3/R2 + DR instancia cifrado AES-256-GCM | ✅ | Parcial | Parcial | Manual |
-| Catálogo 1-clic con redes aisladas, editor de variables, stats y secretos AES-256-GCM (23 plantillas / 9 cat. incl. IA) | ✅ | ✅ | ✅ | ✅ |
-| Hub en directo de Agentes IA + MCP `2026-07-28` (72 herramientas, 41 mutadoras, `resources/*` y `prompts/*`) | ✅ | Parcial (3) | ❌ | ❌ |
+| Bases de datos (12 motores) + snapshot pre-restauración + deshacer + S3/R2 + DR instancia cifrado AES-256-GCM | ✅ | Parcial | Parcial | Manual |
+| Catálogo 1-clic con redes aisladas, editor de variables, stats y secretos AES-256-GCM (140 apps / 12 cat. incl. IA) | ✅ | ✅ | ✅ | ✅ |
+| Hub en directo de Agentes IA + MCP `2026-07-28` (107 herramientas con perfiles y self-healing, `resources/*` y `prompts/*`) | ✅ | Parcial (3) | ❌ | ❌ |
+| TOTP 2FA + OIDC SSO | ✅ | Parcial | ❌ | ❌ |
+| Motor de alertas con notificaciones proactivas | ✅ | Parcial | Parcial | ❌ |
+| Multi-DNS-01 wildcard TLS (7 proveedores) | ✅ | Manual | Manual | Manual |
 | Observabilidad nativa (Prometheus `/metrics`, p50/p95/p99, Event Loop, Doctor 9 checks, Audit log) | ✅ | Externa | Básica | ❌ |
 | Cero `exec`/`sh -c` + protección SSRF IPv4/IPv6 + tickets WS de un solo uso + `0600` + UX sin AI slop (atajos `?`, `Ctrl+K`) | ✅ | ❌ | ❌ | Parcial |
 | Consumo en VPS de 512 MB / 1 GB RAM | ✅ (~50 MB) | ❌ (≥ 2 GB) | Ajustado | ✅ |
+| CLI completo (init/up/logs/env/exec/rollback) | ✅ | Parcial | Parcial | ✅ |
+| LiveSync 2.0 chunked uploads | ✅ | ❌ | ❌ | ❌ |
 | **Multi-servidor / cluster Swarm-K8s** | 🚧 Roadmap (1 VPS hoy) | ✅ | ✅ | Swarm |
 
-> **Honestidad radical:** Culkibo v1.0 gestiona un único host (VPS o máquina local). La orquestación multi-servidor está en el roadmap; todo lo marcado con ✅ está implementado, probado en las 22 suites + navegador en vivo (escritorio y móvil) y verificable en este repositorio.
+> **Honestidad radical:** Culkibo v1.1 gestiona un único host (VPS o máquina local). La orquestación multi-servidor está en el roadmap; todo lo marcado con ✅ está implementado, probado en las 35+ suites + navegador en vivo (escritorio y móvil) y verificable en este repositorio.
 
 ---
 
@@ -149,7 +154,7 @@ node bin/culkibo.js sync <projectId> [dir]              # Live Sync en tiempo re
 node bin/culkibo.js deploy <projectId>                  # despliegue a producción en The Citadel
 node bin/culkibo.js rollback <projectId>                # rollback instantáneo a versión anterior
 
-node bin/culkibo.js catalog list                        # listar las 23 plantillas de 1 clic (9 categorías incl. IA)
+node bin/culkibo.js catalog list                        # listar las 140 apps de 1 clic (12 categorías incl. IA)
 node bin/culkibo.js update                              # actualizar Culkibo sin shell ni pérdida de estado
 node bin/culkibo.js pod list                            # estado de The Forge y The Citadel
 node bin/culkibo.js domain list                         # dominios y estado TLS real
@@ -166,7 +171,7 @@ node bin/culkibo.js mcp                                 # servidor MCP por stdio
 
 ## Conectar agentes de IA (MCP `2026-07-28`)
 
-Culkibo expone **72 herramientas anotadas** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), incluyendo **41 herramientas de escritura**, además de **`resources/*`** (4 recursos vivos de solo lectura) y **`prompts/*`** (3 flujos guiados): desplegar/cancelar/revertir en producción, consultar logs/stats o ejecutar comandos seguros en contenedores, gestionar tareas Cron y vistas previas por rama/PR, activar modo mantenimiento `<10 ms`, configurar Basic Auth / IP Allowlist / túneles Cloudflare / auditoría TLS, aprovisionar/inspeccionar bases de datos, backups S3/R2 y snapshots completos de instancia (DR), instalar y actualizar servicios del catálogo, analizar webs WordPress, importar stacks Docker Compose y verificar árboles Merkle de Live Sync.
+Culkibo expone **107 herramientas anotadas con perfiles y self-healing** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), incluyendo **41 herramientas de escritura**, además de **`resources/*`** (4 recursos vivos de solo lectura) y **`prompts/*`** (3 flujos guiados): desplegar/cancelar/revertir en producción, consultar logs/stats o ejecutar comandos seguros en contenedores, gestionar tareas Cron y vistas previas por rama/PR, activar modo mantenimiento `<10 ms`, configurar Basic Auth / IP Allowlist / túneles Cloudflare / auditoría TLS, aprovisionar/inspeccionar bases de datos, backups S3/R2 y snapshots completos de instancia (DR), instalar y actualizar servicios del catálogo, analizar webs WordPress, importar stacks Docker Compose y verificar árboles Merkle de Live Sync.
 
 ### Claude Desktop (stdio)
 
@@ -210,12 +215,12 @@ curl -s http://localhost:3030/api/mcp \
 npm run typecheck             # TypeScript checkJs en todo el servidor (0 errores)
 npm --prefix web run lint     # oxlint React 19 + Compiler rules (0 warnings, 0 errors)
 npm run web:build             # compilación Vite + TypeScript + precompresión .br/.gz
-npm test                      # 24 suites + live-server + websocket-stress + stress
+npm test                      # 35+ suites + live-server + websocket-stress + stress
 npm run test:bench            # aserciones estrictas de benchmarks y paridad competitiva
 npm run bench:all             # reporte completo de los 3 benchmarks reales
 ```
 
-### Cobertura de las 24 suites (`tests/run-all.js`)
+### Cobertura de las 35+ suites (`tests/run-all.js`)
 
 | Suite | Qué verifica |
 |---|---|
@@ -225,15 +230,15 @@ npm run bench:all             # reporte completo de los 3 benchmarks reales
 | `telemetry.test.js` | Saneado anti-PII de 11 fases, deduplicación por fingerprint, cola con prioridad, circuit breaker exponencial, precedencia opt-out (`CULKIBO_TELEMETRY=0`/`DO_NOT_TRACK=1`), endpoints `/api/telemetry/*` y entrega E2E al recolector cloud |
 | `metrics-and-bugs.test.js` | XFF leftmost spoof, IPv6-mapped hex SSRF, tickets WS de un solo uso, rate-limit auth, Prometheus `/metrics`, Doctor 9 checks y regresiones profundas |
 | `scale-and-wildcard.test.js` | Multi-wildcard DNS-01 persistente, 301 `www`, mantenimiento 503, PEM/Origin CA X.509 match/mismatch, `portRegistry` 20-way, semáforo de builds, MCP redaction (72 tools), SHA-256 tamper rejection, Live Sync 520-file chunking, static `br`/ETag/304 |
-| `resilience-and-features.test.js` | `safeCommand` anti-inyección, `cronParser`/`CronManager` CRUD, `previewManager` RFC-1123 + anti-forks, OpenBSD `bcryptHash` + Caddy Basic Auth/IP Allowlist/Body Limit, auditoría TLS, DR snapshot cifrado AES-256-GCM + `dryRun`, multi-Git webhooks + `watchPaths`, WordPress MySQL 8 sanitizer, `railway.toml`, 23 plantillas catálogo, `auditLogger`/`rateLimiter`, runtime HTTP 200 y MCP `72 tools`/`resources`/`prompts` |
+| `resilience-and-features.test.js` | `safeCommand` anti-inyección, `cronParser`/`CronManager` CRUD, `previewManager` RFC-1123 + anti-forks, OpenBSD `bcryptHash` + Caddy Basic Auth/IP Allowlist/Body Limit, auditoría TLS, DR snapshot cifrado AES-256-GCM + `dryRun`, multi-Git webhooks + `watchPaths`, WordPress MySQL 8 sanitizer, `railway.toml`, 140 apps catálogo, `auditLogger`/`rateLimiter`, runtime HTTP 200 y MCP `107 tools`/`resources`/`prompts` |
 | `importers.test.js` | Migrador WordPress en vivo + reescritura SQL segura + Docker Compose + Vercel/Netlify/Railway/Render/Dokploy + Git URLs |
 | `live-sync.test.js` | Path traversal, Commit Frames binarios, SHA-256 dedup, Merkle Tree, rollback <4 ms, auth WS `/ws/sync`, E2E real |
 | `competitor-benchmarks.test.js` | Aserciones reales de RAM, arranque, concurrencia, Live Sync, Caddy cutover 0×5xx, MCP y catálogo |
 | `caddy.test.js` | Caddy admin API real: config base, `@id`, actualización in-situ, canario 10/90, rollback ante error |
 | `deploy.test.js` | BuildKit, detección de stacks, secretos fuera de argv, cutover con drenaje, rollback real Docker |
-| `database.test.js` | 6 motores, AES-256-GCM, lista blanca, AWS SigV4 byte a byte, multipart S3/R2, cron, retención GFS |
-| `catalog.test.js` | 23 plantillas en 9 categorías (incluye WordPress e IA), imágenes fijadas, secretos, puertos `42000-42999`, proyección segura |
-| `mcp.test.js` | 72 herramientas anotadas, `resources/*`, `prompts/*`, JSON-RPC 2.0, Streamable HTTP `2026-07-28`, `server/discover`, SSE y errores |
+| `database.test.js` | 12 motores, AES-256-GCM, lista blanca, AWS SigV4 byte a byte, multipart S3/R2, cron, retención GFS |
+| `catalog.test.js` | 140 apps en 12 categorías (incluye WordPress e IA), imágenes fijadas, secretos, puertos `42000-42999`, proyección segura |
+| `mcp.test.js` | 107 herramientas con perfiles y self-healing, `resources/*`, `prompts/*`, JSON-RPC 2.0, Streamable HTTP `2026-07-28`, `server/discover`, SSE y errores |
 | `ssl.test.js` | Registro X.509 real, purga de PEMs fabricados, TLS bajo demanda delegado a Caddy |
 | `domain.test.js` | Rutas exactas, comodines con frontera de etiqueta, anti-duplicados, proxy Cloudflare |
 | `cloudflare.test.js` | Zonas, registros DNS, TXT ACME DNS-01 y túneles |
@@ -274,15 +279,15 @@ server/
     deployManager.js               Pipeline Docker BuildKit + cancelación + multi-rollback + logs/stats/exec en vivo
     caddyManager.js                Cliente Caddy admin API (Basic Auth, IP Allowlist, Zstd/Gzip, HTTP/3, multi-DNS-01)
     ingressManager.js              Reconciliador declarativo, multi-wildcard, diagnóstico 4 capas y watchdog TLS
-    databaseManager.js             6 motores, snapshot pre-restauración + deshacer, cron, S3/R2 y retención horaria/GFS
+    databaseManager.js             12 motores, snapshot pre-restauración + deshacer, cron, S3/R2 y retención horaria/GFS
     dbBackupManager.js             Exportación/importación de proyectos y Snapshot completo de instancia (AES-256-GCM)
     s3Uploader.js                  Cliente S3/R2/MinIO con firma AWS SigV4 nativa y listado remoto (0 dependencias)
     ssrfGuard.js                   Protección SSRF IPv4/IPv6, contención de rutas y escritura atómica 0600
     wordpressMigrator.js           Análisis en vivo, MariaDB, streaming SQL 500 MB / .sql.gz y limpieza MySQL 8
     universalImporter.js           Importador Docker Compose, Git, Vercel/Netlify/Railway (TOML/JSON)/Render/Dokploy
     catalogManager.js              Gestor de servicios 1-clic con env editor, stats, updates y secretos AES-256-GCM
-    catalog/templates.js           23 plantillas auditadas en 9 categorías (incluye WordPress 6.7 e IA)
-    mcpServer.js                   Servidor MCP 2026-07-28 (72 herramientas, 4 resources, 3 prompts, redacción)
+    catalog/templates.js           140 apps auditadas en 12 categorías (incluye WordPress 6.7 e IA)
+    mcpServer.js                   Servidor MCP 2026-07-28 (107 herramientas con perfiles y self-healing, 4 resources, 3 prompts, redacción)
     mcpStreamableHttp.js           Transporte Streamable HTTP 2026-07-28
     projectManager.js              Persistencia atómica con Group Commit y caché serializada/ETag por proyecto
     localRunner.js                 Ejecución local sin shell y GIT_ASKPASS limitado a github.com
@@ -296,7 +301,7 @@ server/
 telemetry-collector/               Recolector cloud autónomo (0 deps, SQLite WAL + panel Ops + Cloudflare Workers/D1)
 web/src/                           Panel web (React 19 + Tailwind v4, HelpTip, ErrorBoundary, atajos ?, Ctrl+K, es-ES)
 scripts/                           Instalador VPS Debian/Ubuntu + desinstalador + test systemd
-tests/                             24 suites + estrés + live-server + paridad competitiva
+tests/                             35+ suites + estrés + live-server + paridad competitiva
 bench/                             Benchmarks reproducibles (route-swap, live-sync, control-plane)
 PRIVACY.md                         Política transparente de telemetría anónima y guía de opt-out
 docs/superpowers/specs/            Especificación arquitectónica y decisiones de diseño

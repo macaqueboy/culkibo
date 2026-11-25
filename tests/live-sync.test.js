@@ -486,6 +486,165 @@ async function testLiveSync() {
     assert.strictEqual(read2.kind, 'unchanged', 'Caché stat (mtimeMs, size, sha256) debe evitar lectura duplicada');
     console.log('  ✓ Diff LCS unificado, .culkiboignore y caché stat anti-doble-disparo verificados');
 
+    // 11. Live Sync 2.0 Edge Cases: Dir rename/delete storm, post-ACK reconcile (cero hash poisoning),
+    //     reconcileFull(null) extra cleanup, atomic win32 write, case-only rename y carga troceada >10 MiB SHA-256
+    const edgeSrc = path.join(tmpRoot, 'edge-src');
+    const edgeDst = path.join(tmpRoot, 'edge-dst');
+    fs.mkdirSync(path.join(edgeSrc, 'old-dir'), { recursive: true });
+    fs.mkdirSync(edgeDst, { recursive: true });
+    fs.writeFileSync(path.join(edgeSrc, 'old-dir', 'a.js'), 'export const a = 1;\n', 'utf8');
+    fs.writeFileSync(path.join(edgeSrc, 'old-dir', 'b.js'), 'export const b = 2;\n', 'utf8');
+    fs.writeFileSync(path.join(edgeSrc, 'App.tsx'), 'export default function App(){return 1;}\n', 'utf8');
+
+    // Servidor WS local que expone protocolo completo Live Sync 2.0 + chunkedUploadSupported
+    const { WebSocketServer } = require('ws');
+    const edgeProjId = `proj_edge_${Date.now()}`;
+    liveSyncEngine.setTargetDir(edgeProjId, edgeDst);
+    const edgeWss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    let failNextFrame = false;
+    edgeWss.on('connection', (ws) => {
+      ws.on('message', (raw, isBinary) => {
+        try {
+          const msg = isBinary ? decodeBinarySyncFrame(Buffer.isBuffer(raw) ? raw : Buffer.from(raw)) : JSON.parse(raw.toString());
+          if (msg.type === 'hello') {
+            const ver = liveSyncEngine.verifySync(edgeProjId, { clientDigest: msg.clientDigest, targetDir: edgeDst });
+            ws.send(JSON.stringify({
+              type: 'hello_ack',
+              clientId: 'edge_c1',
+              protocolVersion: 2,
+              codecs: ['br', 'gzip'],
+              binaryFramesSupported: true,
+              chunkedUploadSupported: true,
+              lastSeq: 0,
+              serverDigest: ver.serverDigest,
+              inSync: ver.inSync
+            }));
+          } else if (msg.type === 'verify') {
+            const ver = liveSyncEngine.verifySync(edgeProjId, { clientFiles: msg.clientFiles, targetDir: edgeDst });
+            ws.send(JSON.stringify({ type: 'verify_ack', ...ver }));
+          } else if (msg.type === 'frame') {
+            if (failNextFrame) {
+              failNextFrame = false;
+              ws.send(JSON.stringify({ type: 'error', seq: msg.seq, code: 'INJECTED_DROP', error: 'Fallo simulado de red' }));
+              return;
+            }
+            const res = liveSyncEngine.applyCommitFrame(edgeProjId, msg, { targetDir: edgeDst });
+            ws.send(JSON.stringify({ type: 'frame_ack', ...res }));
+          } else if (String(msg.type || '').startsWith('chunk_')) {
+            const ack = liveSyncEngine.handleChunkMessage(edgeProjId, msg, { targetDir: edgeDst });
+            ws.send(JSON.stringify(ack));
+          }
+        } catch (e) {
+          ws.send(JSON.stringify({ type: 'error', code: e.code || 'ERR', error: e.message }));
+        }
+      });
+    });
+    await new Promise((r) => edgeWss.once('listening', r));
+    const edgePort = /** @type {import('net').AddressInfo} */ (edgeWss.address()).port;
+
+    const edgeClient = new LiveSyncClient({
+      projectId: edgeProjId,
+      sourceDir: edgeSrc,
+      targetDir: edgeDst,
+      wsUrl: `ws://127.0.0.1:${edgePort}`,
+      autoWatch: false,
+      autoReconnect: false
+    });
+    try {
+      await edgeClient.start();
+      assert.strictEqual(edgeClient.chunkedUploadSupported, true);
+
+      // 11a. Post-ACK reconcile: si falla sendChunked a mitad de reconcileDelta, lastSentHashes NO se envenena
+      failNextFrame = true;
+      await assert.rejects(() => edgeClient.reconcileDelta(), /Fallo simulado/i);
+      assert.strictEqual(edgeClient.lastSentHashes.size, 0, 'lastSentHashes JAMÁS debe mutarse antes de ACK');
+
+      // Reintento limpio -> sincroniza todo y Merkle coincide
+      const recOk = await edgeClient.reconcileDelta();
+      assert.strictEqual(recOk.reconciled, true);
+      assert.strictEqual(edgeClient.lastSentHashes.size, 3);
+      assert.strictEqual(computeMerkleTree(edgeSrc).rootDigest, computeMerkleTree(edgeDst).rootDigest);
+
+      // 11b. Tormenta de renombre de directorio (`old-dir` -> `new-dir`):
+      // Simular eventos fs.watch de Windows que sólo reportan la carpeta vieja y la nueva
+      fs.renameSync(path.join(edgeSrc, 'old-dir'), path.join(edgeSrc, 'new-dir'));
+      edgeClient.pending.set('old-dir', 'upsert');
+      edgeClient.pending.set('new-dir', 'upsert');
+      await edgeClient.flushNow();
+      assert.strictEqual(fs.existsSync(path.join(edgeDst, 'old-dir')), false, 'El directorio antiguo debe eliminarse en destino');
+      assert.strictEqual(fs.readFileSync(path.join(edgeDst, 'new-dir', 'a.js'), 'utf8'), 'export const a = 1;\n', 'Los hijos del directorio renombrado deben sincronizarse');
+      assert.strictEqual(fs.readFileSync(path.join(edgeDst, 'new-dir', 'b.js'), 'utf8'), 'export const b = 2;\n');
+      assert.strictEqual(edgeClient.lastSentHashes.has('old-dir/a.js'), false, 'lastSentHashes debe purgar hijos del directorio eliminado');
+      assert.strictEqual(edgeClient.lastSentHashes.has('new-dir/a.js'), true);
+
+      // 11c. Renombre sólo de capitalización (`App.tsx` -> `app.tsx`) con contenido idéntico:
+      // El engine debe ejecutar delete antes del upsert e invalidar stat en NTFS/APFS
+      fs.renameSync(path.join(edgeSrc, 'App.tsx'), path.join(edgeSrc, 'app.tsx'));
+      edgeClient.pending.set('app.tsx', 'upsert');
+      await edgeClient.flushNow();
+      const dstNames = fs.readdirSync(edgeDst);
+      assert.ok(dstNames.includes('app.tsx'), `Destino debe tener exactamente "app.tsx" (encontrados: ${dstNames.join(', ')})`);
+      assert.strictEqual(dstNames.includes('App.tsx'), false, 'La capitalización antigua "App.tsx" no debe quedar huérfana');
+      assert.strictEqual(edgeClient.lastSentHashes.has('App.tsx'), false);
+      assert.strictEqual(edgeClient.lastSentHashes.has('app.tsx'), true);
+
+      // 11d. Fallback reconcileFull(null) limpia ficheros eliminados localmente
+      fs.unlinkSync(path.join(edgeSrc, 'new-dir', 'b.js'));
+      const origVerify = edgeClient.verifyWithServer.bind(edgeClient);
+      edgeClient.verifyWithServer = () => Promise.reject(new Error('legacy server no verify'));
+      try {
+        await edgeClient.reconcileFull(null);
+      } finally {
+        edgeClient.verifyWithServer = origVerify;
+      }
+      assert.strictEqual(fs.existsSync(path.join(edgeDst, 'new-dir', 'b.js')), false, 'reconcileFull(null) debe eliminar huérfanos rastreados');
+
+      // 11e. Carga troceada >10 MiB (11 MiB binarios) end-to-end por WS con verificación SHA-256
+      const bigBytes = 11 * 1024 * 1024;
+      const bigBin = Buffer.alloc(bigBytes);
+      // Llenar patrón binario no-trivial con bytes nulos para validar integridad binaria exacta
+      for (let off = 0; off < bigBytes; off += 4096) {
+        bigBin.writeUInt32BE(off, off);
+      }
+      const bigBinPath = path.join(edgeSrc, 'assets', 'model-11mb.bin');
+      fs.mkdirSync(path.dirname(bigBinPath), { recursive: true });
+      fs.writeFileSync(bigBinPath, bigBin);
+      const expectedBigSha = sha256(bigBin);
+
+      edgeClient.pending.set('assets/model-11mb.bin', 'upsert');
+      const chunkCommitAck = await edgeClient.flushNow();
+      assert.ok(chunkCommitAck && chunkCommitAck.chunked === true, 'Fichero >10 MiB debe transferirse vía carga troceada');
+      const dstBigPath = path.join(edgeDst, 'assets', 'model-11mb.bin');
+      assert.strictEqual(fs.existsSync(dstBigPath), true);
+      assert.strictEqual(fs.statSync(dstBigPath).size, bigBytes);
+      assert.strictEqual(liveSyncEngine.sha256FileSync(dstBigPath), expectedBigSha, 'SHA-256 del binario de 11 MiB en destino debe ser idéntico');
+      assert.strictEqual(computeMerkleTree(edgeSrc).rootDigest, computeMerkleTree(edgeDst).rootDigest, 'Merkle debe incluir ficheros >10 MiB y coincidir');
+
+      // 11f. Validaciones negativas de carga troceada (SHA-256 manipulado limpia temp, traversal bloqueado, out-of-order rechazado)
+      assert.throws(
+        () => liveSyncEngine.startChunkedUpload(edgeProjId, { path: '../escape.bin', totalBytes: 10, sha256: 'a'.repeat(64) }, { targetDir: edgeDst }),
+        (err) => err && err.code === 'PATH_TRAVERSAL_BLOCKED'
+      );
+      const badStart = liveSyncEngine.startChunkedUpload(edgeProjId, { path: 'tampered.bin', totalBytes: 5, sha256: '0'.repeat(64) }, { targetDir: edgeDst });
+      assert.throws(
+        () => liveSyncEngine.appendChunk(edgeProjId, { uploadId: badStart.uploadId, index: 2, data: Buffer.from('hello') }),
+        (err) => err && err.code === 'OUT_OF_ORDER_CHUNK'
+      );
+      liveSyncEngine.appendChunk(edgeProjId, { uploadId: badStart.uploadId, index: 0, data: Buffer.from('hello') });
+      assert.throws(
+        () => liveSyncEngine.commitChunkedUpload(edgeProjId, { uploadId: badStart.uploadId }, { targetDir: edgeDst }),
+        (err) => err && err.code === 'CHECKSUM_MISMATCH'
+      );
+      assert.strictEqual(fs.existsSync(path.join(edgeDst, 'tampered.bin')), false, 'Un checksum inválido jamás debe crear el fichero destino');
+      const leftoverTemps = fs.readdirSync(edgeDst).filter((f) => f.includes('.culkibo-sync-chunk-'));
+      assert.strictEqual(leftoverTemps.length, 0, 'Fallo de checksum debe eliminar el fichero temporal');
+      console.log('  ✓ Live Sync 2.0 edge cases (dir rename storm, post-ACK reconcile, case-only rename, orphan cleanup, 11 MiB chunked SHA-256 upload) verificados');
+    } finally {
+      await edgeClient.stop().catch(() => {});
+      await new Promise((r) => edgeWss.close(() => r(undefined)));
+      liveSyncEngine.resetSession(edgeProjId);
+    }
+
     // Limpiar sesiones de prueba
     liveSyncEngine.resetSession(projectId);
     liveSyncEngine.resetSession(wsProjectId);

@@ -75,6 +75,33 @@ function getAuthMod() {
 }
 
 /**
+ * Comprueba si una fecha coincide exactamente con una expresión cron de 5 campos.
+ * @param {string} expression
+ * @param {Date} date
+ * @returns {boolean}
+ */
+function cronMatchesDate(expression, date) {
+  const cp = getCronParser();
+  if (!cp || typeof cp.parseCron !== 'function') return false;
+  try {
+    const parsed = cp.parseCron(expression);
+    const mon = date.getMonth() + 1;
+    if (!parsed.month.has(mon)) return false;
+    const domMatch = parsed.dom.has(date.getDate());
+    const dowMatch = parsed.dow.has(date.getDay());
+    const dayOk = (!parsed.domWildcard && !parsed.dowWildcard)
+      ? (domMatch || dowMatch)
+      : (domMatch && dowMatch);
+    if (!dayOk) return false;
+    if (!parsed.hour.has(date.getHours())) return false;
+    if (!parsed.minute.has(date.getMinutes())) return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
  * Escapa texto para HTML evitando XSS.
  * @param {any} text
  * @returns {string}
@@ -1397,23 +1424,47 @@ class SleepAdvisor extends EventEmitter {
     return { available: true, containers, error: null };
   }
 
-  /** Evalúa inactividad de todos los proyectos con Auto-Sleep habilitado. */
-  async checkIdleProjects() {
+  /**
+   * Evalúa horarios cron (`schedule.sleepCron` / `schedule.wakeCron`) e inactividad
+   * de todos los proyectos con Auto-Sleep habilitado.
+   * @param {{ now?: number }} [opts]
+   */
+  async checkIdleProjects(opts = {}) {
     this._ensureLoaded();
-    const enabledPolicies = Array.from(this.policies.values()).filter((p) => p.enabled && !p.sleeping);
-    if (enabledPolicies.length === 0) return { checked: 0, slept: [] };
+    const now = Number.isFinite(Number(opts.now)) ? Number(opts.now) : Date.now();
+    const nowDate = new Date(now);
+    const allEnabled = Array.from(this.policies.values()).filter((p) => p.enabled);
+    if (allEnabled.length === 0) return { checked: 0, slept: [], woken: [] };
+
+    /** @type {string[]} */
+    const slept = [];
+    /** @type {string[]} */
+    const woken = [];
+
+    // 1. Evaluar horarios programados (`schedule.sleepCron` / `schedule.wakeCron`)
+    for (const pol of allEnabled) {
+      if (!pol.schedule || typeof pol.schedule !== 'object') continue;
+      if (pol.sleeping && pol.schedule.wakeCron && cronMatchesDate(pol.schedule.wakeCron, nowDate)) {
+        const res = await this.wakeProject(pol.projectId).catch(() => null);
+        if (res && res.woken) woken.push(pol.projectId);
+      } else if (!pol.sleeping && pol.schedule.sleepCron && cronMatchesDate(pol.schedule.sleepCron, nowDate)) {
+        const res = await this.sleepProject(pol.projectId, { reason: 'cron_schedule' }).catch(() => null);
+        if (res && res.slept) slept.push(pol.projectId);
+      }
+    }
+
+    // 2. Evaluar proyectos activos por umbral de inactividad NetIO/CPU
+    const awakePolicies = allEnabled.filter((p) => !p.sleeping && !slept.includes(p.projectId));
+    if (awakePolicies.length === 0) return { checked: allEnabled.length, slept, woken };
 
     const stats = await this.collectContainerStats();
     if (!stats.available) {
-      return { checked: 0, slept: [], skippedReason: stats.error || 'docker_unavailable' };
+      return { checked: allEnabled.length, slept, woken, skippedReason: stats.error || 'docker_unavailable' };
     }
     const statsByName = new Map(stats.containers.map((c) => [c.name, c]));
     const dm = this._getDep('deployManager');
-    const now = Date.now();
-    /** @type {string[]} */
-    const slept = [];
 
-    for (const pol of enabledPolicies) {
+    for (const pol of awakePolicies) {
       const current = dm?.store?.[pol.projectId]?.current;
       if (!current || !current.containerName || current.status === 'sleeping' || current.status === 'detenido') {
         continue;
@@ -1434,7 +1485,7 @@ class SleepAdvisor extends EventEmitter {
       }
     }
 
-    return { checked: enabledPolicies.length, slept };
+    return { checked: allEnabled.length, slept, woken };
   }
 
   // -------------------------------------------------------------------------
@@ -1687,9 +1738,12 @@ class SleepAdvisor extends EventEmitter {
         const severity = (item.oomKilled || effectiveMemPct >= 92) ? 'critical' : 'high';
         const recommendedMemoryMb = ceilTo64Mb(Math.max(item.memLimitMb * 1.5, item.memUsedMb * 1.6));
         const rec = {
+          id: `oom:${item.projectId || item.containerName}`,
           type: 'oom_risk',
+          category: 'oom_risk',
           severity,
           projectId: item.projectId,
+          projectName: item.name,
           target: item.name,
           containerName: item.containerName,
           title: `Riesgo OOM en ${item.name} (${effectiveMemPct}% de ${item.memLimitMb} MB)`,
@@ -1699,6 +1753,7 @@ class SleepAdvisor extends EventEmitter {
           reclaimableRamMb: 0,
           estimatedMonthlySavingsEur: 0,
           recommendedMemoryMb,
+          actionLabel: item.projectId ? `Subir a ${recommendedMemoryMb} MB` : null,
           action: { kind: 'resize_memory', projectId: item.projectId, recommendedMemoryMb }
         };
         oomRisks.push(rec);
@@ -1711,15 +1766,19 @@ class SleepAdvisor extends EventEmitter {
           const reclaimMb = Math.max(16, Math.round(stat.memUsedMb));
           const ramShareEur = totalMemMb > 0 ? Number(((reclaimMb / totalMemMb) * vpsMonthlyEur).toFixed(2)) : 0;
           const rec = {
+            id: `sleep:${meta.projectId}`,
             type: 'auto_sleep_candidate',
+            category: 'auto_sleep',
             severity: reclaimMb >= 256 ? 'high' : 'medium',
             projectId: meta.projectId,
+            projectName: item.name,
             target: item.name,
             containerName: item.containerName,
             title: `Activar Auto-Sleep en ${item.name} (${reclaimMb} MB recuperables)`,
             detail: `Tráfico casi nulo (${stat.netBytesPerMin} B/min, CPU ${stat.cpuPct}%). Activar auto-sleep en modo "stop" libera ~${reclaimMb} MB de RAM.`,
             reclaimableRamMb: reclaimMb,
             estimatedMonthlySavingsEur: ramShareEur,
+            actionLabel: 'Activar Auto-Sleep',
             action: { kind: 'enable_sleep', projectId: meta.projectId, suggestedMode: 'stop', suggestedIdleMinutes: 15 }
           };
           idleCandidates.push(rec);
@@ -1733,9 +1792,12 @@ class SleepAdvisor extends EventEmitter {
         if (recommendedMemoryMb < configuredLimitMb) {
           const headroomMb = Math.round(configuredLimitMb - recommendedMemoryMb);
           const rec = {
+            id: `oversized:${item.projectId || item.containerName}`,
             type: 'oversized_memory_cap',
+            category: 'oversized_ram',
             severity: 'low',
             projectId: item.projectId,
+            projectName: item.name,
             target: item.name,
             containerName: item.containerName,
             title: `Límite RAM sobredimensionado en ${item.name} (${Math.round(stat.memUsedMb)} / ${configuredLimitMb} MB)`,
@@ -1743,6 +1805,7 @@ class SleepAdvisor extends EventEmitter {
             reclaimableRamMb: headroomMb,
             estimatedMonthlySavingsEur: totalMemMb > 0 ? Number(((headroomMb / totalMemMb) * vpsMonthlyEur * 0.5).toFixed(2)) : 0,
             recommendedMemoryMb,
+            actionLabel: item.projectId ? `Ajustar a ${recommendedMemoryMb} MB` : null,
             action: { kind: 'resize_memory', projectId: item.projectId, recommendedMemoryMb }
           };
           oversizedCaps.push(rec);

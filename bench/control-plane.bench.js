@@ -2,9 +2,18 @@
  * Banco de pruebas: rendimiento del plano de control, arranque en frío,
  * huella de RAM/CPU en reposo, concurrencia HTTP y fan-out WebSocket.
  *
- * Compara métricas reales y reproducibles contra la sobrecarga documentada
- * de los competidores self-hosted (Coolify: >2 GB RAM + picos de CPU en reposo;
- * Dokploy: Next.js + Postgres + Redis + Traefik ~600-900 MB).
+ * Metodología honesta y comparativa con fuentes del sector (2025–2026):
+ * - Separa explícitamente la RAM medida del daemon de Culkibo (Node RSS solo)
+ *   frente al estimado con plano de datos Caddy (+12–20 MB idle RSS).
+ * - Distingue RAM idle medida vía `docker stats` del mínimo recomendado de VPS
+ *   (evitando confundir "2 GB VPS mínimo" con "2 GB RAM idle"):
+ *     • Coolify v4 (Laravel/PHP + colas + DB/Redis + proxy): ~400–700 MB idle (VPS min 2 GB)
+ *     • Dokploy (Next.js + Postgres + Redis + Traefik):      ~400–600 MB idle (VPS min 1–2 GB)
+ *     • CapRover (Node + Nginx + Docker Swarm):              ~300–450 MB idle (VPS min 1 GB)
+ *     • Komodo (Rust Core + Periphery + Mongo/FerretDB):     ~300–700 MB idle (VPS min 1–2 GB)
+ *     • Dokku (CLI-only, sin Web UI):                        ~100–200 MB idle (VPS min 512 MB–1 GB)
+ *     • Kamal 2 (CLI/SSH-only, sin panel en servidor):       0 MB panel + ~15–25 MB kamal-proxy
+ *     • Proxies: Caddy ~12–20 MB · Nginx ~20–30 MB · Traefik ~80–100+ MB idle
  */
 
 const { spawn } = require('child_process');
@@ -15,6 +24,21 @@ const WebSocket = require('ws');
 
 const pkg = require('../package.json');
 const mcpServer = require('../server/services/mcpServer');
+
+const CADDY_IDLE_RSS_ESTIMATE_MB = 18;
+
+const COMPETITOR_FOOTPRINT_REFERENCE = Object.freeze({
+  methodology: 'Measured control-plane idle RSS (docker stats) separated from documented minimum VPS RAM',
+  proxiesIdleRssMb: { caddy: '12-20', nginx: '20-30', traefik: '80-100+' },
+  platforms: [
+    { name: 'Coolify v4', ui: 'Web UI (Laravel/PHP)', measuredIdleRssMb: '400-700', minRecommendedVpsMb: 2048 },
+    { name: 'Dokploy', ui: 'Web UI (Next.js/TS)', measuredIdleRssMb: '400-600', minRecommendedVpsMb: 2048 },
+    { name: 'CapRover', ui: 'Web UI (Node/Swarm)', measuredIdleRssMb: '300-450', minRecommendedVpsMb: 1024 },
+    { name: 'Komodo', ui: 'Web UI (Rust+DB)', measuredIdleRssMb: '300-700', minRecommendedVpsMb: 1024 },
+    { name: 'Dokku', ui: 'CLI-only (no GUI)', measuredIdleRssMb: '100-200', minRecommendedVpsMb: 512 },
+    { name: 'Kamal 2', ui: 'CLI/SSH-only (no server panel)', measuredIdleRssMb: '0 (+15-25 proxy)', minRecommendedVpsMb: 512 }
+  ]
+});
 
 function percentile(sorted, p) {
   if (!sorted.length) return null;
@@ -86,7 +110,7 @@ async function waitForHealth(port, child, stderrBuf, timeoutMs = 15000) {
   }
 }
 
-async function run({ silent = false, concurrency = 400, workers = 20, wsClients = 40 } = {}) {
+async function run({ silent = false, concurrency = 500, workers = 25, wsClients = 40 } = {}) {
   const port = await findFreePort();
   const rootDir = path.join(__dirname, '..');
 
@@ -119,15 +143,18 @@ async function run({ silent = false, concurrency = 400, workers = 20, wsClients 
     }
     const coldBootMs = Number((Number(process.hrtime.bigint() - bootStart) / 1e6).toFixed(1));
 
-    // Huella en reposo real del daemon recién arrancado
-    await new Promise((r) => setTimeout(r, 250));
+    // Huella en reposo real del daemon tras estabilización inicial de 500 ms
+    await new Promise((r) => setTimeout(r, 500));
     const statusRes = await (await fetch(`http://127.0.0.1:${port}/api/system/status`)).json();
     const podsRes = await (await fetch(`http://127.0.0.1:${port}/api/pods`)).json();
     const idleRssMb = (podsRes.daemon && podsRes.daemon.memoryMb) || statusRes.memoryUsageMb || null;
     const idleCpuPercent = podsRes.daemon ? podsRes.daemon.cpuPercent : null;
+    const estimatedFullStackWithCaddyMb = idleRssMb !== null
+      ? Number((idleRssMb + CADDY_IDLE_RSS_ESTIMATE_MB).toFixed(1))
+      : null;
 
     // Concurrencia HTTP real estilo wrk/autocannon: pool fijo de workers con
-    // conexiones TCP keep-alive persistentes (evita medir la cola de sockets del cliente).
+    // conexiones TCP keep-alive persistentes (sin alterar ni restar latencia).
     const endpoints = ['/api/health', '/api/projects', '/api/catalog', '/api/pods'];
     const agent = new http.Agent({ keepAlive: true, maxSockets: workers });
     const httpGet = (ep) => new Promise((resolve) => {
@@ -188,9 +215,17 @@ async function run({ silent = false, concurrency = 400, workers = 20, wsClients 
     const summary = {
       coldBootMs,
       idleRssMb,
+      estimatedFullStackWithCaddyMb,
       idleCpuPercent,
+      conditions: {
+        reconcileSkipped: true,
+        settleMs: 500,
+        authMode: 'loopback_read_endpoints',
+        caddyIdleEstimateMb: CADDY_IDLE_RSS_ESTIMATE_MB
+      },
       httpConcurrency: {
         requests: concurrency,
+        workers,
         failures: reqFailures,
         totalMs: Number(batchMs.toFixed(1)),
         rps: Math.round((concurrency / batchMs) * 1000),
@@ -207,20 +242,28 @@ async function run({ silent = false, concurrency = 400, workers = 20, wsClients 
         runtimeDependencies: Object.keys(pkg.dependencies || {}).length,
         mcpToolsTotal: tools.length,
         mcpToolsMutating: mutatingTools
-      }
+      },
+      competitorReference: COMPETITOR_FOOTPRINT_REFERENCE
     };
 
     if (!silent) {
       console.log('\n════════════════════════════════════════════════════════════');
       console.log('  Culkibo · Banco de pruebas: Plano de control y huella');
       console.log('════════════════════════════════════════════════════════════\n');
-      console.log(`  Arranque en frío           ${summary.coldBootMs} ms`);
-      console.log(`  Memoria RAM en reposo      ${summary.idleRssMb} MB RSS  (Coolify requiere >=2.048 MB)`);
-      console.log(`  CPU en reposo              ${summary.idleCpuPercent ?? 0} %`);
-      console.log(`  Concurrencia HTTP (${concurrency})    p50 ${summary.httpConcurrency.p50Ms} ms · p95 ${summary.httpConcurrency.p95Ms} ms · ${summary.httpConcurrency.rps} req/s · ${summary.httpConcurrency.failures} fallos`);
-      console.log(`  WebSocket fan-out (${wsClients})     ${summary.websocketFanout.delivered}/${wsClients} clientes listos en ${summary.websocketFanout.totalMs} ms`);
-      console.log(`  Dependencias de runtime    ${summary.footprint.runtimeDependencies}`);
-      console.log(`  Superficie MCP 2026-07-28  ${summary.footprint.mcpToolsTotal} herramientas (${summary.footprint.mcpToolsMutating} de escritura vs 3 en Coolify)\n`);
+      console.log(`  Arranque en frío             ${summary.coldBootMs} ms (CULKIBO_SKIP_RECONCILE=1)`);
+      console.log(`  RAM idle daemon (solo Node)  ${summary.idleRssMb} MB RSS`);
+      console.log(`  RAM idle estimada (+Caddy)   ~${summary.estimatedFullStackWithCaddyMb} MB (Caddy ~${CADDY_IDLE_RSS_ESTIMATE_MB} MB idle)`);
+      console.log('  Referencia idle docker stats (vs mínimo recomendado de VPS):');
+      console.log('    Coolify v4                 ~400–700 MB idle (VPS min 2.048 MB)');
+      console.log('    Dokploy                    ~400–600 MB idle (VPS min 1.024–2.048 MB)');
+      console.log('    CapRover                   ~300–450 MB idle (VPS min 1.024 MB)');
+      console.log('    Dokku (CLI, sin GUI)       ~100–200 MB idle (VPS min 512 MB)');
+      console.log('    Kamal 2 (CLI/SSH-only)     0 MB panel (+15–25 MB kamal-proxy)');
+      console.log(`  CPU en reposo                ${summary.idleCpuPercent ?? 0} %`);
+      console.log(`  Concurrencia HTTP (${concurrency})      p50 ${summary.httpConcurrency.p50Ms} ms · p95 ${summary.httpConcurrency.p95Ms} ms · p99 ${summary.httpConcurrency.p99Ms} ms · ${summary.httpConcurrency.rps} req/s · ${summary.httpConcurrency.failures} fallos`);
+      console.log(`  WebSocket fan-out (${wsClients})       ${summary.websocketFanout.delivered}/${wsClients} clientes listos en ${summary.websocketFanout.totalMs} ms`);
+      console.log(`  Dependencias de runtime      ${summary.footprint.runtimeDependencies}`);
+      console.log(`  Superficie MCP 2026-07-28    ${summary.footprint.mcpToolsTotal} herramientas (${summary.footprint.mcpToolsMutating} de escritura)\n`);
     }
 
     return summary;
@@ -232,7 +275,11 @@ async function run({ silent = false, concurrency = 400, workers = 20, wsClients 
 }
 
 if (require.main === module) {
-  run().then(() => process.exit(0)).catch((err) => {
+  const asJson = process.argv.includes('--json');
+  run({ silent: asJson }).then((res) => {
+    if (asJson) process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    process.exit(0);
+  }).catch((err) => {
     console.error('❌ Fallo en bench/control-plane.bench.js:', err);
     process.exit(1);
   });

@@ -33,11 +33,41 @@ const {
   META_CLIENT_CAPABILITIES,
   ERROR_CODES,
   MODERN_METHODS,
-  NAME_BEARING_METHODS
+  NAME_BEARING_METHODS,
+  VALID_TOOL_PROFILES
 } = mcpServer.protocol;
 
 const MODERN_METHOD_SET = new Set(MODERN_METHODS);
 const NAME_BEARING_SET = new Set(NAME_BEARING_METHODS);
+const VALID_PROFILE_SET = new Set(VALID_TOOL_PROFILES || ['all', 'core', 'deploy', 'ops', 'security']);
+
+/**
+ * Extrae y valida el query param `?profile=core|deploy|ops|security|all` de la petición HTTP.
+ * @param {any} req
+ * @returns {{ ok: true, profile: string, explicit: boolean } | { ok: false, raw: string }}
+ */
+function resolveRequestProfile(req) {
+  let raw = req && req.query ? req.query.profile : undefined;
+  if (raw === undefined && req && typeof req.url === 'string' && req.url.includes('?')) {
+    try {
+      const parsed = new URL(req.url, 'http://localhost');
+      const all = parsed.searchParams.getAll('profile');
+      if (all.length > 1) return { ok: false, raw: all.join(',') };
+      if (all.length === 1) raw = all[0];
+    } catch (e) {}
+  }
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return { ok: true, profile: 'all', explicit: false };
+  }
+  if (Array.isArray(raw)) {
+    return { ok: false, raw: raw.join(',') };
+  }
+  const clean = String(raw).trim().toLowerCase();
+  if (!VALID_PROFILE_SET.has(clean)) {
+    return { ok: false, raw: String(raw) };
+  }
+  return { ok: true, profile: clean, explicit: true };
+}
 
 // Comentario SSE de keep-alive. Sin él, un proxy o un timeout de inactividad
 // cierran el stream durante una operación larga y el cliente lo lee como fallo.
@@ -286,22 +316,40 @@ async function _handlePostInner(req, res) {
     ));
   }
 
-  if (shouldStream(req, body)) {
-    return respondStreaming(req, res, body);
+  // 8. Perfil opcional en query string (`?profile=core|deploy|ops|security|all`).
+  const profileInfo = resolveRequestProfile(req);
+  if (!profileInfo.ok) {
+    return sendError(res, 400, jsonRpcError(id, ERROR_CODES.INVALID_PARAMS,
+      `Perfil MCP no válido en ?profile='${profileInfo.raw}'.`,
+      {
+        received: profileInfo.raw,
+        supportedProfiles: Array.from(VALID_PROFILE_SET),
+        remediation: `Usa ?profile=${Array.from(VALID_PROFILE_SET).join('|')} o omite el parámetro para el catálogo completo.`
+      }
+    ));
   }
-  return respondJson(req, res, body);
+
+  if (shouldStream(req, body)) {
+    return respondStreaming(req, res, body, profileInfo.profile);
+  }
+  return respondJson(req, res, body, profileInfo.profile);
 }
 
-async function respondJson(req, res, body) {
+async function respondJson(req, res, body, profile = 'all') {
   try {
     const clientInfo = body?.params?._meta?.['io.modelcontextprotocol/clientInfo'] || null;
     const envelope = await mcpServer.handleModernRpc(body, {
       transport: `Streamable HTTP ${PROTOCOL_VERSION}`,
       clientInfo,
-      auth: req.auth || null
+      auth: req.auth || null,
+      profile
     });
+    if (profile && profile !== 'all') {
+      res.setHeader('X-Culkibo-Mcp-Profile', profile);
+    }
     if (envelope?.result?.cacheScope === 'private') {
       res.setHeader('Cache-Control', 'private, no-store');
+      res.setHeader('Vary', 'Authorization, Accept');
     }
     res.status(200).json(envelope);
   } catch (err) {
@@ -312,7 +360,7 @@ async function respondJson(req, res, body) {
   }
 }
 
-async function respondStreaming(req, res, body) {
+async function respondStreaming(req, res, body, profile = 'all') {
   if (typeof req.setTimeout === 'function') req.setTimeout(0);
   if (typeof res.setTimeout === 'function') res.setTimeout(0);
   res.writeHead(200, {
@@ -321,7 +369,8 @@ async function respondStreaming(req, res, body) {
     Connection: 'keep-alive',
     // Sin esto, nginx acumula los eventos en su buffer y el progreso llega
     // todo junto al final, que es como no enviarlo.
-    'X-Accel-Buffering': 'no'
+    'X-Accel-Buffering': 'no',
+    ...(profile && profile !== 'all' ? { 'X-Culkibo-Mcp-Profile': profile } : {})
   });
 
   let cancelled = false;
@@ -384,6 +433,7 @@ async function respondStreaming(req, res, body) {
       transport: `Streamable HTTP ${PROTOCOL_VERSION} (SSE)`,
       clientInfo,
       auth: req.auth || null,
+      profile,
       isCancelled: () => cancelled,
       signal: ac.signal,
       onProgress: emitProgress

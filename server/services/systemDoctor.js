@@ -3,6 +3,7 @@ const os = require('os');
 const path = require('path');
 
 const metricsCollector = require('./metricsCollector');
+const { readHostMemoryStats } = require('./metricsHistory');
 
 /**
  * Diagnóstico real en 1 clic del estado del sistema (`systemDoctor`).
@@ -54,23 +55,41 @@ function checkDiskSpace() {
   };
 }
 
-function checkHostMemory(snap) {
-  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
-  const freeMb = Math.round(os.freemem() / 1024 / 1024);
-  const freePct = totalMb > 0 ? Math.round((freeMb / totalMb) * 100) : 100;
+function checkHostMemory(snap, readProcMeminfo = null) {
+  const mem = readHostMemoryStats(readProcMeminfo);
+  const totalMb = mem.totalMb;
+  const freeMb = mem.availableMb;
+  const freePct = Math.round(mem.availablePct);
+  const usedPct = Math.round(mem.usedPct);
   /** @type {'ok' | 'warn' | 'fail'} */
-  const status = (freeMb < 128 || freePct < 6) ? 'fail' : (freeMb < 384 || freePct < 12) ? 'warn' : 'ok';
+  const status = (freeMb < 128 || freePct < 6 || (mem.swapTotalMb > 0 && mem.swapUsedPct >= 85))
+    ? 'fail'
+    : (freeMb < 384 || freePct < 12 || (mem.swapTotalMb > 0 && mem.swapUsedPct >= 50))
+      ? 'warn'
+      : 'ok';
+  const swapSuffix = mem.swapTotalMb > 0 ? ` · Swap ${mem.swapUsedPct}%` : '';
   return {
     id: 'host_memory',
     name: 'Memoria RAM del servidor',
     status,
-    summary: `RAM libre: ${freeMb} MB de ${totalMb} MB (${freePct}% libre) · Daemon ${snap.process.memoryMb} MB RSS`,
+    summary: `RAM disponible: ${freeMb} MB de ${totalMb} MB (${freePct}% libre${swapSuffix}) · Daemon ${snap.process.memoryMb} MB RSS`,
     detail: status === 'ok'
-      ? 'Memoria disponible suficiente para contenedores, builds y procesos locales.'
-      : 'Memoria RAM ajustada. Limita despliegues simultáneos con CULKIBO_MAX_CONCURRENT_BUILDS=1 o añade swap.',
+      ? 'Memoria disponible real suficiente (MemAvailable en Linux, excluye caché recuperable) para contenedores y builds.'
+      : 'Memoria RAM ajustada. Limita despliegues simultáneos con CULKIBO_MAX_CONCURRENT_BUILDS=1, activa Auto-Sleep o añade swap.',
     fixAction: null,
     fixLabel: null,
-    metrics: { freeMb, totalMb, freePct, rssMb: snap.process.memoryMb }
+    metrics: {
+      freeMb,
+      availableMb: mem.availableMb,
+      usedMb: mem.usedMb,
+      totalMb,
+      freePct,
+      usedPct,
+      swapTotalMb: mem.swapTotalMb,
+      swapUsedPct: mem.swapUsedPct,
+      source: mem.source,
+      rssMb: snap.process.memoryMb
+    }
   };
 }
 
@@ -178,6 +197,10 @@ async function checkCostAndFleet({ snap = null, sleepAdvisorMod = undefined, fle
 
   // 1. Asesor de costes y RAM del VPS
   let advisorHandled = false;
+  /** @type {string | null} */
+  let advisorFixAction = null;
+  /** @type {string | null} */
+  let advisorFixLabel = null;
   if (advisorMod && typeof advisorMod === 'object') {
     try {
       /** @type {any} */
@@ -192,6 +215,12 @@ async function checkCostAndFleet({ snap = null, sleepAdvisorMod = undefined, fle
         const advStatus = adv.status === 'fail' ? 'fail' : (adv.status === 'warn' ? 'warn' : 'ok');
         if (advStatus === 'fail') status = 'fail';
         else if (advStatus === 'warn' && status === 'ok') status = 'warn';
+        if (typeof adv.fixAction === 'string' && adv.fixAction.trim()) {
+          advisorFixAction = adv.fixAction.trim();
+          advisorFixLabel = typeof adv.fixLabel === 'string' && adv.fixLabel.trim()
+            ? adv.fixLabel.trim()
+            : 'Revisar Auto-Sleep';
+        }
 
         const advMetrics = (adv.metrics && typeof adv.metrics === 'object') ? adv.metrics : {};
         const reclaimableMb = Number(advMetrics.reclaimableRamMb ?? adv.reclaimableMb ?? adv.savings?.reclaimableRamMb ?? 0) || 0;
@@ -320,8 +349,8 @@ async function checkCostAndFleet({ snap = null, sleepAdvisorMod = undefined, fle
     status,
     summary: summaryParts.join(' · '),
     detail: detailParts.join(' '),
-    fixAction: null,
-    fixLabel: null,
+    fixAction: advisorFixAction,
+    fixLabel: advisorFixLabel,
     metrics
   };
 }
@@ -666,6 +695,33 @@ async function runDoctor() {
   // 10. Asesor de costes/RAM del VPS y salud de nodos de flota SSH (perezoso, degradación limpia)
   checks.push(await checkCostAndFleet({ snap }));
 
+  // 11. Motor de reglas de alertas proactivas
+  try {
+    const alertEngine = require('./alertEngine');
+    const alertSum = alertEngine.getSummary();
+    /** @type {'ok' | 'warn' | 'fail'} */
+    const alertStatus = alertSum.criticalFiringCount > 0 ? 'fail' : (alertSum.firingCount > 0 ? 'warn' : 'ok');
+    checks.push({
+      id: 'alert_rules',
+      name: 'Motor de alertas proactivas',
+      status: alertStatus,
+      summary: alertSum.firingCount > 0
+        ? `${alertSum.firingCount} alerta(s) activa(s) (${alertSum.criticalFiringCount} críticas)`
+        : `${alertSum.rulesEnabled}/${alertSum.rulesTotal} reglas activas · sin alertas disparadas`,
+      detail: alertSum.firingCount > 0
+        ? alertSum.activeAlerts.slice(0, 3).map((a) => `${a.ruleName} (${a.target})`).join(' · ')
+        : 'Reglas de RAM, disco, CPU, OOM, TLS y Uptime configuradas con amortiguación y enfriamiento.',
+      fixAction: null,
+      fixLabel: null,
+      metrics: {
+        rulesTotal: alertSum.rulesTotal,
+        rulesEnabled: alertSum.rulesEnabled,
+        firingCount: alertSum.firingCount,
+        criticalFiringCount: alertSum.criticalFiringCount
+      }
+    });
+  } catch (e) {}
+
   const summary = {
     ok: checks.filter((c) => c.status === 'ok').length,
     warn: checks.filter((c) => c.status === 'warn').length,
@@ -754,6 +810,21 @@ async function applyFix(action) {
       action,
       message: 'Caché de BuildKit purgada conservando las capas recientes (2 GB).',
       detail: res
+    };
+  }
+
+  if (action === 'review_sleep_candidates') {
+    const sa = require('./sleepAdvisor');
+    const candidates = typeof sa.getSleepCandidates === 'function' ? sa.getSleepCandidates() : [];
+    const totalMb = candidates.reduce((sum, c) => sum + (Number(c.reclaimableRamMb) || 0), 0);
+    return {
+      ok: true,
+      action,
+      message: candidates.length > 0
+        ? `${candidates.length} candidato(s) a Auto-Sleep detectados (~${totalMb} MB recuperables). Actívalos desde Uptime → Ahorro y Reposo.`
+        : 'No hay proyectos inactivos pendientes de Auto-Sleep en este momento.',
+      candidates,
+      reclaimableRamMb: totalMb
     };
   }
 

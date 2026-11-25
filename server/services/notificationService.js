@@ -2,9 +2,14 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const EventEmitter = require('events');
-const { assertSafeUrl, safeFetch, atomicWriteJsonSync } = require('./ssrfGuard');
+const { assertSafeUrl, safeFetch, atomicWriteJsonSync, loadJsonWithBackupSync } = require('./ssrfGuard');
 
-const CONFIG_FILE = path.join(__dirname, '..', '..', 'data', 'notifications.json');
+function resolveDataDir() {
+  return process.env.CULKIBO_DATA_DIR
+    ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
+    : path.join(__dirname, '..', '..', 'data');
+}
+
 const TELEGRAM_TOKEN_RE = /^\d{5,15}:[A-Za-z0-9_-]{20,80}$/;
 const DISCORD_WEBHOOK_HOSTS = new Set(['discord.com', 'discordapp.com', 'ptb.discord.com', 'canary.discord.com']);
 const SLACK_WEBHOOK_HOSTS = new Set(['hooks.slack.com', 'hooks.gov-slack.com']);
@@ -26,7 +31,16 @@ const DEFAULT_CONFIG = {
     disk_warning: true,
     cron_failed: true,
     ssl_issued: false,
-    project_stopped: false
+    project_stopped: false,
+    uptime_down: true,
+    uptime_recovered: true,
+    alert_fired: true,
+    alert_resolved: true,
+    host_ram_high: true,
+    host_cpu_high: true,
+    host_disk_high: true,
+    container_oom: true,
+    container_restart_loop: true
   },
   channels: {
     telegram: { enabled: false, botToken: '', chatId: '' },
@@ -54,26 +68,60 @@ const LEVEL_META = {
  *  - Nunca devuelve secretos: `getConfig()` entrega los tokens enmascarados.
  */
 class NotificationService extends EventEmitter {
-  constructor() {
+  /**
+   * @param {{ configFile?: string | null, historyFile?: string | null, postFn?: ((url: string, body: any, extraHeaders?: Record<string, string>) => Promise<any>) | null }} [options]
+   */
+  constructor(options = {}) {
     super();
+    this._customConfigFile = options.configFile || null;
+    this._customHistoryFile = options.historyFile || null;
+    this._customPostFn = options.postFn || null;
     this.config = this.loadConfig();
+    /** @type {Array<any>} */
     this.history = [];
+    this._historyLoaded = false;
     this.maxHistory = 100;
     // Evita tormentas de avisos idénticos (p. ej. un proceso en bucle de crash).
     this.lastSentAt = new Map();
     this.dedupeWindowMs = 60000;
   }
 
+  getConfigFile() {
+    return this._customConfigFile || path.join(resolveDataDir(), 'notifications.json');
+  }
+
+  getHistoryFile() {
+    return this._customHistoryFile || path.join(resolveDataDir(), 'notification-history.json');
+  }
+
   loadConfig() {
     try {
-      if (fs.existsSync(CONFIG_FILE)) {
-        const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+      const file = this.getConfigFile();
+      if (fs.existsSync(file)) {
+        const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
         return this.mergeConfig(DEFAULT_CONFIG, raw);
       }
     } catch (err) {
       console.error('[Notifications] No se pudo leer la configuración:', err.message);
     }
     return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+  }
+
+  _ensureHistoryLoaded() {
+    if (this._historyLoaded) return;
+    this._historyLoaded = true;
+    const res = loadJsonWithBackupSync(this.getHistoryFile(), {
+      validate: (p) => Array.isArray(p)
+    });
+    if (res.ok && Array.isArray(res.data)) {
+      this.history = res.data.slice(0, this.maxHistory);
+    }
+  }
+
+  _saveHistory() {
+    try {
+      atomicWriteJsonSync(this.getHistoryFile(), this.history.slice(0, this.maxHistory), { mode: 0o600, backup: true });
+    } catch (e) {}
   }
 
   mergeConfig(base, override) {
@@ -97,7 +145,7 @@ class NotificationService extends EventEmitter {
   }
 
   saveConfig() {
-    atomicWriteJsonSync(CONFIG_FILE, this.config, 0o600);
+    atomicWriteJsonSync(this.getConfigFile(), this.config, { mode: 0o600, backup: true });
   }
 
   mask(value) {
@@ -195,6 +243,7 @@ class NotificationService extends EventEmitter {
   }
 
   getHistory(limit = 30) {
+    this._ensureHistoryLoaded();
     return this.history.slice(0, limit);
   }
 
@@ -272,8 +321,10 @@ class NotificationService extends EventEmitter {
 
       await Promise.allSettled(sends);
 
+      this._ensureHistoryLoaded();
       this.history.unshift(entry);
       if (this.history.length > this.maxHistory) this.history.pop();
+      this._saveHistory();
       this.emit('notification', entry);
 
       const okCount = Object.values(entry.results).filter(r => r === 'ok').length;
@@ -429,6 +480,9 @@ class NotificationService extends EventEmitter {
   }
 
   async post(url, body, extraHeaders = {}) {
+    if (this._customPostFn) {
+      return this._customPostFn(url, body, extraHeaders);
+    }
     const payload = typeof body === 'string' ? body : JSON.stringify(body);
     let lastStatus = 0;
     let lastText = '';
@@ -457,4 +511,8 @@ class NotificationService extends EventEmitter {
   }
 }
 
-module.exports = new NotificationService();
+const notificationServiceInstance = Object.assign(new NotificationService(), {
+  NotificationService,
+  DEFAULT_CONFIG
+});
+module.exports = notificationServiceInstance;

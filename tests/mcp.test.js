@@ -136,8 +136,11 @@ async function testMcp() {
   // 11. Transporte Streamable HTTP (2026-07-28)
   await testStreamableHttpTransport();
 
-  // 12. MCP 2.0: 104 herramientas, 7 recursos, 5 prompts, dryRun universal, RBAC y anti-IDOR
+  // 12. MCP 2.0/2.1: 107 herramientas, 7 recursos, 5 prompts, dryRun universal, RBAC y anti-IDOR
   await testMcpV2Capabilities();
+
+  // 13. MCP 2.1: perfiles (-80% contexto), meta-discovery, validación estricta, 4 handlers reparados, 5 anti-IDOR, self-healing ops
+  await testMcpV21Superpowers();
 
   console.log('✅ All MCP tests passed!\n');
 }
@@ -149,9 +152,9 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 104, 'El catálogo MCP 2.0 debe tener exactamente 104 herramientas anotadas');
+  assert.strictEqual(tools.length, 107, 'El catálogo MCP 2.1 debe tener exactamente 107 herramientas anotadas');
   const uniqueNames = new Set(tools.map(t => t.name));
-  assert.strictEqual(uniqueNames.size, 104, 'No puede haber nombres de herramientas duplicados');
+  assert.strictEqual(uniqueNames.size, 107, 'No puede haber nombres de herramientas duplicados');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -173,10 +176,12 @@ async function testToolAnnotations() {
   const mutCount = tools.filter(t => !t.annotations.readOnlyHint).length;
   const destCount = tools.filter(t => t.annotations.destructiveHint === true).length;
   const dryRunCount = tools.filter(t => Boolean(t.inputSchema?.properties?.dryRun)).length;
-  assert.strictEqual(roCount, 46, `Se esperaban 46 herramientas RO, hay ${roCount}`);
-  assert.strictEqual(mutCount, 58, `Se esperaban 58 herramientas mutadoras, hay ${mutCount}`);
-  assert.strictEqual(destCount, 25, `Se esperaban 25 herramientas destructivas, hay ${destCount}`);
-  assert.strictEqual(dryRunCount, 27, `Se esperaban 27 herramientas con dryRun, hay ${dryRunCount}`);
+  const outputSchemaCount = tools.filter(t => Boolean(t.outputSchema)).length;
+  assert.strictEqual(roCount, 48, `Se esperaban 48 herramientas RO, hay ${roCount}`);
+  assert.strictEqual(mutCount, 59, `Se esperaban 59 herramientas mutadoras, hay ${mutCount}`);
+  assert.strictEqual(destCount, 33, `Se esperaban 33 herramientas destructivas, hay ${destCount}`);
+  assert.strictEqual(dryRunCount, 35, `Se esperaban 35 herramientas con dryRun, hay ${dryRunCount}`);
+  assert.ok(outputSchemaCount >= 60, `Se esperaban >=60 herramientas con outputSchema, hay ${outputSchemaCount}`);
 
   const byName = Object.fromEntries(tools.map(t => [t.name, t]));
   const mustMutate = [
@@ -379,15 +384,76 @@ async function testStreamableHttpTransport() {
     assert.ok(noMeta.error.data.missing.includes('io.modelcontextprotocol/clientCapabilities'));
     console.log('  ✓ _meta obligatorio ausente -> -32602 con la lista de campos que faltan');
 
-    // 7. tools/list sobre el transporte nuevo.
+    // 7. tools/list sobre el transporte nuevo + perfiles ?profile= y params.query.
+    assert.strictEqual(discover.result.capabilities.tools.filtering, true, 'discover debe anunciar capabilities.tools.filtering');
     const listRes = await post(
       { 'MCP-Protocol-Version': V, 'Mcp-Method': 'tools/list' },
       { jsonrpc: '2.0', id: 'list-1', method: 'tools/list', params: { _meta: meta() } }
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 104);
-    console.log(`  ✓ tools/list sobre Streamable HTTP (${list.result.tools.length} herramientas)`);
+    assert.strictEqual(list.result.tools.length, 107);
+
+    // 7b. ?profile=core reduce el tamaño/tokens de tools/list en >=80% y mantiene callable herramientas descubiertas.
+    const coreListRes = await fetch(`${endpoint}?profile=core`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': V,
+        'Mcp-Method': 'tools/list'
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'list-core', method: 'tools/list', params: { _meta: meta() } })
+    });
+    assert.strictEqual(coreListRes.status, 200);
+    assert.strictEqual(coreListRes.headers.get('x-culkibo-mcp-profile'), 'core');
+    const coreList = await coreListRes.json();
+    assert.strictEqual(coreList.result.profile, 'core');
+    assert.ok(coreList.result.tools.some((t) => t.name === 'culkibo_search_tools'));
+    assert.ok(coreList.result.tools.some((t) => t.name === 'culkibo_diagnose_incident'));
+    assert.ok(coreList.result.tools.some((t) => t.name === 'culkibo_auto_remediate'));
+    const fullBytes = Buffer.byteLength(JSON.stringify(list.result.tools), 'utf8');
+    const coreBytes = Buffer.byteLength(JSON.stringify(coreList.result.tools), 'utf8');
+    const savedRatio = 1 - (coreBytes / fullBytes);
+    assert.ok(savedRatio >= 0.80, `?profile=core debe recortar >=80% de tokens/bytes (logró ${(savedRatio * 100).toFixed(1)}%)`);
+
+    // Invocar una herramienta fuera de ?profile=core tras descubrirla sigue funcionando
+    const crossProfileCall = await fetch(`${endpoint}?profile=core`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'MCP-Protocol-Version': V,
+        'Mcp-Method': 'tools/call',
+        'Mcp-Name': 'culkibo_list_pods'
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'call-xp', method: 'tools/call', params: { name: 'culkibo_list_pods', arguments: {}, _meta: meta() } })
+    });
+    assert.strictEqual(crossProfileCall.status, 200);
+    assert.strictEqual((await crossProfileCall.json()).result.isError, false);
+
+    // Perfil inválido en query string -> 400 + -32602
+    const badProfileRes = await fetch(`${endpoint}?profile=nonexistent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'MCP-Protocol-Version': V,
+        'Mcp-Method': 'tools/list'
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'bad-prof', method: 'tools/list', params: { _meta: meta() } })
+    });
+    assert.strictEqual(badProfileRes.status, 400);
+    assert.strictEqual((await badProfileRes.json()).error.code, -32602);
+
+    // params.query en tools/list
+    const queryListRes = await post(
+      { 'MCP-Protocol-Version': V, 'Mcp-Method': 'tools/list' },
+      { jsonrpc: '2.0', id: 'list-q', method: 'tools/list', params: { query: 'oom memory', limit: 5, _meta: meta() } }
+    );
+    const queryList = await queryListRes.json();
+    assert.ok(queryList.result.tools.length >= 1 && queryList.result.tools.length <= 5);
+    console.log(`  ✓ tools/list Streamable HTTP (${list.result.tools.length} tools; ?profile=core -> ${coreList.result.tools.length} tools, -${(savedRatio * 100).toFixed(1)}% bytes, params.query ok)`);
 
     // 8. tools/call con salida estructurada.
     const callRes = await post(
@@ -585,8 +651,9 @@ async function testMcpV2Capabilities() {
   const rolloutPrompt = mcpServer.getPrompt('culkibo_multi_server_rollout', { projectId: 'proj_demo', targetServers: 'srv_eu' });
   assert.ok(rolloutPrompt.messages[0].content.text.includes('culkibo_canary_rollout'));
   const triagePrompt = mcpServer.getPrompt('culkibo_incident_triage', { projectId: 'proj_demo', hostname: 'app.demo.test' });
-  assert.ok(triagePrompt.messages[0].content.text.includes('culkibo_cost_advisor'));
-  console.log('  ✓ MCP 2.0: 7 recursos y 5 prompts verificados');
+  assert.ok(triagePrompt.messages[0].content.text.includes('culkibo_diagnose_incident'));
+  assert.ok(triagePrompt.messages[0].content.text.includes('culkibo_auto_remediate'));
+  console.log('  ✓ MCP 2.0/2.1: 7 recursos y 5 prompts verificados');
 
   // 2. Bugfixes y redacción ampliada
   const catTool = mcpServer.getToolByName('culkibo_list_catalog_templates');
@@ -650,7 +717,7 @@ async function testMcpV2Capabilities() {
       principal: { userId: 'usr_viewer_1', role: 'viewer', teamId: 'team_default', projectIds: [projA.id], scopes: ['*'] }
     };
     const viewerTools = mcpServer.getToolsForPrincipal(viewerAuth);
-    assert.ok(viewerTools.length > 0 && viewerTools.length < 104);
+    assert.ok(viewerTools.length > 0 && viewerTools.length < 107);
     assert.ok(viewerTools.every(t => t.annotations.readOnlyHint === true), 'viewer solo puede ver herramientas readOnly');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_database_credentials'), 'viewer NO puede ver culkibo_database_credentials');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_rbac_list_tokens'), 'viewer NO puede ver culkibo_rbac_list_tokens');
@@ -658,7 +725,7 @@ async function testMcpV2Capabilities() {
     // Serialized tools cache isolation
     const pubBuf = mcpServer.getToolsSerialized();
     const privBuf = mcpServer.getToolsSerialized(viewerAuth);
-    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 104);
+    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 107);
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).cacheScope, 'private');
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).count, viewerTools.length);
 
@@ -724,7 +791,7 @@ async function testMcpV2Capabilities() {
     const whoamiSuper = await mcpServer.executeTool('culkibo_rbac_whoami', {});
     assert.strictEqual(whoamiSuper.isError, false);
     assert.strictEqual(whoamiSuper.structuredContent.isSuperAdmin, true);
-    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 104);
+    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 107);
 
     const whoamiViewer = await mcpServer.executeTool('culkibo_rbac_whoami', {}, { auth: viewerAuth });
     assert.strictEqual(whoamiViewer.isError, false);
@@ -922,6 +989,426 @@ async function testMcpV2Capabilities() {
     }
 
     console.log('  ✓ MCP 2.0: dryRun universal (0 mutaciones), RBAC, per-project ACL, anti-IDOR (cron/global/team) y forwarding req.auth verificados');
+  } finally {
+    projectManager.delete(projA.id);
+    projectManager.delete(projB.id);
+    await projectManager.flushToDisk();
+  }
+}
+
+/**
+ * MCP 2.1: auditoría automatizada de los 107 handlers, meta-discovery, validación
+ * estricta de rangos/patrones/items, 4 handlers corregidos, 5 fugas RBAC/IDOR cerradas
+ * y ciclo completo de autocuración (culkibo_diagnose_incident + culkibo_auto_remediate).
+ */
+async function testMcpV21Superpowers() {
+  const fs = require('fs');
+  const path = require('path');
+  const projectManager = require('../server/services/projectManager');
+  const deployManager = require('../server/services/deployManager');
+  const dockerManager = require('../server/services/dockerManager');
+  const systemDoctor = require('../server/services/systemDoctor');
+  const sleepAdvisor = require('../server/services/sleepAdvisor');
+  const uptimeMonitor = require('../server/services/uptimeMonitor');
+  const gitopsManager = require('../server/services/gitopsManager');
+  const ingressManager = require('../server/services/ingressManager');
+
+  // 1. Auditoría automatizada de cableado sobre LAS 107 HERRAMIENTAS (0 stubs rotos, 0 métodos inexistentes, 0 errores sin remediation)
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server', 'services', 'mcpServer.js'), 'utf8');
+  const tools = mcpServer.getToolsDefinition();
+  const switchBlock = src.slice(src.indexOf('switch (toolName)'), src.indexOf('// MCP Resources & Prompts'));
+  const caseNames = new Set();
+  let match;
+  const caseRe = /case\s+'(culkibo_[a-z0-9_]+)'\s*:/g;
+  while ((match = caseRe.exec(switchBlock))) caseNames.add(match[1]);
+  assert.strictEqual(caseNames.size, 107, `Todos los 107 tools deben tener handler en switch (hay ${caseNames.size})`);
+  for (const t of tools) {
+    assert.ok(caseNames.has(t.name), `Falta case para ${t.name}`);
+  }
+
+  const svcMap = {
+    containerOrchestrator: require('../server/services/containerOrchestrator'),
+    domainManager: require('../server/services/domainManager'),
+    sslManager: require('../server/services/sslManager'),
+    cloudflareService: require('../server/services/cloudflareService'),
+    projectManager,
+    dockerManager,
+    dbBackupManager: require('../server/services/dbBackupManager'),
+    githubService: require('../server/services/githubService'),
+    ingressManager,
+    caddyManager: require('../server/services/caddyManager'),
+    deployManager,
+    databaseManager: require('../server/services/databaseManager'),
+    catalogManager: require('../server/services/catalogManager'),
+    liveSyncEngine: require('../server/services/liveSyncEngine'),
+    coolifyMigrator: require('../server/services/coolifyMigrator'),
+    wordpressMigrator: require('../server/services/wordpressMigrator'),
+    universalImporter: require('../server/services/universalImporter'),
+    metricsCollector: require('../server/services/metricsCollector'),
+    systemDoctor,
+    notificationService: require('../server/services/notificationService'),
+    cronManager: require('../server/services/cronManager'),
+    previewManager: require('../server/services/previewManager'),
+    webhookService: require('../server/services/webhookService'),
+    fleet: require('../server/services/serverFleetManager'),
+    fleetSvc: require('../server/services/serverFleetManager'),
+    tm: require('../server/services/teamManager'),
+    em: require('../server/services/environmentManager'),
+    um: uptimeMonitor,
+    gm: gitopsManager,
+    sa: sleepAdvisor,
+    dm: deployManager
+  };
+  const missingCalls = [];
+  const callRe = /\b([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\(/g;
+  while ((match = callRe.exec(switchBlock))) {
+    const [, obj, fn] = match;
+    if (svcMap[obj] && typeof svcMap[obj][fn] !== 'function') {
+      missingCalls.push(`${obj}.${fn}()`);
+    }
+  }
+  assert.deepStrictEqual(missingCalls, [], `Handlers MCP llaman a métodos inexistentes: ${missingCalls.join(', ')}`);
+  assert.ok(!/throw new Error\(/.test(switchBlock), 'No debe haber throw new Error() sin tipar en handlers MCP');
+
+  // Los 7 tools con acciones destructivas ahora son destructiveHint: true y soportan dryRun
+  for (const name of [
+    'culkibo_manage_watcher', 'culkibo_link_database', 'culkibo_manage_wildcard_dns01',
+    'culkibo_manage_webhook', 'culkibo_manage_crons', 'culkibo_manage_previews', 'culkibo_status_page_manage'
+  ]) {
+    const t = mcpServer.getToolByName(name);
+    assert.strictEqual(t.annotations.destructiveHint, true, `${name} debe tener destructiveHint: true`);
+    assert.strictEqual(mcpServer.supportsDryRun(name), true, `${name} debe soportar dryRun`);
+  }
+  // Verificar que los 5 perfiles devuelven subconjuntos válidos
+  for (const prof of ['core', 'deploy', 'ops', 'security', 'all']) {
+    const subset = mcpServer.getToolsForPrincipal(null, { profile: prof });
+    assert.ok(subset.length > 0, `El perfil ${prof} debe devolver herramientas`);
+  }
+  console.log('  ✓ Auditoría automatizada de 107 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
+
+  // 2. culkibo_search_tools (meta-discovery + aislamiento RBAC)
+  const searchSuper = await mcpServer.executeTool('culkibo_search_tools', { query: 'postgres backup', limit: 5 });
+  assert.strictEqual(searchSuper.isError, false);
+  assert.ok(searchSuper.structuredContent.matchedCount >= 1);
+  assert.ok(searchSuper.structuredContent.tools.some((t) => t.name.includes('database') && Boolean(t.inputSchema)));
+
+  const viewerAuth = {
+    ok: true,
+    method: 'api_token',
+    principal: { userId: 'usr_v21_viewer', role: 'viewer', teamId: 'team_default', projectIds: null, scopes: ['*'] }
+  };
+  const searchViewer = await mcpServer.executeTool('culkibo_search_tools', { query: 'delete database revoke token', limit: 15 }, { auth: viewerAuth });
+  assert.strictEqual(searchViewer.isError, false);
+  assert.ok(searchViewer.structuredContent.tools.every((t) => t.annotations.readOnlyHint === true), 'culkibo_search_tools NUNCA debe revelar herramientas de escritura a un viewer');
+  console.log('  ✓ culkibo_search_tools (meta-discovery ES/EN + filtro RBAC estricto) verificado');
+
+  // 3. Validación estricta de rangos (minimum/maximum), pattern y array items
+  const badPct = await mcpServer.executeTool('culkibo_switch_traffic', { citadelPercent: 150 });
+  assert.strictEqual(badPct.isError, true);
+  const badPctEnv = JSON.parse(badPct.content[0].text);
+  assert.strictEqual(badPctEnv.code, 'INVALID_ARGUMENT');
+  assert.ok(badPctEnv.remediation && badPctEnv.remediation.length > 5);
+
+  const badLines = await mcpServer.executeTool('culkibo_get_container_logs', { projectId: 'any', lines: 5 });
+  assert.strictEqual(badLines.isError, true);
+  assert.strictEqual(JSON.parse(badLines.content[0].text).code, 'INVALID_ARGUMENT');
+
+  const badSlug = await mcpServer.executeTool('culkibo_status_page_manage', { action: 'configure', slug: 'INVALID SLUG!' });
+  assert.strictEqual(badSlug.isError, true);
+  assert.strictEqual(JSON.parse(badSlug.content[0].text).code, 'INVALID_ARGUMENT');
+
+  const badItems = await mcpServer.executeTool('culkibo_canary_rollout', { projectId: 'any', action: 'start', steps: [10, 250] });
+  assert.strictEqual(badItems.isError, true);
+  assert.strictEqual(JSON.parse(badItems.content[0].text).code, 'INVALID_ARGUMENT');
+  console.log('  ✓ Validación estricta de minimum/maximum, pattern y array items con remediation verificada');
+
+  // Crear dos proyectos temporales aislados para pruebas de handlers, RBAC/IDOR y autocuración
+  const projA = projectManager.create({ name: 'MCP21 Project A', description: 'Owned A', maintenanceMode: false, teamId: 'team_default' });
+  const projB = projectManager.create({ name: 'MCP21 Project B', description: 'Foreign B', maintenanceMode: false, teamId: 'team_default' });
+
+  try {
+    // 4. Verificación de los 4 handlers reparados (mocks en memoria restaurados en finally)
+    const origStopProd = deployManager.stopProduction;
+    const origStartProd = deployManager.startProduction;
+    const origApplyFix = systemDoctor.applyFix;
+    const origGetCanary = deployManager.getCanaryState;
+    const origSwitchCanary = deployManager.switchCanaryRoute;
+    const origPromoteCanary = deployManager.promoteCanary;
+    const calledOps = [];
+    try {
+      deployManager.stopProduction = async (pid) => { calledOps.push(`stop:${pid}`); return { stopped: true, projectId: pid }; };
+      deployManager.startProduction = async (pid) => { calledOps.push(`start:${pid}`); return { started: true, projectId: pid }; };
+      systemDoctor.applyFix = async (act) => { calledOps.push(`doctor:${act}`); return { ok: true, action: act, message: 'ok' }; };
+      deployManager.getCanaryState = (pid) => ({
+        projectId: pid, deploymentId: 'dep_can_1', stableDial: '127.0.0.1:20001', canaryDial: '127.0.0.1:20002',
+        weight: 10, stepIndex: 0, steps: [10, 50, 100]
+      });
+      deployManager.switchCanaryRoute = async (_dep, _hosts, opts) => {
+        calledOps.push(`canary_weight:${opts.canaryWeight}`);
+        return { ok: true, weights: [100 - opts.canaryWeight, opts.canaryWeight] };
+      };
+      deployManager.promoteCanary = (pid) => { calledOps.push(`canary_promote:${pid}`); return { ok: true, action: 'promote' }; };
+
+      const restartRes = await mcpServer.executeTool('culkibo_manage_production_service', { projectId: projA.id, action: 'restart' });
+      assert.strictEqual(restartRes.isError, false);
+      assert.strictEqual(restartRes.structuredContent.restarted, true);
+      assert.ok(calledOps.includes(`stop:${projA.id}`) && calledOps.includes(`start:${projA.id}`));
+
+      const docFixAlias = await mcpServer.executeTool('culkibo_system_doctor_fix', { action: 'prune_build_cache' });
+      assert.strictEqual(docFixAlias.isError, false);
+      assert.ok(calledOps.includes('doctor:prune_buildkit'), 'prune_build_cache debe mapearse a prune_buildkit');
+
+      const canaryAdv = await mcpServer.executeTool('culkibo_canary_rollout', { projectId: projA.id, action: 'advance' });
+      assert.strictEqual(canaryAdv.isError, false);
+      assert.strictEqual(canaryAdv.structuredContent.nextWeight, 50);
+      assert.ok(calledOps.includes('canary_weight:50'));
+
+      // Verificar propiedades reparadas en inputSchema de manage_domain y manage_crons
+      assert.ok(mcpServer.getToolByName('culkibo_manage_domain').inputSchema.properties.targetPort);
+      assert.ok(mcpServer.getToolByName('culkibo_manage_domain').inputSchema.properties.projectId);
+      assert.ok(mcpServer.getToolByName('culkibo_manage_crons').inputSchema.properties.mode);
+      assert.ok(mcpServer.getToolByName('culkibo_manage_crons').inputSchema.properties.httpPath);
+      assert.ok(mcpServer.getToolByName('culkibo_manage_crons').inputSchema.properties.httpMethod);
+    } finally {
+      deployManager.stopProduction = origStopProd;
+      deployManager.startProduction = origStartProd;
+      systemDoctor.applyFix = origApplyFix;
+      deployManager.getCanaryState = origGetCanary;
+      deployManager.switchCanaryRoute = origSwitchCanary;
+      deployManager.promoteCanary = origPromoteCanary;
+    }
+    console.log('  ✓ 4 handlers reparados verificados (stopProduction/startProduction, prune_buildkit, canary advance, schemas domain/crons)');
+
+    // 5. Regresiones de las 5 fugas RBAC / IDOR cerradas
+    const scopedDevA = {
+      ok: true,
+      method: 'api_token',
+      principal: { userId: 'usr_dev_a', role: 'developer', teamId: 'team_default', projectIds: [projA.id], scopes: ['*'] }
+    };
+    const teamViewer = {
+      ok: true,
+      method: 'session',
+      principal: { userId: 'usr_tv', role: 'viewer', teamId: 'team_other', projectIds: null, scopes: ['*'] }
+    };
+
+    const origListContainers = dockerManager.listContainers;
+    const origGetCandidates = sleepAdvisor.getSleepCandidates;
+    const origAnalyzeRes = sleepAdvisor.analyzeResources;
+    const origListMons = uptimeMonitor.listMonitors;
+    const origListPages = uptimeMonitor.listStatusPages;
+    let observedAnalyzeProjectIds = null;
+    try {
+      // 5a. docker_containers: sin projectId en el contenedor, team_other no ve nada y scopedDevA solo ve su contenedor
+      dockerManager.listContainers = async () => [
+        { id: 'c_a', names: [`culkibo_${projA.id}_live`], image: 'app:a', state: 'running' },
+        { id: 'c_b', names: [`culkibo_${projB.id}_live`], image: 'app:b', state: 'running' },
+        { id: 'c_sys', names: ['unrelated_host_container'], image: 'sys:1', state: 'running' }
+      ];
+      const devContainers = await mcpServer.executeTool('culkibo_docker_containers', {}, { auth: scopedDevA });
+      assert.strictEqual(devContainers.isError, false);
+      assert.deepStrictEqual(devContainers.structuredContent.containers.map((c) => c.id), ['c_a']);
+      const otherTeamContainers = await mcpServer.executeTool('culkibo_docker_containers', {}, { auth: teamViewer });
+      assert.strictEqual(otherTeamContainers.isError, false);
+      assert.strictEqual(otherTeamContainers.structuredContent.containers.length, 0, 'team_other no debe ver contenedores de otro equipo ni sin propietario');
+
+      // 5b. sleep_status: candidates filtrado por projectIds
+      sleepAdvisor.getSleepCandidates = (opts) => [
+        { projectId: projA.id, idleMinutes: 30 },
+        { projectId: projB.id, idleMinutes: 45 }
+      ].filter((c) => !Array.isArray(opts?.projectIds) || opts.projectIds.includes(c.projectId));
+      const sleepScoped = await mcpServer.executeTool('culkibo_sleep_status', {}, { auth: scopedDevA });
+      assert.strictEqual(sleepScoped.isError, false);
+      assert.deepStrictEqual(sleepScoped.structuredContent.candidates.map((c) => c.projectId), [projA.id]);
+
+      // 5c. cost_advisor: pasa projectIds al advisor
+      sleepAdvisor.analyzeResources = async (opts) => {
+        observedAnalyzeProjectIds = opts?.projectIds || null;
+        return { summary: { freeMemPct: 45 }, recommendations: [], reclaimableRamMb: 0, estimatedMonthlySavingsEur: 0 };
+      };
+      const advScoped = await mcpServer.executeTool('culkibo_cost_advisor', {}, { auth: scopedDevA });
+      assert.strictEqual(advScoped.isError, false);
+      assert.deepStrictEqual(observedAnalyzeProjectIds, [projA.id]);
+
+      // 5d. uptime_list_monitors y culkibo://uptime: statusPages filtradas por monitores permitidos
+      uptimeMonitor.listMonitors = () => [
+        { id: 'mon_a', projectId: projA.id, name: 'Mon A', status: 'up' },
+        { id: 'mon_b', projectId: projB.id, name: 'Mon B', status: 'down' }
+      ];
+      uptimeMonitor.listStatusPages = () => [
+        { slug: 'page-a', title: 'Page A', monitorIds: ['mon_a'] },
+        { slug: 'page-b', title: 'Page B', monitorIds: ['mon_b'] },
+        { slug: 'page-mix', title: 'Page Mix', monitorIds: ['mon_a', 'mon_b'] }
+      ];
+      const upScoped = await mcpServer.executeTool('culkibo_uptime_list_monitors', {}, { auth: scopedDevA });
+      assert.strictEqual(upScoped.isError, false);
+      assert.deepStrictEqual(upScoped.structuredContent.statusPages.map((p) => p.slug), ['page-a']);
+      const upResScoped = await mcpServer.readResource('culkibo://uptime', { auth: scopedDevA });
+      const upResParsed = JSON.parse(upResScoped.contents[0].text);
+      assert.deepStrictEqual(upResParsed.statusPages.map((p) => p.slug), ['page-a']);
+
+      // 5e. gitops_plan con prune: true no filtra projB a scopedDevA
+      const gitopsPlan = await mcpServer.executeTool('culkibo_gitops_plan', {
+        yamlText: 'version: 1\nname: scoped-check\nprojects: []\n',
+        prune: true
+      }, { auth: scopedDevA });
+      assert.strictEqual(gitopsPlan.isError, false);
+      const delSerialized = JSON.stringify(gitopsPlan.structuredContent.delete || []);
+      assert.ok(!delSerialized.includes(projB.id) && !delSerialized.includes(projB.name), 'gitops_plan prune NO debe revelar proyectos ajenos');
+    } finally {
+      dockerManager.listContainers = origListContainers;
+      sleepAdvisor.getSleepCandidates = origGetCandidates;
+      sleepAdvisor.analyzeResources = origAnalyzeRes;
+      uptimeMonitor.listMonitors = origListMons;
+      uptimeMonitor.listStatusPages = origListPages;
+    }
+    console.log('  ✓ 5 fugas RBAC/IDOR cerradas verificadas (docker_containers, sleep_status, cost_advisor, uptime/statusPages, gitops_plan)');
+
+    // 6. Autocuración Autónoma: culkibo_diagnose_incident + culkibo_auto_remediate (dryRun + confirmToken + replay + expiry)
+    const origStatus = deployManager.status;
+    const origRuntimeStats = deployManager.getRuntimeStats;
+    const origRuntimeLogs = deployManager.getRuntimeLogs;
+    const origListDeps = deployManager.listDeployments;
+    const origRunDoctor = systemDoctor.runDoctor;
+    const origUmList = uptimeMonitor.listMonitors;
+    const origUmInc = uptimeMonitor.listIncidents;
+    const origReconcile = ingressManager.reconcile;
+    try {
+      deployManager.status = async () => ({
+        current: { id: 'dep_bad', containerName: `culkibo_${projA.id}_live`, status: 'error' },
+        previous: { id: 'dep_good', containerName: `culkibo_${projA.id}_prev`, status: 'activo' }
+      });
+      deployManager.getRuntimeStats = async () => ({
+        ok: true, running: false, status: 'exited', oomKilled: true, restartCount: 4, health: 'unhealthy', containerName: `culkibo_${projA.id}_live`
+      });
+      deployManager.getRuntimeLogs = async () => ({
+        lines: ['INFO starting server', 'FATAL JavaScript heap out of memory (ENOMEM)', 'ERROR ECONNREFUSED 127.0.0.1:5432']
+      });
+      deployManager.listDeployments = () => [{ id: 'dep_bad', status: 'error', stage: 'healthcheck', commit: 'abc12345', error: 'OOM killed', logLines: [] }];
+      systemDoctor.runDoctor = async () => ({ summary: { ok: 6, warn: 1, fail: 0 }, checks: [{ name: 'BuildKit', status: 'warn', summary: 'cache high', fixAction: 'prune_buildkit' }] });
+      uptimeMonitor.listMonitors = () => [{ id: 'mon_a1', projectId: projA.id, name: 'API Health', status: 'down' }];
+      uptimeMonitor.listIncidents = () => [{ id: 'inc_1', projectId: projA.id, status: 'open' }];
+      ingressManager.reconcile = async () => ({ ok: true, reconciled: true });
+
+      const diag = await mcpServer.executeTool('culkibo_diagnose_incident', { projectId: projA.id }, { auth: scopedDevA });
+      assert.strictEqual(diag.isError, false);
+      const d = diag.structuredContent;
+      assert.strictEqual(d.severity, 'critical');
+      const causeCodes = d.rootCauses.map((r) => r.code);
+      assert.ok(causeCodes.includes('CONTAINER_OOM_KILLED'), 'Debe detectar CONTAINER_OOM_KILLED');
+      assert.ok(causeCodes.includes('CONTAINER_CRASH_LOOP'), 'Debe detectar CONTAINER_CRASH_LOOP');
+      assert.ok(causeCodes.includes('RECENT_DEPLOY_FAILED'), 'Debe detectar RECENT_DEPLOY_FAILED');
+      assert.ok(causeCodes.includes('UPTIME_MONITOR_DOWN'), 'Debe detectar UPTIME_MONITOR_DOWN');
+      assert.ok(d.remediationPlan.some((p) => p.tool === 'culkibo_auto_remediate' && p.action === 'rollback_release' && p.args.dryRun === true));
+
+      // 6a. Ejecutar culkibo_auto_remediate SIN confirmToken -> CONFIRMATION_REQUIRED (0 mutaciones)
+      const noTok = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'toggle_maintenance',
+        projectId: projA.id,
+        maintenanceEnabled: true
+      }, { auth: scopedDevA });
+      assert.strictEqual(noTok.isError, true);
+      assert.strictEqual(JSON.parse(noTok.content[0].text).code, 'CONFIRMATION_REQUIRED');
+      assert.strictEqual(projectManager.getById(projA.id).maintenanceMode, false);
+
+      // 6b. Acción global (doctor_fix) bloqueada con FORBIDDEN para developer / token por proyecto
+      const globalBlocked = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'doctor_fix',
+        doctorFixAction: 'clean_tmp',
+        dryRun: true
+      }, { auth: scopedDevA });
+      assert.strictEqual(globalBlocked.isError, true);
+      assert.strictEqual(JSON.parse(globalBlocked.content[0].text).code, 'FORBIDDEN');
+
+      // 6c. Fase 1 dryRun: true emite confirmToken HMAC-SHA256 y lo redacta de la auditoría
+      const dryRem = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'toggle_maintenance',
+        projectId: projA.id,
+        maintenanceEnabled: true,
+        dryRun: true
+      }, { auth: scopedDevA });
+      assert.strictEqual(dryRem.isError, false);
+      assert.strictEqual(dryRem.structuredContent.dryRun, true);
+      assert.strictEqual(dryRem.structuredContent.wouldExecute, true);
+      const token = dryRem.structuredContent.confirmToken;
+      assert.ok(typeof token === 'string' && token.startsWith('ckr_'), 'Debe emitir confirmToken ckr_...');
+      assert.strictEqual(projectManager.getById(projA.id).maintenanceMode, false, 'dryRun NUNCA muta estado');
+      const auditLatest = mcpServer.getAuditLog(1)[0];
+      assert.ok(!JSON.stringify(auditLatest).includes(token), 'confirmToken NUNCA debe quedar en claro en auditLog');
+
+      // 6d. Robo de token por otro principal -> CONFIRM_TOKEN_MISMATCH
+      const otherDevA = {
+        ok: true,
+        method: 'api_token',
+        principal: { userId: 'usr_dev_other', role: 'developer', teamId: 'team_default', projectIds: [projA.id], scopes: ['*'] }
+      };
+      const stolenTok = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'toggle_maintenance',
+        projectId: projA.id,
+        maintenanceEnabled: true,
+        confirmToken: token
+      }, { auth: otherDevA });
+      assert.strictEqual(stolenTok.isError, true);
+      assert.strictEqual(JSON.parse(stolenTok.content[0].text).code, 'CONFIRM_TOKEN_MISMATCH');
+
+      // 6e. Alteración de parámetros -> CONFIRM_TOKEN_MISMATCH
+      const tamperedParams = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'toggle_maintenance',
+        projectId: projA.id,
+        maintenanceEnabled: false,
+        confirmToken: token
+      }, { auth: scopedDevA });
+      assert.strictEqual(tamperedParams.isError, true);
+      assert.strictEqual(JSON.parse(tamperedParams.content[0].text).code, 'CONFIRM_TOKEN_MISMATCH');
+
+      // 6f. Token caducado -> CONFIRM_TOKEN_EXPIRED
+      const expiredMint = mcpServer.mintRemediationToken(
+        mcpServer.normalizePrincipal(scopedDevA),
+        { action: 'toggle_maintenance', projectId: projA.id, maintenanceEnabled: true },
+        10
+      );
+      await new Promise((r) => setTimeout(r, 25));
+      const expRes = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'toggle_maintenance',
+        projectId: projA.id,
+        maintenanceEnabled: true,
+        confirmToken: expiredMint.confirmToken
+      }, { auth: scopedDevA });
+      assert.strictEqual(expRes.isError, true);
+      const expCode = JSON.parse(expRes.content[0].text).code;
+      assert.ok(expCode === 'CONFIRM_TOKEN_EXPIRED' || expCode === 'CONFIRM_TOKEN_INVALID');
+
+      // 6g. Ejecución legítima con confirmToken válido -> aplica y devuelve postVerification
+      const execRem = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'toggle_maintenance',
+        projectId: projA.id,
+        maintenanceEnabled: true,
+        confirmToken: token
+      }, { auth: scopedDevA });
+      assert.strictEqual(execRem.isError, false);
+      assert.strictEqual(execRem.structuredContent.executed, true);
+      assert.ok(execRem.structuredContent.postVerification);
+      assert.strictEqual(projectManager.getById(projA.id).maintenanceMode, true);
+
+      // 6h. Replay con el mismo token ya consumido -> CONFIRM_TOKEN_REPLAYED
+      const replayRes = await mcpServer.executeTool('culkibo_auto_remediate', {
+        action: 'toggle_maintenance',
+        projectId: projA.id,
+        maintenanceEnabled: true,
+        confirmToken: token
+      }, { auth: scopedDevA });
+      assert.strictEqual(replayRes.isError, true);
+      assert.strictEqual(JSON.parse(replayRes.content[0].text).code, 'CONFIRM_TOKEN_REPLAYED');
+    } finally {
+      deployManager.status = origStatus;
+      deployManager.getRuntimeStats = origRuntimeStats;
+      deployManager.getRuntimeLogs = origRuntimeLogs;
+      deployManager.listDeployments = origListDeps;
+      systemDoctor.runDoctor = origRunDoctor;
+      uptimeMonitor.listMonitors = origUmList;
+      uptimeMonitor.listIncidents = origUmInc;
+      ingressManager.reconcile = origReconcile;
+    }
+    console.log('  ✓ Autocuración autónoma verificada (diagnose_incident + auto_remediate dryRun/confirmToken/mismatch/expiry/exec/replay)');
   } finally {
     projectManager.delete(projA.id);
     projectManager.delete(projB.id);

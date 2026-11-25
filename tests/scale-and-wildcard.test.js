@@ -287,10 +287,10 @@ async function testScaleAndWildcard() {
     maintenanceMode: false
   });
   try {
-    // Verify 104 MCP 2.0 tools registered including new v2 tools
+    // Verify 107 MCP 2.1 tools registered including meta-discovery & self-healing tools
     const listedTools = await mcpServer.handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     const toolNames = (listedTools.result?.tools || []).map((t) => t.name);
-    assert.strictEqual(toolNames.length, 104, `Expected 104 MCP tools, got ${toolNames.length}`);
+    assert.strictEqual(toolNames.length, 107, `Expected 107 MCP tools, got ${toolNames.length}`);
     assert.ok(toolNames.includes('culkibo_link_database'));
     assert.ok(toolNames.includes('culkibo_toggle_maintenance'));
     assert.ok(toolNames.includes('culkibo_get_deploy_queue'));
@@ -298,6 +298,14 @@ async function testScaleAndWildcard() {
     assert.ok(toolNames.includes('culkibo_rbac_whoami'));
     assert.ok(toolNames.includes('culkibo_gitops_apply'));
     assert.ok(toolNames.includes('culkibo_cost_advisor'));
+    assert.ok(toolNames.includes('culkibo_search_tools'));
+    assert.ok(toolNames.includes('culkibo_diagnose_incident'));
+    assert.ok(toolNames.includes('culkibo_auto_remediate'));
+
+    // Verify core profile cuts serialized tools payload by >= 80%
+    const allBuf = mcpServer.getToolsSerialized(null, { profile: 'all' });
+    const coreBuf = mcpServer.getToolsSerialized(null, { profile: 'core' });
+    assert.ok((1 - coreBuf.length / allBuf.length) >= 0.80, 'Core profile must cut payload size by >=80%');
 
     // Verify culkibo_get_project & culkibo_list_projects redact envVar secret values
     const getRes = await mcpServer.handleJsonRpc({
@@ -320,7 +328,7 @@ async function testScaleAndWildcard() {
     const qPayload = qRes.result?.structuredContent || JSON.parse(qRes.result?.content?.[0]?.text || '{}');
     assert.strictEqual(typeof qPayload.maxConcurrentBuilds, 'number');
     assert.strictEqual(typeof qPayload.activeBuilds, 'number');
-    console.log('  ✓ MCP secret redaction verified & all 104 tools (incl. queue/link/maintenance/v2) active');
+    console.log('  ✓ MCP secret redaction verified & all 107 tools (incl. profiles -80%+, self-healing, queue/link/maintenance/v2) active');
   } finally {
     projectManager.delete(secretProj.id);
     await projectManager.flushToDisk();
@@ -413,9 +421,15 @@ async function testScaleAndWildcard() {
     assert.ok(htmlRes.headers['content-security-policy'], 'Static / must emit SPA CSP');
     assert.strictEqual(htmlRes.headers['x-content-type-options'], 'nosniff');
 
-    // Find a real hashed asset inside web/dist/assets and verify br + immutable + ETag + 304
+    // Find a real hashed asset served by the daemon (prefer HTML reference so pre-running daemons match)
+    const zlib = require('zlib');
+    const decodedHtml = htmlRes.headers['content-encoding'] === 'br'
+      ? zlib.brotliDecompressSync(htmlRes.body).toString('utf8')
+      : htmlRes.body.toString('utf8');
+    const htmlAssetMatch = decodedHtml.match(/\/assets\/([A-Za-z0-9_.-]+\.js)/);
     const assetsDir = path.join(__dirname, '..', 'web', 'dist', 'assets');
-    const jsAsset = fs.readdirSync(assetsDir).find((f) => f.endsWith('.js') && fs.existsSync(path.join(assetsDir, `${f}.br`)));
+    const jsAsset = (htmlAssetMatch && htmlAssetMatch[1])
+      || fs.readdirSync(assetsDir).find((f) => f.endsWith('.js') && fs.existsSync(path.join(assetsDir, `${f}.br`)));
     assert.ok(jsAsset, 'Expected at least one pre-compressed .js.br bundle in web/dist/assets');
     const assetRes = await rawHttpGet(`/assets/${jsAsset}`, { 'Accept-Encoding': 'br, gzip' });
     assert.strictEqual(assetRes.status, 200);
@@ -446,9 +460,11 @@ async function testScaleAndWildcard() {
 }
 
 if (require.main === module) {
-  testScaleAndWildcard().then(() => process.exit(0)).catch((err) => {
+  testScaleAndWildcard().then(() => {
+    setTimeout(() => process.exit(0), 50);
+  }).catch((err) => {
     console.error(err);
-    process.exit(1);
+    setTimeout(() => process.exit(1), 50);
   });
 }
 

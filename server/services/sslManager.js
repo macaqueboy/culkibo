@@ -73,7 +73,18 @@ const ALLOWED_SSLIP_SERVICES = new Set(['sslip.io', 'nip.io']);
 const MANAGED_BY_CADDY = 'caddy_on_demand';
 
 class SslManager {
-  constructor() {
+  /**
+   * @param {{ dataDir?: string | null, certsDir?: string | null }} [opts]
+   */
+  constructor(opts = {}) {
+    this.certsDir = opts.certsDir
+      ? path.resolve(opts.certsDir)
+      : (opts.dataDir
+          ? path.join(path.resolve(opts.dataDir), 'certs')
+          : (process.env.CULKIBO_DATA_DIR
+              ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data', 'certs')
+              : CERTS_DIR));
+    this.registryFile = path.join(this.certsDir, 'registry.json');
     this.ensureDirectory();
     // Caché del X.509 ya parseado, con clave (ruta, mtime, tamaño).
     //
@@ -93,14 +104,14 @@ class SslManager {
   }
 
   ensureDirectory() {
-    if (!fs.existsSync(CERTS_DIR)) {
-      fs.mkdirSync(CERTS_DIR, { recursive: true });
+    if (!fs.existsSync(this.certsDir)) {
+      fs.mkdirSync(this.certsDir, { recursive: true });
     }
   }
 
   loadRegistry() {
     let stored = [];
-    const loaded = loadJsonWithBackupSync(REGISTRY_FILE, {
+    const loaded = loadJsonWithBackupSync(this.registryFile, {
       validate: (parsed) => Array.isArray(parsed)
     });
     if (loaded.ok && Array.isArray(loaded.data)) {
@@ -172,7 +183,7 @@ class SslManager {
   deleteFabricatedFiles(entry) {
     /** @type {Set<string>} */
     const parentDirs = new Set();
-    const certsRoot = path.resolve(CERTS_DIR);
+    const certsRoot = path.resolve(this.certsDir);
     for (const p of [entry.certPath, entry.keyPath]) {
       if (!p) continue;
       const resolved = path.resolve(String(p));
@@ -234,8 +245,9 @@ class SslManager {
         issuer: this.extractName(x509.issuer),
         subject: this.extractName(x509.subject),
         sans: (x509.subjectAltName || '')
-          .split(',')
-          .map(s => s.trim().replace(/^DNS:/i, '').toLowerCase())
+          .split(/,\s*/)
+          .filter(s => /^DNS:/i.test(s.trim()))
+          .map(s => s.trim().replace(/^DNS:/i, '').trim().toLowerCase())
           .filter(Boolean),
         notBefore: Number.isNaN(notBefore.getTime()) ? null : notBefore.toISOString(),
         notAfter: Number.isNaN(notAfter.getTime()) ? null : notAfter.toISOString(),
@@ -259,9 +271,10 @@ class SslManager {
   }
 
   saveRegistry() {
+    if (this._corruptReadOnly) return;
     this.ensureDirectory();
     this.version++;
-    atomicWriteJsonSync(REGISTRY_FILE, this.registry, 0o600);
+    atomicWriteJsonSync(this.registryFile, this.registry, 0o600);
   }
 
   /**
@@ -378,11 +391,11 @@ class SslManager {
     const rootDomain = String(domain || '').replace(/^\*\./, '').toLowerCase();
     const wildcardDomain = rootDomain ? `*.${rootDomain}` : '*';
 
+    const supportedDnsProviders = ['cloudflare', 'hetzner', 'digitalocean', 'route53', 'porkbun', 'bunny', 'duckdns'];
     const error =
-      'La emisión de certificados comodín por ACME DNS-01 no está implementada en Culkibo. ' +
-      'El TLS lo emite Caddy bajo demanda en el primer handshake de cada host, y el certificado ' +
-      'vive en el volumen de Caddy, no en data/certs/. Para un comodín de verdad hace falta ' +
-      'compilar Caddy con el módulo caddy-dns/cloudflare (xcaddy) y darle el token de Cloudflare. ' +
+      'La emisión de certificados comodín por ACME DNS-01 no está implementada directamente en sslManager. ' +
+      'El TLS lo emite Caddy en el plano de datos (On-Demand TLS para hosts individuales o políticas DNS-01 ' +
+      `nativas multiproveedor en /api/ingress/wildcard-dns01: ${supportedDnsProviders.join(', ')}). ` +
       'Antes esta llamada escribía un PEM inventado: se ha eliminado.';
 
     const payload = {
@@ -392,6 +405,8 @@ class SslManager {
       progress: 100,
       message: error,
       code: 'WILDCARD_ACME_NO_IMPLEMENTADO',
+      supportedDnsProviders,
+      recommendedEndpoint: 'POST /api/ingress/wildcard-dns01',
       error
     };
     if (typeof onProgress === 'function') onProgress(payload);
@@ -401,7 +416,9 @@ class SslManager {
       implemented: false,
       code: 'WILDCARD_ACME_NO_IMPLEMENTADO',
       error,
-      alternative: 'on_demand_tls',
+      alternative: 'caddy_dns01_policy',
+      supportedDnsProviders,
+      recommendedEndpoint: 'POST /api/ingress/wildcard-dns01',
       domain: wildcardDomain,
       zoneId: zoneId || null,
       provider
@@ -559,8 +576,12 @@ class SslManager {
     }
 
     const rootDomain = detectedDomain.replace(/^\*\./, '');
-    const safeSlug = rootDomain.replace(/[^a-z0-9.-]/g, '_');
-    const certDir = path.join(CERTS_DIR, `custom_${safeSlug}_${Date.now()}`);
+    const safeSlug = rootDomain.replace(/[^a-z0-9.-]/g, '_').replace(/\.+/g, '.').replace(/^\.+|\.+$/g, '') || 'cert';
+    const certsRoot = path.resolve(this.certsDir);
+    const certDir = path.resolve(this.certsDir, `custom_${safeSlug}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`);
+    if (!certDir.startsWith(certsRoot + path.sep)) {
+      throw new Error('Ruta de destino de certificado fuera del directorio permitido');
+    }
     fs.mkdirSync(certDir, { recursive: true, mode: 0o700 });
 
     const certPath = path.join(certDir, 'fullchain.pem');
@@ -627,8 +648,8 @@ class SslManager {
       let certPath = entry.certPath;
       let keyPath = entry.keyPath;
       if (containerMountPrefix) {
-        const relCert = path.relative(CERTS_DIR, entry.certPath).replace(/\\/g, '/');
-        const relKey = path.relative(CERTS_DIR, entry.keyPath).replace(/\\/g, '/');
+        const relCert = path.relative(this.certsDir, entry.certPath).replace(/\\/g, '/');
+        const relKey = path.relative(this.certsDir, entry.keyPath).replace(/\\/g, '/');
         if (!relCert.startsWith('..') && !relKey.startsWith('..')) {
           certPath = `${containerMountPrefix.replace(/\/+$/, '')}/${relCert}`;
           keyPath = `${containerMountPrefix.replace(/\/+$/, '')}/${relKey}`;

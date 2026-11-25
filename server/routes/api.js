@@ -56,6 +56,11 @@ function getEnvironmentManager() { return _lazyV2.env || (_lazyV2.env = require(
 function getGitOpsManager() { return _lazyV2.gitops || (_lazyV2.gitops = require('../services/gitopsManager')); }
 function getUptimeMonitor() { return _lazyV2.uptime || (_lazyV2.uptime = require('../services/uptimeMonitor')); }
 function getSleepAdvisor() { return _lazyV2.sleep || (_lazyV2.sleep = require('../services/sleepAdvisor')); }
+function getMetricsHistory() { return _lazyV2.mh || (_lazyV2.mh = require('../services/metricsHistory')); }
+function getAlertEngine() { return _lazyV2.ae || (_lazyV2.ae = require('../services/alertEngine')); }
+function getTopologyService() { return _lazyV2.topo || (_lazyV2.topo = require('../services/topologyService')); }
+function getOidcService() { return _lazyV2.oidc || (_lazyV2.oidc = require('../services/oidcService')); }
+function getSecretScanner() { return _lazyV2.scanner || (_lazyV2.scanner = require('../services/secretScanner')); }
 
 /** @param {any} req */
 function getPrincipal(req) {
@@ -242,7 +247,12 @@ const RBAC_PUBLIC_PATHS = new Set([
   '/webhooks/github',
   '/webhooks/gitlab',
   '/webhooks/gitea',
-  '/webhooks/bitbucket'
+  '/webhooks/bitbucket',
+  '/auth/2fa/setup',
+  '/auth/2fa/verify',
+  '/auth/oidc/authorize',
+  '/auth/oidc/callback',
+  '/auth/oidc/providers'
 ]);
 const rbacGuard = requireRouteRbac();
 router.use((req, res, next) => {
@@ -4665,6 +4675,179 @@ router.post('/projects/:id/canary/abort', certAndAdminLimiter, async (req, res) 
   } catch (err) {
     sendServiceError(err, res, 400);
   }
+});
+
+// ===== v1.1 ENDPOINTS =====
+
+// --- OBSERVABILITY v1.1 ---
+router.get('/observability/history', (req, res) => {
+  try {
+    const data = getMetricsHistory().query({ range: req.query.range || '1h', projectId: req.query.projectId || null });
+    res.json(data);
+  } catch (err) { sendServiceError(err, res); }
+});
+router.get('/observability/alerts', (req, res) => {
+  try { res.json({ alerts: getAlertEngine().listAlerts({ status: req.query.status || 'all' }) }); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/observability/alerts', (req, res) => {
+  try { res.status(201).json(getAlertEngine().createRule(req.body)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.put('/observability/alerts/:id', (req, res) => {
+  try { res.json(getAlertEngine().updateRule(req.params.id, req.body)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.delete('/observability/alerts/:id', (req, res) => {
+  try { getAlertEngine().deleteRule(req.params.id); res.json({ success: true }); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/observability/alerts/:id/acknowledge', (req, res) => {
+  try { getAlertEngine().acknowledge(req.params.id); res.json({ success: true }); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/observability/topology', (req, res) => {
+  try { res.json(getTopologyService().getTopology()); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/observability/logs/search', (req, res) => {
+  try {
+    const co = require('../services/containerOrchestrator');
+    res.json(co.getLogs({ search: req.query.q || '', level: req.query.level || null, projectId: req.query.projectId || null, since: req.query.since || null, limit: Math.min(Number(req.query.limit) || 100, 1000) }));
+  } catch (err) { sendServiceError(err, res); }
+});
+
+// --- EDGE / INGRESS v1.1 ---
+router.get('/ingress/dns-providers', (req, res) => {
+  try { res.json({ providers: caddyManager.listDnsProviders() }); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/ingress/http3', async (req, res) => {
+  try { res.json(await caddyManager.probeHttp3()); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/cloudflare/tunnels/connector/status', async (req, res) => {
+  try { res.json(await cloudflareService.getCloudflaredStatus(req.query)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/cloudflare/tunnels/connector/logs', async (req, res) => {
+  try { res.json(await cloudflareService.getCloudflaredLogs(req.query)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/cloudflare/tunnels/connector/stop', async (req, res) => {
+  try { res.json(await cloudflareService.stopCloudflaredDocker(req.body || {})); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/cloudflare/tunnels/:tunnelId/all-to-caddy', async (req, res) => {
+  try { res.json(await cloudflareService.configureAllResourcesTunnel({ tunnelId: req.params.tunnelId, ...req.body })); }
+  catch (err) { sendServiceError(err, res); }
+});
+
+// --- SECURITY v1.1 ---
+router.post('/auth/2fa/setup', sensitiveAuthLimiter, (req, res) => {
+  try { res.json(getTeamManager().setup2FA((getPrincipal(req).userId || getPrincipal(req).tokenId))); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/auth/2fa/verify', sensitiveAuthLimiter, (req, res) => {
+  try { res.json(getTeamManager().verify2FA((getPrincipal(req).userId || getPrincipal(req).tokenId), req.body.code)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/auth/2fa/disable', sensitiveAuthLimiter, (req, res) => {
+  try { res.json(getTeamManager().disable2FA((getPrincipal(req).userId || getPrincipal(req).tokenId), req.body.code)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/auth/oidc/providers', (req, res) => {
+  try { res.json({ providers: getOidcService().listProviders() }); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/auth/oidc/authorize', (req, res) => {
+  try { const r = getOidcService().getAuthorizationUrl(req.query.provider); res.json(r); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/auth/oidc/callback', async (req, res) => {
+  try { res.json(await getOidcService().handleCallback(req.body)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/security/audit-log', (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json({ entries: auditLogger.query({ limit: Math.min(Number(req.query.limit) || 100, 1000), since: req.query.since || null, action: req.query.action || null }) });
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/security/audit-log/verify', (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(auditLogger.verifyIntegrity());
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/security/scan-secrets', async (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(await getSecretScanner().scan(req.body));
+  } catch (err) { sendServiceError(err, res); }
+});
+
+// --- GITOPS v1.1 ---
+router.get('/gitops/schema.json', (req, res) => {
+  try { res.json(getGitOpsManager().getJsonSchema()); }
+  catch (err) { sendServiceError(err, res); }
+});
+
+// --- DATABASE v1.1 ---
+router.post('/databases/:id/pooler', async (req, res) => {
+  try { res.json(await databaseManager.configurePooler(req.params.id, req.body)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/databases/:id/clone', async (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(await databaseManager.cloneDatabase(req.params.id, req.body));
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/backup/verify', async (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(await dbBackupManager.verifyBackup(req.body));
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/backup/restore-drill', async (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(await dbBackupManager.runRestoreDrill(req.body));
+  } catch (err) { sendServiceError(err, res); }
+});
+
+// --- FLEET v1.1 ---
+router.post('/fleet/servers/:id/maintenance', async (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(await getFleetManager().setMaintenanceMode(req.params.id, req.body));
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/fleet/servers/:id/drain', async (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(await getFleetManager().drainNode(req.params.id, req.body));
+  } catch (err) { sendServiceError(err, res); }
+});
+router.get('/fleet/bootstrap', (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.setHeader('Content-Type', 'text/x-shellscript');
+    res.send(getFleetManager().generateBootstrapScript(req.query));
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/fleet/servers/:id/containers', async (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(await getFleetManager().remoteContainerOp(req.params.id, req.body));
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/fleet/placement', (req, res) => {
+  try {
+    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
+    res.json(getFleetManager().computePlacement(req.body));
+  } catch (err) { sendServiceError(err, res); }
 });
 
 module.exports = router;

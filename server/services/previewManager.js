@@ -79,14 +79,36 @@ function computePreviewIdentity(project, { prNumber = null, branch = null } = {}
 }
 
 class PreviewManager extends EventEmitter {
-  constructor(storeFile = STORE_FILE) {
+  /**
+   * @param {string | { storeFile?: string, dataDir?: string, workDir?: string }} [storeFileOrOpts]
+   */
+  constructor(storeFileOrOpts = STORE_FILE) {
     super();
-    this.storeFile = storeFile;
-    this.storeBakFile = `${storeFile}.bak`;
+    if (storeFileOrOpts && typeof storeFileOrOpts === 'object') {
+      const baseDataDir = storeFileOrOpts.dataDir ? path.resolve(storeFileOrOpts.dataDir) : DATA_DIR;
+      this.storeFile = storeFileOrOpts.storeFile ? path.resolve(storeFileOrOpts.storeFile) : path.join(baseDataDir, 'previews.json');
+      this.workDir = storeFileOrOpts.workDir ? path.resolve(storeFileOrOpts.workDir) : path.join(baseDataDir, '.previews');
+      this.tmpDir = path.join(baseDataDir, '.tmp');
+    } else {
+      this.storeFile = typeof storeFileOrOpts === 'string' && storeFileOrOpts ? storeFileOrOpts : STORE_FILE;
+      this.workDir = PREVIEWS_WORK_DIR;
+      this.tmpDir = path.join(DATA_DIR, '.tmp');
+    }
+    this.storeBakFile = `${this.storeFile}.bak`;
     /** @type {Record<string, Record<string, any>>} */
     this.store = {};
     /** @type {Set<string>} */
     this.inFlightKeys = new Set();
+    /**
+     * Construcciones preview activas por `projectId:key` con `AbortController` propio
+     * (permite cancelar al cerrar PR sin dejar huérfanos y reemplazar en pushes rápidos).
+     * @type {Map<string, { controller: AbortController, cancelled: boolean, destroyed: boolean, superseded: boolean, containerName: string, imageTag: string, promise: Promise<any> | null }>}
+     */
+    this._activeBuilds = new Map();
+    /** Ganchos inyectables para pruebas aisladas sin mutar singletons globales. */
+    this._getDeployManager = () => getDeployManager();
+    this._getIngressManager = () => getIngressManager();
+    this._getRepoSync = () => getRepoSync();
     /** @type {ReturnType<typeof setInterval> | null} */
     this._reaperTimer = null;
     this._loaded = false;
@@ -179,10 +201,14 @@ class PreviewManager extends EventEmitter {
 
   /**
    * Despliega o actualiza una vista previa efímera para una rama o Pull Request.
+   * Soporta cancelación cooperativa (`AbortController`) al cerrar la PR sin huérfanos,
+   * reemplazo automático (`supersede`) ante pushes rápidos, variables de entorno
+   * específicas de preview (`previewDeployments.envVars`), `buildSecrets` y `phaseTimings`.
+   *
    * @param {any} project
-   * @param {{ branch?: string, prNumber?: number | string | null, commit?: string | null, isFork?: boolean, title?: string | null }} [opts]
+   * @param {{ branch?: string, prNumber?: number | string | null, commit?: string | null, isFork?: boolean, title?: string | null, supersede?: boolean, buildSecrets?: Record<string, string> | null }} [opts]
    */
-  async deployPreview(project, { branch = '', prNumber = null, commit = null, isFork = false, title = null } = {}) {
+  async deployPreview(project, { branch = '', prNumber = null, commit = null, isFork = false, title = null, supersede = true, buildSecrets = null } = {}) {
     this._ensureLoaded();
     if (!project || !project.id) throw new Error('Proyecto inválido');
     const cfg = project.previewDeployments || {};
@@ -198,16 +224,28 @@ class PreviewManager extends EventEmitter {
     }
 
     const lockKey = `${project.id}:${identity.key}`;
-    if (this.inFlightKeys.has(lockKey)) {
-      const err = new Error(`Ya hay un despliegue preview en curso para ${identity.key}`);
-      /** @type {any} */ (err).status = 409;
-      throw err;
+    while (this._activeBuilds.has(lockKey) || this.inFlightKeys.has(lockKey)) {
+      const prevActive = this._activeBuilds.get(lockKey);
+      if (!supersede || !prevActive) {
+        const err = new Error(`Ya hay un despliegue preview en curso para ${identity.key}`);
+        /** @type {any} */ (err).status = 409;
+        throw err;
+      }
+      prevActive.cancelled = true;
+      prevActive.superseded = true;
+      try { prevActive.controller.abort(new Error('Vista previa reemplazada por un nuevo push')); } catch (e) {}
+      if (prevActive.promise) {
+        await prevActive.promise.catch(() => {});
+      } else {
+        break;
+      }
     }
-    this.inFlightKeys.add(lockKey);
 
-    const dm = getDeployManager();
-    const ing = getIngressManager();
-    const rs = getRepoSync();
+    const dm = this._getDeployManager();
+    const dmDefaults = dm.DEFAULTS || getDeployManager().DEFAULTS;
+    const dmHelpers = dm.helpers || getDeployManager().helpers;
+    const ing = this._getIngressManager();
+    const rs = this._getRepoSync();
 
     if (!this.store[project.id]) this.store[project.id] = {};
     const existing = this.store[project.id][identity.key];
@@ -229,228 +267,377 @@ class PreviewManager extends EventEmitter {
     const safeKey = dnsLabel(identity.key, 20).replace(/-/g, '_');
     const containerName = `culkibo_prev_${safeProj}_${safeKey}_${suffix}`;
     const imageTag = `culkibo/prev-${dnsLabel(project.id, 24)}:${dnsLabel(identity.key, 24)}`;
-    const checkoutDir = path.join(PREVIEWS_WORK_DIR, project.id, identity.key);
+    const checkoutDir = path.join(this.workDir, project.id, identity.key);
 
-    /** @type {any} */
-    const record = {
-      key: identity.key,
-      projectId: project.id,
-      projectName: project.name || project.id,
-      branch: String(branch || project.gitBranch || 'main'),
-      prNumber: prNumber != null ? Number(prNumber) || String(prNumber) : null,
-      title: title ? String(title).slice(0, 140) : null,
-      commit: commit || null,
-      hostname: identity.hostname,
-      url: `https://${identity.hostname}`,
-      status: 'building',
+    const controller = new AbortController();
+    /** @type {{ controller: AbortController, cancelled: boolean, destroyed: boolean, superseded: boolean, containerName: string, imageTag: string, promise: Promise<any> | null }} */
+    const buildEntry = {
+      controller,
+      cancelled: false,
+      destroyed: false,
+      superseded: false,
       containerName,
       imageTag,
-      hostPort: null,
-      containerPort: null,
-      upstream: null,
-      error: null,
-      createdAt: existing?.createdAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + ttlHours * 3600 * 1000).toISOString()
+      promise: null
     };
-    const previousRecord = existing ? { ...existing } : null;
-    this.store[project.id][identity.key] = record;
-    this.save();
-    this.emit('preview_event', { action: 'building', preview: record });
 
-    /** @type {number | null} */
-    let hostPort = null;
-    /** @type {string | null} */
-    let envFile = null;
-    const portOwner = `prev_${identity.key}_${suffix}`;
-    try {
-      const docker = await dm.detectDocker({ force: true });
-      if (!docker.available) throw new Error(docker.reason || 'Docker no disponible');
-
-      // 1. Clonar / sincronizar rama en directorio aislado de previews
-      fs.mkdirSync(path.dirname(checkoutDir), { recursive: true });
-      const sync = await rs.sync({ ...project, gitBranch: record.branch }, {
-        targetDir: checkoutDir,
-        commit: commit || null
-      });
-      if (!sync.ok) throw new Error(sync.error || 'Error obteniendo código de la rama preview');
-      if (sync.commit) record.commit = sync.shortCommit || sync.commit.slice(0, 7);
-
-      const contextDir = project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.'
-        ? assertContainedPath(checkoutDir, String(project.baseDirectory).replace(/^\/+/, ''))
-        : checkoutDir;
-
-      // 2. Estrategia + build protegido por el semáforo global de deployManager
-      const strategy = await dm.detectStrategy(contextDir, project);
-      if (strategy.builder === 'generated' && strategy.stack === 'desconocido') {
-        throw new Error('No se detectó Dockerfile ni stack compatible para construir la preview');
-      }
-
-      const linkedDb = dm.resolveLinkedDatabases(project);
-      const envVars = {
-        ...linkedDb.injectedEnv,
-        ...(project.envVars || {}),
-        CULKIBO_PREVIEW: '1',
-        CULKIBO_PREVIEW_BRANCH: record.branch,
-        CULKIBO_PREVIEW_URL: record.url
-      };
-
-      await dm.acquireBuildSlot(project.id, `prev_${identity.key}`);
-      try {
-        const fakeDep = {
-          id: portOwner,
-          projectId: project.id,
-          projectName: project.name,
-          imageTag,
-          logLines: []
-        };
-        const buildRes = await dm.runBuild(fakeDep, {
-          strategy,
-          contextDir,
-          project,
-          opts: dm.DEFAULTS,
-          envVars
-        });
-        if (!buildRes.ok) throw new Error(buildRes.error || 'Error construyendo imagen preview');
-      } finally {
-        dm.releaseBuildSlot();
-      }
-
-      // 3. Arrancar contenedor preview con límites estrictos (sin fugar env del host)
-      await dm.ensureNetwork(dm.DEFAULTS.network);
-      hostPort = await dm.findFreePort(20000, portOwner);
-      record.hostPort = hostPort;
-      record.containerPort = strategy.containerPort;
-
-      const memCap = Math.min(Number(cfg.memoryMb) || 512, Number(project.memoryMb) || 512);
-      const validEnvNames = Object.keys(envVars).filter(dm.helpers.isValidEnvName);
-      const blocklist = dm.helpers.HOST_HIJACK_ENV_BLOCKLIST || new Set();
-      const inlineEnvNames = validEnvNames.filter((k) => !blocklist.has(k.toUpperCase()));
-      const fileOnlyEnvNames = validEnvNames.filter((k) => blocklist.has(k.toUpperCase()));
-
-      if (fileOnlyEnvNames.length > 0) {
-        const tmpDir = path.join(DATA_DIR, '.tmp');
-        fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
-        envFile = path.join(tmpDir, `prevenv_${crypto.randomBytes(8).toString('hex')}`);
-        /** @type {Record<string, any>} */
-        const fileOnlyObj = {};
-        for (const k of fileOnlyEnvNames) fileOnlyObj[k] = envVars[k];
-        fs.writeFileSync(envFile, formatDockerEnvFile(fileOnlyObj), { encoding: 'utf8', mode: 0o600 });
-      }
-
-      const runArgs = dm.runArgs({
+    const runPreviewBuild = async () => {
+      /** @type {any} */
+      const record = {
+        key: identity.key,
+        projectId: project.id,
+        projectName: project.name || project.id,
+        branch: String(branch || project.gitBranch || 'main'),
+        prNumber: prNumber != null ? Number(prNumber) || String(prNumber) : null,
+        title: title ? String(title).slice(0, 140) : null,
+        commit: commit || null,
+        hostname: identity.hostname,
+        url: `https://${identity.hostname}`,
+        status: 'building',
         containerName,
         imageTag,
-        hostPort,
-        containerPort: strategy.containerPort,
-        envNames: inlineEnvNames,
-        envFile,
-        network: dm.DEFAULTS.network,
-        memoryMb: Math.max(64, memCap),
-        cpus: '0.5',
-        pidsLimit: 256,
-        labels: {
-          'culkibo.managed': 'true',
-          'com.culkibo.project': dm.helpers.safeSlug(project.id),
-          'com.culkibo.project_id': project.id,
-          'com.culkibo.preview': 'true',
-          'com.culkibo.preview_key': identity.key
-        }
-      });
-
-      const safeEnv = { ...process.env, ...dm.helpers.filterSafeHostEnv(envVars) };
-      const run = await dm.runDocker(runArgs, { timeoutMs: 60000, env: safeEnv });
-      if (run.code !== 0) {
-        throw new Error((run.stderr || '').trim().slice(0, 400) || `docker run terminó con código ${run.code}`);
-      }
-
-      for (const dbNet of linkedDb.networks || []) {
-        if (dbNet !== dm.DEFAULTS.network) {
-          await dm.runDocker(['network', 'connect', dbNet, containerName], { timeoutMs: 10000 }).catch(() => {});
-        }
-      }
-
-      // 4. Healthcheck
-      const health = await dm.waitForHealth({
-        hostPort,
-        containerPort: strategy.containerPort,
-        healthPath: strategy.healthPath,
-        containerName,
-        hostHeader: record.hostname,
-        timeoutMs: 30000,
-        intervalMs: 1000
-      });
-      if (!health.healthy) {
-        await dm.runDocker(['rm', '-f', containerName], { timeoutMs: 15000 }).catch(() => {});
-        throw new Error(`Preview no pasó el healthcheck: ${health.reason}`);
-      }
-
-      const upstream = await dm.resolveUpstream({
-        containerName,
-        containerPort: strategy.containerPort,
-        hostPort,
-        network: dm.DEFAULTS.network
-      });
-      record.upstream = upstream.dial;
-      record.status = 'active';
-      record.error = null;
-      record.updatedAt = new Date().toISOString();
+        hostPort: null,
+        containerPort: null,
+        upstream: null,
+        phaseTimings: {},
+        error: null,
+        createdAt: existing?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + ttlHours * 3600 * 1000).toISOString()
+      };
+      const previousRecord = existing ? { ...existing } : null;
+      if (!this.store[project.id]) this.store[project.id] = {};
+      this.store[project.id][identity.key] = record;
       this.save();
+      this.emit('preview_event', { action: 'building', preview: record });
 
-      // 5. Publicar ruta en ingressManager + Caddy
-      ing.previewRoutes.set(`${project.id}_${identity.key}`, {
-        hostname: record.hostname,
-        upstream: record.upstream,
-        projectId: project.id,
-        prNumber: record.prNumber || identity.key
-      });
-      await ing.reconcile().catch(() => {});
-
-      // Retirar contenedor preview anterior de esta misma clave si existía
-      if (previousRecord && previousRecord.containerName && previousRecord.containerName !== containerName) {
-        await dm.runDocker(['rm', '-f', previousRecord.containerName], { timeoutMs: 15000 }).catch(() => {});
-      }
-
-      this.emit('preview_event', { action: 'active', preview: record });
-      return record;
-    } catch (err) {
-      // Si ya existía una preview activa sana, preservar su containerName/upstream para no dejar huérfanos
-      if (previousRecord && previousRecord.status === 'active' && previousRecord.containerName) {
-        this.store[project.id][identity.key] = {
-          ...previousRecord,
-          lastBuildError: err.message || 'Error reconstruyendo vista previa',
-          updatedAt: new Date().toISOString()
+      /** @type {{ name: string, startedAtMs: number } | null} */
+      let activePhase = null;
+      const closePhase = (nowMs = Date.now()) => {
+        if (!activePhase) return;
+        const entry = record.phaseTimings[activePhase.name];
+        if (entry && entry.finishedAt === null) {
+          entry.finishedAt = new Date(nowMs).toISOString();
+          entry.durationMs = Math.max(0, nowMs - activePhase.startedAtMs);
+        }
+        activePhase = null;
+      };
+      const enterPhase = (name) => {
+        const nowMs = Date.now();
+        closePhase(nowMs);
+        record.phaseTimings[name] = {
+          startedAt: new Date(nowMs).toISOString(),
+          finishedAt: null,
+          durationMs: null
         };
-      } else {
-        record.status = 'failed';
-        record.error = err.message || 'Error en vista previa';
+        activePhase = { name, startedAtMs: nowMs };
+      };
+
+      const checkAborted = () => {
+        if (buildEntry.cancelled || controller.signal.aborted) {
+          const msg = buildEntry.superseded
+            ? 'Vista previa reemplazada por un nuevo push'
+            : 'Vista previa cancelada durante la construcción';
+          const err = new Error(msg);
+          /** @type {any} */ (err).code = buildEntry.superseded ? 'PREVIEW_SUPERSEDED' : 'PREVIEW_ABORTED';
+          throw err;
+        }
+      };
+
+      /** @type {number | null} */
+      let hostPort = null;
+      /** @type {string | null} */
+      let envFile = null;
+      let containerStarted = false;
+      const portOwner = `prev_${identity.key}_${suffix}`;
+      try {
+        const docker = await dm.detectDocker({ force: true });
+        if (!docker.available) throw new Error(docker.reason || 'Docker no disponible');
+        checkAborted();
+
+        // 1. Clonar / sincronizar rama en directorio aislado de previews
+        enterPhase('sync');
+        fs.mkdirSync(path.dirname(checkoutDir), { recursive: true });
+        const sync = await rs.sync({ ...project, gitBranch: record.branch }, {
+          targetDir: checkoutDir,
+          commit: commit || null,
+          signal: controller.signal
+        });
+        checkAborted();
+        if (sync.aborted) {
+          buildEntry.cancelled = true;
+          checkAborted();
+        }
+        if (!sync.ok) throw new Error(sync.error || 'Error obteniendo código de la rama preview');
+        if (sync.commit) record.commit = sync.shortCommit || sync.commit.slice(0, 7);
+
+        // Conservar raíz si es monorepo (pnpm/yarn/turbo/nx) para no cortar lockfiles/packages
+        let contextDir = checkoutDir;
+        /** @type {any} */
+        let monorepoCtx = null;
+        if (project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
+          monorepoCtx = typeof dm.detectMonorepoContext === 'function'
+            ? dm.detectMonorepoContext(checkoutDir, project.baseDirectory)
+            : null;
+          if (!monorepoCtx) {
+            contextDir = assertContainedPath(checkoutDir, String(project.baseDirectory).replace(/^\/+/, ''));
+          }
+        }
+
+        // 2. Estrategia + build protegido por el semáforo global de deployManager
+        enterPhase('detect');
+        const strategy = await dm.detectStrategy(contextDir, project, {
+          workspacePath: monorepoCtx ? monorepoCtx.workspacePath : null,
+          workspaceTool: monorepoCtx ? monorepoCtx.workspaceTool : null,
+          workspacePackageName: monorepoCtx ? monorepoCtx.workspacePackageName : null
+        });
+        checkAborted();
+        if (strategy.builder === 'generated' && strategy.stack === 'desconocido') {
+          throw new Error('No se detectó Dockerfile ni stack compatible para construir la preview');
+        }
+
+        const linkedDb = dm.resolveLinkedDatabases(project);
+        const scopedPreviewEnv = (cfg.envVars && typeof cfg.envVars === 'object' && !Array.isArray(cfg.envVars))
+          ? cfg.envVars
+          : {};
+        const envVars = {
+          ...linkedDb.injectedEnv,
+          ...(project.envVars || {}),
+          ...scopedPreviewEnv,
+          CULKIBO_PREVIEW: '1',
+          CULKIBO_PREVIEW_BRANCH: record.branch,
+          CULKIBO_PREVIEW_URL: record.url
+        };
+        const mergedBuildSecrets = {
+          ...(project.buildSecrets && typeof project.buildSecrets === 'object' ? project.buildSecrets : {}),
+          ...(cfg.buildSecrets && typeof cfg.buildSecrets === 'object' ? cfg.buildSecrets : {}),
+          ...(buildSecrets && typeof buildSecrets === 'object' ? buildSecrets : {})
+        };
+        const effectiveProject = Object.keys(mergedBuildSecrets).length > 0
+          ? { ...project, buildSecrets: mergedBuildSecrets }
+          : project;
+
+        enterPhase('queue');
+        await dm.acquireBuildSlot(project.id, `prev_${identity.key}`, { signal: controller.signal });
+        try {
+          checkAborted();
+          enterPhase('build');
+          const fakeDep = {
+            id: portOwner,
+            projectId: project.id,
+            projectName: project.name,
+            imageTag,
+            logLines: []
+          };
+          const buildRes = await dm.runBuild(fakeDep, {
+            strategy,
+            contextDir,
+            project: effectiveProject,
+            opts: dmDefaults,
+            envVars,
+            signal: controller.signal
+          });
+          checkAborted();
+          if (buildRes.aborted) {
+            buildEntry.cancelled = true;
+            checkAborted();
+          }
+          if (!buildRes.ok) throw new Error(buildRes.error || 'Error construyendo imagen preview');
+        } finally {
+          dm.releaseBuildSlot();
+        }
+
+        checkAborted();
+
+        // 3. Arrancar contenedor preview con límites estrictos (sin fugar env del host)
+        enterPhase('start');
+        await dm.ensureNetwork(dmDefaults.network);
+        hostPort = await dm.findFreePort(20000, portOwner);
+        record.hostPort = hostPort;
+        record.containerPort = strategy.containerPort;
+
+        const memCap = Math.min(Number(cfg.memoryMb) || 512, Number(project.memoryMb) || 512);
+        const validEnvNames = Object.keys(envVars).filter(dmHelpers.isValidEnvName);
+        const blocklist = dmHelpers.HOST_HIJACK_ENV_BLOCKLIST || new Set();
+        const inlineEnvNames = validEnvNames.filter((k) => !blocklist.has(k.toUpperCase()));
+        const fileOnlyEnvNames = validEnvNames.filter((k) => blocklist.has(k.toUpperCase()));
+
+        if (fileOnlyEnvNames.length > 0) {
+          fs.mkdirSync(this.tmpDir, { recursive: true, mode: 0o700 });
+          envFile = path.join(this.tmpDir, `prevenv_${crypto.randomBytes(8).toString('hex')}`);
+          /** @type {Record<string, any>} */
+          const fileOnlyObj = {};
+          for (const k of fileOnlyEnvNames) fileOnlyObj[k] = envVars[k];
+          fs.writeFileSync(envFile, formatDockerEnvFile(fileOnlyObj), { encoding: 'utf8', mode: 0o600 });
+        }
+
+        const healthStartPeriodSec = dmHelpers.sanitizeBoundedInt
+          ? dmHelpers.sanitizeBoundedInt(cfg.healthStartPeriodSec ?? project.healthStartPeriodSec, dmDefaults.healthStartPeriodSec || 10, 0, 300)
+          : 10;
+        const healthyThreshold = dmHelpers.sanitizeBoundedInt
+          ? dmHelpers.sanitizeBoundedInt(cfg.healthyThreshold ?? project.healthyThreshold, dmDefaults.healthyThreshold || 1, 1, 5)
+          : 1;
+
+        const runArgs = dm.runArgs({
+          containerName,
+          imageTag,
+          hostPort,
+          containerPort: strategy.containerPort,
+          envNames: inlineEnvNames,
+          envFile,
+          network: dmDefaults.network,
+          memoryMb: Math.max(64, memCap),
+          cpus: '0.5',
+          pidsLimit: 256,
+          healthStartPeriodSec,
+          labels: {
+            'culkibo.managed': 'true',
+            'com.culkibo.project': dmHelpers.safeSlug(project.id),
+            'com.culkibo.project_id': project.id,
+            'com.culkibo.preview': 'true',
+            'com.culkibo.preview_key': identity.key
+          }
+        });
+
+        const safeEnv = { ...process.env, ...dmHelpers.filterSafeHostEnv(envVars) };
+        const run = await dm.runDocker(runArgs, { timeoutMs: 60000, env: safeEnv, signal: controller.signal });
+        if (run.code === 0) containerStarted = true;
+        checkAborted();
+        if (run.code !== 0) {
+          throw new Error((run.stderr || '').trim().slice(0, 400) || `docker run terminó con código ${run.code}`);
+        }
+
+        for (const dbNet of linkedDb.networks || []) {
+          if (dbNet !== dmDefaults.network) {
+            await dm.runDocker(['network', 'connect', dbNet, containerName], { timeoutMs: 10000 }).catch(() => {});
+          }
+        }
+
+        // 4. Healthcheck
+        enterPhase('health');
+        const healthTimeoutMs = Math.min(180000, Math.max(5000, Number(cfg.healthTimeoutMs) || 30000));
+        const health = await dm.waitForHealth({
+          hostPort,
+          containerPort: strategy.containerPort,
+          healthPath: strategy.healthPath,
+          containerName,
+          hostHeader: record.hostname,
+          timeoutMs: healthTimeoutMs,
+          intervalMs: 1000,
+          healthStartPeriodSec,
+          healthyThreshold,
+          signal: controller.signal
+        });
+        checkAborted();
+        if (!health.healthy) {
+          await dm.runDocker(['rm', '-f', containerName], { timeoutMs: 15000 }).catch(() => {});
+          containerStarted = false;
+          throw new Error(`Preview no pasó el healthcheck: ${health.reason}`);
+        }
+
+        enterPhase('route');
+        const upstream = await dm.resolveUpstream({
+          containerName,
+          containerPort: strategy.containerPort,
+          hostPort,
+          network: dmDefaults.network
+        });
+        checkAborted();
+
+        record.upstream = upstream.dial;
+        record.status = 'active';
+        record.error = null;
         record.updatedAt = new Date().toISOString();
+        closePhase();
+
+        if (!this.store[project.id]) this.store[project.id] = {};
+        this.store[project.id][identity.key] = record;
+        this.save();
+
+        // 5. Publicar ruta en ingressManager + Caddy
+        ing.previewRoutes.set(`${project.id}_${identity.key}`, {
+          hostname: record.hostname,
+          upstream: record.upstream,
+          projectId: project.id,
+          prNumber: record.prNumber || identity.key
+        });
+        await ing.reconcile().catch(() => {});
+
+        // Retirar contenedor preview anterior de esta misma clave si existía
+        if (previousRecord && previousRecord.containerName && previousRecord.containerName !== containerName) {
+          await dm.runDocker(['rm', '-f', previousRecord.containerName], { timeoutMs: 15000 }).catch(() => {});
+        }
+
+        this.emit('preview_event', { action: 'active', preview: record });
+        return record;
+      } catch (err) {
+        closePhase();
+        // Si fue cancelado/destruido/reemplazado, limpiar cualquier contenedor arrancado sin dejar huérfanos
+        if (containerStarted) {
+          await dm.runDocker(['rm', '-f', containerName], { timeoutMs: 15000 }).catch(() => {});
+          containerStarted = false;
+        }
+        const isAborted = buildEntry.cancelled || err?.code === 'PREVIEW_ABORTED' || err?.code === 'PREVIEW_SUPERSEDED';
+        if (isAborted) {
+          if (buildEntry.destroyed) {
+            ing.previewRoutes.delete(`${project.id}_${identity.key}`);
+            if (this.store[project.id]) {
+              delete this.store[project.id][identity.key];
+              if (Object.keys(this.store[project.id]).length === 0) delete this.store[project.id];
+            }
+            this.save();
+          }
+          throw err;
+        }
+        // Si ya existía una preview activa sana, preservar su containerName/upstream para no dejar huérfanos
+        if (!this.store[project.id]) this.store[project.id] = {};
+        if (previousRecord && previousRecord.status === 'active' && previousRecord.containerName) {
+          this.store[project.id][identity.key] = {
+            ...previousRecord,
+            lastBuildError: err.message || 'Error reconstruyendo vista previa',
+            updatedAt: new Date().toISOString()
+          };
+        } else {
+          record.status = 'failed';
+          record.error = err.message || 'Error en vista previa';
+          record.updatedAt = new Date().toISOString();
+          this.store[project.id][identity.key] = record;
+        }
+        this.save();
+        this.emit('preview_event', { action: 'failed', preview: this.store[project.id][identity.key] });
+        throw err;
+      } finally {
+        if (envFile) { try { fs.unlinkSync(envFile); } catch (e) {} }
+        if (hostPort) {
+          if (dm._pendingPorts) dm._pendingPorts.delete(hostPort);
+          portRegistry.release(hostPort, portOwner);
+        }
+        if (this._activeBuilds.get(lockKey) === buildEntry) {
+          this._activeBuilds.delete(lockKey);
+        }
+        this.inFlightKeys.delete(lockKey);
       }
-      this.save();
-      this.emit('preview_event', { action: 'failed', preview: this.store[project.id][identity.key] });
-      throw err;
-    } finally {
-      if (envFile) { try { fs.unlinkSync(envFile); } catch (e) {} }
-      if (hostPort) {
-        if (dm._pendingPorts) dm._pendingPorts.delete(hostPort);
-        portRegistry.release(hostPort, portOwner);
-      }
-      this.inFlightKeys.delete(lockKey);
-    }
+    };
+
+    this.inFlightKeys.add(lockKey);
+    const taskPromise = runPreviewBuild();
+    buildEntry.promise = taskPromise;
+    this._activeBuilds.set(lockKey, buildEntry);
+    return taskPromise;
   }
 
   /**
-   * Destruye una vista previa (ruta Caddy + contenedor + imagen + directorio temporal).
-   * Acepta clave string (`"pr-42"`) o descriptor `{ prNumber, branch, project }`.
+   * Destruye una vista previa (cancela build activo si existe + ruta Caddy + contenedor + imagen + directorio).
+   * Acepta clave string (`"pr-42"`) o descriptor `{ key, prNumber, branch, project }`.
    */
   async destroyPreview(projectId, keyOrTarget) {
     this._ensureLoaded();
-    const projMap = this.store[projectId];
-    if (!projMap) return { removed: false };
 
     let key = typeof keyOrTarget === 'string' ? keyOrTarget : null;
     if (!key && keyOrTarget && typeof keyOrTarget === 'object') {
-      if (keyOrTarget.prNumber != null && String(keyOrTarget.prNumber).trim() !== '') {
+      if (typeof keyOrTarget.key === 'string' && keyOrTarget.key.trim()) {
+        key = keyOrTarget.key.trim();
+      } else if (keyOrTarget.prNumber != null && String(keyOrTarget.prNumber).trim() !== '') {
         key = `pr-${String(keyOrTarget.prNumber).replace(/[^0-9]/g, '')}`;
       } else if (keyOrTarget.branch) {
         try {
@@ -460,42 +647,73 @@ class PreviewManager extends EventEmitter {
         }
       }
     }
-    const prev = key ? projMap[key] : null;
-    if (!prev || !key) return { removed: false };
+    if (!key) return { removed: false };
 
-    const dm = getDeployManager();
-    const ing = getIngressManager();
+    // Si hay un build en vuelo para esta preview (ej. PR cerrada a mitad del build),
+    // abortarlo y esperar a que termine la limpieza para evitar contenedores/rutas huérfanas.
+    const lockKey = `${projectId}:${key}`;
+    const active = this._activeBuilds.get(lockKey);
+    let abortedBuild = false;
+    /** @type {string | null} */
+    let activeContainer = null;
+    /** @type {string | null} */
+    let activeImage = null;
+    if (active) {
+      abortedBuild = true;
+      activeContainer = active.containerName;
+      activeImage = active.imageTag;
+      active.cancelled = true;
+      active.destroyed = true;
+      try { active.controller.abort(new Error('Vista previa destruida durante la construcción')); } catch (e) {}
+      if (active.promise) {
+        await active.promise.catch(() => {});
+      }
+    }
+
+    const projMap = this.store[projectId];
+    const prev = projMap ? projMap[key] : null;
+    if (!prev && !abortedBuild) return { removed: false };
+
+    const dm = this._getDeployManager();
+    const ing = this._getIngressManager();
 
     ing.previewRoutes.delete(`${projectId}_${key}`);
     await ing.reconcile().catch(() => {});
 
-    if (prev.containerName) {
-      await dm.runDocker(['rm', '-f', prev.containerName], { timeoutMs: 20000 }).catch(() => {});
+    const containersToRm = new Set([prev?.containerName, activeContainer].filter(Boolean));
+    for (const cName of containersToRm) {
+      await dm.runDocker(['rm', '-f', cName], { timeoutMs: 20000 }).catch(() => {});
     }
-    if (prev.imageTag) {
-      await dm.runDocker(['rmi', prev.imageTag], { timeoutMs: 20000 }).catch(() => {});
+    const imagesToRm = new Set([prev?.imageTag, activeImage].filter(Boolean));
+    for (const imgTag of imagesToRm) {
+      await dm.runDocker(['rmi', imgTag], { timeoutMs: 20000 }).catch(() => {});
     }
 
-    const checkoutDir = path.join(PREVIEWS_WORK_DIR, projectId, key);
+    const checkoutDir = path.join(this.workDir, projectId, key);
     try { fs.rmSync(checkoutDir, { recursive: true, force: true }); } catch (e) {}
 
-    delete projMap[key];
-    if (Object.keys(projMap).length === 0) delete this.store[projectId];
-    this.save();
-    this.emit('preview_event', { action: 'destroyed', projectId, key });
-    return { removed: true, key };
+    if (projMap && prev) {
+      delete projMap[key];
+      if (Object.keys(projMap).length === 0) delete this.store[projectId];
+      this.save();
+    }
+    this.emit('preview_event', { action: 'destroyed', projectId, key, abortedBuild });
+    return { removed: true, abortedBuild, key };
   }
 
   async destroyProjectPreviews(projectId) {
     this._ensureLoaded();
-    const keys = Object.keys(this.store[projectId] || {});
+    const keys = new Set(Object.keys(this.store[projectId] || {}));
+    for (const lk of this._activeBuilds.keys()) {
+      if (lk.startsWith(`${projectId}:`)) keys.add(lk.slice(projectId.length + 1));
+    }
     let count = 0;
     for (const k of keys) {
       const r = await this.destroyPreview(projectId, k).catch(() => ({ removed: false }));
       if (r.removed) count++;
     }
     try {
-      const projectPreviewDir = assertContainedPath(PREVIEWS_WORK_DIR, String(projectId));
+      const projectPreviewDir = assertContainedPath(this.workDir, String(projectId));
       fs.rmSync(projectPreviewDir, { recursive: true, force: true });
     } catch (e) {}
     return count;
@@ -504,7 +722,7 @@ class PreviewManager extends EventEmitter {
   async getLogs(projectId, key, tail = 150) {
     const prev = this.get(projectId, key);
     if (!prev || !prev.containerName) throw new Error('Vista previa no encontrada');
-    const dm = getDeployManager();
+    const dm = this._getDeployManager();
     const safeTail = Math.min(2000, Math.max(10, Number(tail) || 150));
     const res = await dm.runDocker(['logs', '--tail', String(safeTail), '--timestamps', prev.containerName], { timeoutMs: 10000 });
     const secrets = typeof dm._secretValuesForProject === 'function' ? dm._secretValuesForProject(projectId) : [];

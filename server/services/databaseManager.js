@@ -50,15 +50,30 @@ function getNotificationService() {
  *     con argv, igual que `dbBackupManager.buildDbDumpSpec`.
  */
 
-const DATA_FILE = path.join(__dirname, '..', '..', 'data', 'databases.json');
-const KEY_FILE = path.join(__dirname, '..', '..', 'data', '.databases.key');
-const BACKUPS_ROOT = path.join(__dirname, '..', '..', 'data', 'backups', 'databases');
-const TMP_DIR = path.join(__dirname, '..', '..', 'data', '.tmp');
+function resolveDefaultDataRoot() {
+  return process.env.CULKIBO_DATA_DIR
+    ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
+    : path.join(__dirname, '..', '..', 'data');
+}
+
+const DEFAULT_DATA_ROOT = resolveDefaultDataRoot();
+const DATA_FILE = path.join(DEFAULT_DATA_ROOT, 'databases.json');
+const KEY_FILE = path.join(DEFAULT_DATA_ROOT, '.databases.key');
+const BACKUPS_ROOT = path.join(DEFAULT_DATA_ROOT, 'backups', 'databases');
+const TMP_DIR = path.join(DEFAULT_DATA_ROOT, '.tmp');
 
 /** Cada cuánto despierta el planificador a mirar si toca alguna copia. */
 const SCHEDULER_TICK_MS = 30000;
 /** Una copia perdida por un daemon apagado se recupera si no ha caducado del todo. */
 const MAX_CATCH_UP_MS = 7 * 24 * 3600 * 1000;
+/** Imagen fijada para el pooler PgBouncer co-localizado (PostgreSQL/pgvector/TimescaleDB). */
+const PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.23.1-p3';
+const VALID_POOL_MODES = new Set(['transaction', 'session', 'statement']);
+const VALID_TUNING_PRESETS = new Set(['oltp', 'analytics', 'low-memory', 'cache', 'none']);
+const VALID_REDIS_EVICTION_POLICIES = new Set([
+  'noeviction', 'allkeys-lru', 'volatile-lru', 'allkeys-lfu', 'volatile-lfu', 'volatile-ttl'
+]);
+const MAX_AUDIT_HISTORY = 50;
 
 // ---------------------------------------------------------------------------
 // Catálogo de motores
@@ -123,6 +138,14 @@ const MAX_CATCH_UP_MS = 7 * 24 * 3600 * 1000;
  */
 const MYSQL_PWD_WRAPPER = 'MYSQL_PWD="$CULKIBO_MYSQL_PWD" exec "$@"';
 
+/** Resuelve el PGDATA correcto según la major de PostgreSQL (PG18 movió PGDATA a /var/lib/postgresql). */
+function resolvePostgresDataDir(image) {
+  const tagSeg = String(image || '').split('/').pop() || '';
+  const m = /:(?:[\d.]+-)?(?:pg)?(\d+)/.exec(tagSeg) || /-pg(\d+)/.exec(tagSeg);
+  const major = m ? parseInt(m[1], 10) : 18;
+  return major >= 18 ? '/var/lib/postgresql' : '/var/lib/postgresql/data';
+}
+
 const ENGINES = {
   postgres: {
     label: 'PostgreSQL',
@@ -131,14 +154,10 @@ const ENGINES = {
     port: 5432,
     scheme: 'postgresql',
     dataDir: '/var/lib/postgresql',
+    supportsPooler: true,
     // PG 18 movió PGDATA. Si alguien fija una imagen anterior, el volumen tiene
     // que ir al sitio que esa versión espera.
-    dataDirFor: (image) => {
-      const tagSeg = String(image || '').split('/').pop() || '';
-      const m = /:(?:pg)?(\d+)/.exec(tagSeg);
-      const major = m ? parseInt(m[1], 10) : 18;
-      return major >= 18 ? '/var/lib/postgresql' : '/var/lib/postgresql/data';
-    },
+    dataDirFor: resolvePostgresDataDir,
     licence: 'PostgreSQL License (permisiva)',
     initEnv: ({ username, password, dbName }) => ({
       POSTGRES_USER: username,
@@ -154,7 +173,57 @@ const ENGINES = {
     dumpExt: '.dump',
     restore: ({ username, dbName, inFile }) => ({
       program: 'pg_restore',
-      args: ['-U', username, '-d', dbName, '--clean', '--if-exists', '--no-owner', '-e', inFile]
+      args: ['-U', username, '-d', dbName, '--clean', '--if-exists', '--no-owner', '--no-privileges', '-e', inFile]
+    })
+  },
+
+  pgvector: {
+    label: 'PostgreSQL + pgvector',
+    family: 'postgresql',
+    image: 'pgvector/pgvector:0.8.0-pg17',
+    port: 5432,
+    scheme: 'postgresql',
+    dataDir: '/var/lib/postgresql/data',
+    dataDirFor: resolvePostgresDataDir,
+    supportsPooler: true,
+    extensions: ['vector'],
+    licence: 'PostgreSQL License (permisiva)',
+    initEnv: ({ username, password, dbName }) => ({
+      POSTGRES_USER: username,
+      POSTGRES_PASSWORD: password,
+      POSTGRES_DB: dbName
+    }),
+    clientEnv: ({ password }) => ({ PGPASSWORD: password }),
+    health: ({ username, dbName }) => `pg_isready -h 127.0.0.1 -U ${username} -d ${dbName}`,
+    dumpExt: '.dump',
+    restore: ({ username, dbName, inFile }) => ({
+      program: 'pg_restore',
+      args: ['-U', username, '-d', dbName, '--clean', '--if-exists', '--no-owner', '--no-privileges', '-e', inFile]
+    })
+  },
+
+  timescaledb: {
+    label: 'TimescaleDB',
+    family: 'postgresql',
+    image: 'timescale/timescaledb:2.19.3-pg17',
+    port: 5432,
+    scheme: 'postgresql',
+    dataDir: '/var/lib/postgresql/data',
+    dataDirFor: resolvePostgresDataDir,
+    supportsPooler: true,
+    extensions: ['timescaledb'],
+    licence: 'Apache-2.0 / Timescale License',
+    initEnv: ({ username, password, dbName }) => ({
+      POSTGRES_USER: username,
+      POSTGRES_PASSWORD: password,
+      POSTGRES_DB: dbName
+    }),
+    clientEnv: ({ password }) => ({ PGPASSWORD: password }),
+    health: ({ username, dbName }) => `pg_isready -h 127.0.0.1 -U ${username} -d ${dbName}`,
+    dumpExt: '.dump',
+    restore: ({ username, dbName, inFile }) => ({
+      program: 'pg_restore',
+      args: ['-U', username, '-d', dbName, '--clean', '--if-exists', '--no-owner', '--no-privileges', '-e', inFile]
     })
   },
 
@@ -235,7 +304,7 @@ const ENGINES = {
     noDatabaseName: true,
     initEnv: ({ password }) => ({ VALKEY_PASSWORD: password, REDISCLI_AUTH: password, VALKEYCLI_AUTH: password }),
     clientEnv: ({ password }) => ({ REDISCLI_AUTH: password, VALKEYCLI_AUTH: password }),
-    command: () => REDIS_FAMILY_COMMAND('valkey-server', 'VALKEY_PASSWORD'),
+    command: (opts) => REDIS_FAMILY_COMMAND('valkey-server', 'VALKEY_PASSWORD', opts),
     health: () => 'valkey-cli -e ping',
     // buildDbDumpSpec habla de `redis-cli`; en la imagen de Valkey el binario
     // se llama `valkey-cli` y el enlace de compatibilidad no está garantizado.
@@ -254,8 +323,31 @@ const ENGINES = {
     noDatabaseName: true,
     initEnv: ({ password }) => ({ REDIS_PASSWORD: password, REDISCLI_AUTH: password }),
     clientEnv: ({ password }) => ({ REDISCLI_AUTH: password }),
-    command: () => REDIS_FAMILY_COMMAND('redis-server', 'REDIS_PASSWORD'),
+    command: (opts) => REDIS_FAMILY_COMMAND('redis-server', 'REDIS_PASSWORD', opts),
     health: () => 'redis-cli -e ping',
+    dumpExt: '.rdb'
+  },
+
+  dragonfly: {
+    label: 'Dragonfly',
+    family: 'redis',
+    image: 'docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1',
+    port: 6379,
+    scheme: 'redis',
+    dataDir: '/data',
+    licence: 'BSL 1.1 (source-available)',
+    noDatabaseName: true,
+    // Dragonfly lee variables `DFLY_<flag>` nativamente del entorno (--env-file 0600),
+    // evitando pasar --requirepass por argv o depender de una shell interna.
+    initEnv: ({ password }) => ({ DFLY_requirepass: password, REDISCLI_AUTH: password }),
+    clientEnv: ({ password }) => ({ REDISCLI_AUTH: password }),
+    command: (/** @type {{ tuning?: any }} */ opts = {}) => [
+      '--dir', '/data',
+      '--dbfilename', 'dump.rdb',
+      ...(opts && opts.tuning && Array.isArray(opts.tuning.commandArgs) ? opts.tuning.commandArgs : [])
+    ],
+    health: () => 'redis-cli -e ping',
+    dumpProgram: 'redis-cli',
     dumpExt: '.rdb'
   },
 
@@ -277,6 +369,7 @@ const ENGINES = {
     // contenedor y borramos al terminar. Ver `runBackup()`.
     clientEnv: () => ({}),
     usesConfigFile: true,
+    configFormat: 'mongo-yaml',
     // Sin esto mongodump se autentica contra la base de datos que va a volcar,
     // pero el usuario raíz que crea el entrypoint vive en `admin`, así que la
     // copia falla con «Authentication failed» pese a tener la contraseña bien.
@@ -285,8 +378,213 @@ const ENGINES = {
     // necesita credenciales ni siquiera con auth activada.
     health: () => "mongosh --quiet --eval \"db.adminCommand('ping').ok\"",
     dumpExt: '.archive.gz'
+  },
+
+  clickhouse: {
+    label: 'ClickHouse',
+    family: 'clickhouse',
+    image: 'clickhouse/clickhouse-server:25.8-alpine',
+    port: 8123,
+    nativePort: 9000,
+    scheme: 'http',
+    dataDir: '/var/lib/clickhouse',
+    licence: 'Apache-2.0',
+    initEnv: ({ username, password, dbName }) => ({
+      CLICKHOUSE_USER: username,
+      CLICKHOUSE_PASSWORD: password,
+      CLICKHOUSE_DB: dbName,
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+    }),
+    clientEnv: ({ password }) => ({ CLICKHOUSE_PASSWORD: password }),
+    usesConfigFile: true,
+    configFormat: 'clickhouse-xml',
+    health: () => 'wget -qO- http://127.0.0.1:8123/ping',
+    dumpExt: '.chbackup.zip'
+  },
+
+  qdrant: {
+    label: 'Qdrant',
+    family: 'qdrant',
+    image: 'qdrant/qdrant:v1.15.5',
+    port: 6333,
+    grpcPort: 6334,
+    scheme: 'http',
+    dataDir: '/qdrant/storage',
+    licence: 'Apache-2.0',
+    noDatabaseName: true,
+    initEnv: ({ password }) => ({ QDRANT__SERVICE__API_KEY: password }),
+    clientEnv: () => ({}),
+    usesConfigFile: true,
+    configFormat: 'curl-qdrant',
+    health: () => 'wget -qO- http://127.0.0.1:6333/readyz',
+    dumpExt: '.snapshot'
+  },
+
+  meilisearch: {
+    label: 'Meilisearch',
+    family: 'meilisearch',
+    image: 'getmeili/meilisearch:v1.15.2',
+    port: 7700,
+    scheme: 'http',
+    dataDir: '/meili_data',
+    licence: 'MIT',
+    noDatabaseName: true,
+    initEnv: ({ password }) => ({
+      MEILI_MASTER_KEY: password,
+      MEILI_ENV: 'production',
+      MEILI_NO_ANALYTICS: 'true'
+    }),
+    clientEnv: () => ({}),
+    usesConfigFile: true,
+    configFormat: 'curl-meilisearch',
+    health: () => 'wget -qO- http://127.0.0.1:7700/health',
+    dumpExt: '.dump'
   }
 };
+
+/**
+ * Calcula los parámetros óptimos de afinado de memoria/CPU por motor sin construir
+ * comandos de shell (solo flags en argv o variables de entorno para `--env-file`).
+ * @param {string} engineKey
+ * @param {{ memoryMb?: number, cpus?: number, preset?: string }} [opts]
+ * @returns {{ preset: string, params: Record<string, any>, commandArgs: string[], env: Record<string, string> }}
+ */
+function computeTuningConfig(engineKey, { memoryMb = 512, cpus = 1, preset = 'oltp' } = {}) {
+  const key = String(engineKey || '').toLowerCase();
+  const engine = ENGINES[key];
+  if (!engine) throw new Error(`Motor no soportado para tuning: ${engineKey}`);
+  const cleanPreset = String(preset || 'oltp').toLowerCase();
+  if (!VALID_TUNING_PRESETS.has(cleanPreset)) {
+    throw new Error(`Preset de tuning inválido: ${preset}. Disponibles: ${Array.from(VALID_TUNING_PRESETS).join(', ')}`);
+  }
+  const mem = Math.max(128, Math.min(65536, parseInt(String(memoryMb), 10) || 512));
+  const cpu = Math.max(0.1, Math.min(32, Number(cpus) || 1));
+
+  if (cleanPreset === 'none') {
+    return { preset: 'none', params: {}, commandArgs: [], env: {} };
+  }
+
+  if (engine.family === 'postgresql') {
+    const sharedBuffersMb = Math.max(32, Math.floor(mem * (cleanPreset === 'low-memory' ? 0.15 : 0.25)));
+    const effectiveCacheMb = Math.max(64, Math.floor(mem * (cleanPreset === 'low-memory' ? 0.4 : 0.65)));
+    const workMemMb = cleanPreset === 'analytics'
+      ? Math.max(8, Math.min(256, Math.floor(mem * 0.05)))
+      : Math.max(4, Math.min(64, Math.floor(mem * 0.015)));
+    const maintenanceWorkMemMb = Math.max(32, Math.min(512, Math.floor(mem * 0.08)));
+    const maxConnections = cleanPreset === 'low-memory'
+      ? 50
+      : Math.max(50, Math.min(500, Math.floor(mem / 8)));
+    return {
+      preset: cleanPreset,
+      params: { sharedBuffersMb, effectiveCacheMb, workMemMb, maintenanceWorkMemMb, maxConnections, walCompression: 'on' },
+      commandArgs: [
+        '-c', `shared_buffers=${sharedBuffersMb}MB`,
+        '-c', `effective_cache_size=${effectiveCacheMb}MB`,
+        '-c', `work_mem=${workMemMb}MB`,
+        '-c', `maintenance_work_mem=${maintenanceWorkMemMb}MB`,
+        '-c', `max_connections=${maxConnections}`,
+        '-c', 'wal_compression=on'
+      ],
+      env: {}
+    };
+  }
+
+  if (engine.family === 'mysql' || engine.family === 'mariadb') {
+    const innodbBufferPoolMb = Math.max(64, Math.floor(mem * (cleanPreset === 'low-memory' ? 0.35 : 0.55)));
+    const maxConnections = cleanPreset === 'low-memory'
+      ? 60
+      : Math.max(60, Math.min(400, Math.floor(mem / 10)));
+    return {
+      preset: cleanPreset,
+      params: { innodbBufferPoolMb, maxConnections },
+      commandArgs: [
+        `--innodb-buffer-pool-size=${innodbBufferPoolMb}M`,
+        `--max-connections=${maxConnections}`
+      ],
+      env: {}
+    };
+  }
+
+  if (key === 'dragonfly') {
+    const maxMemoryMb = Math.max(128, Math.floor(mem * 0.8));
+    const proactorThreads = Math.max(1, Math.min(8, Math.ceil(cpu)));
+    const cacheMode = cleanPreset === 'cache';
+    return {
+      preset: cleanPreset,
+      params: { maxMemoryMb, proactorThreads, cacheMode },
+      commandArgs: [
+        `--maxmemory=${maxMemoryMb}mb`,
+        `--proactor_threads=${proactorThreads}`,
+        ...(cacheMode ? ['--cache_mode=true'] : [])
+      ],
+      env: {}
+    };
+  }
+
+  if (engine.family === 'redis') {
+    // 78% del cgroup deja margen para el fork() de BGSAVE sin disparar OOM-killer
+    const maxMemoryMb = Math.max(64, Math.floor(mem * 0.78));
+    const evictionPolicy = cleanPreset === 'cache'
+      ? 'allkeys-lru'
+      : cleanPreset === 'low-memory'
+        ? 'volatile-lru'
+        : 'noeviction';
+    return {
+      preset: cleanPreset,
+      params: { maxMemoryMb, evictionPolicy },
+      commandArgs: ['--maxmemory', `${maxMemoryMb}mb`, '--maxmemory-policy', evictionPolicy],
+      env: {}
+    };
+  }
+
+  if (engine.family === 'mongodb') {
+    const wiredTigerCacheGb = Math.max(0.25, Number(((mem * 0.5) / 1024).toFixed(2)));
+    return {
+      preset: cleanPreset,
+      params: { wiredTigerCacheGb },
+      commandArgs: ['--wiredTigerCacheSizeGB', String(wiredTigerCacheGb)],
+      env: {}
+    };
+  }
+
+  if (engine.family === 'meilisearch') {
+    const maxIndexingMemoryMb = Math.max(64, Math.floor(mem * 0.65));
+    const maxIndexingThreads = Math.max(1, Math.min(8, Math.ceil(cpu)));
+    return {
+      preset: cleanPreset,
+      params: { maxIndexingMemoryMb, maxIndexingThreads },
+      commandArgs: [],
+      env: {
+        MEILI_MAX_INDEXING_MEMORY: `${maxIndexingMemoryMb}MiB`,
+        MEILI_MAX_INDEXING_THREADS: String(maxIndexingThreads)
+      }
+    };
+  }
+
+  if (engine.family === 'qdrant') {
+    const searchThreads = Math.max(1, Math.min(16, Math.ceil(cpu)));
+    return {
+      preset: cleanPreset,
+      params: { searchThreads },
+      commandArgs: [],
+      env: {
+        QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: String(searchThreads)
+      }
+    };
+  }
+
+  if (engine.family === 'clickhouse') {
+    const maxServerMemoryRatio = cleanPreset === 'low-memory' ? 0.7 : 0.85;
+    return {
+      preset: cleanPreset,
+      params: { maxServerMemoryRatio },
+      commandArgs: [],
+      env: {}
+    };
+  }
+
+  return { preset: cleanPreset, params: {}, commandArgs: [], env: {} };
+}
 
 /**
  * Redis y Valkey son las únicas imágenes sin variable de entorno para la
@@ -295,28 +593,22 @@ const ENGINES = {
  * `docker` del HOST, que es exactamente lo que este módulo evita.
  *
  * La salida es una cadena de shell — pero CONSTANTE y sin una sola
- * interpolación: el secreto entra por el `--env-file` y lo expande la shell de
- * dentro del contenedor, entrecomillado, así que ni siquiera una contraseña
- * con metacaracteres podría hacer nada. No hay ningún dato del usuario en esta
- * cadena; si lo hubiera, esto sería un fallo de inyección y no un comentario.
- *
- * Persistencia por RDB con puntos de guardado explícitos, y NO por AOF.
- * No es pereza, es una restricción real que descubrió la prueba contra Docker:
- * con `--appendonly yes` el servidor carga el registro de escrituras y no el
- * `dump.rdb`, así que restaurar sustituyendo el fichero no restaura nada. Y
- * borrar el `appendonlydir` tampoco vale: Valkey 9 no cae entonces al RDB, crea
- * un AOF base VACÍO ("Creating AOF base file ... on server start" con la base
- * de datos a cero). El procedimiento oficial para volver a un RDB con AOF
- * activo exige arrancar con AOF desactivado y reactivarlo después, es decir dos
- * recreaciones del contenedor por restauración. Para un producto cuyo modelo de
- * durabilidad son las copias externas programadas, RDB + esas copias es lo
- * coherente: una restauración que funciona de verdad vale más que un segundo
- * extra de durabilidad ante un corte eléctrico.
+ * interpolación de datos del usuario: el secreto entra por el `--env-file` y
+ * los parámetros de tuning (`maxMemoryMb`, `evictionPolicy`) pasan por entero
+ * estricto y lista blanca cerrada antes de construirse.
  */
-function REDIS_FAMILY_COMMAND(server, envVar) {
+/** @param {string} server @param {string} envVar @param {{ tuning?: any }} [opts] */
+function REDIS_FAMILY_COMMAND(server, envVar, { tuning = null } = {}) {
+  let extra = '';
+  if (tuning && tuning.params && Number.isInteger(tuning.params.maxMemoryMb) && tuning.params.maxMemoryMb >= 64) {
+    const policy = VALID_REDIS_EVICTION_POLICIES.has(tuning.params.evictionPolicy)
+      ? tuning.params.evictionPolicy
+      : 'noeviction';
+    extra = ` --maxmemory ${tuning.params.maxMemoryMb}mb --maxmemory-policy ${policy}`;
+  }
   return [
     'sh', '-c',
-    `exec ${server} --save 900 1 --save 300 10 --save 60 10000 --requirepass "$${envVar}"`
+    `exec ${server} --save 900 1 --save 300 10 --save 60 10000${extra} --requirepass "$${envVar}"`
   ];
 }
 
@@ -362,24 +654,24 @@ function assertResourceId(value, field) {
  * Coolify guarda las credenciales en claro en su base de datos y es
  * exactamente así como se filtran.
  */
-function loadOrCreateKey() {
+function loadOrCreateKey(keyFile = KEY_FILE, dataFile = DATA_FILE) {
   // P0: si KEY_FILE ya existe, JAMÁS regenerarlo ante un error transitorio de lectura (EBUSY/EACCES),
   // porque sobrescribirlo destruiría el descifrado de todas las contraseñas en databases.json.
-  if (fs.existsSync(KEY_FILE)) {
-    const raw = fs.readFileSync(KEY_FILE, 'utf8').trim();
+  if (fs.existsSync(keyFile)) {
+    const raw = fs.readFileSync(keyFile, 'utf8').trim();
     const key = Buffer.from(raw, 'hex');
     if (key.length !== 32) {
-      throw new Error(`Clave de cifrado corrupta en ${KEY_FILE} (esperados 32 bytes). No se regenerará automáticamente para proteger tus contraseñas.`);
+      throw new Error(`Clave de cifrado corrupta en ${keyFile} (esperados 32 bytes). No se regenerará automáticamente para proteger tus contraseñas.`);
     }
     return key;
   }
 
   // Protección anti pérdida de clave: si ya hay registros cifrados v1: en databases.json, no inventar clave nueva
-  if (fs.existsSync(DATA_FILE)) {
+  if (fs.existsSync(dataFile)) {
     try {
-      const existingData = fs.readFileSync(DATA_FILE, 'utf8');
+      const existingData = fs.readFileSync(dataFile, 'utf8');
       if (existingData.includes('"v1:')) {
-        throw new Error(`Falta el archivo de clave ${KEY_FILE} pero ${DATA_FILE} contiene secretos cifrados. Restaura .databases.key desde tu copia segura.`);
+        throw new Error(`Falta el archivo de clave ${keyFile} pero ${dataFile} contiene secretos cifrados. Restaura .databases.key desde tu copia segura.`);
       }
     } catch (e) {
       if (String(e.message || '').includes('Falta el archivo de clave')) throw e;
@@ -387,14 +679,14 @@ function loadOrCreateKey() {
   }
 
   const key = crypto.randomBytes(32);
-  fs.mkdirSync(path.dirname(KEY_FILE), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(keyFile), { recursive: true, mode: 0o700 });
   try {
-    fs.writeFileSync(KEY_FILE, key.toString('hex'), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    try { fs.chmodSync(KEY_FILE, 0o600); } catch (e) {}
+    fs.writeFileSync(keyFile, key.toString('hex'), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    try { fs.chmodSync(keyFile, 0o600); } catch (e) {}
     return key;
   } catch (err) {
     if (err && err.code === 'EEXIST') {
-      const raced = Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
+      const raced = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'hex');
       if (raced.length === 32) return raced;
     }
     throw err;
@@ -417,6 +709,334 @@ function decryptSecret(blob, key) {
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[1], 'base64'));
   decipher.setAuthTag(Buffer.from(parts[2], 'base64'));
   return Buffer.concat([decipher.update(Buffer.from(parts[3], 'base64')), decipher.final()]).toString('utf8');
+}
+
+// ---------------------------------------------------------------------------
+// Cifrado autenticado en streaming para copias S3/R2 (formato CKB1 AEAD)
+// ---------------------------------------------------------------------------
+// Cabecera fija de 32 bytes:
+//   [0..3]   Magic 'CKB1'
+//   [4]      Versión (0x01)
+//   [5]      Suite (0x01 = AES-256-GCM en bloques)
+//   [6..7]   Reservado (0x0000)
+//   [8..15]  Key-ID (primeros 8 bytes de SHA-256(key), permite rotación sin re-cifrar)
+//   [16..27] Base-Nonce aleatorio de 12 bytes
+//   [28..31] Tamaño de bloque uint32 BE (por defecto 65536 B)
+// Cada bloque:
+//   [flags(1B: 0x00 intermedio, 0x01 final) | len(4B BE) | ciphertext(len) | authTag(16B)]
+// El AAD vincula (CKB1, ver, keyId, chunkIndex, flags): impide reordenar,
+// duplicar, truncar o añadir basura tras el bloque final.
+const CKB1_MAGIC = Buffer.from('CKB1', 'ascii');
+const CKB1_VERSION = 1;
+const CKB1_CIPHER_SUITE = 1;
+const CKB1_HEADER_LEN = 32;
+const CKB1_DEFAULT_CHUNK_SIZE = 65536;
+const CKB1_MIN_CHUNK_SIZE = 1024;
+const CKB1_MAX_CHUNK_SIZE = 1024 * 1024;
+const CKB1_AUTH_TAG_LEN = 16;
+
+/** Identificador público de clave de 16 caracteres hex (8 bytes SHA-256) para rotación. */
+function computeKeyId(keyBuf) {
+  if (!Buffer.isBuffer(keyBuf) || keyBuf.length !== 32) {
+    throw new Error('La clave de cifrado CKB1 debe ser un Buffer de exactamente 32 bytes');
+  }
+  return crypto.createHash('sha256').update(keyBuf).digest().subarray(0, 8).toString('hex');
+}
+
+/** Deriva una clave AES-256 (32 bytes) a partir de una passphrase con scrypt. */
+function deriveBackupKeyFromPassphrase(passphrase, salt = null) {
+  const pwd = String(passphrase || '').trim();
+  if (pwd.length < 12) {
+    throw new Error('La frase de paso de cifrado de copias debe tener al menos 12 caracteres');
+  }
+  const saltBuf = salt
+    ? (Buffer.isBuffer(salt) ? salt : Buffer.from(String(salt), 'hex'))
+    : crypto.randomBytes(16);
+  if (saltBuf.length < 16) throw new Error('Salt inválido (mínimo 16 bytes)');
+  const key = crypto.scryptSync(pwd, saltBuf, 32, { N: 16384, r: 8, p: 1 });
+  return { key, saltHex: saltBuf.toString('hex'), keyId: computeKeyId(key) };
+}
+
+function deriveChunkNonce(baseNonce, chunkIndex, flags) {
+  const nonce = Buffer.from(baseNonce);
+  const idxBuf = Buffer.alloc(4);
+  idxBuf.writeUInt32BE(chunkIndex >>> 0, 0);
+  nonce[7] ^= flags & 0xff;
+  nonce[8] ^= idxBuf[0];
+  nonce[9] ^= idxBuf[1];
+  nonce[10] ^= idxBuf[2];
+  nonce[11] ^= idxBuf[3];
+  return nonce;
+}
+
+function buildChunkAad(keyIdBuf, chunkIndex, flags) {
+  const aad = Buffer.alloc(18);
+  CKB1_MAGIC.copy(aad, 0);
+  aad[4] = CKB1_VERSION;
+  keyIdBuf.copy(aad, 5, 0, 8);
+  aad.writeUInt32BE(chunkIndex >>> 0, 13);
+  aad[17] = flags & 0xff;
+  return aad;
+}
+
+/** Comprueba si un fichero en disco comienza por la cabecera mágica `CKB1`. */
+function hasCkb1Magic(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(4);
+    const n = fs.readSync(fd, buf, 0, 4, 0);
+    return n === 4 && buf.equals(CKB1_MAGIC);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Inspecciona la cabecera pública de un archivo cifrado `CKB1` sin requerir clave. */
+function inspectCkb1Header(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const hdr = Buffer.alloc(CKB1_HEADER_LEN);
+    const n = fs.readSync(fd, hdr, 0, CKB1_HEADER_LEN, 0);
+    if (n < CKB1_HEADER_LEN || !hdr.subarray(0, 4).equals(CKB1_MAGIC)) {
+      return { valid: false, reason: 'Cabecera CKB1 ausente o truncada' };
+    }
+    const version = hdr[4];
+    const cipherSuite = hdr[5];
+    const keyId = hdr.subarray(8, 16).toString('hex');
+    const chunkSize = hdr.readUInt32BE(28);
+    if (version !== CKB1_VERSION || cipherSuite !== CKB1_CIPHER_SUITE) {
+      return { valid: false, reason: `Versión/suite CKB1 no soportada (${version}/${cipherSuite})` };
+    }
+    if (chunkSize < CKB1_MIN_CHUNK_SIZE || chunkSize > CKB1_MAX_CHUNK_SIZE) {
+      return { valid: false, reason: `Tamaño de bloque CKB1 fuera de rango (${chunkSize})` };
+    }
+    return { valid: true, version, cipherSuite, keyId, chunkSize };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function readExact(handle, buf, length, position) {
+  let total = 0;
+  while (total < length) {
+    const { bytesRead } = await handle.read(buf, total, length - total, position + total);
+    if (bytesRead <= 0) break;
+    total += bytesRead;
+  }
+  return total;
+}
+
+/**
+ * Cifra un fichero de volcado en streaming con AES-256-GCM en bloques (`CKB1`) con memoria O(1).
+ * @param {string} srcPath
+ * @param {string} destPath
+ * @param {Buffer} keyBuf
+ * @param {{ chunkSize?: number }} [opts]
+ */
+async function encryptBackupFile(srcPath, destPath, keyBuf, { chunkSize = CKB1_DEFAULT_CHUNK_SIZE } = {}) {
+  if (!Buffer.isBuffer(keyBuf) || keyBuf.length !== 32) {
+    throw new Error('La clave AES-256-GCM debe medir exactamente 32 bytes');
+  }
+  const safeChunkSize = Math.max(CKB1_MIN_CHUNK_SIZE, Math.min(CKB1_MAX_CHUNK_SIZE, parseInt(String(chunkSize), 10) || CKB1_DEFAULT_CHUNK_SIZE));
+  const keyIdHex = computeKeyId(keyBuf);
+  const keyIdBuf = Buffer.from(keyIdHex, 'hex');
+  const baseNonce = crypto.randomBytes(12);
+
+  const stat = await fs.promises.stat(srcPath);
+  const totalPlain = stat.size;
+
+  const header = Buffer.alloc(CKB1_HEADER_LEN);
+  CKB1_MAGIC.copy(header, 0);
+  header[4] = CKB1_VERSION;
+  header[5] = CKB1_CIPHER_SUITE;
+  keyIdBuf.copy(header, 8, 0, 8);
+  baseNonce.copy(header, 16, 0, 12);
+  header.writeUInt32BE(safeChunkSize, 28);
+
+  const inHandle = await fs.promises.open(srcPath, 'r');
+  const outHandle = await fs.promises.open(destPath, 'w', 0o600);
+  const readBuf = Buffer.alloc(safeChunkSize);
+  let encryptedBytes = 0;
+  let chunks = 0;
+
+  try {
+    await outHandle.write(header, 0, header.length);
+    encryptedBytes += header.length;
+
+    let offset = 0;
+    const totalChunks = Math.max(1, Math.ceil(totalPlain / safeChunkSize));
+    for (let idx = 0; idx < totalChunks; idx++) {
+      const toRead = Math.min(safeChunkSize, totalPlain - offset);
+      const bytesRead = toRead > 0 ? await readExact(inHandle, readBuf, toRead, offset) : 0;
+      offset += bytesRead;
+      const isFinal = idx === totalChunks - 1 ? 1 : 0;
+      const plainSlice = readBuf.subarray(0, bytesRead);
+
+      const nonce = deriveChunkNonce(baseNonce, idx, isFinal);
+      const cipher = crypto.createCipheriv('aes-256-gcm', keyBuf, nonce, { authTagLength: CKB1_AUTH_TAG_LEN });
+      cipher.setAAD(buildChunkAad(keyIdBuf, idx, isFinal));
+      const ct = Buffer.concat([cipher.update(plainSlice), cipher.final()]);
+      const tag = cipher.getAuthTag();
+
+      const frameMeta = Buffer.alloc(5);
+      frameMeta[0] = isFinal;
+      frameMeta.writeUInt32BE(ct.length, 1);
+
+      const frame = Buffer.concat([frameMeta, ct, tag]);
+      await outHandle.write(frame, 0, frame.length);
+      encryptedBytes += frame.length;
+      chunks++;
+    }
+    return {
+      format: 'CKB1',
+      cipher: 'aes-256-gcm',
+      keyId: keyIdHex,
+      chunks,
+      plainBytes: totalPlain,
+      encryptedBytes
+    };
+  } catch (err) {
+    try { await outHandle.close(); } catch (e) {}
+    try { fs.unlinkSync(destPath); } catch (e) {}
+    throw err;
+  } finally {
+    try { await inHandle.close(); } catch (e) {}
+    try { await outHandle.close(); } catch (e) {}
+  }
+}
+
+/**
+ * Descifra y verifica criptográficamente un archivo `CKB1` bloque a bloque.
+ * Si falla cualquier authTag, el orden, la clave o hay truncamiento/basura al final,
+ * elimina `destPath` antes de lanzar error para que NUNCA llegue texto no autenticado a restore().
+ *
+ * @param {string} srcPath
+ * @param {string} destPath
+ * @param {Buffer | Map<string, Buffer> | Array<{ keyId?: string, key: Buffer }>} keyOrRing
+ */
+async function decryptBackupFile(srcPath, destPath, keyOrRing) {
+  /** @type {Map<string, Buffer>} */
+  const ring = new Map();
+  if (Buffer.isBuffer(keyOrRing)) {
+    ring.set(computeKeyId(keyOrRing), keyOrRing);
+  } else if (keyOrRing instanceof Map) {
+    for (const [k, v] of keyOrRing.entries()) ring.set(k, v);
+  } else if (Array.isArray(keyOrRing)) {
+    for (const item of keyOrRing) {
+      if (item && Buffer.isBuffer(item.key) && item.key.length === 32) {
+        ring.set(item.keyId || computeKeyId(item.key), item.key);
+      }
+    }
+  }
+
+  const stat = await fs.promises.stat(srcPath);
+  if (stat.size < CKB1_HEADER_LEN + 5 + CKB1_AUTH_TAG_LEN) {
+    throw new Error('Archivo cifrado CKB1 truncado o corrupto');
+  }
+
+  const inHandle = await fs.promises.open(srcPath, 'r');
+  const outHandle = await fs.promises.open(destPath, 'w', 0o600);
+  let closedOut = false;
+
+  try {
+    const hdr = Buffer.alloc(CKB1_HEADER_LEN);
+    const hdrRead = await readExact(inHandle, hdr, CKB1_HEADER_LEN, 0);
+    if (hdrRead !== CKB1_HEADER_LEN || !hdr.subarray(0, 4).equals(CKB1_MAGIC)) {
+      throw new Error('Cabecera CKB1 inválida: el archivo no es un volcado cifrado Culkibo');
+    }
+    const version = hdr[4];
+    const suite = hdr[5];
+    if (version !== CKB1_VERSION || suite !== CKB1_CIPHER_SUITE) {
+      throw new Error(`Versión o suite CKB1 no soportada (${version}/${suite})`);
+    }
+    const keyIdBuf = hdr.subarray(8, 16);
+    const keyIdHex = keyIdBuf.toString('hex');
+    const baseNonce = hdr.subarray(16, 28);
+    const chunkSize = hdr.readUInt32BE(28);
+    if (chunkSize < CKB1_MIN_CHUNK_SIZE || chunkSize > CKB1_MAX_CHUNK_SIZE) {
+      throw new Error(`Tamaño de bloque CKB1 inválido (${chunkSize})`);
+    }
+
+    const keyBuf = ring.get(keyIdHex);
+    if (!keyBuf || keyBuf.length !== 32) {
+      throw new Error(`Clave de descifrado CKB1 no encontrada para keyId ${keyIdHex}`);
+    }
+
+    let pos = CKB1_HEADER_LEN;
+    let chunkIndex = 0;
+    let sawFinal = false;
+    let plainBytes = 0;
+    const metaBuf = Buffer.alloc(5);
+
+    while (pos < stat.size) {
+      if (sawFinal) {
+        throw new Error('Archivo cifrado CKB1 alterado: existen bytes sobrantes después del bloque final');
+      }
+      const metaRead = await readExact(inHandle, metaBuf, 5, pos);
+      if (metaRead !== 5) {
+        throw new Error('Archivo cifrado CKB1 truncado en cabecera de bloque');
+      }
+      pos += 5;
+      const flags = metaBuf[0];
+      if (flags !== 0 && flags !== 1) {
+        throw new Error(`Flag de bloque CKB1 inválido: ${flags}`);
+      }
+      const ctLen = metaBuf.readUInt32BE(1);
+      if (ctLen > chunkSize) {
+        throw new Error(`Longitud de bloque CKB1 (${ctLen}) supera chunkSize (${chunkSize})`);
+      }
+      if (pos + ctLen + CKB1_AUTH_TAG_LEN > stat.size) {
+        throw new Error('Archivo cifrado CKB1 truncado dentro del bloque de datos/authTag');
+      }
+      const bodyAndTag = Buffer.alloc(ctLen + CKB1_AUTH_TAG_LEN);
+      const got = await readExact(inHandle, bodyAndTag, bodyAndTag.length, pos);
+      if (got !== bodyAndTag.length) {
+        throw new Error('Lectura incompleta de bloque CKB1');
+      }
+      pos += got;
+
+      const ct = bodyAndTag.subarray(0, ctLen);
+      const tag = bodyAndTag.subarray(ctLen);
+      const nonce = deriveChunkNonce(baseNonce, chunkIndex, flags);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuf, nonce, { authTagLength: CKB1_AUTH_TAG_LEN });
+      decipher.setAAD(buildChunkAad(keyIdBuf, chunkIndex, flags));
+      decipher.setAuthTag(tag);
+
+      let plainChunk;
+      try {
+        plainChunk = Buffer.concat([decipher.update(ct), decipher.final()]);
+      } catch (authErr) {
+        throw new Error(`Fallo de autenticación AES-256-GCM en bloque #${chunkIndex} (archivo alterado o clave errónea)`);
+      }
+
+      if (plainChunk.length > 0) {
+        await outHandle.write(plainChunk, 0, plainChunk.length);
+        plainBytes += plainChunk.length;
+      }
+      chunkIndex++;
+      if (flags === 1) sawFinal = true;
+    }
+
+    if (!sawFinal) {
+      throw new Error('Archivo cifrado CKB1 truncado: falta el bloque final autenticado');
+    }
+
+    await outHandle.close();
+    closedOut = true;
+    return { format: 'CKB1', keyId: keyIdHex, chunks: chunkIndex, plainBytes };
+  } catch (err) {
+    if (!closedOut) {
+      try { await outHandle.close(); } catch (e) {}
+      closedOut = true;
+    }
+    try { if (fs.existsSync(destPath)) fs.unlinkSync(destPath); } catch (e) {}
+    throw err;
+  } finally {
+    try { await inHandle.close(); } catch (e) {}
+    if (!closedOut) {
+      try { await outHandle.close(); } catch (e) {}
+    }
+  }
 }
 
 /**
@@ -455,17 +1075,23 @@ const CRON_FIELDS = [
 // ---------------------------------------------------------------------------
 
 class DatabaseManager extends EventEmitter {
-  constructor() {
+  /** @param {{ dataDir?: string | null, registerPortProvider?: boolean }} [opts] */
+  constructor({ dataDir = null, registerPortProvider = true } = {}) {
     super();
-    /** @type {{ version: number, databases: any[], s3: any }} */
-    this.state = { version: 1, databases: [], s3: null };
+    const dataRoot = dataDir ? path.join(path.resolve(dataDir), 'data') : resolveDefaultDataRoot();
+    this.dataFile = path.join(dataRoot, 'databases.json');
+    this.keyFile = path.join(dataRoot, '.databases.key');
+    this.backupsRoot = path.join(dataRoot, 'backups', 'databases');
+    this.tmpDir = path.join(dataRoot, '.tmp');
+    /** @type {{ version: number, databases: any[], s3: any, backupEncryption: any }} */
+    this.state = { version: 1, databases: [], s3: null, backupEncryption: null };
     /** @type {Buffer | null} */
     this.key = null;
     /** @type {ReturnType<typeof setInterval> | null} */
     this.schedulerTimer = null;
     /** @type {Set<string>} */
     this.runningBackups = new Set();
-    /** Operaciones exclusivas activas por BD (`backup` | `restore`) para rechazar conflictos al instante con 409. */
+    /** Operaciones exclusivas activas por BD (`backup` | `restore` | `drill`) para rechazar conflictos al instante con 409. */
     /** @type {Map<string, { kind: string, startedAt: number | string }>} */
     this._activeOps = new Map();
     /** @type {Map<string, Promise<any>>} Mutex por ID de BD para serializar operaciones destructivas */
@@ -474,13 +1100,16 @@ class DatabaseManager extends EventEmitter {
     this._corruptedOnLoad = false;
     /** @type {any} */
     this.dockerChecked = null;
+    this._lastWatchdogAt = 0;
     this.ensureDirs();
     this.load();
-    portRegistry.registerProvider('databaseManager', () =>
-      this.state.databases
-        .filter((d) => d && d.exposure && d.exposure.enabled && d.exposure.hostPort)
-        .map((d) => Number(d.exposure.hostPort))
-    );
+    if (registerPortProvider) {
+      portRegistry.registerProvider('databaseManager', () =>
+        this.state.databases
+          .filter((d) => d && d.exposure && d.exposure.enabled && d.exposure.hostPort)
+          .map((d) => Number(d.exposure.hostPort))
+      );
+    }
   }
 
   /**
@@ -512,21 +1141,21 @@ class DatabaseManager extends EventEmitter {
   }
 
   ensureDirs() {
-    for (const dir of [path.dirname(DATA_FILE), BACKUPS_ROOT, TMP_DIR]) {
+    for (const dir of [path.dirname(this.dataFile), this.backupsRoot, this.tmpDir]) {
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     }
   }
 
   get cryptoKey() {
-    if (!this.key) this.key = loadOrCreateKey();
+    if (!this.key) this.key = loadOrCreateKey(this.keyFile, this.dataFile);
     return this.key;
   }
 
   load() {
-    const bakFile = `${DATA_FILE}.bak`;
+    const bakFile = `${this.dataFile}.bak`;
     let loadedOk = false;
-    let hadFile = fs.existsSync(DATA_FILE);
-    for (const candidate of [DATA_FILE, bakFile]) {
+    let hadFile = fs.existsSync(this.dataFile);
+    for (const candidate of [this.dataFile, bakFile]) {
       try {
         if (!fs.existsSync(candidate)) continue;
         const parsed = JSON.parse(fs.readFileSync(candidate, 'utf8'));
@@ -534,8 +1163,14 @@ class DatabaseManager extends EventEmitter {
           this.state = {
             version: 1,
             s3: parsed.s3 || null,
+            backupEncryption: parsed.backupEncryption || null,
             databases: parsed.databases.map((d) => ({
               backups: [],
+              restoreHistory: [],
+              verificationHistory: [],
+              pooler: null,
+              tuning: null,
+              clonedFrom: null,
               exposure: { enabled: false, bindAddress: '127.0.0.1', hostPort: null },
               retention: { daily: 7, weekly: 4, hourly: 0 },
               ...d,
@@ -567,10 +1202,10 @@ class DatabaseManager extends EventEmitter {
       return;
     }
     try {
-      if (fs.existsSync(DATA_FILE)) {
-        try { fs.copyFileSync(DATA_FILE, `${DATA_FILE}.bak`); } catch (e) {}
+      if (fs.existsSync(this.dataFile)) {
+        try { fs.copyFileSync(this.dataFile, `${this.dataFile}.bak`); } catch (e) {}
       }
-      atomicWriteJsonSync(DATA_FILE, this.state, 0o600);
+      atomicWriteJsonSync(this.dataFile, this.state, 0o600);
     } catch (err) {
       console.error('[Databases] No se pudo guardar databases.json:', err.message);
       if (strict) throw err;
@@ -586,10 +1221,13 @@ class DatabaseManager extends EventEmitter {
       this._cachedEngines = Object.entries(ENGINES).map(([key, e]) => ({
         engine: key,
         label: e.label,
+        family: e.family,
         image: e.image,
         port: e.port,
         licence: e.licence,
-        requiresDatabaseName: !e.noDatabaseName
+        requiresDatabaseName: !e.noDatabaseName,
+        supportsPooler: Boolean(e.supportsPooler),
+        extensions: e.extensions || []
       }));
     }
     return this._cachedEngines;
@@ -789,7 +1427,8 @@ class DatabaseManager extends EventEmitter {
    *   username?: string,
    *   image?: string,
    *   memoryMb?: number | string,
-   *   cpus?: number | string
+   *   cpus?: number | string,
+   *   tuningPreset?: string
    * }} [opts]
    */
   async provision(opts = {}) {
@@ -814,6 +1453,12 @@ class DatabaseManager extends EventEmitter {
     const password = generatePassword();
     const memoryMb = Math.max(128, Math.min(65536, parseInt(String(opts.memoryMb ?? ''), 10) || 512));
     const cpus = Math.max(0.1, Math.min(32, Number(opts.cpus) || 1));
+    const defaultPreset = engine.family === 'redis' ? 'cache' : 'oltp';
+    const tuning = computeTuningConfig(engineKey, {
+      memoryMb,
+      cpus,
+      preset: opts.tuningPreset || defaultPreset
+    });
 
     const record = {
       id,
@@ -834,6 +1479,9 @@ class DatabaseManager extends EventEmitter {
       dataDir: this.resolveDataDir(engine, opts.image || engine.image),
       memoryMb,
       cpus,
+      tuning: { preset: tuning.preset, params: tuning.params },
+      pooler: null,
+      clonedFrom: null,
       // Nunca expuesto al arrancar. Exponer es una decisión posterior y explícita.
       exposure: { enabled: false, bindAddress: '127.0.0.1', hostPort: null },
       status: 'provisioning',
@@ -842,7 +1490,9 @@ class DatabaseManager extends EventEmitter {
       updatedAt: new Date().toISOString(),
       schedule: { enabled: false, cron: '0 3 * * *', nextRunAt: null, lastRunAt: null, lastStatus: null },
       retention: { daily: 7, weekly: 4 },
-      backups: []
+      backups: [],
+      restoreHistory: [],
+      verificationHistory: []
     };
 
     if (!(await this.isDockerAvailable())) {
@@ -851,24 +1501,19 @@ class DatabaseManager extends EventEmitter {
 
     await this.ensureNetwork(projectId);
 
-    // -- Secretos: fichero de entorno temporal 0600, nunca `-e CLAVE=valor` ---
-    //
-    // `docker run -e POSTGRES_PASSWORD=<secreto>` deja el secreto en el argv
-    // del proceso `docker` del host, y cualquier usuario local lo lee con `ps`.
-    // La alternativa `-e POSTGRES_PASSWORD` (sólo el nombre, heredando del
-    // entorno del cliente) tiene un modo de fallo intolerable: si la variable
-    // no está definida, algunas versiones del CLI pasan el valor vacío en vez
-    // de fallar, y el resultado es una base de datos SIN contraseña. Con
-    // --env-file el valor o está o docker aborta.
     const envVars = {
       ...engine.initEnv({ username, password, dbName }),
-      ...engine.clientEnv({ password })
+      ...engine.clientEnv({ password }),
+      ...(tuning.env || {})
     };
-    const envFile = path.join(TMP_DIR, `env_${id}_${crypto.randomBytes(6).toString('hex')}`);
+    const envFile = path.join(this.tmpDir, `env_${id}_${crypto.randomBytes(6).toString('hex')}`);
 
     const hasSameEngineInProject = this.state.databases.some(
       (d) => d.projectId === projectId && d.engine === engineKey
     );
+    const engineCmd = engine.command
+      ? engine.command({ tuning })
+      : (tuning.commandArgs || []);
     const args = [
       'run', '-d',
       '--name', record.containerName,
@@ -899,9 +1544,7 @@ class DatabaseManager extends EventEmitter {
       '--label', `culkibo.database=${id}`,
       '--label', `culkibo.engine=${engineKey}`,
       record.image,
-      // Redis/Valkey necesitan argumentos de arranque; el resto usa el CMD de
-      // la imagen. Ver REDIS_FAMILY_COMMAND.
-      ...(engine.command ? engine.command() : [])
+      ...engineCmd
     ];
 
     try {
@@ -1069,11 +1712,16 @@ class DatabaseManager extends EventEmitter {
       try { await this.docker(['rm', '-f', record.containerName], { timeout: 30000 }); } catch (e2) {}
     }
 
+    const preset = (record.tuning && record.tuning.preset) || (engine.family === 'redis' ? 'cache' : 'oltp');
+    const tuning = computeTuningConfig(record.engine, { memoryMb: record.memoryMb, cpus: record.cpus, preset });
+    record.tuning = { preset: tuning.preset, params: tuning.params };
+
     const envVars = {
       ...engine.initEnv({ username: record.username, password, dbName: record.dbName }),
-      ...engine.clientEnv({ password })
+      ...engine.clientEnv({ password }),
+      ...(tuning.env || {})
     };
-    const envFile = path.join(TMP_DIR, `env_${record.id}_${crypto.randomBytes(6).toString('hex')}`);
+    const envFile = path.join(this.tmpDir, `env_${record.id}_${crypto.randomBytes(6).toString('hex')}`);
 
     const sameEngineEarlier = this.state.databases.some(
       (d) => d.id !== record.id && d.projectId === record.projectId && d.engine === record.engine
@@ -1109,7 +1757,10 @@ class DatabaseManager extends EventEmitter {
     if (record.exposure && record.exposure.enabled) {
       args.push('-p', `${record.exposure.bindAddress}:${record.exposure.hostPort}:${engine.port}`);
     }
-    args.push(record.image, ...(engine.command ? engine.command() : []));
+    const engineCmd = engine.command
+      ? engine.command({ tuning })
+      : (tuning.commandArgs || []);
+    args.push(record.image, ...engineCmd);
 
     try {
       fs.writeFileSync(
@@ -1125,6 +1776,143 @@ class DatabaseManager extends EventEmitter {
       try { fs.unlinkSync(envFile); } catch (e) {}
     }
     return record;
+  }
+
+  /** Actualiza el preset de afinado y/o recursos RAM/CPU y recrea el contenedor sin perder el volumen. */
+  async setTuning(id, { preset = 'oltp', memoryMb = undefined, cpus = undefined } = {}) {
+    return this.withLock(id, async () => {
+      this.assertNoActiveLongOp(id, 'cambio de tuning');
+      const record = this.mustGet(id);
+      const nextMem = memoryMb !== undefined
+        ? Math.max(128, Math.min(65536, parseInt(String(memoryMb), 10) || record.memoryMb))
+        : record.memoryMb;
+      const nextCpus = cpus !== undefined
+        ? Math.max(0.1, Math.min(32, Number(cpus) || record.cpus))
+        : record.cpus;
+      const tuning = computeTuningConfig(record.engine, { memoryMb: nextMem, cpus: nextCpus, preset });
+      record.memoryMb = nextMem;
+      record.cpus = nextCpus;
+      record.tuning = { preset: tuning.preset, params: tuning.params };
+      await this.recreateContainer(record);
+      this.save({ strict: true });
+      return this.toPublic(record);
+    });
+  }
+
+  /**
+   * Construye la especificación argv + `--env-file` (0 secretos en argv) de un
+   * sidecar PgBouncer co-localizado en la red del proyecto (puerto 6432).
+   */
+  buildPoolerSpec(record, password, { poolMode = 'transaction', maxClientConn = 500, defaultPoolSize = 20, port = 6432 } = {}) {
+    const engine = ENGINES[record.engine];
+    if (!engine || !engine.supportsPooler) {
+      throw new Error(`El motor ${record.engine} no soporta pooler PgBouncer (sólo PostgreSQL, pgvector y TimescaleDB)`);
+    }
+    const mode = String(poolMode || 'transaction').toLowerCase();
+    if (!VALID_POOL_MODES.has(mode)) {
+      throw new Error(`poolMode inválido: ${poolMode}. Usa: transaction, session o statement`);
+    }
+    const safeMaxClient = Math.max(10, Math.min(10000, parseInt(String(maxClientConn), 10) || 500));
+    const safePoolSize = Math.max(2, Math.min(500, parseInt(String(defaultPoolSize), 10) || 20));
+    const safePort = Math.max(1024, Math.min(65535, parseInt(String(port), 10) || 6432));
+    const containerName = `culkibo_pooler_${record.id}`;
+    const envVars = {
+      DB_HOST: record.containerName,
+      DB_PORT: String(record.port),
+      DB_USER: record.username,
+      DB_PASSWORD: password,
+      DB_NAME: record.dbName,
+      LISTEN_PORT: String(safePort),
+      POOL_MODE: mode,
+      MAX_CLIENT_CONN: String(safeMaxClient),
+      DEFAULT_POOL_SIZE: String(safePoolSize),
+      AUTH_TYPE: 'scram-sha-256',
+      IGNORE_STARTUP_PARAMETERS: 'extra_float_digits'
+    };
+    const argsForEnvFile = (envFilePath) => [
+      'run', '-d',
+      '--name', containerName,
+      '--restart', 'unless-stopped',
+      '--network', record.networkName,
+      '--env-file', envFilePath,
+      '--memory', '128m',
+      '--memory-swap', '128m',
+      '--cpus', '0.5',
+      '--pids-limit', '256',
+      '--security-opt', 'no-new-privileges',
+      '--log-driver', 'json-file',
+      '--log-opt', 'max-size=5m',
+      '--log-opt', 'max-file=2',
+      '--health-cmd', `pg_isready -h 127.0.0.1 -p ${safePort}`,
+      '--health-interval', '10s',
+      '--health-timeout', '5s',
+      '--health-retries', '5',
+      '--label', 'culkibo.managed=true',
+      '--label', `culkibo.project=${record.projectId}`,
+      '--label', `culkibo.database=${record.id}`,
+      '--label', 'culkibo.role=pgbouncer',
+      PGBOUNCER_IMAGE
+    ];
+    return {
+      image: PGBOUNCER_IMAGE,
+      containerName,
+      port: safePort,
+      poolMode: mode,
+      maxClientConn: safeMaxClient,
+      defaultPoolSize: safePoolSize,
+      envVars,
+      argsForEnvFile
+    };
+  }
+
+  /** Activa, actualiza o desactiva el pooler PgBouncer co-localizado para una BD PostgreSQL. */
+  async configurePooler(id, { enabled = true, poolMode = 'transaction', maxClientConn = 500, defaultPoolSize = 20, port = 6432 } = {}) {
+    return this.withLock(id, async () => {
+      this.assertNoActiveLongOp(id, 'configuración de pooler');
+      const record = this.mustGet(id);
+      const engine = ENGINES[record.engine];
+      if (!engine || !engine.supportsPooler) {
+        throw new Error(`El motor ${record.engine} no soporta pooler PgBouncer (sólo PostgreSQL, pgvector y TimescaleDB)`);
+      }
+      if (!(await this.isDockerAvailable())) {
+        throw new Error('Docker no está disponible');
+      }
+
+      const poolerContainer = `culkibo_pooler_${record.id}`;
+      try { await this.docker(['stop', '-t', '15', poolerContainer], { timeout: 30000 }); } catch (e) {}
+      try { await this.docker(['rm', '-f', poolerContainer], { timeout: 20000 }); } catch (e) {}
+
+      if (!enabled) {
+        record.pooler = { enabled: false, containerName: poolerContainer, port: 6432, poolMode: 'transaction', maxClientConn: 500, defaultPoolSize: 20, image: PGBOUNCER_IMAGE };
+        record.updatedAt = new Date().toISOString();
+        this.save({ strict: true });
+        return this.toPublic(record);
+      }
+
+      const password = this.decryptPassword(record);
+      const spec = this.buildPoolerSpec(record, password, { poolMode, maxClientConn, defaultPoolSize, port });
+      await this.ensureNetwork(record.projectId);
+      const envFile = path.join(this.tmpDir, `env_pooler_${record.id}_${crypto.randomBytes(6).toString('hex')}`);
+      try {
+        fs.writeFileSync(envFile, formatDockerEnvFile(spec.envVars), { encoding: 'utf8', mode: 0o600 });
+        await this.docker(spec.argsForEnvFile(envFile), { timeout: 120000 });
+      } finally {
+        try { fs.unlinkSync(envFile); } catch (e) {}
+      }
+
+      record.pooler = {
+        enabled: true,
+        containerName: spec.containerName,
+        port: spec.port,
+        poolMode: spec.poolMode,
+        maxClientConn: spec.maxClientConn,
+        defaultPoolSize: spec.defaultPoolSize,
+        image: spec.image
+      };
+      record.updatedAt = new Date().toISOString();
+      this.save({ strict: true });
+      return this.toPublic(record);
+    });
   }
 
   /** Recupera un contenedor desaparecido conservando intacto su volumen y contraseña. */
@@ -1194,6 +1982,10 @@ class DatabaseManager extends EventEmitter {
       this.assertNoActiveLongOp(id, 'eliminación');
       const record = this.mustGet(id);
       if (await this.isDockerAvailable()) {
+        if (record.pooler && record.pooler.containerName) {
+          try { await this.docker(['stop', '-t', '15', record.pooler.containerName], { timeout: 30000 }); } catch (e) {}
+          try { await this.docker(['rm', '-f', record.pooler.containerName], { timeout: 20000 }); } catch (e) {}
+        }
         // Parada ordenada antes de eliminar para no corromper un volumen conservado
         try { await this.docker(['stop', '-t', '30', record.containerName], { timeout: 45000 }); } catch (e) {}
         try { await this.docker(['rm', record.containerName], { timeout: 30000 }); } catch (e) {
@@ -1204,7 +1996,7 @@ class DatabaseManager extends EventEmitter {
         }
       }
       if (deleteBackups) {
-        try { fs.rmSync(path.join(BACKUPS_ROOT, record.id), { recursive: true, force: true }); } catch (e) {}
+        try { fs.rmSync(path.join(this.backupsRoot, record.id), { recursive: true, force: true }); } catch (e) {}
       }
       this.state.databases = this.state.databases.filter((d) => d.id !== id);
       this.save({ strict: true });
@@ -1261,6 +2053,8 @@ class DatabaseManager extends EventEmitter {
    * claves S3. Es lo que devuelven todos los endpoints de listado.
    */
   toPublic(record) {
+    const newestVerified = (record.backups || []).find((b) => b && b.lastVerification && b.lastVerification.ok);
+    const poolerActive = Boolean(record.pooler && record.pooler.enabled);
     return {
       id: record.id,
       projectId: record.projectId,
@@ -1276,6 +2070,9 @@ class DatabaseManager extends EventEmitter {
       networkName: record.networkName,
       memoryMb: record.memoryMb,
       cpus: record.cpus,
+      tuning: record.tuning || null,
+      pooler: record.pooler || null,
+      clonedFrom: record.clonedFrom || null,
       exposure: record.exposure,
       status: record.status,
       health: record.health,
@@ -1290,9 +2087,14 @@ class DatabaseManager extends EventEmitter {
       },
       retention: record.retention,
       backupsCount: (record.backups || []).length,
+      restoreHistoryCount: (record.restoreHistory || []).length,
+      lastVerifiedAt: newestVerified ? newestVerified.lastVerification.verifiedAt : null,
       activeOperation: this._activeOps.get(record.id) || null,
       // Plantilla sin secreto: útil en la interfaz sin filtrar nada.
       connectionTemplate: this.buildConnectionString(record, '********'),
+      pooledConnectionTemplate: poolerActive
+        ? this.buildConnectionString(record, '********', { host: record.pooler.containerName, port: record.pooler.port })
+        : null,
       hasPassword: Boolean(record.passwordEnc)
     };
   }
@@ -1315,6 +2117,7 @@ class DatabaseManager extends EventEmitter {
   getCredentials(id) {
     const record = this.mustGet(id);
     const password = this.decryptPassword(record);
+    const poolerActive = Boolean(record.pooler && record.pooler.enabled);
     return {
       id: record.id,
       username: record.username,
@@ -1323,6 +2126,9 @@ class DatabaseManager extends EventEmitter {
       host: record.containerName,
       port: record.port,
       internalConnectionString: this.buildConnectionString(record, password),
+      pooledConnectionString: poolerActive
+        ? this.buildConnectionString(record, password, { host: record.pooler.containerName, port: record.pooler.port })
+        : null,
       hostConnectionString:
         record.exposure && record.exposure.enabled
           ? this.buildConnectionString(record, password, {
@@ -1350,6 +2156,11 @@ class DatabaseManager extends EventEmitter {
       case 'mysql':
       case 'mariadb':
         return `mysql://${record.username}:${pass}@${host}:${port}/${record.dbName}`;
+      case 'clickhouse':
+        return `http://${record.username}:${pass}@${host}:${port}/${record.dbName}`;
+      case 'qdrant':
+      case 'meilisearch':
+        return `http://${host}:${port}`;
       case 'postgresql':
       default:
         return `postgresql://${record.username}:${pass}@${host}:${port}/${record.dbName}`;
@@ -1370,7 +2181,7 @@ class DatabaseManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   backupDir(id) {
-    const dir = path.join(BACKUPS_ROOT, id);
+    const dir = path.join(this.backupsRoot, id);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -1388,21 +2199,39 @@ class DatabaseManager extends EventEmitter {
   }
 
   /**
-   * Ejecuta un volcado completo.
-   *
-   * Invariante central: el secreto no viaja en ningún argv del host.
-   *  - Postgres/MySQL/MariaDB/Redis: la variable que lee la herramienta
-   *    (PGPASSWORD, MYSQL_PWD, REDISCLI_AUTH) ya está DENTRO del contenedor
-   *    desde que se creó, así que `docker exec` no necesita `-e` ninguno.
-   *  - MongoDB: `mongodump` no lee ninguna variable, así que se le pasa un
-   *    fichero de configuración YAML copiado al contenedor con `docker cp` y
-   *    borrado justo después. Sigue sin haber secretos en `ps`.
-   *
-   * El `spec` de argumentos lo produce `dbBackupManager.buildDbDumpSpec`, que
-   * ya devuelve argv + entorno y nunca una cadena de shell.
+   * Escribe un fichero efímero 0600 de credenciales para motores cuyos clientes
+   * CLI no leen la clave desde variables de entorno (MongoDB, ClickHouse, Qdrant, Meilisearch).
    */
-  /** @param {string} id @param {{ trigger?: string, skipS3?: boolean, skipRetention?: boolean, pinned?: boolean, bypassOpGuard?: boolean }} [opts] */
-  async runBackup(id, { trigger = 'manual', skipS3 = false, skipRetention = false, pinned = false, bypassOpGuard = false } = {}) {
+  _writeEngineAuthConfig(engine, password, tag = 'auth') {
+    const format = engine.configFormat || 'mongo-yaml';
+    const rand = crypto.randomBytes(6).toString('hex');
+    let ext = '.yml';
+    let content = `password: ${JSON.stringify(password)}\n`;
+    if (format === 'clickhouse-xml') {
+      ext = '.xml';
+      const escaped = String(password).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      content = `<config><password>${escaped}</password></config>\n`;
+    } else if (format === 'curl-qdrant') {
+      ext = '.cfg';
+      const clean = String(password).replace(/["\r\n\\]/g, '');
+      content = `header = "api-key: ${clean}"\n`;
+    } else if (format === 'curl-meilisearch') {
+      ext = '.cfg';
+      const clean = String(password).replace(/["\r\n\\]/g, '');
+      content = `header = "Authorization: Bearer ${clean}"\n`;
+    }
+    const localPath = path.join(this.tmpDir, `${tag}_${rand}${ext}`);
+    const containerPath = `/tmp/.culkibo_${tag}_${rand}${ext}`;
+    fs.writeFileSync(localPath, content, { encoding: 'utf8', mode: 0o600 });
+    return { localPath, containerPath, format };
+  }
+
+  /**
+   * Ejecuta un volcado completo con cifrado cliente AEAD (`CKB1`) opcional antes de subir a S3/R2.
+   * @param {string} id
+   * @param {{ trigger?: string, skipS3?: boolean, skipRetention?: boolean, pinned?: boolean, bypassOpGuard?: boolean, encrypt?: boolean }} [opts]
+   */
+  async runBackup(id, { trigger = 'manual', skipS3 = false, skipRetention = false, pinned = false, bypassOpGuard = false, encrypt = undefined } = {}) {
     const record = this.mustGet(id);
     if (this.runningBackups.has(id)) {
       throw new Error('Ya hay una copia en curso para esta base de datos');
@@ -1429,19 +2258,17 @@ class DatabaseManager extends EventEmitter {
     const localPath = path.join(this.backupDir(id), baseName);
     /** @type {string | null} */
     let finalPath = null;
+    /** @type {string | null} */
+    let encryptedPath = null;
     let savedLocally = false;
     /** @type {string | null} */
     let configInContainer = null;
 
     try {
-      const spec = dbBackupManager.buildDbDumpSpec(engine.family, {
+      const specEngine = engine.family === 'postgresql' ? 'postgresql' : record.engine;
+      const spec = dbBackupManager.buildDbDumpSpec(specEngine, {
         host: '127.0.0.1',
-        port: engine.port,
-        // La familia MySQL vuelca como root: el usuario de la aplicación sólo
-        // tiene permisos sobre su propia base y `mysqldump` necesita además
-        // RELOAD/FLUSH_TABLES, así que un volcado con el usuario normal falla a
-        // mitad y deja un fichero incompleto. En PostgreSQL el usuario que crea
-        // el entrypoint ya es superusuario, así que no hace falta distinguir.
+        port: engine.nativePort || engine.port,
         user: engine.dumpUser || record.username,
         password,
         dbName: record.dbName || 'app',
@@ -1450,26 +2277,31 @@ class DatabaseManager extends EventEmitter {
 
       let args = [...spec.args];
 
-      // Las opciones extra van ANTES del último argumento: en la familia MySQL
-      // el nombre de la base de datos es posicional y todo lo que va detrás se
-      // interpreta como una lista de tablas.
+      // Las opciones extra van ANTES del último argumento (deduplicadas)
       if (engine.dumpExtraArgs && engine.dumpExtraArgs.length) {
-        args.splice(Math.max(0, args.length - 1), 0, ...engine.dumpExtraArgs);
+        const extraToAdd = engine.dumpExtraArgs.filter((flag) => !args.includes(flag));
+        if (extraToAdd.length) {
+          args.splice(Math.max(0, args.length - 1), 0, ...extraToAdd);
+        }
       }
 
       if (engine.usesConfigFile) {
-        // Quitamos el --password=... que buildDbDumpSpec marca como
-        // `secretInArgs: true` y lo sustituimos por un fichero de configuración.
+        // Quitamos cualquier --password=... y pasamos credenciales mediante archivo 0600 efímero
         args = args.filter((a) => !String(a).startsWith('--password='));
-        const cfgLocal = path.join(TMP_DIR, `mongo_${record.id}_${crypto.randomBytes(6).toString('hex')}.yml`);
-        configInContainer = `/tmp/.culkibo_${crypto.randomBytes(6).toString('hex')}.yml`;
-        fs.writeFileSync(cfgLocal, `password: ${JSON.stringify(password)}\n`, { encoding: 'utf8', mode: 0o600 });
+        const authCfg = this._writeEngineAuthConfig(engine, password, `auth_${record.id}`);
+        configInContainer = authCfg.containerPath;
         try {
-          await this.docker(['cp', cfgLocal, `${record.containerName}:${configInContainer}`], { timeout: 30000 });
+          await this.docker(['cp', authCfg.localPath, `${record.containerName}:${configInContainer}`], { timeout: 30000 });
         } finally {
-          try { fs.unlinkSync(cfgLocal); } catch (e) {}
+          try { fs.unlinkSync(authCfg.localPath); } catch (e) {}
         }
-        args = [`--config=${configInContainer}`, ...args];
+        if (authCfg.format === 'clickhouse-xml') {
+          args = ['--config-file', configInContainer, ...args];
+        } else if (authCfg.format === 'curl-qdrant' || authCfg.format === 'curl-meilisearch') {
+          args = ['-K', configInContainer, ...args];
+        } else {
+          args = [`--config=${configInContainer}`, ...args];
+        }
       }
 
       // Sin `-e`: el entorno necesario ya está dentro del contenedor.
@@ -1487,12 +2319,34 @@ class DatabaseManager extends EventEmitter {
         throw new Error('El volcado generado está vacío (0 bytes antes de comprimir)');
       }
 
-      // mongodump ya sale comprimido con --gzip; el resto no.
+      // mongodump (.archive.gz) y clickhouse (.zip) ya salen comprimidos; el resto pasa por gzip.
       finalPath = localPath;
-      if (!baseName.endsWith('.gz')) {
+      if (!baseName.endsWith('.gz') && !baseName.endsWith('.zip')) {
         finalPath = `${localPath}.gz`;
         await this.gzipFile(localPath, finalPath);
         try { fs.unlinkSync(localPath); } catch (e) {}
+      }
+
+      // Cifrado autenticado AES-256-GCM en streaming (`CKB1`) ANTES de subir a S3/R2
+      const shouldEncrypt = encrypt === true || (encrypt !== false && Boolean(this.state.backupEncryption && this.state.backupEncryption.enabled));
+      /** @type {any} */
+      let encryptionMeta = null;
+      if (shouldEncrypt) {
+        const activeKey = this._getActiveBackupKey();
+        if (!activeKey) {
+          throw new Error('El cifrado de copias está activado pero no hay ninguna clave activa configurada');
+        }
+        encryptedPath = `${finalPath}.ckb1`;
+        const encInfo = await encryptBackupFile(finalPath, encryptedPath, activeKey.key);
+        try { fs.unlinkSync(finalPath); } catch (e) {}
+        finalPath = encryptedPath;
+        encryptionMeta = {
+          format: encInfo.format,
+          cipher: encInfo.cipher,
+          keyId: encInfo.keyId,
+          chunks: encInfo.chunks,
+          plainBytes: encInfo.plainBytes
+        };
       }
 
       const stat = fs.statSync(finalPath);
@@ -1510,6 +2364,10 @@ class DatabaseManager extends EventEmitter {
         trigger,
         durationMs: Date.now() - startedAt,
         pinned: Boolean(pinned),
+        encrypted: Boolean(encryptionMeta),
+        encryption: encryptionMeta,
+        lastVerification: null,
+        lastDrill: null,
         remote: null,
         remoteError: null
       };
@@ -1519,8 +2377,24 @@ class DatabaseManager extends EventEmitter {
       if (s3) {
         const key = `${this.s3Prefix()}${record.projectId}/${record.id}/${entry.fileName}`;
         try {
-          const uploaded = await s3.uploadFile(key, finalPath, { contentType: 'application/gzip' });
-          entry.remote = { key, etag: uploaded.etag || null, multipart: Boolean(uploaded.multipart), uploadedAt: new Date().toISOString() };
+          const uploaded = await s3.uploadFile(key, finalPath, {
+            contentType: entry.encrypted ? 'application/octet-stream' : 'application/gzip',
+            checksumSha256: true,
+            metadata: {
+              'culkibo-db-id': record.id,
+              'culkibo-engine': record.engine,
+              'culkibo-encrypted': entry.encrypted ? 'true' : 'false',
+              'culkibo-sha256': entry.sha256,
+              ...(entry.encryption ? { 'culkibo-key-id': entry.encryption.keyId } : {})
+            }
+          });
+          entry.remote = {
+            key,
+            etag: uploaded.etag || null,
+            checksumSha256: uploaded.checksumSha256 || null,
+            multipart: Boolean(uploaded.multipart),
+            uploadedAt: new Date().toISOString()
+          };
         } catch (s3Err) {
           entry.remote = null;
           let msg = this.redactMessage(s3Err.message, password);
@@ -1671,7 +2545,9 @@ class DatabaseManager extends EventEmitter {
    */
   async assertSafeSqlFile(filePath, family) {
     const isPg = family === 'postgresql';
-    const pgMetaRe = /^\s*\\(?:!|gexec\b|o\s+\|)|COPY\b[\s\S]{0,200}\b(?:FROM|TO)\s+PROGRAM\b/im;
+    // En psql, `\gexec`, `\g |cmd`, `\o |cmd`, `\!` y `\copy ... program` pueden ir
+    // tanto al inicio de línea como tras una sentencia SQL en la misma línea (`SELECT ... \gexec`).
+    const pgMetaRe = /(?:^|\s)\\(?:!|gexec\b|g\s+\||o\s+\||copy\b[\s\S]{0,120}\bprogram\b)|\bCOPY\b[\s\S]{0,200}\b(?:FROM|TO)\s+PROGRAM\b/im;
     const mysqlMetaRe = /(?:^|[^\\])(?:\\\\)*\\[!TPe.]|^\s*(?:system|tee|pager|edit|source)(?:\s|;|$)/im;
     let carry = '';
     const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 128 * 1024 });
@@ -1825,14 +2701,23 @@ class DatabaseManager extends EventEmitter {
       if (!rawBase || rawBase.startsWith('.')) {
         throw new Error('Nombre de archivo de copia inválido');
       }
-      if (!/\.(sql|dump|rdb|gz|archive\.gz)$/i.test(rawBase)) {
-        throw new Error('Formato no soportado. Usa .sql, .sql.gz, .dump, .dump.gz, .rdb, .rdb.gz o .archive.gz');
+      if (!/\.(sql|dump|rdb|gz|archive\.gz|ckb1|zip|snapshot)$/i.test(rawBase)) {
+        throw new Error('Formato no soportado. Usa .sql, .sql.gz, .dump, .dump.gz, .rdb, .rdb.gz, .archive.gz, .zip, .snapshot o .ckb1');
       }
       const stat = fs.statSync(tempPath);
       if (stat.size <= 0) {
         throw new Error('El archivo subido está vacío (0 bytes)');
       }
-      if (rawBase.endsWith('.gz') && !this.hasGzipMagic(tempPath)) {
+      const isEncryptedUpload = rawBase.endsWith('.ckb1') || hasCkb1Magic(tempPath);
+      /** @type {any} */
+      let encryptionMeta = null;
+      if (isEncryptedUpload) {
+        const hdr = inspectCkb1Header(tempPath);
+        if (!hdr.valid) {
+          throw new Error(`El archivo .ckb1 no tiene una cabecera cifrada válida: ${hdr.reason}`);
+        }
+        encryptionMeta = { format: 'CKB1', cipher: 'aes-256-gcm', keyId: hdr.keyId };
+      } else if (rawBase.endsWith('.gz') && !this.hasGzipMagic(tempPath)) {
         throw new Error('El archivo .gz no tiene una cabecera gzip válida');
       }
 
@@ -1857,6 +2742,10 @@ class DatabaseManager extends EventEmitter {
         trigger: 'upload',
         durationMs: 0,
         pinned: true,
+        encrypted: isEncryptedUpload,
+        encryption: encryptionMeta,
+        lastVerification: null,
+        lastDrill: null,
         remote: null,
         remoteError: null
       };
@@ -1900,11 +2789,11 @@ class DatabaseManager extends EventEmitter {
 
   /**
    * Restaura desde una copia local o, si ya no está en disco, descargándola
-   * primero del bucket. Antes de tocar la base activa crea automáticamente una
-   * copia de seguridad `pre-restore` para poder deshacer en 1 clic.
+   * primero del bucket. Si la copia está cifrada (`CKB1`), descifra y verifica
+   * todos los authTag AES-256-GCM ANTES de tocar la base activa.
    */
-  /** @param {string} id @param {{ backupId?: string | null, remoteKey?: string | null, createSafetySnapshot?: boolean }} [opts] */
-  async restore(id, { backupId = null, remoteKey = null, createSafetySnapshot = true } = {}) {
+  /** @param {string} id @param {{ backupId?: string | null, remoteKey?: string | null, createSafetySnapshot?: boolean, decryptionKey?: Buffer | null }} [opts] */
+  async restore(id, { backupId = null, remoteKey = null, createSafetySnapshot = true, decryptionKey = null } = {}) {
     return this.withLock(id, async () => {
       const record = this.mustGet(id);
       const engine = ENGINES[record.engine];
@@ -1912,7 +2801,8 @@ class DatabaseManager extends EventEmitter {
       if (!(await this.isDockerAvailable())) throw new Error('Docker no está disponible');
 
       // Reservar el slot de operación activa ANTES de descargar de S3 para impedir colisión con backups programados
-      this._activeOps.set(id, { kind: 'restore', startedAt: Date.now() });
+      const restoreStartedAt = Date.now();
+      this._activeOps.set(id, { kind: 'restore', startedAt: restoreStartedAt });
 
       const dir = this.backupDir(id);
       /** @type {string | null} */
@@ -1920,16 +2810,20 @@ class DatabaseManager extends EventEmitter {
       let downloaded = false;
       /** @type {string | null} */
       let tempRemotePath = null;
+      /** @type {string | null} */
+      let decryptedTempPath = null;
       /** @type {string} */
       let plainPath = '';
       /** @type {string | null} */
       let sanitizedSqlPath = null;
       let madeTemp = false;
+      let copiedToContainer = false;
       const inContainer = `/tmp/culkibo_restore_${crypto.randomBytes(6).toString('hex')}`;
       /** @type {any} */
       let safetyBackup = null;
       /** @type {string | null} */
       let safetyBackupWarning = null;
+      let methodUsed = engine.family;
 
       try {
         if (backupId) {
@@ -1946,7 +2840,7 @@ class DatabaseManager extends EventEmitter {
             const s3 = this.s3ClientFor();
             if (!s3) throw new Error('La copia sólo existe en remoto y no hay S3 configurado');
             archivePath = candidate;
-            await s3.downloadFile(entry.remote.key, archivePath);
+            await s3.downloadFile(entry.remote.key, archivePath, { expectedSha256Hex: entry.sha256 || null });
             downloaded = true;
             if (entry.sha256) {
               const actual = await this.sha256File(archivePath);
@@ -1975,7 +2869,18 @@ class DatabaseManager extends EventEmitter {
         if (archStat.size <= 0) {
           throw new Error('El archivo de copia está vacío (0 bytes), no se restaura');
         }
-        if (archivePath.endsWith('.gz') && !this.hasGzipMagic(archivePath)) {
+
+        // Si es un volcado cifrado CKB1, autenticar TODOS los authTag AEAD en staging ANTES de tocar la BD viva
+        let workPath = archivePath;
+        if (archivePath.endsWith('.ckb1') || hasCkb1Magic(archivePath)) {
+          const innerName = path.basename(archivePath).replace(/\.ckb1$/i, '') || 'decrypted.gz';
+          decryptedTempPath = path.join(this.tmpDir, `dec_${record.id}_${crypto.randomBytes(5).toString('hex')}_${innerName}`);
+          const ring = decryptionKey ? decryptionKey : this._getBackupKeyRing();
+          await decryptBackupFile(archivePath, decryptedTempPath, ring);
+          workPath = decryptedTempPath;
+        }
+
+        if (workPath.endsWith('.gz') && !this.hasGzipMagic(workPath)) {
           throw new Error('El archivo de copia .gz no tiene una cabecera gzip válida, no se restaura');
         }
 
@@ -1995,14 +2900,15 @@ class DatabaseManager extends EventEmitter {
           }
         }
 
-        plainPath = archivePath;
-        if (archivePath.endsWith('.gz') && !archivePath.endsWith('.archive.gz')) {
-          plainPath = path.join(TMP_DIR, `restore_${record.id}_${crypto.randomBytes(5).toString('hex')}`);
+        plainPath = workPath;
+        if (workPath.endsWith('.gz') && !workPath.endsWith('.archive.gz')) {
+          plainPath = path.join(this.tmpDir, `restore_${record.id}_${crypto.randomBytes(5).toString('hex')}`);
           madeTemp = true;
-          await this.gunzipFile(archivePath, plainPath);
+          await this.gunzipFile(workPath, plainPath);
         }
 
         if (engine.family === 'redis') {
+          methodUsed = 'rdb-replace';
           const dataDir = record.dataDir || this.resolveDataDir(engine, record.image);
           // Verificar cabecera mágica de 5 bytes `REDIS` antes de detener el contenedor o sustituir dump.rdb
           const rdbHeader = Buffer.alloc(5);
@@ -2033,28 +2939,76 @@ class DatabaseManager extends EventEmitter {
           }
           await this.docker(['start', record.containerName], { timeout: 90000 });
           record.status = 'running';
+          this._recordRestoreAudit(record, {
+            kind: 'restore',
+            backupId,
+            remoteKey,
+            method: methodUsed,
+            status: 'ok',
+            safetyBackupId: safetyBackup ? safetyBackup.id : null,
+            durationMs: Date.now() - restoreStartedAt
+          });
           this.save();
-          this.emit('restore_completed', { databaseId: id, method: 'rdb-replace', downloaded, safetyBackupId: safetyBackup ? safetyBackup.id : null });
-          return { success: true, databaseId: id, method: 'rdb-replace', downloaded, safetyBackup, safetyBackupWarning };
+          this.emit('restore_completed', { databaseId: id, method: methodUsed, downloaded, safetyBackupId: safetyBackup ? safetyBackup.id : null });
+          return { success: true, databaseId: id, method: methodUsed, downloaded, safetyBackup, safetyBackupWarning };
         }
 
         if (engine.family === 'mongodb') {
           await this.docker(['cp', plainPath, `${record.containerName}:${inContainer}`], { timeout: 3600 * 1000 });
-          const cfgLocal = path.join(TMP_DIR, `mongo_r_${record.id}_${crypto.randomBytes(5).toString('hex')}.yml`);
-          const cfgRemote = `/tmp/.culkibo_r_${crypto.randomBytes(5).toString('hex')}.yml`;
-          fs.writeFileSync(cfgLocal, `password: ${JSON.stringify(this.decryptPassword(record))}\n`, { encoding: 'utf8', mode: 0o600 });
+          copiedToContainer = true;
+          const authCfg = this._writeEngineAuthConfig(engine, this.decryptPassword(record), `mongo_r_${record.id}`);
           try {
-            await this.docker(['cp', cfgLocal, `${record.containerName}:${cfgRemote}`], { timeout: 30000 });
+            await this.docker(['cp', authCfg.localPath, `${record.containerName}:${authCfg.containerPath}`], { timeout: 30000 });
             await this.docker([
               'exec', record.containerName, 'mongorestore',
-              `--config=${cfgRemote}`,
+              `--config=${authCfg.containerPath}`,
               `--username=${record.username}`,
               '--authenticationDatabase=admin',
               `--archive=${inContainer}`, '--gzip', '--drop'
             ], { timeout: 6 * 3600 * 1000 });
           } finally {
-            try { fs.unlinkSync(cfgLocal); } catch (e) {}
-            try { await this.docker(['exec', record.containerName, 'rm', '-f', cfgRemote], { timeout: 15000 }); } catch (e) {}
+            try { fs.unlinkSync(authCfg.localPath); } catch (e) {}
+            try { await this.docker(['exec', record.containerName, 'rm', '-f', authCfg.containerPath], { timeout: 15000 }); } catch (e) {}
+          }
+        } else if (engine.family === 'clickhouse') {
+          const safeDb = assertIdentifier(record.dbName, 'base de datos');
+          await this.docker(['cp', plainPath, `${record.containerName}:${inContainer}`], { timeout: 3600 * 1000 });
+          copiedToContainer = true;
+          const authCfg = this._writeEngineAuthConfig(engine, this.decryptPassword(record), `ch_r_${record.id}`);
+          try {
+            await this.docker(['cp', authCfg.localPath, `${record.containerName}:${authCfg.containerPath}`], { timeout: 30000 });
+            await this.docker([
+              'exec', record.containerName, 'clickhouse-client',
+              '--config-file', authCfg.containerPath,
+              '--user', record.username,
+              '--query', `RESTORE DATABASE \`${safeDb}\` FROM File('${inContainer}')`
+            ], { timeout: 6 * 3600 * 1000 });
+          } finally {
+            try { fs.unlinkSync(authCfg.localPath); } catch (e) {}
+            try { await this.docker(['exec', record.containerName, 'rm', '-f', authCfg.containerPath], { timeout: 15000 }); } catch (e) {}
+          }
+        } else if (engine.family === 'qdrant' || engine.family === 'meilisearch') {
+          await this.docker(['cp', plainPath, `${record.containerName}:${inContainer}`], { timeout: 3600 * 1000 });
+          copiedToContainer = true;
+          const authCfg = this._writeEngineAuthConfig(engine, this.decryptPassword(record), `${engine.family}_r_${record.id}`);
+          try {
+            await this.docker(['cp', authCfg.localPath, `${record.containerName}:${authCfg.containerPath}`], { timeout: 30000 });
+            if (engine.family === 'qdrant') {
+              await this.docker([
+                'exec', record.containerName, 'curl', '-fsS', '-K', authCfg.containerPath,
+                '-X', 'POST', `http://127.0.0.1:${engine.port}/snapshots/upload`,
+                '-F', `snapshot=@${inContainer}`
+              ], { timeout: 6 * 3600 * 1000 });
+            } else {
+              await this.docker([
+                'exec', record.containerName, 'curl', '-fsS', '-K', authCfg.containerPath,
+                '-X', 'POST', `http://127.0.0.1:${engine.port}/dumps`,
+                '--data-binary', `@${inContainer}`
+              ], { timeout: 6 * 3600 * 1000 });
+            }
+          } finally {
+            try { fs.unlinkSync(authCfg.localPath); } catch (e) {}
+            try { await this.docker(['exec', record.containerName, 'rm', '-f', authCfg.containerPath], { timeout: 15000 }); } catch (e) {}
           }
         } else if (engine.family === 'postgresql') {
           // Cerrar sesiones abiertas sobre la BD para evitar bloqueos en DROP/CREATE de pg_restore o psql
@@ -2069,6 +3023,7 @@ class DatabaseManager extends EventEmitter {
 
           if (this.isPgCustomFormat(plainPath)) {
             await this.docker(['cp', plainPath, `${record.containerName}:${inContainer}`], { timeout: 3600 * 1000 });
+            copiedToContainer = true;
             const plan = engine.restore({ username: record.username, dbName: record.dbName, inFile: inContainer });
             const argv = this.wrapInContainer(engine, plan.program, plan.args);
             await this.docker(['exec', record.containerName, ...argv], { timeout: 6 * 3600 * 1000 });
@@ -2085,12 +3040,13 @@ class DatabaseManager extends EventEmitter {
           let inputForRestore = plainPath;
           if (plan.stdinFile && (engine.family === 'mysql' || engine.family === 'mariadb')) {
             await this.assertSafeSqlFile(plainPath, engine.family);
-            sanitizedSqlPath = path.join(TMP_DIR, `sanitized_${record.id}_${crypto.randomBytes(5).toString('hex')}.sql`);
+            sanitizedSqlPath = path.join(this.tmpDir, `sanitized_${record.id}_${crypto.randomBytes(5).toString('hex')}.sql`);
             await this.sanitizeMysqlSqlFile(plainPath, sanitizedSqlPath);
             inputForRestore = sanitizedSqlPath;
           }
           if (!plan.stdinFile) {
             await this.docker(['cp', inputForRestore, `${record.containerName}:${inContainer}`], { timeout: 3600 * 1000 });
+            copiedToContainer = true;
           }
           const argv = this.wrapInContainer(engine, plan.program, plan.args);
           if (plan.stdinFile) {
@@ -2103,10 +3059,43 @@ class DatabaseManager extends EventEmitter {
           }
         }
 
+        this._recordRestoreAudit(record, {
+          kind: 'restore',
+          backupId,
+          remoteKey,
+          method: methodUsed,
+          status: 'ok',
+          safetyBackupId: safetyBackup ? safetyBackup.id : null,
+          durationMs: Date.now() - restoreStartedAt
+        });
+        this.save();
         this.emit('restore_completed', { databaseId: id, safetyBackupId: safetyBackup ? safetyBackup.id : null });
         try { require('./telemetryService').recordFeatureUsage(`db_restore:${record.engine}`, true); } catch (e) {}
-        return { success: true, databaseId: id, method: engine.family, downloaded, safetyBackup, safetyBackupWarning };
+        return { success: true, databaseId: id, method: methodUsed, downloaded, safetyBackup, safetyBackupWarning };
       } catch (err) {
+        const safeErrMsg = this.redactMessage(err.message, this.decryptPassword(record));
+        this._recordRestoreAudit(record, {
+          kind: 'restore',
+          backupId,
+          remoteKey,
+          method: methodUsed,
+          status: 'failed',
+          safetyBackupId: safetyBackup ? safetyBackup.id : null,
+          durationMs: Date.now() - restoreStartedAt,
+          error: safeErrMsg
+        });
+        this.save();
+        this.emit('restore_failed', { databaseId: id, error: safeErrMsg });
+        const ns = getNotificationService();
+        if (ns && typeof ns.notify === 'function') {
+          Promise.resolve(ns.notify({
+            event: 'backup_failed',
+            level: 'error',
+            title: `Restauración fallida: ${record.name}`,
+            message: `Error al restaurar ${record.name} (${record.engine}): ${safeErrMsg}`,
+            projectId: record.projectId
+          })).catch(() => {});
+        }
         try {
           const ts = require('./telemetryService');
           ts.recordFeatureUsage(`db_restore:${record.engine}`, false);
@@ -2114,7 +3103,7 @@ class DatabaseManager extends EventEmitter {
             operation: 'database_restore',
             stage: 'restore',
             kind: record.engine,
-            message: this.redactMessage(err.message, this.decryptPassword(record))
+            message: safeErrMsg
           });
         } catch (e) {}
         if (safetyBackup) {
@@ -2122,8 +3111,11 @@ class DatabaseManager extends EventEmitter {
         }
         throw err;
       } finally {
-        try { await this.docker(['exec', record.containerName, 'rm', '-f', inContainer], { timeout: 15000 }); } catch (e) {}
+        if (copiedToContainer) {
+          try { await this.docker(['exec', record.containerName, 'rm', '-f', inContainer], { timeout: 15000 }); } catch (e) {}
+        }
         if (madeTemp && plainPath) { try { fs.unlinkSync(plainPath); } catch (e) {} }
+        if (decryptedTempPath) { try { fs.unlinkSync(decryptedTempPath); } catch (e) {} }
         if (sanitizedSqlPath) { try { fs.unlinkSync(sanitizedSqlPath); } catch (e) {} }
         if (tempRemotePath) { try { fs.unlinkSync(tempRemotePath); } catch (e) {} }
         if (this._activeOps.get(id)?.kind === 'restore') {
@@ -2295,6 +3287,63 @@ class DatabaseManager extends EventEmitter {
         } catch (e) {
           base.reachable = true;
           base.version = record.image;
+        }
+      } else if (engine.family === 'clickhouse') {
+        const authCfg = this._writeEngineAuthConfig(engine, this.decryptPassword(record), `ch_i_${record.id}`);
+        try {
+          await this.docker(['cp', authCfg.localPath, `${record.containerName}:${authCfg.containerPath}`], { timeout: 15000 });
+          const ver = await this.docker([
+            'exec', record.containerName, 'clickhouse-client',
+            '--config-file', authCfg.containerPath, '--user', record.username, '--query', 'SELECT version()'
+          ], { timeout: 15000 });
+          base.latencyMs = Date.now() - started;
+          base.reachable = true;
+          base.version = `ClickHouse ${(ver.stdout || '').trim()}`;
+          const safeDb = assertIdentifier(record.dbName, 'base de datos');
+          const tbl = await this.docker([
+            'exec', record.containerName, 'clickhouse-client',
+            '--config-file', authCfg.containerPath, '--user', record.username, '--query',
+            `SELECT name, total_bytes, total_rows FROM system.tables WHERE database='${safeDb}' ORDER BY total_bytes DESC LIMIT 15 FORMAT TSV`
+          ], { timeout: 15000 });
+          let total = 0;
+          base.tables = (tbl.stdout || '').trim().split(/\r?\n/).filter(Boolean).map((line) => {
+            const [name, size, rows] = line.split('\t');
+            const s = parseInt(size, 10) || 0;
+            total += s;
+            return { name, sizeBytes: s, rows: parseInt(rows, 10) || 0 };
+          });
+          base.dbSizeBytes = total;
+        } finally {
+          try { fs.unlinkSync(authCfg.localPath); } catch (e) {}
+          try { await this.docker(['exec', record.containerName, 'rm', '-f', authCfg.containerPath], { timeout: 15000 }); } catch (e) {}
+        }
+      } else if (engine.family === 'qdrant' || engine.family === 'meilisearch') {
+        const authCfg = this._writeEngineAuthConfig(engine, this.decryptPassword(record), `${engine.family}_i_${record.id}`);
+        try {
+          await this.docker(['cp', authCfg.localPath, `${record.containerName}:${authCfg.containerPath}`], { timeout: 15000 });
+          const endpoint = engine.family === 'qdrant'
+            ? `http://127.0.0.1:${engine.port}/collections`
+            : `http://127.0.0.1:${engine.port}/stats`;
+          const out = await this.docker([
+            'exec', record.containerName, 'curl', '-fsS', '-K', authCfg.containerPath, endpoint
+          ], { timeout: 15000 });
+          base.latencyMs = Date.now() - started;
+          base.reachable = true;
+          base.version = record.image;
+          try {
+            const parsed = JSON.parse((out.stdout || '').trim());
+            if (engine.family === 'qdrant' && Array.isArray(parsed?.result?.collections)) {
+              base.tables = parsed.result.collections.slice(0, 15).map((c) => ({ name: c.name, sizeBytes: 0, rows: 0 }));
+            } else if (engine.family === 'meilisearch' && parsed) {
+              base.dbSizeBytes = Number(parsed.databaseSize) || 0;
+              base.tables = Object.entries(parsed.indexes || {}).slice(0, 15).map(([name, info]) => ({
+                name, sizeBytes: 0, rows: Number(info?.numberOfDocuments) || 0
+              }));
+            }
+          } catch (e) {}
+        } finally {
+          try { fs.unlinkSync(authCfg.localPath); } catch (e) {}
+          try { await this.docker(['exec', record.containerName, 'rm', '-f', authCfg.containerPath], { timeout: 15000 }); } catch (e) {}
         }
       }
 
@@ -2685,7 +3734,792 @@ class DatabaseManager extends EventEmitter {
         console.error(`[Databases] Copia programada fallida (${record.name}): ${e.message}`)
       );
     }
+
+    // Watchdog perezoso (máx. 1 vez/hora, 0 timers extra): detecta copias silenciosamente atascadas (Coolify #10636)
+    const nowMs = now.getTime();
+    if (nowMs - this._lastWatchdogAt >= 3600 * 1000) {
+      this._lastWatchdogAt = nowMs;
+      try {
+        this.checkBackupHealth({ now, notify: true });
+      } catch (e) {}
+    }
+
     return { firedAt: now.toISOString(), fired };
+  }
+
+  // -------------------------------------------------------------------------
+  // Cifrado de copias (Key-ring AEAD CKB1 + rotación por keyId)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Activa o desactiva el cifrado cliente AES-256-GCM (`CKB1`) para copias S3/R2.
+   * Desactivar nunca borra las claves retiradas: las copias anteriores siguen siendo restaurables.
+   * @param {{ enabled?: boolean, passphrase?: string | null, keyHex?: string | null }} [opts]
+   */
+  setBackupEncryption({ enabled = true, passphrase = null, keyHex = null } = {}) {
+    const prev = this.state.backupEncryption || { enabled: false, activeKeyId: null, keys: [] };
+    if (!enabled) {
+      this.state.backupEncryption = {
+        ...prev,
+        enabled: false
+      };
+      this.save({ strict: true });
+      return this.getBackupEncryptionConfig();
+    }
+
+    // Si ya hay clave activa y no se pasó material nuevo, simplemente reactivar
+    if (!passphrase && !keyHex && prev.activeKeyId && Array.isArray(prev.keys) && prev.keys.some((k) => k.keyId === prev.activeKeyId)) {
+      this.state.backupEncryption = { ...prev, enabled: true };
+      this.save({ strict: true });
+      return this.getBackupEncryptionConfig();
+    }
+
+    const { keyBuf, keyId, source } = this._materializeBackupKey({ passphrase, keyHex });
+    const nextKeys = (prev.keys || []).map((k) => (k.status === 'active' ? { ...k, status: 'retired' } : k));
+    if (!nextKeys.some((k) => k.keyId === keyId)) {
+      nextKeys.push({
+        keyId,
+        keyEnc: encryptSecret(keyBuf.toString('hex'), this.cryptoKey),
+        source,
+        createdAt: new Date().toISOString(),
+        status: 'active'
+      });
+    } else {
+      for (const k of nextKeys) {
+        if (k.keyId === keyId) k.status = 'active';
+      }
+    }
+
+    this.state.backupEncryption = {
+      enabled: true,
+      activeKeyId: keyId,
+      keys: nextKeys
+    };
+    this.save({ strict: true });
+    return this.getBackupEncryptionConfig();
+  }
+
+  /**
+   * Rota la clave activa de cifrado `CKB1` conservando las claves previas como
+   * `retired` en el anillo para descifrar copias históricas sin re-cifrar todo el bucket.
+   * @param {{ passphrase?: string | null, keyHex?: string | null }} [opts]
+   */
+  rotateBackupEncryptionKey({ passphrase = null, keyHex = null } = {}) {
+    const prev = this.state.backupEncryption || { enabled: false, activeKeyId: null, keys: [] };
+    const previousKeyId = prev.activeKeyId || null;
+    const { keyBuf, keyId, source } = this._materializeBackupKey({ passphrase, keyHex });
+    if (previousKeyId && keyId === previousKeyId) {
+      throw new Error('La nueva clave coincide con la clave activa actual; proporciona una clave diferente');
+    }
+    const nextKeys = (prev.keys || []).map((k) => ({ ...k, status: 'retired' }));
+    const existing = nextKeys.find((k) => k.keyId === keyId);
+    if (existing) {
+      existing.status = 'active';
+    } else {
+      nextKeys.push({
+        keyId,
+        keyEnc: encryptSecret(keyBuf.toString('hex'), this.cryptoKey),
+        source,
+        createdAt: new Date().toISOString(),
+        status: 'active'
+      });
+    }
+    this.state.backupEncryption = {
+      enabled: true,
+      activeKeyId: keyId,
+      keys: nextKeys
+    };
+    this.save({ strict: true });
+    return {
+      previousKeyId,
+      activeKeyId: keyId,
+      keyCount: nextKeys.length,
+      config: this.getBackupEncryptionConfig()
+    };
+  }
+
+  /** @param {{ passphrase?: string | null, keyHex?: string | null }} [opts] */
+  _materializeBackupKey({ passphrase = null, keyHex = null } = {}) {
+    if (keyHex) {
+      const clean = String(keyHex).trim();
+      if (!/^[a-fA-F0-9]{64}$/.test(clean)) {
+        throw new Error('keyHex inválido: debe ser una clave AES-256 de 64 caracteres hexadecimales (32 bytes)');
+      }
+      const keyBuf = Buffer.from(clean, 'hex');
+      return { keyBuf, keyId: computeKeyId(keyBuf), source: 'raw-hex' };
+    }
+    if (passphrase) {
+      const derived = deriveBackupKeyFromPassphrase(passphrase);
+      return { keyBuf: derived.key, keyId: derived.keyId, source: 'scrypt-passphrase' };
+    }
+    const keyBuf = crypto.randomBytes(32);
+    return { keyBuf, keyId: computeKeyId(keyBuf), source: 'generated' };
+  }
+
+  /** Vista pública del anillo de cifrado de copias: NUNCA expone material secreto. */
+  getBackupEncryptionConfig() {
+    const cfg = this.state.backupEncryption;
+    if (!cfg) {
+      return { enabled: false, activeKeyId: null, keyCount: 0, keys: [] };
+    }
+    return {
+      enabled: Boolean(cfg.enabled),
+      activeKeyId: cfg.activeKeyId || null,
+      keyCount: Array.isArray(cfg.keys) ? cfg.keys.length : 0,
+      keys: (cfg.keys || []).map((k) => ({
+        keyId: k.keyId,
+        source: k.source || 'generated',
+        createdAt: k.createdAt,
+        status: k.status || 'retired'
+      }))
+    };
+  }
+
+  /** @returns {{ keyId: string, key: Buffer } | null} */
+  _getActiveBackupKey() {
+    const cfg = this.state.backupEncryption;
+    if (!cfg || !cfg.activeKeyId || !Array.isArray(cfg.keys)) return null;
+    const entry = cfg.keys.find((k) => k.keyId === cfg.activeKeyId);
+    if (!entry || !entry.keyEnc) return null;
+    const hex = decryptSecret(entry.keyEnc, this.cryptoKey);
+    const key = Buffer.from(hex, 'hex');
+    if (key.length !== 32) return null;
+    return { keyId: entry.keyId, key };
+  }
+
+  /** @returns {Map<string, Buffer>} */
+  _getBackupKeyRing() {
+    /** @type {Map<string, Buffer>} */
+    const ring = new Map();
+    const cfg = this.state.backupEncryption;
+    if (!cfg || !Array.isArray(cfg.keys)) return ring;
+    for (const entry of cfg.keys) {
+      if (!entry || !entry.keyEnc || !entry.keyId) continue;
+      try {
+        const key = Buffer.from(decryptSecret(entry.keyEnc, this.cryptoKey), 'hex');
+        if (key.length === 32) ring.set(entry.keyId, key);
+      } catch (e) {}
+    }
+    return ring;
+  }
+
+  // -------------------------------------------------------------------------
+  // Historial de auditoría, verificación automática, drills DR y clonado
+  // -------------------------------------------------------------------------
+
+  _recordRestoreAudit(record, entry) {
+    if (!Array.isArray(record.restoreHistory)) record.restoreHistory = [];
+    record.restoreHistory.unshift({
+      id: `rst_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`,
+      executedAt: new Date().toISOString(),
+      ...entry
+    });
+    if (record.restoreHistory.length > MAX_AUDIT_HISTORY) {
+      record.restoreHistory.length = MAX_AUDIT_HISTORY;
+    }
+  }
+
+  _recordVerificationAudit(record, entry) {
+    if (!Array.isArray(record.verificationHistory)) record.verificationHistory = [];
+    record.verificationHistory.unshift({
+      id: `ver_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`,
+      verifiedAt: new Date().toISOString(),
+      ...entry
+    });
+    if (record.verificationHistory.length > MAX_AUDIT_HISTORY) {
+      record.verificationHistory.length = MAX_AUDIT_HISTORY;
+    }
+  }
+
+  listRestoreHistory(id) {
+    const record = this.mustGet(id);
+    return (record.restoreHistory || []).slice();
+  }
+
+  listVerificationHistory(id) {
+    const record = this.mustGet(id);
+    return (record.verificationHistory || []).slice();
+  }
+
+  /**
+   * Verificación multicapa de una copia sin tocar la base viva:
+   *  1. Tamaño > 0 y coincidencia estricta SHA-256
+   *  2. Descifrado AEAD `CKB1` verificando TODOS los authTag por bloque
+   *  3. Integridad del stream gzip (CRC32 + límite anti-bomba)
+   *  4. Cabecera mágica del motor (`PGDMP`, `REDIS`, seguridad SQL sin meta-comandos)
+   *  5. Verificación S3 `HEAD` (existencia y tamaño remoto) si aplica
+   *
+   * @param {string} id
+   * @param {string} backupId
+   * @param {{ checkRemote?: boolean, decryptionKey?: Buffer | null }} [opts]
+   */
+  async verifyBackup(id, backupId, { checkRemote = true, decryptionKey = null } = {}) {
+    const record = this.mustGet(id);
+    const engine = ENGINES[record.engine];
+    const entry = (record.backups || []).find((b) => b.id === backupId);
+    if (!entry) throw new Error(`Copia ${backupId} no encontrada en el historial`);
+
+    const startedAt = Date.now();
+    const dir = this.backupDir(id);
+    const candidate = assertContainedPath(dir, entry.fileName);
+    /** @type {Record<string, any>} */
+    const checks = {
+      exists: false,
+      sha256: null,
+      aead: null,
+      gzip: null,
+      format: null,
+      remoteHead: null
+    };
+    /** @type {string | null} */
+    let tempDownloadPath = null;
+    /** @type {string | null} */
+    let tempDecryptedPath = null;
+    /** @type {string | null} */
+    let tempGunzipPath = null;
+
+    try {
+      let targetPath = candidate;
+      if (!fs.existsSync(targetPath)) {
+        if (entry.remote && entry.remote.key) {
+          const s3 = this.s3ClientFor();
+          if (!s3) throw new Error('Copia ausente en disco y no hay S3 configurado');
+          tempDownloadPath = path.join(this.tmpDir, `ver_dl_${record.id}_${crypto.randomBytes(5).toString('hex')}_${entry.fileName}`);
+          await s3.downloadFile(entry.remote.key, tempDownloadPath);
+          targetPath = tempDownloadPath;
+        } else {
+          throw new Error('Fichero de copia ausente en disco y sin réplica S3');
+        }
+      }
+      checks.exists = true;
+
+      const stat = fs.statSync(targetPath);
+      if (stat.size <= 0) throw new Error('El fichero de copia está vacío (0 bytes)');
+
+      // 1. SHA-256
+      const actualSha = await this.sha256File(targetPath);
+      if (entry.sha256 && actualSha !== entry.sha256) {
+        checks.sha256 = false;
+        throw new Error(`SHA-256 no coincide: esperado ${entry.sha256.slice(0, 12)}…, obtenido ${actualSha.slice(0, 12)}…`);
+      }
+      checks.sha256 = true;
+
+      // 2. AEAD CKB1 si está cifrado
+      let workPath = targetPath;
+      if (entry.encrypted || targetPath.endsWith('.ckb1') || hasCkb1Magic(targetPath)) {
+        const innerName = path.basename(entry.fileName).replace(/\.ckb1$/i, '') || 'backup.gz';
+        tempDecryptedPath = path.join(this.tmpDir, `ver_dec_${record.id}_${crypto.randomBytes(5).toString('hex')}_${innerName}`);
+        const ring = decryptionKey ? decryptionKey : this._getBackupKeyRing();
+        const dec = await decryptBackupFile(targetPath, tempDecryptedPath, ring);
+        checks.aead = { ok: true, keyId: dec.keyId, chunks: dec.chunks };
+        workPath = tempDecryptedPath;
+      }
+
+      // 3. Integridad gzip
+      let inspectPath = workPath;
+      if (workPath.endsWith('.gz')) {
+        if (!this.hasGzipMagic(workPath)) {
+          checks.gzip = false;
+          throw new Error('Cabecera gzip (0x1f 0x8b) inválida');
+        }
+        tempGunzipPath = path.join(this.tmpDir, `ver_gunz_${record.id}_${crypto.randomBytes(5).toString('hex')}`);
+        await this.gunzipFile(workPath, tempGunzipPath);
+        checks.gzip = true;
+        inspectPath = tempGunzipPath;
+      }
+
+      // 4. Magic bytes / seguridad SQL por motor
+      if (engine.family === 'postgresql') {
+        if (this.isPgCustomFormat(inspectPath)) {
+          checks.format = 'pg-custom-PGDMP';
+        } else {
+          await this.assertSafeSqlFile(inspectPath, 'postgresql');
+          checks.format = 'pg-plain-sql';
+        }
+      } else if (engine.family === 'redis') {
+        const hdr = Buffer.alloc(5);
+        const fd = fs.openSync(inspectPath, 'r');
+        try {
+          const n = fs.readSync(fd, hdr, 0, 5, 0);
+          if (n < 5 || hdr.toString('ascii') !== 'REDIS') {
+            throw new Error('Cabecera mágica REDIS ausente en volcado RDB');
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+        checks.format = 'redis-RDB';
+      } else if (engine.family === 'mysql' || engine.family === 'mariadb') {
+        await this.assertSafeSqlFile(inspectPath, engine.family);
+        checks.format = `${engine.family}-sql`;
+      } else if (engine.family === 'mongodb') {
+        checks.format = 'mongo-archive-gz';
+      } else {
+        checks.format = `${engine.family}-artifact`;
+      }
+
+      // 5. Remoto S3 HEAD
+      if (checkRemote && entry.remote && entry.remote.key) {
+        const s3 = this.s3ClientFor();
+        if (s3) {
+          const head = await s3.headObject(entry.remote.key);
+          if (!head) {
+            checks.remoteHead = false;
+            throw new Error(`El objeto remoto ${entry.remote.key} ya no existe en S3`);
+          }
+          if (head.sizeBytes !== entry.sizeBytes) {
+            checks.remoteHead = false;
+            throw new Error(`Tamaño remoto S3 (${head.sizeBytes} B) distinto del registrado (${entry.sizeBytes} B)`);
+          }
+          checks.remoteHead = { ok: true, sizeBytes: head.sizeBytes, etag: head.etag };
+        }
+      }
+
+      const durationMs = Date.now() - startedAt;
+      const verifiedAt = new Date().toISOString();
+      entry.lastVerification = { ok: true, verifiedAt, checks, durationMs, error: null };
+      this._recordVerificationAudit(record, { backupId, ok: true, checks, durationMs, error: null });
+      this.save();
+      this.emit('backup_verified', { databaseId: id, backupId, ok: true, durationMs });
+      return { ok: true, status: 'verified', databaseId: id, backupId, verifiedAt, checks, durationMs, error: null };
+    } catch (err) {
+      const durationMs = Date.now() - startedAt;
+      const verifiedAt = new Date().toISOString();
+      const errMsg = this.redactMessage(err.message, this.decryptPassword(record));
+      entry.lastVerification = { ok: false, verifiedAt, checks, durationMs, error: errMsg };
+      this._recordVerificationAudit(record, { backupId, ok: false, checks, durationMs, error: errMsg });
+      this.save();
+      this.emit('backup_verification_failed', { databaseId: id, backupId, error: errMsg });
+      const ns = getNotificationService();
+      if (ns && typeof ns.notify === 'function') {
+        Promise.resolve(ns.notify({
+          event: 'backup_failed',
+          level: 'error',
+          title: `Verificación de copia fallida: ${record.name}`,
+          message: `La copia ${entry.fileName} (${backupId}) no superó la verificación de integridad: ${errMsg}`,
+          projectId: record.projectId
+        })).catch(() => {});
+      }
+      return { ok: false, status: 'failed', databaseId: id, backupId, verifiedAt, checks, durationMs, error: errMsg };
+    } finally {
+      for (const f of [tempDownloadPath, tempDecryptedPath, tempGunzipPath]) {
+        if (f) { try { fs.unlinkSync(f); } catch (e) {} }
+      }
+    }
+  }
+
+  /**
+   * Simulacro real de recuperación ante desastres (Restore Drill):
+   *  1. Ejecuta `verifyBackup()` completo (SHA-256 + AEAD + gzip + magic)
+   *  2. Levanta un contenedor efímero y completamente aislado (`--network none`, sin puertos)
+   *  3. Restaura la copia verificada en el contenedor efímero
+   *  4. Ejecuta una consulta real del motor para confirmar que los datos responden
+   *  5. Destruye siempre el contenedor efímero y registra el resultado en `restoreHistory`
+   *
+   * @param {string} id
+   * @param {{ backupId?: string | null, timeoutMs?: number, decryptionKey?: Buffer | null }} [opts]
+   */
+  async runRestoreDrill(id, { backupId = null, timeoutMs = 120000, decryptionKey = null } = {}) {
+    const record = this.mustGet(id);
+    const engine = ENGINES[record.engine];
+    const targetEntry = backupId
+      ? (record.backups || []).find((b) => b.id === backupId)
+      : (record.backups || [])[0];
+    if (!targetEntry) {
+      throw new Error(backupId ? `Copia ${backupId} no encontrada` : 'No hay ninguna copia disponible para ejecutar un simulacro de restauración');
+    }
+    if (!(await this.isDockerAvailable())) {
+      throw new Error('Docker no está disponible: no se puede ejecutar el simulacro de restauración');
+    }
+
+    const startedAt = Date.now();
+    const drillContainer = `culkibo_drill_${record.id}_${crypto.randomBytes(4).toString('hex')}`;
+    const drillPassword = generatePassword();
+    const envFile = path.join(this.tmpDir, `env_drill_${crypto.randomBytes(6).toString('hex')}`);
+    const inContainer = `/tmp/culkibo_drill_${crypto.randomBytes(5).toString('hex')}`;
+    /** @type {string | null} */
+    let decryptedTempPath = null;
+    /** @type {string | null} */
+    let gunzipTempPath = null;
+    /** @type {string | null} */
+    let sanitizedSqlPath = null;
+    let containerCreated = false;
+
+    try {
+      // 1. Pre-verificación criptográfica e integridad antes de arrancar Docker
+      const preCheck = await this.verifyBackup(id, targetEntry.id, { checkRemote: false, decryptionKey });
+      if (!preCheck.ok) {
+        throw new Error(`Pre-verificación fallida antes del drill: ${preCheck.error}`);
+      }
+
+      const dir = this.backupDir(id);
+      let workPath = assertContainedPath(dir, targetEntry.fileName);
+      if (targetEntry.encrypted || workPath.endsWith('.ckb1') || hasCkb1Magic(workPath)) {
+        const innerName = path.basename(workPath).replace(/\.ckb1$/i, '') || 'drill.gz';
+        decryptedTempPath = path.join(this.tmpDir, `drill_dec_${crypto.randomBytes(5).toString('hex')}_${innerName}`);
+        await decryptBackupFile(workPath, decryptedTempPath, decryptionKey || this._getBackupKeyRing());
+        workPath = decryptedTempPath;
+      }
+
+      let plainPath = workPath;
+      if (workPath.endsWith('.gz') && !workPath.endsWith('.archive.gz')) {
+        gunzipTempPath = path.join(this.tmpDir, `drill_plain_${crypto.randomBytes(5).toString('hex')}`);
+        await this.gunzipFile(workPath, gunzipTempPath);
+        plainPath = gunzipTempPath;
+      }
+
+      // 2. Levantar contenedor efímero aislado (--network none, 0 puertos, memoria acotada)
+      const drillMem = Math.max(128, Math.min(512, record.memoryMb || 512));
+      const drillEnv = {
+        ...engine.initEnv({ username: record.username, password: drillPassword, dbName: record.dbName }),
+        ...engine.clientEnv({ password: drillPassword })
+      };
+      fs.writeFileSync(envFile, formatDockerEnvFile(drillEnv), { encoding: 'utf8', mode: 0o600 });
+
+      const runArgs = [
+        'run', '-d',
+        '--name', drillContainer,
+        '--network', 'none',
+        '--env-file', envFile,
+        '--memory', `${drillMem}m`,
+        '--memory-swap', `${drillMem}m`,
+        '--cpus', '1',
+        '--pids-limit', '256',
+        '--security-opt', 'no-new-privileges',
+        '--label', 'culkibo.managed=true',
+        '--label', 'culkibo.role=restore-drill',
+        record.image,
+        ...(engine.command ? engine.command() : [])
+      ];
+      await this.docker(runArgs, { timeout: timeoutMs });
+      containerCreated = true;
+
+      // 3. Restaurar en el contenedor efímero + ejecutar sonda real de lectura
+      let objectCount = 0;
+      if (engine.family === 'postgresql') {
+        if (this.isPgCustomFormat(plainPath)) {
+          await this.docker(['cp', plainPath, `${drillContainer}:${inContainer}`], { timeout: timeoutMs });
+          const plan = engine.restore({ username: record.username, dbName: record.dbName, inFile: inContainer });
+          await this.docker(['exec', drillContainer, ...this.wrapInContainer(engine, plan.program, plan.args)], { timeout: timeoutMs });
+        } else {
+          await this.assertSafeSqlFile(plainPath, 'postgresql');
+          await this.docker(
+            ['exec', '-i', drillContainer, 'psql', '-U', record.username, '-d', record.dbName, '-v', 'ON_ERROR_STOP=1'],
+            { timeout: timeoutMs, inputFile: plainPath }
+          );
+        }
+        const probe = await this.docker([
+          'exec', drillContainer, 'psql', '-U', record.username, '-d', record.dbName, '-tAc',
+          "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');"
+        ], { timeout: 30000 });
+        objectCount = parseInt((probe.stdout || '').trim(), 10) || 0;
+      } else if (engine.family === 'mysql' || engine.family === 'mariadb') {
+        await this.assertSafeSqlFile(plainPath, engine.family);
+        sanitizedSqlPath = path.join(this.tmpDir, `drill_sql_${crypto.randomBytes(5).toString('hex')}.sql`);
+        await this.sanitizeMysqlSqlFile(plainPath, sanitizedSqlPath);
+        const plan = engine.restore({ username: record.username, dbName: record.dbName, inFile: inContainer });
+        await this.docker(
+          ['exec', '-i', drillContainer, ...this.wrapInContainer(engine, plan.program, plan.args)],
+          { timeout: timeoutMs, inputFile: sanitizedSqlPath }
+        );
+        const cli = record.engine === 'mariadb' ? 'mariadb' : 'mysql';
+        const safeDb = assertIdentifier(record.dbName, 'base de datos');
+        const probe = await this.docker([
+          'exec', drillContainer, ...this.wrapInContainer(engine, cli, [
+            '-u', 'root', '-N', '-B', '-e',
+            `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${safeDb}';`
+          ])
+        ], { timeout: 30000 });
+        objectCount = parseInt((probe.stdout || '').trim(), 10) || 0;
+      } else if (engine.family === 'redis') {
+        const dataDir = record.dataDir || this.resolveDataDir(engine, record.image);
+        await this.docker(['stop', '-t', '10', drillContainer], { timeout: 30000 });
+        await this.docker(['cp', plainPath, `${drillContainer}:${dataDir}/dump.rdb`], { timeout: timeoutMs });
+        await this.docker(['start', drillContainer], { timeout: 30000 });
+        const cli = record.engine === 'valkey' ? 'valkey-cli' : 'redis-cli';
+        const probe = await this.docker(['exec', drillContainer, cli, 'DBSIZE'], { timeout: 30000 });
+        const m = /(\d+)/.exec(probe.stdout || '');
+        objectCount = m ? parseInt(m[1], 10) : 0;
+      } else if (engine.family === 'mongodb') {
+        await this.docker(['cp', plainPath, `${drillContainer}:${inContainer}`], { timeout: timeoutMs });
+        const authCfg = this._writeEngineAuthConfig(engine, drillPassword, 'drill_mongo');
+        try {
+          await this.docker(['cp', authCfg.localPath, `${drillContainer}:${authCfg.containerPath}`], { timeout: 15000 });
+          await this.docker([
+            'exec', drillContainer, 'mongorestore',
+            `--config=${authCfg.containerPath}`, `--username=${record.username}`,
+            '--authenticationDatabase=admin', `--archive=${inContainer}`, '--gzip', '--drop'
+          ], { timeout: timeoutMs });
+        } finally {
+          try { fs.unlinkSync(authCfg.localPath); } catch (e) {}
+        }
+        const probe = await this.docker([
+          'exec', drillContainer, 'mongosh', '--quiet', '--eval',
+          `db.getSiblingDB('admin').auth(process.env.MONGO_INITDB_ROOT_USERNAME, process.env.MONGO_INITDB_ROOT_PASSWORD); print(db.getSiblingDB(${JSON.stringify(record.dbName)}).getCollectionNames().length);`
+        ], { timeout: 30000 });
+        objectCount = parseInt((probe.stdout || '').trim(), 10) || 0;
+      } else {
+        await this.docker(['cp', plainPath, `${drillContainer}:${inContainer}`], { timeout: timeoutMs });
+        objectCount = 1;
+      }
+
+      const durationMs = Date.now() - startedAt;
+      const executedAt = new Date().toISOString();
+      targetEntry.lastDrill = { ok: true, executedAt, objectCount, durationMs, error: null };
+      this._recordRestoreAudit(record, {
+        kind: 'drill',
+        backupId: targetEntry.id,
+        method: engine.family,
+        status: 'ok',
+        objectCount,
+        durationMs
+      });
+      this.save();
+      this.emit('restore_drill_completed', { databaseId: id, backupId: targetEntry.id, objectCount, durationMs });
+      return { ok: true, databaseId: id, backupId: targetEntry.id, engine: record.engine, objectCount, durationMs, executedAt, error: null };
+    } catch (err) {
+      const durationMs = Date.now() - startedAt;
+      const executedAt = new Date().toISOString();
+      const errMsg = this.redactMessage(err.message, drillPassword, this.decryptPassword(record));
+      targetEntry.lastDrill = { ok: false, executedAt, objectCount: 0, durationMs, error: errMsg };
+      this._recordRestoreAudit(record, {
+        kind: 'drill',
+        backupId: targetEntry.id,
+        method: engine.family,
+        status: 'failed',
+        objectCount: 0,
+        durationMs,
+        error: errMsg
+      });
+      this.save();
+      this.emit('restore_drill_failed', { databaseId: id, backupId: targetEntry.id, error: errMsg });
+      const ns = getNotificationService();
+      if (ns && typeof ns.notify === 'function') {
+        Promise.resolve(ns.notify({
+          event: 'backup_failed',
+          level: 'error',
+          title: `Simulacro DR fallido: ${record.name}`,
+          message: `El simulacro de restauración de ${record.name} (${targetEntry.fileName}) ha fallado: ${errMsg}`,
+          projectId: record.projectId
+        })).catch(() => {});
+      }
+      return { ok: false, databaseId: id, backupId: targetEntry.id, engine: record.engine, objectCount: 0, durationMs, executedAt, error: errMsg };
+    } finally {
+      if (containerCreated) {
+        try { await this.docker(['rm', '-f', drillContainer], { timeout: 30000 }); } catch (e) {}
+      }
+      for (const f of [envFile, decryptedTempPath, gunzipTempPath, sanitizedSqlPath]) {
+        if (f) { try { fs.unlinkSync(f); } catch (e) {} }
+      }
+    }
+  }
+
+  /**
+   * Clona / ramifica una base de datos a una instancia nueva completamente aislada
+   * (o restaura un `backupId` histórico en una BD nueva sin tocar producción).
+   *
+   * @param {string} sourceId
+   * @param {{
+   *   name?: string,
+   *   projectId?: string,
+   *   backupId?: string | null,
+   *   memoryMb?: number,
+   *   cpus?: number,
+   *   tuningPreset?: string,
+   *   branchLabel?: string | null
+   * }} [opts]
+   */
+  async cloneDatabase(sourceId, opts = {}) {
+    const source = this.mustGet(sourceId);
+    if (!(await this.isDockerAvailable())) {
+      throw new Error('Docker no está disponible: no se puede clonar la base de datos');
+    }
+
+    // 1. Obtener o generar la instantánea origen
+    /** @type {any} */
+    let sourceBackupEntry = null;
+    if (opts.backupId) {
+      sourceBackupEntry = (source.backups || []).find((b) => b.id === opts.backupId) || null;
+      if (!sourceBackupEntry) {
+        throw new Error(`Copia origen ${opts.backupId} no encontrada en ${source.name}`);
+      }
+    } else {
+      const snap = await this.runBackup(sourceId, { trigger: 'clone', skipS3: true, skipRetention: true });
+      sourceBackupEntry = snap.backup;
+    }
+    if (!sourceBackupEntry) {
+      throw new Error(`No se pudo obtener la copia origen para clonar ${source.name}`);
+    }
+
+    const srcFile = await this.getBackupFilePath(sourceId, sourceBackupEntry.id);
+
+    // 2. Aprovisionar la nueva BD destino aislada (nueva clave, nuevo volumen, 0 puertos)
+    const branchTag = opts.branchLabel ? String(opts.branchLabel).slice(0, 32) : 'clone';
+    const created = await this.provision({
+      projectId: opts.projectId || source.projectId,
+      engine: source.engine,
+      name: opts.name || `${source.name} (${branchTag})`,
+      dbName: source.dbName || undefined,
+      username: source.username,
+      image: source.image,
+      memoryMb: opts.memoryMb || source.memoryMb,
+      cpus: opts.cpus || source.cpus,
+      tuningPreset: opts.tuningPreset || (source.tuning && source.tuning.preset) || undefined
+    });
+
+    const targetRecord = this.mustGet(created.id);
+    try {
+      // 3. Copiar artefacto verificado a la carpeta de backups del destino y restaurarlo allí
+      const targetDir = this.backupDir(targetRecord.id);
+      const seedFileName = `clone_${sourceBackupEntry.fileName}`;
+      const seedPath = assertContainedPath(targetDir, seedFileName);
+      fs.copyFileSync(srcFile.filePath, seedPath);
+      const seedEntry = {
+        id: `bk_clone_${crypto.randomBytes(4).toString('hex')}`,
+        fileName: seedFileName,
+        sizeBytes: fs.statSync(seedPath).size,
+        sha256: sourceBackupEntry.sha256 || await this.sha256File(seedPath),
+        createdAt: new Date().toISOString(),
+        trigger: 'clone-seed',
+        durationMs: 0,
+        pinned: true,
+        encrypted: Boolean(sourceBackupEntry.encrypted),
+        encryption: sourceBackupEntry.encryption || null,
+        lastVerification: null,
+        lastDrill: null,
+        remote: null,
+        remoteError: null
+      };
+      targetRecord.backups.unshift(seedEntry);
+      this.save();
+
+      await this.restore(targetRecord.id, { backupId: seedEntry.id, createSafetySnapshot: false });
+
+      targetRecord.clonedFrom = {
+        sourceDatabaseId: source.id,
+        sourceBackupId: sourceBackupEntry.id,
+        branchLabel: opts.branchLabel || null,
+        clonedAt: new Date().toISOString()
+      };
+      this.save({ strict: true });
+      return {
+        ...this.toPublic(targetRecord),
+        connectionString: created.connectionString
+      };
+    } catch (err) {
+      // Limpieza total: nunca dejar contenedores/volúmenes huérfanos si falla el clonado
+      try { await this.remove(targetRecord.id, { deleteVolume: true, deleteBackups: true }); } catch (e) {}
+      throw new Error(`Clonado fallido desde ${source.name}: ${err.message}`);
+    }
+  }
+
+  /**
+   * Watchdog de SLA de copias: detecta copias programadas que dejaron de ejecutarse
+   * silenciosamente (Coolify #10636), último estado en error o verificación fallida.
+   *
+   * @param {{ now?: Date, maxMissedFactor?: number, notify?: boolean }} [opts]
+   */
+  checkBackupHealth({ now = new Date(), maxMissedFactor = 2, notify = false } = {}) {
+    const nowMs = now instanceof Date ? now.getTime() : Date.now();
+    const factor = Math.max(1.2, Math.min(10, Number(maxMissedFactor) || 2));
+    /** @type {Array<{ databaseId: string, name: string, engine: string, severity: 'warning' | 'critical', code: string, message: string, ageMs?: number, expectedIntervalMs?: number }>} */
+    const alerts = [];
+    let totalScheduled = 0;
+    let healthyCount = 0;
+    let staleCount = 0;
+    let erroredCount = 0;
+    let unverifiedCount = 0;
+
+    for (const record of this.state.databases) {
+      const s = record.schedule || {};
+      const latestBackup = (record.backups || [])[0] || null;
+      if (latestBackup && (!latestBackup.lastVerification || latestBackup.lastVerification.ok !== true)) {
+        unverifiedCount++;
+        if (latestBackup.lastVerification && latestBackup.lastVerification.ok === false) {
+          alerts.push({
+            databaseId: record.id,
+            name: record.name,
+            engine: record.engine,
+            severity: 'critical',
+            code: 'VERIFICATION_FAILED',
+            message: `Última copia ${latestBackup.fileName} falló la verificación: ${latestBackup.lastVerification.error || 'corrupta'}`
+          });
+        }
+      }
+
+      if (!s.enabled) continue;
+      totalScheduled++;
+      let hasIssue = false;
+
+      if (s.lastStatus === 'error' || s.lastStatus === 'horario-invalido') {
+        erroredCount++;
+        hasIssue = true;
+        alerts.push({
+          databaseId: record.id,
+          name: record.name,
+          engine: record.engine,
+          severity: 'critical',
+          code: 'LAST_BACKUP_ERROR',
+          message: `La última copia programada de ${record.name} terminó en estado "${s.lastStatus}"${record.lastError ? `: ${record.lastError}` : ''}`
+        });
+      }
+
+      // Calcular cadencia real del cron entre dos disparos consecutivos
+      let expectedIntervalMs = 24 * 3600 * 1000;
+      try {
+        const r1 = this.nextCronRun(s.cron, new Date(nowMs));
+        const r2 = r1 ? this.nextCronRun(s.cron, r1) : null;
+        if (r1 && r2) {
+          expectedIntervalMs = Math.max(60000, r2.getTime() - r1.getTime());
+        }
+      } catch (e) {}
+
+      const refTs = s.lastRunAt ? Date.parse(s.lastRunAt) : Date.parse(record.createdAt || '');
+      if (Number.isFinite(refTs)) {
+        const ageMs = nowMs - refTs;
+        if (ageMs > expectedIntervalMs * factor) {
+          staleCount++;
+          hasIssue = true;
+          alerts.push({
+            databaseId: record.id,
+            name: record.name,
+            engine: record.engine,
+            severity: 'warning',
+            code: 'BACKUP_STALE',
+            ageMs,
+            expectedIntervalMs,
+            message: `${record.name} lleva ${Math.round(ageMs / 60000)} min sin copia completada (esperado <= ${Math.round((expectedIntervalMs * factor) / 60000)} min)`
+          });
+        }
+      }
+
+      if (!hasIssue) healthyCount++;
+    }
+
+    if (notify && alerts.length > 0) {
+      const ns = getNotificationService();
+      if (ns && typeof ns.notify === 'function') {
+        const hasCrit = alerts.some((a) => a.severity === 'critical');
+        Promise.resolve(ns.notify({
+          event: 'backup_failed',
+          level: hasCrit ? 'error' : 'warning',
+          title: `Alerta SLA de copias (${alerts.length} incidencias)`,
+          message: alerts.slice(0, 5).map((a) => `[${a.code}] ${a.message}`).join('\n')
+        })).catch(() => {});
+      }
+    }
+
+    return {
+      healthy: alerts.length === 0,
+      checkedAt: new Date(nowMs).toISOString(),
+      alerts,
+      summary: {
+        totalScheduled,
+        healthy: healthyCount,
+        stale: staleCount,
+        errored: erroredCount,
+        unverified: unverifiedCount
+      }
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -2811,10 +4645,20 @@ class DatabaseManager extends EventEmitter {
 }
 
 const instance = Object.assign(new DatabaseManager(), {
+  DatabaseManager,
   ENGINES,
+  PGBOUNCER_IMAGE,
+  computeTuningConfig,
+  loadOrCreateKey,
   generatePassword,
   encryptSecret,
-  decryptSecret
+  decryptSecret,
+  computeKeyId,
+  deriveBackupKeyFromPassphrase,
+  encryptBackupFile,
+  decryptBackupFile,
+  hasCkb1Magic,
+  inspectCkb1Header
 });
 
 module.exports = instance;

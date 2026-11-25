@@ -61,13 +61,44 @@ const KEY_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const TEAM_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const SSH_USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
 const DOCKER_SOCKET_RE = /^\/[a-zA-Z0-9._/-]{1,180}$/;
+const DOCKER_REF_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.\-/:]*$/;
+const DOCKER_SINCE_RE = /^(?:\d{1,6}[smhd]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)$/;
+const DOCKER_WORKDIR_RE = /^\/[a-zA-Z0-9._/-]{1,256}$/;
+const DOCKER_USER_RE = /^[a-zA-Z0-9_.:-]{1,64}$/;
+const DOCKER_ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const REGION_RE = /^[a-z0-9_-]{1,32}$/;
 const TAG_RE = /^[a-z0-9._:-]{1,32}$/;
+const STALE_SOCKET_RE = /^ck-[a-f0-9]{10}\.sock$/;
 const RFC1123_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 const HOST_FORBIDDEN_RE = /[\0\r\n\s;|&`$<>()'"\\/@%#?,!*=]/;
 const CONTROL_CHAR_RE = /[\0\r\n]/;
 const FINGERPRINT_RE = /^SHA256:[A-Za-z0-9+/]{43}=?$/;
 const BASE64_STRICT_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+const VALID_MAINTENANCE_STATES = new Set(['active', 'draining', 'maintenance']);
+const VALID_PLACEMENT_STRATEGIES = new Set(['balanced', 'most-free-ram', 'least-loaded', 'lowest-latency']);
+const BOOTSTRAP_SENTINEL = 'CULKIBO_BOOTSTRAP_EOF';
+
+const NON_RETRYABLE_TUNNEL_CODES = new Set([
+  'HOST_KEY_MISMATCH',
+  'SSRF_BLOCKED',
+  'SERVER_NOT_FOUND',
+  'KEY_NOT_FOUND',
+  'FLEET_KEY_MISSING',
+  'FLEET_KEY_CORRUPT',
+  'CRYPTO_DECRYPT_FAILED',
+  'ABORTED',
+  'SERVER_IN_MAINTENANCE',
+  'LOCAL_SERVER_IMMUTABLE',
+  'INVALID_DOCKER_REF',
+  'INVALID_EXEC_COMMAND',
+  'INVALID_INPUT',
+  'INVALID_HOST',
+  'INVALID_PORT',
+  'INVALID_USER'
+]);
+
+const TRANSIENT_TUNNEL_ERROR_RE = /cannot connect to the docker daemon|broken pipe|connection reset|socket hang up|unexpected eof|econnrefused|econnreset|epipe|etimedout|connection closed by remote host|administratively prohibited/i;
 
 const BLOCKED_HOSTNAMES = new Set([
   'localhost',
@@ -834,6 +865,250 @@ function validateTeamId(rawTeamId) {
 }
 
 /**
+ * Validates node maintenance state (`'active' | 'draining' | 'maintenance'`).
+ * @param {any} rawState
+ * @returns {'active' | 'draining' | 'maintenance'}
+ */
+function validateMaintenanceState(rawState) {
+  const s = String(rawState == null || rawState === '' ? 'active' : rawState).trim().toLowerCase();
+  if (!VALID_MAINTENANCE_STATES.has(s)) {
+    throw createFleetError(
+      'maintenanceState inválido (usa "active", "draining" o "maintenance")',
+      'INVALID_MAINTENANCE_STATE',
+      400
+    );
+  }
+  return /** @type {'active' | 'draining' | 'maintenance'} */ (s);
+}
+
+/**
+ * Validates optional human-readable maintenance reason (no null bytes or control newlines).
+ * @param {any} rawReason
+ * @returns {string | null}
+ */
+function validateMaintenanceReason(rawReason) {
+  if (rawReason == null) return null;
+  const raw = String(rawReason);
+  if (raw.includes('\0')) {
+    throw createFleetError('maintenanceReason contiene bytes nulos', 'INVALID_MAINTENANCE_REASON', 400);
+  }
+  const clean = raw.replace(/[\r\n]+/g, ' ').trim();
+  if (!clean) return null;
+  return clean.slice(0, 240);
+}
+
+/**
+ * Validates a Docker container/image reference (strict allowlist; never starts with `-`).
+ * @param {any} rawRef
+ * @param {string} [label]
+ * @returns {string}
+ */
+function validateDockerRef(rawRef, label = 'containerId') {
+  const ref = String(rawRef == null ? '' : rawRef).trim();
+  if (!ref || ref.length > 255 || !DOCKER_REF_RE.test(ref)) {
+    throw createFleetError(`${label} de Docker inválido`, 'INVALID_DOCKER_REF', 400);
+  }
+  return ref;
+}
+
+/**
+ * Validates a Docker exec argv array (strict non-empty string[]; zero shell construction).
+ * @param {any} command
+ * @returns {string[]}
+ */
+function validateDockerExecCommand(command) {
+  if (!Array.isArray(command) || command.length === 0 || command.length > 64) {
+    throw createFleetError(
+      'command debe ser un array argv no vacío (1..64 argumentos); no se permiten cadenas de shell',
+      'INVALID_EXEC_COMMAND',
+      400
+    );
+  }
+  /** @type {string[]} */
+  const out = [];
+  for (let i = 0; i < command.length; i++) {
+    const arg = command[i];
+    if (typeof arg !== 'string') {
+      throw createFleetError(`Argumento #${i} de command debe ser string`, 'INVALID_EXEC_COMMAND', 400);
+    }
+    if (arg.includes('\0') || arg.length > 4096) {
+      throw createFleetError(`Argumento #${i} de command inválido (byte nulo o >4096 bytes)`, 'INVALID_EXEC_COMMAND', 400);
+    }
+    if (i === 0 && (!arg.trim() || CONTROL_CHAR_RE.test(arg))) {
+      throw createFleetError('El binario inicial de command es inválido', 'INVALID_EXEC_COMMAND', 400);
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
+/**
+ * Validates an optional IPv4/IPv6 or CIDR control-plane address for UFW allowlisting
+ * inside generated VPS bootstrap scripts. Rejects metadata/loopback/metacharacters.
+ * @param {any} rawCidr
+ * @returns {string | null}
+ */
+function validateControlPlaneCidr(rawCidr) {
+  if (rawCidr == null || String(rawCidr).trim() === '') return null;
+  const s = String(rawCidr).trim();
+  if (CONTROL_CHAR_RE.test(s) || HOST_FORBIDDEN_RE.test(s.replace('/', ''))) {
+    throw createFleetError('controlPlaneIp contiene caracteres no permitidos', 'INVALID_CONTROL_PLANE_IP', 400);
+  }
+  const slashIdx = s.indexOf('/');
+  const ipPart = slashIdx === -1 ? s : s.slice(0, slashIdx);
+  const prefixPart = slashIdx === -1 ? null : s.slice(slashIdx + 1);
+  const ipKind = net.isIP(ipPart);
+  if (ipKind !== 4 && ipKind !== 6) {
+    throw createFleetError('controlPlaneIp debe ser una IPv4/IPv6 o CIDR válido', 'INVALID_CONTROL_PLANE_IP', 400);
+  }
+  if (isBlockedFleetIp(ipPart)) {
+    throw createFleetError('controlPlaneIp no puede apuntar a loopback/metadatos', 'INVALID_CONTROL_PLANE_IP', 400);
+  }
+  if (prefixPart !== null) {
+    if (!/^\d{1,3}$/.test(prefixPart)) {
+      throw createFleetError('Prefijo CIDR inválido en controlPlaneIp', 'INVALID_CONTROL_PLANE_IP', 400);
+    }
+    const prefix = parseInt(prefixPart, 10);
+    const maxPrefix = ipKind === 4 ? 32 : 128;
+    if (prefix < 1 || prefix > maxPrefix) {
+      throw createFleetError(`Prefijo CIDR fuera de rango (1..${maxPrefix})`, 'INVALID_CONTROL_PLANE_IP', 400);
+    }
+    return `${ipPart.toLowerCase()}/${prefix}`;
+  }
+  return ipPart.toLowerCase();
+}
+
+/**
+ * Parses NDJSON output from `docker stats --format '{{json .}}'` safely.
+ * @param {string} stdout
+ * @returns {Array<{
+ *   id: string,
+ *   name: string,
+ *   cpuPercent: number | null,
+ *   memUsage: string,
+ *   memPercent: number | null,
+ *   netIO: string,
+ *   blockIO: string,
+ *   pids: number | null,
+ *   raw: Record<string, any>
+ * }>}
+ */
+function parseDockerStatsLines(stdout) {
+  const out = [];
+  const lines = String(stdout || '').split(/\r?\n/);
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || !trimmed.startsWith('{')) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      if (!obj || typeof obj !== 'object') continue;
+      const cpuNum = parseFloat(String(obj.CPUPerc || '').replace('%', ''));
+      const memNum = parseFloat(String(obj.MemPerc || '').replace('%', ''));
+      const pidsNum = parseInt(String(obj.PIDs || ''), 10);
+      out.push({
+        id: String(obj.ID || obj.Container || ''),
+        name: String(obj.Name || obj.Container || ''),
+        cpuPercent: Number.isFinite(cpuNum) ? cpuNum : null,
+        memUsage: String(obj.MemUsage || ''),
+        memPercent: Number.isFinite(memNum) ? memNum : null,
+        netIO: String(obj.NetIO || ''),
+        blockIO: String(obj.BlockIO || ''),
+        pids: Number.isFinite(pidsNum) ? pidsNum : null,
+        raw: obj
+      });
+    } catch (e) {
+      // Ignore malformed / partial status lines
+    }
+  }
+  return out;
+}
+
+/**
+ * Determines whether a tunnel/Docker error is transient and safe to retry after reconnect.
+ * @param {any} err
+ * @returns {boolean}
+ */
+function isRetryableTunnelError(err) {
+  if (!err) return false;
+  const code = String(err.code || '').toUpperCase();
+  if (NON_RETRYABLE_TUNNEL_CODES.has(code)) return false;
+  if (
+    code === 'TUNNEL_EXIT_EARLY' ||
+    code === 'TUNNEL_TIMEOUT' ||
+    code === 'TUNNEL_DROPPED' ||
+    code === 'ECONNREFUSED' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ENOENT'
+  ) {
+    return true;
+  }
+  const msg = `${err.stderr || ''}\n${err.message || ''}`;
+  return TRANSIENT_TUNNEL_ERROR_RE.test(msg);
+}
+
+/**
+ * Sleeps for `ms` milliseconds, cancelling immediately if `signal` aborts.
+ * @param {number} ms
+ * @param {AbortSignal | null} [signal]
+ * @returns {Promise<void>}
+ */
+function sleepWithAbort(ms, signal = null) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      return reject(createFleetError('Operación cancelada', 'ABORTED', 499));
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(createFleetError('Operación cancelada', 'ABORTED', 499));
+    };
+    const timer = setTimeout(() => {
+      if (signal && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', onAbort);
+      }
+      resolve();
+    }, Math.max(0, ms));
+    if (signal && typeof signal.addEventListener === 'function') {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+/**
+ * Fast active liveness probe for a cached local TCP or Unix tunnel endpoint.
+ * @param {{ localSock?: string | null, localPort?: number | null }} endpoint
+ * @param {number} [timeoutMs]
+ * @returns {Promise<boolean>}
+ */
+function defaultProbeEndpoint(endpoint, timeoutMs = 400) {
+  return new Promise((resolve) => {
+    if (!endpoint || (!endpoint.localSock && !endpoint.localPort)) {
+      return resolve(false);
+    }
+    let settled = false;
+    let sock;
+    try {
+      sock = endpoint.localSock
+        ? net.createConnection({ path: endpoint.localSock })
+        : net.createConnection({ host: '127.0.0.1', port: Number(endpoint.localPort) });
+    } catch (e) {
+      return resolve(false);
+    }
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch (e) {}
+      resolve(ok);
+    };
+    sock.setTimeout(Math.max(50, timeoutMs));
+    sock.once('connect', () => finish(true));
+    sock.once('error', () => finish(false));
+    sock.once('timeout', () => finish(false));
+  });
+}
+
+/**
  * Builds hardened OpenSSH argv array.
  * - Uses `-F /dev/null`, `GlobalKnownHostsFile=/dev/null`, `StrictHostKeyChecking=yes`,
  *   `IdentitiesOnly=yes`, `ForwardAgent=no`, `ForwardX11=no`, `PermitLocalCommand=no`,
@@ -947,13 +1222,15 @@ function parseProbeOutput(stdout, latencyMs = 0, sshUser = 'root') {
 
   const memParts = (kv.MEM_KB || '0 0').split(/\s+/).map((x) => parseInt(x, 10));
   const memTotalKb = Number.isFinite(memParts[0]) && memParts[0] > 0 ? memParts[0] : 0;
-  const memAvailKb = Number.isFinite(memParts[1]) && memParts[1] >= 0 ? memParts[1] : 0;
+  const rawMemAvailKb = Number.isFinite(memParts[1]) && memParts[1] >= 0 ? memParts[1] : 0;
+  const memAvailKb = memTotalKb > 0 ? Math.min(rawMemAvailKb, memTotalKb) : rawMemAvailKb;
   const memoryTotalMb = Math.round(memTotalKb / 1024);
   const memoryAvailableMb = Math.round(memAvailKb / 1024);
 
   const diskParts = (kv.DISK_KB || '0 0').split(/\s+/).map((x) => parseInt(x, 10));
   const diskTotalKb = Number.isFinite(diskParts[0]) && diskParts[0] > 0 ? diskParts[0] : 0;
-  const diskAvailKb = Number.isFinite(diskParts[1]) && diskParts[1] >= 0 ? diskParts[1] : 0;
+  const rawDiskAvailKb = Number.isFinite(diskParts[1]) && diskParts[1] >= 0 ? diskParts[1] : 0;
+  const diskAvailKb = diskTotalKb > 0 ? Math.min(rawDiskAvailKb, diskTotalKb) : rawDiskAvailKb;
   const diskTotalGb = Number((diskTotalKb / (1024 * 1024)).toFixed(2));
   const diskAvailableGb = Number((diskAvailKb / (1024 * 1024)).toFixed(2));
 
@@ -1315,6 +1592,9 @@ function defaultWaitForEndpoint(endpoint, child, opts = {}) {
  * @property {string | null} hostKeyLine
  * @property {string | null} hostKeyPinnedAt
  * @property {'pending' | 'online' | 'degraded' | 'offline' | 'host_key_mismatch'} status
+ * @property {'active' | 'draining' | 'maintenance'} maintenanceState
+ * @property {string | null} maintenanceReason
+ * @property {string | null} maintenanceSince
  * @property {string | null} statusReason
  * @property {string | null} statusFix
  * @property {string[]} warnings
@@ -1340,6 +1620,13 @@ function defaultWaitForEndpoint(endpoint, child, opts = {}) {
  * @property {number} createdAt
  */
 
+/**
+ * @typedef {Object} InFlightTunnelConnect
+ * @property {Promise<ActiveDockerTunnel>} promise
+ * @property {Set<symbol>} waiters
+ * @property {AbortController} internalController
+ */
+
 class ServerFleetManager extends EventEmitter {
   /**
    * @param {{
@@ -1348,6 +1635,8 @@ class ServerFleetManager extends EventEmitter {
    *   _spawn?: typeof defaultSpawn,
    *   _resolveHost?: (host: string) => Promise<string[]>,
    *   _waitForEndpoint?: typeof defaultWaitForEndpoint,
+   *   _probeEndpoint?: typeof defaultProbeEndpoint,
+   *   _caddyManager?: any,
    *   tunnelIdleMs?: number,
    *   probeTtlMs?: number,
    *   monitorIntervalMs?: number,
@@ -1369,6 +1658,9 @@ class ServerFleetManager extends EventEmitter {
     this._spawn = opts._spawn || defaultSpawn;
     this._resolveHost = opts._resolveHost || defaultResolveHost;
     this._waitForEndpoint = opts._waitForEndpoint || defaultWaitForEndpoint;
+    this._customProbeEndpoint = typeof opts._probeEndpoint === 'function';
+    this._probeEndpoint = opts._probeEndpoint || defaultProbeEndpoint;
+    this._caddyManager = opts._caddyManager || null;
 
     this._tunnelIdleMs = opts.tunnelIdleMs ?? DEFAULTS.tunnelIdleMs;
     this._probeTtlMs = opts.probeTtlMs ?? DEFAULTS.probeTtlMs;
@@ -1394,8 +1686,8 @@ class ServerFleetManager extends EventEmitter {
     /** Draining tunnels awaiting active leases to finish before closing. */
     /** @type {Set<ActiveDockerTunnel>} */
     this._drainingTunnels = new Set();
-    /** Coalesced in-flight connect promises per serverId. */
-    /** @type {Map<string, Promise<ActiveDockerTunnel>>} */
+    /** Coalesced in-flight connect entries per serverId (with per-caller abort isolation). */
+    /** @type {Map<string, InFlightTunnelConnect>} */
     this._dockerTunnelConnects = new Map();
     /** Short-lived port/caddy tunnel children tracked for clean shutdown. */
     /** @type {Set<any>} */
@@ -1423,11 +1715,82 @@ class ServerFleetManager extends EventEmitter {
     if (fs.existsSync(this.tmpDir)) {
       try { this.sweepTmpDir(); } catch (e) {}
     }
+
+    // Startup sweep of orphaned POSIX tunnel sockets (`ck-*.sock`) if socket dir already exists.
+    // Never creates directories on single-node installs.
+    for (const sockDir of this._getSocketDirs()) {
+      if (fs.existsSync(sockDir)) {
+        try { this.sweepStaleSockets(); } catch (e) {}
+        break;
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
   // Lazy Loading, Master Key Vault & Persistence
   // -------------------------------------------------------------------------
+
+  /**
+   * Returns candidate POSIX Unix socket directories owned by this instance.
+   * @returns {string[]}
+   */
+  _getSocketDirs() {
+    if (this._tmpSocketBaseDir) {
+      return [path.resolve(this._tmpSocketBaseDir)];
+    }
+    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : 'user';
+    const dirs = [path.resolve(path.join(os.tmpdir(), `ck-fleet-${uid}`))];
+    if (this._platform !== 'win32') {
+      const fallback = path.resolve(path.join('/tmp', `ck-fleet-${uid}`));
+      if (!dirs.includes(fallback)) dirs.push(fallback);
+    }
+    return dirs;
+  }
+
+  /**
+   * Sweeps stale orphaned POSIX tunnel sockets (`ck-<10hex>.sock`) left behind by crashes.
+   * - Never touches sockets owned by currently active or draining tunnels.
+   * - Refuses to follow a symlinked socket directory (`SYMLINK_DETECTED`).
+   * - Does NOT create directories if absent.
+   * @returns {number} Number of stale sockets removed
+   */
+  sweepStaleSockets() {
+    /** @type {Set<string>} */
+    const activeSocks = new Set();
+    for (const t of this._dockerTunnels.values()) {
+      if (t && t.localSock) activeSocks.add(path.resolve(t.localSock));
+    }
+    for (const t of this._drainingTunnels) {
+      if (t && t.localSock) activeSocks.add(path.resolve(t.localSock));
+    }
+
+    let cleaned = 0;
+    for (const dir of this._getSocketDirs()) {
+      let st;
+      try {
+        st = fs.lstatSync(dir);
+      } catch (err) {
+        /** @type {any} */
+        const e = err;
+        if (e && e.code === 'ENOENT') continue;
+        throw e;
+      }
+      if (st.isSymbolicLink()) {
+        throw createFleetError(`Directorio de sockets inseguro (symlink detectado): ${path.basename(dir)}`, 'SYMLINK_DETECTED', 500);
+      }
+      if (!st.isDirectory()) continue;
+
+      const entries = fs.readdirSync(dir);
+      for (const entry of entries) {
+        if (!STALE_SOCKET_RE.test(entry)) continue;
+        const full = path.resolve(path.join(dir, entry));
+        if (activeSocks.has(full)) continue;
+        secureUnlinkFile(full);
+        cleaned++;
+      }
+    }
+    return cleaned;
+  }
 
   /**
    * Sweeps stale ephemeral key files in `data/.fleet-tmp/` safely.
@@ -1556,6 +1919,9 @@ class ServerFleetManager extends EventEmitter {
     if (serversRes.ok && serversRes.data) {
       for (const s of serversRes.data.servers) {
         if (s && typeof s.id === 'string' && s.id !== LOCAL_SERVER_ID) {
+          s.maintenanceState = VALID_MAINTENANCE_STATES.has(s.maintenanceState) ? s.maintenanceState : 'active';
+          s.maintenanceReason = typeof s.maintenanceReason === 'string' && s.maintenanceReason.trim() ? s.maintenanceReason : null;
+          s.maintenanceSince = s.maintenanceState === 'active' ? null : (s.maintenanceSince || null);
           this._servers.set(s.id, s);
         }
       }
@@ -1642,6 +2008,9 @@ class ServerFleetManager extends EventEmitter {
       hostKeyType: s.hostKeyType || null,
       hostKeyPinnedAt: s.hostKeyPinnedAt || null,
       status: s.status || 'pending',
+      maintenanceState: VALID_MAINTENANCE_STATES.has(s.maintenanceState) ? s.maintenanceState : 'active',
+      maintenanceReason: s.maintenanceReason || null,
+      maintenanceSince: s.maintenanceState && s.maintenanceState !== 'active' ? (s.maintenanceSince || null) : null,
       statusReason: s.statusReason || null,
       statusFix: s.statusFix || null,
       warnings: Array.isArray(s.warnings) ? [...s.warnings] : [],
@@ -1674,6 +2043,9 @@ class ServerFleetManager extends EventEmitter {
       hostKeyType: null,
       hostKeyPinnedAt: null,
       status: 'online',
+      maintenanceState: 'active',
+      maintenanceReason: null,
+      maintenanceSince: null,
       statusReason: null,
       statusFix: null,
       warnings: [],
@@ -2152,6 +2524,9 @@ class ServerFleetManager extends EventEmitter {
       hostKeyLine: null,
       hostKeyPinnedAt: null,
       status: 'pending',
+      maintenanceState: 'active',
+      maintenanceReason: null,
+      maintenanceSince: null,
       statusReason: null,
       statusFix: null,
       warnings: [],
@@ -2193,7 +2568,7 @@ class ServerFleetManager extends EventEmitter {
   }
 
   /**
-   * Updates an existing remote server.
+   * Updates an existing remote server atomically (validates full cloned copy before committing).
    * Rotating key/endpoint gracefully drains active tunnels (never kills in-flight leases).
    * Changing host/port clears the pinned host key so the new endpoint is re-verified.
    * @param {string} serverId
@@ -2213,32 +2588,44 @@ class ServerFleetManager extends EventEmitter {
       throw createFleetError('Datos de actualización requeridos', 'INVALID_INPUT', 400);
     }
 
+    // Clone record first so any validation/async failure leaves `server` untouched (atomic update)
+    /** @type {FleetServerRecord} */
+    const next = {
+      ...server,
+      tags: Array.isArray(server.tags) ? [...server.tags] : [],
+      warnings: Array.isArray(server.warnings) ? [...server.warnings] : [],
+      resources: server.resources ? { ...server.resources } : null,
+      maintenanceState: VALID_MAINTENANCE_STATES.has(server.maintenanceState) ? server.maintenanceState : 'active',
+      maintenanceReason: server.maintenanceReason || null,
+      maintenanceSince: server.maintenanceSince || null
+    };
+
     let endpointChanged = false;
     let tunnelParamsChanged = false;
 
     if (patch.name !== undefined) {
-      server.name = validateDisplayName(patch.name, 'name');
+      next.name = validateDisplayName(patch.name, 'name');
     }
     if (patch.host !== undefined) {
       const { host } = await assertSafeFleetHost(patch.host, { resolveHost: this._resolveHost });
-      if (host !== server.host) {
-        server.host = host;
+      if (host !== next.host) {
+        next.host = host;
         endpointChanged = true;
         tunnelParamsChanged = true;
       }
     }
     if (patch.port !== undefined) {
       const port = validatePort(patch.port, 'port');
-      if (port !== server.port) {
-        server.port = port;
+      if (port !== next.port) {
+        next.port = port;
         endpointChanged = true;
         tunnelParamsChanged = true;
       }
     }
     if (patch.user !== undefined) {
       const user = validateSshUser(patch.user);
-      if (user !== server.user) {
-        server.user = user;
+      if (user !== next.user) {
+        next.user = user;
         tunnelParamsChanged = true;
       }
     }
@@ -2249,7 +2636,7 @@ class ServerFleetManager extends EventEmitter {
       }
       const targetKey = this._keys.get(keyId);
       const keyTeamId = (targetKey && targetKey.teamId) || DEFAULTS.teamId;
-      const serverTeamId = server.teamId || DEFAULTS.teamId;
+      const serverTeamId = next.teamId || DEFAULTS.teamId;
       if (keyTeamId !== serverTeamId) {
         throw createFleetError(
           `La clave SSH "${keyId}" pertenece a otro equipo y no puede asignarse a este servidor`,
@@ -2257,40 +2644,64 @@ class ServerFleetManager extends EventEmitter {
           403
         );
       }
-      if (keyId !== server.keyId) {
-        server.keyId = keyId;
+      if (keyId !== next.keyId) {
+        next.keyId = keyId;
         tunnelParamsChanged = true;
       }
     }
     if (patch.dockerSocketPath !== undefined) {
       const sock = validateDockerSocketPath(patch.dockerSocketPath);
-      if (sock !== server.dockerSocketPath) {
-        server.dockerSocketPath = sock;
+      if (sock !== next.dockerSocketPath) {
+        next.dockerSocketPath = sock;
         tunnelParamsChanged = true;
       }
     }
     if (patch.caddyAdminPort !== undefined) {
-      server.caddyAdminPort = validatePort(patch.caddyAdminPort, 'caddyAdminPort');
+      next.caddyAdminPort = validatePort(patch.caddyAdminPort, 'caddyAdminPort');
     }
     if (patch.region !== undefined) {
-      server.region = validateRegion(patch.region);
+      next.region = validateRegion(patch.region);
     }
     if (patch.tags !== undefined) {
-      server.tags = validateTags(patch.tags);
+      next.tags = validateTags(patch.tags);
     }
     if (patch.hostKeyPolicy !== undefined) {
       const policyRaw = String(patch.hostKeyPolicy).trim().toLowerCase();
       if (policyRaw !== 'tofu' && policyRaw !== 'strict') {
         throw createFleetError('hostKeyPolicy inválido (usa "tofu" o "strict")', 'INVALID_HOST_KEY_POLICY', 400);
       }
-      server.hostKeyPolicy = policyRaw;
+      next.hostKeyPolicy = policyRaw;
     }
     if (patch.expectedFingerprint !== undefined) {
-      server.expectedFingerprint = patch.expectedFingerprint
+      next.expectedFingerprint = patch.expectedFingerprint
         ? normalizeFingerprint(String(patch.expectedFingerprint))
         : null;
     }
-    if (server.hostKeyPolicy === 'strict' && !server.expectedFingerprint && !server.hostKeyFingerprint) {
+    if (patch.maintenanceState !== undefined) {
+      const nextState = validateMaintenanceState(patch.maintenanceState);
+      if (nextState !== next.maintenanceState) {
+        next.maintenanceState = nextState;
+        next.maintenanceSince = nextState === 'active' ? null : (next.maintenanceSince || new Date().toISOString());
+        if (nextState === 'active') next.maintenanceReason = null;
+      }
+    }
+    if (patch.maintenanceReason !== undefined) {
+      next.maintenanceReason = next.maintenanceState === 'active'
+        ? null
+        : validateMaintenanceReason(patch.maintenanceReason);
+    }
+
+    if (endpointChanged) {
+      next.hostKeyFingerprint = null;
+      next.hostKeyType = null;
+      next.hostKeyLine = null;
+      next.hostKeyPinnedAt = null;
+      next.status = 'pending';
+      next.statusReason = null;
+      next.statusFix = null;
+    }
+
+    if (next.hostKeyPolicy === 'strict' && !next.expectedFingerprint && !next.hostKeyFingerprint) {
       throw createFleetError(
         'hostKeyPolicy="strict" requiere expectedFingerprint ("SHA256:...")',
         'EXPECTED_FINGERPRINT_REQUIRED',
@@ -2298,18 +2709,16 @@ class ServerFleetManager extends EventEmitter {
       );
     }
 
-    if (endpointChanged) {
-      server.hostKeyFingerprint = null;
-      server.hostKeyType = null;
-      server.hostKeyLine = null;
-      server.hostKeyPinnedAt = null;
-      server.status = 'pending';
-      server.statusReason = null;
-      server.statusFix = null;
-      this._deleteKnownHostsFile(id);
+    // Re-check server still exists after async DNS resolution before committing
+    if (!this._servers.has(id)) {
+      throw createFleetError(`Servidor no encontrado: ${id}`, 'SERVER_NOT_FOUND', 404);
     }
 
-    server.updatedAt = new Date().toISOString();
+    next.updatedAt = new Date().toISOString();
+    this._servers.set(id, next);
+    if (endpointChanged) {
+      this._deleteKnownHostsFile(id);
+    }
     this._saveServers();
 
     if (tunnelParamsChanged) {
@@ -2317,7 +2726,7 @@ class ServerFleetManager extends EventEmitter {
     }
 
     this._audit('fleet.server_updated', id, { endpointChanged, tunnelParamsChanged });
-    const sanitized = this.sanitizeServer(server);
+    const sanitized = this.sanitizeServer(next);
     this.emit('server:updated', sanitized);
     return sanitized;
   }
@@ -2380,6 +2789,524 @@ class ServerFleetManager extends EventEmitter {
     this._audit('fleet.server_deleted', id, { force: Boolean(opts.force) });
     this.emit('server:deleted', { id });
     return { deleted: true, id };
+  }
+
+  // -------------------------------------------------------------------------
+  // Node Maintenance / Drain Mode, Smart Placement & Hardened VPS Bootstrap
+  // -------------------------------------------------------------------------
+
+  /**
+   * Transitions a remote node between `'active'`, `'draining'`, and `'maintenance'`.
+   * - `'active'`: accepts new deployments & placement scheduling.
+   * - `'draining'`: cordons node (blocks new deploys & placement) while existing containers keep running.
+   * - `'maintenance'`: cordons node and gracefully drains idle/completed SSH tunnels.
+   *
+   * @param {string} serverId
+   * @param {'active' | 'draining' | 'maintenance' | {
+   *   state?: string,
+   *   mode?: string,
+   *   maintenanceState?: string,
+   *   reason?: string | null,
+   *   drainTunnels?: boolean
+   * }} input
+   */
+  setServerMaintenance(serverId, input) {
+    this._ensureLoaded();
+    const id = String(serverId || '').trim();
+    if (id === LOCAL_SERVER_ID) {
+      throw createFleetError('El servidor virtual "local" no admite modo mantenimiento de nodo', 'LOCAL_SERVER_IMMUTABLE', 400);
+    }
+    const server = this._servers.get(id);
+    if (!server) {
+      throw createFleetError(`Servidor no encontrado: ${id}`, 'SERVER_NOT_FOUND', 404);
+    }
+
+    const opts = typeof input === 'string' ? { state: input } : (input && typeof input === 'object' ? input : {});
+    const nextState = validateMaintenanceState(opts.maintenanceState ?? opts.state ?? opts.mode);
+    const reason = nextState === 'active'
+      ? null
+      : (opts.reason !== undefined ? validateMaintenanceReason(opts.reason) : (server.maintenanceReason || null));
+
+    const previousState = VALID_MAINTENANCE_STATES.has(server.maintenanceState) ? server.maintenanceState : 'active';
+    const now = new Date().toISOString();
+
+    server.maintenanceState = nextState;
+    server.maintenanceReason = reason;
+    server.maintenanceSince = nextState === 'active' ? null : (server.maintenanceSince || now);
+    server.updatedAt = now;
+    this._saveServers();
+
+    const shouldDrainTunnels = opts.drainTunnels === true || (nextState === 'maintenance' && opts.drainTunnels !== false);
+    if (shouldDrainTunnels) {
+      this.drainServerTunnels(id);
+    }
+
+    this._audit('fleet.server_maintenance', id, {
+      previousState,
+      maintenanceState: nextState,
+      reason,
+      drainedTunnels: shouldDrainTunnels
+    });
+    const sanitized = this.sanitizeServer(server);
+    this.emit('server:maintenance', {
+      serverId: id,
+      previousState,
+      maintenanceState: nextState,
+      reason,
+      server: sanitized
+    });
+    return sanitized;
+  }
+
+  /**
+   * Checks whether a server is eligible to receive new deployments.
+   * @param {string} serverId
+   * @returns {{ schedulable: boolean, code: string | null, reason: string | null }}
+   */
+  isServerSchedulable(serverId) {
+    this._ensureLoaded();
+    const id = String(serverId || '').trim() || LOCAL_SERVER_ID;
+    const server = this.getServer(id);
+    if (!server) {
+      return { schedulable: false, code: 'SERVER_NOT_FOUND', reason: `Servidor no encontrado: ${id}` };
+    }
+    if (server.maintenanceState && server.maintenanceState !== 'active') {
+      return {
+        schedulable: false,
+        code: 'SERVER_IN_MAINTENANCE',
+        reason: `El servidor "${id}" está en modo "${server.maintenanceState}"${server.maintenanceReason ? ` (${server.maintenanceReason})` : ''}`
+      };
+    }
+    if (server.status === 'host_key_mismatch') {
+      return {
+        schedulable: false,
+        code: 'HOST_KEY_MISMATCH',
+        reason: `El servidor "${id}" está bloqueado por cambio de clave de host SSH`
+      };
+    }
+    if (server.status === 'offline' || server.status === 'degraded') {
+      return {
+        schedulable: false,
+        code: 'SERVER_UNHEALTHY',
+        reason: `El servidor "${id}" no está saludable (status=${server.status})`
+      };
+    }
+    return { schedulable: true, code: null, reason: null };
+  }
+
+  /**
+   * Smart placement scheduler: selects the healthiest schedulable fleet node
+   * based on free RAM, CPU load, disk headroom, latency, region, tags, and workload spread.
+   * Never selects nodes in `draining`/`maintenance` mode or `offline`/`degraded`/`host_key_mismatch`.
+   *
+   * @param {{
+   *   minFreeRamMb?: number,
+   *   minFreeDiskGb?: number,
+   *   region?: string | null,
+   *   preferRegion?: string | null,
+   *   tags?: string[],
+   *   preferredTags?: string[],
+   *   teamId?: string | null,
+   *   preferLocal?: boolean,
+   *   includeLocal?: boolean,
+   *   excludeServerIds?: string[],
+   *   requireCaddy?: boolean,
+   *   requireDocker?: boolean,
+   *   strategy?: 'balanced' | 'most-free-ram' | 'least-loaded' | 'lowest-latency',
+   *   projectCounts?: Record<string, number>
+   * }} [criteria]
+   */
+  selectBestServer(criteria = {}) {
+    this._ensureLoaded();
+    const opts = criteria && typeof criteria === 'object' ? criteria : {};
+    const strategyRaw = String(opts.strategy || 'balanced').trim().toLowerCase();
+    if (!VALID_PLACEMENT_STRATEGIES.has(strategyRaw)) {
+      throw createFleetError(
+        'strategy inválida (usa "balanced", "most-free-ram", "least-loaded" o "lowest-latency")',
+        'INVALID_PLACEMENT_STRATEGY',
+        400
+      );
+    }
+    /** @type {'balanced' | 'most-free-ram' | 'least-loaded' | 'lowest-latency'} */
+    const strategy = /** @type {any} */ (strategyRaw);
+
+    const minFreeRamMb = Math.max(0, Number(opts.minFreeRamMb) || 0);
+    const minFreeDiskGb = Math.max(0, Number(opts.minFreeDiskGb) || 0);
+    const requiredRegion = opts.region ? validateRegion(opts.region) : null;
+    const preferRegion = opts.preferRegion ? validateRegion(opts.preferRegion) : null;
+    const requiredTags = opts.tags ? validateTags(opts.tags) : [];
+    const preferredTags = opts.preferredTags ? validateTags(opts.preferredTags) : [];
+    const teamId = opts.teamId ? validateTeamId(opts.teamId) : null;
+    const includeLocal = opts.includeLocal !== false;
+    const preferLocal = Boolean(opts.preferLocal);
+    const requireDocker = opts.requireDocker !== false;
+    const requireCaddy = Boolean(opts.requireCaddy);
+    const excludeSet = new Set(Array.isArray(opts.excludeServerIds) ? opts.excludeServerIds.map((x) => String(x || '').trim()) : []);
+    const projectCounts = opts.projectCounts && typeof opts.projectCounts === 'object' ? opts.projectCounts : {};
+
+    const allServers = this.listServers({ includeLocal });
+
+    const weights = strategy === 'most-free-ram'
+      ? { ram: 65, cpu: 15, disk: 10, latency: 10 }
+      : strategy === 'least-loaded'
+        ? { ram: 20, cpu: 60, disk: 10, latency: 10 }
+        : strategy === 'lowest-latency'
+          ? { ram: 15, cpu: 10, disk: 5, latency: 70 }
+          : { ram: 40, cpu: 30, disk: 15, latency: 15 };
+
+    /** @type {Array<{ serverId: string, name: string, region: string, score: number, breakdown: Record<string, number>, server: any }>} */
+    const candidates = [];
+    /** @type {Array<{ serverId: string, name: string, reasons: string[] }>} */
+    const rejected = [];
+
+    for (const srv of allServers) {
+      /** @type {string[]} */
+      const reasons = [];
+      if (excludeSet.has(srv.id)) reasons.push('excluded');
+      if (teamId && !srv.isLocal && srv.teamId !== teamId) reasons.push('team_mismatch');
+      if (srv.maintenanceState && srv.maintenanceState !== 'active') {
+        reasons.push(`maintenance_state:${srv.maintenanceState}`);
+      }
+      if (srv.status !== 'online') {
+        reasons.push(`status:${srv.status || 'pending'}`);
+      }
+      if (requiredRegion && srv.region !== requiredRegion) {
+        reasons.push(`region_mismatch:${srv.region}`);
+      }
+      const srvTags = Array.isArray(srv.tags) ? srv.tags : [];
+      for (const reqTag of requiredTags) {
+        if (!srvTags.includes(reqTag)) {
+          reasons.push(`missing_tag:${reqTag}`);
+        }
+      }
+
+      const res = srv.resources || null;
+      if (requireDocker && (!res || !res.dockerReady)) {
+        reasons.push('docker_not_ready');
+      }
+      if (requireCaddy && (!res || !res.caddyAvailable)) {
+        reasons.push('caddy_unavailable');
+      }
+      const freeRamMb = res && Number.isFinite(res.memoryAvailableMb) ? res.memoryAvailableMb : 0;
+      const totalRamMb = res && Number.isFinite(res.memoryTotalMb) ? res.memoryTotalMb : 0;
+      if (minFreeRamMb > 0 && freeRamMb < minFreeRamMb) {
+        reasons.push(`insufficient_ram:${freeRamMb}mb<${minFreeRamMb}mb`);
+      }
+      const freeDiskGb = res && res.diskAvailableGb != null && Number.isFinite(res.diskAvailableGb) ? res.diskAvailableGb : null;
+      const totalDiskGb = res && res.diskTotalGb != null && Number.isFinite(res.diskTotalGb) ? res.diskTotalGb : null;
+      if (minFreeDiskGb > 0) {
+        if (freeDiskGb == null) {
+          if (!srv.isLocal) reasons.push('disk_metric_missing');
+        } else if (freeDiskGb < minFreeDiskGb) {
+          reasons.push(`insufficient_disk:${freeDiskGb}gb<${minFreeDiskGb}gb`);
+        }
+      }
+
+      if (reasons.length > 0) {
+        rejected.push({ serverId: srv.id, name: srv.name, reasons });
+        continue;
+      }
+
+      // Compute normalized resource scores
+      const ramRatio = totalRamMb > 0 ? Math.max(0, Math.min(1, freeRamMb / totalRamMb)) : 0;
+      const ramHeadroom = Math.max(0, Math.min(1, freeRamMb / 8192));
+      const ramNorm = ramRatio * 0.6 + ramHeadroom * 0.4;
+
+      const cpus = res && res.cpus > 0 ? res.cpus : 1;
+      const load1m = res && Number.isFinite(res.load1m) && res.load1m >= 0 ? res.load1m : 0;
+      const cpuNorm = Math.max(0, Math.min(1, 1 - (load1m / cpus)));
+
+      const diskNorm = (totalDiskGb && totalDiskGb > 0 && freeDiskGb != null)
+        ? Math.max(0, Math.min(1, freeDiskGb / totalDiskGb))
+        : 0.6;
+
+      const latencyMs = res && Number.isFinite(res.latencyMs) && res.latencyMs >= 0 ? res.latencyMs : 150;
+      const latencyNorm = Math.max(0, Math.min(1, 1 - (latencyMs / 500)));
+
+      const ramScore = Number((ramNorm * weights.ram).toFixed(2));
+      const cpuScore = Number((cpuNorm * weights.cpu).toFixed(2));
+      const diskScore = Number((diskNorm * weights.disk).toFixed(2));
+      const latencyScore = Number((latencyNorm * weights.latency).toFixed(2));
+
+      let affinityBonus = 0;
+      if (preferLocal && srv.isLocal) affinityBonus += 8;
+      if (preferRegion && srv.region === preferRegion) affinityBonus += 6;
+      let tagHits = 0;
+      for (const pt of preferredTags) {
+        if (srvTags.includes(pt)) tagHits++;
+      }
+      affinityBonus += Math.min(9, tagHits * 3);
+
+      const assignedCount = Math.max(0, Number(projectCounts[srv.id]) || 0);
+      const spreadPenalty = Math.min(12, assignedCount * 2);
+
+      const score = Number((ramScore + cpuScore + diskScore + latencyScore + affinityBonus - spreadPenalty).toFixed(2));
+      candidates.push({
+        serverId: srv.id,
+        name: srv.name,
+        region: srv.region,
+        score,
+        breakdown: {
+          ramScore,
+          cpuScore,
+          diskScore,
+          latencyScore,
+          affinityBonus,
+          spreadPenalty
+        },
+        server: srv
+      });
+    }
+
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const ramDiff = (b.server.resources?.memoryAvailableMb || 0) - (a.server.resources?.memoryAvailableMb || 0);
+      if (ramDiff !== 0) return ramDiff;
+      const latDiff = (a.server.resources?.latencyMs ?? 9999) - (b.server.resources?.latencyMs ?? 9999);
+      if (latDiff !== 0) return latDiff;
+      return a.serverId.localeCompare(b.serverId);
+    });
+
+    const best = candidates[0] || null;
+    return {
+      selected: best ? best.server : null,
+      serverId: best ? best.serverId : null,
+      score: best ? best.score : null,
+      strategy,
+      candidates,
+      rejected
+    };
+  }
+
+  /**
+   * Generates an auditable, idempotent 1-command hardened VPS bootstrap script
+   * (Docker Engine + Caddy bound to 127.0.0.1:<caddyAdminPort> + non-root deploy user
+   * + SSH key install + UFW with control-plane anti-LIMIT allowlist + sshd hardening).
+   * Pure deterministic template generation — ZERO shell execution on the Culkibo host.
+   *
+   * @param {string} serverId
+   * @param {{
+   *   deployUser?: string,
+   *   useRoot?: boolean,
+   *   sshPort?: number,
+   *   caddyAdminPort?: number,
+   *   controlPlaneIp?: string | null,
+   *   installCaddy?: boolean,
+   *   configureUfw?: boolean,
+   *   hardenSsh?: boolean,
+   *   disableRootSsh?: boolean
+   * }} [opts]
+   */
+  generateBootstrapScript(serverId, opts = {}) {
+    this._ensureLoaded();
+    const id = String(serverId || '').trim();
+    if (id === LOCAL_SERVER_ID) {
+      throw createFleetError('No se genera script de bootstrap VPS para el nodo "local"', 'LOCAL_SERVER_IMMUTABLE', 400);
+    }
+    const server = this._servers.get(id);
+    if (!server) {
+      throw createFleetError(`Servidor no encontrado: ${id}`, 'SERVER_NOT_FOUND', 404);
+    }
+    const key = this._keys.get(server.keyId);
+    if (!key) {
+      throw createFleetError(`Clave SSH no encontrada para el servidor "${id}": ${server.keyId}`, 'KEY_NOT_FOUND', 404);
+    }
+
+    // Re-validate public key strictly so zero shell metacharacters can ever enter the template
+    const parsedPub = computeSshFingerprint(key.publicKey);
+    const safePubLine = `${parsedPub.keyType} ${parsedPub.keyBase64} culkibo-${server.id}`;
+
+    const useRoot = Boolean(opts.useRoot);
+    const defaultUser = useRoot ? 'root' : (server.user === 'root' ? 'deploy' : server.user);
+    const deployUser = validateSshUser(opts.deployUser ?? defaultUser);
+    const sshPort = validatePort(opts.sshPort ?? server.port, 'sshPort');
+    const caddyAdminPort = validatePort(opts.caddyAdminPort ?? server.caddyAdminPort ?? DEFAULTS.caddyAdminPort, 'caddyAdminPort');
+    const controlPlaneIp = validateControlPlaneCidr(opts.controlPlaneIp);
+    const installCaddy = opts.installCaddy !== false;
+    const configureUfw = opts.configureUfw !== false;
+    const hardenSsh = opts.hardenSsh !== false;
+    const disableRootSsh = Boolean(opts.disableRootSsh) && deployUser !== 'root';
+
+    /** @type {string[]} */
+    const steps = ['preflight', 'user_and_ssh_key', 'docker'];
+    /** @type {string[]} */
+    const lines = [
+      '#!/usr/bin/env bash',
+      '# Culkibo Hardened Fleet Node Bootstrap (auditable & idempotent)',
+      `# Server ID: ${server.id} | SSH Port: ${sshPort} | Deploy User: ${deployUser}`,
+      `# Vault Key: ${key.id} (${parsedPub.fingerprint})`,
+      'set -euo pipefail',
+      'umask 027',
+      '',
+      'if [ "$(id -u)" -ne 0 ]; then',
+      '  echo "[culkibo-bootstrap] ERROR: ejecuta este script como root o con sudo." >&2',
+      '  exit 1',
+      'fi',
+      '',
+      `DEPLOY_USER='${deployUser}'`,
+      `SSH_PORT='${sshPort}'`,
+      `CADDY_ADMIN_PORT='${caddyAdminPort}'`,
+      `PUB_KEY='${safePubLine}'`,
+      '',
+      'echo "[1/6] Preflight y paquetes base..."',
+      'if command -v apt-get >/dev/null 2>&1; then',
+      '  export DEBIAN_FRONTEND=noninteractive',
+      '  apt-get update -qq',
+      '  apt-get install -y -qq ca-certificates curl gnupg lsb-release sudo ufw >/dev/null',
+      'fi',
+      '',
+      'echo "[2/6] Usuario de despliegue y clave SSH autorizada..."',
+      'if [ "$DEPLOY_USER" != "root" ]; then',
+      '  if ! id -u "$DEPLOY_USER" >/dev/null 2>&1; then',
+      '    useradd -m -s /bin/bash "$DEPLOY_USER"',
+      '  fi',
+      '  USER_HOME="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"',
+      'else',
+      '  USER_HOME="/root"',
+      'fi',
+      'install -d -m 700 -o "$DEPLOY_USER" -g "$DEPLOY_USER" "${USER_HOME}/.ssh"',
+      'AUTH_KEYS="${USER_HOME}/.ssh/authorized_keys"',
+      'touch "$AUTH_KEYS"',
+      'grep -qxF "$PUB_KEY" "$AUTH_KEYS" || printf "%s\\n" "$PUB_KEY" >> "$AUTH_KEYS"',
+      'chown "$DEPLOY_USER:$DEPLOY_USER" "$AUTH_KEYS"',
+      'chmod 600 "$AUTH_KEYS"',
+      '',
+      'echo "[3/6] Instalando y verificando Docker Engine..."',
+      'if ! command -v docker >/dev/null 2>&1; then',
+      '  curl -fsSL https://get.docker.com | sh',
+      'fi',
+      'systemctl enable --now docker >/dev/null 2>&1 || true',
+      'if [ "$DEPLOY_USER" != "root" ]; then',
+      '  usermod -aG docker "$DEPLOY_USER"',
+      'fi',
+      ''
+    ];
+
+    if (installCaddy) {
+      steps.push('caddy_loopback_admin');
+      lines.push(
+        'echo "[4/6] Instalando Caddy con Admin API restringida a 127.0.0.1:${CADDY_ADMIN_PORT}..."',
+        'if ! command -v caddy >/dev/null 2>&1; then',
+        '  if command -v apt-get >/dev/null 2>&1; then',
+        '    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https >/dev/null',
+        '    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg',
+        '    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list',
+        '    apt-get update -qq && apt-get install -y -qq caddy >/dev/null',
+        '  fi',
+        'fi',
+        'install -d -m 755 /etc/caddy',
+        'if [ ! -f /etc/caddy/Caddyfile ] || ! grep -q "admin 127.0.0.1:" /etc/caddy/Caddyfile; then',
+        '  cat > /etc/caddy/Caddyfile <<CADDY_EOF',
+        '{',
+        `  admin 127.0.0.1:${caddyAdminPort}`,
+        '}',
+        'CADDY_EOF',
+        'fi',
+        'systemctl enable --now caddy >/dev/null 2>&1 || systemctl reload caddy >/dev/null 2>&1 || true',
+        ''
+      );
+    }
+
+    if (configureUfw) {
+      steps.push('ufw');
+      lines.push(
+        'echo "[5/6] Configurando cortafuegos UFW (sin bloqueos LIMIT al plano de control)..."',
+        'if command -v ufw >/dev/null 2>&1; then',
+        '  ufw default deny incoming >/dev/null',
+        '  ufw default allow outgoing >/dev/null',
+        '  ufw allow 80/tcp comment "Culkibo HTTP" >/dev/null',
+        '  ufw allow 443/tcp comment "Culkibo HTTPS" >/dev/null',
+        '  ufw allow 443/udp comment "Culkibo HTTP3-QUIC" >/dev/null'
+      );
+      if (controlPlaneIp) {
+        lines.push(
+          `  ufw allow from ${controlPlaneIp} to any port "${sshPort}" proto tcp comment "Culkibo Control Plane SSH" >/dev/null`,
+          `  ufw limit "${sshPort}/tcp" comment "SSH public rate-limit" >/dev/null`
+        );
+      } else {
+        lines.push(
+          `  ufw allow "${sshPort}/tcp" comment "Culkibo Fleet SSH" >/dev/null`
+        );
+      }
+      lines.push(
+        '  ufw --force enable >/dev/null',
+        'fi',
+        ''
+      );
+    }
+
+    if (hardenSsh) {
+      steps.push('sshd_hardening');
+      const permitRoot = disableRootSsh ? 'no' : 'prohibit-password';
+      lines.push(
+        'echo "[6/6] Endureciendo sshd (solo llave pública, validación previa con sshd -t)..."',
+        'install -d -m 755 /etc/ssh/sshd_config.d',
+        'cat > /etc/ssh/sshd_config.d/99-culkibo-hardening.conf <<SSHD_EOF',
+        '# Managed by Culkibo Fleet Bootstrap',
+        `Port ${sshPort}`,
+        'PasswordAuthentication no',
+        'KbdInteractiveAuthentication no',
+        'ChallengeResponseAuthentication no',
+        'PubkeyAuthentication yes',
+        `PermitRootLogin ${permitRoot}`,
+        'X11Forwarding no',
+        'AllowAgentForwarding no',
+        'MaxAuthTries 4',
+        'SSHD_EOF',
+        'if sshd -t; then',
+        '  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true',
+        'else',
+        '  rm -f /etc/ssh/sshd_config.d/99-culkibo-hardening.conf',
+        '  echo "[culkibo-bootstrap] ERROR: sshd -t falló; revertido para evitar bloqueo." >&2',
+        '  exit 1',
+        'fi',
+        ''
+      );
+    }
+
+    steps.push('host_fingerprint');
+    lines.push(
+      'echo "=== Culkibo Fleet Node Ready ==="',
+      'if [ -f /etc/ssh/ssh_host_ed25519_key.pub ]; then',
+      '  printf "HOST_KEY_SHA256=%s\\n" "$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk \'{print $2}\')"',
+      'fi',
+      'docker --version || true',
+      'caddy version || true'
+    );
+
+    const script = lines.join('\n') + '\n';
+    if (script.includes(BOOTSTRAP_SENTINEL)) {
+      throw createFleetError('Error interno generando delimitador de bootstrap', 'BOOTSTRAP_GENERATION_FAILED', 500);
+    }
+    const sha256 = crypto.createHash('sha256').update(script, 'utf8').digest('hex');
+    const oneLiner = `cat <<'${BOOTSTRAP_SENTINEL}' | sudo bash\n${script}${BOOTSTRAP_SENTINEL}`;
+
+    this._audit('fleet.bootstrap_generated', id, {
+      deployUser,
+      sshPort,
+      caddyAdminPort,
+      hasControlPlaneIp: Boolean(controlPlaneIp),
+      installCaddy,
+      configureUfw,
+      hardenSsh,
+      sha256: sha256.slice(0, 16)
+    });
+
+    return {
+      serverId: server.id,
+      serverName: server.name,
+      host: server.host,
+      deployUser,
+      sshPort,
+      caddyAdminPort,
+      controlPlaneIp,
+      keyId: key.id,
+      keyFingerprint: parsedPub.fingerprint,
+      sha256,
+      script,
+      oneLiner,
+      steps
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -2880,15 +3807,93 @@ class ServerFleetManager extends EventEmitter {
   }
 
   /**
+   * Arms the idle teardown timer on an active tunnel when `refCount === 0`.
+   * @param {ActiveDockerTunnel} tunnel
+   */
+  _armIdleTimer(tunnel) {
+    if (!tunnel || tunnel.refCount > 0 || !tunnel.alive) return;
+    if (tunnel.draining) {
+      this._closeTunnelImmediate(tunnel);
+      return;
+    }
+    if (tunnel.idleTimer) {
+      clearTimeout(tunnel.idleTimer);
+    }
+    tunnel.idleTimer = setTimeout(() => {
+      tunnel.idleTimer = null;
+      if (tunnel.refCount === 0) {
+        this._closeTunnelImmediate(tunnel);
+      }
+    }, this._tunnelIdleMs);
+    if (tunnel.idleTimer.unref) tunnel.idleTimer.unref();
+  }
+
+  /**
+   * Awaits a coalesced tunnel connect while isolating each caller's `AbortSignal`.
+   * Aborting one caller NEVER cancels sibling waiters on the same connect; the underlying
+   * SSH handshake is aborted ONLY when zero waiters remain.
+   * @param {InFlightTunnelConnect} entry
+   * @param {symbol} waiterToken
+   * @param {AbortSignal | null} callerSignal
+   * @returns {Promise<ActiveDockerTunnel>}
+   */
+  _awaitWithCallerAbort(entry, waiterToken, callerSignal) {
+    if (!callerSignal) return entry.promise;
+    if (callerSignal.aborted) {
+      entry.waiters.delete(waiterToken);
+      if (entry.waiters.size === 0) {
+        entry.promise.catch(() => {});
+        try { entry.internalController.abort(); } catch (e) {}
+      }
+      return Promise.reject(createFleetError('Solicitud de túnel cancelada', 'ABORTED', 499));
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        entry.waiters.delete(waiterToken);
+        if (entry.waiters.size === 0) {
+          try { entry.internalController.abort(); } catch (e) {}
+        }
+        reject(createFleetError('Solicitud de túnel cancelada', 'ABORTED', 499));
+      };
+      callerSignal.addEventListener('abort', onAbort, { once: true });
+      entry.promise.then(
+        (t) => {
+          if (settled) {
+            if (t && t.refCount === 0 && entry.waiters.size === 0) {
+              if (t.draining || !t.alive) this._closeTunnelImmediate(t);
+              else this._armIdleTimer(t);
+            }
+            return;
+          }
+          settled = true;
+          callerSignal.removeEventListener('abort', onAbort);
+          resolve(t);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          callerSignal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      );
+    });
+  }
+
+  /**
    * Acquires a ref-counted Docker SSH tunnel lease.
    * - Never closes the tunnel while `refCount > 0`.
-   * - Coalesces concurrent connects for the same `serverId`.
+   * - Active liveness-checks cached tunnels and transparently reaps stale/zombie sockets.
+   * - Coalesces concurrent connects with per-caller `AbortSignal` isolation.
    * - Never mutates `process.env.DOCKER_HOST`.
    * - Arms idle teardown timer ONLY when `refCount` drops to `0`.
    *
    * @param {string} serverId
-   * @param {{ signal?: AbortSignal | null, connectTimeoutMs?: number }} [opts]
-   * @returns {Promise<{ serverId: string, dockerHost: string | null, tunnelId: string | null, isLocal: boolean, release: () => Promise<void> }>}
+   * @param {{ signal?: AbortSignal | null, connectTimeoutMs?: number, skipLivenessCheck?: boolean }} [opts]
+   * @returns {Promise<{ serverId: string, dockerHost: string | null, tunnelId: string | null, isLocal: boolean, isAlive: () => boolean, release: () => Promise<void> }>}
    */
   async acquireDockerTunnel(serverId, opts = {}) {
     this._ensureLoaded();
@@ -2899,6 +3904,7 @@ class ServerFleetManager extends EventEmitter {
         dockerHost: null,
         tunnelId: null,
         isLocal: true,
+        isAlive: () => true,
         release: async () => {}
       };
     }
@@ -2916,30 +3922,82 @@ class ServerFleetManager extends EventEmitter {
     const { pinnedIp } = await assertSafeFleetHost(server.host, { resolveHost: this._resolveHost });
     const knownHostsFile = await this._ensureHostKeyReady(server, pinnedIp);
 
+    if (opts.signal && opts.signal.aborted) {
+      throw createFleetError('Solicitud de túnel cancelada', 'ABORTED', 499);
+    }
+
     /** @type {ActiveDockerTunnel | null} */
     let tunnel = this._dockerTunnels.get(id) || null;
-    if (tunnel && (!tunnel.alive || tunnel.draining)) {
-      tunnel = null;
+    if (tunnel) {
+      const childDead = Boolean(tunnel.child && (tunnel.child.killed || tunnel.child.exitCode !== null));
+      if (!tunnel.alive || tunnel.draining || childDead) {
+        if (childDead || !tunnel.alive) {
+          this._closeTunnelImmediate(tunnel);
+        }
+        tunnel = null;
+      } else if (!opts.skipLivenessCheck) {
+        const canProbe = this._customProbeEndpoint || !(tunnel.localSock && process.platform === 'win32');
+        if (canProbe) {
+          const healthy = await this._probeEndpoint({ localSock: tunnel.localSock, localPort: tunnel.localPort }, 400);
+          if (!healthy) {
+            this.emit('tunnel:stale_reaped', { serverId: id, tunnelId: tunnel.id });
+            this._closeTunnelImmediate(tunnel);
+            tunnel = null;
+          } else if (!tunnel.alive || tunnel.draining) {
+            tunnel = null;
+          }
+        }
+      }
+    }
+
+    if (opts.signal && opts.signal.aborted) {
+      throw createFleetError('Solicitud de túnel cancelada', 'ABORTED', 499);
     }
 
     if (!tunnel) {
-      let connectPromise = this._dockerTunnelConnects.get(id);
-      if (!connectPromise) {
-        connectPromise = this._openDockerTunnel(server, pinnedIp, knownHostsFile, opts)
-          .finally(() => {
-            if (this._dockerTunnelConnects.get(id) === connectPromise) {
-              this._dockerTunnelConnects.delete(id);
-            }
-          });
-        this._dockerTunnelConnects.set(id, connectPromise);
+      const waiterToken = Symbol('tunnel_waiter');
+      let entry = this._dockerTunnelConnects.get(id);
+      if (!entry) {
+        const internalController = new AbortController();
+        /** @type {Set<symbol>} */
+        const waiters = new Set();
+        const promise = this._openDockerTunnel(server, pinnedIp, knownHostsFile, {
+          connectTimeoutMs: opts.connectTimeoutMs,
+          signal: internalController.signal
+        }).finally(() => {
+          if (this._dockerTunnelConnects.get(id) === entry) {
+            this._dockerTunnelConnects.delete(id);
+          }
+        });
+        entry = { promise, waiters, internalController };
+        this._dockerTunnelConnects.set(id, entry);
       }
-      tunnel = await connectPromise;
-      // If the coalesced tunnel became draining/dead while awaiting, close it if unreferenced and open a fresh one
+      entry.waiters.add(waiterToken);
+      try {
+        tunnel = await this._awaitWithCallerAbort(entry, waiterToken, opts.signal || null);
+      } finally {
+        entry.waiters.delete(waiterToken);
+      }
+
+      // If the coalesced tunnel became draining/dead while awaiting, close if unreferenced
+      // and re-fetch the latest server record so rotated credentials/user/endpoint are used!
       if (!tunnel.alive || tunnel.draining) {
         if (tunnel.refCount === 0) {
           this._closeTunnelImmediate(tunnel);
         }
-        tunnel = await this._openDockerTunnel(server, pinnedIp, knownHostsFile, opts);
+        if (opts.signal && opts.signal.aborted) {
+          throw createFleetError('Solicitud de túnel cancelada', 'ABORTED', 499);
+        }
+        const freshServer = this._servers.get(id);
+        if (!freshServer) {
+          throw createFleetError(`Servidor no encontrado: ${id}`, 'SERVER_NOT_FOUND', 404);
+        }
+        const { pinnedIp: freshPinnedIp } = await assertSafeFleetHost(freshServer.host, { resolveHost: this._resolveHost });
+        const freshKnownHosts = await this._ensureHostKeyReady(freshServer, freshPinnedIp);
+        tunnel = await this._openDockerTunnel(freshServer, freshPinnedIp, freshKnownHosts, {
+          connectTimeoutMs: opts.connectTimeoutMs,
+          signal: opts.signal || null
+        });
       }
     }
 
@@ -2964,17 +4022,7 @@ class ServerFleetManager extends EventEmitter {
         return;
       }
 
-      // Arm idle close timer ONLY when refCount === 0
-      if (boundTunnel.idleTimer) {
-        clearTimeout(boundTunnel.idleTimer);
-      }
-      boundTunnel.idleTimer = setTimeout(() => {
-        boundTunnel.idleTimer = null;
-        if (boundTunnel.refCount === 0) {
-          this._closeTunnelImmediate(boundTunnel);
-        }
-      }, this._tunnelIdleMs);
-      if (boundTunnel.idleTimer.unref) boundTunnel.idleTimer.unref();
+      this._armIdleTimer(boundTunnel);
     };
 
     return {
@@ -2982,6 +4030,7 @@ class ServerFleetManager extends EventEmitter {
       dockerHost: boundTunnel.dockerHost,
       tunnelId: boundTunnel.id,
       isLocal: false,
+      isAlive: () => Boolean(boundTunnel.alive && (!boundTunnel.child || (!boundTunnel.child.killed && boundTunnel.child.exitCode === null))),
       release
     };
   }
@@ -2990,8 +4039,8 @@ class ServerFleetManager extends EventEmitter {
    * Runs `fn(lease)` inside a ref-counted Docker tunnel lease, guaranteeing `lease.release()`.
    * @template T
    * @param {string} serverId
-   * @param {(lease: { serverId: string, dockerHost: string | null, tunnelId: string | null, isLocal: boolean, release: () => Promise<void> }) => Promise<T>} fn
-   * @param {{ signal?: AbortSignal | null, connectTimeoutMs?: number }} [opts]
+   * @param {(lease: { serverId: string, dockerHost: string | null, tunnelId: string | null, isLocal: boolean, isAlive: () => boolean, release: () => Promise<void> }) => Promise<T>} fn
+   * @param {{ signal?: AbortSignal | null, connectTimeoutMs?: number, skipLivenessCheck?: boolean }} [opts]
    * @returns {Promise<T>}
    */
   async withDockerTunnel(serverId, fn, opts = {}) {
@@ -3001,6 +4050,107 @@ class ServerFleetManager extends EventEmitter {
     } finally {
       await lease.release();
     }
+  }
+
+  /**
+   * Force-invalidates a specific broken Docker tunnel so the next acquire opens a clean connection.
+   * @param {string} serverId
+   * @param {string | null} [tunnelId]
+   */
+  _invalidateBrokenTunnel(serverId, tunnelId = null) {
+    const active = this._dockerTunnels.get(serverId);
+    if (active && (!tunnelId || active.id === tunnelId)) {
+      this._closeTunnelImmediate(active);
+    }
+    for (const dt of Array.from(this._drainingTunnels)) {
+      if (dt.serverId === serverId && (!tunnelId || dt.id === tunnelId)) {
+        this._closeTunnelImmediate(dt);
+      }
+    }
+  }
+
+  /**
+   * Executes `fn(lease, meta)` over a liveness-verified Docker SSH tunnel with automatic
+   * reconnect and bounded exponential backoff if the SSH tunnel drops transiently mid-flight.
+   * NEVER retries security errors (`HOST_KEY_MISMATCH`, `SSRF_BLOCKED`, `ABORTED`, vault errors).
+   *
+   * @template T
+   * @param {string} serverId
+   * @param {(lease: { serverId: string, dockerHost: string | null, tunnelId: string | null, isLocal: boolean, isAlive: () => boolean, release: () => Promise<void> }, meta: { attempt: number, reconnected: boolean }) => Promise<T>} fn
+   * @param {{
+   *   maxRetries?: number,
+   *   baseDelayMs?: number,
+   *   maxDelayMs?: number,
+   *   connectTimeoutMs?: number,
+   *   signal?: AbortSignal | null,
+   *   isRetryable?: (err: any, attempt: number) => boolean
+   * }} [opts]
+   * @returns {Promise<T>}
+   */
+  async withResilientDockerTunnel(serverId, fn, opts = {}) {
+    const id = String(serverId || '').trim();
+    if (id === LOCAL_SERVER_ID) {
+      return this.withDockerTunnel(LOCAL_SERVER_ID, (lease) => fn(lease, { attempt: 0, reconnected: false }), opts);
+    }
+
+    const maxRetries = Math.max(0, Math.min(5, typeof opts.maxRetries === 'number' && Number.isInteger(opts.maxRetries) ? opts.maxRetries : 2));
+    const baseDelayMs = Math.max(10, Math.min(10000, Number(opts.baseDelayMs) || 250));
+    const maxDelayMs = Math.max(baseDelayMs, Math.min(30000, Number(opts.maxDelayMs) || 3000));
+    const signal = opts.signal || null;
+
+    /** @type {any} */
+    let lastErr = null;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (signal && signal.aborted) {
+        throw createFleetError('Operación cancelada', 'ABORTED', 499);
+      }
+      /** @type {any} */
+      let lease = null;
+      try {
+        lease = await this.acquireDockerTunnel(id, {
+          signal,
+          connectTimeoutMs: opts.connectTimeoutMs
+        });
+        return await fn(lease, { attempt, reconnected: attempt > 0 });
+      } catch (err) {
+        lastErr = err;
+        const tunnelDiedDuringOp = Boolean(lease && typeof lease.isAlive === 'function' && !lease.isAlive());
+        const customRetry = typeof opts.isRetryable === 'function' ? Boolean(opts.isRetryable(err, attempt)) : false;
+        const code = String(err && err.code ? err.code : '').toUpperCase();
+        const isFatal = NON_RETRYABLE_TUNNEL_CODES.has(code);
+        const canRetry = !isFatal && attempt < maxRetries && (tunnelDiedDuringOp || isRetryableTunnelError(err) || customRetry);
+
+        if (lease) {
+          const brokenId = lease.tunnelId;
+          await lease.release().catch(() => {});
+          lease = null;
+          if (canRetry) {
+            this._invalidateBrokenTunnel(id, brokenId);
+          }
+        } else if (canRetry) {
+          this._invalidateBrokenTunnel(id, null);
+        }
+
+        if (!canRetry) {
+          throw err;
+        }
+
+        const delayMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+        this.emit('tunnel:reconnecting', {
+          serverId: id,
+          attempt: attempt + 1,
+          maxRetries,
+          delayMs,
+          reason: redactSensitiveOutput(err && err.message ? err.message : String(err)).slice(0, 180)
+        });
+        await sleepWithAbort(delayMs, signal);
+      } finally {
+        if (lease) {
+          await lease.release().catch(() => {});
+        }
+      }
+    }
+    throw lastErr;
   }
 
   /**
@@ -3108,10 +4258,12 @@ class ServerFleetManager extends EventEmitter {
 
   /**
    * Tunnels the remote Caddy Admin API (`127.0.0.1:<caddyAdminPort>`, default 2019)
-   * and passes the tunneled `adminUrl` to `fn(adminUrl, meta)`.
+   * and passes the tunneled `adminUrl` plus canonical `hostHeader`/`originHeader`
+   * (`127.0.0.1:<caddyAdminPort>`) so Caddy's Host-enforcement never rejects ephemeral tunnel ports with 403.
+   *
    * @template T
    * @param {string} serverId
-   * @param {(adminUrl: string, meta: { localPort: number, adminUrl: string, isLocal: boolean }) => Promise<T>} fn
+   * @param {(adminUrl: string, meta: { localPort: number, adminUrl: string, remoteAdminPort: number, hostHeader: string, originHeader: string, isLocal: boolean }) => Promise<T>} fn
    * @param {{ connectTimeoutMs?: number, signal?: AbortSignal | null }} [opts]
    * @returns {Promise<T>}
    */
@@ -3120,19 +4272,718 @@ class ServerFleetManager extends EventEmitter {
     const id = String(serverId || '').trim();
     if (id === LOCAL_SERVER_ID) {
       const localAdmin = `http://127.0.0.1:${DEFAULTS.caddyAdminPort}`;
-      return fn(localAdmin, { localPort: DEFAULTS.caddyAdminPort, adminUrl: localAdmin, isLocal: true });
+      return fn(localAdmin, {
+        localPort: DEFAULTS.caddyAdminPort,
+        adminUrl: localAdmin,
+        remoteAdminPort: DEFAULTS.caddyAdminPort,
+        hostHeader: `127.0.0.1:${DEFAULTS.caddyAdminPort}`,
+        originHeader: localAdmin,
+        isLocal: true
+      });
     }
     const server = this._servers.get(id);
     if (!server) {
       throw createFleetError(`Servidor no encontrado: ${id}`, 'SERVER_NOT_FOUND', 404);
     }
     const caddyPort = server.caddyAdminPort || DEFAULTS.caddyAdminPort;
+    const hostHeader = `127.0.0.1:${caddyPort}`;
+    const originHeader = `http://${hostHeader}`;
     return this.withPortTunnel(
       id,
       caddyPort,
-      ({ url, localPort }) => fn(url, { localPort, adminUrl: url, isLocal: false }),
+      ({ url, localPort }) => fn(url, {
+        localPort,
+        adminUrl: url,
+        remoteAdminPort: caddyPort,
+        hostHeader,
+        originHeader,
+        isLocal: false
+      }),
       opts
     );
+  }
+
+  /**
+   * Lazily resolves `caddyManager` for remote worker Caddy sync without eager boot coupling.
+   * @param {any} [override]
+   */
+  _getCaddyManager(override = null) {
+    if (override) return override;
+    if (!this._caddyManager) {
+      this._caddyManager = require('./caddyManager');
+    }
+    return this._caddyManager;
+  }
+
+  /**
+   * Synchronizes Caddy base config, TLS policy, and HTTP routes onto a remote fleet node
+   * (or `'local'`) inside a single SSH Caddy tunnel, forwarding the canonical remote
+   * `Host`/`Origin` (`127.0.0.1:<caddyAdminPort>`) to avoid HTTP 403 rejections.
+   *
+   * @param {string} serverId
+   * @param {Array<Record<string, any>> | {
+   *   routes?: Array<Record<string, any>>,
+   *   removeProjectIds?: string[],
+   *   bootstrapBaseConfig?: boolean,
+   *   pruneStale?: boolean,
+   *   tls?: Record<string, any> | null,
+   *   continueOnError?: boolean
+   * }} routesSpec
+   * @param {{ connectTimeoutMs?: number, signal?: AbortSignal | null, _caddyManager?: any }} [opts]
+   */
+  async syncRemoteCaddy(serverId, routesSpec, opts = {}) {
+    this._ensureLoaded();
+    const id = String(serverId || '').trim();
+    const specObj = Array.isArray(routesSpec)
+      ? { routes: routesSpec }
+      : (routesSpec && typeof routesSpec === 'object' ? routesSpec : {});
+    const routes = Array.isArray(specObj.routes) ? specObj.routes : [];
+    const removeProjectIds = Array.isArray(specObj.removeProjectIds) ? specObj.removeProjectIds : [];
+    const bootstrapBaseConfig = specObj.bootstrapBaseConfig !== false;
+    const pruneStale = Boolean(specObj.pruneStale);
+    const continueOnError = Boolean(specObj.continueOnError);
+    const tlsOpts = specObj.tls && typeof specObj.tls === 'object' ? specObj.tls : null;
+
+    const cm = this._getCaddyManager(opts._caddyManager);
+    if (!cm || typeof cm.upsertRoute !== 'function') {
+      throw createFleetError('caddyManager no disponible para sincronización remota', 'CADDY_MANAGER_UNAVAILABLE', 500);
+    }
+
+    return this.withCaddyTunnel(id, async (adminUrl, meta) => {
+      const caddyReqOpts = meta.isLocal
+        ? {}
+        : {
+            adminUrl,
+            caddyAdminPort: meta.remoteAdminPort,
+            remoteAdminPort: meta.remoteAdminPort,
+            hostHeader: meta.hostHeader,
+            originHeader: meta.originHeader
+          };
+
+      if (typeof cm.detect === 'function') {
+        const detection = await cm.detect({ force: true, ...caddyReqOpts });
+        if (!detection || !detection.available) {
+          throw createFleetError(
+            `Caddy Admin API no responde en nodo "${id}" (${detection && detection.reason ? detection.reason : adminUrl})`,
+            'REMOTE_CADDY_UNAVAILABLE',
+            503
+          );
+        }
+      }
+
+      let bootstrapped = false;
+      if (bootstrapBaseConfig && typeof cm.getWithEtag === 'function' && typeof cm.write === 'function') {
+        const existingSrv = await cm.getWithEtag('/config/apps/http/servers/culkibo', caddyReqOpts);
+        if (!existingSrv || !existingSrv.found) {
+          const base = typeof cm.buildBaseConfig === 'function'
+            ? cm.buildBaseConfig(tlsOpts || {})
+            : {
+                admin: { listen: meta.hostHeader },
+                apps: {
+                  http: {
+                    servers: {
+                      culkibo: { listen: [':80', ':443'], routes: [] }
+                    }
+                  }
+                }
+              };
+          const fullCfg = await cm.getWithEtag('/config/apps/http/servers', caddyReqOpts);
+          if (fullCfg && fullCfg.found) {
+            await cm.write('PUT', '/config/apps/http/servers/culkibo', base.apps.http.servers.culkibo, caddyReqOpts);
+          } else {
+            const httpCfg = await cm.getWithEtag('/config/apps/http', caddyReqOpts);
+            if (httpCfg && httpCfg.found) {
+              await cm.write('PUT', '/config/apps/http/servers', base.apps.http.servers, caddyReqOpts);
+            } else if (typeof cm.adminRequest === 'function') {
+              const loadRes = await cm.adminRequest('POST', '/load', {
+                headers: {
+                  'Content-Type': 'application/json',
+                  ...(meta.isLocal ? {} : { Host: meta.hostHeader, Origin: meta.originHeader })
+                },
+                body: JSON.stringify(base),
+                ...caddyReqOpts
+              });
+              if (!loadRes || !loadRes.ok) {
+                throw createFleetError(
+                  `No se pudo inicializar configuración base de Caddy en "${id}" (HTTP ${loadRes ? loadRes.status : 'unknown'})`,
+                  'REMOTE_CADDY_BOOTSTRAP_FAILED',
+                  502
+                );
+              }
+            } else {
+              await cm.write('PUT', '/config/apps/http', base.apps.http, caddyReqOpts);
+            }
+          }
+          bootstrapped = true;
+        }
+      }
+
+      let tlsSynced = false;
+      if (tlsOpts && typeof cm.reconcileTls === 'function') {
+        await cm.reconcileTls({ ...tlsOpts, ...caddyReqOpts });
+        tlsSynced = true;
+      }
+
+      /** @type {Array<{ projectId: string, created: boolean, unchanged: boolean, id: string | null }>} */
+      const synced = [];
+      /** @type {Array<{ projectId: string, error: string }>} */
+      const failed = [];
+      /** @type {Set<string>} */
+      const desiredRouteIds = new Set();
+
+      for (const routeSpec of routes) {
+        const pid = String((routeSpec && routeSpec.projectId) || '');
+        if (!pid) {
+          const msg = 'Ruta sin projectId válido';
+          if (!continueOnError) throw createFleetError(msg, 'INVALID_ROUTE_SPEC', 400);
+          failed.push({ projectId: '', error: msg });
+          continue;
+        }
+        try {
+          const res = await cm.upsertRoute(routeSpec, caddyReqOpts);
+          const routeId = (res && res.id) || (typeof cm.routeId === 'function' ? cm.routeId(pid) : `culkibo_${pid}`);
+          desiredRouteIds.add(routeId);
+          synced.push({
+            projectId: pid,
+            created: Boolean(res && res.created),
+            unchanged: Boolean(res && res.unchanged),
+            id: routeId
+          });
+        } catch (err) {
+          /** @type {any} */
+          const e = err;
+          if (!continueOnError) throw err;
+          failed.push({ projectId: pid, error: redactSensitiveOutput(e && e.message ? e.message : String(e)) });
+        }
+      }
+
+      /** @type {string[]} */
+      const removed = [];
+      if (typeof cm.removeRoute === 'function') {
+        for (const pid of removeProjectIds) {
+          const cleanPid = String(pid || '').trim();
+          if (!cleanPid) continue;
+          try {
+            await cm.removeRoute(cleanPid, caddyReqOpts);
+            removed.push(cleanPid);
+          } catch (err) {
+            if (!continueOnError) throw err;
+            /** @type {any} */
+            const e = err;
+            failed.push({ projectId: cleanPid, error: redactSensitiveOutput(e && e.message ? e.message : String(e)) });
+          }
+        }
+
+        if (pruneStale && typeof cm.listRoutes === 'function') {
+          const existingRoutes = await cm.listRoutes(caddyReqOpts);
+          const list = Array.isArray(existingRoutes) ? existingRoutes : [];
+          for (const r of list) {
+            const rid = r && typeof r['@id'] === 'string' ? r['@id'] : '';
+            if (!rid.startsWith('culkibo_') || desiredRouteIds.has(rid)) continue;
+            const staleProjectId = rid.slice('culkibo_'.length);
+            if (!staleProjectId || removed.includes(staleProjectId)) continue;
+            try {
+              await cm.removeRoute(staleProjectId, caddyReqOpts);
+              removed.push(staleProjectId);
+            } catch (err) {
+              if (!continueOnError) throw err;
+              /** @type {any} */
+              const e = err;
+              failed.push({ projectId: staleProjectId, error: redactSensitiveOutput(e && e.message ? e.message : String(e)) });
+            }
+          }
+        }
+      }
+
+      const result = {
+        ok: failed.length === 0,
+        serverId: id,
+        isLocal: meta.isLocal,
+        hostHeader: meta.hostHeader,
+        bootstrapped,
+        tlsSynced,
+        syncedCount: synced.length,
+        removedCount: removed.length,
+        synced,
+        removed,
+        failed
+      };
+      this._audit('fleet.remote_caddy_synced', id, {
+        bootstrapped,
+        tlsSynced,
+        syncedCount: synced.length,
+        removedCount: removed.length,
+        failedCount: failed.length
+      });
+      this.emit('server:caddy_synced', result);
+      return result;
+    }, { connectTimeoutMs: opts.connectTimeoutMs, signal: opts.signal });
+  }
+
+  // -------------------------------------------------------------------------
+  // Tunneled Remote Container Operations (Logs, Stats, Exec — 0 Shell)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Reads or streams container logs from a remote fleet node (or `'local'`) over the
+   * ref-counted SSH Docker tunnel (`shell: false`, strict container ref validation,
+   * zero mutation of `process.env.DOCKER_HOST`).
+   *
+   * - Snapshot mode (`follow: false`, default): uses `withResilientDockerTunnel` auto-reconnect.
+   * - Streaming mode (`follow: true`): holds a tunnel lease until `stop()` / `signal` / exit.
+   *
+   * @param {string} serverId
+   * @param {string} containerId
+   * @param {{
+   *   tail?: number,
+   *   since?: string | null,
+   *   timestamps?: boolean,
+   *   follow?: boolean,
+   *   timeoutMs?: number,
+   *   maxBytes?: number,
+   *   signal?: AbortSignal | null,
+   *   onChunk?: (ev: { stream: 'stdout' | 'stderr', chunk: string }) => void
+   * }} [opts]
+   */
+  async remoteContainerLogs(serverId, containerId, opts = {}) {
+    this._ensureLoaded();
+    const id = String(serverId || '').trim() || LOCAL_SERVER_ID;
+    const ref = validateDockerRef(containerId, 'containerId');
+    const tailNum = Number.isFinite(Number(opts.tail))
+      ? Math.min(Math.max(parseInt(String(opts.tail), 10) || 100, 1), 10000)
+      : 100;
+
+    /** @type {string[]} */
+    const args = ['logs', '--tail', String(tailNum)];
+    if (opts.timestamps) args.push('--timestamps');
+    if (opts.since != null && String(opts.since).trim() !== '') {
+      const sinceVal = String(opts.since).trim();
+      if (!DOCKER_SINCE_RE.test(sinceVal)) {
+        throw createFleetError('Parámetro since inválido (usa ej. "10m", "2h" o RFC3339)', 'INVALID_INPUT', 400);
+      }
+      args.push('--since', sinceVal);
+    }
+
+    if (opts.follow) {
+      args.push('--follow', ref);
+      const lease = await this.acquireDockerTunnel(id, { signal: opts.signal || null });
+      const env = lease.dockerHost ? { ...process.env, DOCKER_HOST: lease.dockerHost } : { ...process.env };
+      const maxBytes = Math.max(4096, Math.min(16 * 1024 * 1024, Number(opts.maxBytes) || 2 * 1024 * 1024));
+      let child;
+      try {
+        child = this._spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'], env });
+      } catch (err) {
+        await lease.release().catch(() => {});
+        throw err;
+      }
+
+      let totalBytes = 0;
+      let truncated = false;
+      let stopped = false;
+
+      const stop = async () => {
+        if (stopped) return;
+        stopped = true;
+        if (child && typeof child.kill === 'function') {
+          try { child.kill('SIGTERM'); } catch (e) {}
+        }
+        await lease.release().catch(() => {});
+      };
+
+      const onAbort = () => { stop().catch(() => {}); };
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          await stop();
+          throw createFleetError('Stream de logs cancelado', 'ABORTED', 499);
+        }
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      const emitChunk = (streamName, raw) => {
+        if (stopped || truncated) return;
+        const text = redactSensitiveOutput(Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || ''));
+        if (!text) return;
+        totalBytes += Buffer.byteLength(text, 'utf8');
+        if (totalBytes > maxBytes) {
+          truncated = true;
+          stop().catch(() => {});
+          return;
+        }
+        if (typeof opts.onChunk === 'function') {
+          try { opts.onChunk({ stream: streamName, chunk: text }); } catch (e) {}
+        }
+      };
+
+      if (child && child.stdout && typeof child.stdout.on === 'function') {
+        child.stdout.on('data', (chunk) => emitChunk('stdout', chunk));
+      }
+      if (child && child.stderr && typeof child.stderr.on === 'function') {
+        child.stderr.on('data', (chunk) => emitChunk('stderr', chunk));
+      }
+
+      const done = new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = async () => {
+          if (opts.signal && typeof opts.signal.removeEventListener === 'function') {
+            opts.signal.removeEventListener('abort', onAbort);
+          }
+          await lease.release().catch(() => {});
+        };
+        if (child && typeof child.once === 'function') {
+          child.once('error', (err) => {
+            if (settled) return;
+            settled = true;
+            cleanup().finally(() => reject(err));
+          });
+          child.once('close', (code) => {
+            if (settled) return;
+            settled = true;
+            cleanup().finally(() => resolve({ serverId: id, containerId: ref, exitCode: code, truncated, isLocal: lease.isLocal }));
+          });
+          child.once('exit', (code) => {
+            if (settled) return;
+            settled = true;
+            cleanup().finally(() => resolve({ serverId: id, containerId: ref, exitCode: code, truncated, isLocal: lease.isLocal }));
+          });
+        } else {
+          cleanup().finally(() => resolve({ serverId: id, containerId: ref, exitCode: 0, truncated, isLocal: lease.isLocal }));
+        }
+      });
+
+      return { serverId: id, containerId: ref, isLocal: lease.isLocal, tail: tailNum, child, stop, done };
+    }
+
+    args.push(ref);
+    const timeout = Math.max(1000, Math.min(60000, Number(opts.timeoutMs) || 10000));
+    return this.withResilientDockerTunnel(id, async (lease, meta) => {
+      const env = lease.dockerHost ? { ...process.env, DOCKER_HOST: lease.dockerHost } : { ...process.env };
+      const res = await this._execFile('docker', args, { timeout, env, maxBuffer: 4 * 1024 * 1024 });
+      const combined = redactSensitiveOutput([res.stdout, res.stderr].filter(Boolean).join('\n'));
+      const lines = combined ? combined.split(/\r?\n/) : [];
+      return {
+        serverId: id,
+        containerId: ref,
+        isLocal: lease.isLocal,
+        reconnected: meta.reconnected,
+        tail: tailNum,
+        output: combined,
+        lines
+      };
+    }, { signal: opts.signal || null });
+  }
+
+  /**
+   * Collects or streams live container resource stats (`docker stats`) from a remote
+   * fleet node (or `'local'`) over the ref-counted SSH Docker tunnel (`shell: false`).
+   *
+   * @param {string} serverId
+   * @param {string | null} [containerId]
+   * @param {{
+   *   follow?: boolean,
+   *   timeoutMs?: number,
+   *   signal?: AbortSignal | null,
+   *   onStats?: (sample: { serverId: string, containers: any[], collectedAt: string }) => void
+   * }} [opts]
+   */
+  async remoteContainerStats(serverId, containerId = null, opts = {}) {
+    this._ensureLoaded();
+    const id = String(serverId || '').trim() || LOCAL_SERVER_ID;
+    const ref = containerId ? validateDockerRef(containerId, 'containerId') : null;
+
+    if (opts.follow) {
+      const args = ['stats', '--format', '{{json .}}'];
+      if (ref) args.push(ref);
+      const lease = await this.acquireDockerTunnel(id, { signal: opts.signal || null });
+      const env = lease.dockerHost ? { ...process.env, DOCKER_HOST: lease.dockerHost } : { ...process.env };
+      let child;
+      try {
+        child = this._spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'], env });
+      } catch (err) {
+        await lease.release().catch(() => {});
+        throw err;
+      }
+
+      let stopped = false;
+      let lineBuf = '';
+      const stop = async () => {
+        if (stopped) return;
+        stopped = true;
+        if (child && typeof child.kill === 'function') {
+          try { child.kill('SIGTERM'); } catch (e) {}
+        }
+        await lease.release().catch(() => {});
+      };
+
+      const onAbort = () => { stop().catch(() => {}); };
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          await stop();
+          throw createFleetError('Stream de estadísticas cancelado', 'ABORTED', 499);
+        }
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      if (child && child.stdout && typeof child.stdout.on === 'function') {
+        child.stdout.on('data', (chunk) => {
+          if (stopped) return;
+          lineBuf += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk || '');
+          const nlIdx = lineBuf.lastIndexOf('\n');
+          if (nlIdx === -1) return;
+          const complete = lineBuf.slice(0, nlIdx);
+          lineBuf = lineBuf.slice(nlIdx + 1);
+          const containers = parseDockerStatsLines(complete);
+          if (containers.length > 0 && typeof opts.onStats === 'function') {
+            try {
+              opts.onStats({ serverId: id, containers, collectedAt: new Date().toISOString() });
+            } catch (e) {}
+          }
+        });
+      }
+
+      const done = new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = async () => {
+          if (opts.signal && typeof opts.signal.removeEventListener === 'function') {
+            opts.signal.removeEventListener('abort', onAbort);
+          }
+          await lease.release().catch(() => {});
+        };
+        if (child && typeof child.once === 'function') {
+          child.once('error', (err) => {
+            if (settled) return;
+            settled = true;
+            cleanup().finally(() => reject(err));
+          });
+          child.once('close', (code) => {
+            if (settled) return;
+            settled = true;
+            cleanup().finally(() => resolve({ serverId: id, containerId: ref, exitCode: code, isLocal: lease.isLocal }));
+          });
+          child.once('exit', (code) => {
+            if (settled) return;
+            settled = true;
+            cleanup().finally(() => resolve({ serverId: id, containerId: ref, exitCode: code, isLocal: lease.isLocal }));
+          });
+        } else {
+          cleanup().finally(() => resolve({ serverId: id, containerId: ref, exitCode: 0, isLocal: lease.isLocal }));
+        }
+      });
+
+      return { serverId: id, containerId: ref, isLocal: lease.isLocal, child, stop, done };
+    }
+
+    const args = ['stats', '--no-stream', '--format', '{{json .}}'];
+    if (ref) args.push(ref);
+    const timeout = Math.max(1000, Math.min(30000, Number(opts.timeoutMs) || 8000));
+
+    return this.withResilientDockerTunnel(id, async (lease, meta) => {
+      const env = lease.dockerHost ? { ...process.env, DOCKER_HOST: lease.dockerHost } : { ...process.env };
+      const res = await this._execFile('docker', args, { timeout, env, maxBuffer: 2 * 1024 * 1024 });
+      const containers = parseDockerStatsLines(res.stdout);
+      return {
+        serverId: id,
+        containerId: ref,
+        isLocal: lease.isLocal,
+        reconnected: meta.reconnected,
+        stats: ref ? (containers[0] || null) : containers,
+        containers,
+        collectedAt: new Date().toISOString()
+      };
+    }, { signal: opts.signal || null });
+  }
+
+  /**
+   * Executes a strict argv command inside a container on a remote fleet node (or `'local'`)
+   * over the ref-counted SSH Docker tunnel (`shell: false`, zero shell string interpolation).
+   *
+   * @param {string} serverId
+   * @param {string} containerId
+   * @param {string[]} command
+   * @param {{
+   *   workdir?: string | null,
+   *   user?: string | null,
+   *   env?: Record<string, string> | null,
+   *   timeoutMs?: number,
+   *   maxOutputBytes?: number,
+   *   signal?: AbortSignal | null,
+   *   onChunk?: (ev: { stream: 'stdout' | 'stderr', chunk: string }) => void
+   * }} [opts]
+   */
+  async remoteContainerExec(serverId, containerId, command, opts = {}) {
+    this._ensureLoaded();
+    const id = String(serverId || '').trim() || LOCAL_SERVER_ID;
+    const ref = validateDockerRef(containerId, 'containerId');
+    const argv = validateDockerExecCommand(command);
+
+    /** @type {string[]} */
+    const dockerArgs = ['exec'];
+    if (opts.workdir != null && String(opts.workdir).trim() !== '') {
+      const wd = String(opts.workdir).trim();
+      if (!DOCKER_WORKDIR_RE.test(wd) || wd.includes('..')) {
+        throw createFleetError('workdir inválido (debe ser ruta absoluta POSIX sin "..")', 'INVALID_INPUT', 400);
+      }
+      dockerArgs.push('-w', wd);
+    }
+    if (opts.user != null && String(opts.user).trim() !== '') {
+      const u = String(opts.user).trim();
+      if (!DOCKER_USER_RE.test(u) || u.startsWith('-')) {
+        throw createFleetError('user de contenedor inválido', 'INVALID_INPUT', 400);
+      }
+      dockerArgs.push('-u', u);
+    }
+    if (opts.env && typeof opts.env === 'object') {
+      const entries = Object.entries(opts.env);
+      if (entries.length > 32) {
+        throw createFleetError('Máximo 32 variables env en remoteContainerExec', 'INVALID_INPUT', 400);
+      }
+      for (const [k, v] of entries) {
+        if (!DOCKER_ENV_KEY_RE.test(k)) {
+          throw createFleetError(`Nombre de variable env inválido: "${String(k).slice(0, 32)}"`, 'INVALID_INPUT', 400);
+        }
+        const strVal = String(v == null ? '' : v);
+        if (strVal.includes('\0') || strVal.length > 4096) {
+          throw createFleetError(`Valor inválido para variable env "${k}"`, 'INVALID_INPUT', 400);
+        }
+        dockerArgs.push('-e', `${k}=${strVal}`);
+      }
+    }
+    dockerArgs.push(ref, ...argv);
+
+    const timeoutMs = Math.max(1000, Math.min(300000, Number(opts.timeoutMs) || 30000));
+    const maxOutputBytes = Math.max(4096, Math.min(4 * 1024 * 1024, Number(opts.maxOutputBytes) || 512 * 1024));
+    const started = Date.now();
+
+    const onChunkCb = typeof opts.onChunk === 'function' ? opts.onChunk : null;
+    if (onChunkCb) {
+      return this.withDockerTunnel(id, async (lease) => {
+        const env = lease.dockerHost ? { ...process.env, DOCKER_HOST: lease.dockerHost } : { ...process.env };
+        const child = this._spawn('docker', dockerArgs, { stdio: ['ignore', 'pipe', 'pipe'], env });
+        let stdout = '';
+        let stderr = '';
+        let bytes = 0;
+        let truncated = false;
+        let timedOut = false;
+
+        return new Promise((resolve, reject) => {
+          let settled = false;
+          const finish = (err, exitCode = 0) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (opts.signal && typeof opts.signal.removeEventListener === 'function') {
+              opts.signal.removeEventListener('abort', onAbort);
+            }
+            if (err) return reject(err);
+            resolve({
+              serverId: id,
+              containerId: ref,
+              isLocal: lease.isLocal,
+              ok: exitCode === 0 && !timedOut,
+              exitCode,
+              timedOut,
+              truncated,
+              stdout: redactSensitiveOutput(stdout),
+              stderr: redactSensitiveOutput(stderr),
+              durationMs: Date.now() - started
+            });
+          };
+
+          const onAbort = () => {
+            if (child && typeof child.kill === 'function') {
+              try { child.kill('SIGTERM'); } catch (e) {}
+            }
+            finish(createFleetError('Ejecución remota cancelada', 'ABORTED', 499));
+          };
+
+          const timer = setTimeout(() => {
+            timedOut = true;
+            if (child && typeof child.kill === 'function') {
+              try { child.kill('SIGTERM'); } catch (e) {}
+            }
+            finish(createFleetError(`remoteContainerExec excedió ${timeoutMs} ms`, 'TIMEOUT', 504));
+          }, timeoutMs);
+          if (timer.unref) timer.unref();
+
+          if (opts.signal) {
+            if (opts.signal.aborted) return onAbort();
+            opts.signal.addEventListener('abort', onAbort, { once: true });
+          }
+
+          const pushData = (streamName, raw) => {
+            const text = redactSensitiveOutput(Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || ''));
+            if (!text) return;
+            const len = Buffer.byteLength(text, 'utf8');
+            if (bytes + len > maxOutputBytes) {
+              truncated = true;
+              const remaining = Math.max(0, maxOutputBytes - bytes);
+              const slice = remaining > 0 ? text.slice(0, remaining) : '';
+              if (slice) {
+                if (streamName === 'stdout') stdout += slice;
+                else stderr += slice;
+                try { onChunkCb({ stream: streamName, chunk: slice }); } catch (e) {}
+              }
+              bytes = maxOutputBytes;
+              return;
+            }
+            bytes += len;
+            if (streamName === 'stdout') stdout += text;
+            else stderr += text;
+            try { onChunkCb({ stream: streamName, chunk: text }); } catch (e) {}
+          };
+
+          if (child && child.stdout && typeof child.stdout.on === 'function') {
+            child.stdout.on('data', (c) => pushData('stdout', c));
+          }
+          if (child && child.stderr && typeof child.stderr.on === 'function') {
+            child.stderr.on('data', (c) => pushData('stderr', c));
+          }
+          if (child && typeof child.once === 'function') {
+            child.once('error', (err) => finish(err));
+            child.once('close', (code) => finish(null, typeof code === 'number' ? code : 1));
+            child.once('exit', (code) => finish(null, typeof code === 'number' ? code : 1));
+          } else {
+            finish(null, 0);
+          }
+        });
+      }, { signal: opts.signal || null });
+    }
+
+    return this.withResilientDockerTunnel(id, async (lease, meta) => {
+      const env = lease.dockerHost ? { ...process.env, DOCKER_HOST: lease.dockerHost } : { ...process.env };
+      try {
+        const res = await this._execFile('docker', dockerArgs, { timeout: timeoutMs, env, maxBuffer: maxOutputBytes });
+        return {
+          serverId: id,
+          containerId: ref,
+          isLocal: lease.isLocal,
+          reconnected: meta.reconnected,
+          ok: true,
+          exitCode: 0,
+          stdout: redactSensitiveOutput(res.stdout),
+          stderr: redactSensitiveOutput(res.stderr),
+          durationMs: Date.now() - started
+        };
+      } catch (err) {
+        /** @type {any} */
+        const e = err;
+        // Rethrow tunnel/daemon transport failures so withResilientDockerTunnel can reconnect
+        if (isRetryableTunnelError(e) || (typeof lease.isAlive === 'function' && !lease.isAlive())) {
+          throw err;
+        }
+        const exitCode = typeof e.code === 'number' ? e.code : 1;
+        return {
+          serverId: id,
+          containerId: ref,
+          isLocal: lease.isLocal,
+          reconnected: meta.reconnected,
+          ok: false,
+          exitCode,
+          stdout: redactSensitiveOutput(e.stdout || ''),
+          stderr: redactSensitiveOutput(e.stderr || e.message || ''),
+          durationMs: Date.now() - started
+        };
+      }
+    }, { signal: opts.signal || null });
   }
 
   /**
@@ -3445,6 +5296,9 @@ class ServerFleetManager extends EventEmitter {
     const offlineCount = remotes.filter((s) => s.status === 'offline').length;
     const mismatchCount = remotes.filter((s) => s.status === 'host_key_mismatch').length;
     const pendingCount = remotes.filter((s) => s.status === 'pending').length;
+    const drainingCount = remotes.filter((s) => s.maintenanceState === 'draining').length;
+    const maintenanceCount = remotes.filter((s) => s.maintenanceState === 'maintenance').length;
+    const schedulableCount = servers.filter((s) => s.status === 'online' && (!s.maintenanceState || s.maintenanceState === 'active')).length;
 
     return {
       totalServers: servers.length,
@@ -3454,6 +5308,9 @@ class ServerFleetManager extends EventEmitter {
       offlineCount,
       mismatchCount,
       pendingCount,
+      drainingCount,
+      maintenanceCount,
+      schedulableCount,
       keysCount: this._keys.size,
       activeTunnels: this._dockerTunnels.size + this._drainingTunnels.size,
       monitorActive: this._monitorRunning,
@@ -3474,6 +5331,8 @@ class ServerFleetManager extends EventEmitter {
     } else if (summary.offlineCount > 0 || summary.degradedCount > 0) {
       status = 'warn';
       message = `Flota remota: ${summary.onlineCount} online, ${summary.degradedCount} degradado(s), ${summary.offlineCount} offline.`;
+    } else if (summary.drainingCount > 0 || summary.maintenanceCount > 0) {
+      message = `${summary.onlineCount}/${summary.remoteCount} nodos remotos online (${summary.drainingCount} drenando, ${summary.maintenanceCount} en mantenimiento).`;
     }
 
     return {
@@ -3485,6 +5344,9 @@ class ServerFleetManager extends EventEmitter {
       degradedCount: summary.degradedCount,
       offlineCount: summary.offlineCount,
       mismatchCount: summary.mismatchCount,
+      drainingCount: summary.drainingCount,
+      maintenanceCount: summary.maintenanceCount,
+      schedulableCount: summary.schedulableCount,
       activeTunnels: summary.activeTunnels,
       keysCount: summary.keysCount
     };
@@ -3496,6 +5358,14 @@ class ServerFleetManager extends EventEmitter {
 
   async shutdown() {
     this.stopMonitor();
+
+    for (const entry of Array.from(this._dockerTunnelConnects.values())) {
+      if (entry && entry.internalController && typeof entry.internalController.abort === 'function') {
+        if (entry.promise && typeof entry.promise.catch === 'function') entry.promise.catch(() => {});
+        try { entry.internalController.abort(); } catch (e) {}
+      }
+    }
+    this._dockerTunnelConnects.clear();
 
     for (const tunnel of Array.from(this._dockerTunnels.values())) {
       this._closeTunnelImmediate(tunnel);
@@ -3510,12 +5380,12 @@ class ServerFleetManager extends EventEmitter {
       this._ephemeralTunnelChildren.delete(child);
     }
 
-    this._dockerTunnelConnects.clear();
     this._inFlightProbes.clear();
 
     if (fs.existsSync(this.tmpDir)) {
       try { this.sweepTmpDir(); } catch (e) {}
     }
+    try { this.sweepStaleSockets(); } catch (e) {}
   }
 }
 
@@ -3526,6 +5396,7 @@ module.exports = Object.assign(singleton, {
   LOCAL_SERVER_ID,
   PROBE_CMD,
   DEFAULTS,
+  VALID_MAINTENANCE_STATES,
   helpers: {
     encryptPrivateKey,
     decryptPrivateKey,
@@ -3539,15 +5410,23 @@ module.exports = Object.assign(singleton, {
     validatePort,
     validateSshUser,
     validateDockerSocketPath,
+    validateDockerRef,
+    validateDockerExecCommand,
     validateServerId,
     validateRegion,
     validateTags,
     validateDisplayName,
     validateTeamId,
+    validateMaintenanceState,
+    validateMaintenanceReason,
+    validateControlPlaneCidr,
     buildBaseSshArgs,
     parseProbeOutput,
     parseDockerPublishedPorts,
+    parseDockerStatsLines,
     parseBestKeyscanOutput,
+    isRetryableTunnelError,
+    defaultProbeEndpoint,
     redactSensitiveOutput,
     secureUnlinkFile,
     ensureSecureDir,

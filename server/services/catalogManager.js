@@ -83,10 +83,11 @@ const TEMPLATE_MAP = new Map(TEMPLATES.map((t) => [t.id, t]));
  * que Culkibo conoce.
  */
 
-const DATA_FILE = path.join(__dirname, '..', '..', 'data', 'services.json');
-const KEY_FILE = path.join(__dirname, '..', '..', 'data', '.services.key');
-const FILES_ROOT = path.join(__dirname, '..', '..', 'data', 'services');
-const TMP_DIR = path.join(__dirname, '..', '..', 'data', '.tmp');
+const DATA_DIR_DEFAULT = path.join(__dirname, '..', '..', 'data');
+const BACKUP_IMAGE = 'alpine:3.21.3';
+const BACKUP_ID_RE = /^vbk_[0-9a-zA-Z_-]{6,64}$/;
+const TZ_RE = /^[A-Za-z0-9_\/+\-]{1,64}$/;
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,120}$/;
 
 /**
  * Rango de puertos de bucle local reservado al catálogo.
@@ -114,7 +115,7 @@ const STEPS = [
 const DEFAULT_READY_TIMEOUT_MS = 120000;
 
 // ---------------------------------------------------------------------------
-// Validación
+// Validación y helpers puros
 // ---------------------------------------------------------------------------
 
 const INSTALL_ID_RE = /^svc_[a-z0-9-]{2,32}_[0-9a-f]{8}$/;
@@ -123,6 +124,102 @@ const DOMAIN_RE = /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/;
 function assertInstallId(id) {
   if (!INSTALL_ID_RE.test(String(id || ''))) throw new Error('Identificador de instalación inválido');
   return String(id);
+}
+
+/** Zona horaria efectiva del servidor (nunca fija un país concreto a menos que el entorno lo pida). */
+function defaultTimezone() {
+  const envTz = String(process.env.TZ || '').trim();
+  if (envTz && TZ_RE.test(envTz)) return envTz;
+  try {
+    const intlTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (intlTz && TZ_RE.test(intlTz)) return intlTz;
+  } catch (e) {}
+  return 'UTC';
+}
+
+/** Separa repositorio y etiqueta de una referencia OCI (soporta registros con puerto como `localhost:5000/img:1.0`). */
+function parseImageRef(image) {
+  const raw = String(image || '').trim();
+  const lastColon = raw.lastIndexOf(':');
+  const lastSlash = raw.lastIndexOf('/');
+  if (lastColon <= lastSlash || lastColon === -1) return { repo: raw, tag: '' };
+  return { repo: raw.slice(0, lastColon), tag: raw.slice(lastColon + 1) };
+}
+
+/** Calcula la imagen destino de un auxiliar acoplado cuando se actualiza la imagen principal. */
+function resolveCoupledSidecarImage(spec, currentSidecarImage, newAppImage) {
+  if (spec && spec.coupledTagOnly) {
+    const { repo } = parseImageRef(spec.image || currentSidecarImage);
+    const { tag } = parseImageRef(newAppImage);
+    return `${repo}:${tag}`;
+  }
+  return newAppImage;
+}
+
+/**
+ * Ordena topológicamente los auxiliares respetando `dependsOn` y separa los
+ * que arrancan antes de `app` (`preApp`) de los workers que esperan a que
+ * `app` migre el esquema y pase salud (`postApp`).
+ * @param {any[]} sidecars
+ */
+function orderSidecars(sidecars = []) {
+  const list = Array.isArray(sidecars) ? sidecars : [];
+  const byName = new Map(list.map((c) => [c.name, c]));
+  /** @type {any[]} */
+  const ordered = [];
+  /** @type {Map<string, number>} */
+  const state = new Map();
+
+  const visit = (car) => {
+    const st = state.get(car.name);
+    if (st === 2) return;
+    if (st === 1) throw new Error(`Dependencia circular entre auxiliares: «${car.name}»`);
+    state.set(car.name, 1);
+    for (const depName of car.dependsOn || []) {
+      const dep = byName.get(depName);
+      if (!dep) throw new Error(`El auxiliar «${car.name}» depende de «${depName}», que no existe`);
+      visit(dep);
+    }
+    state.set(car.name, 2);
+    ordered.push(car);
+  };
+
+  for (const car of list) visit(car);
+
+  return {
+    ordered,
+    preApp: ordered.filter((c) => !c.startAfterApp),
+    postApp: ordered.filter((c) => Boolean(c.startAfterApp))
+  };
+}
+
+/**
+ * Valida un mapa de variables de entorno personalizadas.
+ * @param {Record<string, any>} overrides
+ * @param {{ allowDelete?: boolean }} [opts]
+ */
+function validateEnvOverrides(overrides, { allowDelete = true } = {}) {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    throw new Error('Debes indicar un objeto de variables de entorno');
+  }
+  /** @type {Array<[string, string | null]>} */
+  const entries = [];
+  for (const [rawKey, rawVal] of Object.entries(overrides)) {
+    const k = String(rawKey || '').trim();
+    if (!ENV_KEY_RE.test(k)) {
+      throw new Error(`Nombre de variable inválido: «${k}»`);
+    }
+    if (rawVal === null || rawVal === undefined) {
+      if (allowDelete) entries.push([k, null]);
+      continue;
+    }
+    const val = String(rawVal);
+    if (/[\r\n\0]/.test(val)) {
+      throw new Error(`La variable ${k} no puede contener saltos de línea ni bytes nulos`);
+    }
+    entries.push([k, val]);
+  }
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,38 +231,38 @@ function assertInstallId(id) {
  * fichero. Separar las claves significa que filtrar `services.json` no expone
  * las contraseñas de las bases de datos, y al revés.
  */
-function loadOrCreateKey() {
-  if (fs.existsSync(KEY_FILE)) {
-    const raw = fs.readFileSync(KEY_FILE, 'utf8').trim();
+function loadOrCreateKey(keyFile, dataFile) {
+  if (fs.existsSync(keyFile)) {
+    const raw = fs.readFileSync(keyFile, 'utf8').trim();
     const key = Buffer.from(raw, 'hex');
     if (key.length !== 32) {
-      throw new Error(`Clave de cifrado ${KEY_FILE} corrupta (longitud inválida). No se sobrescribe para evitar pérdida de secretos.`);
+      throw new Error(`Clave de cifrado ${keyFile} corrupta (longitud inválida). No se sobrescribe para evitar pérdida de secretos.`);
     }
     return key;
   }
   // Defensa anti-pérdida: nunca generar clave nueva si ya existen secretos cifrados en services.json
-  if (fs.existsSync(DATA_FILE)) {
+  if (fs.existsSync(dataFile)) {
     try {
-      const storeRaw = fs.readFileSync(DATA_FILE, 'utf8');
+      const storeRaw = fs.readFileSync(dataFile, 'utf8');
       if (/"v1:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+"/.test(storeRaw)) {
-        throw new Error(`Falta ${KEY_FILE} pero ${DATA_FILE} contiene secretos cifrados. Restaura la clave antes de continuar.`);
+        throw new Error(`Falta ${keyFile} pero ${dataFile} contiene secretos cifrados. Restaura la clave antes de continuar.`);
       }
     } catch (err) {
       if (/Falta /.test(err.message)) throw err;
     }
   }
   const key = crypto.randomBytes(32);
-  fs.mkdirSync(path.dirname(KEY_FILE), { recursive: true });
+  fs.mkdirSync(path.dirname(keyFile), { recursive: true });
   try {
-    fs.writeFileSync(KEY_FILE, key.toString('hex'), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(keyFile, key.toString('hex'), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   } catch (err) {
     if (err && err.code === 'EEXIST') {
-      const existing = Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
+      const existing = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'hex');
       if (existing.length === 32) return existing;
     }
     throw err;
   }
-  try { fs.chmodSync(KEY_FILE, 0o600); } catch (e) {}
+  try { fs.chmodSync(keyFile, 0o600); } catch (e) {}
   return key;
 }
 
@@ -217,9 +314,12 @@ function resolvePlaceholders(value, context) {
     const parts = expr.split('.');
 
     if (expr === 'domain') return context.domain || (context.hostPort ? `127.0.0.1:${context.hostPort}` : 'localhost');
+    if (expr === 'host') return context.domain || '127.0.0.1';
     if (expr === 'protocol') return context.domain ? 'https' : 'http';
+    if (expr === 'wsProtocol') return context.domain ? 'wss' : 'ws';
     if (expr === 'isHttps') return context.domain ? 'true' : 'false';
     if (expr === 'url') return context.url || '';
+    if (expr === 'tz') return context.tz || defaultTimezone();
     if (expr === 'install.id') return context.installId;
 
     if (parts[0] === 'secret' && parts.length === 2) {
@@ -254,8 +354,15 @@ function resolveEnv(env, context) {
 // ---------------------------------------------------------------------------
 
 class CatalogManager extends EventEmitter {
-  constructor() {
+  /** @param {{ dataDir?: string | null, registerPorts?: boolean }} [options] */
+  constructor(options = {}) {
     super();
+    this.dataDir = options.dataDir ? path.resolve(options.dataDir) : DATA_DIR_DEFAULT;
+    this.dataFile = path.join(this.dataDir, 'services.json');
+    this.keyFile = path.join(this.dataDir, '.services.key');
+    this.filesRoot = path.join(this.dataDir, 'services');
+    this.backupsRoot = path.join(this.dataDir, 'service-backups');
+    this.tmpDir = path.join(this.dataDir, '.tmp');
     /** @type {{ version: number, installations: any[] }} */
     this.state = { version: 1, installations: [] };
     /** @type {Buffer | null} */
@@ -266,28 +373,30 @@ class CatalogManager extends EventEmitter {
     this.pendingPorts = new Set();
     /** @type {Buffer | null} */
     this._catalogSerializedCache = null;
+    /** @type {boolean | null} */
+    this._swapLimitSupported = null;
     this.ensureDirs();
     this.load();
-    portRegistry.registerProvider('catalogManager', () =>
-      this.state.installations.map((i) => i && i.hostPort).filter(Boolean)
-    );
+    if (options.registerPorts !== false) {
+      portRegistry.registerProvider('catalogManager', () => this.allAllocatedPorts());
+    }
   }
 
   ensureDirs() {
-    for (const dir of [path.dirname(DATA_FILE), FILES_ROOT, TMP_DIR]) {
+    for (const dir of [this.dataDir, this.filesRoot, this.backupsRoot, this.tmpDir]) {
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     }
   }
 
   get cryptoKey() {
-    if (!this.key) this.key = loadOrCreateKey();
+    if (!this.key) this.key = loadOrCreateKey(this.keyFile, this.dataFile);
     return this.key;
   }
 
   load() {
     try {
-      if (fs.existsSync(DATA_FILE)) {
-        const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      if (fs.existsSync(this.dataFile)) {
+        const parsed = JSON.parse(fs.readFileSync(this.dataFile, 'utf8'));
         if (parsed && Array.isArray(parsed.installations)) {
           this.state = {
             version: 1,
@@ -295,6 +404,7 @@ class CatalogManager extends EventEmitter {
               sidecars: [],
               volumes: {},
               secretsEnc: {},
+              extraPorts: {},
               ...i,
               // Una instalación que se quedó a medias porque el daemon murió no
               // puede volver como «instalando»: nadie la está instalando ya.
@@ -314,7 +424,7 @@ class CatalogManager extends EventEmitter {
   save() {
     this._catalogSerializedCache = null;
     try {
-      atomicWriteJsonSync(DATA_FILE, this.state, 0o600);
+      atomicWriteJsonSync(this.dataFile, this.state, 0o600);
     } catch (err) {
       console.error('[Catálogo] No se pudo guardar services.json:', err.message);
     }
@@ -402,9 +512,23 @@ class CatalogManager extends EventEmitter {
   volumeName(installId, key) { return `culkibo_svcdata_${installId.slice(4)}_${key}`; }
   networkName(installId) { return `culkibo_net_${installId}`; }
 
-  /** Puertos que este registro ya tiene reservados. */
+  /** Todos los puertos reservados por todas las instalaciones (principal + `extraPorts`). */
+  allAllocatedPorts() {
+    /** @type {number[]} */
+    const out = [];
+    for (const i of this.state.installations) {
+      if (!i) continue;
+      if (i.hostPort) out.push(i.hostPort);
+      for (const ep of Object.values(i.extraPorts || {})) {
+        if (ep) out.push(Number(ep));
+      }
+    }
+    return out;
+  }
+
+  /** Puertos que este registro ya tiene reservados (principal + `extraPorts`). */
   reservedPorts() {
-    return new Set(this.state.installations.map((i) => i.hostPort).filter(Boolean));
+    return new Set(this.allAllocatedPorts());
   }
 
   /**
@@ -429,10 +553,16 @@ class CatalogManager extends EventEmitter {
       owner,
       start: PORT_RANGE_START,
       end: PORT_RANGE_END,
-      extraExcluded: this.pendingPorts
+      extraExcluded: new Set([...this.pendingPorts, ...this.allAllocatedPorts()])
     });
     this.pendingPorts.add(port);
     return port;
+  }
+
+  /** Libera un puerto reservado previamente con `allocatePort` (útil en rollbacks y pruebas). */
+  releasePort(port, owner = null) {
+    this.pendingPorts.delete(port);
+    portRegistry.release(port, owner);
   }
 
   // -------------------------------------------------------------------------
@@ -479,6 +609,19 @@ class CatalogManager extends EventEmitter {
   async install(opts = {}) {
     const tpl = this.getTemplate(String(opts.templateId || ''));
 
+    // Validar overrides de entorno y zona horaria ANTES de reservar puertos o tocar Docker
+    /** @type {Array<[string, string | null]>} */
+    let initialEnvEntries = [];
+    if (opts.env !== undefined && opts.env !== null) {
+      initialEnvEntries = validateEnvOverrides(opts.env, { allowDelete: false });
+    }
+    let tz = defaultTimezone();
+    if (opts.tz !== undefined && opts.tz !== null && String(opts.tz).trim()) {
+      const rawTz = String(opts.tz).trim();
+      if (!TZ_RE.test(rawTz)) throw new Error(`Zona horaria inválida: «${rawTz}»`);
+      tz = rawTz;
+    }
+
     if (!(await this.isDockerAvailable(true))) {
       throw new Error('Docker no está disponible: el catálogo de servicios lo necesita');
     }
@@ -504,6 +647,12 @@ class CatalogManager extends EventEmitter {
         secrets[key] = generateSecret(spec);
       }
 
+      /** @type {Record<string, string>} */
+      const customEnvEnc = {};
+      for (const [k, v] of initialEnvEntries) {
+        if (v !== null) customEnvEnc[k] = encryptSecret(v, this.cryptoKey);
+      }
+
       record = {
         id,
         templateId: tpl.id,
@@ -513,9 +662,11 @@ class CatalogManager extends EventEmitter {
         image: tpl.app.image,
         domain,
         url: domain ? `https://${domain}` : `http://127.0.0.1:${hostPort}`,
+        tz,
         domainId: null,
         hostPort,
         appPort: tpl.app.port,
+        extraPorts: {},
         containerName: this.containerName(id, 'app'),
         networkName: this.networkName(id),
         volumes: Object.fromEntries((tpl.app.volumes || []).map((v) => [v.name, this.volumeName(id, v.name)])),
@@ -523,12 +674,16 @@ class CatalogManager extends EventEmitter {
           name: c.name,
           image: c.image,
           containerName: this.containerName(id, c.name),
+          startAfterApp: Boolean(c.startAfterApp),
+          coupledWithApp: Boolean(c.coupledWithApp),
+          coupledTagOnly: Boolean(c.coupledTagOnly),
           volumes: Object.fromEntries((c.volumes || []).map((v) => [v.name, this.volumeName(id, `${c.name}_${v.name}`)]))
         })),
         databaseId: null,
         secretsEnc: Object.fromEntries(
           Object.entries(secrets).map(([k, v]) => [k, encryptSecret(v, this.cryptoKey)])
         ),
+        customEnvEnc,
         memoryMb: tpl.app.memoryMb,
         cpus: tpl.app.cpus,
         status: 'installing',
@@ -551,7 +706,7 @@ class CatalogManager extends EventEmitter {
       .catch((err) => {
         record.status = 'error';
         /** @type {Record<string, any>} */
-        const redactBag = { ...secrets };
+        const redactBag = { ...secrets, ...this.decryptCustomEnv(record) };
         if (record.databaseId) {
           try {
             const dbCreds = getDbManager().getCredentials(record.databaseId);
@@ -593,6 +748,59 @@ class CatalogManager extends EventEmitter {
     return maxLength === null || maxLength === Infinity ? out : out.slice(0, maxLength);
   }
 
+  /**
+   * Espera a que la base de datos gestionada alcance `healthy` y falla de forma
+   * explícita si vence el tiempo límite (nunca continúa a ciegas).
+   */
+  async waitDbReady(databaseId, timeoutMs = 90000) {
+    const databaseManager = getDbManager();
+    const budget = Math.max(1000, Number(timeoutMs) || 90000);
+    const deadline = Date.now() + budget;
+    let lastHealth = 'unknown';
+    while (Date.now() < deadline) {
+      try {
+        const st = await databaseManager.refreshHealth(databaseId);
+        if (st && st.health) lastHealth = st.health;
+        if (lastHealth === 'healthy') return;
+      } catch (e) {
+        lastHealth = e.message || 'error';
+      }
+      await new Promise((r) => setTimeout(r, Math.min(1500, Math.max(50, deadline - Date.now()))));
+    }
+    throw new Error(`La base de datos ${databaseId} no alcanzó estado saludable en ${Math.round(budget / 1000)} s (último estado: ${lastHealth})`);
+  }
+
+  /**
+   * Arranca y verifica un auxiliar concreto (usado en arranque por fases pre/post-app).
+   * @param {any} record
+   * @param {any} spec
+   * @param {any} context
+   * @param {Record<string, string>} customEnv
+   */
+  async startSingleSidecarForInstall(record, spec, context, customEnv) {
+    const stored = record.sidecars.find((c) => c.name === spec.name);
+    if (!stored) return;
+    await this.pullImage(spec.image);
+    const sidecarEnv = spec.coupledWithApp
+      ? { ...resolveEnv(spec.env, context), ...customEnv }
+      : resolveEnv(spec.env, context);
+    await this.runContainer({
+      containerName: stored.containerName,
+      image: spec.image,
+      networkName: record.networkName,
+      networkAlias: spec.name,
+      env: sidecarEnv,
+      volumes: (spec.volumes || []).map((v) => `${stored.volumes[v.name]}:${v.path}`),
+      files: this.materialiseFiles(record.id, spec.name, spec.files || []),
+      memoryMb: spec.memoryMb,
+      cpus: spec.cpus,
+      command: spec.command || null,
+      publish: null,
+      labels: { 'culkibo.service': record.id, 'culkibo.role': spec.name }
+    });
+    await this.waitSidecarReady(stored.containerName, spec.readiness || null);
+  }
+
   async runInstall(record, tpl, secrets) {
     // --- 1. Red aislada -----------------------------------------------------
     //
@@ -631,15 +839,8 @@ class CatalogManager extends EventEmitter {
       record.databaseImage = dbImage || provisioned.image || null;
       this.save();
 
-      // Esperar a que la BD esté realmente saludable (hasta 90s) antes de arrancar sidecars y la app
-      const dbDeadline = Date.now() + 90000;
-      while (Date.now() < dbDeadline) {
-        try {
-          const st = await databaseManager.refreshHealth(provisioned.id);
-          if (st.health === 'healthy') break;
-        } catch (e) {}
-        await new Promise((r) => setTimeout(r, 1500));
-      }
+      // Fail-fast: esperar a que la BD esté realmente saludable antes de arrancar auxiliares/app
+      await this.waitDbReady(provisioned.id, tpl.database.readyTimeoutMs || 90000);
 
       const creds = databaseManager.getCredentials(provisioned.id);
       const alias = tpl.database.engine;
@@ -662,38 +863,19 @@ class CatalogManager extends EventEmitter {
       domain: record.domain,
       hostPort: record.hostPort,
       url: record.url,
+      tz: record.tz || defaultTimezone(),
       secrets,
       db: dbContext,
       sidecarHosts: Object.fromEntries(record.sidecars.map((c) => [c.name, c.containerName]))
     };
+    const customEnv = this.decryptCustomEnv(record);
+    const { preApp, postApp } = orderSidecars(tpl.sidecars || []);
 
-    // --- 3. Auxiliares ------------------------------------------------------
-    if (record.sidecars.length > 0) {
-      this.setProgress(record, 'auxiliares', `Levantando ${record.sidecars.length} servicio(s) auxiliar(es)`);
-      for (const spec of tpl.sidecars || []) {
-        const stored = record.sidecars.find((c) => c.name === spec.name);
-        if (!stored) continue;
-        await this.pullImage(spec.image);
-        await this.runContainer({
-          containerName: stored.containerName,
-          image: spec.image,
-          networkName: record.networkName,
-          networkAlias: spec.name,
-          env: resolveEnv(spec.env, context),
-          volumes: (spec.volumes || []).map((v) => `${stored.volumes[v.name]}:${v.path}`),
-          files: this.materialiseFiles(record.id, spec.name, spec.files || []),
-          memoryMb: spec.memoryMb,
-          cpus: spec.cpus,
-          command: spec.command || null,
-          publish: null,
-          labels: { 'culkibo.service': record.id, 'culkibo.role': spec.name }
-        });
-      }
-      // Esperar a que cada auxiliar esté `running` y supere su sonda interna (p. ej. `valkey-cli ping`)
-      for (const spec of tpl.sidecars || []) {
-        const stored = record.sidecars.find((c) => c.name === spec.name);
-        if (!stored) continue;
-        await this.waitSidecarReady(stored.containerName, spec.readiness || null);
+    // --- 3. Auxiliares previos a la app (en orden topológico y esperando salud uno a uno) ---
+    if (preApp.length > 0) {
+      this.setProgress(record, 'auxiliares', `Levantando ${preApp.length} servicio(s) auxiliar(es) previos`);
+      for (const spec of preApp) {
+        await this.startSingleSidecarForInstall(record, spec, context, customEnv);
       }
     }
 
@@ -716,13 +898,22 @@ class CatalogManager extends EventEmitter {
         if (!Number.isInteger(cPort) || cPort <= 0 || cPort >= 65536) continue;
         let hPort = record.extraPorts[String(cPort)];
         if (!hPort) {
+          const epOwner = `svc_ep_${record.id}_${cPort}`;
           hPort = await portRegistry.allocate({
             kind: 'catalog',
-            owner: `svc_ep_${record.id}_${cPort}`,
+            owner: epOwner,
             start: PORT_RANGE_START,
-            end: PORT_RANGE_END
+            end: PORT_RANGE_END,
+            extraExcluded: new Set([...this.pendingPorts, ...this.allAllocatedPorts()])
           });
-          record.extraPorts[String(cPort)] = hPort;
+          this.pendingPorts.add(hPort);
+          try {
+            record.extraPorts[String(cPort)] = hPort;
+            this.save();
+          } finally {
+            this.pendingPorts.delete(hPort);
+            portRegistry.release(hPort, epOwner);
+          }
         }
         extraPublishes.push(`127.0.0.1:${hPort}:${cPort}`);
       }
@@ -733,7 +924,7 @@ class CatalogManager extends EventEmitter {
       image: tpl.app.image,
       networkName: record.networkName,
       networkAlias: 'app',
-      env: resolveEnv(tpl.app.env, context),
+      env: { ...resolveEnv(tpl.app.env, context), ...customEnv },
       volumes: (tpl.app.volumes || []).map((v) => `${record.volumes[v.name]}:${v.path}`),
       files: this.materialiseFiles(record.id, 'app', tpl.app.files || []),
       memoryMb: record.memoryMb,
@@ -784,6 +975,14 @@ class CatalogManager extends EventEmitter {
     }
     this.save();
 
+    // --- 8. Auxiliares posteriores a la app (workers tras migración) --------
+    if (postApp.length > 0 && probe.healthy) {
+      this.setProgress(record, 'auxiliares', `Levantando ${postApp.length} worker(s) dependiente(s)`);
+      for (const spec of postApp) {
+        await this.startSingleSidecarForInstall(record, spec, context, customEnv);
+      }
+    }
+
     this.setProgress(
       record,
       'listo',
@@ -796,43 +995,124 @@ class CatalogManager extends EventEmitter {
     try { require('./telemetryService').recordFeatureUsage(`catalog:${record.templateId}`, Boolean(probe.healthy)); } catch (e) {}
   }
 
+  /** Conexión TCP real con timeout limpio (usada por `waitSidecarReady` en sondas `type: 'tcp'`). */
+  _tcpConnect(host, port, timeoutMs = 2500) {
+    return new Promise((resolve, reject) => {
+      const socket = net.createConnection({ host, port });
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        if (err) reject(err);
+        else resolve(true);
+      };
+      socket.setTimeout(timeoutMs, () => {
+        const err = new Error(`Timeout TCP tras ${timeoutMs} ms`);
+        /** @type {any} */ (err).code = 'ETIMEDOUT';
+        done(err);
+      });
+      socket.once('connect', () => done(null));
+      socket.once('error', (err) => done(err));
+    });
+  }
+
   /**
-   * Espera a que un auxiliar esté arrancado y, si declara `readiness`, pase
-   * su comprobación interna (siempre vía `docker` argv, nunca shell).
+   * Espera a que un auxiliar esté arrancado y, si declara `readiness` (`exec` o `tcp`),
+   * supere su comprobación interna antes de continuar (fail-fast en timeout, siempre vía
+   * `docker` argv o socket TCP nativo, nunca shell).
    * @param {string} containerName
    * @param {any} readiness
+   * @param {{ runningTimeoutMs?: number, hostOverride?: string }} [opts]
    */
-  async waitSidecarReady(containerName, readiness) {
-    const runningDeadline = Date.now() + 15000;
+  async waitSidecarReady(containerName, readiness, opts = {}) {
+    const runBudget = Math.max(500, Number(opts.runningTimeoutMs) || 15000);
+    const runningDeadline = Date.now() + runBudget;
+    let isRunning = false;
     while (Date.now() < runningDeadline) {
       try {
         const { stdout } = await this.docker(['inspect', '--format', '{{.State.Running}}', containerName], { timeout: 5000 });
-        if (stdout.trim() === 'true') break;
+        if (stdout.trim() === 'true') {
+          isRunning = true;
+          break;
+        }
       } catch (e) {}
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, Math.min(800, Math.max(50, runningDeadline - Date.now()))));
+    }
+    if (!isRunning) {
+      throw new Error(`El servicio auxiliar «${containerName}» no alcanzó el estado running a tiempo`);
     }
 
-    if (!readiness || typeof readiness !== 'object') return;
+    if (!readiness || typeof readiness !== 'object') return { ok: true, mode: 'running' };
+
     if (readiness.type === 'exec' && Array.isArray(readiness.cmd) && readiness.cmd.length > 0) {
       const cmd = readiness.cmd.map((a) => String(a));
-      const deadline = Date.now() + Math.max(5000, Math.min(90000, Number(readiness.timeoutMs) || 30000));
+      const budget = Math.max(500, Math.min(180000, Number(readiness.timeoutMs) || 30000));
+      const deadline = Date.now() + budget;
+      let lastErr = 'sin respuesta';
       while (Date.now() < deadline) {
         try {
           await this.docker(['exec', containerName, ...cmd], { timeout: 5000 });
-          return;
-        } catch (e) {}
-        await new Promise((r) => setTimeout(r, 1000));
+          return { ok: true, mode: 'exec' };
+        } catch (e) {
+          lastErr = e.message || 'exec falló';
+        }
+        await new Promise((r) => setTimeout(r, Math.min(1000, Math.max(50, deadline - Date.now()))));
       }
+      throw new Error(`El servicio auxiliar «${containerName}» no superó su sonda exec a tiempo (${lastErr})`);
     }
+
+    if (readiness.type === 'tcp' && Number.isInteger(readiness.port) && readiness.port > 0 && readiness.port < 65536) {
+      const budget = Math.max(500, Math.min(180000, Number(readiness.timeoutMs) || 30000));
+      const deadline = Date.now() + budget;
+      let lastErr = 'sin respuesta TCP';
+      while (Date.now() < deadline) {
+        try {
+          const { stdout } = await this.docker(
+            ['inspect', '--format', '{{.State.Running}}|{{.State.Restarting}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}', containerName],
+            { timeout: 5000 }
+          );
+          const [running, restarting, ipsRaw] = String(stdout || '').trim().split('|');
+          if (running !== 'true') {
+            lastErr = 'contenedor detenido';
+          } else {
+            const ip = opts.hostOverride || String(ipsRaw || '').trim().split(/\s+/).find(Boolean);
+            if (!ip) {
+              lastErr = 'sin IP en la red aislada';
+            } else {
+              try {
+                await this._tcpConnect(ip, readiness.port, Math.min(2500, Math.max(300, deadline - Date.now())));
+                return { ok: true, mode: 'tcp', ip, port: readiness.port };
+              } catch (tcpErr) {
+                const code = tcpErr && tcpErr.code;
+                // En Docker Desktop (Windows/macOS) las IPs del puente Linux VM no son enrutables desde el host.
+                if (
+                  process.platform !== 'linux' &&
+                  !opts.hostOverride &&
+                  (code === 'ENETUNREACH' || code === 'EHOSTUNREACH') &&
+                  restarting !== 'true'
+                ) {
+                  return { ok: true, mode: 'tcp_vm_fallback', ip, port: readiness.port };
+                }
+                lastErr = tcpErr.message || String(code || 'tcp error');
+              }
+            }
+          }
+        } catch (e) {
+          lastErr = e.message || 'inspect falló';
+        }
+        await new Promise((r) => setTimeout(r, Math.min(1000, Math.max(50, deadline - Date.now()))));
+      }
+      throw new Error(`El servicio auxiliar «${containerName}» no escuchó en TCP :${readiness.port} a tiempo (${lastErr})`);
+    }
+
+    return { ok: true, mode: 'running' };
   }
 
   /**
    * Escribe en disco los ficheros de configuración de una plantilla y devuelve
-   * los montajes que hay que pasar a `docker run`.
-   *
-   * Sólo de lectura dentro del contenedor (`:ro`): son configuración nuestra,
-   * no datos del servicio, y un contenedor que pueda reescribirlos rompe la
-   * reproducibilidad de la instalación en el primer reinicio.
+   * las especificaciones de montaje (`{ hostPath, targetPath }`) que `runContainer`
+   * convierte en `--mount type=bind,...,readonly` (seguro en Windows y Linux).
    */
   materialiseFiles(installId, role, files) {
     if (!files || files.length === 0) return [];
@@ -840,8 +1120,8 @@ class CatalogManager extends EventEmitter {
     if (!/^[a-z][a-z0-9_]{0,31}$/.test(safeRole)) {
       throw new Error(`Rol de contenedor inválido al materializar ficheros: «${safeRole}»`);
     }
-    const dir = path.resolve(FILES_ROOT, installId, safeRole);
-    const rootResolved = path.resolve(FILES_ROOT);
+    const dir = path.resolve(this.filesRoot, installId, safeRole);
+    const rootResolved = path.resolve(this.filesRoot);
     if (!dir.startsWith(rootResolved + path.sep)) {
       throw new Error('Ruta de destino fuera del directorio de servicios');
     }
@@ -852,22 +1132,41 @@ class CatalogManager extends EventEmitter {
         throw new Error(`Nombre de fichero de configuración inválido: «${fileName}»`);
       }
       const targetPath = String(file.path || '');
-      if (!targetPath.startsWith('/') || targetPath.includes('docker.sock')) {
+      if (!targetPath.startsWith('/') || targetPath.includes('docker.sock') || /[\r\n\0,]/.test(targetPath)) {
         throw new Error(`Ruta de montaje inválida en fichero de configuración: «${targetPath}»`);
       }
       const hostPath = path.resolve(dir, fileName);
       if (!hostPath.startsWith(dir + path.sep)) {
         throw new Error(`Nombre de fichero fuera del directorio permitido: «${fileName}»`);
       }
+      const normalisedHost = hostPath.split(path.sep).join('/');
+      if (/[\r\n\0,]/.test(normalisedHost)) {
+        throw new Error(`La ruta de host contiene caracteres no soportados por --mount: «${normalisedHost}»`);
+      }
       fs.writeFileSync(hostPath, file.content, { encoding: 'utf8', mode: 0o644 });
       // Forzar 0644 explícito para ignorar UMask=0027 de systemd y evitar EACCES en contenedores no-root
       if (process.platform !== 'win32') {
         try { fs.chmodSync(dir, 0o755); fs.chmodSync(hostPath, 0o644); } catch (e) {}
       }
-      // Docker quiere barras normales incluso cuando el daemon corre en
-      // Windows contra un motor Linux.
-      return `${hostPath.split(path.sep).join('/')}:${targetPath}:ro`;
+      return { hostPath: normalisedHost, targetPath };
     });
+  }
+
+  /** Detecta de forma perezosa si el kernel soporta `--memory-swap` (evita fallos en Linux cgroup v2 sin swapaccount). */
+  async supportsMemorySwap() {
+    if (this._swapLimitSupported !== null) return this._swapLimitSupported;
+    try {
+      const { stdout } = await this.docker(['info', '--format', '{{.SwapLimit}}'], { timeout: 5000 });
+      const val = String(stdout || '').trim().toLowerCase();
+      if (val === 'false' || val === '0') {
+        this._swapLimitSupported = false;
+        return false;
+      }
+      this._swapLimitSupported = true;
+      return true;
+    } catch (e) {
+      return true;
+    }
   }
 
   async pullImage(image) {
@@ -885,7 +1184,8 @@ class CatalogManager extends EventEmitter {
    * la misma decisión que documenta `databaseManager.provision()`.
    */
   async runContainer(spec) {
-    const envFile = path.join(TMP_DIR, `svcenv_${crypto.randomBytes(8).toString('hex')}`);
+    const envFile = path.join(this.tmpDir, `svcenv_${crypto.randomBytes(8).toString('hex')}`);
+    const allowSwapLimit = await this.supportsMemorySwap();
 
     const args = [
       'run', '-d',
@@ -895,9 +1195,7 @@ class CatalogManager extends EventEmitter {
       '--network-alias', spec.networkAlias,
       '--env-file', envFile,
       '--memory', `${spec.memoryMb}m`,
-      // Igualar memory-swap a memory desactiva el swap. Sin esto el límite no
-      // limita: sólo empuja el contenedor al disco y degrada el host entero.
-      '--memory-swap', `${spec.memoryMb}m`,
+      ...(allowSwapLimit ? ['--memory-swap', `${spec.memoryMb}m`] : []),
       '--cpus', String(spec.cpus),
       '--pids-limit', '1024',
       '--security-opt', 'no-new-privileges',
@@ -926,10 +1224,17 @@ class CatalogManager extends EventEmitter {
       args.push('-v', volume);
     }
     for (const file of spec.files) {
-      if (String(file).includes('docker.sock')) {
-        throw new Error('Montaje de docker.sock prohibido en ficheros de configuración');
+      if (file && typeof file === 'object' && file.hostPath && file.targetPath) {
+        if (String(file.hostPath).includes('docker.sock') || String(file.targetPath).includes('docker.sock')) {
+          throw new Error('Montaje de docker.sock prohibido en ficheros de configuración');
+        }
+        args.push('--mount', `type=bind,source=${file.hostPath},target=${file.targetPath},readonly`);
+      } else {
+        if (String(file).includes('docker.sock')) {
+          throw new Error('Montaje de docker.sock prohibido en ficheros de configuración');
+        }
+        args.push('-v', String(file));
       }
-      args.push('-v', file);
     }
     if (Array.isArray(spec.publish)) {
       for (const p of spec.publish) { if (p) args.push('-p', p); }
@@ -941,6 +1246,7 @@ class CatalogManager extends EventEmitter {
     if (spec.command) args.push(...spec.command);
 
     try {
+      fs.mkdirSync(this.tmpDir, { recursive: true });
       fs.writeFileSync(
         envFile,
         formatDockerEnvFile(spec.env),
@@ -1036,7 +1342,7 @@ class CatalogManager extends EventEmitter {
     return out;
   }
 
-  /** Reconstruye el contexto completo de plantilla (incluyendo BD, secretos y sidecars) para recrear el contenedor app. */
+  /** Reconstruye el contexto completo de plantilla (incluyendo BD, secretos, zona horaria y sidecars). */
   buildRuntimeContext(record, tpl) {
     const secrets = this.decryptSecrets(record);
     /** @type {any} */
@@ -1059,24 +1365,96 @@ class CatalogManager extends EventEmitter {
       domain: record.domain,
       hostPort: record.hostPort,
       url: record.url,
+      tz: record.tz || defaultTimezone(),
       secrets,
       db: dbContext,
       sidecarHosts: Object.fromEntries((record.sidecars || []).map((c) => [c.name, c.containerName]))
     };
   }
 
-  /** Devuelve las variables efectivas (con secretos redactados) + claves editables personalizadas. */
+  /**
+   * Devuelve las variables efectivas (con secretos redactados) + overrides
+   * personalizados del usuario. Expone tanto `overrides`/`env` (consumido por
+   * `ServiceCatalog.tsx` y `api.ts`) como `customEnv`/`templateKeys` por
+   * retrocompatibilidad.
+   */
   getEnv(id) {
     const record = this.mustGet(id);
     const tpl = this.getTemplate(record.templateId);
     const customEnv = this.decryptCustomEnv(record);
     const templateKeys = Object.keys(tpl.app.env || {});
+    const secretKeys = Object.keys(tpl.secrets || {});
+    /** @type {Record<string, string>} */
+    const maskedTemplateEnv = {};
+    try {
+      const ctx = {
+        installId: record.id,
+        domain: record.domain,
+        hostPort: record.hostPort,
+        url: record.url,
+        tz: record.tz || defaultTimezone(),
+        secrets: Object.fromEntries(secretKeys.map((k) => [k, '••••••••'])),
+        db: tpl.database
+          ? { host: tpl.database.engine, port: 0, user: tpl.database.username || 'culkibo', password: '••••••••', name: tpl.database.dbName || '', url: '••••••••' }
+          : null,
+        sidecarHosts: Object.fromEntries((record.sidecars || []).map((c) => [c.name, c.containerName]))
+      };
+      const resolved = resolveEnv(tpl.app.env, ctx);
+      for (const [k, v] of Object.entries(resolved)) {
+        maskedTemplateEnv[k] = String(v).includes('••••••••') ? '••••••••' : v;
+      }
+    } catch (e) {
+      for (const k of templateKeys) maskedTemplateEnv[k] = String(tpl.app.env[k] || '');
+    }
     return {
       id: record.id,
-      templateKeys,
+      env: { ...maskedTemplateEnv, ...customEnv },
+      overrides: customEnv,
       customEnv,
-      customKeys: Object.keys(customEnv)
+      templateKeys,
+      customKeys: Object.keys(customEnv),
+      secretKeys
     };
+  }
+
+  /**
+   * Recrea un contenedor auxiliar aplicando su contexto vigente, overrides
+   * (si está acoplado) y una imagen opcional.
+   * @param {any} record
+   * @param {any} sidecarSpec
+   * @param {any} storedSidecar
+   * @param {{ imageOverride?: string | null }} [opts]
+   */
+  async recreateSidecarContainer(record, sidecarSpec, storedSidecar, { imageOverride = null } = {}) {
+    const tpl = this.getTemplate(record.templateId);
+    const context = this.buildRuntimeContext(record, tpl);
+    const customEnv = this.decryptCustomEnv(record);
+    const effectiveEnv = sidecarSpec.coupledWithApp
+      ? { ...resolveEnv(sidecarSpec.env, context), ...customEnv }
+      : resolveEnv(sidecarSpec.env, context);
+    const targetImage = imageOverride || storedSidecar.image || sidecarSpec.image;
+
+    try { await this.docker(['stop', '-t', '20', storedSidecar.containerName], { timeout: 60000 }); } catch (e) {}
+    try { await this.docker(['rm', '-f', storedSidecar.containerName], { timeout: 30000 }); } catch (e) {}
+
+    const containerId = await this.runContainer({
+      containerName: storedSidecar.containerName,
+      image: targetImage,
+      networkName: record.networkName,
+      networkAlias: sidecarSpec.name,
+      env: effectiveEnv,
+      volumes: (sidecarSpec.volumes || []).map((v) => `${storedSidecar.volumes[v.name]}:${v.path}`),
+      files: this.materialiseFiles(record.id, sidecarSpec.name, sidecarSpec.files || []),
+      memoryMb: sidecarSpec.memoryMb,
+      cpus: sidecarSpec.cpus,
+      command: sidecarSpec.command || null,
+      publish: null,
+      labels: { 'culkibo.service': record.id, 'culkibo.role': sidecarSpec.name }
+    });
+    storedSidecar.image = targetImage;
+    record.updatedAt = new Date().toISOString();
+    this.save();
+    return containerId;
   }
 
   /**
@@ -1119,7 +1497,7 @@ class CatalogManager extends EventEmitter {
     return containerId;
   }
 
-  /** Actualiza variables personalizadas del servicio y recrea el contenedor con seguridad. */
+  /** Actualiza variables personalizadas del servicio y recrea app + auxiliares acoplados con rollback. */
   async updateEnv(id, overrides = {}) {
     if (this.inFlight.has(id)) {
       const err = new Error('El servicio se está instalando ahora mismo');
@@ -1127,43 +1505,51 @@ class CatalogManager extends EventEmitter {
       throw err;
     }
     const record = this.mustGet(id);
-    if (!overrides || typeof overrides !== 'object') {
-      throw new Error('Debes indicar un objeto de variables de entorno');
-    }
+    const entries = validateEnvOverrides(overrides, { allowDelete: true });
     const prevCustom = { ...(record.customEnvEnc || {}) };
     /** @type {Record<string, string>} */
     const nextEnc = { ...prevCustom };
-    for (const [rawKey, rawVal] of Object.entries(overrides)) {
-      const k = String(rawKey || '').trim();
-      if (!/^[A-Za-z_][A-Za-z0-9_]{0,120}$/.test(k)) {
-        throw new Error(`Nombre de variable inválido: «${k}»`);
-      }
-      if (rawVal === null || rawVal === undefined) {
-        delete nextEnc[k];
-      } else {
-        const val = String(rawVal);
-        if (/[\r\n\0]/.test(val)) throw new Error(`La variable ${k} no puede contener saltos de línea ni bytes nulos`);
-        nextEnc[k] = encryptSecret(val, this.cryptoKey);
-      }
+    for (const [k, val] of entries) {
+      if (val === null) delete nextEnc[k];
+      else nextEnc[k] = encryptSecret(val, this.cryptoKey);
     }
     record.customEnvEnc = nextEnc;
     this.save();
 
     if (await this.isDockerAvailable()) {
+      const tpl = this.getTemplate(record.templateId);
+      const coupledSpecs = (tpl.sidecars || []).filter((s) => s.coupledWithApp);
       try {
         await this.recreateAppContainer(record);
+        for (const spec of coupledSpecs) {
+          const stored = (record.sidecars || []).find((c) => c.name === spec.name);
+          if (stored) await this.recreateSidecarContainer(record, spec, stored);
+        }
       } catch (err) {
         record.customEnvEnc = prevCustom;
         this.save();
         try { await this.recreateAppContainer(record); } catch (e2) {}
+        for (const spec of coupledSpecs) {
+          const stored = (record.sidecars || []).find((c) => c.name === spec.name);
+          if (stored) {
+            try { await this.recreateSidecarContainer(record, spec, stored); } catch (e2) {}
+          }
+        }
         throw err;
       }
     }
     return { success: true, service: this.toPublic(record), customKeys: Object.keys(record.customEnvEnc || {}) };
   }
 
-  /** Actualiza la etiqueta fijada de imagen del contenedor con rollback automático si no pasa la sonda. */
-  async updateImage(id, newImage) {
+  /**
+   * Actualiza la etiqueta fijada de imagen del contenedor principal y de todos
+   * sus auxiliares acoplados (`coupledWithApp` / misma imagen), con validación
+   * de repositorio y rollback automático completo si falla la sonda de salud.
+   * @param {string} id
+   * @param {string} newImage
+   * @param {{ allowRepoChange?: boolean }} [opts]
+   */
+  async updateImage(id, newImage, { allowRepoChange = false } = {}) {
     if (this.inFlight.has(id)) {
       const err = new Error('El servicio se está instalando ahora mismo');
       /** @type {any} */ (err).status = 409;
@@ -1174,31 +1560,330 @@ class CatalogManager extends EventEmitter {
     if (!IMAGE_RE.test(img) || FLOATING_TAG_RE.test(img)) {
       throw new Error('La nueva imagen debe llevar una etiqueta de versión fija (no :latest ni etiquetas móviles)');
     }
+    const prevImage = record.image;
+    const prevRepo = parseImageRef(prevImage).repo;
+    const nextRepo = parseImageRef(img).repo;
+    if (!allowRepoChange && prevRepo && nextRepo && prevRepo !== nextRepo) {
+      throw new Error(
+        `La nueva imagen (${nextRepo}) pertenece a otro repositorio distinto de ${prevRepo}. ` +
+        'Confirma explícitamente `allowRepoChange: true` si deseas cambiar de repositorio.'
+      );
+    }
     if (!(await this.isDockerAvailable())) {
       throw new Error('Docker no está disponible');
     }
-    const prevImage = record.image;
     const tpl = this.getTemplate(record.templateId);
+    const { preApp, postApp } = orderSidecars(tpl.sidecars || []);
+    const isCoupled = (spec, stored) => Boolean(spec.coupledWithApp || (stored && stored.image === prevImage));
 
-    await this.pullImage(img);
+    /** @type {Array<{ spec: any, stored: any, prevImage: string, nextImage: string, phase: 'pre' | 'post' }>} */
+    const coupledTargets = [];
+    for (const [phase, list] of /** @type {const} */ ([['pre', preApp], ['post', postApp]])) {
+      for (const spec of list) {
+        const stored = (record.sidecars || []).find((c) => c.name === spec.name);
+        if (!stored || !isCoupled(spec, stored)) continue;
+        const nextSidecarImage = resolveCoupledSidecarImage(spec, stored.image, img);
+        if (!IMAGE_RE.test(nextSidecarImage) || FLOATING_TAG_RE.test(nextSidecarImage)) {
+          throw new Error(`Imagen acoplada inválida para el auxiliar «${spec.name}»: ${nextSidecarImage}`);
+        }
+        coupledTargets.push({ spec, stored, prevImage: stored.image, nextImage: nextSidecarImage, phase });
+      }
+    }
+
+    // Descargar todas las imágenes nuevas antes de detener ningún contenedor
+    const imagesToPull = new Set([img, ...coupledTargets.map((t) => t.nextImage)]);
+    for (const toPull of imagesToPull) {
+      await this.pullImage(toPull);
+    }
+
+    const prevHealth = record.health;
+    const prevStatus = record.status;
+    /** @type {typeof coupledTargets} */
+    const mutatedSidecars = [];
     try {
+      for (const target of coupledTargets.filter((t) => t.phase === 'pre')) {
+        await this.recreateSidecarContainer(record, target.spec, target.stored, { imageOverride: target.nextImage });
+        mutatedSidecars.push(target);
+        await this.waitSidecarReady(target.stored.containerName, target.spec.readiness || null);
+      }
+
       await this.recreateAppContainer(record, { imageOverride: img });
-      const probe = await this.waitUntilReady(record, { ...tpl.app.readiness, timeoutMs: Math.max(tpl.app.readiness.timeoutMs || 90000, 60000) });
+      const probe = await this.waitUntilReady(record, {
+        ...tpl.app.readiness,
+        timeoutMs: Math.max(tpl.app.readiness.timeoutMs || 90000, 60000)
+      });
       if (!probe.healthy) {
         throw new Error(`La nueva imagen no respondió en ${tpl.app.readiness.path} (${probe.detail})`);
       }
+
+      for (const target of coupledTargets.filter((t) => t.phase === 'post')) {
+        await this.recreateSidecarContainer(record, target.spec, target.stored, { imageOverride: target.nextImage });
+        mutatedSidecars.push(target);
+        await this.waitSidecarReady(target.stored.containerName, target.spec.readiness || null);
+      }
+
       record.health = 'healthy';
       record.lastProbe = probe;
       record.lastError = null;
       this.save();
-      return { success: true, previousImage: prevImage, image: img, service: this.toPublic(record) };
+      return {
+        success: true,
+        previousImage: prevImage,
+        image: img,
+        updatedSidecars: mutatedSidecars.map((t) => ({ name: t.spec.name, previousImage: t.prevImage, image: t.nextImage })),
+        service: this.toPublic(record)
+      };
     } catch (err) {
-      // Rollback automático a la imagen anterior
+      // Rollback automático completo: app + todos los auxiliares acoplados modificados
       record.image = prevImage;
+      record.health = prevHealth;
+      record.status = prevStatus;
+      for (const target of mutatedSidecars) target.stored.image = target.prevImage;
       this.save();
+      for (const target of mutatedSidecars.filter((t) => t.phase === 'pre')) {
+        try { await this.recreateSidecarContainer(record, target.spec, target.stored, { imageOverride: target.prevImage }); } catch (e2) {}
+      }
       try { await this.recreateAppContainer(record, { imageOverride: prevImage }); } catch (e2) {}
+      for (const target of mutatedSidecars.filter((t) => t.phase === 'post')) {
+        try { await this.recreateSidecarContainer(record, target.spec, target.stored, { imageOverride: target.prevImage }); } catch (e2) {}
+      }
+      record.health = prevHealth;
+      record.status = prevStatus;
+      this.save();
       throw new Error(`Actualización revertida a ${prevImage}: ${err.message}`);
     }
+  }
+
+  /**
+   * Comprueba si una o todas las instalaciones están desfasadas respecto a la
+   * versión fijada actual del catálogo (sin red, O(n) instantáneo).
+   * @param {string | null} [id]
+   */
+  checkImageDrift(id = null) {
+    const inspectOne = (record) => {
+      const tpl = TEMPLATE_MAP.get(record.templateId);
+      const catalogImage = tpl ? tpl.app.image : record.image;
+      const appDrifted = Boolean(tpl && tpl.app.image !== record.image);
+      const sidecarDrifts = [];
+      for (const stored of record.sidecars || []) {
+        const spec = tpl ? (tpl.sidecars || []).find((s) => s.name === stored.name) : null;
+        if (spec && spec.image !== stored.image) {
+          sidecarDrifts.push({
+            name: stored.name,
+            currentImage: stored.image,
+            catalogImage: spec.image,
+            coupledWithApp: Boolean(spec.coupledWithApp)
+          });
+        }
+      }
+      return {
+        id: record.id,
+        templateId: record.templateId,
+        name: record.name,
+        currentImage: record.image,
+        catalogImage,
+        hasUpdate: appDrifted || sidecarDrifts.length > 0,
+        appDrifted,
+        sidecarDrifts,
+        totalDrifts: (appDrifted ? 1 : 0) + sidecarDrifts.length
+      };
+    };
+
+    if (id) return inspectOne(this.mustGet(id));
+    const services = this.state.installations.map(inspectOne);
+    return {
+      checkedAt: new Date().toISOString(),
+      totalCount: services.length,
+      outdatedCount: services.filter((s) => s.hasUpdate).length,
+      services
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Copias de seguridad de volúmenes Docker (0 shell, imagen fijada alpine)
+  // -------------------------------------------------------------------------
+
+  /** Lista todos los volúmenes nombrados de una instalación (app + sidecars). */
+  collectNamedVolumes(record) {
+    /** @type {Array<{ role: string, key: string, volumeName: string, archiveName: string }>} */
+    const out = [];
+    for (const [key, volumeName] of Object.entries(record.volumes || {})) {
+      if (volumeName) out.push({ role: 'app', key, volumeName, archiveName: `app_${key}.tar.gz` });
+    }
+    for (const car of record.sidecars || []) {
+      for (const [key, volumeName] of Object.entries(car.volumes || {})) {
+        if (volumeName) out.push({ role: car.name, key, volumeName, archiveName: `${car.name}_${key}.tar.gz` });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Crea una copia de seguridad `.tar.gz` con resumen SHA-256 de todos los
+   * volúmenes nombrados del servicio usando únicamente `docker(argv)` y una
+   * imagen fijada (`alpine:3.21.3`).
+   */
+  async backupVolumes(id, { label = 'manual' } = {}) {
+    if (this.inFlight.has(id)) {
+      const err = new Error('El servicio se está instalando ahora mismo');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
+    const record = this.mustGet(id);
+    const volumes = this.collectNamedVolumes(record);
+    if (volumes.length === 0) {
+      return {
+        success: true,
+        id: record.id,
+        backupId: null,
+        skipped: 'no_volumes',
+        volumes: [],
+        totalBytes: 0
+      };
+    }
+    if (!(await this.isDockerAvailable())) {
+      throw new Error('Docker no está disponible');
+    }
+    const safeLabel = String(label || 'manual').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'manual';
+    const stamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+    const backupId = `vbk_${stamp}_${crypto.randomBytes(3).toString('hex')}`;
+    const destDir = path.resolve(this.backupsRoot, record.id, backupId);
+    const rootResolved = path.resolve(this.backupsRoot);
+    if (!destDir.startsWith(rootResolved + path.sep)) {
+      throw new Error('Ruta de copia de seguridad fuera del directorio permitido');
+    }
+    fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
+    const mountDest = destDir.split(path.sep).join('/');
+
+    /** @type {Array<{ role: string, key: string, volumeName: string, archiveName: string, sizeBytes: number, sha256: string }>} */
+    const backedUp = [];
+    let totalBytes = 0;
+    try {
+      for (const vol of volumes) {
+        await this.docker([
+          'run', '--rm',
+          '--security-opt', 'no-new-privileges',
+          '-v', `${vol.volumeName}:/source:ro`,
+          '--mount', `type=bind,source=${mountDest},target=/backup`,
+          BACKUP_IMAGE,
+          'tar', '-czf', `/backup/${vol.archiveName}`, '-C', '/source', '.'
+        ], { timeout: 600000 });
+        const archivePath = path.join(destDir, vol.archiveName);
+        if (!fs.existsSync(archivePath)) {
+          throw new Error(`El volcado del volumen «${vol.volumeName}» no generó el archivo esperado`);
+        }
+        const buf = fs.readFileSync(archivePath);
+        const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+        totalBytes += buf.length;
+        backedUp.push({ ...vol, sizeBytes: buf.length, sha256 });
+      }
+    } catch (err) {
+      try { fs.rmSync(destDir, { recursive: true, force: true }); } catch (e) {}
+      throw err;
+    }
+
+    const manifest = {
+      version: 1,
+      backupId,
+      installId: record.id,
+      templateId: record.templateId,
+      image: record.image,
+      label: safeLabel,
+      createdAt: new Date().toISOString(),
+      totalBytes,
+      volumes: backedUp
+    };
+    atomicWriteJsonSync(path.join(destDir, 'manifest.json'), manifest, 0o600);
+    return { success: true, id: record.id, ...manifest };
+  }
+
+  /** Lista copias de volúmenes existentes de una instalación (de más reciente a más antigua). */
+  listVolumeBackups(id) {
+    const record = this.mustGet(id);
+    const serviceDir = path.resolve(this.backupsRoot, record.id);
+    if (!fs.existsSync(serviceDir)) return [];
+    const entries = fs.readdirSync(serviceDir, { withFileTypes: true }).filter((d) => d.isDirectory());
+    /** @type {any[]} */
+    const out = [];
+    for (const entry of entries) {
+      if (!BACKUP_ID_RE.test(entry.name)) continue;
+      const manifestPath = path.join(serviceDir, entry.name, 'manifest.json');
+      try {
+        if (fs.existsSync(manifestPath)) {
+          out.push(JSON.parse(fs.readFileSync(manifestPath, 'utf8')));
+        }
+      } catch (e) {}
+    }
+    return out.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  }
+
+  /**
+   * Restaura uno o todos los volúmenes de una copia de seguridad verificando
+   * previamente el SHA-256 de cada archivo (fail-fast antes de tocar datos).
+   */
+  async restoreVolume(id, backupId, { volumeKey = null } = {}) {
+    if (this.inFlight.has(id)) {
+      const err = new Error('El servicio se está instalando ahora mismo');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
+    const record = this.mustGet(id);
+    const bid = String(backupId || '').trim();
+    if (!BACKUP_ID_RE.test(bid)) throw new Error('Identificador de copia de seguridad inválido');
+    const backupDir = path.resolve(this.backupsRoot, record.id, bid);
+    const rootResolved = path.resolve(this.backupsRoot);
+    if (!backupDir.startsWith(rootResolved + path.sep) || !fs.existsSync(path.join(backupDir, 'manifest.json'))) {
+      throw new Error(`La copia de seguridad ${bid} no existe para ${record.id}`);
+    }
+    if (!(await this.isDockerAvailable())) {
+      throw new Error('Docker no está disponible');
+    }
+
+    const manifest = JSON.parse(fs.readFileSync(path.join(backupDir, 'manifest.json'), 'utf8'));
+    const targets = (manifest.volumes || []).filter((v) => !volumeKey || v.key === volumeKey || `${v.role}:${v.key}` === volumeKey);
+    if (targets.length === 0) {
+      throw new Error(`No hay volúmenes que coincidan con «${volumeKey || '*'}» en la copia ${bid}`);
+    }
+
+    // 1. Verificar integridad SHA-256 ANTES de detener o sobrescribir nada
+    for (const v of targets) {
+      if (!FILE_NAME_RE.test(String(v.archiveName || ''))) {
+        throw new Error(`Nombre de archivo inválido en el manifiesto: ${v.archiveName}`);
+      }
+      const archivePath = path.join(backupDir, v.archiveName);
+      if (!fs.existsSync(archivePath)) throw new Error(`Falta el archivo ${v.archiveName} en la copia ${bid}`);
+      const actualHash = crypto.createHash('sha256').update(fs.readFileSync(archivePath)).digest('hex');
+      if (v.sha256 && actualHash !== v.sha256) {
+        throw new Error(`Integridad SHA-256 fallida en ${v.archiveName}: copia corrupta o manipulada`);
+      }
+    }
+
+    const wasRunning = record.status === 'running' || record.status === 'degraded';
+    if (wasRunning) {
+      await this.stop(record.id);
+    }
+
+    const mountSrc = backupDir.split(path.sep).join('/');
+    /** @type {string[]} */
+    const restoredVolumes = [];
+    try {
+      for (const v of targets) {
+        await this.docker([
+          'run', '--rm',
+          '--security-opt', 'no-new-privileges',
+          '-v', `${v.volumeName}:/target`,
+          '--mount', `type=bind,source=${mountSrc},target=/backup,readonly`,
+          BACKUP_IMAGE,
+          'tar', '-xzf', `/backup/${v.archiveName}`, '-C', '/target'
+        ], { timeout: 600000 });
+        restoredVolumes.push(v.volumeName);
+      }
+    } finally {
+      if (wasRunning) {
+        try { await this.start(record.id); } catch (e) {}
+      }
+    }
+    return { success: true, id: record.id, backupId: bid, restoredVolumes };
   }
 
   /** Estadísticas en vivo (`docker stats --no-stream`) del contenedor principal y auxiliares. */
@@ -1218,6 +1903,7 @@ class CatalogManager extends EventEmitter {
         const [name, cpu, memUsage, memPerc, netIo, pids] = line.split('|');
         return {
           name,
+          containerName: name,
           role: name === record.containerName ? 'app' : (record.sidecars.find((c) => c.containerName === name)?.name || 'sidecar'),
           cpuPercent: parseFloat(String(cpu || '0').replace('%', '')) || 0,
           memoryUsage: memUsage || '',
@@ -1254,13 +1940,47 @@ class CatalogManager extends EventEmitter {
       throw err;
     }
     const record = this.mustGet(id);
+    const tpl = TEMPLATE_MAP.get(record.templateId);
+
+    // 1. Base de datos gestionada + espera de salud
     if (record.databaseId) {
-      try { await getDbManager().start(record.databaseId); } catch (e) {}
+      await getDbManager().start(record.databaseId);
+      await this.waitDbReady(record.databaseId, (tpl && tpl.database && tpl.database.readyTimeoutMs) || 90000);
     }
-    for (const car of record.sidecars) {
+
+    const { preApp, postApp } = tpl
+      ? orderSidecars(tpl.sidecars || [])
+      : { preApp: record.sidecars.filter((c) => !c.startAfterApp), postApp: record.sidecars.filter((c) => c.startAfterApp) };
+
+    // 2. Auxiliares previos en orden topológico, esperando su sonda uno a uno
+    for (const spec of preApp) {
+      const car = record.sidecars.find((c) => c.name === spec.name);
+      if (!car) continue;
       await this.docker(['start', car.containerName], { timeout: 60000 });
+      await this.waitSidecarReady(car.containerName, spec.readiness || null);
     }
+
+    // 3. Contenedor principal
     await this.docker(['start', record.containerName], { timeout: 60000 });
+
+    // 4. Auxiliares dependientes (workers) tras arranque de `app`
+    if (postApp.length > 0) {
+      if (tpl && tpl.app && tpl.app.readiness) {
+        const probe = await this.waitUntilReady(record, {
+          ...tpl.app.readiness,
+          timeoutMs: Math.min(tpl.app.readiness.timeoutMs || 60000, 90000)
+        });
+        record.health = probe.healthy ? 'healthy' : 'unhealthy';
+        record.lastProbe = probe;
+      }
+      for (const spec of postApp) {
+        const car = record.sidecars.find((c) => c.name === spec.name);
+        if (!car) continue;
+        await this.docker(['start', car.containerName], { timeout: 60000 });
+        await this.waitSidecarReady(car.containerName, spec.readiness || null);
+      }
+    }
+
     record.status = 'running';
     record.updatedAt = new Date().toISOString();
     this.save();
@@ -1277,8 +1997,21 @@ class CatalogManager extends EventEmitter {
       throw err;
     }
     const record = this.mustGet(id);
+    const tpl = TEMPLATE_MAP.get(record.templateId);
+    const { preApp, postApp } = tpl
+      ? orderSidecars(tpl.sidecars || [])
+      : { preApp: record.sidecars.filter((c) => !c.startAfterApp), postApp: record.sidecars.filter((c) => c.startAfterApp) };
+
+    // Parada en orden inverso de dependencias: workers → app → auxiliares base
+    for (const spec of [...postApp].reverse()) {
+      const car = record.sidecars.find((c) => c.name === spec.name);
+      if (!car) continue;
+      try { await this.docker(['stop', car.containerName], { timeout: 90000 }); } catch (e) {}
+    }
     await this.docker(['stop', record.containerName], { timeout: 90000 });
-    for (const car of record.sidecars) {
+    for (const spec of [...preApp].reverse()) {
+      const car = record.sidecars.find((c) => c.name === spec.name);
+      if (!car) continue;
       try { await this.docker(['stop', car.containerName], { timeout: 90000 }); } catch (e) {}
     }
     record.status = 'stopped';
@@ -1375,9 +2108,19 @@ class CatalogManager extends EventEmitter {
     record.url = `https://${domain}`;
     record.updatedAt = new Date().toISOString();
     this.save();
-    // Recrear el contenedor si está activo para aplicar el nuevo `{{url}}` / `{{domain}}` / `{{isHttps}}`
+    // Recrear app y auxiliares acoplados o que consuman {{url}}/{{domain}}/{{host}} si está activo
     if (record.status === 'running' && (await this.isDockerAvailable())) {
       try { await this.recreateAppContainer(record); } catch (e) {}
+      const tpl = TEMPLATE_MAP.get(record.templateId);
+      for (const spec of (tpl && tpl.sidecars) || []) {
+        const envStr = JSON.stringify(spec.env || {});
+        const usesUrl = spec.coupledWithApp || /\{\{(url|domain|host|protocol|wsProtocol|isHttps)\}\}/.test(envStr);
+        if (!usesUrl) continue;
+        const stored = (record.sidecars || []).find((c) => c.name === spec.name);
+        if (stored) {
+          try { await this.recreateSidecarContainer(record, spec, stored); } catch (e) {}
+        }
+      }
     }
     const ingress = await getIngressManager().reconcile().catch((e) => ({ applied: false, reason: e.message }));
     record.ingress = {
@@ -1388,7 +2131,7 @@ class CatalogManager extends EventEmitter {
     return this.toPublic(record);
   }
 
-  async remove(id, { deleteVolumes = false } = {}) {
+  async remove(id, { deleteVolumes = false, deleteBackups = deleteVolumes } = {}) {
     if (this.inFlight.has(id)) {
       const err = new Error('El servicio se está instalando ahora mismo; espera a que termine antes de eliminarlo');
       /** @type {any} */ (err).status = 409;
@@ -1415,7 +2158,7 @@ class CatalogManager extends EventEmitter {
 
     if (record.databaseId) {
       try {
-        await getDbManager().remove(record.databaseId, { deleteVolume: deleteVolumes, deleteBackups: deleteVolumes });
+        await getDbManager().remove(record.databaseId, { deleteVolume: deleteVolumes, deleteBackups });
         removed.database = record.databaseId;
       } catch (e) {}
     }
@@ -1431,7 +2174,11 @@ class CatalogManager extends EventEmitter {
           removed.volumes.push(volume);
         } catch (e) {}
       }
-      try { fs.rmSync(path.join(FILES_ROOT, record.id), { recursive: true, force: true }); } catch (e) {}
+    }
+    // Los ficheros de configuración se regeneran desde la plantilla: limpiarlos siempre para no dejar huérfanos.
+    try { fs.rmSync(path.join(this.filesRoot, record.id), { recursive: true, force: true }); } catch (e) {}
+    if (deleteBackups) {
+      try { fs.rmSync(path.join(this.backupsRoot, record.id), { recursive: true, force: true }); } catch (e) {}
     }
 
     if (await this.isDockerAvailable()) {
@@ -1448,6 +2195,14 @@ class CatalogManager extends EventEmitter {
       } catch (e) {}
       try { await getIngressManager().reconcile(); } catch (e) {}
     }
+
+    // Liberar reservas de puertos principales y extraPorts en portRegistry
+    portRegistry.releaseOwner(record.id);
+    for (const [cPort, hPort] of Object.entries(record.extraPorts || {})) {
+      this.pendingPorts.delete(Number(hPort));
+      portRegistry.release(Number(hPort), `svc_ep_${record.id}_${cPort}`);
+    }
+    this.pendingPorts.delete(record.hostPort);
 
     this.state.installations = this.state.installations.filter((i) => i.id !== id);
     this.save();
@@ -1474,6 +2229,7 @@ class CatalogManager extends EventEmitter {
    */
   toPublic(record) {
     const tpl = TEMPLATE_MAP.get(record.templateId);
+    const catalogImage = tpl ? tpl.app.image : record.image;
     return {
       id: record.id,
       templateId: record.templateId,
@@ -1482,10 +2238,13 @@ class CatalogManager extends EventEmitter {
       category: record.category,
       categoryLabel: CATEGORY_MAP.get(record.category) || record.category,
       image: record.image,
+      catalogImage,
+      updateAvailable: Boolean(tpl && tpl.app.image !== record.image),
       domain: record.domain,
       url: record.url,
       hostPort: record.hostPort,
       appPort: record.appPort,
+      extraPorts: record.extraPorts || {},
       containerName: record.containerName,
       networkName: record.networkName,
       sidecars: record.sidecars.map((c) => ({ name: c.name, image: c.image, containerName: c.containerName })),
@@ -1540,6 +2299,11 @@ const catalogManager = Object.assign(new CatalogManager(), {
   resolvePlaceholders,
   resolveEnv,
   generateSecret,
+  orderSidecars,
+  parseImageRef,
+  resolveCoupledSidecarImage,
+  defaultTimezone,
+  BACKUP_IMAGE,
   STEPS,
   PORT_RANGE: { start: PORT_RANGE_START, end: PORT_RANGE_END }
 });

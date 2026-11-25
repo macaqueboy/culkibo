@@ -8,9 +8,11 @@ const {
   computeMerkleTree,
   diffMerkleTrees,
   sha256,
+  sha256FileSync,
   FRAME_MAGIC_RAW,
   FRAME_MAGIC_BROTLI,
-  FRAME_MAGIC_GZIP
+  FRAME_MAGIC_GZIP,
+  MAX_CHUNKED_FILE_BYTES
 } = require('./liveSyncEngine');
 
 /**
@@ -26,6 +28,7 @@ const IGNORED_SEGMENT_RE = /(^|[\\/])(\.git|node_modules|\.next|\.nuxt|\.turbo|\
 const EDITOR_SWAP_RE = /(^|[\\/])(\.#[^\\/]+|#[^\\/]+#|~\$[^\\/]+|\.DS_Store|Thumbs\.db|4913)$|(\.(swp|swo|swx|tmp|bak|orig)|~)$/i;
 const INCOMPRESSIBLE_EXT_RE = /\.(png|jpe?g|webp|gif|avif|ico|woff2?|mp4|webm|mp3|ogg|zip|gz|br|zst|7z|rar|pdf|wasm)$/i;
 const MAX_CLIENT_FILE_BYTES = 10 * 1024 * 1024;
+const CLIENT_CHUNK_PART_BYTES = 1024 * 1024; // 1 MiB por trozo para archivos >10 MiB
 const CHUNK_MAX_FILES = 250;
 const CHUNK_MAX_BYTES = 8 * 1024 * 1024;
 const COMPRESSION_MIN_BYTES = 512;
@@ -190,6 +193,10 @@ class LiveSyncClient extends EventEmitter {
     this._fileHistoryWaiters = [];
     /** @type {Array<{ resolve: (v: any) => void, reject: (e: any) => void, timer: ReturnType<typeof setTimeout> }>} */
     this._rollbackFileWaiters = [];
+    /** @type {Map<string, { resolve: (v: any) => void, reject: (e: any) => void, timer: ReturnType<typeof setTimeout> }>} */
+    this._chunkWaiters = new Map();
+    this._chunkReqSeq = 0;
+    this.chunkedUploadSupported = false;
 
     /** @type {Map<string, 'upsert' | 'delete'>} */
     this.pending = new Map();
@@ -446,6 +453,7 @@ class LiveSyncClient extends EventEmitter {
           this.clientId = msg.clientId || null;
           this.initialInSync = Boolean(msg.inSync);
           this.binaryFramesSupported = Boolean(msg.binaryFramesSupported);
+          this.chunkedUploadSupported = Boolean(msg.chunkedUploadSupported);
           const advertised = Array.isArray(msg.codecs)
             ? msg.codecs
             : (Array.isArray(msg.compressionSupported) ? msg.compressionSupported : []);
@@ -536,10 +544,31 @@ class LiveSyncClient extends EventEmitter {
           return;
         }
 
+        if (msg.type === 'chunk_ack') {
+          const reqId = msg.reqId ? String(msg.reqId) : null;
+          if (reqId && this._chunkWaiters.has(reqId)) {
+            const waiter = this._chunkWaiters.get(reqId);
+            this._chunkWaiters.delete(reqId);
+            if (waiter) {
+              clearTimeout(waiter.timer);
+              waiter.resolve(msg);
+            }
+          }
+          this.emit('chunk_ack', msg);
+          return;
+        }
+
         if (msg.type === 'error') {
           const err = new Error(msg.error || 'Error en sincronización en vivo');
           /** @type {any} */ (err).code = msg.code || 'SYNC_ERROR';
-          if (msg.seq && this.inflight.has(msg.seq)) {
+          if (msg.reqId && this._chunkWaiters.has(String(msg.reqId))) {
+            const waiter = this._chunkWaiters.get(String(msg.reqId));
+            this._chunkWaiters.delete(String(msg.reqId));
+            if (waiter) {
+              clearTimeout(waiter.timer);
+              waiter.reject(err);
+            }
+          } else if (msg.seq && this.inflight.has(msg.seq)) {
             const waiter = this.inflight.get(msg.seq);
             this.inflight.delete(msg.seq);
             waiter && waiter.reject(err);
@@ -564,6 +593,11 @@ class LiveSyncClient extends EventEmitter {
           waiter.reject(new Error('Conexión de sincronización cerrada'));
         }
         this.inflight.clear();
+        for (const [, waiter] of this._chunkWaiters) {
+          clearTimeout(waiter.timer);
+          waiter.reject(new Error('Conexión de sincronización cerrada'));
+        }
+        this._chunkWaiters.clear();
         for (const queue of [this._verifyWaiters, this._fileHistoryWaiters, this._rollbackFileWaiters]) {
           while (queue.length) {
             const w = queue.shift();
@@ -696,6 +730,20 @@ class LiveSyncClient extends EventEmitter {
         if (st.isDirectory()) return { kind: 'dir' };
         if (!st.isFile()) return { kind: 'dir' };
         if (st.size > MAX_CLIENT_FILE_BYTES) {
+          if (st.size <= MAX_CHUNKED_FILE_BYTES) {
+            const cachedLarge = this._statCache.get(abs);
+            if (
+              cachedLarge &&
+              cachedLarge.mtimeMs === st.mtimeMs &&
+              cachedLarge.ctimeMs === st.ctimeMs &&
+              cachedLarge.size === st.size &&
+              opts.skipIfUnchangedHash &&
+              cachedLarge.sha256 === opts.skipIfUnchangedHash
+            ) {
+              return { kind: 'unchanged', sha256: cachedLarge.sha256, mtimeMs: st.mtimeMs, size: st.size };
+            }
+            return { kind: 'chunked', size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
+          }
           return { kind: 'too_large', size: st.size };
         }
         const cached = this._statCache.get(abs);
@@ -833,6 +881,159 @@ class LiveSyncClient extends EventEmitter {
     }, this.quiescenceMs);
   }
 
+  /**
+   * Recorre recursivamente un subdirectorio relativo (sin seguir symlinks) para expandir
+   * eventos de directorio renombrado/copiado en Windows ReadDirectoryChangesW / macOS FSEvents.
+   * @param {string} relDir
+   * @returns {string[]}
+   */
+  _walkDirRel(relDir) {
+    /** @type {string[]} */
+    const found = [];
+    const maxWalkFiles = 2000;
+    const walk = (absDir, prefix, depth) => {
+      if (depth > 20 || found.length >= maxWalkFiles) return;
+      let entries;
+      try {
+        entries = fs.readdirSync(absDir, { withFileTypes: true });
+      } catch (e) {
+        return;
+      }
+      for (const entry of entries) {
+        if (found.length >= maxWalkFiles) break;
+        if (entry.isSymbolicLink()) continue;
+        const childRel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (this.isIgnored(childRel)) continue;
+        const childAbs = path.join(absDir, entry.name);
+        if (entry.isDirectory()) {
+          walk(childAbs, childRel, depth + 1);
+        } else if (entry.isFile()) {
+          found.push(childRel);
+        }
+      }
+    };
+    const startAbs = path.join(this.sourceDir, relDir);
+    walk(startAbs, relDir, 0);
+    return found;
+  }
+
+  /**
+   * Detecta renombres que sólo cambian mayúsculas/minúsculas (p. ej. `App.tsx` -> `app.tsx`
+   * en NTFS/APFS) comprobando `readdirSync` para eliminar la ruta antigua en servidores Linux.
+   * @param {string} rel
+   * @param {string} abs
+   * @returns {string[]}
+   */
+  _detectCaseRenameOldKeys(rel, abs) {
+    const lowerRel = rel.toLowerCase();
+    /** @type {string[]} */
+    const oldKeys = [];
+    for (const tracked of this.lastSentHashes.keys()) {
+      if (tracked !== rel && tracked.toLowerCase() === lowerRel) {
+        oldKeys.push(tracked);
+      }
+    }
+    if (oldKeys.length === 0) return oldKeys;
+    try {
+      const entries = new Set(fs.readdirSync(path.dirname(abs)));
+      return oldKeys.filter((oldRel) => !entries.has(path.posix.basename(oldRel)));
+    } catch (e) {
+      return oldKeys;
+    }
+  }
+
+  /** Envía un mensaje de protocolo de carga troceada y espera su `chunk_ack`. */
+  _sendChunkRpc(payload, timeoutMs = 30000) {
+    if (!this.ws || this.ws.readyState !== 1) {
+      return Promise.reject(new Error('El WebSocket de sincronización no está conectado'));
+    }
+    const reqId = `chkreq_${++this._chunkReqSeq}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._chunkWaiters.delete(reqId);
+        reject(new Error(`Tiempo de espera agotado en carga troceada (${payload.type})`));
+      }, timeoutMs);
+      if (timer.unref) timer.unref();
+      this._chunkWaiters.set(reqId, { resolve, reject, timer });
+      this.ws.send(JSON.stringify({
+        ...payload,
+        reqId,
+        projectId: this.projectId,
+        targetDir: this.targetDir
+      }));
+    });
+  }
+
+  /**
+   * Transfiere un archivo grande (>10 MiB hasta 100 MiB) mediante troceado secuencial
+   * (`chunk_start` -> `chunk_part` -> `chunk_commit`) con verificación SHA-256 en destino.
+   * Confirma `lastSentHashes` ÚNICAMENTE tras el ACK del commit.
+   *
+   * @param {string} rel
+   * @param {string} abs
+   * @param {number} size
+   */
+  async sendLargeFileChunked(rel, abs, size) {
+    const fileSha = sha256FileSync(abs);
+    const prevHash = this.lastSentHashes.get(rel);
+    if (prevHash === fileSha) {
+      return { skipped: true, sha256: fileSha };
+    }
+
+    const startAck = await this._sendChunkRpc({
+      type: 'chunk_start',
+      path: rel,
+      totalBytes: size,
+      sha256: fileSha,
+      ...(prevHash ? { baseSha256: prevHash } : {})
+    });
+    const uploadId = startAck.uploadId;
+    const partSize = Math.min(CLIENT_CHUNK_PART_BYTES, Number(startAck.maxChunkBytes) || CLIENT_CHUNK_PART_BYTES);
+
+    let fd = -1;
+    try {
+      fd = fs.openSync(abs, 'r');
+      const buf = Buffer.allocUnsafe(partSize);
+      let index = 0;
+      let bytesRead = 0;
+      while ((bytesRead = fs.readSync(fd, buf, 0, partSize, null)) > 0) {
+        const slice = bytesRead === partSize ? buf : buf.subarray(0, bytesRead);
+        await this._sendChunkRpc({
+          type: 'chunk_part',
+          uploadId,
+          index,
+          encoding: 'base64',
+          data: slice.toString('base64')
+        });
+        index++;
+      }
+      fs.closeSync(fd);
+      fd = -1;
+
+      const commitAck = await this._sendChunkRpc({
+        type: 'chunk_commit',
+        uploadId
+      });
+      this.lastSentHashes.set(rel, fileSha);
+      try {
+        const st = fs.lstatSync(abs);
+        this._statCache.set(abs, { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, sha256: fileSha });
+      } catch (e) {}
+      this.emit('frame_ack', commitAck);
+      return commitAck;
+    } catch (err) {
+      if (fd !== -1) {
+        try { fs.closeSync(fd); } catch (e) {}
+      }
+      try {
+        if (this.ws && this.ws.readyState === 1) {
+          await this._sendChunkRpc({ type: 'chunk_abort', uploadId }, 5000).catch(() => {});
+        }
+      } catch (e) {}
+      throw err;
+    }
+  }
+
   /** Envía inmediatamente todos los ficheros acumulados (serializado y confirmando hashes solo tras ACK). */
   async flushNow() {
     if (this._flushing && this._activeFlushPromise) {
@@ -852,22 +1053,59 @@ class LiveSyncClient extends EventEmitter {
         const files = [];
         /** @type {Array<{ rel: string, op: 'upsert' | 'delete', hash?: string }>} */
         const pendingHashCommits = [];
+        /** @type {Array<{ rel: string, abs: string, size: number }>} */
+        const largeFiles = [];
+        const queuedOps = new Set();
 
-        for (const [rel, op] of batch) {
+        /** @param {string} rel @param {'upsert' | 'delete'} op */
+        const processEntry = async (rel, op) => {
           const prevHash = this.lastSentHashes.get(rel);
           const abs = path.join(this.sourceDir, rel);
           if (op === 'delete') {
             this._statCache.delete(abs);
-            pendingHashCommits.push({ rel, op: 'delete' });
-            files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
-          } else {
-            const res = await this._readFileSafe(abs, { skipIfUnchangedHash: prevHash || null });
-            if (res.kind === 'unchanged') {
-              continue;
+            const prefix = `${rel}/`;
+            for (const tracked of Array.from(this.lastSentHashes.keys())) {
+              if (tracked.startsWith(prefix)) {
+                this._statCache.delete(path.join(this.sourceDir, tracked));
+                pendingHashCommits.push({ rel: tracked, op: 'delete' });
+              }
             }
-            if (res.kind === 'file' && res.buffer) {
-              const h = res.sha256 || sha256(res.buffer);
-              if (prevHash === h) continue;
+            if (!queuedOps.has(`delete:${rel}`)) {
+              queuedOps.add(`delete:${rel}`);
+              pendingHashCommits.push({ rel, op: 'delete' });
+              files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
+            }
+            return;
+          }
+
+          const res = await this._readFileSafe(abs, { skipIfUnchangedHash: prevHash || null });
+          if (res.kind === 'unchanged') return;
+
+          if (res.kind === 'dir') {
+            // Windows/macOS fs.watch emite sólo el directorio en renombres/copias: expandir todos sus hijos
+            const children = this._walkDirRel(rel);
+            for (const childRel of children) {
+              await processEntry(childRel, 'upsert');
+            }
+            return;
+          }
+
+          if (res.kind === 'file' && res.buffer) {
+            const h = res.sha256 || sha256(res.buffer);
+            // Detectar renombres sólo de capitalización (App.tsx -> app.tsx) y emitir delete antes del upsert
+            const oldCaseKeys = this._detectCaseRenameOldKeys(rel, abs);
+            for (const oldRel of oldCaseKeys) {
+              const oldPrev = this.lastSentHashes.get(oldRel);
+              this._statCache.delete(path.join(this.sourceDir, oldRel));
+              if (!queuedOps.has(`delete:${oldRel}`)) {
+                queuedOps.add(`delete:${oldRel}`);
+                pendingHashCommits.push({ rel: oldRel, op: 'delete' });
+                files.push({ path: oldRel, op: 'delete', ...(oldPrev ? { baseSha256: oldPrev } : {}) });
+              }
+            }
+            if (prevHash === h && oldCaseKeys.length === 0) return;
+            if (!queuedOps.has(`upsert:${rel}`)) {
+              queuedOps.add(`upsert:${rel}`);
               pendingHashCommits.push({ rel, op: 'upsert', hash: h });
               files.push({
                 path: rel,
@@ -876,22 +1114,48 @@ class LiveSyncClient extends EventEmitter {
                 sha256: h,
                 ...(prevHash ? { baseSha256: prevHash } : {})
               });
-            } else if (res.kind === 'missing') {
-              pendingHashCommits.push({ rel, op: 'delete' });
-              files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
-            } else if (res.kind === 'too_large') {
+            }
+          } else if (res.kind === 'chunked' && typeof res.size === 'number') {
+            if (this.chunkedUploadSupported) {
+              largeFiles.push({ rel, abs, size: res.size });
+            } else {
               this.emit('file_skipped', { path: rel, size: res.size, limit: MAX_CLIENT_FILE_BYTES });
             }
+          } else if (res.kind === 'missing') {
+            // Si era un directorio borrado en Windows/macOS, purgar también los hijos de lastSentHashes
+            const prefix = `${rel}/`;
+            for (const tracked of Array.from(this.lastSentHashes.keys())) {
+              if (tracked.startsWith(prefix)) {
+                this._statCache.delete(path.join(this.sourceDir, tracked));
+                pendingHashCommits.push({ rel: tracked, op: 'delete' });
+              }
+            }
+            if (!queuedOps.has(`delete:${rel}`)) {
+              queuedOps.add(`delete:${rel}`);
+              pendingHashCommits.push({ rel, op: 'delete' });
+              files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
+            }
+          } else if (res.kind === 'too_large') {
+            this.emit('file_skipped', { path: rel, size: res.size, limit: MAX_CHUNKED_FILE_BYTES });
           }
+        };
+
+        for (const [rel, op] of batch) {
+          await processEntry(rel, op);
         }
 
-        if (files.length === 0) continue;
+        if (files.length === 0 && largeFiles.length === 0) continue;
         try {
-          const res = await this.sendChunked(files);
-          lastAck = res.lastAck;
-          for (const c of pendingHashCommits) {
-            if (c.op === 'delete') this.lastSentHashes.delete(c.rel);
-            else if (c.hash) this.lastSentHashes.set(c.rel, c.hash);
+          if (files.length > 0) {
+            const res = await this.sendChunked(files);
+            lastAck = res.lastAck;
+            for (const c of pendingHashCommits) {
+              if (c.op === 'delete') this.lastSentHashes.delete(c.rel);
+              else if (c.hash) this.lastSentHashes.set(c.rel, c.hash);
+            }
+          }
+          for (const lf of largeFiles) {
+            lastAck = await this.sendLargeFileChunked(lf.rel, lf.abs, lf.size);
           }
         } catch (err) {
           // Re-encolar cambios no confirmados sin sobrescribir cambios más recientes
@@ -1078,12 +1342,18 @@ class LiveSyncClient extends EventEmitter {
 
       /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string, baseSha256?: string }>} */
       const files = [];
+      /** @type {Array<{ rel: string, op: 'upsert' | 'delete', hash?: string }>} */
+      const pendingHashCommits = [];
+      /** @type {Array<{ rel: string, abs: string, size: number }>} */
+      const largeFiles = [];
+
       for (const rel of [...(cmp.missingOnServer || []), ...(cmp.staleOnServer || [])]) {
-        const res = await this._readFileSafe(path.join(this.sourceDir, rel));
+        const abs = path.join(this.sourceDir, rel);
+        const res = await this._readFileSafe(abs);
         if (res.kind === 'file' && res.buffer) {
           const h = res.sha256 || sha256(res.buffer);
           const prevHash = this.lastSentHashes.get(rel);
-          this.lastSentHashes.set(rel, h);
+          pendingHashCommits.push({ rel, op: 'upsert', hash: h });
           files.push({
             path: rel,
             op: 'upsert',
@@ -1091,19 +1361,44 @@ class LiveSyncClient extends EventEmitter {
             sha256: h,
             ...(prevHash ? { baseSha256: prevHash } : {})
           });
+        } else if (res.kind === 'chunked' && typeof res.size === 'number') {
+          if (this.chunkedUploadSupported) {
+            largeFiles.push({ rel, abs, size: res.size });
+          } else {
+            this.emit('file_skipped', { path: rel, size: res.size, limit: MAX_CLIENT_FILE_BYTES });
+          }
         }
       }
       for (const rel of (cmp.extraOnServer || [])) {
         const prevHash = this.lastSentHashes.get(rel);
-        this.lastSentHashes.delete(rel);
-        this._statCache.delete(path.join(this.sourceDir, rel));
+        pendingHashCommits.push({ rel, op: 'delete' });
         files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
       }
-      if (files.length === 0) {
+      if (files.length === 0 && largeFiles.length === 0) {
         return { reconciled: true, changed: 0, framesSent: 0, rootDigest: localTree.rootDigest };
       }
-      const { lastAck, framesSent } = await this.sendChunked(files);
-      return { reconciled: true, changed: files.length, framesSent, rootDigest: localTree.rootDigest, ack: lastAck };
+
+      let lastAck = null;
+      let framesSent = 0;
+      if (files.length > 0) {
+        const res = await this.sendChunked(files);
+        lastAck = res.lastAck;
+        framesSent += res.framesSent;
+        // Confirmar lastSentHashes ÚNICAMENTE tras ACK exitoso (cero envenenamiento si cae el WS)
+        for (const c of pendingHashCommits) {
+          if (c.op === 'delete') {
+            this.lastSentHashes.delete(c.rel);
+            this._statCache.delete(path.join(this.sourceDir, c.rel));
+          } else if (c.hash) {
+            this.lastSentHashes.set(c.rel, c.hash);
+          }
+        }
+      }
+      for (const lf of largeFiles) {
+        lastAck = await this.sendLargeFileChunked(lf.rel, lf.abs, lf.size);
+        framesSent++;
+      }
+      return { reconciled: true, changed: files.length + largeFiles.length, framesSent, rootDigest: localTree.rootDigest, ack: lastAck };
     } finally {
       this._reconciling = false;
     }
@@ -1134,47 +1429,86 @@ class LiveSyncClient extends EventEmitter {
     this._initialTreeHasFiles = false;
     /** @type {Array<{ path: string, op: 'upsert' | 'delete', buffer?: Buffer, sha256?: string, baseSha256?: string }>} */
     const files = [];
+    /** @type {Array<{ rel: string, op: 'upsert' | 'delete', hash?: string }>} */
+    const pendingHashCommits = [];
+    /** @type {Array<{ rel: string, abs: string, size: number }>} */
+    const largeFiles = [];
 
     if (serverFilesMap) {
       const diff = diffMerkleTrees(localTree.files, serverFilesMap);
       for (const rel of [...diff.missingOnServer, ...diff.staleOnServer]) {
-        const buf = fs.readFileSync(path.join(this.sourceDir, rel));
-        const h = sha256(buf);
-        const prevHash = this.lastSentHashes.get(rel);
-        this.lastSentHashes.set(rel, h);
-        files.push({
-          path: rel,
-          op: 'upsert',
-          buffer: buf,
-          sha256: h,
-          ...(prevHash ? { baseSha256: prevHash } : {})
-        });
+        const abs = path.join(this.sourceDir, rel);
+        const res = await this._readFileSafe(abs);
+        if (res.kind === 'file' && res.buffer) {
+          const h = res.sha256 || sha256(res.buffer);
+          const prevHash = this.lastSentHashes.get(rel);
+          pendingHashCommits.push({ rel, op: 'upsert', hash: h });
+          files.push({
+            path: rel,
+            op: 'upsert',
+            buffer: res.buffer,
+            sha256: h,
+            ...(prevHash ? { baseSha256: prevHash } : {})
+          });
+        } else if (res.kind === 'chunked' && typeof res.size === 'number' && this.chunkedUploadSupported) {
+          largeFiles.push({ rel, abs, size: res.size });
+        }
       }
       for (const rel of diff.extraOnServer) {
         const prevHash = this.lastSentHashes.get(rel);
-        this.lastSentHashes.delete(rel);
-        this._statCache.delete(path.join(this.sourceDir, rel));
+        pendingHashCommits.push({ rel, op: 'delete' });
         files.push({ path: rel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
       }
     } else {
-      for (const [rel, hash] of Object.entries(localTree.files)) {
-        const buf = fs.readFileSync(path.join(this.sourceDir, rel));
-        const prevHash = this.lastSentHashes.get(rel);
-        this.lastSentHashes.set(rel, hash);
-        files.push({
-          path: rel,
-          op: 'upsert',
-          buffer: buf,
-          sha256: hash,
-          ...(prevHash ? { baseSha256: prevHash } : {})
-        });
+      for (const [rel] of Object.entries(localTree.files)) {
+        const abs = path.join(this.sourceDir, rel);
+        const res = await this._readFileSafe(abs);
+        if (res.kind === 'file' && res.buffer) {
+          const h = res.sha256 || sha256(res.buffer);
+          const prevHash = this.lastSentHashes.get(rel);
+          pendingHashCommits.push({ rel, op: 'upsert', hash: h });
+          files.push({
+            path: rel,
+            op: 'upsert',
+            buffer: res.buffer,
+            sha256: h,
+            ...(prevHash ? { baseSha256: prevHash } : {})
+          });
+        } else if (res.kind === 'chunked' && typeof res.size === 'number' && this.chunkedUploadSupported) {
+          largeFiles.push({ rel, abs, size: res.size });
+        }
+      }
+      // Limpiar ficheros que fueron sincronizados antes pero ya no existen en localTree (extras huérfanos en fallback)
+      for (const [trackedRel, prevHash] of this.lastSentHashes.entries()) {
+        if (!Object.prototype.hasOwnProperty.call(localTree.files, trackedRel)) {
+          pendingHashCommits.push({ rel: trackedRel, op: 'delete' });
+          files.push({ path: trackedRel, op: 'delete', ...(prevHash ? { baseSha256: prevHash } : {}) });
+        }
       }
     }
 
-    if (files.length === 0) return { reconciled: true, changed: 0, rootDigest: localTree.rootDigest };
+    if (files.length === 0 && largeFiles.length === 0) return { reconciled: true, changed: 0, rootDigest: localTree.rootDigest };
 
-    const { lastAck, framesSent } = await this.sendChunked(files);
-    return { reconciled: true, changed: files.length, framesSent, rootDigest: localTree.rootDigest, ack: lastAck };
+    let lastAck = null;
+    let framesSent = 0;
+    if (files.length > 0) {
+      const res = await this.sendChunked(files);
+      lastAck = res.lastAck;
+      framesSent += res.framesSent;
+      for (const c of pendingHashCommits) {
+        if (c.op === 'delete') {
+          this.lastSentHashes.delete(c.rel);
+          this._statCache.delete(path.join(this.sourceDir, c.rel));
+        } else if (c.hash) {
+          this.lastSentHashes.set(c.rel, c.hash);
+        }
+      }
+    }
+    for (const lf of largeFiles) {
+      lastAck = await this.sendLargeFileChunked(lf.rel, lf.abs, lf.size);
+      framesSent++;
+    }
+    return { reconciled: true, changed: files.length + largeFiles.length, framesSent, rootDigest: localTree.rootDigest, ack: lastAck };
   }
 
   async stop() {

@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const EventEmitter = require('events');
 const Project = require('../models/Project');
@@ -376,20 +377,72 @@ class ProjectManager extends EventEmitter {
         throw new Error('Invalid localPath');
       }
       const resolved = path.resolve(lp);
-      const parsedRoot = path.parse(resolved).root;
-      if (resolved === parsedRoot) {
-        throw new Error('No se permite vincular el directorio raíz del sistema');
+
+      // Resolver ruta canónica con realpathSync (caminando hasta el ancestro existente)
+      // para bloquear escapes por symlinks/junctions apuntando a data/, /etc o ~/.ssh.
+      let canonical = resolved;
+      try {
+        let cursor = resolved;
+        /** @type {string[]} */
+        const tailParts = [];
+        while (cursor && !fs.existsSync(cursor)) {
+          const parent = path.dirname(cursor);
+          if (parent === cursor) break;
+          tailParts.unshift(path.basename(cursor));
+          cursor = parent;
+        }
+        if (cursor && fs.existsSync(cursor)) {
+          const realAncestor = fs.realpathSync(cursor);
+          canonical = tailParts.length > 0 ? path.join(realAncestor, ...tailParts) : realAncestor;
+        }
+      } catch (e) {
+        throw new Error('No se pudo resolver la ruta canónica de localPath');
       }
-      // Bloquear data/ de Culkibo y directorios sensibles del SO (Coolify CVE-2026-34153)
-      const dataDirAbs = path.resolve(path.dirname(this.dataPath));
-      const relToData = path.relative(dataDirAbs, resolved);
-      if (relToData === '' || (!relToData.startsWith('..') && !path.isAbsolute(relToData))) {
-        throw new Error('No se permite vincular el directorio interno data/ de Culkibo como carpeta local');
+
+      const candidates = canonical === resolved ? [resolved] : [resolved, canonical];
+
+      // Directorios internos de Culkibo a proteger (tanto resolved como realpath)
+      const rawDataDirs = [path.resolve(path.dirname(this.dataPath))];
+      if (process.env.CULKIBO_DATA_DIR) {
+        const envRoot = path.resolve(process.env.CULKIBO_DATA_DIR);
+        rawDataDirs.push(envRoot, path.join(envRoot, 'data'));
       }
-      const forbiddenPrefixes = ['/etc', '/proc', '/sys', '/root', '/var/run', '/run', 'c:\\windows\\system32'];
-      const lowerRes = resolved.toLowerCase();
-      if (forbiddenPrefixes.some((p) => lowerRes === p || lowerRes.startsWith(`${p}${path.sep}`) || lowerRes.startsWith(`${p}/`))) {
-        throw new Error('No se permite vincular un directorio sensible del sistema como carpeta local');
+      const protectedDataDirs = new Set();
+      for (const d of rawDataDirs) {
+        protectedDataDirs.add(d);
+        try {
+          if (fs.existsSync(d)) protectedDataDirs.add(fs.realpathSync(d));
+        } catch (e) {}
+      }
+
+      const homeDir = (() => {
+        try { return os.homedir(); } catch (e) { return ''; }
+      })();
+      const sensitiveHomeDirs = homeDir
+        ? ['.ssh', '.aws', '.gnupg', '.kube', '.docker'].map((sub) => path.resolve(homeDir, sub).toLowerCase())
+        : [];
+      const forbiddenPrefixes = [
+        '/etc', '/proc', '/sys', '/root', '/var/run', '/run', '/dev', '/boot',
+        'c:\\windows\\system32', 'c:\\windows\\syswow64',
+        ...sensitiveHomeDirs
+      ];
+
+      for (const cand of candidates) {
+        const parsedRoot = path.parse(cand).root;
+        if (cand === parsedRoot) {
+          throw new Error('No se permite vincular el directorio raíz del sistema');
+        }
+        // Bloquear data/ de Culkibo y directorios sensibles del SO (Coolify CVE-2026-34153)
+        for (const dataDirAbs of protectedDataDirs) {
+          const relToData = path.relative(dataDirAbs, cand);
+          if (relToData === '' || (!relToData.startsWith('..') && !path.isAbsolute(relToData))) {
+            throw new Error('No se permite vincular el directorio interno data/ de Culkibo como carpeta local');
+          }
+        }
+        const lowerRes = cand.toLowerCase();
+        if (forbiddenPrefixes.some((p) => lowerRes === p || lowerRes.startsWith(`${p}${path.sep}`) || lowerRes.startsWith(`${p}/`))) {
+          throw new Error('No se permite vincular un directorio sensible del sistema como carpeta local');
+        }
       }
     }
     if (Array.isArray(data.domains) && data.domains.length > 0) {

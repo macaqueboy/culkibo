@@ -4,6 +4,163 @@ const path = require('path');
 const crypto = require('crypto');
 const metricsCollector = require('./metricsCollector');
 
+const LOG_ROTATE_MAX_BYTES = 2 * 1024 * 1024; // 2 MiB rotated NDJSON ring (zero disk bloat)
+const MAX_REGEX_LENGTH = 160;
+const ANSI_ESCAPE_RE = /\x1B\[[0-9;]*[a-zA-Z]/g;
+
+function resolveDefaultLogFile() {
+  const dataDir = process.env.CULKIBO_DATA_DIR
+    ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
+    : path.resolve(__dirname, '..', '..', 'data');
+  return path.join(dataDir, 'logs.ndjson');
+}
+
+function isRunningInTestMode() {
+  if (process.env.NODE_ENV === 'test') return true;
+  const argvJoined = (process.argv || []).join(' ').toLowerCase();
+  return /[\\/](tests|bench)[\\/]/.test(argvJoined);
+}
+
+/**
+ * Strips ANSI color escape codes from log messages.
+ * @param {string} str
+ */
+function stripAnsi(str) {
+  return String(str || '').replace(ANSI_ESCAPE_RE, '');
+}
+
+/**
+ * Compiles a user-supplied regex safely with strict ReDoS protection.
+ * Rejects nested quantifiers, backreferences, lookbehinds, excessive length/alternation.
+ * @param {string} rawPattern
+ * @param {string} [flags]
+ * @returns {RegExp}
+ */
+function compileSafeRegex(rawPattern, flags = 'i') {
+  const pattern = String(rawPattern || '');
+  if (!pattern) throw new Error('Patrón regex vacío');
+  if (pattern.length > MAX_REGEX_LENGTH) {
+    const err = new Error(`Expresión regular demasiado larga (máx. ${MAX_REGEX_LENGTH} caracteres)`);
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  // Reject backreferences (\1..\9) and lookbehind assertions
+  if (/\\[1-9]/.test(pattern) || /\(\?<[=!]/.test(pattern)) {
+    const err = new Error('Expresión regular rechazada por seguridad (backreferences/lookbehind no permitidos)');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  // Reject nested quantifiers inside capturing/non-capturing groups, e.g. (a+)+, (\w*)*, (a|aa)+, (.+){2,}
+  if (/\([^)]*[+*?}][^)]*\)\s*[+*{]/.test(pattern) || /(\.\*){2,}/.test(pattern)) {
+    const err = new Error('Expresión regular rechazada por riesgo de ReDoS (cuantificadores anidados)');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  // Reject excessive alternation branches
+  const pipes = (pattern.match(/\|/g) || []).length;
+  if (pipes > 12) {
+    const err = new Error('Expresión regular rechazada por exceso de ramas de alternancia (máx. 12)');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  // Reject giant repetition ranges like {1,1000}
+  const repMatch = pattern.match(/\{\s*(\d+)\s*(?:,\s*(\d*))?\s*\}/g);
+  if (repMatch) {
+    for (const r of repMatch) {
+      const nums = r.match(/\d+/g) || [];
+      if (nums.some((n) => Number(n) > 32)) {
+        const err = new Error('Expresión regular rechazada por cuantificador excesivo (máx. 32)');
+        /** @type {any} */ (err).status = 400;
+        throw err;
+      }
+    }
+  }
+  const safeFlags = String(flags || 'i').replace(/[^ims]/g, '');
+  try {
+    return new RegExp(pattern, safeFlags);
+  } catch (e) {
+    const err = new Error(`Expresión regular inválida: ${e.message}`);
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+}
+
+/**
+ * Parses relative time windows (`5m`, `1h`, `24h`, `7d`) or ISO/epoch timestamps into epoch ms.
+ * @param {string | number | null | undefined} input
+ * @param {number} [now]
+ * @returns {number | null}
+ */
+function parseTimeBoundary(input, now = Date.now()) {
+  if (input === null || input === undefined || input === '') return null;
+  if (typeof input === 'number' && Number.isFinite(input)) return input;
+  const raw = String(input).trim();
+  if (!raw) return null;
+  if (/^\d{10,13}$/.test(raw)) {
+    const num = Number(raw);
+    return raw.length === 10 ? num * 1000 : num;
+  }
+  const rel = raw.match(/^(\d+)\s*(s|m|h|d)$/i);
+  if (rel) {
+    const qty = Number(rel[1]);
+    const unit = rel[2].toLowerCase();
+    const mult = unit === 's' ? 1000 : unit === 'm' ? 60000 : unit === 'h' ? 3600000 : 86400000;
+    return now - qty * mult;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Extracts flat structured attributes from JSON log lines or `key=value` tokens.
+ * Bounded to 12 scalar fields so memory stays tiny.
+ * @param {string} message
+ * @returns {Record<string, string | number | boolean> | null}
+ */
+function extractLogFields(message) {
+  const clean = stripAnsi(message).trim();
+  if (!clean) return null;
+  /** @type {Record<string, string | number | boolean>} */
+  const fields = {};
+  let count = 0;
+
+  // 1. JSON object log line (common in Pino, Winston, Zap, Go slog, Railway JSON logs)
+  if (clean.startsWith('{') && clean.endsWith('}') && clean.length <= 8192) {
+    try {
+      const parsed = JSON.parse(clean);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (count >= 12) break;
+          if (!/^[a-zA-Z0-9_.-]{1,32}$/.test(k)) continue;
+          if (typeof v === 'string') {
+            fields[k] = v.slice(0, 120);
+            count++;
+          } else if (typeof v === 'number' && Number.isFinite(v)) {
+            fields[k] = v;
+            count++;
+          } else if (typeof v === 'boolean') {
+            fields[k] = v;
+            count++;
+          }
+        }
+        return count > 0 ? fields : null;
+      }
+    } catch (e) {}
+  }
+
+  // 2. Lightweight `key=value` tokens (e.g. `status=500 method=POST durationMs=42`)
+  const kvRe = /\b([a-zA-Z][a-zA-Z0-9_]{1,24})=([^\s,;\]"']{1,64})/g;
+  let m;
+  while ((m = kvRe.exec(clean)) !== null && count < 12) {
+    const k = m[1];
+    const v = m[2];
+    if (/(pass|secret|token|key|auth)/i.test(k)) continue;
+    fields[k] = /^-?\d+(?:\.\d+)?$/.test(v) ? Number(v) : v;
+    count++;
+  }
+  return count > 0 ? fields : null;
+}
+
 /** @type {any} */
 let _chokidar = null;
 function getChokidar() {
@@ -25,6 +182,15 @@ class ContainerOrchestrator extends EventEmitter {
     /** @type {Map<string, any[]>} Buffer dedicado por proyecto (500 líneas/proyecto) para que un proyecto ruidoso no borre los logs de otros. */
     this.projectLogs = new Map();
     this.maxProjectLogs = 500;
+    // Persistencia rotada NDJSON en disco (desactivada por defecto en tests sobre `data/` real)
+    this._logPersistenceEnabled = !isRunningInTestMode();
+    /** @type {string | null} */
+    this._customLogFile = null;
+    this._logMaxBytes = LOG_ROTATE_MAX_BYTES;
+    /** @type {string[]} */
+    this._pendingLogLines = [];
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    this._logFlushTimer = null;
     this.watcher = null;
     this.watchedDirectory = null;
     this.debounceTimer = null;
@@ -96,8 +262,93 @@ class ContainerOrchestrator extends EventEmitter {
       }
     };
 
-    this.initSampleLogs();
+    this.loadPersistedLogs();
+    if (this.logs.length === 0) {
+      this.initSampleLogs();
+    }
     this.startMetricsCollection();
+  }
+
+  getLogFilePath() {
+    return this._customLogFile || resolveDefaultLogFile();
+  }
+
+  /**
+   * Configures rotated NDJSON log persistence (used by daemon & isolated tests).
+   * @param {{ filePath?: string | null, enabled?: boolean, maxBytes?: number, reload?: boolean }} [opts]
+   */
+  configureLogPersistence(opts = {}) {
+    if (opts.filePath !== undefined) this._customLogFile = opts.filePath || null;
+    if (typeof opts.enabled === 'boolean') this._logPersistenceEnabled = opts.enabled;
+    if (typeof opts.maxBytes === 'number' && opts.maxBytes >= 1024) this._logMaxBytes = opts.maxBytes;
+    if (opts.reload) {
+      this.logs = [];
+      this.projectLogs.clear();
+      this._pendingLogLines = [];
+      this.loadPersistedLogs();
+    }
+  }
+
+  /** Loads recent persisted NDJSON logs on boot so history survives daemon restarts. */
+  loadPersistedLogs() {
+    if (!this._logPersistenceEnabled) return 0;
+    const file = this.getLogFilePath();
+    if (!fs.existsSync(file)) return 0;
+    try {
+      const raw = fs.readFileSync(file, 'utf8');
+      const lines = raw.split(/\r?\n/).filter(Boolean);
+      const tail = lines.slice(-this.maxLogs);
+      let loaded = 0;
+      for (const line of tail) {
+        try {
+          const entry = JSON.parse(line);
+          if (!entry || typeof entry.message !== 'string' || typeof entry.timestamp !== 'string') continue;
+          this.logs.push(entry);
+          if (entry.projectId && entry.projectId !== 'global') {
+            let bucket = this.projectLogs.get(entry.projectId);
+            if (!bucket) {
+              bucket = [];
+              this.projectLogs.set(entry.projectId, bucket);
+            }
+            bucket.push(entry);
+            if (bucket.length > this.maxProjectLogs) {
+              bucket.splice(0, bucket.length - this.maxProjectLogs);
+            }
+          }
+          loaded++;
+        } catch (e) {}
+      }
+      return loaded;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /** Flushes buffered log lines to the rotated NDJSON ring file (`logs.ndjson` / `.1`). */
+  flushLogsToDisk() {
+    if (this._logFlushTimer) {
+      clearTimeout(this._logFlushTimer);
+      this._logFlushTimer = null;
+    }
+    if (!this._logPersistenceEnabled || this._pendingLogLines.length === 0) return 0;
+    const batch = this._pendingLogLines.splice(0, this._pendingLogLines.length);
+    const file = this.getLogFilePath();
+    try {
+      const dir = path.dirname(file);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      try {
+        const st = fs.statSync(file);
+        if (st.size >= this._logMaxBytes) {
+          const rotated = `${file}.1`;
+          try { if (fs.existsSync(rotated)) fs.unlinkSync(rotated); } catch (e) {}
+          fs.renameSync(file, rotated);
+        }
+      } catch (e) {}
+      fs.appendFileSync(file, `${batch.join('\n')}\n`, { mode: 0o600 });
+      return batch.length;
+    } catch (e) {
+      return 0;
+    }
   }
 
   initSampleLogs() {
@@ -120,14 +371,18 @@ class ContainerOrchestrator extends EventEmitter {
     });
   }
 
-  addLog(level, pod, message, timestamp = new Date(), projectId = 'global') {
+  addLog(level, pod, message, timestamp = new Date(), projectId = 'global', meta = null) {
+    const parsedFields = (meta && typeof meta === 'object' && !Array.isArray(meta))
+      ? meta
+      : extractLogFields(message);
     const logEntry = {
       id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      timestamp: timestamp.toISOString(),
-      level: level.toUpperCase(),
+      timestamp: (timestamp instanceof Date ? timestamp : new Date(timestamp)).toISOString(),
+      level: String(level || 'INFO').toUpperCase(),
       pod,
       projectId,
-      message
+      message,
+      ...(parsedFields ? { fields: parsedFields } : {})
     };
 
     // Almacenamos cronológicamente al final (O(1) amortized) y leemos en reverso.
@@ -152,6 +407,18 @@ class ContainerOrchestrator extends EventEmitter {
       bucket.push(logEntry);
       if (bucket.length > this.maxProjectLogs + 100) {
         bucket.splice(0, bucket.length - this.maxProjectLogs);
+      }
+    }
+
+    if (this._logPersistenceEnabled) {
+      this._pendingLogLines.push(JSON.stringify(logEntry));
+      if (this._pendingLogLines.length >= 25) {
+        this.flushLogsToDisk();
+      } else if (!this._logFlushTimer) {
+        this._logFlushTimer = setTimeout(() => {
+          this.flushLogsToDisk();
+        }, 1500);
+        if (this._logFlushTimer.unref) this._logFlushTimer.unref();
       }
     }
 
@@ -199,26 +466,173 @@ class ContainerOrchestrator extends EventEmitter {
   }
 
   /**
-   * @param {{ pod?: string | null, level?: string | null, limit?: number, search?: string, projectId?: string | null }} [opts]
+   * Queries structured logs with ReDoS-safe regex, relative/ISO `since`/`until`,
+   * multi-level, structured JSON/kv attribute filter (`attr`), and RBAC `projectIds` ACL.
+   *
+   * @param {{
+   *   pod?: string | null,
+   *   level?: string | string[] | null,
+   *   limit?: number,
+   *   search?: string,
+   *   regex?: boolean | string,
+   *   since?: string | number | null,
+   *   until?: string | number | null,
+   *   attr?: string | Record<string, any> | null,
+   *   projectId?: string | null,
+   *   projectIds?: string[] | null
+   * }} [opts]
    */
-  getLogs({ pod = null, level = null, limit = 100, search = '', projectId = null } = {}) {
+  getLogs({
+    pod = null,
+    level = null,
+    limit = 100,
+    search = '',
+    regex = false,
+    since = null,
+    until = null,
+    attr = null,
+    projectId = null,
+    projectIds = null
+  } = {}) {
     const cap = Math.max(1, Math.min(2000, Number(limit) || 100));
-    const upperLevel = level ? String(level).toUpperCase() : null;
-    const q = search ? String(search).toLowerCase() : '';
+    const allowedProjects = Array.isArray(projectIds) ? new Set(projectIds) : null;
+    if (projectId && allowedProjects && !allowedProjects.has(projectId)) {
+      return [];
+    }
+
+    /** @type {Set<string> | null} */
+    let levelSet = null;
+    if (Array.isArray(level)) {
+      const cleaned = level.map((lv) => String(lv || '').trim().toUpperCase()).filter((lv) => lv && lv !== 'ALL');
+      if (cleaned.length > 0) levelSet = new Set(cleaned);
+    } else if (typeof level === 'string' && level.trim() && level.trim().toLowerCase() !== 'all') {
+      const cleaned = level.split(',').map((lv) => lv.trim().toUpperCase()).filter((lv) => lv && lv !== 'ALL');
+      if (cleaned.length > 0) levelSet = new Set(cleaned);
+    }
+
+    const sinceMs = parseTimeBoundary(since);
+    const untilMs = parseTimeBoundary(until);
+
+    /** @type {RegExp | null} */
+    let compiledRe = null;
+    let plainQuery = '';
+    const rawSearch = typeof regex === 'string' && regex.trim() ? regex.trim() : String(search || '').trim();
+    const useRegex = Boolean(regex === true || (typeof regex === 'string' && regex.trim()));
+    if (rawSearch) {
+      if (useRegex) {
+        compiledRe = compileSafeRegex(rawSearch, 'i');
+      } else {
+        plainQuery = rawSearch.toLowerCase();
+      }
+    }
+
+    /** @type {Array<[string, string]>} */
+    const attrPairs = [];
+    if (typeof attr === 'string' && attr.trim()) {
+      for (const tok of attr.trim().split(/\s+/)) {
+        const cleanTok = tok.replace(/^@/, '');
+        const sepIdx = cleanTok.search(/[:=]/);
+        if (sepIdx > 0) {
+          attrPairs.push([cleanTok.slice(0, sepIdx).trim().toLowerCase(), cleanTok.slice(sepIdx + 1).trim().toLowerCase()]);
+        }
+      }
+    } else if (attr && typeof attr === 'object') {
+      for (const [k, v] of Object.entries(attr)) {
+        if (k && v !== undefined && v !== null) {
+          attrPairs.push([String(k).toLowerCase(), String(v).toLowerCase()]);
+        }
+      }
+    }
+
     const source = (projectId && projectId !== 'global' && this.projectLogs.has(projectId))
       ? /** @type {any[]} */ (this.projectLogs.get(projectId))
       : this.logs;
+
     /** @type {any[]} */
     const out = [];
     for (let i = source.length - 1; i >= 0 && out.length < cap; i--) {
       const l = source[i];
+      if (!l) continue;
       if (projectId && l.projectId !== projectId) continue;
-      if (pod && l.pod !== pod) continue;
-      if (upperLevel && l.level !== upperLevel) continue;
-      if (q && !l.message.toLowerCase().includes(q)) continue;
+      if (allowedProjects && (!l.projectId || l.projectId === 'global' || !allowedProjects.has(l.projectId))) {
+        continue;
+      }
+      if (pod && pod !== 'all' && l.pod !== pod) continue;
+      if (levelSet && !levelSet.has(l.level)) continue;
+
+      if (sinceMs !== null || untilMs !== null) {
+        const tsMs = Date.parse(l.timestamp);
+        if (!Number.isFinite(tsMs)) continue;
+        if (sinceMs !== null && tsMs < sinceMs) continue;
+        if (untilMs !== null && tsMs > untilMs) continue;
+      }
+
+      if (attrPairs.length > 0) {
+        const fields = l.fields || extractLogFields(l.message);
+        if (!fields) continue;
+        let allMatch = true;
+        for (const [ak, av] of attrPairs) {
+          const entryKey = Object.keys(fields).find((fk) => fk.toLowerCase() === ak);
+          if (!entryKey || String(fields[entryKey]).toLowerCase() !== av) {
+            allMatch = false;
+            break;
+          }
+        }
+        if (!allMatch) continue;
+      }
+
+      if (compiledRe) {
+        if (!compiledRe.test(stripAnsi(l.message))) continue;
+      } else if (plainQuery) {
+        if (!stripAnsi(l.message).toLowerCase().includes(plainQuery)) continue;
+      }
+
       out.push(l);
     }
     return out;
+  }
+
+  /**
+   * Exports filtered logs as `.log` (chronological plain text), `.ndjson`, or `.json`.
+   * @param {Parameters<ContainerOrchestrator['getLogs']>[0] & { format?: 'log' | 'ndjson' | 'json' }} [opts]
+   */
+  exportLogs(opts = {}) {
+    const format = ['log', 'ndjson', 'json'].includes(String(opts.format || 'log').toLowerCase())
+      ? String(opts.format || 'log').toLowerCase()
+      : 'log';
+    const recentFirst = this.getLogs({ ...opts, limit: Math.min(2000, Number(opts.limit) || 2000) });
+    const ordered = [...recentFirst].reverse();
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const scope = opts.projectId ? `-${String(opts.projectId).replace(/[^a-zA-Z0-9_-]/g, '')}` : '';
+
+    if (format === 'ndjson') {
+      return {
+        format: 'ndjson',
+        contentType: 'application/x-ndjson; charset=utf-8',
+        filename: `culkibo-logs${scope}-${stamp}.ndjson`,
+        count: ordered.length,
+        content: ordered.map((l) => JSON.stringify(l)).join('\n')
+      };
+    }
+    if (format === 'json') {
+      return {
+        format: 'json',
+        contentType: 'application/json; charset=utf-8',
+        filename: `culkibo-logs${scope}-${stamp}.json`,
+        count: ordered.length,
+        content: JSON.stringify({ exportedAt: new Date().toISOString(), count: ordered.length, logs: ordered }, null, 2)
+      };
+    }
+    const text = ordered
+      .map((l) => `[${l.timestamp}] [${l.level}] [${l.pod || 'system'}]${l.projectId && l.projectId !== 'global' ? ` [${l.projectId}]` : ''} ${stripAnsi(l.message)}`)
+      .join('\n');
+    return {
+      format: 'log',
+      contentType: 'text/plain; charset=utf-8',
+      filename: `culkibo-logs${scope}-${stamp}.log`,
+      count: ordered.length,
+      content: text
+    };
   }
 
   // Detección de un cambio de fichero. Todavía no lo transporta ni lo aplica.
@@ -572,8 +986,15 @@ class ContainerOrchestrator extends EventEmitter {
       clearInterval(this.metricsTimer);
       this.metricsTimer = null;
     }
+    this.flushLogsToDisk();
     await this.stopWatching();
   }
 }
 
-module.exports = new ContainerOrchestrator();
+const orchestratorInstance = Object.assign(new ContainerOrchestrator(), {
+  compileSafeRegex,
+  extractLogFields,
+  parseTimeBoundary,
+  stripAnsi
+});
+module.exports = orchestratorInstance;

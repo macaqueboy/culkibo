@@ -127,7 +127,11 @@ const CATEGORIES = [
  *   volumes?: TemplateVolume[],
  *   files?: TemplateFile[],
  *   command?: string[],
- *   readiness?: SidecarReadiness
+ *   readiness?: SidecarReadiness,
+ *   dependsOn?: string[],
+ *   startAfterApp?: boolean,
+ *   coupledWithApp?: boolean,
+ *   coupledTagOnly?: boolean
  * }} TemplateSidecar
  * @typedef {{
  *   engine: 'postgres' | 'mysql' | 'mariadb' | 'valkey' | 'redis' | 'mongodb',
@@ -135,7 +139,8 @@ const CATEGORIES = [
  *   dbName?: string,
  *   username?: string,
  *   memoryMb?: number,
- *   cpus?: number
+ *   cpus?: number,
+ *   readyTimeoutMs?: number
  * }} TemplateDatabase
  * @typedef {{ bytes: number, encoding: 'hex' | 'base64' | 'base64url' }} TemplateSecretSpec
  * @typedef {{
@@ -186,6 +191,54 @@ function makeValkeySidecar(memoryMb = 256) {
   };
 }
 
+/**
+ * Auxiliar ClickHouse fijado con supresión de logs de consulta para VPS compactos
+ * y sonda TCP real en el puerto HTTP 8123.
+ * @param {number} [memoryMb]
+ * @param {Record<string, string>} [extraEnv]
+ * @returns {TemplateSidecar}
+ */
+function makeClickhouseSidecar(memoryMb = 2048, extraEnv = {}) {
+  return {
+    name: 'clickhouse',
+    image: 'clickhouse/clickhouse-server:25.8-alpine',
+    memoryMb,
+    cpus: memoryMb >= 1536 ? 2 : 1,
+    env: { CLICKHOUSE_SKIP_USER_SETUP: '1', ...extraEnv },
+    volumes: [{ name: 'clickhouse', path: '/var/lib/clickhouse' }],
+    files: [
+      {
+        name: 'logs.xml',
+        path: '/etc/clickhouse-server/config.d/logging.xml',
+        content:
+          '<clickhouse>\n' +
+          '  <logger><level>warning</level><console>true</console></logger>\n' +
+          '  <query_thread_log remove="remove"/>\n' +
+          '  <query_log remove="remove"/>\n' +
+          '  <text_log remove="remove"/>\n' +
+          '  <trace_log remove="remove"/>\n' +
+          '  <metric_log remove="remove"/>\n' +
+          '  <asynchronous_metric_log remove="remove"/>\n' +
+          '  <session_log remove="remove"/>\n' +
+          '  <part_log remove="remove"/>\n' +
+          '</clickhouse>\n'
+      },
+      {
+        name: 'user.xml',
+        path: '/etc/clickhouse-server/users.d/logging.xml',
+        content:
+          '<clickhouse>\n' +
+          '  <profiles><default>\n' +
+          '    <log_queries>0</log_queries>\n' +
+          '    <log_query_threads>0</log_query_threads>\n' +
+          '  </default></profiles>\n' +
+          '</clickhouse>\n'
+      }
+    ],
+    readiness: { type: 'tcp', port: 8123, timeoutMs: 45000 }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Plantillas
 // ---------------------------------------------------------------------------
@@ -229,7 +282,7 @@ const TEMPLATES = [
         N8N_PROTOCOL: '{{protocol}}',
         WEBHOOK_URL: '{{url}}/',
         N8N_EDITOR_BASE_URL: '{{url}}',
-        GENERIC_TIMEZONE: 'Europe/Madrid',
+        GENERIC_TIMEZONE: '{{tz}}',
         // Sin esto n8n avisa en cada arranque de que los ficheros de
         // configuración son legibles por otros usuarios del contenedor.
         N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: 'true',
@@ -381,54 +434,13 @@ const TEMPLATES = [
       SECRET_KEY_BASE: { bytes: 64, encoding: 'base64' },
       TOTP_VAULT_KEY: { bytes: 32, encoding: 'base64' }
     },
-    sidecars: [
-      {
-        name: 'clickhouse',
-        image: 'clickhouse/clickhouse-server:25.8-alpine',
-        memoryMb: 2048,
-        cpus: 2,
-        env: { CLICKHOUSE_SKIP_USER_SETUP: '1' },
-        volumes: [{ name: 'clickhouse', path: '/var/lib/clickhouse' }],
-        // Sin estos dos ficheros, ClickHouse escribe varios GB de registro de
-        // consultas al mes en un VPS pequeño y se come el disco en semanas. Es
-        // el fallo que más se repite en las instalaciones de Plausible.
-        files: [
-          {
-            name: 'logs.xml',
-            path: '/etc/clickhouse-server/config.d/logging.xml',
-            content:
-              '<clickhouse>\n' +
-              '  <logger><level>warning</level><console>true</console></logger>\n' +
-              '  <query_thread_log remove="remove"/>\n' +
-              '  <query_log remove="remove"/>\n' +
-              '  <text_log remove="remove"/>\n' +
-              '  <trace_log remove="remove"/>\n' +
-              '  <metric_log remove="remove"/>\n' +
-              '  <asynchronous_metric_log remove="remove"/>\n' +
-              '  <session_log remove="remove"/>\n' +
-              '  <part_log remove="remove"/>\n' +
-              '</clickhouse>\n'
-          },
-          {
-            name: 'user.xml',
-            path: '/etc/clickhouse-server/users.d/logging.xml',
-            content:
-              '<clickhouse>\n' +
-              '  <profiles><default>\n' +
-              '    <log_queries>0</log_queries>\n' +
-              '    <log_query_threads>0</log_query_threads>\n' +
-              '  </default></profiles>\n' +
-              '</clickhouse>\n'
-          }
-        ]
-      }
-    ],
+    sidecars: [makeClickhouseSidecar(2048)],
     app: {
       image: 'ghcr.io/plausible/community-edition:v3.2.1',
       port: 8000,
       memoryMb: 1536,
       cpus: 1,
-      command: ['sh', '-c', 'sleep 3 && /entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run'],
+      command: ['sh', '-c', '/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run'],
       env: {
         BASE_URL: '{{url}}',
         SECRET_KEY_BASE: '{{secret.SECRET_KEY_BASE}}',
@@ -1899,13 +1911,16 @@ const TEMPLATES = [
         image: 'glitchtip/glitchtip:7.0.0',
         memoryMb: 512,
         cpus: 0.5,
+        dependsOn: ['valkey'],
+        startAfterApp: true,
+        coupledWithApp: true,
         command: ['./bin/run-celery-with-beat.sh'],
         env: {
           DATABASE_URL: '{{db.url}}',
           REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379/0',
           SECRET_KEY: '{{secret.SECRET_KEY}}',
           GLITCHTIP_DOMAIN: '{{url}}',
-          DEFAULT_FROM_EMAIL: 'noreply@{{domain}}'
+          DEFAULT_FROM_EMAIL: 'noreply@{{host}}'
         },
         volumes: []
       }
@@ -1921,7 +1936,7 @@ const TEMPLATES = [
         SECRET_KEY: '{{secret.SECRET_KEY}}',
         GLITCHTIP_DOMAIN: '{{url}}',
         PORT: '8000',
-        DEFAULT_FROM_EMAIL: 'noreply@{{domain}}',
+        DEFAULT_FROM_EMAIL: 'noreply@{{host}}',
         ENABLE_USER_REGISTRATION: 'true',
         ENABLE_ORGANIZATION_CREATION: 'true'
       },
@@ -2126,6 +2141,8 @@ const TEMPLATES = [
         image: 'ghcr.io/windmill-labs/windmill:1.881.0',
         memoryMb: 1024,
         cpus: 1,
+        startAfterApp: true,
+        coupledWithApp: true,
         env: {
           DATABASE_URL: '{{db.url}}',
           MODE: 'worker',
@@ -2178,7 +2195,7 @@ const TEMPLATES = [
       memoryMb: 512,
       cpus: 1,
       env: {
-        TZ: 'Europe/Madrid',
+        TZ: '{{tz}}',
         NODE_RED_CREDENTIAL_SECRET: '{{secret.NODE_RED_CREDENTIAL_SECRET}}',
         NODE_RED_ENABLE_PROJECTS: 'true'
       },
@@ -2913,7 +2930,7 @@ const TEMPLATES = [
         VITE_SHORTCODE_BASE_URL: '{{url}}',
         VITE_ADMIN_URL: '{{url}}/admin',
         VITE_BACKEND_GQL_URL: '{{url}}/backend/graphql',
-        VITE_BACKEND_WS_URL: 'wss://{{domain}}/backend/graphql',
+        VITE_BACKEND_WS_URL: '{{wsProtocol}}://{{domain}}/backend/graphql',
         VITE_BACKEND_API_URL: '{{url}}/backend/v1',
         ALLOW_SECURE_COOKIES: '{{isHttps}}'
       },
@@ -3035,6 +3052,9 @@ const TEMPLATES = [
         image: 'ghcr.io/goauthentik/server:2026.8.5',
         memoryMb: 1024,
         cpus: 1,
+        dependsOn: ['valkey'],
+        startAfterApp: true,
+        coupledWithApp: true,
         command: ['worker'],
         env: {
           AUTHENTIK_SECRET_KEY: '{{secret.AUTHENTIK_SECRET_KEY}}',
@@ -3226,7 +3246,7 @@ const TEMPLATES = [
       memoryMb: 256,
       cpus: 0.5,
       env: {
-        TZ: 'Europe/Madrid'
+        TZ: '{{tz}}'
       },
       volumes: [{ name: 'data', path: '/srv/data' }],
       readiness: { path: '/', expect: [200] }
@@ -3381,7 +3401,7 @@ const TEMPLATES = [
       memoryMb: 512,
       cpus: 0.5,
       env: {
-        TZ: 'Europe/Madrid',
+        TZ: '{{tz}}',
         CRON_MIN: '3,33',
         TRUSTED_PROXY: '127.0.0.1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16',
         FRESHRSS_INSTALL:
@@ -3513,7 +3533,7 @@ const TEMPLATES = [
       env: {
         PUID: '1000',
         PGID: '1000',
-        TZ: 'Europe/Madrid',
+        TZ: '{{tz}}',
         APP_URL: '{{url}}',
         APP_KEY: 'base64:{{secret.APP_KEY}}',
         DB_HOST: '{{db.host}}',
@@ -3666,7 +3686,7 @@ const TEMPLATES = [
       env: {
         PUID: '1000',
         PGID: '1000',
-        TZ: 'Europe/Madrid'
+        TZ: '{{tz}}'
       },
       volumes: [{ name: 'config', path: '/config' }],
       readiness: { path: '/', expect: [200, 302] }
@@ -3835,7 +3855,7 @@ const TEMPLATES = [
         PAPERLESS_DBPASS: '{{db.password}}',
         PAPERLESS_SECRET_KEY: '{{secret.PAPERLESS_SECRET_KEY}}',
         PAPERLESS_URL: '{{url}}',
-        PAPERLESS_TIME_ZONE: 'Europe/Madrid',
+        PAPERLESS_TIME_ZONE: '{{tz}}',
         PAPERLESS_OCR_LANGUAGE: 'spa+eng',
         PAPERLESS_ADMIN_USER: 'admin',
         PAPERLESS_ADMIN_PASSWORD: '{{secret.PAPERLESS_ADMIN_PASSWORD}}',
@@ -3965,6 +3985,9 @@ const TEMPLATES = [
         image: 'twentycrm/twenty:v2.38.1',
         memoryMb: 1024,
         cpus: 1,
+        dependsOn: ['valkey'],
+        startAfterApp: true,
+        coupledWithApp: true,
         command: ['yarn', 'worker:prod'],
         env: {
           PG_DATABASE_URL: '{{db.url}}',
@@ -4073,7 +4096,7 @@ const TEMPLATES = [
         REDIS_HOST: '{{sidecar.valkey.host}}',
         NEXTCLOUD_ADMIN_USER: 'admin',
         NEXTCLOUD_ADMIN_PASSWORD: '{{secret.NEXTCLOUD_ADMIN_PASSWORD}}',
-        NEXTCLOUD_TRUSTED_DOMAINS: '{{domain}}',
+        NEXTCLOUD_TRUSTED_DOMAINS: '{{host}}',
         OVERWRITECLIURL: '{{url}}',
         OVERWRITEPROTOCOL: '{{protocol}}'
       },
@@ -4127,8 +4150,11 @@ const TEMPLATES = [
         image: 'ghcr.io/immich-app/immich-machine-learning:v1.125.0',
         memoryMb: 2048,
         cpus: 2,
+        coupledWithApp: true,
+        coupledTagOnly: true,
         env: {},
-        volumes: [{ name: 'cache', path: '/cache' }]
+        volumes: [{ name: 'cache', path: '/cache' }],
+        readiness: { type: 'tcp', port: 3003, timeoutMs: 60000 }
       }
     ],
     app: {
@@ -4218,7 +4244,7 @@ const TEMPLATES = [
       cpus: 2,
       env: {
         JELLYFIN_PublishedServerUrl: '{{url}}',
-        TZ: 'Europe/Madrid'
+        TZ: '{{tz}}'
       },
       volumes: [
         { name: 'config', path: '/config' },
@@ -4294,7 +4320,7 @@ const TEMPLATES = [
       memoryMb: 512,
       cpus: 1,
       env: {
-        TZ: 'Europe/Madrid'
+        TZ: '{{tz}}'
       },
       volumes: [
         { name: 'config', path: '/config' },
@@ -4377,6 +4403,9 @@ const TEMPLATES = [
         image: 'chatwoot/chatwoot:v4.20.0-ce',
         memoryMb: 1024,
         cpus: 1,
+        dependsOn: ['valkey'],
+        startAfterApp: true,
+        coupledWithApp: true,
         command: ['bundle', 'exec', 'sidekiq', '-C', 'config/sidekiq.yml'],
         env: {
           RAILS_ENV: 'production',
@@ -4450,7 +4479,7 @@ const TEMPLATES = [
       cpus: 0.5,
       command: ['serve'],
       env: {
-        TZ: 'Europe/Madrid',
+        TZ: '{{tz}}',
         NTFY_BASE_URL: '{{url}}',
         NTFY_BEHIND_PROXY: 'true',
         NTFY_CACHE_FILE: '/var/cache/ntfy/cache.db',
@@ -4494,7 +4523,7 @@ const TEMPLATES = [
       memoryMb: 256,
       cpus: 0.5,
       env: {
-        TZ: 'Europe/Madrid',
+        TZ: '{{tz}}',
         GOTIFY_DEFAULTUSER_NAME: 'admin',
         GOTIFY_DEFAULTUSER_PASS: '{{secret.GOTIFY_DEFAULTUSER_PASS}}',
         GOTIFY_REGISTRATION: 'false'
@@ -4531,7 +4560,7 @@ const TEMPLATES = [
       memoryMb: 512,
       cpus: 0.5,
       env: {
-        CONDUIT_SERVER_NAME: '{{domain}}',
+        CONDUIT_SERVER_NAME: '{{host}}',
         CONDUIT_DATABASE_PATH: '/var/lib/matrix-conduit/',
         CONDUIT_DATABASE_BACKEND: 'rocksdb',
         CONDUIT_PORT: '6167',
@@ -4551,6 +4580,1798 @@ const TEMPLATES = [
     notes: [
       'Asigna un dominio HTTPS antes de federar: el nombre del servidor Matrix (`CONDUIT_SERVER_NAME`) no puede cambiarse una vez creados los usuarios.'
     ]
+  },
+
+  // -------------------------------------------------------------------------
+  // M. Expansión 2025–2026: 40 plantillas top de alta demanda (100 → 140)
+  // -------------------------------------------------------------------------
+
+  // --- AI / LLM (+7) -------------------------------------------------------
+  {
+    id: 'langfuse',
+    name: 'Langfuse',
+    category: 'ia',
+    summary: 'Observabilidad open-source para LLMs: trazas, prompts, evaluaciones y coste por token.',
+    description:
+      'Registra cada llamada a agentes y modelos de lenguaje con latencia, costes, versionado de ' +
+      'prompts y datasets de evaluación sobre PostgreSQL, ClickHouse y Valkey aislados.',
+    website: 'https://langfuse.com',
+    licence: 'MIT (edición OSS)',
+    tags: ['llm', 'observabilidad', 'trazas', 'prompts', 'agentes', 'ia'],
+    database: { engine: 'postgres', dbName: 'langfuse', username: 'langfuse', memoryMb: 512 },
+    secrets: {
+      NEXTAUTH_SECRET: { bytes: 32, encoding: 'hex' },
+      SALT: { bytes: 32, encoding: 'hex' },
+      ENCRYPTION_KEY: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [
+      makeValkeySidecar(256),
+      makeClickhouseSidecar(1536)
+    ],
+    app: {
+      image: 'langfuse/langfuse:3.55.0',
+      port: 3000,
+      memoryMb: 1536,
+      cpus: 2,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        NEXTAUTH_URL: '{{url}}',
+        NEXTAUTH_SECRET: '{{secret.NEXTAUTH_SECRET}}',
+        SALT: '{{secret.SALT}}',
+        ENCRYPTION_KEY: '{{secret.ENCRYPTION_KEY}}',
+        REDIS_HOST: '{{sidecar.valkey.host}}',
+        REDIS_PORT: '6379',
+        CLICKHOUSE_URL: 'http://{{sidecar.clickhouse.host}}:8123',
+        CLICKHOUSE_MIGRATION_URL: 'clickhouse://{{sidecar.clickhouse.host}}:9000',
+        CLICKHOUSE_USER: 'default',
+        CLICKHOUSE_CLUSTER_ENABLED: 'false',
+        TELEMETRY_ENABLED: 'false'
+      },
+      volumes: [{ name: 'data', path: '/app/data' }],
+      readiness: { path: '/api/public/health', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para registrar tu organización y generar tus claves pública y secreta de proyecto.',
+      'Conecta tus SDKs de OpenAI, LangChain o Anthropic apuntando `LANGFUSE_HOST` a {{url}}.'
+    ],
+    notes: [
+      'Langfuse v3 con ClickHouse, PostgreSQL y Valkey necesita al menos 4 GB de RAM libre.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'dify',
+    name: 'Dify',
+    category: 'ia',
+    summary: 'Constructor visual de aplicaciones LLM, pipelines RAG y agentes con API lista para producción.',
+    description:
+      'Diseña flujos agénticos, bases de conocimiento RAG y asistentes multi-modelo desde una ' +
+      'interfaz visual completa con API, worker Celery, PostgreSQL y Valkey aislados.',
+    website: 'https://dify.ai',
+    licence: 'Apache-2.0 (con cláusula Dify Open Source)',
+    tags: ['llm', 'rag', 'agentes', 'flujos', 'ia', 'workflows'],
+    database: { engine: 'postgres', dbName: 'dify', username: 'dify', memoryMb: 512 },
+    secrets: {
+      SECRET_KEY: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [
+      makeValkeySidecar(256),
+      {
+        name: 'api',
+        image: 'langgenius/dify-api:1.3.1',
+        memoryMb: 1536,
+        cpus: 1,
+        dependsOn: ['valkey'],
+        coupledWithApp: true,
+        coupledTagOnly: true,
+        env: {
+          MODE: 'api',
+          SECRET_KEY: '{{secret.SECRET_KEY}}',
+          CONSOLE_WEB_URL: '{{url}}',
+          APP_WEB_URL: '{{url}}',
+          DB_USERNAME: '{{db.user}}',
+          DB_PASSWORD: '{{db.password}}',
+          DB_HOST: '{{db.host}}',
+          DB_PORT: '{{db.port}}',
+          DB_DATABASE: '{{db.name}}',
+          REDIS_HOST: '{{sidecar.valkey.host}}',
+          REDIS_PORT: '6379',
+          CELERY_BROKER_URL: 'redis://{{sidecar.valkey.host}}:6379/1',
+          MIGRATION_ENABLED: 'true',
+          STORAGE_TYPE: 'opendal',
+          OPENDAL_SCHEME: 'fs',
+          OPENDAL_FS_ROOT: 'storage'
+        },
+        volumes: [{ name: 'storage', path: '/app/api/storage' }],
+        readiness: { type: 'tcp', port: 5001, timeoutMs: 120000 }
+      },
+      {
+        name: 'worker',
+        image: 'langgenius/dify-api:1.3.1',
+        memoryMb: 1024,
+        cpus: 1,
+        dependsOn: ['valkey', 'api'],
+        startAfterApp: true,
+        coupledWithApp: true,
+        coupledTagOnly: true,
+        env: {
+          MODE: 'worker',
+          SECRET_KEY: '{{secret.SECRET_KEY}}',
+          DB_USERNAME: '{{db.user}}',
+          DB_PASSWORD: '{{db.password}}',
+          DB_HOST: '{{db.host}}',
+          DB_PORT: '{{db.port}}',
+          DB_DATABASE: '{{db.name}}',
+          REDIS_HOST: '{{sidecar.valkey.host}}',
+          REDIS_PORT: '6379',
+          CELERY_BROKER_URL: 'redis://{{sidecar.valkey.host}}:6379/1',
+          STORAGE_TYPE: 'opendal',
+          OPENDAL_SCHEME: 'fs',
+          OPENDAL_FS_ROOT: 'storage'
+        },
+        volumes: []
+      }
+    ],
+    app: {
+      image: 'langgenius/dify-web:1.3.1',
+      port: 3000,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        CONSOLE_API_URL: 'http://{{sidecar.api.host}}:5001',
+        APP_API_URL: 'http://{{sidecar.api.host}}:5001',
+        EDITION: 'SELF_HOSTED',
+        NEXT_TELEMETRY_DISABLED: '1'
+      },
+      volumes: [{ name: 'cache', path: '/app/web/.next/cache' }],
+      readiness: { path: '/', expect: [200, 302, 307], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/install para configurar la cuenta administradora de Dify.',
+      'Añade tus proveedores de modelos (OpenAI, Anthropic, Ollama o LiteLLM) en Ajustes → Proveedores.'
+    ],
+    notes: [
+      'Stack completo (web + api + worker + PostgreSQL + Valkey) requiere al menos 4 GB de RAM.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'librechat',
+    name: 'LibreChat',
+    category: 'ia',
+    summary: 'Interfaz de chat IA multi-proveedor estilo ChatGPT con asistentes, artefactos y MCP.',
+    description:
+      'Unifica OpenAI, Anthropic, Gemini, Ollama y endpoints OpenAI-compatibles en una sola web ' +
+      'con historial persistente en MongoDB, búsqueda y control de cuentas.',
+    website: 'https://www.librechat.ai',
+    licence: 'MIT',
+    tags: ['chat', 'llm', 'chatgpt', 'mcp', 'ollama', 'ia'],
+    database: { engine: 'mongodb', dbName: 'librechat', username: 'librechat', memoryMb: 512 },
+    secrets: {
+      JWT_SECRET: { bytes: 32, encoding: 'hex' },
+      JWT_REFRESH_SECRET: { bytes: 32, encoding: 'hex' },
+      CREDS_KEY: { bytes: 32, encoding: 'hex' },
+      CREDS_IV: { bytes: 16, encoding: 'hex' }
+    },
+    app: {
+      image: 'ghcr.io/danny-avila/librechat:v0.7.7',
+      port: 3080,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        HOST: '0.0.0.0',
+        PORT: '3080',
+        DOMAIN_CLIENT: '{{url}}',
+        DOMAIN_SERVER: '{{url}}',
+        MONGO_URI: '{{db.url}}',
+        JWT_SECRET: '{{secret.JWT_SECRET}}',
+        JWT_REFRESH_SECRET: '{{secret.JWT_REFRESH_SECRET}}',
+        CREDS_KEY: '{{secret.CREDS_KEY}}',
+        CREDS_IV: '{{secret.CREDS_IV}}',
+        ALLOW_EMAIL_LOGIN: 'true',
+        ALLOW_REGISTRATION: 'true',
+        NO_INDEX: 'true'
+      },
+      volumes: [
+        { name: 'images', path: '/app/client/public/images' },
+        { name: 'uploads', path: '/app/uploads' },
+        { name: 'logs', path: '/app/api/logs' }
+      ],
+      readiness: { path: '/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Crea tu cuenta en {{url}} y luego desactiva el registro (`ALLOW_REGISTRATION=false`) en Variables.',
+      'Añade tus claves (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) en Variables para activar proveedores.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'lobechat',
+    name: 'LobeChat',
+    category: 'ia',
+    summary: 'Cliente IA moderno con mercado de plugins, artefactos, visión, voz y soporte MCP.',
+    description:
+      'Interfaz de última generación para conversar con decenas de proveedores LLM con base de ' +
+      'datos PostgreSQL para sincronizar sesiones, agentes personalizados y memoria.',
+    website: 'https://lobehub.com',
+    licence: 'Apache-2.0 (con cláusula LobeHub)',
+    tags: ['chat', 'llm', 'plugins', 'mcp', 'agentes', 'ia'],
+    database: { engine: 'postgres', dbName: 'lobechat', username: 'lobechat', memoryMb: 512 },
+    secrets: {
+      KEY_VAULTS_SECRET: { bytes: 32, encoding: 'base64' },
+      NEXT_AUTH_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'lobehub/lobe-chat-database:1.84.12',
+      port: 3210,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        APP_URL: '{{url}}',
+        DATABASE_URL: '{{db.url}}',
+        DATABASE_DRIVER: 'node',
+        KEY_VAULTS_SECRET: '{{secret.KEY_VAULTS_SECRET}}',
+        NEXT_AUTH_SECRET: '{{secret.NEXT_AUTH_SECRET}}',
+        NEXTAUTH_URL: '{{url}}/api/auth',
+        NEXT_PUBLIC_SERVICE_MODE: 'server'
+      },
+      volumes: [{ name: 'cache', path: '/app/.next/cache' }],
+      readiness: { path: '/', expect: [200, 302, 307], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y configura tus proveedores de modelos o conecta un proveedor OIDC en Variables.',
+      'Activa servidores MCP o plugins directamente desde el menú de extensiones.'
+    ],
+    notes: [
+      'Configura un proveedor de autenticación (Authentik, Keycloak o Pocket ID) en Variables para uso multiusuario.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'langflow',
+    name: 'Langflow',
+    category: 'ia',
+    summary: 'Editor visual low-code en Python para diseñar agentes IA, cadenas RAG y APIs MCP.',
+    description:
+      'Arrastra componentes de LangChain, modelos locales o en la nube y bases vectoriales para ' +
+      'prototipar y servir flujos de IA como endpoints REST o servidores MCP.',
+    website: 'https://www.langflow.org',
+    licence: 'MIT',
+    tags: ['agentes', 'rag', 'python', 'visual', 'mcp', 'ia'],
+    database: { engine: 'postgres', dbName: 'langflow', username: 'langflow', memoryMb: 512 },
+    secrets: {
+      LANGFLOW_SUPERUSER_PASSWORD: { bytes: 18, encoding: 'base64url' },
+      LANGFLOW_SECRET_KEY: { bytes: 32, encoding: 'base64url' }
+    },
+    app: {
+      image: 'langflowai/langflow:1.3.4',
+      port: 7860,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        LANGFLOW_DATABASE_URL: '{{db.url}}',
+        LANGFLOW_CONFIG_DIR: '/app/langflow',
+        LANGFLOW_AUTO_LOGIN: 'false',
+        LANGFLOW_SUPERUSER: 'admin',
+        LANGFLOW_SUPERUSER_PASSWORD: '{{secret.LANGFLOW_SUPERUSER_PASSWORD}}',
+        LANGFLOW_SECRET_KEY: '{{secret.LANGFLOW_SECRET_KEY}}',
+        DO_NOT_TRACK: 'true'
+      },
+      volumes: [{ name: 'data', path: '/app/langflow' }],
+      readiness: { path: '/health', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con `LANGFLOW_SUPERUSER_PASSWORD` desde «Credenciales».',
+      'Crea un flujo desde plantilla y publícalo como API REST o endpoint MCP.'
+    ],
+    notes: [
+      'El primer arranque migra el esquema Python/FastAPI y requiere al menos 2 GB de RAM.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'perplexica',
+    name: 'Perplexica',
+    category: 'ia',
+    summary: 'Motor de búsqueda con IA autohospedado (alternativa a Perplexity) con SearXNG integrado.',
+    description:
+      'Combina búsqueda web privada en tiempo real mediante un auxiliar SearXNG aislado con ' +
+      'modelos locales (Ollama) o en la nube para responder con citas verificables.',
+    website: 'https://github.com/ItzCrazyKns/Perplexica',
+    licence: 'MIT',
+    tags: ['busqueda', 'perplexity', 'searxng', 'rag', 'ia'],
+    database: null,
+    secrets: {
+      SEARXNG_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [
+      {
+        name: 'searxng',
+        image: 'searxng/searxng:2026.11.18-b867c56a5',
+        memoryMb: 512,
+        cpus: 0.5,
+        env: {
+          SEARXNG_SECRET: '{{secret.SEARXNG_SECRET}}'
+        },
+        volumes: [{ name: 'config', path: '/etc/searxng' }],
+        readiness: { type: 'tcp', port: 8080, timeoutMs: 45000 }
+      }
+    ],
+    app: {
+      image: 'itzcrazykns1337/perplexica:1.10.2',
+      port: 3000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        SEARXNG_API_URL: 'http://{{sidecar.searxng.host}}:8080'
+      },
+      volumes: [
+        { name: 'data', path: '/home/perplexica/data' },
+        { name: 'uploads', path: '/home/perplexica/uploads' }
+      ],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} y configura tu proveedor de chat y embeddings (Ollama, OpenAI, Groq o Anthropic) en Ajustes.',
+      'Activa el formato JSON en SearXNG si personalizas `settings.yml`.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'milvus',
+    name: 'Milvus',
+    category: 'ia',
+    summary: 'Base de datos vectorial de alto rendimiento para búsqueda semántica y RAG a escala.',
+    description:
+      'Despliegue standalone autocontenido con etcd embebido y almacenamiento local en volumen, ' +
+      'exponiendo salud HTTP en 9091 y API vectorial gRPC en el puerto auxiliar 19530.',
+    website: 'https://milvus.io',
+    licence: 'Apache-2.0',
+    tags: ['vectores', 'embeddings', 'rag', 'ia', 'busqueda'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'milvusdb/milvus:v2.5.10',
+      port: 9091,
+      extraPorts: [{ containerPort: 19530, label: 'gRPC API' }],
+      memoryMb: 2048,
+      cpus: 2,
+      command: ['milvus', 'run', 'standalone'],
+      env: {
+        ETCD_USE_EMBED: 'true',
+        ETCD_DATA_DIR: '/var/lib/milvus/etcd',
+        COMMON_STORAGETYPE: 'local',
+        DEPLOY_MODE: 'STANDALONE'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/milvus' }],
+      readiness: { path: '/healthz', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Conecta tus clientes pymilvus o LangChain al puerto auxiliar gRPC (19530) en `127.0.0.1`.',
+      'Consulta métricas Prometheus y estado en {{url}}/metrics y {{url}}/healthz.'
+    ],
+    notes: [
+      'Configurado en modo standalone con etcd embebido y almacenamiento local para reducir complejidad y RAM.'
+    ]
+  },
+
+  // --- Auth / IAM & Seguridad (+7) -----------------------------------------
+  {
+    id: 'authelia',
+    name: 'Authelia',
+    category: 'seguridad',
+    summary: 'Servidor ligero de autenticación 2FA/Passkeys y SSO (OIDC + Forward Auth) para tu proxy.',
+    description:
+      'Protege cualquier servicio web con inicio de sesión único, TOTP, llaves WebAuthn y reglas ' +
+      'de acceso granulares sobre PostgreSQL y Valkey en una fracción de memoria.',
+    website: 'https://www.authelia.com',
+    licence: 'Apache-2.0',
+    tags: ['sso', '2fa', 'oidc', 'passkeys', 'forward-auth', 'seguridad'],
+    database: { engine: 'postgres', dbName: 'authelia', username: 'authelia', memoryMb: 256 },
+    secrets: {
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET: { bytes: 32, encoding: 'hex' },
+      AUTHELIA_SESSION_SECRET: { bytes: 32, encoding: 'hex' },
+      AUTHELIA_STORAGE_ENCRYPTION_KEY: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [makeValkeySidecar(128)],
+    app: {
+      image: 'authelia/authelia:4.39.1',
+      port: 9091,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        TZ: '{{tz}}',
+        AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET: '{{secret.AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET}}',
+        AUTHELIA_SESSION_SECRET: '{{secret.AUTHELIA_SESSION_SECRET}}',
+        AUTHELIA_STORAGE_ENCRYPTION_KEY: '{{secret.AUTHELIA_STORAGE_ENCRYPTION_KEY}}',
+        AUTHELIA_STORAGE_POSTGRES_ADDRESS: 'tcp://{{db.host}}:{{db.port}}',
+        AUTHELIA_STORAGE_POSTGRES_DATABASE: '{{db.name}}',
+        AUTHELIA_STORAGE_POSTGRES_USERNAME: '{{db.user}}',
+        AUTHELIA_STORAGE_POSTGRES_PASSWORD: '{{db.password}}',
+        AUTHELIA_SESSION_REDIS_HOST: '{{sidecar.valkey.host}}',
+        AUTHELIA_SESSION_REDIS_PORT: '6379'
+      },
+      files: [
+        {
+          name: 'configuration.yml',
+          path: '/config/configuration.yml',
+          content:
+            'theme: auto\n' +
+            'server:\n' +
+            '  address: tcp://:9091\n' +
+            'log:\n' +
+            '  level: info\n' +
+            'authentication_backend:\n' +
+            '  file:\n' +
+            '    path: /data/users_database.yml\n' +
+            'access_control:\n' +
+            '  default_policy: two_factor\n' +
+            'session:\n' +
+            '  cookies:\n' +
+            '    - domain: localhost\n' +
+            '      authelia_url: http://localhost:9091\n' +
+            'notifier:\n' +
+            '  filesystem:\n' +
+            '    filename: /data/notification.txt\n'
+        }
+      ],
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/api/health', expect: [200] }
+    },
+    nextSteps: [
+      'Crea tu archivo `/data/users_database.yml` dentro del volumen (usando `authelia crypto hash generate argon2`).',
+      'Asigna un dominio HTTPS y ajusta `session.cookies` si proteges múltiples subdominios.'
+    ],
+    notes: [
+      'Los secretos criptográficos se inyectan exclusivamente por variables de entorno (nunca en texto plano en `configuration.yml`).'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'zitadel',
+    name: 'Zitadel',
+    category: 'seguridad',
+    summary: 'Plataforma IAM cloud-native en Go con OIDC, SAML 2.0, Passkeys, multitenancy y auditoría.',
+    description:
+      'Alternativa moderna y ultraligera a Auth0 y Keycloak con trazabilidad completa de eventos, ' +
+      'organizaciones aisladas y APIs gRPC/REST sobre PostgreSQL.',
+    website: 'https://zitadel.com',
+    licence: 'Apache-2.0',
+    tags: ['iam', 'oidc', 'saml', 'sso', 'passkeys', 'auth0'],
+    database: { engine: 'postgres', dbName: 'zitadel', username: 'zitadel', memoryMb: 512 },
+    secrets: {
+      // Zitadel exige exactamente 32 caracteres para su clave maestra.
+      ZITADEL_MASTERKEY: { bytes: 16, encoding: 'hex' }
+    },
+    app: {
+      image: 'ghcr.io/zitadel/zitadel:v2.71.6',
+      port: 8080,
+      memoryMb: 512,
+      cpus: 1,
+      command: ['start-from-init', '--masterkeyFromEnv'],
+      env: {
+        ZITADEL_MASTERKEY: '{{secret.ZITADEL_MASTERKEY}}',
+        ZITADEL_EXTERNALDOMAIN: '{{host}}',
+        ZITADEL_EXTERNALPORT: '443',
+        ZITADEL_EXTERNALSECURE: '{{isHttps}}',
+        ZITADEL_TLS_ENABLED: 'false',
+        ZITADEL_DATABASE_POSTGRES_HOST: '{{db.host}}',
+        ZITADEL_DATABASE_POSTGRES_PORT: '{{db.port}}',
+        ZITADEL_DATABASE_POSTGRES_DATABASE: '{{db.name}}',
+        ZITADEL_DATABASE_POSTGRES_USER_USERNAME: '{{db.user}}',
+        ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: '{{db.password}}',
+        ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: 'disable',
+        ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: '{{db.user}}',
+        ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: '{{db.password}}',
+        ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: 'disable'
+      },
+      volumes: [],
+      readiness: { path: '/debug/healthz', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/ui/console e inicia sesión con el usuario inicial (`zitadel-admin@zitadel.<dominio>` / `Password1!`) y cámbiala de inmediato.',
+      'Asigna un dominio HTTPS antes de emitir tokens OIDC en producción.'
+    ],
+    notes: [
+      'Zitadel vincula su dominio externo al inicializar la base de datos: recomienda instalarlo directamente con dominio.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'logto',
+    name: 'Logto',
+    category: 'seguridad',
+    summary: 'Infraestructura de identidad moderna (alternativa a Clerk/Auth0) con SDKs y consola web.',
+    description:
+      'Autenticación lista para apps web y móviles con login social, magic links, RBAC, MFA, ' +
+      'organizaciones B2B y consola de administración en el puerto auxiliar 3002.',
+    website: 'https://logto.io',
+    licence: 'MPL-2.0',
+    tags: ['auth', 'oidc', 'clerk', 'auth0', 'rbac', 'identidad'],
+    database: { engine: 'postgres', dbName: 'logto', username: 'logto', memoryMb: 512 },
+    secrets: {},
+    app: {
+      image: 'svhd/logto:1.27.0',
+      port: 3001,
+      extraPorts: [{ containerPort: 3002, label: 'Admin Console' }],
+      memoryMb: 1024,
+      cpus: 1,
+      command: ['sh', '-c', 'npm run cli db seed -- --swe && npm start'],
+      env: {
+        TRUST_PROXY_HEADER: '1',
+        DB_URL: '{{db.url}}',
+        ENDPOINT: '{{url}}',
+        ADMIN_ENDPOINT: 'http://127.0.0.1:3002'
+      },
+      volumes: [],
+      readiness: { path: '/api/status', expect: [200, 204], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre la consola de administración (puerto auxiliar 3002) para crear tu cuenta administradora.',
+      'Registra tu primera aplicación OIDC y copia el `App ID` en tu frontend o backend.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'twofauth',
+    name: '2FAuth',
+    category: 'seguridad',
+    summary: 'Gestor web autohospedado para códigos 2FA (TOTP/HOTP) con escáner QR y Passkeys.',
+    description:
+      'Alternativa privada a Authy y Google Authenticator accesible desde cualquier navegador o ' +
+      'PWA móvil, con base de datos SQLite cifrada mediante `APP_KEY` única.',
+    website: 'https://docs.2fauth.app',
+    licence: 'AGPLv3',
+    tags: ['2fauth', '2fa', 'totp', 'otp', 'mfa', 'seguridad'],
+    database: null,
+    secrets: {
+      APP_KEY: { bytes: 16, encoding: 'hex' }
+    },
+    app: {
+      image: '2fauth/2fauth:5.4.3',
+      port: 8000,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        APP_NAME: '2FAuth',
+        APP_ENV: 'production',
+        APP_DEBUG: 'false',
+        APP_URL: '{{url}}',
+        APP_KEY: '{{secret.APP_KEY}}',
+        IS_DEMO_APP: 'false',
+        TRUSTED_PROXIES: '*',
+        AUTHENTICATION_GUARD: 'web-guard'
+      },
+      volumes: [{ name: 'data', path: '/2fauth' }],
+      readiness: { path: '/', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Abre {{url}} para registrar tu cuenta administradora y desactivar registros adicionales.',
+      'Guarda una copia de `APP_KEY` desde «Credenciales»: sin ella no se pueden descifrar los secretos TOTP.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'headscale',
+    name: 'Headscale',
+    category: 'seguridad',
+    summary: 'Servidor de control autohospedado y open-source compatible con clientes oficiales Tailscale.',
+    description:
+      'Coordina tu propia red mesh WireGuard privada sin depender del plano de control en la nube ' +
+      'de Tailscale ni abrir puertos peligrosos en tus nodos internos.',
+    website: 'https://headscale.net',
+    licence: 'BSD-3-Clause',
+    tags: ['vpn', 'tailscale', 'wireguard', 'mesh', 'red', 'seguridad'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'headscale/headscale:0.25.1',
+      port: 8080,
+      memoryMb: 256,
+      cpus: 0.5,
+      command: ['serve'],
+      env: {
+        TZ: '{{tz}}'
+      },
+      files: [
+        {
+          name: 'config.yaml',
+          path: '/etc/headscale/config.yaml',
+          content:
+            'server_url: http://127.0.0.1:8080\n' +
+            'listen_addr: 0.0.0.0:8080\n' +
+            'metrics_listen_addr: 127.0.0.1:9090\n' +
+            'noise:\n' +
+            '  private_key_path: /var/lib/headscale/noise_private.key\n' +
+            'prefixes:\n' +
+            '  v4: 100.64.0.0/10\n' +
+            '  v6: fd7a:115c:a1e0::/48\n' +
+            'derp:\n' +
+            '  server:\n' +
+            '    enabled: false\n' +
+            '  urls:\n' +
+            '    - https://controlplane.tailscale.com/derpmap/default\n' +
+            '  auto_update_enabled: true\n' +
+            '  update_frequency: 24h\n' +
+            'database:\n' +
+            '  type: sqlite\n' +
+            '  sqlite:\n' +
+            '    path: /var/lib/headscale/db.sqlite\n' +
+            'dns:\n' +
+            '  magic_dns: true\n' +
+            '  base_domain: culkibo.internal\n'
+        }
+      ],
+      volumes: [{ name: 'data', path: '/var/lib/headscale' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Crea tu primer usuario dentro del contenedor con `headscale users create mi-red`.',
+      'Asigna un dominio HTTPS y actualiza `server_url` o pasa `HEADSCALE_SERVER_URL={{url}}` en Variables.'
+    ],
+    notes: [
+      'Headscale actúa únicamente como plano de control HTTP/HTTPS (no necesita privilegios NET_ADMIN ni `docker.sock`).'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'guacamole',
+    name: 'Apache Guacamole',
+    category: 'seguridad',
+    summary: 'Pasarela de escritorio remoto sin cliente (RDP, VNC y SSH) directamente desde el navegador.',
+    description:
+      'Accede de forma centralizada y auditada a servidores Linux y escritorios Windows vía HTML5 ' +
+      'con el demonio `guacd` y autenticación persistente en PostgreSQL.',
+    website: 'https://guacamole.apache.org',
+    licence: 'Apache-2.0',
+    tags: ['rdp', 'vnc', 'ssh', 'escritorio remoto', 'bastion', 'seguridad'],
+    database: { engine: 'postgres', dbName: 'guacamole', username: 'guacamole', memoryMb: 512 },
+    secrets: {},
+    sidecars: [
+      {
+        name: 'guacd',
+        image: 'guacamole/guacd:1.5.5',
+        memoryMb: 512,
+        cpus: 1,
+        coupledWithApp: true,
+        coupledTagOnly: true,
+        env: {},
+        volumes: [],
+        readiness: { type: 'tcp', port: 4822, timeoutMs: 30000 }
+      }
+    ],
+    app: {
+      image: 'guacamole/guacamole:1.5.5',
+      port: 8080,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        GUACD_HOSTNAME: '{{sidecar.guacd.host}}',
+        GUACD_PORT: '4822',
+        POSTGRESQL_HOSTNAME: '{{db.host}}',
+        POSTGRESQL_PORT: '{{db.port}}',
+        POSTGRESQL_DATABASE: '{{db.name}}',
+        POSTGRESQL_USER: '{{db.user}}',
+        POSTGRESQL_PASSWORD: '{{db.password}}',
+        POSTGRESQL_AUTO_CREATE_ACCOUNTS: 'true'
+      },
+      volumes: [{ name: 'home', path: '/etc/guacamole' }],
+      readiness: { path: '/guacamole/', expect: [200, 302], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Inicializa el esquema SQL de Guacamole en la BD gestionada (`initdb.sh --postgresql`) si es el primer arranque.',
+      'Abre {{url}}/guacamole/ e inicia sesión con `guacadmin` / `guacadmin`, cambiando la contraseña al instante.'
+    ],
+    notes: [
+      'Cambia la contraseña por defecto `guacadmin` y activa TOTP antes de exponer Guacamole en internet.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'adguard-home',
+    name: 'AdGuard Home',
+    category: 'seguridad',
+    summary: 'Bloqueador DNS de anuncios y rastreadores con soporte DoH/DoT y panel de estadísticas.',
+    description:
+      'Filtra dominios maliciosos, telemetría y publicidad con listas personalizables, reescrituras ' +
+      'DNS locales y panel web protegido.',
+    website: 'https://adguard.com/en/adguard-home/overview.html',
+    licence: 'GPLv3',
+    tags: ['dns', 'adblock', 'privacidad', 'doh', 'red', 'seguridad'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'adguard/adguardhome:v0.107.59',
+      port: 3000,
+      extraPorts: [{ containerPort: 80, label: 'Panel Web (post-setup)' }],
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        TZ: '{{tz}}'
+      },
+      volumes: [
+        { name: 'work', path: '/opt/adguardhome/work' },
+        { name: 'conf', path: '/opt/adguardhome/conf' }
+      ],
+      readiness: { path: '/', expect: [200, 302, 307] }
+    },
+    nextSteps: [
+      'Abre {{url}} para completar el asistente inicial en el puerto 3000 y fijar tu usuario y contraseña.',
+      'Usa DNS-over-HTTPS (DoH) detrás de Caddy para filtrar tráfico de forma cifrada sin exponer el puerto 53 abierto.'
+    ],
+    notes: [
+      'Por seguridad Culkibo publica los puertos solo en `127.0.0.1`: para clientes externos usa DoH tras tu dominio HTTPS.'
+    ]
+  },
+
+  // --- Productividad, Documentación y Finanzas (+10) -----------------------
+  {
+    id: 'outline',
+    name: 'Outline',
+    category: 'docs',
+    summary: 'Base de conocimiento y wiki colaborativa ultrarrápida para equipos (alternativa a Notion).',
+    description:
+      'Editor en tiempo real con Markdown, colecciones jerárquicas, búsqueda instantánea, ' +
+      'comentarios y SSO sobre PostgreSQL y Valkey.',
+    website: 'https://www.getoutline.com',
+    licence: 'BSL 1.1 (código fuente disponible)',
+    tags: ['wiki', 'notion', 'confluence', 'documentacion', 'equipos'],
+    database: { engine: 'postgres', dbName: 'outline', username: 'outline', memoryMb: 512 },
+    secrets: {
+      SECRET_KEY: { bytes: 32, encoding: 'hex' },
+      UTILS_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'docker.getoutline.com/outlinewiki/outline:0.82.0',
+      port: 3000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        NODE_ENV: 'production',
+        URL: '{{url}}',
+        PORT: '3000',
+        SECRET_KEY: '{{secret.SECRET_KEY}}',
+        UTILS_SECRET: '{{secret.UTILS_SECRET}}',
+        DATABASE_URL: '{{db.url}}',
+        PGSSLMODE: 'disable',
+        REDIS_URL: 'redis://{{sidecar.valkey.host}}:6379',
+        FILE_STORAGE: 'local',
+        FILE_STORAGE_LOCAL_ROOT_DIR: '/var/lib/outline/data',
+        FILE_STORAGE_UPLOAD_MAX_SIZE: '26214400',
+        FORCE_HTTPS: '{{isHttps}}',
+        DEFAULT_LANGUAGE: 'es_ES'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/outline/data' }],
+      readiness: { path: '/_health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Configura un proveedor OIDC (Authentik, Keycloak, Pocket ID o Google) en Variables: Outline requiere SSO para iniciar sesión.',
+      'Abre {{url}} tras guardar tus variables OIDC.'
+    ],
+    notes: [
+      'Outline no incluye login local con contraseña por diseño: conéctalo a Authentik, Keycloak o Pocket ID desde el catálogo.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'affine',
+    name: 'AFFiNE',
+    category: 'docs',
+    summary: 'Espacio de trabajo local-first que une documentos, pizarras infinitas y bases de datos.',
+    description:
+      'Alternativa open-source a Notion y Miro con edición colaborativa offline-first, modo pizarra ' +
+      'Edgeless y almacenamiento persistente sobre PostgreSQL y Valkey.',
+    website: 'https://affine.pro',
+    licence: 'MIT (edición comunitaria)',
+    tags: ['notion', 'miro', 'pizarra', 'documentos', 'workspace'],
+    database: { engine: 'postgres', dbName: 'affine', username: 'affine', memoryMb: 512 },
+    secrets: {},
+    sidecars: [makeValkeySidecar(256)],
+    app: {
+      image: 'ghcr.io/toeverything/affine:0.20.4',
+      port: 3010,
+      memoryMb: 1536,
+      cpus: 2,
+      env: {
+        NODE_ENV: 'production',
+        AFFINE_SERVER_EXTERNAL_URL: '{{url}}',
+        DATABASE_URL: '{{db.url}}',
+        REDIS_SERVER_HOST: '{{sidecar.valkey.host}}',
+        REDIS_SERVER_PORT: '6379',
+        AFFINE_INDEXER_ENABLED: 'false'
+      },
+      volumes: [
+        { name: 'storage', path: '/root/.affine/storage' },
+        { name: 'config', path: '/root/.affine/config' }
+      ],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/admin/setup en el primer arranque para crear la cuenta administradora.',
+      'Conecta los clientes de escritorio de AFFiNE a tu instancia en {{url}}.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'calcom',
+    name: 'Cal.com',
+    category: 'productividad',
+    summary: 'Infraestructura abierta de reservas y agendas (alternativa autohospedada a Calendly).',
+    description:
+      'Publica enlaces de reserva sincronizados con Google Calendar, CalDAV o Outlook, con reglas ' +
+      'de disponibilidad, zonas horarias y flujos automatizados sobre PostgreSQL.',
+    website: 'https://cal.com',
+    licence: 'AGPLv3',
+    tags: ['calendario', 'reservas', 'calendly', 'citas', 'productividad'],
+    database: { engine: 'postgres', dbName: 'calcom', username: 'calcom', memoryMb: 512 },
+    secrets: {
+      NEXTAUTH_SECRET: { bytes: 32, encoding: 'base64' },
+      CALENDSO_ENCRYPTION_KEY: { bytes: 24, encoding: 'base64' }
+    },
+    app: {
+      image: 'calcom/cal.com:v5.1.10',
+      port: 3000,
+      memoryMb: 2048,
+      cpus: 2,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        DATABASE_DIRECT_URL: '{{db.url}}',
+        NEXT_PUBLIC_WEBAPP_URL: '{{url}}',
+        NEXTAUTH_URL: '{{url}}',
+        NEXTAUTH_SECRET: '{{secret.NEXTAUTH_SECRET}}',
+        CALENDSO_ENCRYPTION_KEY: '{{secret.CALENDSO_ENCRYPTION_KEY}}',
+        NEXT_PUBLIC_LICENSE_CONSENT: 'agree',
+        CALCOM_TELEMETRY_DISABLED: '1'
+      },
+      volumes: [],
+      readiness: { path: '/api/health', expect: [200], timeoutMs: 240000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/auth/setup para completar la configuración inicial y crear tu cuenta.',
+      'Configura SMTP (`EMAIL_SERVER_HOST`, `EMAIL_FROM`) en Variables para enviar confirmaciones de reserva.'
+    ],
+    notes: [
+      'El primer arranque aplica migraciones Prisma y compila recursos: requiere 2 GB de RAM y 1–3 minutos.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'docuseal',
+    name: 'DocuSeal',
+    category: 'productividad',
+    summary: 'Firma electrónica de documentos y formularios PDF (alternativa abierta a DocuSign).',
+    description:
+      'Crea plantillas PDF arrastrando campos de firma, envía contratos a múltiples firmantes con ' +
+      'registro de auditoría y almacena los documentos firmados en tu servidor.',
+    website: 'https://www.docuseal.com',
+    licence: 'AGPLv3',
+    tags: ['firma', 'pdf', 'contratos', 'docusign', 'documentos'],
+    database: { engine: 'postgres', dbName: 'docuseal', username: 'docuseal', memoryMb: 512 },
+    secrets: {
+      SECRET_KEY_BASE: { bytes: 64, encoding: 'hex' }
+    },
+    app: {
+      image: 'docuseal/docuseal:2.0.2',
+      port: 3000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        SECRET_KEY_BASE: '{{secret.SECRET_KEY_BASE}}',
+        FORCE_SSL: '{{isHttps}}'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/up', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para registrar tu cuenta de administración y subir tu primera plantilla PDF.',
+      'Configura SMTP dentro de Ajustes → Correo para enviar solicitudes de firma automáticamente.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'actual-budget',
+    name: 'Actual Budget',
+    category: 'productividad',
+    summary: 'Finanzas personales local-first con presupuesto por sobres y sincronización cifrada.',
+    description:
+      'Alternativa rápida y privada a YNAB con soporte de importación bancaria, informes de flujo ' +
+      'de caja y cifrado extremo a extremo en menos de 256 MB de RAM.',
+    website: 'https://actualbudget.org',
+    licence: 'MIT',
+    tags: ['finanzas', 'presupuesto', 'ynab', 'contabilidad', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'actualbudget/actual-server:25.4.0',
+      port: 5006,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        ACTUAL_PORT: '5006',
+        ACTUAL_DATA_DIR: '/data'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Abre {{url}} bajo HTTPS para establecer la contraseña inicial del servidor.',
+      'Crea tu primer presupuesto o importa tu historial desde YNAB/CSV.'
+    ],
+    notes: [
+      'Actual Budget usa SharedArrayBuffer en el navegador: requiere dominio HTTPS para funcionar fuera de `127.0.0.1`.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'firefly-iii',
+    name: 'Firefly III',
+    category: 'productividad',
+    summary: 'Gestor completo de finanzas personales por partida doble con reglas, metas e informes.',
+    description:
+      'Controla cuentas bancarias, tarjetas, presupuestos recurrentes, facturas y etiquetas con ' +
+      'API REST completa sobre MariaDB aislada.',
+    website: 'https://www.firefly-iii.org',
+    licence: 'AGPLv3',
+    tags: ['finanzas', 'gastos', 'banca', 'presupuesto', 'contabilidad'],
+    database: { engine: 'mariadb', dbName: 'firefly', username: 'firefly', memoryMb: 512 },
+    secrets: {
+      // Firefly III exige exactamente 32 caracteres para APP_KEY.
+      APP_KEY: { bytes: 16, encoding: 'hex' }
+    },
+    app: {
+      image: 'fireflyiii/core:version-6.2.10',
+      port: 8080,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        APP_ENV: 'production',
+        APP_DEBUG: 'false',
+        APP_URL: '{{url}}',
+        APP_KEY: '{{secret.APP_KEY}}',
+        TZ: '{{tz}}',
+        DEFAULT_LANGUAGE: 'es_ES',
+        DB_CONNECTION: 'mysql',
+        DB_HOST: '{{db.host}}',
+        DB_PORT: '{{db.port}}',
+        DB_DATABASE: '{{db.name}}',
+        DB_USERNAME: '{{db.user}}',
+        DB_PASSWORD: '{{db.password}}',
+        TRUSTED_PROXIES: '**'
+      },
+      volumes: [{ name: 'upload', path: '/var/www/html/storage/upload' }],
+      readiness: { path: '/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para registrar tu primera cuenta de propietario.',
+      'Guarda `APP_KEY` desde «Credenciales» junto a tus copias de seguridad.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'karakeep',
+    name: 'Karakeep',
+    category: 'productividad',
+    summary: 'Gestor de marcadores, notas y capturas web con auto-etiquetado IA y búsqueda instantánea.',
+    description:
+      'Anteriormente Hoarder: guarda enlaces, imágenes y notas rápidas con archivado automático ' +
+      'de páginas, búsqueda full-text con Meilisearch y apps móviles oficiales.',
+    website: 'https://karakeep.app',
+    licence: 'AGPLv3',
+    tags: ['marcadores', 'bookmarks', 'hoarder', 'read-later', 'ia'],
+    database: null,
+    secrets: {
+      NEXTAUTH_SECRET: { bytes: 32, encoding: 'base64url' },
+      MEILI_MASTER_KEY: { bytes: 24, encoding: 'base64url' }
+    },
+    sidecars: [
+      {
+        name: 'meilisearch',
+        image: 'getmeili/meilisearch:v1.13.3',
+        memoryMb: 512,
+        cpus: 0.5,
+        env: {
+          MEILI_NO_ANALYTICS: 'true',
+          MEILI_MASTER_KEY: '{{secret.MEILI_MASTER_KEY}}'
+        },
+        volumes: [{ name: 'data', path: '/meili_data' }],
+        readiness: { type: 'tcp', port: 7700, timeoutMs: 30000 }
+      }
+    ],
+    app: {
+      image: 'ghcr.io/karakeep-app/karakeep:0.24.1',
+      port: 3000,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        NEXTAUTH_URL: '{{url}}',
+        NEXTAUTH_SECRET: '{{secret.NEXTAUTH_SECRET}}',
+        MEILI_ADDR: 'http://{{sidecar.meilisearch.host}}:7700',
+        MEILI_MASTER_KEY: '{{secret.MEILI_MASTER_KEY}}',
+        DATA_DIR: '/data',
+        DISABLE_NEW_RELEASE_CHECK: 'true'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/api/health', expect: [200], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear tu cuenta y luego añade `DISABLE_SIGNUPS=true` en Variables si es uso privado.',
+      'Opcionalmente añade `OPENAI_API_KEY` u `OLLAMA_BASE_URL` en Variables para auto-etiquetado por IA.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'linkwarden',
+    name: 'Linkwarden',
+    category: 'productividad',
+    summary: 'Gestor colaborativo de marcadores que archiva capturas y copias permanentes de cada web.',
+    description:
+      'Preserva artículos, PDFs y páginas completas contra enlaces rotos, organízalos por ' +
+      'colecciones compartidas y sincronízalos con su extensión de navegador sobre PostgreSQL.',
+    website: 'https://linkwarden.app',
+    licence: 'AGPLv3',
+    tags: ['marcadores', 'archivo', 'bookmarks', 'colecciones', 'productividad'],
+    database: { engine: 'postgres', dbName: 'linkwarden', username: 'linkwarden', memoryMb: 512 },
+    secrets: {
+      NEXTAUTH_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'ghcr.io/linkwarden/linkwarden:v2.9.3',
+      port: 3000,
+      memoryMb: 1536,
+      cpus: 1,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        NEXTAUTH_URL: '{{url}}/api/v1/auth',
+        NEXTAUTH_SECRET: '{{secret.NEXTAUTH_SECRET}}'
+      },
+      volumes: [{ name: 'data', path: '/data/data' }],
+      readiness: { path: '/', expect: [200, 302, 307], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para registrar tu primera cuenta y crear colecciones.',
+      'Instala la extensión de Linkwarden en tu navegador apuntando a {{url}}.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'linkding',
+    name: 'Linkding',
+    category: 'productividad',
+    summary: 'Gestor minimalista de marcadores con instantáneas HTML, etiquetas y consumo mínimo.',
+    description:
+      'Guarda miles de enlaces con búsqueda instantánea, importación desde Pocket o navegadores ' +
+      'y API REST en menos de 256 MB de RAM con SQLite integrado.',
+    website: 'https://linkding.link',
+    licence: 'MIT',
+    tags: ['marcadores', 'bookmarks', 'ligero', 'archivo'],
+    database: null,
+    secrets: {
+      LD_SUPERUSER_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'sissbruecker/linkding:1.40.0',
+      port: 9090,
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        LD_SUPERUSER_NAME: 'admin',
+        LD_SUPERUSER_PASSWORD: '{{secret.LD_SUPERUSER_PASSWORD}}',
+        LD_DISABLE_BACKGROUND_TASKS: 'False'
+      },
+      volumes: [{ name: 'data', path: '/etc/linkding/data' }],
+      readiness: { path: '/health', expect: [200] }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con `LD_SUPERUSER_PASSWORD` desde «Credenciales».',
+      'Instala la extensión de Linkding y configura tu token API desde Ajustes → Integraciones.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'grist',
+    name: 'Grist',
+    category: 'productividad',
+    summary: 'Hoja de cálculo relacional con fórmulas Python, paneles interactivos y permisos por fila.',
+    description:
+      'Combina la agilidad de una hoja de cálculo con el rigor de una base de datos relacional ' +
+      'y soporte nativo de fórmulas en Python sin dependencias externas.',
+    website: 'https://www.getgrist.com',
+    licence: 'Apache-2.0',
+    tags: ['hojas de calculo', 'airtable', 'python', 'datos', 'tablas'],
+    database: null,
+    secrets: {
+      GRIST_SESSION_SECRET: { bytes: 32, encoding: 'hex' }
+    },
+    app: {
+      image: 'gristlabs/grist:1.4.2',
+      port: 8484,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        APP_HOME_URL: '{{url}}',
+        GRIST_SESSION_SECRET: '{{secret.GRIST_SESSION_SECRET}}',
+        GRIST_DATA_DIR: '/persist/docs',
+        GRIST_INST_DIR: '/persist',
+        GRIST_SANDBOX_FLAVOR: 'unsandboxed',
+        GRIST_TELEMETRY_LEVEL: 'off'
+      },
+      volumes: [{ name: 'persist', path: '/persist' }],
+      readiness: { path: '/status', expect: [200], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear tu primer documento o importar archivos Excel/CSV.',
+      'Conecta un proveedor OIDC en Variables si vas a compartir documentos en equipo.'
+    ],
+    notes: []
+  },
+
+  // --- DevTools, Dashboards e Infraestructura (+8) -------------------------
+  {
+    id: 'it-tools',
+    name: 'IT-Tools',
+    category: 'desarrollo',
+    summary: 'Caja de herramientas web con más de 80 utilidades para desarrolladores (JWT, cron, regex, hashes).',
+    description:
+      'Colección ultraligera de conversores, generadores de claves, decodificadores JWT, pruebas ' +
+      'regex y calculadoras de red ejecutándose 100% en local sin enviar datos a terceros.',
+    website: 'https://it-tools.tech',
+    licence: 'GPLv3',
+    tags: ['utilidades', 'devtools', 'jwt', 'regex', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'corentinth/it-tools:2024.10.22-7ca5933',
+      port: 80,
+      memoryMb: 128,
+      cpus: 0.25,
+      env: {},
+      volumes: [{ name: 'cache', path: '/var/cache/nginx' }],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para usar cualquiera de las utilidades directamente en el navegador.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'excalidraw',
+    name: 'Excalidraw',
+    category: 'desarrollo',
+    summary: 'Pizarra virtual minimalista de diagramas de arquitectura con estilo trazado a mano.',
+    description:
+      'Diseña diagramas de sistemas, wireframes y esquemas técnicos en tu propio dominio con ' +
+      'exportación SVG/PNG y privacidad total.',
+    website: 'https://excalidraw.com',
+    licence: 'MIT',
+    tags: ['pizarra', 'diagramas', 'arquitectura', 'diseno', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'excalidraw/excalidraw:v0.18.0',
+      port: 80,
+      memoryMb: 128,
+      cpus: 0.25,
+      env: {},
+      volumes: [{ name: 'cache', path: '/var/cache/nginx' }],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y guarda o exporta tus diagramas `.excalidraw` directamente en tu equipo.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'glance',
+    name: 'Glance',
+    category: 'monitorizacion',
+    summary: 'Dashboard personal ultrarrápido con feeds RSS, estado de servicios, clima y marcadores.',
+    description:
+      'Página de inicio autohospedada escrita en Go que consume menos de 30 MB de RAM y agrega ' +
+      'en un panel limpio tus servicios, fuentes RSS, repositorios y métricas sin `docker.sock`.',
+    website: 'https://github.com/glanceapp/glance',
+    licence: 'AGPLv3',
+    tags: ['dashboard', 'homepage', 'rss', 'inicio', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'glanceapp/glance:v0.8.4',
+      port: 8080,
+      memoryMb: 128,
+      cpus: 0.25,
+      env: {
+        TZ: '{{tz}}'
+      },
+      files: [
+        {
+          name: 'glance.yml',
+          path: '/app/config/glance.yml',
+          content:
+            'pages:\n' +
+            '  - name: Inicio\n' +
+            '    columns:\n' +
+            '      - size: full\n' +
+            '        widgets:\n' +
+            '          - type: clock\n' +
+            '            hour-format: 24h\n' +
+            '          - type: search\n' +
+            '            autofocus: true\n' +
+            '          - type: bookmarks\n' +
+            '            groups:\n' +
+            '              - title: Servicios\n' +
+            '                links:\n' +
+            '                  - title: Culkibo\n' +
+            '                    url: http://127.0.0.1:3000\n'
+        }
+      ],
+      volumes: [{ name: 'assets', path: '/app/assets' }],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para ver tu dashboard inicial.',
+      'Personaliza `glance.yml` añadiendo widgets de monitorización HTTP, RSS, GitHub o marcadores.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'rabbitmq',
+    name: 'RabbitMQ',
+    category: 'datos',
+    summary: 'Bróker de mensajes empresarial (AMQP, Streams y colas) con consola web de gestión.',
+    description:
+      'Desacopla microservicios y workers con colas duraderas, enrutamiento avanzado y consola ' +
+      'web en el puerto principal (15672) más puerto AMQP auxiliar (5672).',
+    website: 'https://www.rabbitmq.com',
+    licence: 'MPL-2.0',
+    tags: ['colas', 'amqp', 'mensajeria', 'broker', 'microservicios'],
+    database: null,
+    secrets: {
+      RABBITMQ_DEFAULT_PASS: { bytes: 24, encoding: 'base64url' }
+    },
+    app: {
+      image: 'rabbitmq:4.0.9-management-alpine',
+      port: 15672,
+      extraPorts: [{ containerPort: 5672, label: 'AMQP' }],
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        RABBITMQ_DEFAULT_USER: 'culkibo',
+        RABBITMQ_DEFAULT_PASS: '{{secret.RABBITMQ_DEFAULT_PASS}}'
+      },
+      volumes: [{ name: 'data', path: '/var/lib/rabbitmq' }],
+      readiness: { path: '/', expect: [200], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Accede a la consola web en {{url}} con usuario «culkibo» y `RABBITMQ_DEFAULT_PASS` desde «Credenciales».',
+      'Conecta tus productores/consumidores por AMQP usando el puerto auxiliar 5672.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'nats',
+    name: 'NATS JetStream',
+    category: 'datos',
+    summary: 'Sistema de mensajería cloud-native ultrarrápido con persistencia JetStream y KV.',
+    description:
+      'Pub/sub, colas de trabajo, almacenamiento clave-valor y streams persistentes en un binario ' +
+      'Go diminuto con endpoint HTTP de monitorización (8222) y puerto cliente 4222.',
+    website: 'https://nats.io',
+    licence: 'Apache-2.0',
+    tags: ['mensajeria', 'pubsub', 'jetstream', 'colas', 'ligero'],
+    database: null,
+    secrets: {
+      NATS_AUTH_TOKEN: { bytes: 24, encoding: 'base64url' }
+    },
+    app: {
+      image: 'nats:2.11.1-alpine',
+      port: 8222,
+      extraPorts: [{ containerPort: 4222, label: 'NATS Client' }],
+      memoryMb: 256,
+      cpus: 0.5,
+      command: ['-c', '/etc/nats/nats.conf'],
+      env: {
+        NATS_AUTH_TOKEN: '{{secret.NATS_AUTH_TOKEN}}'
+      },
+      files: [
+        {
+          name: 'nats.conf',
+          path: '/etc/nats/nats.conf',
+          content:
+            'port: 4222\n' +
+            'http_port: 8222\n' +
+            'jetstream {\n' +
+            '  store_dir: /data\n' +
+            '}\n' +
+            'authorization {\n' +
+            '  token: $NATS_AUTH_TOKEN\n' +
+            '}\n'
+        }
+      ],
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/healthz', expect: [200] }
+    },
+    nextSteps: [
+      'Consulta el estado y estadísticas JetStream en {{url}}/jsz y {{url}}/varz.',
+      'Conecta tus clientes NATS al puerto auxiliar 4222 usando `NATS_AUTH_TOKEN` desde «Credenciales».'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'garage',
+    name: 'Garage S3',
+    category: 'datos',
+    summary: 'Almacenamiento de objetos compatible con S3 escrito en Rust: ligero, libre y resiliente.',
+    description:
+      'Alternativa moderna y ultraligera a MinIO con licencia AGPLv3, bajo consumo de memoria ' +
+      'y API S3 lista para copias de seguridad de Culkibo, adjuntos y activos estáticos.',
+    website: 'https://garagehq.deuxfleurs.fr',
+    licence: 'AGPLv3',
+    tags: ['s3', 'objetos', 'rust', 'almacenamiento', 'copias', 'ligero'],
+    database: null,
+    secrets: {
+      GARAGE_RPC_SECRET: { bytes: 32, encoding: 'hex' },
+      GARAGE_ADMIN_TOKEN: { bytes: 24, encoding: 'base64url' }
+    },
+    app: {
+      image: 'dxflrs/garage:v1.1.0',
+      port: 3900,
+      extraPorts: [{ containerPort: 3903, label: 'Admin API' }],
+      memoryMb: 256,
+      cpus: 0.5,
+      env: {
+        GARAGE_RPC_SECRET: '{{secret.GARAGE_RPC_SECRET}}',
+        GARAGE_ADMIN_TOKEN: '{{secret.GARAGE_ADMIN_TOKEN}}'
+      },
+      files: [
+        {
+          name: 'garage.toml',
+          path: '/etc/garage.toml',
+          content:
+            'metadata_dir = "/var/lib/garage/meta"\n' +
+            'data_dir = "/var/lib/garage/data"\n' +
+            'db_engine = "sqlite"\n' +
+            'replication_factor = 1\n' +
+            'rpc_bind_addr = "[::]:3901"\n' +
+            'rpc_public_addr = "127.0.0.1:3901"\n' +
+            '[s3_api]\n' +
+            's3_region = "garage"\n' +
+            'api_bind_addr = "[::]:3900"\n' +
+            'root_domain = ".s3.garage.localhost"\n' +
+            '[admin]\n' +
+            'api_bind_addr = "[::]:3903"\n'
+        }
+      ],
+      volumes: [
+        { name: 'meta', path: '/var/lib/garage/meta' },
+        { name: 'data', path: '/var/lib/garage/data' }
+      ],
+      readiness: { path: '/', expect: [200, 400, 403] }
+    },
+    nextSteps: [
+      'Asigna el layout del nodo y crea tu primer bucket y clave S3 dentro del contenedor con `garage status`, `garage layout assign` y `garage key create`.',
+      'Usa las claves generadas en Culkibo → Configuración → Almacenamiento de copias S3.'
+    ],
+    notes: [
+      'Garage consume una fracción de la RAM de MinIO y mantiene licencia completamente abierta.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'backrest',
+    name: 'Backrest',
+    category: 'datos',
+    summary: 'Interfaz web para copias de seguridad cifradas y deduplicadas con Restic.',
+    description:
+      'Programa snapshots incrementales de volúmenes y carpetas hacia S3, Backblaze B2, SFTP o ' +
+      'discos locales con exploración de ficheros y restauración en un clic.',
+    website: 'https://garethgeorge.github.io/backrest/',
+    licence: 'GPLv3',
+    tags: ['backups', 'restic', 'copias', 'cifrado', 's3'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'garethgeorge/backrest:v1.7.2',
+      port: 9898,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        TZ: '{{tz}}',
+        BACKREST_DATA: '/data',
+        BACKREST_CONFIG: '/config/config.json',
+        XDG_CACHE_HOME: '/cache'
+      },
+      volumes: [
+        { name: 'data', path: '/data' },
+        { name: 'config', path: '/config' },
+        { name: 'cache', path: '/cache' },
+        { name: 'repos', path: '/repos' }
+      ],
+      readiness: { path: '/', expect: [200, 302] }
+    },
+    nextSteps: [
+      'Abre {{url}} para completar el asistente inicial y activar la autenticación de Backrest.',
+      'Añade tu repositorio Restic (S3, Garage, MinIO o SFTP) y crea un plan programado.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'adminer',
+    name: 'Adminer',
+    category: 'datos',
+    summary: 'Cliente web ultraligero para administrar PostgreSQL, MySQL, MariaDB, SQLite y MongoDB.',
+    description:
+      'Alternativa rápida y minimalista a phpMyAdmin y pgAdmin en menos de 128 MB de RAM con ' +
+      'editor SQL, exportación e importación de volcados.',
+    website: 'https://www.adminer.org',
+    licence: 'Apache-2.0 / GPLv2',
+    tags: ['sql', 'postgres', 'mysql', 'mariadb', 'admin', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'adminer:5.2.1',
+      port: 8080,
+      memoryMb: 128,
+      cpus: 0.5,
+      env: {
+        ADMINER_DESIGN: 'nette'
+      },
+      volumes: [{ name: 'plugins', path: '/var/www/html/plugins-enabled' }],
+      readiness: { path: '/', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} e introduce las credenciales de tu base de datos.',
+      'Mantén Adminer sin dominio público o detrás de SSO (Authelia/Authentik) en producción.'
+    ],
+    notes: []
+  },
+
+  // --- Multimedia, Libros y Sincronización (+5) ----------------------------
+  {
+    id: 'syncthing',
+    name: 'Syncthing',
+    category: 'media',
+    summary: 'Sincronización continua de carpetas P2P cifrada entre servidores, ordenadores y móviles.',
+    description:
+      'Replica archivos en tiempo real sin nube intermediaria ni límites de tamaño, con ' +
+      'versionado de ficheros, panel web (8384) y puerto de sincronización TCP (22000).',
+    website: 'https://syncthing.net',
+    licence: 'MPL-2.0',
+    tags: ['sincronizacion', 'archivos', 'p2p', 'nube', 'backup'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'syncthing/syncthing:1.29.5',
+      port: 8384,
+      extraPorts: [{ containerPort: 22000, label: 'Sync TCP' }],
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        TZ: '{{tz}}',
+        STGUIADDRESS: '0.0.0.0:8384'
+      },
+      volumes: [{ name: 'data', path: '/var/syncthing' }],
+      readiness: { path: '/rest/noauth/health', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} y configura de inmediato usuario y contraseña en Acciones → Configuración → Interfaz.',
+      'Vincula tus otros dispositivos intercambiando el ID de dispositivo.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'kavita',
+    name: 'Kavita',
+    category: 'media',
+    summary: 'Servidor rápido de lectura para eBooks (EPUB/PDF), manga y cómics con soporte OPDS.',
+    description:
+      'Organiza bibliotecas personales de libros y cómics con progreso sincronizado, múltiples ' +
+      'usuarios, lector web adaptable y soporte nativo para lectores móviles.',
+    website: 'https://www.kavitareader.com',
+    licence: 'GPLv3',
+    tags: ['libros', 'ebooks', 'manga', 'comics', 'opds'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'jvmilazz0/kavita:0.8.5',
+      port: 5000,
+      memoryMb: 512,
+      cpus: 1,
+      env: {
+        TZ: '{{tz}}'
+      },
+      volumes: [
+        { name: 'config', path: '/kavita/config' },
+        { name: 'library', path: '/books' }
+      ],
+      readiness: { path: '/api/health', expect: [200], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para crear tu cuenta administradora y añadir tu biblioteca en `/books`.',
+      'Activa OPDS en Ajustes de usuario si lees desde apps externas.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'komga',
+    name: 'Komga',
+    category: 'media',
+    summary: 'Servidor multimedia para cómics, manga y eBooks con metadatos, OPDS y API REST.',
+    description:
+      'Escanea colecciones CBZ/CBR/PDF/EPUB automáticamente, gestiona series y listas de lectura ' +
+      'y ofrece compatibilidad con Mihon, Panels y lectores OPDS.',
+    website: 'https://komga.org',
+    licence: 'MIT',
+    tags: ['comics', 'manga', 'ebooks', 'opds', 'biblioteca'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'gotson/komga:1.21.2',
+      port: 25600,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        TZ: '{{tz}}',
+        JAVA_TOOL_OPTIONS: '-Xmx768m'
+      },
+      volumes: [
+        { name: 'config', path: '/config' },
+        { name: 'data', path: '/data' }
+      ],
+      readiness: { path: '/actuator/health', expect: [200], timeoutMs: 180000 }
+    },
+    nextSteps: [
+      'Abre {{url}} para registrar la cuenta inicial de administración.',
+      'Apunta tu primera biblioteca a `/data` para indexar tus archivos.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'calibre-web',
+    name: 'Calibre-Web',
+    category: 'media',
+    summary: 'Biblioteca web limpia para explorar, leer y enviar a Kindle/Kobo tu colección Calibre.',
+    description:
+      'Interfaz web ligera sobre una base `metadata.db` de Calibre con estanterías, descarga ' +
+      'EPUB/PDF, sincronización Kobo y feed OPDS.',
+    website: 'https://github.com/janeczku/calibre-web',
+    licence: 'GPLv3',
+    tags: ['libros', 'calibre', 'ebooks', 'kobo', 'kindle'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'lscr.io/linuxserver/calibre-web:0.6.24-ls300',
+      port: 8083,
+      memoryMb: 512,
+      cpus: 0.5,
+      env: {
+        PUID: '1000',
+        PGID: '1000',
+        TZ: '{{tz}}'
+      },
+      volumes: [
+        { name: 'config', path: '/config' },
+        { name: 'books', path: '/books' }
+      ],
+      readiness: { path: '/', expect: [200, 302], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} con `admin` / `admin123` y cambia la contraseña de inmediato.',
+      'Coloca tu carpeta de biblioteca Calibre (`metadata.db`) en el volumen `/books`.'
+    ],
+    notes: [
+      'La contraseña inicial la fija el proyecto (`admin123`): cámbiala en el primer inicio.'
+    ]
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'owncast',
+    name: 'Owncast',
+    category: 'media',
+    summary: 'Servidor autohospedado de streaming en directo con chat integrado (alternativa a Twitch).',
+    description:
+      'Recibe tu emisión desde OBS vía RTMP (puerto auxiliar 1935) y sírvela por HLS en tu ' +
+      'propio dominio con chat en vivo, federación ActivityPub y webhooks.',
+    website: 'https://owncast.online',
+    licence: 'MIT',
+    tags: ['streaming', 'video', 'twitch', 'rtmp', 'obs', 'chat'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'owncast/owncast:0.2.2',
+      port: 8080,
+      extraPorts: [{ containerPort: 1935, label: 'RTMP Ingest' }],
+      memoryMb: 1024,
+      cpus: 2,
+      env: {
+        TZ: '{{tz}}'
+      },
+      volumes: [{ name: 'data', path: '/app/data' }],
+      readiness: { path: '/api/status', expect: [200], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Abre {{url}}/admin e inicia sesión con `admin` / `abc123` (clave inicial de Owncast) y cámbiala de inmediato.',
+      'Configura OBS apuntando a `rtmp://127.0.0.1:<puerto-1935>/live` con tu clave de emisión.'
+    ],
+    notes: [
+      'Cambiar la clave de administración y emisión en `/admin` es imprescindible antes de publicar tu dominio.'
+    ]
+  },
+
+  // --- Monitorización y RSS (+3) -------------------------------------------
+  {
+    id: 'openobserve',
+    name: 'OpenObserve',
+    category: 'monitorizacion',
+    summary: 'Plataforma unificada en Rust de logs, métricas y trazas OTel (alternativa a Datadog/ELK).',
+    description:
+      'Ingiere telemetría OpenTelemetry, logs JSON y métricas Prometheus con búsqueda SQL/PromQL, ' +
+      'alertas y paneles en un único binario Rust de altísima eficiencia.',
+    website: 'https://openobserve.ai',
+    licence: 'AGPLv3',
+    tags: ['logs', 'metricas', 'trazas', 'otel', 'datadog', 'rust'],
+    database: null,
+    secrets: {
+      ZO_ROOT_USER_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'public.ecr.aws/zinclabs/openobserve:v0.14.6',
+      port: 5080,
+      memoryMb: 1024,
+      cpus: 1,
+      env: {
+        ZO_ROOT_USER_EMAIL: 'admin@culkibo.local',
+        ZO_ROOT_USER_PASSWORD: '{{secret.ZO_ROOT_USER_PASSWORD}}',
+        ZO_DATA_DIR: '/data',
+        ZO_TELEMETRY: 'false'
+      },
+      volumes: [{ name: 'data', path: '/data' }],
+      readiness: { path: '/healthz', expect: [200], timeoutMs: 120000 }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} con `admin@culkibo.local` y `ZO_ROOT_USER_PASSWORD` desde «Credenciales».',
+      'Copia las instrucciones de ingesta OpenTelemetry/Vector desde la pestaña Ingestion.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'alertmanager',
+    name: 'Alertmanager',
+    category: 'monitorizacion',
+    summary: 'Enrutamiento, agrupación y silenciamiento de alertas de Prometheus hacia Slack, correo o webhooks.',
+    description:
+      'Deduplica alertas repetitivas, gestiona inhibiciones y ventanas de mantenimiento y entrega ' +
+      'avisos fiables a tus canales de guardia en menos de 128 MB de RAM.',
+    website: 'https://prometheus.io/docs/alerting/latest/alertmanager/',
+    licence: 'Apache-2.0',
+    tags: ['alertas', 'prometheus', 'guardias', 'webhooks', 'ligero'],
+    database: null,
+    secrets: {},
+    app: {
+      image: 'prom/alertmanager:v0.28.1',
+      port: 9093,
+      memoryMb: 128,
+      cpus: 0.25,
+      command: [
+        '--config.file=/etc/alertmanager/alertmanager.yml',
+        '--storage.path=/alertmanager'
+      ],
+      env: {},
+      files: [
+        {
+          name: 'alertmanager.yml',
+          path: '/etc/alertmanager/alertmanager.yml',
+          content:
+            'route:\n' +
+            '  group_by: ["alertname"]\n' +
+            '  group_wait: 30s\n' +
+            '  group_interval: 5m\n' +
+            '  repeat_interval: 4h\n' +
+            '  receiver: "default"\n' +
+            'receivers:\n' +
+            '  - name: "default"\n'
+        }
+      ],
+      volumes: [{ name: 'data', path: '/alertmanager' }],
+      readiness: { path: '/-/healthy', expect: [200] }
+    },
+    nextSteps: [
+      'Abre {{url}} para revisar alertas activas y gestionar silencios.',
+      'Configura tus receptores (webhook, Telegram, Slack o SMTP) en `alertmanager.yml`.'
+    ],
+    notes: []
+  },
+
+  // -------------------------------------------------------------------------
+  {
+    id: 'miniflux',
+    name: 'Miniflux',
+    category: 'contenido',
+    summary: 'Lector RSS/Atom minimalista en Go, rapidísimo y compatible con Fever y Google Reader API.',
+    description:
+      'Sigue cientos de blogs, newsletters y podcasts sin distracciones ni rastreadores, con ' +
+      'migraciones automáticas sobre PostgreSQL y consumo mínimo.',
+    website: 'https://miniflux.app',
+    licence: 'Apache-2.0',
+    tags: ['rss', 'atom', 'lector', 'noticias', 'ligero'],
+    database: { engine: 'postgres', dbName: 'miniflux', username: 'miniflux', memoryMb: 256 },
+    secrets: {
+      ADMIN_PASSWORD: { bytes: 18, encoding: 'base64url' }
+    },
+    app: {
+      image: 'miniflux/miniflux:2.2.7',
+      port: 8080,
+      memoryMb: 128,
+      cpus: 0.25,
+      env: {
+        DATABASE_URL: '{{db.url}}',
+        RUN_MIGRATIONS: '1',
+        CREATE_ADMIN: '1',
+        ADMIN_USERNAME: 'admin',
+        ADMIN_PASSWORD: '{{secret.ADMIN_PASSWORD}}',
+        BASE_URL: '{{url}}'
+      },
+      volumes: [],
+      readiness: { path: '/healthcheck', expect: [200] }
+    },
+    nextSteps: [
+      'Inicia sesión en {{url}} como «admin» con `ADMIN_PASSWORD` desde «Credenciales».',
+      'Importa tu archivo OPML o conecta clientes móviles (Reeder, NetNewsWire) mediante la API Fever/Google Reader.'
+    ],
+    notes: []
   }
 ];
 
@@ -4621,6 +6442,26 @@ function validateTemplate(tpl) {
     app.readiness.expect.length === 0
   ) {
     fail(`${tpl.id}: falta la sonda de disponibilidad (readiness.path y readiness.expect)`);
+  }
+
+  if (app.extraPorts !== undefined && app.extraPorts !== null) {
+    if (!Array.isArray(app.extraPorts)) {
+      fail(`${tpl.id}: extraPorts debe ser una lista`);
+    } else {
+      const seenExtra = new Set();
+      for (const ep of app.extraPorts) {
+        const p = Number(ep && ep.containerPort);
+        if (!Number.isInteger(p) || p <= 0 || p >= 65536) {
+          fail(`${tpl.id}: puerto auxiliar inválido en extraPorts`);
+        } else if (p === app.port) {
+          fail(`${tpl.id}: extraPorts colisiona con app.port (${p})`);
+        } else if (seenExtra.has(p)) {
+          fail(`${tpl.id}: puerto auxiliar duplicado en extraPorts (${p})`);
+        } else {
+          seenExtra.add(p);
+        }
+      }
+    }
   }
 
   // Estado persistente: si no hay base de datos gestionada, el servicio guarda
@@ -4704,6 +6545,38 @@ function validateTemplate(tpl) {
       const validTcp = r.type === 'tcp' && Number.isInteger(r.port) && r.port > 0 && r.port < 65536;
       if (!validExec && !validTcp) fail(`${tpl.id}: sonda de auxiliar inválida en «${car.name}»`);
     }
+    if (car.dependsOn !== undefined && !Array.isArray(car.dependsOn)) {
+      fail(`${tpl.id}: dependsOn debe ser una lista en «${car.name}»`);
+    }
+  }
+
+  // Validar grafo de dependencias `dependsOn` entre auxiliares (referencias válidas y acíclico).
+  const sidecarList = tpl.sidecars || [];
+  const sidecarByName = new Map(sidecarList.map((c) => [c.name, c]));
+  for (const car of sidecarList) {
+    for (const dep of car.dependsOn || []) {
+      if (dep === car.name) fail(`${tpl.id}: el auxiliar «${car.name}» no puede depender de sí mismo`);
+      else if (!sidecarByName.has(dep)) fail(`${tpl.id}: el auxiliar «${car.name}» depende de «${dep}», que no existe`);
+    }
+  }
+  const visitState = new Map();
+  const hasCycle = (name) => {
+    const state = visitState.get(name);
+    if (state === 1) return true;
+    if (state === 2) return false;
+    visitState.set(name, 1);
+    const car = sidecarByName.get(name);
+    for (const dep of (car && car.dependsOn) || []) {
+      if (sidecarByName.has(dep) && hasCycle(dep)) return true;
+    }
+    visitState.set(name, 2);
+    return false;
+  };
+  for (const car of sidecarList) {
+    if (hasCycle(car.name)) {
+      fail(`${tpl.id}: dependencia circular en dependsOn del auxiliar «${car.name}»`);
+      break;
+    }
   }
 
   // Un secreto referenciado pero no declarado produciría una variable con el
@@ -4711,26 +6584,39 @@ function validateTemplate(tpl) {
   // literal. Es un fallo silencioso: se caza aquí.
   const declared = new Set(Object.keys(tpl.secrets || {}));
   const appEnvBlob = JSON.stringify(app.env || {});
-  const envBlobs = [appEnvBlob, ...(tpl.sidecars || []).map((c) => JSON.stringify(c.env || {}))];
+  const envBlobs = [appEnvBlob, ...sidecarList.map((c) => JSON.stringify(c.env || {}))];
+  const usedBlob = envBlobs.join('');
   for (const blob of envBlobs) {
     for (const match of blob.matchAll(/\{\{secret\.([A-Z0-9_]+)\}\}/g)) {
       if (!declared.has(match[1])) fail(`${tpl.id}: usa el secreto «${match[1]}» sin declararlo`);
     }
   }
-  // Y al revés: un secreto declarado debe llegar a app.env (no quedarse huérfano).
+  // Y al revés: todo secreto declarado debe usarse en app.env o en algún auxiliar.
   for (const key of declared) {
-    if (!appEnvBlob.includes(`{{secret.${key}}}`)) fail(`${tpl.id}: declara el secreto «${key}» y no lo usa en app.env`);
+    if (!usedBlob.includes(`{{secret.${key}}}`)) fail(`${tpl.id}: declara el secreto «${key}» y no lo usa en app.env ni en auxiliares`);
   }
 
-  const usedBlob = envBlobs.join('');
   // Referencias a la base de datos sin base de datos declarada.
   if (!tpl.database && usedBlob.includes('{{db.')) {
     fail(`${tpl.id}: usa {{db.*}} pero no declara ninguna base de datos`);
   }
 
-  const sidecarNames = new Set((tpl.sidecars || []).map((c) => c.name));
+  const sidecarNames = new Set(sidecarList.map((c) => c.name));
   for (const match of usedBlob.matchAll(/\{\{sidecar\.([a-z0-9_]+)\.host\}\}/g)) {
     if (!sidecarNames.has(match[1])) fail(`${tpl.id}: referencia al auxiliar «${match[1]}», que no existe`);
+  }
+
+  // Verificar que no exista ningún marcador desconocido en ninguna variable.
+  const SIMPLE_PLACEHOLDERS = new Set(['domain', 'host', 'protocol', 'wsProtocol', 'isHttps', 'url', 'tz', 'install.id']);
+  const DB_FIELDS = new Set(['host', 'port', 'user', 'password', 'name', 'url']);
+  for (const match of usedBlob.matchAll(/\{\{([a-zA-Z0-9_.]+)\}\}/g)) {
+    const expr = match[1];
+    if (SIMPLE_PLACEHOLDERS.has(expr)) continue;
+    const parts = expr.split('.');
+    if (parts[0] === 'secret' && parts.length === 2) continue;
+    if (parts[0] === 'db' && parts.length === 2 && DB_FIELDS.has(parts[1])) continue;
+    if (parts[0] === 'sidecar' && parts.length === 3 && parts[2] === 'host') continue;
+    fail(`${tpl.id}: marcador desconocido «{{${expr}}}»`);
   }
 
   return problems;

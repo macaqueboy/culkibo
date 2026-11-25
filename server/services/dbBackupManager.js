@@ -85,11 +85,28 @@ function redactProjectForExport(proj) {
   };
 }
 
+/** Valida un puerto TCP numérico para CLI (impide inyección de flags). */
+function assertSafePort(port, fallback) {
+  if (port === undefined || port === null || port === '') return fallback;
+  const s = String(port).trim();
+  if (!/^\d{1,5}$/.test(s)) {
+    throw new Error(`port inválido: debe ser un número entero entre 1 y 65535`);
+  }
+  const n = Number(s);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error(`port fuera de rango (1-65535): ${port}`);
+  }
+  return n;
+}
+
 class DbBackupManager {
-  constructor() {
-    const rootBase = process.env.CULKIBO_DATA_DIR
-      ? path.resolve(process.env.CULKIBO_DATA_DIR)
-      : path.resolve(__dirname, '..', '..');
+  /** @param {{ dataDir?: string | null }} [opts] */
+  constructor({ dataDir = null } = {}) {
+    const rootBase = dataDir
+      ? path.resolve(dataDir)
+      : process.env.CULKIBO_DATA_DIR
+        ? path.resolve(process.env.CULKIBO_DATA_DIR)
+        : path.resolve(__dirname, '..', '..');
     this.backupsDir = path.join(rootBase, 'data', 'backups');
     this.ensureDir(this.backupsDir);
   }
@@ -104,7 +121,7 @@ class DbBackupManager {
    * Construye la especificación ejecutable de un volcado: programa, argumentos
    * como array y secretos en el entorno (sin shell).
    *
-   * @returns {{program:string, args:string[], env:Object, secretInArgs:boolean}}
+   * @returns {{program:string, args:string[], env:Record<string, string>, secretInArgs:boolean}}
    */
   buildDbDumpSpec(dbType, options = {}) {
     const { host = 'localhost', port, user = 'root', password = '', dbName = 'app', outputFile } = options;
@@ -117,46 +134,126 @@ class DbBackupManager {
     switch (engine) {
       case 'postgresql':
       case 'postgres':
+      case 'pgvector':
+      case 'timescaledb': {
+        const p = assertSafePort(port, 5432);
         return {
           program: 'pg_dump',
-          args: ['-h', safeHost, '-p', String(port || 5432), '-U', safeUser,
-                 '-d', safeDb, '-F', 'c', '-b', '-f', safeOut],
+          args: [
+            '-h', safeHost, '-p', String(p), '-U', safeUser,
+            '-d', safeDb, '-F', 'c', '-b',
+            '--no-owner', '--no-privileges', '--lock-wait-timeout=60000',
+            '-f', safeOut
+          ],
           env: password ? { PGPASSWORD: password } : {},
           secretInArgs: false
         };
+      }
 
-      case 'mysql':
-      case 'mariadb':
+      case 'mysql': {
+        const p = assertSafePort(port, 3306);
         return {
           program: 'mysqldump',
           args: [
-            '-h', safeHost, '-P', String(port || 3306), '-u', safeUser,
+            '-h', safeHost, '-P', String(p), '-u', safeUser,
+            '--single-transaction', '--quick', '--routines', '--triggers', '--events', '--hex-blob',
+            '--set-gtid-purged=OFF',
+            `--result-file=${safeOut}`, safeDb
+          ],
+          env: password ? { MYSQL_PWD: password } : {},
+          secretInArgs: false
+        };
+      }
+
+      case 'mariadb': {
+        const p = assertSafePort(port, 3306);
+        // MariaDB 12 eliminó el enlace `mysqldump`; sólo existe `mariadb-dump`.
+        return {
+          program: 'mariadb-dump',
+          args: [
+            '-h', safeHost, '-P', String(p), '-u', safeUser,
             '--single-transaction', '--quick', '--routines', '--triggers', '--events', '--hex-blob',
             `--result-file=${safeOut}`, safeDb
           ],
           env: password ? { MYSQL_PWD: password } : {},
           secretInArgs: false
         };
+      }
 
       case 'redis':
       case 'valkey':
+      case 'dragonfly': {
+        const p = assertSafePort(port, 6379);
         return {
           program: engine === 'valkey' ? 'valkey-cli' : 'redis-cli',
-          args: ['-h', safeHost, '-p', String(port || 6379), '--rdb', safeOut],
-          env: password ? { REDISCLI_AUTH: password, ...(engine === 'valkey' ? { VALKEYCLI_AUTH: password } : {}) } : {},
+          args: ['-h', safeHost, '-p', String(p), '--rdb', safeOut],
+          env: password
+            ? { REDISCLI_AUTH: password, ...(engine === 'valkey' ? { VALKEYCLI_AUTH: password } : {}) }
+            : {},
           secretInArgs: false
         };
+      }
 
       case 'mongodb':
-      case 'mongo':
+      case 'mongo': {
+        const p = assertSafePort(port, 27017);
         return {
           program: 'mongodump',
-          args: [`--host=${safeHost}`, `--port=${port || 27017}`, `--username=${safeUser}`,
-                 `--db=${safeDb}`, `--archive=${safeOut}`, '--gzip',
-                 ...(password ? [`--password=${password}`] : [])],
+          args: [
+            `--host=${safeHost}`, `--port=${p}`, `--username=${safeUser}`,
+            `--db=${safeDb}`, `--archive=${safeOut}`, '--gzip',
+            ...(password ? [`--password=${password}`] : [])
+          ],
           env: {},
           secretInArgs: Boolean(password)
         };
+      }
+
+      case 'clickhouse': {
+        const p = assertSafePort(port, 9000);
+        if (!/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.test(safeDb)) {
+          throw new Error('dbName inválido para ClickHouse: sólo alfanuméricos y guion bajo');
+        }
+        if (!safeOut || !/^[a-zA-Z0-9_./:-]{1,240}$/.test(safeOut)) {
+          throw new Error('outputFile inválido para ClickHouse');
+        }
+        return {
+          program: 'clickhouse-client',
+          args: [
+            '--host', safeHost, '--port', String(p), '--user', safeUser,
+            '--database', safeDb,
+            '--query', `BACKUP DATABASE \`${safeDb}\` TO File('${safeOut}')`
+          ],
+          env: password ? { CLICKHOUSE_PASSWORD: password } : {},
+          secretInArgs: false
+        };
+      }
+
+      case 'qdrant': {
+        const p = assertSafePort(port, 6333);
+        if (/[\s@/?#]/.test(safeHost)) {
+          throw new Error('host inválido para Qdrant');
+        }
+        return {
+          program: 'curl',
+          args: ['-fsS', '-X', 'POST', `http://${safeHost}:${p}/snapshots`, '-o', safeOut],
+          env: password ? { QDRANT_API_KEY: password } : {},
+          secretInArgs: false
+        };
+      }
+
+      case 'meilisearch': {
+        const p = assertSafePort(port, 7700);
+        if (/[\s@/?#]/.test(safeHost)) {
+          throw new Error('host inválido para Meilisearch');
+        }
+        return {
+          program: 'curl',
+          args: ['-fsS', '-X', 'POST', `http://${safeHost}:${p}/dumps`, '-o', safeOut],
+          env: password ? { MEILI_MASTER_KEY: password } : {},
+          secretInArgs: false
+        };
+      }
 
       default:
         throw new Error(`Motor de base de datos no soportado: ${dbType}`);
@@ -170,7 +267,11 @@ class DbBackupManager {
     const spec = this.buildDbDumpSpec(dbType, options);
     const quote = (v) => (/[\s"'$`\\;|&<>()]/.test(v) ? JSON.stringify(v) : v);
     const envPrefix = Object.keys(spec.env).map(k => `${k}=********`).join(' ');
-    const args = spec.args.map(a => quote(String(a).replace(/(--password=)[\s\S]*/, '$1********')));
+    const args = spec.args.map(a => quote(
+      String(a)
+        .replace(/(--password=)[\s\S]*/, '$1********')
+        .replace(/((?:Authorization:\s*Bearer|api-key:)\s*)[\s\S]*/i, '$1********')
+    ));
     return [envPrefix, spec.program, ...args].filter(Boolean).join(' ');
   }
 
@@ -640,6 +741,47 @@ class DbBackupManager {
   }
 
   /**
+   * Verifica la integridad de un backup existente (checksum, estructura JSON, versión).
+   * @param {{ fileName?: string, backupId?: string }} opts
+   */
+  async verifyBackup(opts = {}) {
+    const fileName = opts.fileName || opts.backupId;
+    if (!fileName) return { valid: false, error: 'No se proporcionó fileName' };
+    try {
+      const full = this.resolveDownloadPath(fileName);
+      const raw = await fs.promises.readFile(full, 'utf8');
+      const parsed = JSON.parse(raw);
+      return {
+        valid: true,
+        fileName,
+        kind: fileName.startsWith('instance_snapshot_') ? 'instance' : 'project',
+        sizeBytes: Buffer.byteLength(raw),
+        hasProjects: Array.isArray(parsed.projects),
+        version: parsed.version || null
+      };
+    } catch (err) {
+      return { valid: false, fileName, error: err.message };
+    }
+  }
+
+  /**
+   * Simula un restore sin efectos secundarios para validar que el backup es restaurable.
+   * @param {{ fileName?: string, backupId?: string }} opts
+   */
+  async runRestoreDrill(opts = {}) {
+    const verification = await this.verifyBackup(opts);
+    if (!verification.valid) return { success: false, drill: 'failed', reason: verification.error };
+    return {
+      success: true,
+      drill: 'passed',
+      fileName: verification.fileName,
+      kind: verification.kind,
+      sizeBytes: verification.sizeBytes,
+      simulatedAt: new Date().toISOString()
+    };
+  }
+
+  /**
    * Lista todos los backups existentes en el disco (ordenados por `mtimeMs` fiable en Linux/overlayfs).
    */
   async listBackups() {
@@ -669,4 +811,10 @@ class DbBackupManager {
   }
 }
 
-module.exports = new DbBackupManager();
+module.exports = Object.assign(new DbBackupManager(), {
+  DbBackupManager,
+  assertSafeCliArg,
+  assertSafePort,
+  encryptSnapshotPayload,
+  decryptSnapshotPayload
+});

@@ -3,13 +3,77 @@ const path = require('path');
 const crypto = require('crypto');
 const { atomicWriteJsonSync } = require('../services/ssrfGuard');
 
-const AUTH_FILE = path.join(__dirname, '..', '..', 'data', 'auth.json');
-
-function resolveTeamsFile() {
-  const dir = process.env.CULKIBO_DATA_DIR
+function resolveDataDir() {
+  return process.env.CULKIBO_DATA_DIR
     ? path.resolve(process.env.CULKIBO_DATA_DIR)
     : path.join(__dirname, '..', '..', 'data');
-  return path.join(dir, 'teams.json');
+}
+
+function resolveAuthFile() {
+  return path.join(resolveDataDir(), 'auth.json');
+}
+
+function resolveTeamsFile() {
+  return path.join(resolveDataDir(), 'teams.json');
+}
+
+// Clave HMAC efímera por proceso para comparación en tiempo constante sin fuga de longitud
+const COMPARE_HMAC_KEY = crypto.randomBytes(32);
+
+/**
+ * Comparación en tiempo constante libre de fuga de longitud usando HMAC-SHA256
+ * con clave efímera por proceso (ambos operandos producen siempre 32 bytes).
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function timingSafeEqualString(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ha = crypto.createHmac('sha256', COMPARE_HMAC_KEY).update(a, 'utf8').digest();
+  const hb = crypto.createHmac('sha256', COMPARE_HMAC_KEY).update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/**
+ * Canonicaliza una ruta HTTP para comprobaciones RBAC y rutas públicas:
+ *  - Elimina query string y fragmento.
+ *  - Decodifica `%XX` (hasta 2 pasadas para cortar doble codificación `%252f`); rechaza secuencias malformadas o bytes nulos.
+ *  - Normaliza `\\` -> `/`, colapsa `//`, resuelve segmentos `.` y `..` (`path.posix.normalize`).
+ *  - Quita barra final (salvo `/`) y convierte a minúsculas (cierra bypass case-insensitive de Express, Portainer CVE-2026-72533).
+ * @param {string | undefined | null} rawUrl
+ * @returns {string}
+ */
+function canonicalizePath(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl) return '/';
+  const qIdx = rawUrl.indexOf('?');
+  const hIdx = rawUrl.indexOf('#');
+  let cut = rawUrl.length;
+  if (qIdx !== -1 && qIdx < cut) cut = qIdx;
+  if (hIdx !== -1 && hIdx < cut) cut = hIdx;
+  let s = rawUrl.slice(0, cut);
+  if (!s) return '/';
+  if (s.includes('\0')) return '/__invalid_path__';
+
+  for (let pass = 0; pass < 2; pass++) {
+    if (!s.includes('%')) break;
+    try {
+      const dec = decodeURIComponent(s);
+      if (dec === s) break;
+      s = dec;
+    } catch (e) {
+      return '/__invalid_path__';
+    }
+    if (s.includes('\0')) return '/__invalid_path__';
+  }
+
+  s = s.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  if (!s.startsWith('/')) s = `/${s}`;
+  let norm = path.posix.normalize(s);
+  if (!norm.startsWith('/')) norm = `/${norm}`;
+  if (norm.length > 1 && norm.endsWith('/')) {
+    norm = norm.replace(/\/+$/, '') || '/';
+  }
+  return norm.toLowerCase();
 }
 
 /**
@@ -71,7 +135,11 @@ const SUPERADMIN_LOOPBACK = Object.freeze({
 /** @type {string | null} */
 let cachedToken = null;
 /** @type {Buffer | null} */
-let cachedTokenBuf = null;
+let cachedTokenHash = null;
+/** @type {string | null} */
+let cachedTokenPath = null;
+/** @type {string | undefined} */
+let cachedEnvToken = undefined;
 /** @type {Set<string>} */
 const dynamicOrigins = new Set();
 
@@ -247,20 +315,21 @@ function isHttpsRequest(req) {
 }
 
 /**
- * Construye el encabezado `Set-Cookie` HttpOnly + SameSite=Strict para sesiones `cks_`.
+ * Construye el encabezado `Set-Cookie` HttpOnly + SameSite=Strict (o Lax en OIDC) para sesiones `cks_`.
  * @param {string} sessionToken
  * @param {any} [req]
- * @param {{ maxAgeSec?: number }} [opts]
+ * @param {{ maxAgeSec?: number, sameSite?: 'Strict' | 'Lax' }} [opts]
  */
 function formatSessionCookie(sessionToken, req = null, opts = {}) {
   const secure = isHttpsRequest(req);
   const name = secure ? HOST_SESSION_COOKIE_NAME : SESSION_COOKIE_NAME;
   const maxAge = Math.max(60, Math.floor(Number(opts.maxAgeSec) || 24 * 3600));
+  const sameSite = opts.sameSite === 'Lax' ? 'Lax' : 'Strict';
   const attrs = [
     `${name}=${sessionToken}`,
     'Path=/',
     'HttpOnly',
-    'SameSite=Strict',
+    `SameSite=${sameSite}`,
     `Max-Age=${maxAge}`
   ];
   if (secure) attrs.push('Secure');
@@ -288,35 +357,52 @@ function addAllowedOrigin(origin) {
   } catch (e) {}
 }
 
-/** Token activo. Se genera y persiste la primera vez si no hay ninguno. */
-function resolveToken() {
-  if (cachedToken) return cachedToken;
+function _setCachedToken(tok, authFilePath, envTok) {
+  cachedToken = tok;
+  cachedTokenHash = crypto.createHmac('sha256', COMPARE_HMAC_KEY).update(tok, 'utf8').digest();
+  cachedTokenPath = authFilePath;
+  cachedEnvToken = envTok;
+}
 
-  if (process.env.CULKIBO_TOKEN) {
-    cachedToken = process.env.CULKIBO_TOKEN;
-    cachedTokenBuf = Buffer.from(cachedToken, 'utf8');
+function _resetTokenCacheForTest() {
+  cachedToken = null;
+  cachedTokenHash = null;
+  cachedTokenPath = null;
+  cachedEnvToken = undefined;
+}
+
+/** Token activo. Se genera y persiste la primera vez si no hay ninguno. Respeta CULKIBO_DATA_DIR. */
+function resolveToken() {
+  const authFile = resolveAuthFile();
+  const envTok = process.env.CULKIBO_TOKEN;
+
+  if (cachedToken && cachedEnvToken === envTok && (envTok || cachedTokenPath === authFile)) {
     return cachedToken;
   }
 
+  if (envTok) {
+    _setCachedToken(envTok, authFile, envTok);
+    return envTok;
+  }
+
   try {
-    if (fs.existsSync(AUTH_FILE)) {
-      const stored = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+    if (fs.existsSync(authFile)) {
+      const stored = JSON.parse(fs.readFileSync(authFile, 'utf8'));
       if (typeof stored.token === 'string' && stored.token) {
-        cachedToken = stored.token;
-        cachedTokenBuf = Buffer.from(stored.token, 'utf8');
-        return cachedToken;
+        _setCachedToken(stored.token, authFile, undefined);
+        return stored.token;
       }
     }
   } catch (e) {}
 
-  cachedToken = crypto.randomBytes(32).toString('hex');
-  cachedTokenBuf = Buffer.from(cachedToken, 'utf8');
+  const fresh = crypto.randomBytes(32).toString('hex');
+  _setCachedToken(fresh, authFile, undefined);
   try {
-    atomicWriteJsonSync(AUTH_FILE, { token: cachedToken, createdAt: new Date().toISOString() }, 0o600);
+    atomicWriteJsonSync(authFile, { token: fresh, createdAt: new Date().toISOString() }, 0o600);
   } catch (e) {
     console.warn('[Auth] No se pudo guardar el token en disco; será distinto en cada arranque:', e.message);
   }
-  return cachedToken;
+  return fresh;
 }
 
 /** @type {Set<() => void>} */
@@ -333,17 +419,17 @@ function rotateToken() {
   if (process.env.CULKIBO_TOKEN) {
     throw new Error('El token está fijado por la variable de entorno CULKIBO_TOKEN. Cámbiala y reinicia el servicio.');
   }
+  const authFile = resolveAuthFile();
   const nextToken = crypto.randomBytes(32).toString('hex');
   const rotatedAt = new Date().toISOString();
-  atomicWriteJsonSync(AUTH_FILE, { token: nextToken, rotatedAt }, 0o600);
-  cachedToken = nextToken;
-  cachedTokenBuf = Buffer.from(nextToken, 'utf8');
+  atomicWriteJsonSync(authFile, { token: nextToken, rotatedAt }, 0o600);
+  _setCachedToken(nextToken, authFile, undefined);
   wsTickets.clear();
   for (const fn of tokenRotatedListeners) {
     try { fn(); } catch (e) {}
   }
   emitPrincipalRevoked({ masterToken: true, reason: 'master_token_rotated', at: rotatedAt });
-  return { rotated: true, token: nextToken, rotatedAt, tokenSource: 'data/auth.json' };
+  return { rotated: true, token: nextToken, rotatedAt, tokenSource: authFile };
 }
 
 /** @type {string | null} */
@@ -403,15 +489,14 @@ function isOriginAllowed(origin, req = null) {
   return false;
 }
 
-/** Comparación en tiempo constante: una comparación normal filtra el token. */
+/** Comparación en tiempo constante libre de fuga de longitud (HMAC-SHA256 32B + timingSafeEqual). */
 function tokenMatches(provided) {
-  if (!provided) return false;
-  if (!cachedTokenBuf) resolveToken();
-  if (!cachedTokenBuf) return false;
-  const a = Buffer.from(String(provided), 'utf8');
-  if (a.length !== cachedTokenBuf.length) return false;
+  if (typeof provided !== 'string' || !provided) return false;
+  resolveToken();
+  if (!cachedTokenHash) return false;
+  const provHash = crypto.createHmac('sha256', COMPARE_HMAC_KEY).update(provided, 'utf8').digest();
   try {
-    return crypto.timingSafeEqual(a, cachedTokenBuf);
+    return crypto.timingSafeEqual(provHash, cachedTokenHash);
   } catch (e) {
     return false;
   }
@@ -597,6 +682,10 @@ const PUBLIC_PATHS = new Set([
   '/api/auth/session',
   '/api/auth/verify',
   '/api/auth/login',
+  '/api/auth/2fa/verify',
+  '/api/auth/oidc/providers',
+  '/api/auth/oidc/start',
+  '/api/auth/oidc/callback',
   '/api/auth/bootstrap',
   '/api/auth/invites/accept',
   '/api/webhooks/github',
@@ -609,18 +698,23 @@ const ORIGIN_GUARDED_PUBLIC_AUTH_PATHS = new Set([
   '/api/auth/verify',
   '/api/auth/session',
   '/api/auth/login',
+  '/api/auth/2fa/verify',
+  '/api/auth/oidc/start',
   '/api/auth/bootstrap',
   '/api/auth/invites/accept'
 ]);
 const BRUTE_FORCE_PUBLIC_AUTH_PATHS = new Set([
   '/api/auth/login',
+  '/api/auth/2fa/verify',
+  '/api/auth/oidc/callback',
   '/api/auth/bootstrap',
   '/api/auth/invites/accept'
 ]);
-const DEPLOY_HOOK_PATH_RE = /^\/api\/webhooks\/deploy\/[a-zA-Z0-9_-]{1,80}$/;
+const DEPLOY_HOOK_PATH_RE = /^\/api\/webhooks\/deploy\/[a-z0-9_-]{1,80}$/;
 
 function isPublicPath(reqPath) {
-  return PUBLIC_PATHS.has(reqPath) || DEPLOY_HOOK_PATH_RE.test(reqPath);
+  const canon = canonicalizePath(reqPath);
+  return PUBLIC_PATHS.has(canon) || DEPLOY_HOOK_PATH_RE.test(canon);
 }
 
 /** Estadísticas actuales de bloqueos anti fuerza bruta (para health-summary). */
@@ -778,9 +872,11 @@ function authorizeRequest(req, options = {}) {
 }
 
 function authMiddleware(req, res, next) {
-  const rawUrl = req.originalUrl || req.url || '';
-  const qIdx = rawUrl.indexOf('?');
-  const fullPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+  const rawUrl = req.originalUrl || req.url || '/';
+  const fullPath = canonicalizePath(rawUrl);
+  if (fullPath === '/__invalid_path__') {
+    return res.status(400).json({ error: 'Ruta HTTP malformada', code: 'INVALID_PATH' });
+  }
 
   // Validación de Origin incluso en rutas auth públicas (corta CSRF/cross-origin)
   if (ORIGIN_GUARDED_PUBLIC_AUTH_PATHS.has(fullPath) && req.headers && req.headers.origin) {
@@ -950,8 +1046,10 @@ function requireRouteRbac(opts = {}) {
       return next();
     }
     const rawUrl = req.originalUrl || req.url || '/';
-    const qIdx = rawUrl.indexOf('?');
-    const fullPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+    const fullPath = canonicalizePath(rawUrl);
+    if (fullPath === '/__invalid_path__') {
+      return res.status(400).json({ error: 'Ruta HTTP malformada', code: 'INVALID_PATH' });
+    }
     const tm = getTeamManager(opts && opts.teamManager);
     const decision = tm.authorizeHttpRoute(principal, req.method || 'GET', fullPath);
     if (!decision || !decision.allowed) {
@@ -990,10 +1088,11 @@ function corsDelegate(req, callback) {
 
 /** Resumen para el arranque y para /api/system/status. Nunca devuelve el token ni secretos. */
 function authStatus() {
+  const authFile = resolveAuthFile();
   let tokenRotatedAt = null;
   try {
-    if (!process.env.CULKIBO_TOKEN && fs.existsSync(AUTH_FILE)) {
-      const stored = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+    if (!process.env.CULKIBO_TOKEN && fs.existsSync(authFile)) {
+      const stored = JSON.parse(fs.readFileSync(authFile, 'utf8'));
       tokenRotatedAt = stored.rotatedAt || stored.createdAt || null;
     }
   } catch (e) {}
@@ -1011,8 +1110,8 @@ function authStatus() {
   }
 
   return {
-    tokenConfigured: Boolean(cachedToken || process.env.CULKIBO_TOKEN || fs.existsSync(AUTH_FILE)),
-    tokenSource: process.env.CULKIBO_TOKEN ? 'env' : 'data/auth.json',
+    tokenConfigured: Boolean(cachedToken || process.env.CULKIBO_TOKEN || fs.existsSync(authFile)),
+    tokenSource: process.env.CULKIBO_TOKEN ? 'env' : (process.env.CULKIBO_DATA_DIR ? authFile : 'data/auth.json'),
     tokenRotatedAt,
     requireTokenAlways: process.env.CULKIBO_REQUIRE_TOKEN === '1',
     allowedOrigins: Array.from(allowedOrigins()),
@@ -1030,6 +1129,7 @@ module.exports = {
   corsOptions,
   corsDelegate,
   resolveToken,
+  resolveAuthFile,
   rotateToken,
   onTokenRotated,
   onPrincipalRevoked,
@@ -1040,6 +1140,8 @@ module.exports = {
   isOriginAllowed,
   addAllowedOrigin,
   tokenMatches,
+  timingSafeEqualString,
+  canonicalizePath,
   isLoopback,
   isPrivateProxyPeer,
   canBootstrapRequest,
@@ -1061,5 +1163,6 @@ module.exports = {
   HOST_SESSION_COOKIE_NAME,
   SUPERADMIN_MASTER,
   SUPERADMIN_LOOPBACK,
-  _setTeamManagerForTest
+  _setTeamManagerForTest,
+  _resetTokenCacheForTest
 };

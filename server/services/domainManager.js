@@ -29,21 +29,107 @@ const DOMAINS_FILE = path.join(__dirname, '..', '..', 'data', 'domains.json');
 const DOMAIN_REGEX = /^(?:\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
 const VALID_TLD_RE = /^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/;
+const HEADER_NAME_RE = /^[A-Za-z0-9-]+$/;
+const INVISIBLE_OR_BIDI_RE = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/;
+const LATIN_SCRIPT_RE = /\p{Script=Latin}/u;
+const CYRILLIC_SCRIPT_RE = /\p{Script=Cyrillic}/u;
+const GREEK_SCRIPT_RE = /\p{Script=Greek}/u;
+const CYRILLIC_CONFUSABLE_CHARS = new Set(['а', 'е', 'о', 'р', 'с', 'х', 'у', 'і', 'ј', 'ѕ', 'һ', 'ԁ', 'ԝ', 'к', 'м', 'т', 'в', 'н']);
+const GREEK_CONFUSABLE_CHARS = new Set(['α', 'β', 'ε', 'ζ', 'η', 'ι', 'κ', 'μ', 'ν', 'ο', 'ρ', 'σ', 'τ', 'υ', 'χ']);
+
+/** @type {any} */
+let _caddyManager = null;
+function getCaddyManager() {
+  if (!_caddyManager) _caddyManager = require('./caddyManager');
+  return _caddyManager;
+}
 
 /**
- * Normaliza y valida un hostname (RFC 1123 + IDN Punycode + sin punto final FQDN
- * + límite de 63 chars por etiqueta + TLD no numérico + rechazo de IPv4).
+ * Detecta ataques de homógrafos IDN (mezcla de alfabetos Latin+Cirílico/Griego,
+ * caracteres invisibles/BiDi, o etiquetas totalmente confusables bajo TLDs latinos ASCII).
+ * Permite IDN legítimos de un único alfabeto (p. ej. `café.ejemplo.es` o `пример.рф`).
+ *
+ * @param {string} rawHostname
+ * @returns {{ suspicious: boolean, reason?: string }}
+ */
+function detectIdnHomograph(rawHostname) {
+  const clean = String(rawHostname || '').trim().toLowerCase().replace(/^\*\./, '').replace(/\.+$/, '');
+  if (!clean) return { suspicious: false };
+  if (INVISIBLE_OR_BIDI_RE.test(clean)) {
+    return { suspicious: true, reason: 'Caracteres invisibles o de control bidireccional (BiDi) no permitidos en hostname' };
+  }
+
+  // Evaluar tanto la forma cruda Unicode como la decodificada desde punycode (`xn--...`)
+  const forms = [clean];
+  if (typeof url.domainToUnicode === 'function') {
+    const decoded = url.domainToUnicode(clean);
+    if (decoded && decoded.toLowerCase() !== clean) {
+      forms.push(decoded.toLowerCase());
+    }
+  }
+
+  for (const form of forms) {
+    if (INVISIBLE_OR_BIDI_RE.test(form)) {
+      return { suspicious: true, reason: 'Punycode decodifica caracteres invisibles/BiDi' };
+    }
+    const labels = form.split('.').filter(Boolean);
+    const tld = labels[labels.length - 1] || '';
+    const isAsciiLatinTld = /^[a-z]{2,63}$/.test(tld);
+
+    for (const label of labels) {
+      const hasLatin = LATIN_SCRIPT_RE.test(label);
+      const hasCyrillic = CYRILLIC_SCRIPT_RE.test(label);
+      const hasGreek = GREEK_SCRIPT_RE.test(label);
+
+      const scriptCount = Number(hasLatin) + Number(hasCyrillic) + Number(hasGreek);
+      if (scriptCount > 1) {
+        return {
+          suspicious: true,
+          reason: `Etiqueta IDN homógrafa (mezcla de alfabetos Latin/Cirílico/Griego) detectada en "${label}"`
+        };
+      }
+
+      // Spoof de etiqueta completa con caracteres visualmente idénticos a Latin bajo TLD ASCII (p. ej. `аеорс.com`)
+      if (isAsciiLatinTld && (hasCyrillic || hasGreek)) {
+        const letters = Array.from(label).filter((ch) => /\p{L}/u.test(ch));
+        const confusableSet = hasCyrillic ? CYRILLIC_CONFUSABLE_CHARS : GREEK_CONFUSABLE_CHARS;
+        if (letters.length > 0 && letters.every((ch) => confusableSet.has(ch))) {
+          return {
+            suspicious: true,
+            reason: `Etiqueta IDN homógrafa confusable con ASCII bajo TLD .${tld} detectada en "${label}"`
+          };
+        }
+      }
+    }
+  }
+  return { suspicious: false };
+}
+
+/**
+ * Normaliza y valida un hostname (RFC 1123 + guardia anti-homógrafos IDN + Punycode
+ * + sin punto final FQDN + límite de 63 chars por etiqueta + TLD no numérico + rechazo de IPv4).
  * @param {string} raw
  * @returns {string}
  */
 function normalizeAndValidateHostname(raw) {
-  let clean = String(raw || '').trim().toLowerCase().replace(/\.+$/, '');
+  const rawStr = String(raw || '').trim();
+  if (/[\r\n\0\s]/.test(rawStr)) {
+    throw new Error(`Invalid domain format (RFC 1123 required): ${raw}`);
+  }
+  const homograph = detectIdnHomograph(rawStr);
+  if (homograph.suspicious) {
+    throw new Error(`IDN homograph rejected (${homograph.reason}): ${raw}`);
+  }
+  let clean = rawStr.toLowerCase().replace(/\.+$/, '');
   if (clean === 'localhost') return 'localhost';
   const isWild = clean.startsWith('*.');
   const body = isWild ? clean.slice(2) : clean;
   let ascii = body;
   if (body && typeof url.domainToASCII === 'function') {
     const conv = url.domainToASCII(body);
+    if (!conv && /[^\x00-\x7f]/.test(body)) {
+      throw new Error(`Invalid IDN domain format: ${raw}`);
+    }
     if (conv) ascii = conv.toLowerCase().replace(/\.+$/, '');
   }
   const normalized = isWild ? `*.${ascii}` : ascii;
@@ -64,15 +150,29 @@ const UPDATABLE_DOMAIN_FIELDS = new Set([
   'cloudflareProxied',
   'cloudflareZoneId',
   'cloudflareRecordId',
+  'tunnelId',
   'sslStatus',
   'sslCertId',
   'sslProvider',
   'routingMode',
   'canonicalRedirect',
   'securityHeaders',
+  'hstsPreload',
+  'hstsMaxAge',
+  'permissionsPolicy',
+  'csp',
   'framePolicy',
   'customHeaders',
   'basicAuth',
+  'forwardAuth',
+  'cors',
+  'pathRoutes',
+  'pathRedirects',
+  'protocol',
+  'streaming',
+  'flushInterval',
+  'streamCloseDelayMs',
+  'responseHeaderTimeoutMs',
   'ipAllowlist',
   'maxBodySizeMb',
   'rateLimit',
@@ -84,6 +184,54 @@ const UPDATABLE_DOMAIN_FIELDS = new Set([
 ]);
 
 const HOP_BY_HOP_HEADER_RE = /^(host|content-length|transfer-encoding|connection|keep-alive|upgrade|proxy-authenticate|proxy-authorization|te|trailer)$/i;
+
+/**
+ * Valida y sanea `customHeaders` (compartido por `addDomain` y `updateDomain`).
+ * Rechaza estrictamente inyección CRLF/NUL, cabeceras hop-by-hop y `Host`.
+ *
+ * @param {any} rawHeaders
+ * @returns {{ response?: Record<string, string>, request?: Record<string, string> } | null}
+ */
+function sanitizeCustomHeaders(rawHeaders) {
+  if (rawHeaders === null || rawHeaders === undefined) return null;
+  if (typeof rawHeaders !== 'object' || Array.isArray(rawHeaders)) {
+    throw new Error('customHeaders debe ser un objeto con secciones response y/o request');
+  }
+  /** @type {{ response?: Record<string, string>, request?: Record<string, string> }} */
+  const cleanHeaders = {};
+  for (const section of ['response', 'request']) {
+    const src = rawHeaders[section];
+    if (src === undefined || src === null) continue;
+    if (typeof src !== 'object' || Array.isArray(src)) {
+      throw new Error(`customHeaders.${section} debe ser un objeto clave-valor`);
+    }
+    /** @type {Record<string, string>} */
+    const map = {};
+    let count = 0;
+    for (const [hk, hv] of Object.entries(src)) {
+      if (count >= 20) break;
+      const rawKey = String(hk);
+      if (/[\r\n\0]/.test(rawKey)) {
+        throw new Error('Inyección CRLF/NUL rechazada en nombre de cabecera HTTP');
+      }
+      const k = rawKey.trim();
+      if (!HEADER_NAME_RE.test(k)) {
+        throw new Error(`Nombre de cabecera HTTP inválido: "${k.slice(0, 40)}"`);
+      }
+      if (HOP_BY_HOP_HEADER_RE.test(k)) {
+        throw new Error(`Cabecera hop-by-hop o reservada no permitida: "${k}"`);
+      }
+      const rawVal = String(hv == null ? '' : hv);
+      if (/[\r\n\0]/.test(rawVal)) {
+        throw new Error(`Inyección CRLF/NUL rechazada en valor de cabecera "${k}"`);
+      }
+      map[k] = rawVal.slice(0, 1024);
+      count++;
+    }
+    if (Object.keys(map).length > 0) cleanHeaders[section] = map;
+  }
+  return (cleanHeaders.response || cleanHeaders.request) ? cleanHeaders : null;
+}
 
 /** Valida una IP o CIDR IPv4/IPv6 para la lista blanca de Caddy `client_ip`. */
 function isValidCidrOrIp(entry) {
@@ -165,7 +313,22 @@ function withTimeout(promise, ms) {
 }
 
 class DomainManager {
-  constructor() {
+  /**
+   * @param {{
+   *   dataDir?: string | null,
+   *   domainsFile?: string | null,
+   *   seedDefaults?: boolean,
+   *   sslManager?: any,
+   *   cloudflareService?: any
+   * }} [opts]
+   */
+  constructor(opts = {}) {
+    this.domainsFile = opts.domainsFile
+      || (opts.dataDir ? path.join(path.resolve(opts.dataDir), 'domains.json') : null)
+      || (process.env.CULKIBO_DATA_DIR ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data', 'domains.json') : DOMAINS_FILE);
+    this._seedDefaults = opts.seedDefaults !== undefined ? Boolean(opts.seedDefaults) : true;
+    this._customSslManager = opts.sslManager || null;
+    this._customCloudflareService = opts.cloudflareService || null;
     this.ensureDirectory();
     this.domains = this.loadDomains();
     /** @type {Map<string, any>} */
@@ -178,6 +341,14 @@ class DomainManager {
     /** @type {{ sslVersion: number, at: number, etag: string, buffer: Buffer | null, wrappedBuffer: Buffer | null } | null} */
     this._serializedCache = null;
     this.rebuildIndex();
+  }
+
+  _getSsl() {
+    return this._customSslManager || getSslManager();
+  }
+
+  _getCloudflare() {
+    return this._customCloudflareService || getCloudflareService();
   }
 
   rebuildIndex() {
@@ -201,14 +372,14 @@ class DomainManager {
   }
 
   ensureDirectory() {
-    const dir = path.dirname(DOMAINS_FILE);
+    const dir = path.dirname(this.domainsFile);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
   }
 
   loadDomains() {
-    const loaded = loadJsonWithBackupSync(DOMAINS_FILE, {
+    const loaded = loadJsonWithBackupSync(this.domainsFile, {
       validate: (parsed) => Array.isArray(parsed)
     });
     if (loaded.ok && Array.isArray(loaded.data)) {
@@ -217,9 +388,10 @@ class DomainManager {
     if (loaded.corrupt) {
       // Defensa anti-borrado (CapRover #2413): nunca reemplazar un domains.json corrupto por semillas de demo
       this._corruptReadOnly = true;
-      console.error(`[DomainManager] data/domains.json corrupto; archivado en ${loaded.quarantinePath}. Guardado bloqueado para proteger rutas de producción.`);
+      console.error(`[DomainManager] ${this.domainsFile} corrupto; archivado en ${loaded.quarantinePath}. Guardado bloqueado para proteger rutas de producción.`);
       return [];
     }
+    if (!this._seedDefaults) return [];
     // Default initial seed domains (solo en instalación completamente nueva sin domains.json)
     return [
       {
@@ -280,7 +452,7 @@ class DomainManager {
     if (this._corruptReadOnly) return;
     this.ensureDirectory();
     this.rebuildIndex();
-    atomicWriteJsonSync(DOMAINS_FILE, this.domains, { mode: 0o600, backup: true });
+    atomicWriteJsonSync(this.domainsFile, this.domains, { mode: 0o600, backup: true });
   }
 
   /** Valida redirección canónica bidireccionalmente (evita bucles 301 www ↔ raíz y colisiones). */
@@ -323,7 +495,7 @@ class DomainManager {
 
   listDomains() {
     // Una sola pasada de verificación sobre el registro SSL en vez de O(D × C).
-    const sslManager = getSslManager();
+    const sslManager = this._getSsl();
     const certs = sslManager.listCertificates();
     const now = Date.now();
     return this.domains.map(d => {
@@ -333,14 +505,18 @@ class DomainManager {
         ...(d.basicAuth ? { basicAuth: sanitizeBasicAuthForPublic(d.basicAuth) } : {}),
         projectId: d.projectId || null,
         certClaim: cert ? {
-          verified: false,
+          verified: Boolean(cert.verified && cert.managedBy === 'on_disk'),
           managedBy: cert.managedBy || null,
           issuer: cert.issuer || null,
           expiresAt: cert.expiresAt || null,
           daysRemaining: cert.expiresAt
             ? Math.max(0, Math.floor((new Date(cert.expiresAt).getTime() - now) / 86400000))
             : null,
-          isWildcard: cert.type === 'wildcard_dns01'
+          isWildcard: Boolean(
+            cert.type === 'wildcard_dns01' ||
+            cert.type === 'custom_wildcard' ||
+            String(cert.domain || '').startsWith('*.')
+          )
         } : null
       };
     });
@@ -352,7 +528,7 @@ class DomainManager {
    * @returns {Buffer}
    */
   getAllSerialized() {
-    const sslManager = getSslManager();
+    const sslManager = this._getSsl();
     const sslVer = sslManager.version || 0;
     const now = Date.now();
     const hasOnDisk = sslManager.registry.some(c => c && c.managedBy !== sslManager.MANAGED_BY_CADDY);
@@ -379,7 +555,7 @@ class DomainManager {
 
   /** Buffer JSON pre-serializado con envoltorio `{"domains":[...]}` y ETag. */
   getAllWrappedSerialized() {
-    const sslManager = getSslManager();
+    const sslManager = this._getSsl();
     const sslVer = sslManager.version || 0;
     const now = Date.now();
     const hasOnDisk = sslManager.registry.some(c => c && c.managedBy !== sslManager.MANAGED_BY_CADDY);
@@ -453,16 +629,419 @@ class DomainManager {
   }
 
   /**
+   * Valida y normaliza todos los campos de política de borde (compartido entre
+   * `addDomain` y `updateDomain` para impedir inyección de cabeceras, SSRF en ForwardAuth,
+   * CORS inseguro `*`+credenciales, ReDoS en redirecciones o bypasses CIDR/bcrypt).
+   *
+   * @param {Record<string, any>} fields
+   * @param {any} [prevDomain]
+   * @returns {Record<string, any>}
+   */
+  _validateEdgeFields(fields, prevDomain = null) {
+    /** @type {Record<string, any>} */
+    const out = { ...fields };
+    const cm = getCaddyManager();
+
+    // framePolicy
+    if (out.framePolicy !== undefined) {
+      const fp = out.framePolicy ? String(out.framePolicy).toUpperCase() : null;
+      if (fp && !['DENY', 'SAMEORIGIN', 'ALLOW'].includes(fp)) {
+        throw new Error(`framePolicy inválido: ${fp}`);
+      }
+      out.framePolicy = fp;
+    }
+
+    // HSTS Preload & cabeceras de seguridad extendidas
+    if (out.hstsPreload !== undefined) {
+      out.hstsPreload = Boolean(out.hstsPreload);
+    }
+    if (out.hstsMaxAge !== undefined) {
+      if (out.hstsMaxAge === null || out.hstsMaxAge === '') {
+        out.hstsMaxAge = null;
+      } else {
+        const age = Number(out.hstsMaxAge);
+        if (!Number.isFinite(age) || age < 0 || age > 63072000) {
+          throw new Error('hstsMaxAge debe estar entre 0 y 63072000 segundos');
+        }
+        out.hstsMaxAge = Math.round(age);
+      }
+    }
+    if (out.permissionsPolicy !== undefined) {
+      if (out.permissionsPolicy === null || out.permissionsPolicy === '') {
+        out.permissionsPolicy = null;
+      } else {
+        const pp = String(out.permissionsPolicy);
+        if (/[\r\n\0]/.test(pp)) throw new Error('Inyección CRLF/NUL rechazada en permissionsPolicy');
+        out.permissionsPolicy = pp.trim().slice(0, 512) || null;
+      }
+    }
+    if (out.csp !== undefined) {
+      if (out.csp === null || out.csp === '') {
+        out.csp = null;
+      } else {
+        const c = String(out.csp);
+        if (/[\r\n\0]/.test(c)) throw new Error('Inyección CRLF/NUL rechazada en csp');
+        out.csp = c.trim().slice(0, 2048) || null;
+      }
+    }
+
+    // customHeaders (CRLF + hop-by-hop strict)
+    if (out.customHeaders !== undefined) {
+      out.customHeaders = sanitizeCustomHeaders(out.customHeaders);
+    }
+
+    // Basic Auth bcrypt
+    if (out.basicAuth !== undefined) {
+      if (!out.basicAuth || out.basicAuth.enabled === false) {
+        out.basicAuth = { enabled: false, realm: 'Acceso protegido', accounts: [] };
+      } else if (typeof out.basicAuth === 'object') {
+        const prevAccounts = new Map(
+          ((prevDomain && prevDomain.basicAuth && prevDomain.basicAuth.accounts) || []).map((a) => [a.username, a.passwordHash])
+        );
+        const rawList = Array.isArray(out.basicAuth.accounts)
+          ? out.basicAuth.accounts
+          : (Array.isArray(out.basicAuth.users) ? out.basicAuth.users : []);
+        /** @type {Array<{ username: string, passwordHash: string }>} */
+        const hashedAccounts = [];
+        /** @type {Set<string>} */
+        const seenUsers = new Set();
+        for (const item of rawList.slice(0, 20)) {
+          if (!item || typeof item !== 'object') continue;
+          const username = String(item.username || '').trim();
+          if (!username || !/^[A-Za-z0-9._@+-]{1,64}$/.test(username)) {
+            throw new Error(`Usuario de Basic Auth inválido: "${username.slice(0, 30)}"`);
+          }
+          if (seenUsers.has(username)) {
+            throw new Error(`Usuario de Basic Auth duplicado: "${username}" (Caddy exige usuarios únicos)`);
+          }
+          seenUsers.add(username);
+          let passwordHash = '';
+          if (typeof item.password === 'string' && item.password.length > 0) {
+            if (!isBcryptHash(item.password)) {
+              if (item.password.includes('\0')) {
+                throw new Error(`La contraseña de "${username}" contiene caracteres nulos no permitidos`);
+              }
+              if (Buffer.byteLength(item.password, 'utf8') > 72) {
+                throw new Error(`La contraseña de "${username}" supera el límite de 72 bytes de bcrypt`);
+              }
+            }
+            passwordHash = isBcryptHash(item.password) ? item.password : hashBcrypt(item.password, 10);
+          } else if (typeof item.passwordHash === 'string' && isBcryptHash(item.passwordHash)) {
+            passwordHash = item.passwordHash;
+          } else if (prevAccounts.has(username)) {
+            passwordHash = prevAccounts.get(username);
+          } else {
+            throw new Error(`Debes indicar una contraseña para el usuario "${username}"`);
+          }
+          hashedAccounts.push({ username, passwordHash });
+        }
+        if (hashedAccounts.length === 0) {
+          throw new Error('Activar Basic Auth requiere al menos un usuario con contraseña');
+        }
+        out.basicAuth = {
+          enabled: true,
+          realm: String(out.basicAuth.realm || 'Acceso protegido').replace(/[\r\n\0"]/g, '').slice(0, 80),
+          accounts: hashedAccounts
+        };
+      }
+    }
+
+    // ForwardAuth (Authelia / Authentik / Keycloak)
+    if (out.forwardAuth !== undefined) {
+      if (!out.forwardAuth || out.forwardAuth.enabled === false) {
+        out.forwardAuth = { enabled: false, upstream: '', uri: '/api/verify', copyHeaders: [] };
+      } else if (typeof out.forwardAuth === 'object') {
+        const dial = cm.sanitizeUpstreamDial(out.forwardAuth.upstream, 'forwardAuth.upstream');
+        const uri = String(out.forwardAuth.uri || '/api/verify').trim();
+        if (!uri.startsWith('/') || /[\s\r\n\0]/.test(uri) || uri.includes('..')) {
+          throw new Error(`URI de forwardAuth inválida: ${uri.slice(0, 80)}`);
+        }
+        const rawCopy = Array.isArray(out.forwardAuth.copyHeaders) && out.forwardAuth.copyHeaders.length > 0
+          ? out.forwardAuth.copyHeaders
+          : ['Remote-User', 'Remote-Groups', 'Remote-Name', 'Remote-Email'];
+        const copyHeaders = [];
+        for (const h of rawCopy.slice(0, 20)) {
+          const clean = String(h || '').trim();
+          if (!HEADER_NAME_RE.test(clean) || HOP_BY_HOP_HEADER_RE.test(clean)) {
+            throw new Error(`Cabecera copyHeaders inválida en forwardAuth: "${clean.slice(0, 40)}"`);
+          }
+          copyHeaders.push(clean);
+        }
+        out.forwardAuth = {
+          enabled: true,
+          upstream: dial,
+          uri,
+          copyHeaders: Array.from(new Set(copyHeaders)),
+          dialTimeoutMs: Number.isFinite(Number(out.forwardAuth.dialTimeoutMs))
+            ? Math.min(30000, Math.max(500, Math.round(Number(out.forwardAuth.dialTimeoutMs))))
+            : 3000,
+          responseTimeoutMs: Number.isFinite(Number(out.forwardAuth.responseTimeoutMs))
+            ? Math.min(30000, Math.max(500, Math.round(Number(out.forwardAuth.responseTimeoutMs))))
+            : 5000
+        };
+      } else {
+        throw new Error('forwardAuth debe ser un objeto de configuración');
+      }
+    }
+
+    // CORS
+    if (out.cors !== undefined) {
+      if (!out.cors || out.cors.enabled === false) {
+        out.cors = { enabled: false, allowedOrigins: [] };
+      } else if (typeof out.cors === 'object') {
+        const rawOrigins = Array.isArray(out.cors.allowedOrigins) ? out.cors.allowedOrigins : [];
+        const origins = Array.from(new Set(rawOrigins.map((o) => cm.validateCorsOrigin(o))));
+        if (origins.length === 0) {
+          throw new Error('Activar CORS requiere al menos un origen en allowedOrigins');
+        }
+        const allowCredentials = Boolean(out.cors.allowCredentials);
+        if (allowCredentials && origins.includes('*')) {
+          throw new Error('Política CORS insegura bloqueada: allowCredentials=true no puede combinarse con allowedOrigins=["*"]');
+        }
+        const allowedMethods = (Array.isArray(out.cors.allowedMethods) && out.cors.allowedMethods.length > 0
+          ? out.cors.allowedMethods
+          : ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+          .map((m) => String(m || '').trim().toUpperCase())
+          .filter((m) => /^[A-Z]{2,16}$/.test(m));
+        const allowedHeaders = (Array.isArray(out.cors.allowedHeaders) && out.cors.allowedHeaders.length > 0
+          ? out.cors.allowedHeaders
+          : ['Authorization', 'Content-Type', 'X-Requested-With'])
+          .map((h) => String(h || '').trim())
+          .filter((h) => HEADER_NAME_RE.test(h));
+        const exposedHeaders = (Array.isArray(out.cors.exposedHeaders) ? out.cors.exposedHeaders : [])
+          .map((h) => String(h || '').trim())
+          .filter((h) => HEADER_NAME_RE.test(h));
+        const maxAge = Number.isFinite(Number(out.cors.maxAge))
+          ? Math.min(86400, Math.max(0, Math.round(Number(out.cors.maxAge))))
+          : 3600;
+        out.cors = {
+          enabled: true,
+          allowedOrigins: origins,
+          allowedMethods,
+          allowedHeaders,
+          exposedHeaders,
+          allowCredentials,
+          maxAge
+        };
+      } else {
+        throw new Error('cors debe ser un objeto de configuración');
+      }
+    }
+
+    // Path-based routing (`pathRoutes`)
+    if (out.pathRoutes !== undefined) {
+      if (out.pathRoutes === null || (Array.isArray(out.pathRoutes) && out.pathRoutes.length === 0)) {
+        out.pathRoutes = [];
+      } else if (Array.isArray(out.pathRoutes)) {
+        const cleanPaths = [];
+        for (const pr of out.pathRoutes.slice(0, 32)) {
+          if (!pr || typeof pr !== 'object') throw new Error('Entrada inválida en pathRoutes');
+          const p = String(pr.path || '').trim();
+          if (!p.startsWith('/') || p.length > 256 || /[\s\r\n\0]/.test(p) || p.includes('..')) {
+            throw new Error(`Prefijo de pathRoute inválido: "${p.slice(0, 60)}"`);
+          }
+          if (!Array.isArray(pr.upstreams) || pr.upstreams.length === 0) {
+            throw new Error(`pathRoute "${p}" necesita al menos un upstream`);
+          }
+          const ups = pr.upstreams.map((u) => cm.sanitizeUpstreamDial(u, `pathRoute(${p}).upstream`));
+          let stripPrefix = false;
+          if (typeof pr.stripPrefix === 'string' && pr.stripPrefix.trim()) {
+            const sp = pr.stripPrefix.trim();
+            if (!sp.startsWith('/') || /[\s\r\n\0]/.test(sp) || sp.includes('..')) {
+              throw new Error(`stripPrefix inválido en pathRoute "${p}"`);
+            }
+            stripPrefix = sp;
+          } else if (pr.stripPrefix === true) {
+            stripPrefix = true;
+          }
+          const proto = pr.protocol ? String(pr.protocol).trim().toLowerCase() : 'http';
+          if (!['http', 'grpc', 'h2c'].includes(proto)) {
+            throw new Error(`Protocolo inválido en pathRoute "${p}": ${proto}`);
+          }
+          cleanPaths.push({
+            path: p,
+            upstreams: ups,
+            stripPrefix,
+            protocol: proto,
+            ...(pr.streaming !== undefined ? { streaming: Boolean(pr.streaming) } : {}),
+            ...(pr.flushInterval !== undefined && pr.flushInterval !== null ? { flushInterval: Number(pr.flushInterval) } : {})
+          });
+        }
+        out.pathRoutes = cleanPaths;
+      } else {
+        throw new Error('pathRoutes debe ser un array');
+      }
+    }
+
+    // Path redirects (`pathRedirects`) con validación anti-ReDoS
+    if (out.pathRedirects !== undefined) {
+      if (out.pathRedirects === null || (Array.isArray(out.pathRedirects) && out.pathRedirects.length === 0)) {
+        out.pathRedirects = [];
+      } else if (Array.isArray(out.pathRedirects)) {
+        const cleanRedirs = [];
+        for (const rd of out.pathRedirects.slice(0, 32)) {
+          if (!rd || typeof rd !== 'object') throw new Error('Entrada inválida en pathRedirects');
+          const pattern = String(rd.pattern || '').trim();
+          const target = String(rd.target || '').trim();
+          const isRegex = rd.isRegex !== false;
+          const status = [301, 302, 307, 308].includes(Number(rd.status)) ? Number(rd.status) : 301;
+          if (!pattern || !target || /[\r\n\0]/.test(target)) {
+            throw new Error('Redirección de ruta inválida (pattern/target)');
+          }
+          if (/^(?:javascript|data|vbscript):/i.test(target) || (!target.startsWith('/') && !/^https?:\/\//i.test(target))) {
+            throw new Error(`Destino de redirección inválido o bloqueado: ${target.slice(0, 60)}`);
+          }
+          if (isRegex) {
+            const check = cm.validateSafeRedirectRegex(pattern);
+            if (!check.ok) throw new Error(`Regex de redirección rechazado: ${check.error}`);
+          } else if (!pattern.startsWith('/') || /[\s\r\n\0]/.test(pattern)) {
+            throw new Error(`Ruta de redirección inválida: ${pattern.slice(0, 60)}`);
+          }
+          cleanRedirs.push({ pattern, target, status, isRegex });
+        }
+        out.pathRedirects = cleanRedirs;
+      } else {
+        throw new Error('pathRedirects debe ser un array');
+      }
+    }
+
+    // Protocolo upstream (http / grpc / h2c) y tuning SSE/WS
+    if (out.protocol !== undefined) {
+      const proto = String(out.protocol || 'http').trim().toLowerCase();
+      if (!['http', 'grpc', 'h2c'].includes(proto)) {
+        throw new Error(`Protocolo de upstream inválido: ${out.protocol} (usa http, grpc o h2c)`);
+      }
+      out.protocol = proto;
+    }
+    if (out.streaming !== undefined) {
+      out.streaming = Boolean(out.streaming);
+    }
+    if (out.flushInterval !== undefined) {
+      if (out.flushInterval === null || out.flushInterval === '') {
+        out.flushInterval = null;
+      } else {
+        const fi = Number(out.flushInterval);
+        if (!Number.isFinite(fi) || fi < -1 || fi > 60000) {
+          throw new Error('flushInterval debe ser -1 o un valor en ms entre 0 y 60000');
+        }
+        out.flushInterval = Math.round(fi);
+      }
+    }
+    if (out.streamCloseDelayMs !== undefined) {
+      if (out.streamCloseDelayMs === null || out.streamCloseDelayMs === '') {
+        out.streamCloseDelayMs = null;
+      } else {
+        const sc = Number(out.streamCloseDelayMs);
+        if (!Number.isFinite(sc) || sc < 0 || sc > 300000) {
+          throw new Error('streamCloseDelayMs debe estar entre 0 y 300000 ms');
+        }
+        out.streamCloseDelayMs = Math.round(sc);
+      }
+    }
+    if (out.responseHeaderTimeoutMs !== undefined) {
+      if (out.responseHeaderTimeoutMs === null || out.responseHeaderTimeoutMs === '') {
+        out.responseHeaderTimeoutMs = null;
+      } else {
+        const rt = Number(out.responseHeaderTimeoutMs);
+        if (!Number.isFinite(rt) || rt < 1000 || rt > 600000) {
+          throw new Error('responseHeaderTimeoutMs debe estar entre 1000 y 600000 ms');
+        }
+        out.responseHeaderTimeoutMs = Math.round(rt);
+      }
+    }
+
+    // tunnelId (para routingMode: 'cloudflare_tunnel')
+    if (out.tunnelId !== undefined) {
+      if (out.tunnelId === null || out.tunnelId === '') {
+        out.tunnelId = null;
+      } else {
+        const tid = String(out.tunnelId).trim();
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(tid)) {
+          throw new Error(`tunnelId inválido: "${tid.slice(0, 40)}"`);
+        }
+        out.tunnelId = tid;
+      }
+    }
+
+    // IP Allowlist
+    if (out.ipAllowlist !== undefined) {
+      if (out.ipAllowlist === null || (Array.isArray(out.ipAllowlist) && out.ipAllowlist.length === 0)) {
+        out.ipAllowlist = [];
+      } else if (Array.isArray(out.ipAllowlist)) {
+        const cleanIps = [];
+        for (const rawIp of out.ipAllowlist.slice(0, 64)) {
+          const s = String(rawIp || '').trim();
+          if (!s) continue;
+          if (!isValidCidrOrIp(s)) {
+            throw new Error(`IP o rango CIDR inválido en lista blanca: "${s.slice(0, 48)}"`);
+          }
+          cleanIps.push(s);
+        }
+        out.ipAllowlist = Array.from(new Set(cleanIps));
+      } else {
+        throw new Error('ipAllowlist debe ser un array de direcciones IP o rangos CIDR');
+      }
+    }
+
+    // maxBodySizeMb
+    if (out.maxBodySizeMb !== undefined) {
+      if (out.maxBodySizeMb === null || out.maxBodySizeMb === '') {
+        out.maxBodySizeMb = null;
+      } else {
+        const mb = Number(out.maxBodySizeMb);
+        if (!Number.isFinite(mb) || mb < 1 || mb > 10240) {
+          throw new Error('maxBodySizeMb debe estar entre 1 y 10240 MB');
+        }
+        out.maxBodySizeMb = Math.round(mb);
+      }
+    }
+
+    // rateLimit
+    if (out.rateLimit !== undefined) {
+      if (!out.rateLimit || out.rateLimit.enabled === false) {
+        out.rateLimit = { enabled: false, requests: 120, windowSeconds: 60 };
+      } else if (typeof out.rateLimit === 'object') {
+        out.rateLimit = {
+          enabled: true,
+          requests: Math.min(100000, Math.max(1, Math.round(Number(out.rateLimit.requests) || 120))),
+          windowSeconds: Math.min(3600, Math.max(1, Math.round(Number(out.rateLimit.windowSeconds) || 60)))
+        };
+      }
+    }
+
+    return out;
+  }
+
+  /**
    * @param {{
    *   hostname: string,
    *   targetPod?: string,
    *   targetPort?: number | string,
    *   cloudflareZoneId?: string | null,
    *   cloudflareProxied?: boolean,
+   *   tunnelId?: string | null,
    *   routingMode?: string,
    *   canonicalRedirect?: 'none' | 'www_to_apex' | 'apex_to_www',
    *   securityHeaders?: boolean,
+   *   hstsPreload?: boolean,
+   *   hstsMaxAge?: number | null,
+   *   permissionsPolicy?: string | null,
+   *   csp?: string | null,
+   *   framePolicy?: 'DENY' | 'SAMEORIGIN' | 'ALLOW' | null,
    *   customHeaders?: { response?: Record<string, string>, request?: Record<string, string> } | null,
+   *   basicAuth?: any,
+   *   forwardAuth?: any,
+   *   cors?: any,
+   *   pathRoutes?: any[] | null,
+   *   pathRedirects?: any[] | null,
+   *   protocol?: string,
+   *   streaming?: boolean,
+   *   flushInterval?: number | null,
+   *   streamCloseDelayMs?: number | null,
+   *   responseHeaderTimeoutMs?: number | null,
+   *   ipAllowlist?: string[] | null,
+   *   maxBodySizeMb?: number | null,
+   *   rateLimit?: any,
    *   autoCreateDns?: boolean,
    *   serverIp?: string,
    *   sslStatus?: string,
@@ -473,25 +1052,26 @@ class DomainManager {
    *   serviceName?: string | null
    * }} opts
    */
-  async addDomain({
-    hostname,
-    targetPod = 'forge',
-    targetPort = 3001,
-    cloudflareZoneId = null,
-    cloudflareProxied = true,
-    routingMode = 'cloudflare_proxy',
-    canonicalRedirect = 'none',
-    securityHeaders = true,
-    customHeaders = null,
-    autoCreateDns = false,
-    serverIp = '127.0.0.1',
-    sslStatus = undefined,
-    sslProvider = undefined,
-    migrationSource = undefined,
-    projectId = null,
-    serviceId = null,
-    serviceName = null
-  }) {
+  async addDomain(opts) {
+    const {
+      hostname,
+      targetPod = 'forge',
+      targetPort = 3001,
+      cloudflareZoneId = null,
+      cloudflareProxied = true,
+      routingMode = 'cloudflare_proxy',
+      canonicalRedirect = 'none',
+      securityHeaders = true,
+      autoCreateDns = false,
+      serverIp = '127.0.0.1',
+      sslStatus = undefined,
+      sslProvider = undefined,
+      migrationSource = undefined,
+      projectId = null,
+      serviceId = null,
+      serviceName = null
+    } = opts || /** @type {any} */ ({});
+
     const cleanHost = normalizeAndValidateHostname(hostname);
 
     const isWildcard = cleanHost.startsWith('*.');
@@ -507,8 +1087,22 @@ class DomainManager {
 
     const safeCanonical = this._validateCanonicalMode(cleanHost, canonicalRedirect || 'none', -1);
 
+    // Aplicar validación compartida de políticas de borde en alta (evita inyección CRLF/hop-by-hop/CORS/ForwardAuth)
+    const edgeFieldKeys = [
+      'framePolicy', 'hstsPreload', 'hstsMaxAge', 'permissionsPolicy', 'csp',
+      'customHeaders', 'basicAuth', 'forwardAuth', 'cors', 'pathRoutes', 'pathRedirects',
+      'protocol', 'streaming', 'flushInterval', 'streamCloseDelayMs', 'responseHeaderTimeoutMs',
+      'ipAllowlist', 'maxBodySizeMb', 'rateLimit', 'tunnelId'
+    ];
+    /** @type {Record<string, any>} */
+    const rawEdge = {};
+    for (const k of edgeFieldKeys) {
+      if (opts && opts[k] !== undefined) rawEdge[k] = opts[k];
+    }
+    const validatedEdge = this._validateEdgeFields(rawEdge, null);
+
     // Si piden autoCreateDns sin zoneId explícito, intentar resolver la zona en Cloudflare automáticamente.
-    const cloudflareService = getCloudflareService();
+    const cloudflareService = this._getCloudflare();
     const cfStatus = cloudflareService.getConfigStatus();
     let resolvedZoneId = cloudflareZoneId || null;
     if (autoCreateDns && !resolvedZoneId && !cfStatus.useMock) {
@@ -526,7 +1120,7 @@ class DomainManager {
     }
 
     const domainId = `dom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const cert = getSslManager().getCertificateByDomain(cleanHost);
+    const cert = this._getSsl().getCertificateByDomain(cleanHost);
 
     /** @type {{ attempted: boolean, success: boolean, action?: string, error?: string, companionAction?: string } | null} */
     let dnsSyncResult = null;
@@ -578,6 +1172,7 @@ class DomainManager {
       }
     }
 
+    /** @type {Record<string, any>} */
     const newDomain = {
       id: domainId,
       hostname: cleanHost,
@@ -597,7 +1192,8 @@ class DomainManager {
       routingMode,
       canonicalRedirect: safeCanonical,
       securityHeaders: securityHeaders !== false,
-      customHeaders: customHeaders || null,
+      customHeaders: null,
+      ...validatedEdge,
       migrationSource,
       ...(dnsSyncResult ? { dnsSyncResult } : {}),
       createdAt: new Date().toISOString(),
@@ -606,7 +1202,7 @@ class DomainManager {
 
     this.domains.unshift(newDomain);
     this.saveDomains();
-    return newDomain;
+    return newDomain.basicAuth ? { ...newDomain, basicAuth: sanitizeBasicAuthForPublic(newDomain.basicAuth) } : newDomain;
   }
 
   async deleteDomain(id) {
@@ -659,144 +1255,8 @@ class DomainManager {
       safeUpdates.canonicalRedirect = this._validateCanonicalMode(effectiveHostname, candidateMode, idx);
     }
 
-    // Validar framePolicy
-    if (safeUpdates.framePolicy !== undefined) {
-      const fp = safeUpdates.framePolicy ? String(safeUpdates.framePolicy).toUpperCase() : null;
-      if (fp && !['DENY', 'SAMEORIGIN', 'ALLOW'].includes(fp)) {
-        throw new Error(`framePolicy inválido: ${fp}`);
-      }
-      safeUpdates.framePolicy = fp;
-    }
-
-    // Validar y sanear customHeaders (sin CRLF ni hop-by-hop)
-    if (safeUpdates.customHeaders !== undefined) {
-      if (safeUpdates.customHeaders === null) {
-        safeUpdates.customHeaders = null;
-      } else if (typeof safeUpdates.customHeaders === 'object') {
-        /** @type {{ response?: Record<string, string>, request?: Record<string, string> }} */
-        const cleanHeaders = {};
-        for (const section of ['response', 'request']) {
-          const src = safeUpdates.customHeaders[section];
-          if (!src || typeof src !== 'object') continue;
-          /** @type {Record<string, string>} */
-          const map = {};
-          let count = 0;
-          for (const [hk, hv] of Object.entries(src)) {
-            if (count >= 20) break;
-            const k = String(hk).trim();
-            if (!/^[A-Za-z0-9-]+$/.test(k) || HOP_BY_HOP_HEADER_RE.test(k)) continue;
-            map[k] = String(hv == null ? '' : hv).replace(/[\r\n\0]/g, '').slice(0, 1024);
-            count++;
-          }
-          if (Object.keys(map).length > 0) cleanHeaders[section] = map;
-        }
-        safeUpdates.customHeaders = (cleanHeaders.response || cleanHeaders.request) ? cleanHeaders : null;
-      }
-    }
-
-    // Validar y cifrar con bcrypt las cuentas de HTTP Basic Auth (nunca guardar texto plano)
-    if (safeUpdates.basicAuth !== undefined) {
-      if (!safeUpdates.basicAuth || safeUpdates.basicAuth.enabled === false) {
-        safeUpdates.basicAuth = { enabled: false, realm: 'Acceso protegido', accounts: [] };
-      } else if (typeof safeUpdates.basicAuth === 'object') {
-        const prevAccounts = new Map(
-          ((this.domains[idx].basicAuth && this.domains[idx].basicAuth.accounts) || []).map((a) => [a.username, a.passwordHash])
-        );
-        const rawList = Array.isArray(safeUpdates.basicAuth.accounts)
-          ? safeUpdates.basicAuth.accounts
-          : (Array.isArray(safeUpdates.basicAuth.users) ? safeUpdates.basicAuth.users : []);
-        /** @type {Array<{ username: string, passwordHash: string }>} */
-        const hashedAccounts = [];
-        /** @type {Set<string>} */
-        const seenUsers = new Set();
-        for (const item of rawList.slice(0, 20)) {
-          if (!item || typeof item !== 'object') continue;
-          const username = String(item.username || '').trim();
-          if (!username || !/^[A-Za-z0-9._@+-]{1,64}$/.test(username)) {
-            throw new Error(`Usuario de Basic Auth inválido: "${username.slice(0, 30)}"`);
-          }
-          if (seenUsers.has(username)) {
-            throw new Error(`Usuario de Basic Auth duplicado: "${username}" (Caddy exige usuarios únicos)`);
-          }
-          seenUsers.add(username);
-          let passwordHash = '';
-          if (typeof item.password === 'string' && item.password.length > 0) {
-            if (!isBcryptHash(item.password)) {
-              if (item.password.includes('\0')) {
-                throw new Error(`La contraseña de "${username}" contiene caracteres nulos no permitidos`);
-              }
-              if (Buffer.byteLength(item.password, 'utf8') > 72) {
-                throw new Error(`La contraseña de "${username}" supera el límite de 72 bytes de bcrypt`);
-              }
-            }
-            passwordHash = isBcryptHash(item.password) ? item.password : hashBcrypt(item.password, 10);
-          } else if (typeof item.passwordHash === 'string' && isBcryptHash(item.passwordHash)) {
-            passwordHash = item.passwordHash;
-          } else if (prevAccounts.has(username)) {
-            passwordHash = prevAccounts.get(username);
-          } else {
-            throw new Error(`Debes indicar una contraseña para el usuario "${username}"`);
-          }
-          hashedAccounts.push({ username, passwordHash });
-        }
-        if (hashedAccounts.length === 0) {
-          throw new Error('Activar Basic Auth requiere al menos un usuario con contraseña');
-        }
-        safeUpdates.basicAuth = {
-          enabled: true,
-          realm: String(safeUpdates.basicAuth.realm || 'Acceso protegido').replace(/[\r\n\0"]/g, '').slice(0, 80),
-          accounts: hashedAccounts
-        };
-      }
-    }
-
-    // Validar IP Allowlist (CIDRs / IPs IPv4 e IPv6)
-    if (safeUpdates.ipAllowlist !== undefined) {
-      if (safeUpdates.ipAllowlist === null || (Array.isArray(safeUpdates.ipAllowlist) && safeUpdates.ipAllowlist.length === 0)) {
-        safeUpdates.ipAllowlist = [];
-      } else if (Array.isArray(safeUpdates.ipAllowlist)) {
-        const cleanIps = [];
-        for (const rawIp of safeUpdates.ipAllowlist.slice(0, 64)) {
-          const s = String(rawIp || '').trim();
-          if (!s) continue;
-          if (!isValidCidrOrIp(s)) {
-            throw new Error(`IP o rango CIDR inválido en lista blanca: "${s.slice(0, 48)}"`);
-          }
-          cleanIps.push(s);
-        }
-        safeUpdates.ipAllowlist = Array.from(new Set(cleanIps));
-      } else {
-        throw new Error('ipAllowlist debe ser un array de direcciones IP o rangos CIDR');
-      }
-    }
-
-    // Validar maxBodySizeMb
-    if (safeUpdates.maxBodySizeMb !== undefined) {
-      if (safeUpdates.maxBodySizeMb === null || safeUpdates.maxBodySizeMb === '') {
-        safeUpdates.maxBodySizeMb = null;
-      } else {
-        const mb = Number(safeUpdates.maxBodySizeMb);
-        if (!Number.isFinite(mb) || mb < 1 || mb > 10240) {
-          throw new Error('maxBodySizeMb debe estar entre 1 y 10240 MB');
-        }
-        safeUpdates.maxBodySizeMb = Math.round(mb);
-      }
-    }
-
-    // Validar rateLimit por dominio
-    if (safeUpdates.rateLimit !== undefined) {
-      if (!safeUpdates.rateLimit || safeUpdates.rateLimit.enabled === false) {
-        safeUpdates.rateLimit = { enabled: false, requests: 120, windowSeconds: 60 };
-      } else if (typeof safeUpdates.rateLimit === 'object') {
-        safeUpdates.rateLimit = {
-          enabled: true,
-          requests: Math.min(100000, Math.max(1, Math.round(Number(safeUpdates.rateLimit.requests) || 120))),
-          windowSeconds: Math.min(3600, Math.max(1, Math.round(Number(safeUpdates.rateLimit.windowSeconds) || 60)))
-        };
-      }
-    }
-
-    this.domains[idx] = { ...this.domains[idx], ...safeUpdates, updatedAt: new Date().toISOString() };
+    const validatedEdge = this._validateEdgeFields(safeUpdates, this.domains[idx]);
+    this.domains[idx] = { ...this.domains[idx], ...validatedEdge, updatedAt: new Date().toISOString() };
     this.saveDomains();
     const updated = this.domains[idx];
     return updated.basicAuth ? { ...updated, basicAuth: sanitizeBasicAuthForPublic(updated.basicAuth) } : updated;
@@ -809,7 +1269,7 @@ class DomainManager {
     const nextProxied = !dom.cloudflareProxied;
 
     // Sincronizar realmente con Cloudflare API cuando hay credenciales reales (auto-resolviendo zona si falta)
-    const cloudflareService = getCloudflareService();
+    const cloudflareService = this._getCloudflare();
     const cfStatus = cloudflareService.getConfigStatus();
     let cloudflareSynced = false;
     /** @type {string | null} */
@@ -996,6 +1456,13 @@ class DomainManager {
 }
 
 domainManagerExport: {
-  const instance = Object.assign(new DomainManager(), { isCloudflareIp });
+  const instance = Object.assign(new DomainManager(), {
+    DomainManager,
+    normalizeAndValidateHostname,
+    detectIdnHomograph,
+    sanitizeCustomHeaders,
+    isValidCidrOrIp,
+    isCloudflareIp
+  });
   module.exports = instance;
 }

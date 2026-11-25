@@ -1088,6 +1088,844 @@ async function testFleet() {
     console.log('  ✓ Red-team checks: DNS-rebinding TOCTOU, tunnel MITM lockdown, PEM redaction & active-tunnel delete guard');
   }
 
+  // -------------------------------------------------------------------------
+  // 10. Stale POSIX Socket Sweep on Boot & Active-Socket Preservation
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    const sockDir = path.join(dir, 'ck-socks');
+    try {
+      fs.mkdirSync(sockDir, { recursive: true, mode: 0o700 });
+      const stale1 = path.join(sockDir, 'ck-0123456789.sock');
+      const stale2 = path.join(sockDir, 'ck-abcdef0123.sock');
+      const unrelated = path.join(sockDir, 'keep-me.txt');
+      fs.writeFileSync(stale1, 'orphan1');
+      fs.writeFileSync(stale2, 'orphan2');
+      fs.writeFileSync(unrelated, 'do-not-delete');
+
+      const hostKey = makeFakeEd25519PubKey('sock-host');
+      const clientPub = makeFakeEd25519PubKey('sock-client');
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        if (bin === 'ssh-keyscan') return { stdout: `10.91.0.1 ${hostKey.keyType} ${hostKey.b64}\n`, stderr: '' };
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+      const spawner = createFakeTunnelSpawner({ connectDelayMs: 10 });
+
+      // Boot constructor sweeps orphaned ck-<10hex>.sock files automatically without touching unrelated files
+      const mgr = new ServerFleetManager({
+        dataDir: dir,
+        tmpSocketBaseDir: sockDir,
+        platform: 'linux',
+        _execFile: fakeExec,
+        _spawn: spawner.spawnFn,
+        _waitForEndpoint: async () => {},
+        _resolveHost: async () => ['10.91.0.1'],
+        autoMonitor: false
+      });
+      assert.strictEqual(fs.existsSync(stale1), false, 'Boot sweep must remove orphaned ck-*.sock #1');
+      assert.strictEqual(fs.existsSync(stale2), false, 'Boot sweep must remove orphaned ck-*.sock #2');
+      assert.strictEqual(fs.existsSync(unrelated), true, 'Boot sweep must ignore non-socket files');
+
+      // Active tunnel socket must be preserved during runtime sweepStaleSockets()
+      const key = await mgr.importKey({ name: 'sk', privateKeyPem: makeFakePrivatePem('SK') });
+      await mgr.addServer({ id: 'sock-node', name: 'Sock Node', host: '10.91.0.1', keyId: key.id });
+      const lease = await mgr.acquireDockerTunnel('sock-node');
+      const activeSockPath = lease.dockerHost.slice('unix://'.length);
+      fs.writeFileSync(activeSockPath, 'active-placeholder');
+      const lateOrphan = path.join(sockDir, 'ck-9999999999.sock');
+      fs.writeFileSync(lateOrphan, 'late-orphan');
+
+      const removed = mgr.sweepStaleSockets();
+      assert.strictEqual(removed, 1, 'Runtime sweep must remove only the orphan socket');
+      assert.strictEqual(fs.existsSync(lateOrphan), false);
+      assert.strictEqual(fs.existsSync(activeSockPath), true, 'Active tunnel socket must never be deleted by sweepStaleSockets');
+
+      await lease.release();
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Stale POSIX socket sweep on boot & active-socket preservation');
+  }
+
+  // -------------------------------------------------------------------------
+  // 11. Mid-Flight Tunnel Drop, Liveness Reap & withResilientDockerTunnel Auto-Reconnect
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    try {
+      const hostKey = makeFakeEd25519PubKey('rec-host');
+      const clientPub = makeFakeEd25519PubKey('rec-client');
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        if (bin === 'ssh-keyscan') return { stdout: `10.92.0.5 ${hostKey.keyType} ${hostKey.b64}\n`, stderr: '' };
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+
+      const spawner = createFakeTunnelSpawner({ connectDelayMs: 10 });
+      let probeAlive = true;
+      const staleEvents = [];
+      const reconnectEvents = [];
+
+      const mgr = new ServerFleetManager({
+        dataDir: dir,
+        _execFile: fakeExec,
+        _spawn: spawner.spawnFn,
+        _probeEndpoint: async () => probeAlive,
+        _resolveHost: async () => ['10.92.0.5'],
+        platform: 'win32',
+        autoMonitor: false
+      });
+      mgr.on('tunnel:stale_reaped', (ev) => staleEvents.push(ev));
+      mgr.on('tunnel:reconnecting', (ev) => reconnectEvents.push(ev));
+
+      const key = await mgr.importKey({ name: 'rec-k', privateKeyPem: makeFakePrivatePem('REC') });
+      await mgr.addServer({ id: 'rec-node', name: 'Reconnect Node', host: '10.92.0.5', keyId: key.id });
+
+      // A. Unexpected mid-flight ssh exit(255) clears cache and next acquire transparently reconnects
+      const l1 = await mgr.acquireDockerTunnel('rec-node');
+      assert.strictEqual(spawner.spawns.length, 1);
+      assert.strictEqual(l1.isAlive(), true);
+      spawner.spawns[0].child.exitCode = 255;
+      spawner.spawns[0].child.emit('exit', 255, null);
+      assert.strictEqual(l1.isAlive(), false, 'Lease must report isAlive()=false after ssh exit');
+      await l1.release();
+
+      const l2 = await mgr.acquireDockerTunnel('rec-node');
+      assert.strictEqual(spawner.spawns.length, 2, 'Next acquire after drop must spawn fresh tunnel');
+      assert.notStrictEqual(l2.tunnelId, l1.tunnelId);
+      await l2.release();
+
+      // B. Zombie half-open socket (alive in JS, unreachable on probe) reaped & replaced
+      probeAlive = false;
+      const l3 = await mgr.acquireDockerTunnel('rec-node');
+      assert.strictEqual(staleEvents.length, 1, 'Stale zombie tunnel must emit tunnel:stale_reaped');
+      assert.strictEqual(spawner.spawns.length, 3, 'Must spawn replacement tunnel after reaping zombie');
+      assert.strictEqual(spawner.spawns[1].child.killed, true, 'Reaped zombie child must be killed');
+      probeAlive = true;
+      await l3.release();
+
+      // C. withResilientDockerTunnel recovers from transient mid-flight drop with backoff
+      let calls = 0;
+      const seenTunnelIds = [];
+      const res = await mgr.withResilientDockerTunnel('rec-node', async (lease, meta) => {
+        calls++;
+        seenTunnelIds.push(lease.tunnelId);
+        if (calls === 1) {
+          const err = new Error('Cannot connect to the Docker daemon at tcp://127.0.0.1:44444');
+          err.code = 'ECONNRESET';
+          throw err;
+        }
+        return { ok: true, attempt: meta.attempt, reconnected: meta.reconnected };
+      }, { maxRetries: 2, baseDelayMs: 15, maxDelayMs: 40 });
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.attempt, 1);
+      assert.strictEqual(res.reconnected, true);
+      assert.strictEqual(reconnectEvents.length, 1);
+      assert.notStrictEqual(seenTunnelIds[0], seenTunnelIds[1], 'Reconnect must use a brand-new tunnel');
+
+      // D. Fatal security error MUST NOT retry
+      let fatalCalls = 0;
+      await assert.rejects(
+        () => mgr.withResilientDockerTunnel('rec-node', async () => {
+          fatalCalls++;
+          const err = new Error('MITM detected');
+          err.code = 'HOST_KEY_MISMATCH';
+          throw err;
+        }, { maxRetries: 3, baseDelayMs: 10 }),
+        (e) => e && e.code === 'HOST_KEY_MISMATCH'
+      );
+      assert.strictEqual(fatalCalls, 1, 'HOST_KEY_MISMATCH must never be retried');
+
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Mid-flight tunnel drop recovery, zombie liveness reap & withResilientDockerTunnel backoff');
+  }
+
+  // -------------------------------------------------------------------------
+  // 12. Concurrency Races: Coalesced AbortSignal Isolation, Drain-Epoch & Atomic updateServer Rollback
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    try {
+      const hostKey = makeFakeEd25519PubKey('race-host');
+      const clientPub = makeFakeEd25519PubKey('race-client');
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        if (bin === 'ssh-keyscan') return { stdout: `10.93.0.10 ${hostKey.keyType} ${hostKey.b64}\n`, stderr: '' };
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+
+      const spawner = createFakeTunnelSpawner({ connectDelayMs: 90 });
+      const mgr = new ServerFleetManager({
+        dataDir: dir,
+        _execFile: fakeExec,
+        _spawn: spawner.spawnFn,
+        _resolveHost: async () => ['10.93.0.10'],
+        platform: 'win32',
+        autoMonitor: false
+      });
+
+      const k1 = await mgr.importKey({ name: 'rk1', privateKeyPem: makeFakePrivatePem('RK1') });
+      const k2 = await mgr.importKey({ name: 'rk2', privateKeyPem: makeFakePrivatePem('RK2') });
+      await mgr.addServer({ id: 'race-node', name: 'Race Node', host: 'race.internal', port: 2222, keyId: k1.id });
+      await mgr.pinHostKey('race-node');
+
+      // A. Caller A aborts while Caller B coalesces on same connect -> A gets ABORTED, B SUCCEEDS!
+      const ctrlA = new AbortController();
+      const ctrlB = new AbortController();
+      const pA = mgr.acquireDockerTunnel('race-node', { signal: ctrlA.signal });
+      const pB = mgr.acquireDockerTunnel('race-node', { signal: ctrlB.signal });
+      setTimeout(() => ctrlA.abort(), 20);
+
+      await assert.rejects(() => pA, (e) => e && e.code === 'ABORTED');
+      const leaseB = await pB;
+      assert.strictEqual(spawner.spawns.length, 1, 'Sibling waiter must share the single SSH handshake');
+      assert.strictEqual(mgr.getTunnelState('race-node').refCount, 1, 'Aborted caller must not inflate refCount');
+      await leaseB.release();
+      mgr.drainServerTunnels('race-node');
+
+      // B. When ALL waiters abort, underlying SSH handshake IS cancelled & ephemeral key wiped
+      const ctrlC = new AbortController();
+      const ctrlD = new AbortController();
+      const pC = mgr.acquireDockerTunnel('race-node', { signal: ctrlC.signal });
+      const pD = mgr.acquireDockerTunnel('race-node', { signal: ctrlD.signal });
+      setTimeout(() => { ctrlC.abort(); ctrlD.abort(); }, 20);
+      await assert.rejects(() => pC, (e) => e && e.code === 'ABORTED');
+      await assert.rejects(() => pD, (e) => e && e.code === 'ABORTED');
+      await new Promise((r) => setTimeout(r, 40));
+      assert.strictEqual(spawner.spawns[spawner.spawns.length - 1].child.killed, true, 'Orphaned connect must kill ssh when all waiters abort');
+      assert.strictEqual(fs.readdirSync(path.join(dir, '.fleet-tmp')).length, 0);
+
+      // C. Concurrent updateServer() key/user rotation mid-handshake triggers drain epoch & re-fetches freshServer
+      const spawnsBeforeEpoch = spawner.spawns.length;
+      const slowAcquire = mgr.acquireDockerTunnel('race-node');
+      setTimeout(() => { mgr.updateServer('race-node', { keyId: k2.id, user: 'ubuntu' }).catch(() => {}); }, 20);
+      const epochLease = await slowAcquire;
+      assert.strictEqual(epochLease.isAlive(), true, 'In-flight handshake crossing rotation must deliver a live fresh lease');
+      assert.strictEqual(spawner.spawns.length, spawnsBeforeEpoch + 2, 'Must discard stale pre-rotation tunnel and open fresh tunnel');
+      assert.strictEqual(spawner.spawns[spawnsBeforeEpoch].child.killed, true, 'Stale pre-rotation tunnel must be closed immediately');
+      assert.strictEqual(
+        spawner.spawns[spawnsBeforeEpoch + 1].args[spawner.spawns[spawnsBeforeEpoch + 1].args.length - 1],
+        'ubuntu@10.93.0.10',
+        'Re-opened tunnel must use fresh rotated user/keyId, never stale pre-update server reference'
+      );
+      const nextKeyLease = await mgr.acquireDockerTunnel('race-node');
+      assert.strictEqual(nextKeyLease.tunnelId, epochLease.tunnelId, 'Subsequent caller must coalesce onto the fresh post-rotation tunnel');
+      await epochLease.release();
+      await nextKeyLease.release();
+
+      // D. Atomic updateServer() rollback: invalid late field must leave earlier fields UNCHANGED
+      const before = mgr.getServer('race-node');
+      const khPath = path.join(dir, '.fleet-known-hosts', 'race-node');
+      const khBefore = fs.readFileSync(khPath, 'utf8');
+      await assert.rejects(
+        () => mgr.updateServer('race-node', {
+          name: 'CORRUPTED_PARTIAL_NAME',
+          host: 'other.internal',
+          port: 2299,
+          region: 'ap-south',
+          hostKeyPolicy: 'strict' // missing expectedFingerprint after endpoint change -> must throw!
+        }),
+        (e) => e && e.code === 'EXPECTED_FINGERPRINT_REQUIRED'
+      );
+      const after = mgr.getServer('race-node');
+      assert.strictEqual(after.name, before.name, 'Atomic rollback must preserve original name');
+      assert.strictEqual(after.host, before.host, 'Atomic rollback must preserve original host');
+      assert.strictEqual(after.port, before.port, 'Atomic rollback must preserve original port');
+      assert.strictEqual(after.region, before.region, 'Atomic rollback must preserve original region');
+      assert.strictEqual(after.hostKeyPolicy, before.hostKeyPolicy, 'Atomic rollback must preserve hostKeyPolicy');
+      assert.strictEqual(after.hostKeyFingerprint, before.hostKeyFingerprint, 'Atomic rollback must preserve pinned fingerprint');
+      assert.strictEqual(fs.readFileSync(khPath, 'utf8'), khBefore, 'Atomic rollback must not delete known_hosts');
+
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Concurrency races: coalesced AbortSignal isolation, drain-epoch & atomic updateServer rollback');
+  }
+
+  // -------------------------------------------------------------------------
+  // 13. Node Maintenance / Drain Mode & Persistence
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    try {
+      const clientPub = makeFakeEd25519PubKey('maint-client');
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+      const mgr = new ServerFleetManager({ dataDir: dir, _execFile: fakeExec, _resolveHost: async () => ['10.94.0.1'], autoMonitor: false });
+      const key = await mgr.importKey({ name: 'mk', privateKeyPem: makeFakePrivatePem('MK') });
+      await mgr.addServer({ id: 'maint-1', name: 'Maint Node', host: '10.94.0.1', keyId: key.id });
+      assert.strictEqual(mgr.getServer('maint-1').maintenanceState, 'active');
+
+      // Local immutable & invalid states rejected
+      assert.throws(() => mgr.setServerMaintenance('local', 'maintenance'), (e) => e && e.code === 'LOCAL_SERVER_IMMUTABLE');
+      assert.throws(() => mgr.setServerMaintenance('maint-1', 'paused'), (e) => e && e.code === 'INVALID_MAINTENANCE_STATE');
+      assert.throws(() => mgr.setServerMaintenance('maint-1', { state: 'draining', reason: 'bad\0byte' }), (e) => e && e.code === 'INVALID_MAINTENANCE_REASON');
+
+      const events = [];
+      mgr.on('server:maintenance', (ev) => events.push(ev));
+
+      const draining = mgr.setServerMaintenance('maint-1', { state: 'draining', reason: 'Kernel security patching' });
+      assert.strictEqual(draining.maintenanceState, 'draining');
+      assert.strictEqual(draining.maintenanceReason, 'Kernel security patching');
+      assert.ok(draining.maintenanceSince);
+      assert.strictEqual(mgr.isServerSchedulable('maint-1').schedulable, false);
+      assert.strictEqual(mgr.isServerSchedulable('maint-1').code, 'SERVER_IN_MAINTENANCE');
+      assert.strictEqual(mgr.getFleetSummary().drainingCount, 1);
+
+      const maint = mgr.setServerMaintenance('maint-1', 'maintenance');
+      assert.strictEqual(maint.maintenanceState, 'maintenance');
+      assert.strictEqual(maint.maintenanceReason, 'Kernel security patching');
+      assert.strictEqual(mgr.getFleetSummary().maintenanceCount, 1);
+
+      // Persists across reload
+      const reloaded = new ServerFleetManager({ dataDir: dir, _execFile: fakeExec, autoMonitor: false });
+      assert.strictEqual(reloaded.getServer('maint-1').maintenanceState, 'maintenance');
+      assert.strictEqual(reloaded.getServer('maint-1').maintenanceReason, 'Kernel security patching');
+
+      const active = reloaded.setServerMaintenance('maint-1', 'active');
+      assert.strictEqual(active.maintenanceState, 'active');
+      assert.strictEqual(active.maintenanceReason, null);
+      assert.strictEqual(active.maintenanceSince, null);
+      assert.strictEqual(events.length, 2);
+
+      await mgr.shutdown();
+      await reloaded.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Node maintenance/draining state transitions, schedulability guard & persistence');
+  }
+
+  // -------------------------------------------------------------------------
+  // 14. Smart Placement Scheduler (selectBestServer)
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    try {
+      const clientPub = makeFakeEd25519PubKey('sched-client');
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+      const mgr = new ServerFleetManager({ dataDir: dir, _execFile: fakeExec, autoMonitor: false });
+      const key = await mgr.importKey({ name: 'sk', privateKeyPem: makeFakePrivatePem('SCHED') });
+
+      await mgr.addServer({ id: 'eu-heavy', name: 'EU Heavy', host: '10.95.0.1', keyId: key.id, region: 'eu-west', tags: ['prod', 'ssd'] });
+      await mgr.addServer({ id: 'eu-prime', name: 'EU Prime', host: '10.95.0.2', keyId: key.id, region: 'eu-west', tags: ['prod', 'ssd'] });
+      await mgr.addServer({ id: 'eu-drain', name: 'EU Draining', host: '10.95.0.3', keyId: key.id, region: 'eu-west', tags: ['prod', 'ssd'] });
+      await mgr.addServer({ id: 'us-gpu', name: 'US GPU', host: '10.95.0.4', keyId: key.id, region: 'us-east', tags: ['prod', 'gpu'] });
+
+      // Seed deterministic probe telemetry directly on loaded records
+      Object.assign(mgr._servers.get('eu-heavy'), {
+        status: 'online',
+        resources: { cpus: 4, load1m: 3.6, memoryTotalMb: 4096, memoryAvailableMb: 1024, diskTotalGb: 100, diskAvailableGb: 40, dockerReady: true, caddyAvailable: true, latencyMs: 35 }
+      });
+      Object.assign(mgr._servers.get('eu-prime'), {
+        status: 'online',
+        resources: { cpus: 8, load1m: 0.4, memoryTotalMb: 16384, memoryAvailableMb: 12288, diskTotalGb: 200, diskAvailableGb: 160, dockerReady: true, caddyAvailable: true, latencyMs: 65 }
+      });
+      Object.assign(mgr._servers.get('eu-drain'), {
+        status: 'online',
+        maintenanceState: 'draining',
+        resources: { cpus: 16, load1m: 0.1, memoryTotalMb: 32768, memoryAvailableMb: 30000, diskTotalGb: 500, diskAvailableGb: 450, dockerReady: true, caddyAvailable: true, latencyMs: 5 }
+      });
+      Object.assign(mgr._servers.get('us-gpu'), {
+        status: 'online',
+        resources: { cpus: 8, load1m: 0.2, memoryTotalMb: 16384, memoryAvailableMb: 10000, diskTotalGb: 200, diskAvailableGb: 150, dockerReady: true, caddyAvailable: false, latencyMs: 4 }
+      });
+
+      // Picks eu-prime in eu-west and disqualifies eu-drain (even though eu-drain has 30GB free!)
+      const p1 = mgr.selectBestServer({ region: 'eu-west', includeLocal: false });
+      assert.strictEqual(p1.serverId, 'eu-prime');
+      const drainRej = p1.rejected.find((r) => r.serverId === 'eu-drain');
+      assert.ok(drainRej && drainRej.reasons.includes('maintenance_state:draining'));
+
+      // Required tags & Caddy requirement
+      const pGpu = mgr.selectBestServer({ tags: ['gpu'], includeLocal: false });
+      assert.strictEqual(pGpu.serverId, 'us-gpu');
+      const pGpuCaddy = mgr.selectBestServer({ tags: ['gpu'], requireCaddy: true, includeLocal: false });
+      assert.strictEqual(pGpuCaddy.selected, null);
+      assert.ok(pGpuCaddy.rejected.find((r) => r.serverId === 'us-gpu').reasons.includes('caddy_unavailable'));
+
+      // RAM floor & anti-affinity exclusion
+      const pRam = mgr.selectBestServer({ region: 'eu-west', minFreeRamMb: 8192, includeLocal: false });
+      assert.strictEqual(pRam.serverId, 'eu-prime');
+      assert.ok(pRam.rejected.find((r) => r.serverId === 'eu-heavy').reasons.some((x) => x.startsWith('insufficient_ram')));
+
+      const pExclude = mgr.selectBestServer({ region: 'eu-west', excludeServerIds: ['eu-prime'], includeLocal: false });
+      assert.strictEqual(pExclude.serverId, 'eu-heavy');
+
+      // Lowest-latency strategy prefers us-gpu (4ms)
+      const pLat = mgr.selectBestServer({ strategy: 'lowest-latency', includeLocal: false });
+      assert.strictEqual(pLat.serverId, 'us-gpu');
+
+      // Invalid strategy throws cleanly
+      assert.throws(() => mgr.selectBestServer({ strategy: 'random' }), (e) => e && e.code === 'INVALID_PLACEMENT_STRATEGY');
+
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Smart placement scheduler (RAM/load/disk/latency/region/tags/drain exclusion/strategies)');
+  }
+
+  // -------------------------------------------------------------------------
+  // 15. Hardened 1-Command VPS Bootstrap Script Generator
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    try {
+      const clientPub = makeFakeEd25519PubKey('boot-client');
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+      const mgr = new ServerFleetManager({ dataDir: dir, _execFile: fakeExec, autoMonitor: false });
+      const key = await mgr.importKey({ name: 'bk', privateKeyPem: makeFakePrivatePem('BOOT_SECRET') });
+      await mgr.addServer({ id: 'vps-boot', name: 'Hetzner EU', host: '203.0.113.50', port: 2222, user: 'deploy', caddyAdminPort: 2019, keyId: key.id });
+
+      const boot = mgr.generateBootstrapScript('vps-boot', {
+        controlPlaneIp: '198.51.100.20/32',
+        disableRootSsh: true
+      });
+      assert.strictEqual(boot.serverId, 'vps-boot');
+      assert.strictEqual(boot.deployUser, 'deploy');
+      assert.strictEqual(boot.sshPort, 2222);
+      assert.strictEqual(boot.caddyAdminPort, 2019);
+      assert.strictEqual(boot.keyFingerprint, clientPub.fingerprint);
+      assert.ok(/^[a-f0-9]{64}$/.test(boot.sha256), 'Bootstrap script must include SHA-256 integrity hash');
+      assert.ok(boot.script.includes('set -euo pipefail'));
+      assert.ok(boot.script.includes('usermod -aG docker'));
+      assert.ok(boot.script.includes('admin 127.0.0.1:2019'), 'Caddy admin must bind strictly to loopback');
+      assert.ok(!boot.script.includes('0.0.0.0:2019'), 'Caddy admin must never expose 0.0.0.0');
+      assert.ok(boot.script.includes('ufw allow from 198.51.100.20/32 to any port "2222" proto tcp'), 'UFW must allowlist control plane IP to prevent LIMIT lockouts');
+      assert.ok(boot.script.includes('ufw allow 443/udp'), 'UFW must allow HTTP/3 QUIC');
+      assert.ok(boot.script.includes('PasswordAuthentication no'));
+      assert.ok(boot.script.includes('PermitRootLogin no'));
+      assert.ok(boot.script.includes('if sshd -t; then'), 'Must validate sshd config before reload');
+      assert.ok(boot.script.includes(clientPub.b64), 'Must embed vault public key');
+      assert.ok(!boot.script.includes('BOOT_SECRET') && !boot.script.includes('PRIVATE KEY'), 'Must NEVER embed private key material');
+      assert.ok(boot.oneLiner.startsWith("cat <<'CULKIBO_BOOTSTRAP_EOF' | sudo bash\n"));
+
+      // Adversarial inputs rejected
+      assert.throws(() => mgr.generateBootstrapScript('local'), (e) => e && e.code === 'LOCAL_SERVER_IMMUTABLE');
+      assert.throws(() => mgr.generateBootstrapScript('vps-boot', { deployUser: 'deploy;id' }), (e) => e && e.code === 'INVALID_USER');
+      assert.throws(() => mgr.generateBootstrapScript('vps-boot', { controlPlaneIp: '127.0.0.1' }), (e) => e && e.code === 'INVALID_CONTROL_PLANE_IP');
+      assert.throws(() => mgr.generateBootstrapScript('vps-boot', { controlPlaneIp: '169.254.169.254' }), (e) => e && e.code === 'INVALID_CONTROL_PLANE_IP');
+      assert.throws(() => mgr.generateBootstrapScript('vps-boot', { controlPlaneIp: '10.0.0.1;rm -rf /' }), (e) => e && e.code === 'INVALID_CONTROL_PLANE_IP');
+      assert.throws(() => mgr.generateBootstrapScript('vps-boot', { sshPort: 70000 }), (e) => e && e.code === 'INVALID_PORT');
+
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Auditable 1-command hardened VPS bootstrap script generator & injection guards');
+  }
+
+  // -------------------------------------------------------------------------
+  // 16. Tunneled Remote Container Ops (Logs, Stats, Exec — Snapshot, Streaming & Adversarial)
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    try {
+      const hostKey = makeFakeEd25519PubKey('ops-host');
+      const clientPub = makeFakeEd25519PubKey('ops-client');
+      const dockerExecCalls = [];
+      let failFirstLogs = true;
+
+      const fakeExec = async (bin, args, opts) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        if (bin === 'ssh-keyscan') return { stdout: `10.96.0.10 ${hostKey.keyType} ${hostKey.b64}\n`, stderr: '' };
+        if (bin === 'docker') {
+          dockerExecCalls.push({ args: [...args], dockerHost: opts && opts.env ? opts.env.DOCKER_HOST : null });
+          if (args[0] === 'logs') {
+            if (failFirstLogs) {
+              failFirstLogs = false;
+              const e = new Error('Cannot connect to the Docker daemon');
+              e.code = 'ECONNRESET';
+              throw e;
+            }
+            return {
+              stdout: 'server ready\n-----BEGIN OPENSSH PRIVATE KEY-----\nLEAK\n-----END OPENSSH PRIVATE KEY-----\n',
+              stderr: 'warn line'
+            };
+          }
+          if (args[0] === 'stats') {
+            return {
+              stdout: JSON.stringify({ ID: 'abc123', Name: 'web-prod', CPUPerc: '12.50%', MemUsage: '128MiB / 2GiB', MemPerc: '6.25%', NetIO: '1MB / 2MB', BlockIO: '0B / 0B', PIDs: '14' }) + '\n',
+              stderr: ''
+            };
+          }
+          if (args[0] === 'exec') {
+            if (args.includes('fail-cmd')) {
+              const e = new Error('exit 42');
+              e.code = 42;
+              e.stdout = 'partial';
+              e.stderr = 'command failed';
+              throw e;
+            }
+            return { stdout: 'v22.14.0\n', stderr: '' };
+          }
+        }
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+
+      const tunnelSpawner = createFakeTunnelSpawner({ connectDelayMs: 10 });
+      const dockerSpawns = [];
+      const compositeSpawn = (bin, args, spawnOpts) => {
+        if (bin === 'ssh') return tunnelSpawner.spawnFn(bin, args, spawnOpts);
+        if (bin === 'docker') {
+          const child = new EventEmitter();
+          child.stdout = new EventEmitter();
+          child.stderr = new EventEmitter();
+          child.killed = false;
+          child.kill = () => {
+            if (child.killed) return true;
+            child.killed = true;
+            setImmediate(() => { child.emit('exit', 0, 'SIGTERM'); child.emit('close', 0, 'SIGTERM'); });
+            return true;
+          };
+          dockerSpawns.push({ args: [...args], dockerHost: spawnOpts && spawnOpts.env ? spawnOpts.env.DOCKER_HOST : null, child });
+          return child;
+        }
+        throw new Error(`Unexpected spawn: ${bin}`);
+      };
+
+      const prevDockerHost = process.env.DOCKER_HOST;
+      const mgr = new ServerFleetManager({
+        dataDir: dir,
+        _execFile: fakeExec,
+        _spawn: compositeSpawn,
+        _resolveHost: async () => ['10.96.0.10'],
+        platform: 'win32',
+        autoMonitor: false
+      });
+
+      const key = await mgr.importKey({ name: 'ops-k', privateKeyPem: makeFakePrivatePem('OPS') });
+      await mgr.addServer({ id: 'ops-node', name: 'Ops Node', host: '10.96.0.10', keyId: key.id });
+
+      // A. Snapshot logs auto-reconnects on ECONNRESET & redacts secrets without mutating process.env.DOCKER_HOST
+      const logs = await mgr.remoteContainerLogs('ops-node', 'web_prod_1', { tail: 50, since: '10m', timestamps: true });
+      assert.strictEqual(logs.reconnected, true, 'remoteContainerLogs must auto-reconnect on transient drop');
+      assert.ok(logs.output.includes('server ready') && logs.output.includes('[REDACTED_PRIVATE_KEY]'));
+      assert.ok(!logs.output.includes('LEAK'));
+      assert.strictEqual(process.env.DOCKER_HOST, prevDockerHost);
+      assert.ok(dockerExecCalls[0].dockerHost.startsWith('tcp://127.0.0.1:'));
+
+      // B. Streaming logs holds tunnel lease until stop()
+      const chunks = [];
+      const logStream = await mgr.remoteContainerLogs('ops-node', 'web_prod_1', {
+        follow: true,
+        tail: 20,
+        onChunk: (ev) => chunks.push(ev)
+      });
+      assert.strictEqual(mgr.getTunnelState('ops-node').refCount, 1, 'Streaming logs must hold tunnel lease');
+      dockerSpawns[0].child.stdout.emit('data', Buffer.from('live line 1\n'));
+      assert.strictEqual(chunks.length, 1);
+      assert.strictEqual(chunks[0].chunk, 'live line 1\n');
+      await logStream.stop();
+      await logStream.done;
+      assert.strictEqual(mgr.getTunnelState('ops-node').refCount, 0, 'Stopping stream must release tunnel lease');
+
+      // C. Snapshot & streaming stats
+      const st = await mgr.remoteContainerStats('ops-node', 'web_prod_1');
+      assert.strictEqual(st.stats.name, 'web-prod');
+      assert.strictEqual(st.stats.cpuPercent, 12.5);
+      assert.strictEqual(st.stats.pids, 14);
+
+      const statSamples = [];
+      const statStream = await mgr.remoteContainerStats('ops-node', 'web_prod_1', {
+        follow: true,
+        onStats: (s) => statSamples.push(s)
+      });
+      dockerSpawns[1].child.stdout.emit('data', Buffer.from(JSON.stringify({ ID: 'abc123', Name: 'web-prod', CPUPerc: '4.0%', MemPerc: '5.0%', PIDs: '10' }) + '\n'));
+      assert.strictEqual(statSamples.length, 1);
+      assert.strictEqual(statSamples[0].containers[0].cpuPercent, 4);
+      await statStream.stop();
+      await statStream.done;
+
+      // D. remoteContainerExec strict argv + non-zero exit (must NOT retry app exit code)
+      const exOk = await mgr.remoteContainerExec('ops-node', 'web_prod_1', ['node', '-v'], {
+        workdir: '/app',
+        user: 'node',
+        env: { NODE_ENV: 'production' }
+      });
+      assert.strictEqual(exOk.ok, true);
+      assert.strictEqual(exOk.exitCode, 0);
+      assert.strictEqual(exOk.stdout.trim(), 'v22.14.0');
+      const lastExecCall = dockerExecCalls[dockerExecCalls.length - 1];
+      assert.deepStrictEqual(lastExecCall.args, ['exec', '-w', '/app', '-u', 'node', '-e', 'NODE_ENV=production', 'web_prod_1', 'node', '-v']);
+
+      const beforeFailCalls = dockerExecCalls.length;
+      const exFail = await mgr.remoteContainerExec('ops-node', 'web_prod_1', ['fail-cmd']);
+      assert.strictEqual(exFail.ok, false);
+      assert.strictEqual(exFail.exitCode, 42);
+      assert.strictEqual(dockerExecCalls.length, beforeFailCalls + 1, 'Non-zero app exit code must not trigger tunnel retry');
+
+      // E. Adversarial injections rejected cleanly
+      await assert.rejects(() => mgr.remoteContainerLogs('ops-node', '--privileged'), (e) => e && e.code === 'INVALID_DOCKER_REF');
+      await assert.rejects(() => mgr.remoteContainerLogs('ops-node', 'web_prod_1', { since: '10m;id' }), (e) => e && e.code === 'INVALID_INPUT');
+      await assert.rejects(() => mgr.remoteContainerExec('ops-node', 'web_prod_1', 'sh -c id'), (e) => e && e.code === 'INVALID_EXEC_COMMAND');
+      await assert.rejects(() => mgr.remoteContainerExec('ops-node', 'web_prod_1', []), (e) => e && e.code === 'INVALID_EXEC_COMMAND');
+      await assert.rejects(() => mgr.remoteContainerExec('ops-node', 'web_prod_1', ['ls', 'a\0b']), (e) => e && e.code === 'INVALID_EXEC_COMMAND');
+      await assert.rejects(() => mgr.remoteContainerExec('ops-node', 'web_prod_1', ['id'], { workdir: '/app/../etc' }), (e) => e && e.code === 'INVALID_INPUT');
+      await assert.rejects(() => mgr.remoteContainerExec('ops-node', 'web_prod_1', ['id'], { user: '-root' }), (e) => e && e.code === 'INVALID_INPUT');
+      await assert.rejects(() => mgr.remoteContainerExec('ops-node', 'web_prod_1', ['id'], { env: { 'BAD;KEY': '1' } }), (e) => e && e.code === 'INVALID_INPUT');
+
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Tunneled remote container logs/stats/exec (snapshot, streaming, reconnect & adversarial rejection)');
+  }
+
+  // -------------------------------------------------------------------------
+  // 17. Remote Caddy Sync (syncRemoteCaddy) & Tunneled Host/Origin Anti-403 Verification
+  // -------------------------------------------------------------------------
+  {
+    const dir = createTempDir();
+    try {
+      const hostKey = makeFakeEd25519PubKey('cad-host');
+      const clientPub = makeFakeEd25519PubKey('cad-client');
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        if (bin === 'ssh-keyscan') return { stdout: `10.97.0.5 ${hostKey.keyType} ${hostKey.b64}\n`, stderr: '' };
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+      const spawner = createFakeTunnelSpawner({ connectDelayMs: 10 });
+
+      const caddyCalls = [];
+      const mockCaddy = {
+        routeId: (pid) => `culkibo_${pid}`,
+        detect: async (opts) => { caddyCalls.push({ op: 'detect', opts }); return { available: true }; },
+        getWithEtag: async (reqPath, opts) => {
+          caddyCalls.push({ op: 'getWithEtag', reqPath, opts });
+          return { found: false, value: null, etag: null };
+        },
+        buildBaseConfig: (tls) => ({
+          admin: { listen: '127.0.0.1:2099' },
+          apps: { http: { servers: { culkibo: { listen: [':80', ':443'], routes: [] } } }, tls }
+        }),
+        adminRequest: async (method, reqPath, opts) => {
+          caddyCalls.push({ op: 'adminRequest', method, reqPath, opts });
+          return { ok: true, status: 200, text: '' };
+        },
+        write: async (method, reqPath, body, opts) => {
+          caddyCalls.push({ op: 'write', method, reqPath, opts });
+          return { ok: true };
+        },
+        reconcileTls: async (opts) => {
+          caddyCalls.push({ op: 'reconcileTls', opts });
+          return { ok: true };
+        },
+        upsertRoute: async (spec, opts) => {
+          caddyCalls.push({ op: 'upsertRoute', spec, opts });
+          return { created: true, unchanged: false, id: `culkibo_${spec.projectId}` };
+        },
+        removeRoute: async (pid, opts) => {
+          caddyCalls.push({ op: 'removeRoute', pid, opts });
+          return { removed: true };
+        },
+        listRoutes: async (opts) => {
+          caddyCalls.push({ op: 'listRoutes', opts });
+          return [
+            { '@id': 'culkibo_app1' },
+            { '@id': 'culkibo_stale_orphan' },
+            { '@id': 'foreign_user_route' }
+          ];
+        }
+      };
+
+      const mgr = new ServerFleetManager({
+        dataDir: dir,
+        _execFile: fakeExec,
+        _spawn: spawner.spawnFn,
+        _caddyManager: mockCaddy,
+        _resolveHost: async () => ['10.97.0.5'],
+        platform: 'win32',
+        autoMonitor: false
+      });
+
+      const key = await mgr.importKey({ name: 'ck', privateKeyPem: makeFakePrivatePem('CAD') });
+      await mgr.addServer({ id: 'caddy-node', name: 'Caddy Worker', host: '10.97.0.5', caddyAdminPort: 2099, keyId: key.id });
+
+      const syncRes = await mgr.syncRemoteCaddy('caddy-node', {
+        routes: [
+          { projectId: 'app1', hostnames: ['app1.example.com'], upstream: '127.0.0.1:30001' },
+          { projectId: 'app2', hostnames: ['app2.example.com'], upstream: '127.0.0.1:30002' }
+        ],
+        removeProjectIds: ['old-app'],
+        pruneStale: true,
+        tls: { acmeEmail: 'ops@example.com' }
+      });
+
+      assert.strictEqual(syncRes.ok, true);
+      assert.strictEqual(syncRes.bootstrapped, true, 'Fresh worker node must bootstrap base Caddy config');
+      assert.strictEqual(syncRes.tlsSynced, true);
+      assert.strictEqual(syncRes.syncedCount, 2);
+      assert.deepStrictEqual(syncRes.removed, ['old-app', 'stale_orphan'], 'Must remove explicit + stale managed routes while preserving foreign routes');
+      assert.strictEqual(syncRes.hostHeader, '127.0.0.1:2099');
+      assert.strictEqual(spawner.spawns.length, 1, 'Entire sync must share ONE single SSH Caddy tunnel');
+      assert.strictEqual(spawner.spawns[0].child.killed, true, 'Caddy tunnel must close after sync');
+
+      // Every Caddy call must forward canonical Host/Origin 127.0.0.1:2099 (prevents remote Caddy HTTP 403!)
+      const upsertCalls = caddyCalls.filter((c) => c.op === 'upsertRoute');
+      assert.strictEqual(upsertCalls.length, 2);
+      for (const c of upsertCalls) {
+        assert.strictEqual(c.opts.hostHeader, '127.0.0.1:2099');
+        assert.strictEqual(c.opts.originHeader, 'http://127.0.0.1:2099');
+        assert.strictEqual(c.opts.remoteAdminPort, 2099);
+        assert.ok(c.opts.adminUrl.startsWith('http://127.0.0.1:'));
+      }
+      const loadCall = caddyCalls.find((c) => c.op === 'adminRequest' && c.reqPath === '/load');
+      assert.ok(loadCall && loadCall.opts.headers.Host === '127.0.0.1:2099');
+
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Remote Caddy sync (single tunnel, base bootstrap, TLS, stale prune & Host/Origin anti-403)');
+  }
+
+  // -------------------------------------------------------------------------
+  // 18. Adversarial Edge Cases: Invalid Hostnames, Malformed Probe, PortTunnel Errors & Monitor Backoff
+  // -------------------------------------------------------------------------
+  {
+    // A. Additional invalid hostnames & empty DNS resolution
+    const extraBadHosts = [
+      'vps.example.com.',
+      '.leading.dot',
+      'double..dot.com',
+      'my_vps.internal',
+      'bücher.de',
+      'fe80::1%eth0',
+      '[10.0.0.1]',
+      `${'a'.repeat(64)}.example.com`
+    ];
+    for (const bad of extraBadHosts) {
+      assert.throws(
+        () => helpers.validateHostSyntax(bad),
+        (e) => e && e.code === 'INVALID_HOST',
+        `Expected invalid hostname to reject: ${bad}`
+      );
+    }
+    await assert.rejects(
+      () => helpers.assertSafeFleetHost('empty.example.com', { resolveHost: async () => [] }),
+      (e) => e && e.code === 'DNS_RESOLUTION_FAILED'
+    );
+
+    // B. Malformed & adversarial parseProbeOutput edge cases (CRLF, garbage MEM_KB, avail>total clamp, negative load)
+    const badProbe = helpers.parseProbeOutput(
+      'OS=Linux\r\nARCH=x86_64\r\nCPUS=0\r\nLOAD=-5.4\r\nMEM_KB=abc def\r\nDISK_KB=bad data\r\nDOCKER=none\r\nDOCKER_SOCK=rw\r\nCADDY=none\r\n',
+      -10,
+      'ops'
+    );
+    assert.strictEqual(badProbe.status, 'degraded');
+    assert.strictEqual(badProbe.resources.cpus, 1);
+    assert.strictEqual(badProbe.resources.load1m, 0);
+    assert.strictEqual(badProbe.resources.memoryTotalMb, 0);
+    assert.strictEqual(badProbe.resources.latencyMs, 0);
+
+    const clampedProbe = helpers.parseProbeOutput('MEM_KB=2048000 9999999\nDISK_KB=10485760 99999999\nDOCKER=27.0.0\n', 12, 'root');
+    assert.strictEqual(clampedProbe.resources.memoryAvailableMb, clampedProbe.resources.memoryTotalMb, 'Available RAM must clamp <= total');
+    assert.strictEqual(clampedProbe.resources.diskAvailableGb, clampedProbe.resources.diskTotalGb, 'Available disk must clamp <= total');
+
+    // C. withPortTunnel error/timeout/MITM paths + _runMonitorTick exponential backoff (60s -> 120s -> 300s)
+    const dir = createTempDir();
+    try {
+      const hostKey = makeFakeEd25519PubKey('edge-host');
+      const clientPub = makeFakeEd25519PubKey('edge-client');
+      let sshProbeCalls = 0;
+
+      const fakeExec = async (bin, args) => {
+        if (bin === 'ssh-keygen' && args.includes('-y')) return { stdout: `${clientPub.line}\n`, stderr: '' };
+        if (bin === 'ssh-keyscan') return { stdout: `10.98.0.5 ${hostKey.keyType} ${hostKey.b64}\n`, stderr: '' };
+        if (bin === 'ssh') {
+          sshProbeCalls++;
+          const err = new Error('Connection timed out');
+          err.stderr = 'ssh: connect to host 10.98.0.5 port 22: Connection timed out';
+          throw err;
+        }
+        throw new Error(`Unexpected execFile: ${bin}`);
+      };
+
+      const slowSpawner = createFakeTunnelSpawner({ connectDelayMs: 500 });
+      const mgr = new ServerFleetManager({
+        dataDir: dir,
+        _execFile: fakeExec,
+        _spawn: slowSpawner.spawnFn,
+        _resolveHost: async () => ['10.98.0.5'],
+        platform: 'win32',
+        autoMonitor: false
+      });
+      const key = await mgr.importKey({ name: 'ek', privateKeyPem: makeFakePrivatePem('EDGE') });
+      await mgr.addServer({ id: 'edge-node', name: 'Edge Node', host: '10.98.0.5', keyId: key.id });
+      await mgr.pinHostKey('edge-node');
+
+      // withPortTunnel timeout -> TUNNEL_TIMEOUT (504), kills child, wipes ephemeral key
+      await assert.rejects(
+        () => mgr.withPortTunnel('edge-node', 3000, async () => 'never', { connectTimeoutMs: 60 }),
+        (e) => e && e.code === 'TUNNEL_TIMEOUT' && e.statusCode === 504
+      );
+      assert.strictEqual(slowSpawner.spawns[0].child.killed, true, 'Timed-out port tunnel child must be killed');
+      assert.strictEqual(fs.readdirSync(path.join(dir, '.fleet-tmp')).length, 0, 'Ephemeral key must be wiped on timeout');
+
+      // withPortTunnel callback throw -> still tears down tunnel child
+      const okSpawner = createFakeTunnelSpawner({ connectDelayMs: 10 });
+      mgr._spawn = okSpawner.spawnFn;
+      await assert.rejects(
+        () => mgr.withPortTunnel('edge-node', 3000, async () => { throw new Error('callback boom'); }),
+        /callback boom/
+      );
+      assert.strictEqual(okSpawner.spawns[0].child.killed, true, 'Port tunnel child must close when callback throws');
+
+      // _runMonitorTick exponential backoff: 1st fail >=60s, 2nd fail >=120s, 3rd fail >=300s, and skips before dueAt
+      mgr._monitorRunning = true;
+      const before1 = Date.now();
+      await mgr._runMonitorTick();
+      assert.strictEqual(sshProbeCalls, 1);
+      const next1 = mgr._nextProbeAt.get('edge-node') - before1;
+      assert.ok(next1 >= 55000 && next1 <= 65000, `1st failure backoff should be ~60s (got ${next1}ms)`);
+
+      // Calling tick immediately before dueAt must skip probe
+      await mgr._runMonitorTick();
+      assert.strictEqual(sshProbeCalls, 1, 'Monitor tick must skip server before backoff expires');
+
+      // Simulate backoff elapsed -> 2nd failure => 120s
+      mgr._nextProbeAt.set('edge-node', 0);
+      const before2 = Date.now();
+      await mgr._runMonitorTick();
+      const next2 = mgr._nextProbeAt.get('edge-node') - before2;
+      assert.ok(next2 >= 115000 && next2 <= 125000, `2nd failure backoff should be ~120s (got ${next2}ms)`);
+
+      // 3rd failure => 300s
+      mgr._nextProbeAt.set('edge-node', 0);
+      const before3 = Date.now();
+      await mgr._runMonitorTick();
+      const next3 = mgr._nextProbeAt.get('edge-node') - before3;
+      assert.ok(next3 >= 295000 && next3 <= 305000, `3rd failure backoff should be ~300s (got ${next3}ms)`);
+
+      // Locked host_key_mismatch server must be skipped completely by _runMonitorTick
+      mgr._servers.get('edge-node').status = 'host_key_mismatch';
+      mgr._nextProbeAt.set('edge-node', 0);
+      await mgr._runMonitorTick();
+      assert.strictEqual(sshProbeCalls, 3, 'Monitor tick must never probe a host_key_mismatch server');
+
+      await mgr.shutdown();
+    } finally {
+      rmDirSafe(dir);
+    }
+    console.log('  ✓ Edge cases: invalid hostnames, malformed probe clamping, port-tunnel timeout/throw & monitor backoff');
+  }
+
   console.log('✅ All Multi-Server Fleet SSH tests passed!\n');
 }
 

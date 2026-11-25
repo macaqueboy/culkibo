@@ -27,12 +27,15 @@ const testRbac = require('./rbac.test');
 const { testEnvironmentsGitops } = require('./environments-gitops.test');
 const testUptimeSleep = require('./uptime-sleep.test');
 const { testCoreBoost } = require('./core-boost.test');
+const testAdversarialFuzz = require('./adversarial-fuzz.test');
+const testCliDx = require('./cli-dx.test');
+const testObservabilityAlerts = require('./observability-alerts.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
 async function runAll() {
   console.log('\n======================================================');
-  console.log('🧪 RUNNING CULKIBO v1.0.0 FULL VERIFICATION SUITE');
+  console.log('🧪 RUNNING CULKIBO v1.1.0 FULL VERIFICATION SUITE');
   console.log('======================================================\n');
 
   let stopDaemon = null;
@@ -78,7 +81,10 @@ async function runAll() {
     { name: 'Environments, Encrypted Vault, Promotion & GitOps culkibo.yaml', fn: testEnvironmentsGitops },
     { name: 'Synthetic Uptime Monitors, Public Status Pages & Auto-Sleep Advisor', fn: testUptimeSleep },
     { name: 'Core +70% Boost (Smoke Tests, Canary Auto-Guard, Freeze Windows, Remote Fleet)', fn: testCoreBoost },
-    { name: 'Competitor Benchmarks & Parity Verification', fn: testCompetitorBenchmarks }
+    { name: 'Competitor Benchmarks & Parity Verification', fn: testCompetitorBenchmarks },
+    { name: 'Adversarial Fuzz & Crash Recovery', fn: testAdversarialFuzz },
+    { name: 'CLI DX (init, up, logs, env, exec, releases, rollback)', fn: testCliDx },
+    { name: 'Observability Alerts, Metrics History & Topology', fn: testObservabilityAlerts },
   ];
 
   for (const suite of suites) {

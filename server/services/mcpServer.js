@@ -1,5 +1,6 @@
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const containerOrchestrator = require('./containerOrchestrator');
 const domainManager = require('./domainManager');
@@ -57,7 +58,7 @@ function lazySvc(name) {
   }
 }
 
-const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars|passphrase|privatekey|private_key|sshkey|ssh_key|invitetoken|invite_token|tokenhash|token_hash|signingsecret|signing_secret|masterkey|master_key)/i;
+const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars|passphrase|privatekey|private_key|sshkey|ssh_key|invitetoken|invite_token|tokenhash|token_hash|signingsecret|signing_secret|masterkey|master_key|confirmtoken|confirm_token)/i;
 const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck[stihp]_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_database_credentials',
@@ -81,14 +82,152 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas que también soportan `dryRun: true` (25 destructivas + 2 = 27). */
+/** Herramientas no destructivas que también soportan `dryRun: true` (33 destructivas + 2 = 35). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment'
 ]);
 
+/** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
+const VALID_TOOL_PROFILES = Object.freeze(['all', 'core', 'deploy', 'ops', 'security']);
+
+/** @type {Record<string, Set<string>>} */
+const TOOL_PROFILES = Object.freeze({
+  core: new Set([
+    'culkibo_search_tools',
+    'culkibo_rbac_whoami',
+    'culkibo_list_projects',
+    'culkibo_get_project',
+    'culkibo_create_project',
+    'culkibo_set_project_env',
+    'culkibo_deploy_production',
+    'culkibo_list_deployments',
+    'culkibo_rollback_deployment',
+    'culkibo_get_container_logs',
+    'culkibo_get_deployment_logs',
+    'culkibo_manage_domain',
+    'culkibo_list_databases',
+    'culkibo_system_doctor',
+    'culkibo_diagnose_incident',
+    'culkibo_auto_remediate'
+  ]),
+  deploy: new Set([
+    'culkibo_search_tools',
+    'culkibo_rbac_whoami',
+    'culkibo_list_projects',
+    'culkibo_get_project',
+    'culkibo_create_project',
+    'culkibo_add_resource',
+    'culkibo_set_project_env',
+    'culkibo_deploy_strategy',
+    'culkibo_deploy_production',
+    'culkibo_list_deployments',
+    'culkibo_rollback_deployment',
+    'culkibo_cancel_deployment',
+    'culkibo_get_deploy_queue',
+    'culkibo_get_deployment_logs',
+    'culkibo_get_container_logs',
+    'culkibo_manage_previews',
+    'culkibo_smoke_test_configure',
+    'culkibo_smoke_test_run',
+    'culkibo_canary_rollout',
+    'culkibo_deploy_freeze',
+    'culkibo_env_list',
+    'culkibo_env_promote'
+  ]),
+  ops: new Set([
+    'culkibo_search_tools',
+    'culkibo_rbac_whoami',
+    'culkibo_list_projects',
+    'culkibo_get_project',
+    'culkibo_list_pods',
+    'culkibo_get_logs',
+    'culkibo_get_container_logs',
+    'culkibo_get_observability',
+    'culkibo_system_doctor',
+    'culkibo_system_doctor_fix',
+    'culkibo_docker_status',
+    'culkibo_docker_containers',
+    'culkibo_manage_production_service',
+    'culkibo_toggle_maintenance',
+    'culkibo_diagnose_domain',
+    'culkibo_ingress_status',
+    'culkibo_reconcile_ingress',
+    'culkibo_uptime_list_monitors',
+    'culkibo_status_page_manage',
+    'culkibo_cost_advisor',
+    'culkibo_sleep_status',
+    'culkibo_sleep_manage',
+    'culkibo_fleet_list_servers',
+    'culkibo_diagnose_incident',
+    'culkibo_auto_remediate'
+  ]),
+  security: new Set([
+    'culkibo_search_tools',
+    'culkibo_rbac_whoami',
+    'culkibo_team_list_members',
+    'culkibo_team_invite_member',
+    'culkibo_team_update_member',
+    'culkibo_rbac_list_tokens',
+    'culkibo_rbac_manage_token',
+    'culkibo_system_doctor',
+    'culkibo_system_doctor_fix',
+    'culkibo_diagnose_domain',
+    'culkibo_ingress_status',
+    'culkibo_manage_wildcard_dns01',
+    'culkibo_set_domain_basic_auth',
+    'culkibo_manage_webhook',
+    'culkibo_deploy_freeze',
+    'culkibo_list_databases',
+    'culkibo_database_list_backups',
+    'culkibo_export_instance_snapshot',
+    'culkibo_diagnose_incident'
+  ])
+});
+
+/** Sinónimos bilingües ES/EN para mejorar el ranking de `culkibo_search_tools` y `tools/list` (`params.query`). */
+const SEARCH_SYNONYMS = Object.freeze({
+  oom: ['memory', 'memoria', 'ram', 'crash', 'incident', 'advisor', 'cost', 'diagnose'],
+  ram: ['memory', 'memoria', 'oom', 'advisor', 'sleep', 'cost'],
+  memory: ['ram', 'memoria', 'oom', 'advisor', 'sleep'],
+  ssl: ['tls', 'cert', 'wildcard', 'https', 'caddy', 'domain', 'ingress'],
+  tls: ['ssl', 'cert', 'wildcard', 'https', 'caddy', 'domain', 'ingress'],
+  db: ['database', 'postgres', 'mysql', 'mariadb', 'redis', 'valkey', 'mongodb', 'backup'],
+  database: ['db', 'postgres', 'mysql', 'redis', 'backup', 'restore', 'credentials'],
+  crash: ['incident', 'diagnose', 'remediate', 'rollback', 'logs', 'oom', 'restart'],
+  incident: ['diagnose', 'remediate', 'uptime', 'status', 'rollback', 'logs', 'crash', 'oom'],
+  heal: ['remediate', 'diagnose', 'doctor', 'fix', 'rollback', 'restart'],
+  fix: ['remediate', 'doctor', 'diagnose', 'reconcile', 'rollback'],
+  deploy: ['production', 'release', 'build', 'rollback', 'canary', 'smoke', 'freeze', 'preview'],
+  rollback: ['revert', 'sync', 'deploy', 'remediate'],
+  auth: ['rbac', 'token', 'team', 'basic', 'whoami', 'security'],
+  ssh: ['fleet', 'server', 'remote', 'node', 'probe'],
+  sleep: ['hibernate', 'scale', 'idle', 'wake', 'cost', 'ram'],
+  yaml: ['gitops', 'compose', 'manifest', 'plan', 'apply', 'export']
+});
+
+const AUTO_REMEDIATE_ACTIONS = Object.freeze([
+  'rollback_release',
+  'restart_service',
+  'wake_service',
+  'toggle_maintenance',
+  'reconcile_ingress',
+  'doctor_fix'
+]);
+
+const GLOBAL_REMEDIATE_ACTIONS = new Set(['reconcile_ingress', 'doctor_fix']);
+const DOCTOR_FIX_CANONICAL_ACTIONS = Object.freeze([
+  'reconcile_caddy',
+  'clean_tmp',
+  'start_caddy',
+  'clean_orphans',
+  'prune_buildkit'
+]);
+const REMEDIATION_TOKEN_TTL_MS = 5 * 60 * 1000;
+const MAX_PENDING_REMEDIATIONS = 200;
+
 /**
- * Mapa paralelo de políticas RBAC para las 104 herramientas MCP (no se filtra al JSON Schema).
+ * Mapa paralelo de políticas RBAC para las 107 herramientas MCP (no se filtra al JSON Schema).
  * @type {Record<string, { minRole: 'viewer' | 'developer' | 'admin' | 'owner', scope: string, projectScoped?: boolean, secretSensitive?: boolean }>}
  */
 const TOOL_POLICIES = Object.freeze({
@@ -197,7 +336,11 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_smoke_test_configure: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
   culkibo_smoke_test_run: { minRole: 'viewer', scope: 'deployments:read', projectScoped: true },
   culkibo_canary_rollout: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
-  culkibo_deploy_freeze: { minRole: 'admin', scope: 'deployments:freeze', projectScoped: true }
+  culkibo_deploy_freeze: { minRole: 'admin', scope: 'deployments:freeze', projectScoped: true },
+  // MCP 2.1: Meta-Discovery & Autonomous Self-Healing Ops (+3 = 107)
+  culkibo_search_tools: { minRole: 'viewer', scope: 'tools:read', projectScoped: false },
+  culkibo_diagnose_incident: { minRole: 'viewer', scope: 'observability:read', projectScoped: true },
+  culkibo_auto_remediate: { minRole: 'developer', scope: 'deployments:write', projectScoped: true }
 });
 
 /**
@@ -412,7 +555,10 @@ function sanitizeSmokeChecks(checks) {
   }
   return checks.map((c, idx) => {
     if (!c || typeof c !== 'object') {
-      throw new McpToolError('INVALID_ARGUMENT', `Smoke check #${idx + 1} debe ser un objeto.`, { retryable: true });
+      throw new McpToolError('INVALID_ARGUMENT', `Smoke check #${idx + 1} debe ser un objeto.`, {
+        retryable: true,
+        remediation: 'Cada elemento de checks[] debe ser un objeto { path: "/health", expectedStatus: 200 }.'
+      });
     }
     const rawPath = String(c.path || '/').trim();
     if (!rawPath.startsWith('/') || rawPath.length > 512 || /\.\.|[\s\r\n\0]/.test(rawPath)) {
@@ -423,7 +569,10 @@ function sanitizeSmokeChecks(checks) {
     }
     const method = String(c.method || 'GET').toUpperCase();
     if (!['GET', 'HEAD', 'POST'].includes(method)) {
-      throw new McpToolError('INVALID_ARGUMENT', `Método HTTP no permitido en smoke check #${idx + 1}: '${method}'.`, { retryable: true });
+      throw new McpToolError('INVALID_ARGUMENT', `Método HTTP no permitido en smoke check #${idx + 1}: '${method}'.`, {
+        retryable: true,
+        remediation: 'Usa uno de los métodos permitidos para smoke checks: GET, HEAD o POST.'
+      });
     }
     return {
       name: c.name ? String(c.name).slice(0, 64) : `check-${idx + 1}`,
@@ -570,6 +719,24 @@ const NAME_BEARING_METHODS = ['tools/call', 'resources/read', 'prompts/get'];
  * debe cambiar de argumentos; este lleva el código estable, si es reintentable
  * y qué hacer a continuación.
  */
+/** @type {Record<string, string>} */
+const DEFAULT_ERROR_REMEDIATIONS = Object.freeze({
+  FORBIDDEN: 'Consulta tus permisos efectivos con culkibo_rbac_whoami o solicita un token con el rol y scopes necesarios.',
+  MISSING_ARGUMENT: 'Revisa el inputSchema de la herramienta (o usa culkibo_search_tools) y repite la llamada con los parámetros obligatorios.',
+  INVALID_ARGUMENT: 'Ajusta el tipo, rango o patrón del argumento según el inputSchema y vuelve a llamar.',
+  INVALID_ARGUMENTS: 'Envía un objeto JSON plano en params.arguments.',
+  NOT_FOUND: 'Verifica el identificador llamando primero a la herramienta de listado correspondiente.',
+  SERVICE_UNAVAILABLE: 'Comprueba el estado de los servicios con culkibo_system_doctor antes de reintentar.',
+  CANCELLED: 'La petición fue cancelada por el cliente; vuelve a invocarla si aún necesitas el resultado.',
+  CONFIRMATION_REQUIRED: 'Ejecuta primero la herramienta con dryRun: true para revisar el plan y obtener un confirmToken válido de un solo uso.',
+  CONFIRM_TOKEN_INVALID: 'Solicita un nuevo confirmToken ejecutando culkibo_auto_remediate con dryRun: true.',
+  CONFIRM_TOKEN_EXPIRED: 'El confirmToken caducó (5 min); genera uno nuevo con culkibo_auto_remediate y dryRun: true.',
+  CONFIRM_TOKEN_REPLAYED: 'Cada confirmToken es de un solo uso; ejecuta dryRun: true para generar uno nuevo si necesitas repetir la acción.',
+  CONFIRM_TOKEN_MISMATCH: 'El confirmToken está vinculado al llamante, acción, proyecto y parámetros exactos del dryRun; solicita uno nuevo para estos parámetros.',
+  CANARY_NOT_ACTIVE: 'Inicia primero un despliegue canario con culkibo_canary_rollout (action: "start") o consulta su estado con action: "status".',
+  FORBIDDEN_PATH: 'Usa un directorio dentro del workspace actual o de la carpeta projects/ de Culkibo.'
+});
+
 class McpToolError extends Error {
   /**
    * @param {string} code
@@ -581,7 +748,7 @@ class McpToolError extends Error {
     this.name = 'McpToolError';
     this.code = code;
     this.retryable = retryable;
-    this.remediation = remediation;
+    this.remediation = remediation || DEFAULT_ERROR_REMEDIATIONS[code] || 'Revisa los parámetros y ejecuta culkibo_system_doctor o culkibo_diagnose_incident si el problema persiste.';
     this.details = details;
   }
 }
@@ -594,6 +761,9 @@ function jsonType(value) {
 }
 
 function matchesSchemaType(value, expected) {
+  if (Array.isArray(expected)) {
+    return expected.some((t) => matchesSchemaType(value, t));
+  }
   switch (expected) {
     case 'string': return typeof value === 'string';
     case 'number': return typeof value === 'number' && Number.isFinite(value);
@@ -601,7 +771,194 @@ function matchesSchemaType(value, expected) {
     case 'boolean': return typeof value === 'boolean';
     case 'array': return Array.isArray(value);
     case 'object': return value !== null && typeof value === 'object' && !Array.isArray(value);
+    case 'null': return value === null;
     default: return true;
+  }
+}
+
+/**
+ * Valida recursivamente un valor contra su especificación JSON Schema
+ * (tipo, enum, minimum/maximum, minLength/maxLength/pattern, items, properties/required).
+ * @param {string} toolName
+ * @param {string} propPath
+ * @param {any} value
+ * @param {any} spec
+ * @param {number} [depth]
+ */
+function validatePropertyValue(toolName, propPath, value, spec, depth = 0) {
+  if (!spec || typeof spec !== 'object' || depth > 4 || value === undefined || value === null) return;
+
+  if (Array.isArray(spec.enum) && !spec.enum.includes(value)) {
+    throw new McpToolError(
+      'INVALID_ARGUMENT',
+      `El argumento '${propPath}' de ${toolName} no admite el valor ${JSON.stringify(value)}.`,
+      {
+        retryable: true,
+        remediation: `Usa uno de estos valores para '${propPath}': ${spec.enum.join(', ')}.`,
+        details: { argument: propPath, received: value, allowed: spec.enum }
+      }
+    );
+  }
+
+  if (spec.type && !matchesSchemaType(value, spec.type)) {
+    throw new McpToolError(
+      'INVALID_ARGUMENT',
+      `El argumento '${propPath}' de ${toolName} debe ser de tipo ${Array.isArray(spec.type) ? spec.type.join('|') : spec.type}.`,
+      {
+        retryable: true,
+        remediation: `Convierte '${propPath}' a ${Array.isArray(spec.type) ? spec.type.join('|') : spec.type} y vuelve a llamar.`,
+        details: { argument: propPath, expectedType: spec.type, receivedType: jsonType(value) }
+      }
+    );
+  }
+
+  if (typeof value === 'number') {
+    if (typeof spec.minimum === 'number' && value < spec.minimum) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${propPath}' de ${toolName} debe ser >= ${spec.minimum} (recibido ${value}).`,
+        {
+          retryable: true,
+          remediation: `Usa un valor numérico para '${propPath}' entre ${spec.minimum}${typeof spec.maximum === 'number' ? ` y ${spec.maximum}` : ' o superior'}.`,
+          details: { argument: propPath, minimum: spec.minimum, maximum: spec.maximum ?? null, received: value }
+        }
+      );
+    }
+    if (typeof spec.maximum === 'number' && value > spec.maximum) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${propPath}' de ${toolName} debe ser <= ${spec.maximum} (recibido ${value}).`,
+        {
+          retryable: true,
+          remediation: `Usa un valor numérico para '${propPath}' <= ${spec.maximum}.`,
+          details: { argument: propPath, minimum: spec.minimum ?? null, maximum: spec.maximum, received: value }
+        }
+      );
+    }
+    if (typeof spec.exclusiveMinimum === 'number' && value <= spec.exclusiveMinimum) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${propPath}' de ${toolName} debe ser estrictamente > ${spec.exclusiveMinimum}.`,
+        {
+          retryable: true,
+          remediation: `Usa un valor numérico mayor que ${spec.exclusiveMinimum} para '${propPath}'.`,
+          details: { argument: propPath, exclusiveMinimum: spec.exclusiveMinimum, received: value }
+        }
+      );
+    }
+    if (typeof spec.exclusiveMaximum === 'number' && value >= spec.exclusiveMaximum) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${propPath}' de ${toolName} debe ser estrictamente < ${spec.exclusiveMaximum}.`,
+        {
+          retryable: true,
+          remediation: `Usa un valor numérico menor que ${spec.exclusiveMaximum} para '${propPath}'.`,
+          details: { argument: propPath, exclusiveMaximum: spec.exclusiveMaximum, received: value }
+        }
+      );
+    }
+  }
+
+  if (typeof value === 'string') {
+    if (typeof spec.minLength === 'number' && value.length < spec.minLength) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${propPath}' de ${toolName} debe tener al menos ${spec.minLength} caracteres.`,
+        {
+          retryable: true,
+          remediation: `Proporciona un texto de al menos ${spec.minLength} caracteres para '${propPath}'.`,
+          details: { argument: propPath, minLength: spec.minLength, receivedLength: value.length }
+        }
+      );
+    }
+    if (typeof spec.maxLength === 'number' && value.length > spec.maxLength) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El argumento '${propPath}' de ${toolName} excede la longitud máxima de ${spec.maxLength} caracteres.`,
+        {
+          retryable: true,
+          remediation: `Acorta '${propPath}' a un máximo de ${spec.maxLength} caracteres.`,
+          details: { argument: propPath, maxLength: spec.maxLength, receivedLength: value.length }
+        }
+      );
+    }
+    if (typeof spec.pattern === 'string' && spec.pattern.length > 0) {
+      const re = new RegExp(spec.pattern);
+      if (!re.test(value)) {
+        throw new McpToolError(
+          'INVALID_ARGUMENT',
+          `El argumento '${propPath}' de ${toolName} no cumple el formato esperado (${spec.pattern}).`,
+          {
+            retryable: true,
+            remediation: `Formatea '${propPath}' para que coincida con el patrón ${spec.pattern}.`,
+            details: { argument: propPath, pattern: spec.pattern }
+          }
+        );
+      }
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (typeof spec.minItems === 'number' && value.length < spec.minItems) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El array '${propPath}' de ${toolName} requiere al menos ${spec.minItems} elemento(s).`,
+        {
+          retryable: true,
+          remediation: `Incluye al menos ${spec.minItems} elemento(s) en '${propPath}'.`,
+          details: { argument: propPath, minItems: spec.minItems, receivedLength: value.length }
+        }
+      );
+    }
+    if (typeof spec.maxItems === 'number' && value.length > spec.maxItems) {
+      throw new McpToolError(
+        'INVALID_ARGUMENT',
+        `El array '${propPath}' de ${toolName} admite como máximo ${spec.maxItems} elemento(s).`,
+        {
+          retryable: true,
+          remediation: `Reduce '${propPath}' a un máximo de ${spec.maxItems} elemento(s).`,
+          details: { argument: propPath, maxItems: spec.maxItems, receivedLength: value.length }
+        }
+      );
+    }
+    if (spec.items && typeof spec.items === 'object') {
+      for (let i = 0; i < value.length; i++) {
+        if (value[i] === undefined || value[i] === null) {
+          throw new McpToolError(
+            'INVALID_ARGUMENT',
+            `El elemento '${propPath}[${i}]' de ${toolName} no puede ser nulo.`,
+            {
+              retryable: true,
+              remediation: `Elimina valores nulos de '${propPath}' y vuelve a llamar.`,
+              details: { argument: `${propPath}[${i}]` }
+            }
+          );
+        }
+        validatePropertyValue(toolName, `${propPath}[${i}]`, value[i], spec.items, depth + 1);
+      }
+    }
+  }
+
+  if (value && typeof value === 'object' && !Array.isArray(value) && spec.properties && typeof spec.properties === 'object') {
+    const nestedReq = Array.isArray(spec.required) ? spec.required : [];
+    for (const rk of nestedReq) {
+      if (value[rk] === undefined || value[rk] === null || (spec.properties[rk]?.type === 'string' && typeof value[rk] === 'string' && value[rk].trim() === '')) {
+        throw new McpToolError(
+          'MISSING_ARGUMENT',
+          `Falta el campo obligatorio '${propPath}.${rk}' en ${toolName}.`,
+          {
+            retryable: true,
+            remediation: `Incluye '${rk}' dentro de '${propPath}' y vuelve a llamar.`,
+            details: { argument: `${propPath}.${rk}` }
+          }
+        );
+      }
+    }
+    for (const [nk, nv] of Object.entries(value)) {
+      if (spec.properties[nk]) {
+        validatePropertyValue(toolName, `${propPath}.${nk}`, nv, spec.properties[nk], depth + 1);
+      }
+    }
   }
 }
 
@@ -609,9 +966,9 @@ function matchesSchemaType(value, expected) {
  * Validación de argumentos contra el `inputSchema` declarado.
  *
  * Se hace aquí y no en cada `case` porque el fallo de un agente casi siempre es
- * el mismo —falta un campo obligatorio o mete un valor fuera del enum— y ese
- * fallo se corrige solo si la respuesta dice exactamente qué falta. Antes se
- * colaba hasta el servicio y volvía como un `TypeError` ilegible.
+ * el mismo —falta un campo obligatorio, mete un valor fuera del enum/rango o
+ * rompe un patrón/elemento de array— y ese fallo se corrige solo si la
+ * respuesta dice exactamente qué falta.
  */
 function validateToolArguments(tool, args) {
   const schema = tool.inputSchema || {};
@@ -640,30 +997,7 @@ function validateToolArguments(tool, args) {
   for (const [key, value] of Object.entries(args)) {
     const spec = properties[key];
     if (!spec || value === undefined || value === null) continue;
-
-    if (Array.isArray(spec.enum) && !spec.enum.includes(value)) {
-      throw new McpToolError(
-        'INVALID_ARGUMENT',
-        `El argumento '${key}' de ${tool.name} no admite el valor ${JSON.stringify(value)}.`,
-        {
-          retryable: true,
-          remediation: `Usa uno de estos valores para '${key}': ${spec.enum.join(', ')}.`,
-          details: { argument: key, received: value, allowed: spec.enum }
-        }
-      );
-    }
-
-    if (spec.type && !matchesSchemaType(value, spec.type)) {
-      throw new McpToolError(
-        'INVALID_ARGUMENT',
-        `El argumento '${key}' de ${tool.name} debe ser de tipo ${spec.type}.`,
-        {
-          retryable: true,
-          remediation: `Convierte '${key}' a ${spec.type} y vuelve a llamar.`,
-          details: { argument: key, expectedType: spec.type, receivedType: jsonType(value) }
-        }
-      );
-    }
+    validatePropertyValue(tool.name, key, value, spec, 0);
   }
 }
 
@@ -715,6 +1049,61 @@ function requireLazySvc(name, featureLabel) {
   return svc;
 }
 
+/**
+ * Esquemas de salida estructurada (`outputSchema`, MCP 2026-07-28) para herramientas core, RO y ops.
+ * Garantizan contratos máquina-verificables en `structuredContent` sin inflar el catálogo.
+ * @type {Record<string, Record<string, any>>}
+ */
+const DEFAULT_OUTPUT_SCHEMAS = Object.freeze({
+  culkibo_get_project: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, status: { type: 'string' }, envVarsKeys: { type: 'array' }, resources: { type: 'array' } } },
+  culkibo_create_project: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, status: { type: 'string' } } },
+  culkibo_add_resource: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, resources: { type: 'array' } } },
+  culkibo_set_project_env: { type: 'object', properties: { id: { type: 'string' }, envVarsKeys: { type: 'array' } } },
+  culkibo_deploy_project: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' } } },
+  culkibo_docker_status: { type: 'object', properties: { available: { type: 'boolean' }, mode: { type: 'string' }, containersRunning: { type: 'number' } } },
+  culkibo_github_status: { type: 'object', properties: { connected: { type: 'boolean' } } },
+  culkibo_github_list_repos: { type: 'object', properties: { repos: { type: 'array' } } },
+  culkibo_github_get_branches: { type: 'object', properties: { branches: { type: 'array' } } },
+  culkibo_github_auto_detect: { type: 'object', properties: { stack: { type: 'string' }, port: { type: 'number' } } },
+  culkibo_deploy_strategy: { type: 'object', properties: { projectId: { type: 'string' }, contextDir: { type: 'string' }, strategy: { type: 'object' } } },
+  culkibo_deploy_production: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' } } },
+  culkibo_list_deployments: { type: 'object', properties: { projectId: { type: 'string' }, status: { type: 'object' }, deployments: { type: 'array' } } },
+  culkibo_rollback_deployment: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' } } },
+  culkibo_list_databases: { type: 'object', properties: { engines: { type: 'array' }, databases: { type: 'array' } } },
+  culkibo_database_credentials: { type: 'object', properties: { engine: { type: 'string' }, connectionString: { type: 'string' } } },
+  culkibo_list_catalog_templates: { type: 'object', properties: { categories: { type: 'array' }, templates: { type: 'array' } } },
+  culkibo_list_catalog_installations: { type: 'object', properties: { installations: { type: 'array' } } },
+  culkibo_verify_sync: { type: 'object', properties: { inSync: { type: 'boolean' }, serverDigest: { type: 'string' }, telemetry: { type: 'object' } } },
+  culkibo_analyze_wordpress: { type: 'object', properties: { url: { type: 'string' }, isWordPress: { type: 'boolean' } } },
+  culkibo_get_remote_access: { type: 'object', properties: { panelDomain: { type: ['string', 'null'] }, caddy: { type: 'object' }, cloudflare: { type: 'object' }, clientConfigs: { type: 'object' } } },
+  culkibo_get_observability: { type: 'object', properties: { timestamp: { type: 'string' }, memory: { type: 'object' }, http: { type: 'object' } } },
+  culkibo_system_doctor: { type: 'object', properties: { checks: { type: 'array' }, summary: { type: 'object' }, durationMs: { type: 'number' } } },
+  culkibo_system_doctor_fix: { type: 'object', properties: { ok: { type: 'boolean' }, action: { type: 'string' }, message: { type: 'string' } } },
+  culkibo_get_deploy_queue: { type: 'object', properties: { activeBuilds: { type: 'number' }, maxConcurrentBuilds: { type: 'number' }, queuedBuilds: { type: 'array' } } },
+  culkibo_get_container_logs: { type: 'object', properties: { containerName: { type: ['string', 'null'] }, lines: { type: 'array' } } },
+  culkibo_get_deployment_logs: { type: 'object', properties: { projectId: { type: 'string' }, deploymentId: { type: 'string' }, status: { type: 'string' }, totalLines: { type: 'number' }, lines: { type: 'array' } } },
+  culkibo_diagnose_domain: { type: 'object', properties: { hostname: { type: 'string' }, checks: { type: 'array' } } },
+  culkibo_ingress_status: { type: 'object', properties: { available: { type: 'boolean' }, routes: { type: 'array' } } },
+  culkibo_reconcile_ingress: { type: 'object', properties: { ok: { type: 'boolean' } } },
+  culkibo_manage_production_service: { type: 'object', properties: { projectId: { type: 'string' }, action: { type: 'string' } } },
+  culkibo_toggle_maintenance: { type: 'object', properties: { success: { type: 'boolean' }, projectId: { type: 'string' }, maintenanceMode: { type: 'boolean' } } },
+  culkibo_database_list_backups: { type: 'object', properties: { databaseId: { type: 'string' }, backups: { type: 'array' } } },
+  culkibo_database_inspect: { type: 'object', properties: { healthy: { type: 'boolean' }, latencyMs: { type: 'number' } } },
+  culkibo_list_backups: { type: 'object', properties: { backups: { type: 'array' } } },
+  culkibo_fleet_probe_server: { type: 'object', properties: { serverId: { type: 'string' }, status: { type: 'string' } } },
+  culkibo_team_list_members: { type: 'object', properties: { teamId: { type: 'string' }, multiUserEnabled: { type: 'boolean' }, members: { type: 'array' }, pendingInvites: { type: 'array' } } },
+  culkibo_rbac_list_tokens: { type: 'object', properties: { tokens: { type: 'array' }, count: { type: 'number' } } },
+  culkibo_env_diff: { type: 'object', properties: { fromEnv: { type: 'string' }, toEnv: { type: 'string' } } },
+  culkibo_gitops_export: { type: 'object', properties: { yaml: { type: 'string' } } },
+  culkibo_sleep_status: { type: 'object', properties: { sleeping: { type: 'boolean' }, policies: { type: 'array' }, candidates: { type: 'array' } } },
+  culkibo_sync_file_history: { type: 'object', properties: { projectId: { type: 'string' }, filePath: { type: 'string' }, versions: { type: 'array' } } },
+  culkibo_sync_conflicts: { type: 'object', properties: { projectId: { type: 'string' }, conflicts: { type: 'array' }, count: { type: 'number' } } },
+  culkibo_smoke_test_run: { type: 'object', properties: { projectId: { type: 'string' }, target: { type: 'string' }, passed: { type: 'boolean' }, results: { type: 'array' } } },
+  culkibo_canary_rollout: { type: 'object', properties: { projectId: { type: 'string' }, ok: { type: 'boolean' } } },
+  culkibo_deploy_freeze: { type: 'object', properties: { scope: { type: 'string' }, frozen: { type: 'boolean' }, windows: { type: 'array' } } },
+  culkibo_issue_wildcard_ssl: { type: 'object', properties: { implemented: { type: 'boolean' }, error: { type: 'string' } } }
+});
+
 class McpServer extends EventEmitter {
   constructor() {
     super();
@@ -726,8 +1115,14 @@ class McpServer extends EventEmitter {
     this._toolsByName = null;
     /** @type {Buffer | null} */
     this._toolsSerializedCache = null;
+    /** @type {Map<string, Buffer>} */
+    this._profileSerializedCache = new Map();
     /** @type {any | null} */
     this._discoverCache = null;
+    /** Clave efímera HMAC-SHA256 en memoria para tokens de confirmación de un solo uso (`culkibo_auto_remediate`). */
+    this._remediationHmacKey = crypto.randomBytes(32);
+    /** @type {Map<string, { exp: number, used: boolean, principalKey: string, action: string, projectId: string | null, paramsHash: string }>} */
+    this._pendingRemediations = new Map();
   }
 
   getToolsDefinition() {
@@ -741,12 +1136,12 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            name: { type: 'string' },
-            description: { type: 'string' },
-            icon: { type: 'string' },
-            gitRepo: { type: 'string' },
-            forgePort: { type: 'number' },
-            citadelPort: { type: 'number' }
+            name: { type: 'string', minLength: 1, maxLength: 120, description: 'Nombre del proyecto' },
+            description: { type: 'string', maxLength: 500, description: 'Descripción opcional del proyecto' },
+            icon: { type: 'string', maxLength: 32, description: 'Emoji o icono del proyecto' },
+            gitRepo: { type: 'string', maxLength: 512, description: 'URL del repositorio Git asociado' },
+            forgePort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Puerto interno para The Forge' },
+            citadelPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Puerto interno para The Citadel' }
           },
           required: ['name']
         }
@@ -759,13 +1154,13 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string' },
-            type: { type: 'string', enum: ['app', 'database', 'service'] },
-            name: { type: 'string' },
-            image: { type: 'string' },
-            envVars: { type: 'object' },
-            ports: { type: 'array', items: { type: 'string' } },
-            credentials: { type: 'object' }
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto propietario' },
+            type: { type: 'string', enum: ['app', 'database', 'service'], description: 'Tipo de recurso' },
+            name: { type: 'string', minLength: 1, maxLength: 120, description: 'Nombre del recurso' },
+            image: { type: 'string', maxLength: 256, description: 'Imagen Docker opcional del recurso' },
+            envVars: { type: 'object', description: 'Variables de entorno iniciales del recurso' },
+            ports: { type: 'array', items: { type: 'string' }, maxItems: 32, description: 'Mapeos de puertos del recurso' },
+            credentials: { type: 'object', description: 'Credenciales opcionales del recurso (se redactan en auditoría)' }
           },
           required: ['projectId', 'type', 'name']
         }
@@ -790,7 +1185,7 @@ class McpServer extends EventEmitter {
         description: 'Obtiene los detalles completos de un proyecto.',
         inputSchema: {
           type: 'object',
-          properties: { projectId: { type: 'string' } },
+          properties: { projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' } },
           required: ['projectId']
         }
       },
@@ -802,9 +1197,9 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string' },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
             resourceId: { type: 'string', description: 'Opcional. ID o nombre del recurso específico (app, database, service) para inyectar variables de entorno.' },
-            envVars: { type: 'object' }
+            envVars: { type: 'object', description: 'Mapa clave-valor de variables de entorno a inyectar o actualizar' }
           },
           required: ['projectId', 'envVars']
         }
@@ -813,10 +1208,10 @@ class McpServer extends EventEmitter {
         name: 'culkibo_deploy_project',
         title: 'Desplegar proyecto',
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-        description: 'Despliega o publica un proyecto.',
+        description: 'Activa o publica un proyecto (para despliegue completo Docker BuildKit + Caddy zero-downtime usa culkibo_deploy_production).',
         inputSchema: {
           type: 'object',
-          properties: { projectId: { type: 'string' } },
+          properties: { projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' } },
           required: ['projectId']
         }
       },
@@ -862,8 +1257,8 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            forgePercent: { type: 'number', description: 'Percentage of traffic to The Forge (0-100)' },
-            citadelPercent: { type: 'number', description: 'Percentage of traffic to The Citadel (0-100)' }
+            forgePercent: { type: 'number', minimum: 0, maximum: 100, description: 'Percentage of traffic to The Forge (0-100)' },
+            citadelPercent: { type: 'number', minimum: 0, maximum: 100, description: 'Percentage of traffic to The Citadel (0-100)' }
           },
           required: ['citadelPercent']
         }
@@ -877,9 +1272,11 @@ class McpServer extends EventEmitter {
           type: 'object',
           properties: {
             action: { type: 'string', enum: ['add', 'delete', 'list', 'toggle_proxy', 'update'], description: 'Action to perform' },
-            hostname: { type: 'string', description: 'Domain name (e.g. api.domain.com or *.domain.com)' },
+            hostname: { type: 'string', minLength: 1, maxLength: 253, description: 'Domain name (e.g. api.domain.com or *.domain.com)' },
             id: { type: 'string', description: 'Domain ID' },
+            projectId: { type: 'string', description: 'Optional project ID to associate the domain with' },
             targetPod: { type: 'string', enum: ['forge', 'citadel'], description: 'Target pod to route traffic to' },
+            targetPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Optional upstream target port (1-65535)' },
             cloudflareProxied: { type: 'boolean', description: 'Enable Cloudflare Orange Cloud (CDN/WAF/Edge)' },
             cloudflareZoneId: { type: 'string', description: 'Cloudflare Zone ID if applicable' }
           },
@@ -920,7 +1317,7 @@ class McpServer extends EventEmitter {
       {
         name: 'culkibo_manage_watcher',
         title: 'Gestionar el vigilante de ficheros',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Start, stop, or inspect the directory watcher that detects code changes for The Forge.',
         inputSchema: {
           type: 'object',
@@ -1437,7 +1834,7 @@ class McpServer extends EventEmitter {
       {
         name: 'culkibo_link_database',
         title: 'Vincular o desvincular base de datos a proyecto',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Vincula (action: "link") o desvincula (action: "unlink") una base de datos gestionada a un proyecto para conectar su red Docker aislada e inyectar DATABASE_URL/REDIS_URL/MONGODB_URI cifradas en tiempo de despliegue sin guardar contraseñas en claro en projects.json.',
         inputSchema: {
           type: 'object',
@@ -1483,8 +1880,8 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string', description: 'ID del proyecto' },
-            lines: { type: 'number', description: 'Número de líneas (10–2000, default 200)' }
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
+            lines: { type: 'number', minimum: 10, maximum: 2000, description: 'Número de líneas (10–2000, default 200)' }
           },
           required: ['projectId']
         }
@@ -1497,9 +1894,9 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string', description: 'ID del proyecto' },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
             deploymentId: { type: 'string', description: 'ID del despliegue (opcional: el más reciente si se omite)' },
-            tail: { type: 'number', description: 'Últimas N líneas a devolver (default 200)' }
+            tail: { type: 'number', minimum: 10, maximum: 2000, description: 'Últimas N líneas a devolver (10–2000, default 200)' }
           },
           required: ['projectId']
         }
@@ -1561,14 +1958,14 @@ class McpServer extends EventEmitter {
         name: 'culkibo_system_doctor_fix',
         title: 'Aplicar reparación automática de System Doctor',
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-        description: 'Ejecuta una reparación segura en 1 clic detectada por el Doctor del sistema (`reconcile_caddy`, `clean_tmp`, `start_caddy`, `clean_orphans`, `prune_build_cache`).',
+        description: 'Ejecuta una reparación segura en 1 clic detectada por el Doctor del sistema (`reconcile_caddy`, `clean_tmp`, `start_caddy`, `clean_orphans`, `prune_buildkit`).',
         inputSchema: {
           type: 'object',
           properties: {
             action: {
               type: 'string',
-              enum: ['reconcile_caddy', 'clean_tmp', 'start_caddy', 'clean_orphans', 'prune_build_cache'],
-              description: 'Acción de auto-reparación a ejecutar'
+              enum: ['reconcile_caddy', 'clean_tmp', 'start_caddy', 'clean_orphans', 'prune_buildkit', 'prune_build_cache'],
+              description: 'Acción de auto-reparación a ejecutar (prune_build_cache actúa como alias compatible de prune_buildkit)'
             }
           },
           required: ['action']
@@ -1582,12 +1979,12 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            databaseId: { type: 'string', description: 'ID de la base de datos' },
+            databaseId: { type: 'string', minLength: 1, description: 'ID de la base de datos' },
             enabled: { type: 'boolean', description: 'Activar o desactivar programación cron' },
             cron: { type: 'string', description: 'Expresión cron de 5 campos o alias (@hourly, @daily, @weekly)' },
-            hourly: { type: 'number', description: 'Número de copias horarias a conservar (0–168)' },
-            daily: { type: 'number', description: 'Número de copias diarias a conservar (0–365)' },
-            weekly: { type: 'number', description: 'Número de copias semanales a conservar (0–260)' }
+            hourly: { type: 'number', minimum: 0, maximum: 168, description: 'Número de copias horarias a conservar (0–168)' },
+            daily: { type: 'number', minimum: 0, maximum: 365, description: 'Número de copias diarias a conservar (0–365)' },
+            weekly: { type: 'number', minimum: 0, maximum: 260, description: 'Número de copias semanales a conservar (0–260)' }
           },
           required: ['databaseId']
         }
@@ -1654,7 +2051,7 @@ class McpServer extends EventEmitter {
       {
         name: 'culkibo_manage_wildcard_dns01',
         title: 'Gestionar políticas TLS wildcard DNS-01',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
         description: 'Lista, añade o elimina políticas wildcard DNS-01 (`*.midominio.com`) en Caddy + Cloudflare.',
         inputSchema: {
           type: 'object',
@@ -1674,7 +2071,7 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            domainId: { type: 'string', description: 'ID del dominio (o hostname)' },
+            domainId: { type: 'string', minLength: 1, description: 'ID del dominio (o hostname)' },
             enabled: { type: 'boolean', description: 'true para activar, false para desactivar' },
             username: { type: 'string', description: 'Usuario HTTP Basic Auth (requerido si enabled=true)' },
             password: { type: 'string', description: 'Contraseña HTTP Basic Auth (requerido si enabled=true)' }
@@ -1691,7 +2088,7 @@ class McpServer extends EventEmitter {
           type: 'object',
           properties: {
             action: { type: 'string', enum: ['get', 'history', 'test'], description: 'Acción: get, history o test' },
-            limit: { type: 'number', description: 'Límite de entradas para history (default 20)' }
+            limit: { type: 'number', minimum: 1, maximum: 100, description: 'Límite de entradas para history (1–100, default 20)' }
           },
           required: ['action']
         }
@@ -1699,12 +2096,12 @@ class McpServer extends EventEmitter {
       {
         name: 'culkibo_manage_webhook',
         title: 'Consultar estado de webhooks o rotar Deploy Hook',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
         description: 'Muestra las URLs de webhook multi-Git (GitHub/GitLab/Gitea/Bitbucket/CI Deploy Hook) de un proyecto o rota su `deployHookToken`.',
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string', description: 'ID del proyecto' },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
             action: { type: 'string', enum: ['status', 'rotate_deploy_hook'], description: 'status para consultar, rotate_deploy_hook para generar nuevo token CI/CD' }
           },
           required: ['projectId', 'action']
@@ -1713,19 +2110,22 @@ class McpServer extends EventEmitter {
       {
         name: 'culkibo_manage_crons',
         title: 'Gestionar tareas programadas (Cron Jobs) por proyecto',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
         description: 'Lista, crea, activa/desactiva, ejecuta manualmente o elimina Cron Jobs de un proyecto (`exec` dentro del contenedor o `http`).',
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string', description: 'ID del proyecto' },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
             action: { type: 'string', enum: ['list', 'create', 'toggle', 'run', 'delete'], description: 'Acción a realizar' },
             cronId: { type: 'string', description: 'ID del cron (para toggle/run/delete)' },
-            name: { type: 'string', description: 'Nombre del cron (para create)' },
+            name: { type: 'string', maxLength: 120, description: 'Nombre del cron (para create)' },
             schedule: { type: 'string', description: 'Expresión cron de 5 campos (para create)' },
             kind: { type: 'string', enum: ['exec', 'http'], description: 'Tipo de tarea (default exec)' },
+            mode: { type: 'string', enum: ['exec', 'http'], description: 'Alias de kind (exec o http)' },
             command: { type: 'string', description: 'Comando sin shell dentro del contenedor (si kind=exec)' },
-            url: { type: 'string', description: 'URL destino (si kind=http)' },
+            url: { type: 'string', description: 'URL o ruta destino (si kind=http)' },
+            httpPath: { type: 'string', description: 'Ruta HTTP relativa dentro del contenedor (ej. /api/cron, si mode=http)' },
+            httpMethod: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], description: 'Método HTTP para cron http (default POST)' },
             enabled: { type: 'boolean', description: 'Estado activo (para create/toggle)' }
           },
           required: ['projectId', 'action']
@@ -1734,15 +2134,15 @@ class McpServer extends EventEmitter {
       {
         name: 'culkibo_manage_previews',
         title: 'Gestionar Preview Deployments por rama o PR',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
         description: 'Lista, despliega o destruye entornos de previsualización aislados por Pull Request o rama de un proyecto.',
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string', description: 'ID del proyecto' },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
             action: { type: 'string', enum: ['list', 'deploy', 'destroy'], description: 'Acción sobre previews' },
             branch: { type: 'string', description: 'Rama Git del preview (para deploy/destroy)' },
-            prNumber: { type: 'number', description: 'Número de PR/MR (opcional)' },
+            prNumber: { type: 'number', minimum: 1, description: 'Número de PR/MR (opcional)' },
             previewId: { type: 'string', description: 'ID del preview (para destroy)' }
           },
           required: ['projectId', 'action']
@@ -2069,21 +2469,21 @@ class McpServer extends EventEmitter {
       {
         name: 'culkibo_status_page_manage',
         title: 'Gestionar páginas de estado públicas e incidentes',
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description: 'Configura páginas de estado públicas (/status/:slug) con aislamiento cero-fugas o publica/resuelve incidentes manuales.',
         inputSchema: {
           type: 'object',
           properties: {
             action: { type: 'string', enum: ['configure', 'publish_incident', 'resolve_incident', 'delete'], description: 'Operación sobre la página de estado' },
-            slug: { type: 'string', description: 'Identificador URL público (p. ej. "status-prod")' },
+            slug: { type: 'string', minLength: 2, maxLength: 49, pattern: '^[a-z0-9][a-z0-9-]{1,48}$', description: 'Identificador URL público (p. ej. "status-prod")' },
             customDomain: { type: 'string', description: 'Dominio personalizado opcional' },
-            title: { type: 'string', description: 'Título público de la página' },
-            description: { type: 'string', description: 'Descripción pública opcional' },
+            title: { type: 'string', maxLength: 120, description: 'Título público de la página' },
+            description: { type: 'string', maxLength: 500, description: 'Descripción pública opcional' },
             monitorIds: { type: 'array', items: { type: 'string' }, description: 'IDs de monitores visibles en la página' },
             incidentId: { type: 'string', description: 'ID del incidente (para resolve_incident)' },
-            incidentTitle: { type: 'string', description: 'Título del incidente (para publish_incident)' },
+            incidentTitle: { type: 'string', maxLength: 160, description: 'Título del incidente (para publish_incident)' },
             severity: { type: 'string', enum: ['minor', 'major', 'critical', 'maintenance'], description: 'Gravedad del incidente' },
-            message: { type: 'string', description: 'Actualización de estado del incidente' }
+            message: { type: 'string', maxLength: 1000, description: 'Actualización de estado del incidente' }
           },
           required: ['action', 'slug']
         }
@@ -2161,8 +2561,8 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            monthlyServerCostEur: { type: 'number', description: 'Coste mensual actual del VPS en EUR (opcional)' },
-            vpsMonthlyEur: { type: 'number', description: 'Alias opcional de monthlyServerCostEur' }
+            monthlyServerCostEur: { type: 'number', minimum: 0, maximum: 100000, description: 'Coste mensual actual del VPS en EUR (opcional)' },
+            vpsMonthlyEur: { type: 'number', minimum: 0, maximum: 100000, description: 'Alias opcional de monthlyServerCostEur' }
           }
         }
       },
@@ -2186,12 +2586,12 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string', description: 'ID del proyecto' },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
             action: { type: 'string', enum: ['configure', 'sleep', 'wake'], description: 'Acción: configure, sleep o wake' },
             enabled: { type: 'boolean', description: 'Activar auto-sleep (para configure)' },
             mode: { type: 'string', enum: ['pause', 'stop'], description: 'Modo de suspensión del contenedor (default stop)' },
-            idleMinutes: { type: 'number', description: 'Minutos de inactividad antes de dormir (mínimo 5)' },
-            wakeTimeoutMs: { type: 'number', description: 'Timeout de despertar en ms (opcional)' },
+            idleMinutes: { type: 'number', minimum: 5, maximum: 10080, description: 'Minutos de inactividad antes de dormir (mínimo 5)' },
+            wakeTimeoutMs: { type: 'number', minimum: 1000, maximum: 120000, description: 'Timeout de despertar en ms (opcional)' },
             excludeCrons: { type: 'boolean', description: 'Evitar dormir mientras haya crons activos (default true)' }
           },
           required: ['projectId', 'action']
@@ -2289,11 +2689,11 @@ class McpServer extends EventEmitter {
         inputSchema: {
           type: 'object',
           properties: {
-            projectId: { type: 'string', description: 'ID del proyecto' },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
             action: { type: 'string', enum: ['start', 'advance', 'promote', 'abort', 'status'], description: 'Acción sobre el rollout canario' },
-            steps: { type: 'array', items: { type: 'number' }, description: 'Pasos ascendentes de porcentaje canario (p. ej. [10, 50, 100])' },
-            stepIntervalSec: { type: 'number', description: 'Segundos de observación por paso (default 15)' },
-            weightPercent: { type: 'number', description: 'Peso canario explícito opcional (1-100)' },
+            steps: { type: 'array', items: { type: 'number', minimum: 1, maximum: 100 }, minItems: 1, maxItems: 10, description: 'Pasos ascendentes de porcentaje canario (p. ej. [10, 50, 100])' },
+            stepIntervalSec: { type: 'number', minimum: 3, maximum: 3600, description: 'Segundos de observación por paso (default 15)' },
+            weightPercent: { type: 'number', minimum: 1, maximum: 100, description: 'Peso canario explícito opcional (1-100)' },
             autoRollbackOnSmokeFail: { type: 'boolean', description: 'Revertir automáticamente al 100% estable ante fallo (default true)' }
           },
           required: ['projectId', 'action']
@@ -2312,18 +2712,117 @@ class McpServer extends EventEmitter {
             windows: {
               type: 'array',
               items: { type: 'object' },
+              maxItems: 32,
               description: 'Ventanas [{ days, startUtc, endUtc, startHour, endHour, tz, reason }] (para set)'
             },
             windowId: { type: 'string', description: 'ID de ventana a eliminar (opcional para remove)' }
           },
           required: ['action']
         }
+      },
+
+      // --- MCP 2.1: I. Meta-Discovery y Autocuración Autónoma (3 -> 107) ---
+      {
+        name: 'culkibo_search_tools',
+        title: 'Buscar herramientas MCP bajo demanda (meta-discovery)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+            profile: { type: 'string' },
+            totalAuthorized: { type: 'number' },
+            matchedCount: { type: 'number' },
+            tools: { type: 'array' },
+            profiles: { type: 'object' }
+          }
+        },
+        description: 'Busca semánticamente (ES/EN) entre las 107 herramientas autorizadas de Culkibo para descubrir sus esquemas bajo demanda sin saturar la ventana de contexto (ideal con ?profile=core).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', maxLength: 120, description: 'Palabras clave o intención (p. ej. "postgres backup", "ssl wildcard", "oom", "canary")' },
+            profile: { type: 'string', enum: ['all', 'core', 'deploy', 'ops', 'security'], description: 'Restringir la búsqueda a un perfil concreto (default all)' },
+            readOnlyOnly: { type: 'boolean', description: 'Si true, devuelve solo herramientas de solo lectura' },
+            includeSchema: { type: 'boolean', description: 'Incluir inputSchema y outputSchema completos (default true)' },
+            limit: { type: 'integer', minimum: 1, maximum: 25, description: 'Máximo de herramientas devueltas (1–25, default 8)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_diagnose_incident',
+        title: 'Diagnosticar incidente autónomo y proponer plan de reparación',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            incidentId: { type: 'string' },
+            diagnosedAt: { type: 'string' },
+            scope: { type: 'string' },
+            severity: { type: 'string' },
+            summary: { type: 'string' },
+            signals: { type: 'object' },
+            rootCauses: { type: 'array' },
+            remediationPlan: { type: 'array' }
+          }
+        },
+        description: 'Correlaciona en una sola llamada crashes/OOM del contenedor, despliegues recientes, logs redactados, monitores de uptime, RAM/disco/Smart Sleep, System Doctor, dominio/TLS, flota SSH y conflictos de LiveSync en causas raíz priorizadas y un plan seguro ejecutable con culkibo_auto_remediate.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto a diagnosticar (opcional; si se omite evalúa los proyectos accesibles y la salud global)' },
+            hostname: { type: 'string', maxLength: 253, description: 'Dominio afectado opcional para sondear DNS/TLS/Caddy' },
+            logLines: { type: 'integer', minimum: 10, maximum: 500, description: 'Líneas recientes de log del contenedor a inspeccionar (10–500, default 80)' },
+            includeDoctor: { type: 'boolean', description: 'Incluir informe de System Doctor (default true)' },
+            probeDomain: { type: 'boolean', description: 'Ejecutar sonda activa DNS/TLS contra hostname (default false salvo hostname explícito)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_auto_remediate',
+        title: 'Ejecutar remediación autónoma segura (dryRun + confirmToken)',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            executed: { type: 'boolean' },
+            dryRun: { type: 'boolean' },
+            action: { type: 'string' },
+            projectId: { type: ['string', 'null'] },
+            confirmToken: { type: 'string' },
+            postVerification: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Ejecuta una acción de auto-reparación segura y permitida (`rollback_release`, `restart_service`, `wake_service`, `toggle_maintenance`, `reconcile_ingress`, `doctor_fix`). EXIGE flujo en dos pasos: primero `dryRun: true` para obtener `confirmToken` HMAC-SHA256 de un solo uso (5 min) y después confirmar pasando ese `confirmToken` con `dryRun: false`.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['rollback_release', 'restart_service', 'wake_service', 'toggle_maintenance', 'reconcile_ingress', 'doctor_fix'],
+              description: 'Acción de remediación segura a ejecutar'
+            },
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto (obligatorio para rollback_release, restart_service, wake_service y toggle_maintenance)' },
+            confirmToken: { type: 'string', minLength: 16, maxLength: 512, description: 'Token HMAC-SHA256 de un solo uso emitido por esta misma herramienta con dryRun: true (obligatorio para aplicar)' },
+            doctorFixAction: {
+              type: 'string',
+              enum: ['reconcile_caddy', 'clean_tmp', 'start_caddy', 'clean_orphans', 'prune_buildkit'],
+              description: 'Subacción de System Doctor cuando action="doctor_fix"'
+            },
+            maintenanceEnabled: { type: 'boolean', description: 'Activar (true) o desactivar (false) modo mantenimiento cuando action="toggle_maintenance" (default true)' },
+            verifyAfter: { type: 'boolean', description: 'Ejecutar verificación de salud/smoke checks tras aplicar el fix (default true)' }
+          },
+          required: ['action']
+        }
       }
     ];
 
-    // Inyección automática del parámetro opcional `dryRun` en todas las herramientas
-    // destructivas (25) + deploy_production y rollback_deployment (27 en total).
+    // Inyección automática de `outputSchema` estructurados y del parámetro opcional `dryRun`
+    // en todas las herramientas destructivas (33) + deploy_production y rollback_deployment (35 en total).
     for (const tool of this._toolsCache) {
+      if (!tool.outputSchema && DEFAULT_OUTPUT_SCHEMAS[tool.name]) {
+        tool.outputSchema = DEFAULT_OUTPUT_SCHEMAS[tool.name];
+      }
       if (tool.annotations?.destructiveHint === true || EXTRA_DRY_RUN_TOOLS.has(tool.name)) {
         if (!tool.inputSchema) tool.inputSchema = { type: 'object', properties: {} };
         if (!tool.inputSchema.properties) tool.inputSchema.properties = {};
@@ -2341,14 +2840,152 @@ class McpServer extends EventEmitter {
   }
 
   /**
-   * Devuelve las herramientas visibles para un principal RBAC concreto.
-   * @param {any} [authOrPrincipal]
+   * Normaliza y valida un nombre de perfil MCP (`all | core | deploy | ops | security`).
+   * @param {any} rawProfile
+   * @returns {'all' | 'core' | 'deploy' | 'ops' | 'security'}
    */
-  getToolsForPrincipal(authOrPrincipal = null) {
+  normalizeProfile(rawProfile) {
+    if (rawProfile === undefined || rawProfile === null || String(rawProfile).trim() === '') {
+      return 'all';
+    }
+    const clean = String(rawProfile).trim().toLowerCase();
+    if (!VALID_TOOL_PROFILES.includes(/** @type {any} */ (clean))) {
+      throw new McpToolError('INVALID_ARGUMENT', `Perfil MCP desconocido: '${rawProfile}'.`, {
+        retryable: true,
+        remediation: `Usa uno de los perfiles soportados: ${VALID_TOOL_PROFILES.join(', ')}.`,
+        details: { received: rawProfile, allowed: VALID_TOOL_PROFILES }
+      });
+    }
+    return /** @type {'all' | 'core' | 'deploy' | 'ops' | 'security'} */ (clean);
+  }
+
+  /**
+   * Calcula puntuación de relevancia ES/EN de una herramienta para un texto de consulta.
+   * @param {any} tool
+   * @param {string} rawQuery
+   * @returns {number}
+   */
+  scoreToolForQuery(tool, rawQuery) {
+    const q = String(rawQuery || '').trim().toLowerCase();
+    if (!q) return 1;
+    const rawTokens = q.split(/[\s,._:/-]+/).filter((t) => t.length >= 2);
+    if (rawTokens.length === 0) return 1;
+
+    const name = String(tool.name || '').toLowerCase();
+    const title = String(tool.title || '').toLowerCase();
+    const desc = String(tool.description || '').toLowerCase();
+    const scope = String(TOOL_POLICIES[tool.name]?.scope || '').toLowerCase();
+    const paramNames = Object.keys(tool.inputSchema?.properties || {}).join(' ').toLowerCase();
+    const haystack = `${name} ${title} ${desc} ${scope} ${paramNames}`;
+
+    let score = 0;
+    if (name === q || name === `culkibo_${q}`) score += 200;
+    else if (name.includes(q)) score += 90;
+
+    for (const tok of rawTokens) {
+      let tokScore = 0;
+      if (name.includes(tok)) tokScore += 40;
+      if (scope.includes(tok)) tokScore += 22;
+      if (title.includes(tok)) tokScore += 20;
+      if (desc.includes(tok)) tokScore += 14;
+      if (paramNames.includes(tok)) tokScore += 8;
+      const syns = SEARCH_SYNONYMS[tok];
+      if (tokScore === 0 && Array.isArray(syns)) {
+        for (const syn of syns) {
+          if (haystack.includes(syn)) {
+            tokScore += 10;
+            break;
+          }
+        }
+      }
+      score += tokScore;
+    }
+    return score;
+  }
+
+  /**
+   * Devuelve las herramientas visibles para un principal RBAC concreto, opcionalmente
+   * filtradas por perfil (`core|deploy|ops|security|all`), búsqueda textual (`query`),
+   * `readOnlyOnly` y `limit`.
+   * @param {any} [authOrPrincipal]
+   * @param {{ profile?: string | null, query?: string | null, readOnlyOnly?: boolean, limit?: number | null }} [opts]
+   */
+  getToolsForPrincipal(authOrPrincipal = null, opts = {}) {
     const all = this.getToolsDefinition();
     const principal = normalizePrincipal(authOrPrincipal);
-    if (principal.isSuperAdmin) return all;
-    return all.filter((tool) => isToolAllowedForPrincipal(principal, tool.name, tool));
+    let list = principal.isSuperAdmin
+      ? all
+      : all.filter((tool) => isToolAllowedForPrincipal(principal, tool.name, tool));
+
+    const profile = this.normalizeProfile(opts && opts.profile);
+    if (profile !== 'all') {
+      const allowedSet = TOOL_PROFILES[profile];
+      list = list.filter((tool) => allowedSet.has(tool.name));
+    }
+
+    if (opts && opts.readOnlyOnly === true) {
+      list = list.filter((tool) => tool.annotations?.readOnlyHint === true);
+    }
+
+    if (opts && typeof opts.query === 'string' && opts.query.trim()) {
+      const q = opts.query.trim();
+      list = list
+        .map((tool) => ({ tool, score: this.scoreToolForQuery(tool, q) }))
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name))
+        .map((x) => x.tool);
+    }
+
+    if (opts && typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0) {
+      list = list.slice(0, Math.min(all.length, Math.floor(opts.limit)));
+    }
+
+    return list;
+  }
+
+  /**
+   * Meta-discovery bajo demanda (`culkibo_search_tools`): busca solo dentro de las
+   * herramientas autorizadas para `principal`, devolviendo esquemas completos bajo petición.
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   * @param {any} args
+   */
+  searchTools(principal, args = {}) {
+    const profile = this.normalizeProfile(args.profile || 'all');
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    const limit = Math.min(25, Math.max(1, Number(args.limit) || 8));
+    const includeSchema = args.includeSchema !== false;
+    const authorizedAll = this.getToolsForPrincipal(principal);
+    const matched = this.getToolsForPrincipal(principal, {
+      profile,
+      query,
+      readOnlyOnly: Boolean(args.readOnlyOnly),
+      limit
+    });
+
+    const profileCounts = {
+      all: authorizedAll.length,
+      core: authorizedAll.filter((t) => TOOL_PROFILES.core.has(t.name)).length,
+      deploy: authorizedAll.filter((t) => TOOL_PROFILES.deploy.has(t.name)).length,
+      ops: authorizedAll.filter((t) => TOOL_PROFILES.ops.has(t.name)).length,
+      security: authorizedAll.filter((t) => TOOL_PROFILES.security.has(t.name)).length
+    };
+
+    return {
+      query,
+      profile,
+      totalAuthorized: authorizedAll.length,
+      matchedCount: matched.length,
+      tools: matched.map((t) => ({
+        name: t.name,
+        title: t.title,
+        description: t.description,
+        annotations: t.annotations,
+        scope: TOOL_POLICIES[t.name]?.scope || null,
+        supportsDryRun: this.supportsDryRun(t.name),
+        ...(includeSchema ? { inputSchema: t.inputSchema, ...(t.outputSchema ? { outputSchema: t.outputSchema } : {}) } : {})
+      })),
+      profiles: profileCounts
+    };
   }
 
   /**
@@ -2366,24 +3003,34 @@ class McpServer extends EventEmitter {
    * Si el principal no es superadmin o está acotado por scopes/proyectos,
    * NUNCA reutiliza el caché global público y responde con `cacheScope: 'private'`.
    * @param {any} [authOrPrincipal]
+   * @param {{ profile?: string | null }} [opts]
    */
-  getToolsSerialized(authOrPrincipal = null) {
+  getToolsSerialized(authOrPrincipal = null, opts = {}) {
     const principal = normalizePrincipal(authOrPrincipal);
+    const profile = this.normalizeProfile(opts && opts.profile);
     if (principal.isSuperAdmin) {
-      if (!this._toolsSerializedCache) {
-        const tools = this.getToolsDefinition();
-        this._toolsSerializedCache = Buffer.from(JSON.stringify({
-          protocolVersion: PROTOCOL_VERSION,
-          tools,
-          count: tools.length,
-          cacheScope: 'public'
-        }), 'utf8');
+      if (profile === 'all' && this._toolsSerializedCache) {
+        return this._toolsSerializedCache;
       }
-      return this._toolsSerializedCache;
+      if (this._profileSerializedCache.has(profile)) {
+        return /** @type {Buffer} */ (this._profileSerializedCache.get(profile));
+      }
+      const tools = this.getToolsForPrincipal(principal, { profile });
+      const buf = Buffer.from(JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        profile,
+        tools,
+        count: tools.length,
+        cacheScope: 'public'
+      }), 'utf8');
+      this._profileSerializedCache.set(profile, buf);
+      if (profile === 'all') this._toolsSerializedCache = buf;
+      return buf;
     }
-    const tools = this.getToolsForPrincipal(principal);
+    const tools = this.getToolsForPrincipal(principal, { profile });
     return Buffer.from(JSON.stringify({
       protocolVersion: PROTOCOL_VERSION,
+      profile,
       tools,
       count: tools.length,
       cacheScope: 'private'
@@ -2393,6 +3040,758 @@ class McpServer extends EventEmitter {
   getToolByName(toolName) {
     if (!this._toolsByName) this.getToolsDefinition();
     return (this._toolsByName && this._toolsByName.get(toolName)) || null;
+  }
+
+  /**
+   * Devuelve la lista de IDs de proyectos accesibles para `principal` (o `null` si superadmin).
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   * @returns {string[] | null}
+   */
+  _accessibleProjectIds(principal) {
+    if (principal.isSuperAdmin) return null;
+    return projectManager.getAll()
+      .filter((p) => canAccessProject(principal, p.id, p))
+      .map((p) => p.id);
+  }
+
+  /**
+   * Identificador estable del principal para vincular tokens de confirmación HMAC-SHA256.
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   */
+  _principalKey(principal) {
+    return `${principal.method}:${principal.userId || 'anon'}:${principal.role}:${principal.teamId || 'global'}:${principal.tokenId || ''}`;
+  }
+
+  /**
+   * Hash determinista de parámetros relevantes de `culkibo_auto_remediate`.
+   * @param {any} args
+   */
+  _remediationParamsHash(args) {
+    const canonical = JSON.stringify({
+      action: String(args.action || ''),
+      projectId: args.projectId ? String(args.projectId) : null,
+      doctorFixAction: args.doctorFixAction ? String(args.doctorFixAction) : null,
+      maintenanceEnabled: args.action === 'toggle_maintenance' ? (args.maintenanceEnabled !== false) : null
+    });
+    return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+  }
+
+  /** Limpia tokens caducados y acota la tabla en memoria sin timers en segundo plano. */
+  _prunePendingRemediations() {
+    const now = Date.now();
+    for (const [nonce, rec] of this._pendingRemediations.entries()) {
+      if (now > rec.exp + 60000) {
+        this._pendingRemediations.delete(nonce);
+      }
+    }
+    while (this._pendingRemediations.size >= MAX_PENDING_REMEDIATIONS) {
+      const oldestKey = this._pendingRemediations.keys().next().value;
+      if (!oldestKey) break;
+      this._pendingRemediations.delete(oldestKey);
+    }
+  }
+
+  /**
+   * Emite un token HMAC-SHA256 de un solo uso (TTL 5 min) vinculado a principal + acción + proyecto + parámetros.
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   * @param {any} args
+   * @param {number} [ttlMs]
+   */
+  mintRemediationToken(principal, args, ttlMs = REMEDIATION_TOKEN_TTL_MS) {
+    this._prunePendingRemediations();
+    const nonce = crypto.randomBytes(12).toString('base64url');
+    const clampedTtl = Math.min(REMEDIATION_TOKEN_TTL_MS, Math.max(1, Number(ttlMs) || REMEDIATION_TOKEN_TTL_MS));
+    const exp = Date.now() + clampedTtl;
+    const principalKey = this._principalKey(principal);
+    const action = String(args.action || '');
+    const projectId = args.projectId ? String(args.projectId) : null;
+    const paramsHash = this._remediationParamsHash(args);
+
+    const payload = Buffer.from(JSON.stringify({ n: nonce, e: exp, a: action, p: projectId, h: paramsHash }), 'utf8').toString('base64url');
+    const sig = crypto
+      .createHmac('sha256', this._remediationHmacKey)
+      .update(`${payload}.${principalKey}`)
+      .digest('base64url');
+
+    this._pendingRemediations.set(nonce, {
+      exp,
+      used: false,
+      principalKey,
+      action,
+      projectId,
+      paramsHash
+    });
+
+    return {
+      confirmToken: `ckr_${payload}.${sig}`,
+      confirmTokenExpiresAt: new Date(exp).toISOString()
+    };
+  }
+
+  /**
+   * Valida firma HMAC-SHA256 en tiempo constante, expiración, vinculación y un solo uso.
+   * @param {string} rawToken
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   * @param {any} args
+   */
+  verifyAndConsumeRemediationToken(rawToken, principal, args) {
+    this._prunePendingRemediations();
+    if (typeof rawToken !== 'string' || !rawToken.startsWith('ckr_')) {
+      throw new McpToolError('CONFIRM_TOKEN_INVALID', 'El confirmToken proporcionado no tiene formato válido.', {
+        retryable: true,
+        remediation: 'Ejecuta culkibo_auto_remediate con dryRun: true para obtener un confirmToken válido.'
+      });
+    }
+    const body = rawToken.slice(4);
+    const dotIdx = body.lastIndexOf('.');
+    if (dotIdx <= 0) {
+      throw new McpToolError('CONFIRM_TOKEN_INVALID', 'El confirmToken está truncado o malformado.', {
+        retryable: true,
+        remediation: 'Ejecuta culkibo_auto_remediate con dryRun: true para obtener un nuevo confirmToken.'
+      });
+    }
+    const payloadB64 = body.slice(0, dotIdx);
+    const providedSig = body.slice(dotIdx + 1);
+    let decoded;
+    try {
+      decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    } catch (e) {
+      throw new McpToolError('CONFIRM_TOKEN_INVALID', 'No se pudo decodificar el confirmToken.', {
+        retryable: true,
+        remediation: 'Ejecuta culkibo_auto_remediate con dryRun: true para obtener un nuevo confirmToken.'
+      });
+    }
+    const nonce = decoded && typeof decoded.n === 'string' ? decoded.n : '';
+    const record = nonce ? this._pendingRemediations.get(nonce) : null;
+    if (!record) {
+      throw new McpToolError('CONFIRM_TOKEN_INVALID', 'El confirmToken no existe o ya expiró.', {
+        retryable: true,
+        remediation: 'Genera un nuevo confirmToken ejecutando culkibo_auto_remediate con dryRun: true.'
+      });
+    }
+    if (record.used) {
+      throw new McpToolError('CONFIRM_TOKEN_REPLAYED', 'Este confirmToken ya fue consumido (un solo uso).', {
+        retryable: false,
+        remediation: 'Genera un nuevo confirmToken con dryRun: true si deseas ejecutar una nueva remediación.'
+      });
+    }
+
+    const callerKey = this._principalKey(principal);
+    const expectedSig = crypto
+      .createHmac('sha256', this._remediationHmacKey)
+      .update(`${payloadB64}.${callerKey}`)
+      .digest('base64url');
+    const bufA = Buffer.from(providedSig, 'utf8');
+    const bufB = Buffer.from(expectedSig, 'utf8');
+    if (bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB) || record.principalKey !== callerKey) {
+      throw new McpToolError('CONFIRM_TOKEN_MISMATCH', 'El confirmToken no pertenece a tu sesión/principal o fue alterado.', {
+        retryable: false,
+        remediation: 'Solicita tu propio confirmToken ejecutando culkibo_auto_remediate con dryRun: true.'
+      });
+    }
+
+    const reqAction = String(args.action || '');
+    const reqProjectId = args.projectId ? String(args.projectId) : null;
+    const reqParamsHash = this._remediationParamsHash(args);
+    if (record.action !== reqAction || record.projectId !== reqProjectId || record.paramsHash !== reqParamsHash) {
+      throw new McpToolError('CONFIRM_TOKEN_MISMATCH', 'El confirmToken no coincide con la acción, proyecto o parámetros solicitados.', {
+        retryable: true,
+        remediation: 'Usa exactamente la misma acción, projectId y parámetros que en el dryRun, o solicita un nuevo confirmToken.',
+        details: { expectedAction: record.action, receivedAction: reqAction }
+      });
+    }
+
+    if (Date.now() > record.exp) {
+      this._pendingRemediations.delete(nonce);
+      throw new McpToolError('CONFIRM_TOKEN_EXPIRED', 'El confirmToken ha caducado (validez máxima 5 minutos).', {
+        retryable: true,
+        remediation: 'Ejecuta culkibo_auto_remediate con dryRun: true para obtener un confirmToken fresco.'
+      });
+    }
+
+    record.used = true;
+    return { nonce, exp: record.exp };
+  }
+
+  /**
+   * Diagnóstico autónomo correlacionado (`culkibo_diagnose_incident`).
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   * @param {any} args
+   */
+  async diagnoseIncident(principal, args = {}) {
+    const incidentId = `inc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const diagnosedAt = new Date().toISOString();
+    const logLines = Math.min(500, Math.max(10, Number(args.logLines) || 80));
+    const includeDoctor = args.includeDoctor !== false;
+
+    const project = args.projectId ? projectManager.getById(String(args.projectId)) : null;
+    if (args.projectId && !project) {
+      throw projectNotFoundError(args.projectId);
+    }
+
+    const allowedProjectIds = this._accessibleProjectIds(principal);
+    /** @type {Array<{ code: string, confidence: number, severity: 'critical' | 'high' | 'warning', title: string, evidence: string, affectedComponent: string }>} */
+    const rootCauses = [];
+    /** @type {Array<{ step: number, action: string, safe: boolean, automated: boolean, tool: string, args: Record<string, any>, dryRunRequired: boolean, rationale: string }>} */
+    const remediationPlan = [];
+    const plannedKeys = new Set();
+    const addFix = (entry) => {
+      const key = `${entry.tool}:${entry.action}:${JSON.stringify(entry.args)}`;
+      if (plannedKeys.has(key)) return;
+      plannedKeys.add(key);
+      remediationPlan.push({ step: remediationPlan.length + 1, ...entry });
+    };
+
+    /** @type {Record<string, any>} */
+    const signals = {
+      container: null,
+      deployments: null,
+      logs: null,
+      uptime: null,
+      resources: null,
+      doctor: null,
+      domain: null,
+      fleet: null,
+      liveSync: null
+    };
+
+    // 1. Contenedor + Despliegues + Logs redactados + LiveSync (cuando hay projectId)
+    if (project) {
+      if (project.maintenanceMode) {
+        rootCauses.push({
+          code: 'MAINTENANCE_MODE_ACTIVE',
+          confidence: 0.98,
+          severity: 'warning',
+          title: 'Proyecto en modo mantenimiento (HTTP 503)',
+          evidence: `El proyecto '${project.name}' tiene maintenanceMode=true en Caddy.`,
+          affectedComponent: 'ingress'
+        });
+        addFix({
+          action: 'toggle_maintenance',
+          safe: true,
+          automated: true,
+          tool: 'culkibo_auto_remediate',
+          args: { action: 'toggle_maintenance', projectId: project.id, maintenanceEnabled: false, dryRun: true },
+          dryRunRequired: true,
+          rationale: 'Restaurar tráfico normal cuando finalice el mantenimiento.'
+        });
+      }
+
+      const [depStatus, runtimeStats, runtimeLogs] = await Promise.all([
+        deployManager.status(project.id).catch((e) => ({ error: e.message })),
+        typeof deployManager.getRuntimeStats === 'function'
+          ? deployManager.getRuntimeStats(project.id).catch((e) => ({ ok: false, error: e.message }))
+          : Promise.resolve(null),
+        typeof deployManager.getRuntimeLogs === 'function'
+          ? deployManager.getRuntimeLogs(project.id, { lines: logLines }).catch((e) => ({ lines: [], error: e.message }))
+          : Promise.resolve({ lines: [] })
+      ]);
+
+      const recentDeps = deployManager.listDeployments(project.id, 5).map(({ logLines: _ll, ...summary }) => summary);
+      const latestDep = recentDeps[0] || null;
+      signals.container = runtimeStats;
+      signals.deployments = {
+        current: depStatus?.current || null,
+        previous: depStatus?.previous || null,
+        recent: recentDeps
+      };
+
+      const rawLogLines = Array.isArray(runtimeLogs?.lines) ? runtimeLogs.lines : [];
+      const oomLogHits = rawLogLines.filter((l) => /out of memory|oom|enomem|heap limit|allocation failed/i.test(String(l)));
+      const crashLogHits = rawLogLines.filter((l) => /fatal|panic|unhandledpromiserejection|uncaughtexception|traceback|segfault|eaddrinuse/i.test(String(l)));
+      const connLogHits = rawLogLines.filter((l) => /econnrefused|etimedout|econnreset|connection refused|too many connections|502|503|504/i.test(String(l)));
+      signals.logs = {
+        inspectedLines: rawLogLines.length,
+        oomHits: oomLogHits.length,
+        crashHits: crashLogHits.length,
+        connectionHits: connLogHits.length,
+        excerpts: [...oomLogHits.slice(-2), ...crashLogHits.slice(-2), ...connLogHits.slice(-2)].slice(0, 5)
+      };
+
+      if (runtimeStats?.oomKilled === true || oomLogHits.length > 0) {
+        rootCauses.push({
+          code: 'CONTAINER_OOM_KILLED',
+          confidence: runtimeStats?.oomKilled === true ? 0.96 : 0.85,
+          severity: 'critical',
+          title: 'Contenedor terminado por falta de memoria (OOMKilled)',
+          evidence: runtimeStats?.oomKilled === true
+            ? `Docker reporta OOMKilled=true (restarts=${runtimeStats.restartCount ?? 0}).`
+            : `Se detectaron ${oomLogHits.length} trazas OOM/heap en los últimos logs.`,
+          affectedComponent: 'container'
+        });
+        if (depStatus?.previous) {
+          addFix({
+            action: 'rollback_release',
+            safe: true,
+            automated: true,
+            tool: 'culkibo_auto_remediate',
+            args: { action: 'rollback_release', projectId: project.id, dryRun: true },
+            dryRunRequired: true,
+            rationale: 'Revertir a la release anterior estable si la fuga de RAM empezó en el último despliegue.'
+          });
+        }
+        addFix({
+          action: 'restart_service',
+          safe: true,
+          automated: true,
+          tool: 'culkibo_auto_remediate',
+          args: { action: 'restart_service', projectId: project.id, dryRun: true },
+          dryRunRequired: true,
+          rationale: 'Reiniciar el contenedor tras revisar el límite de RAM con culkibo_cost_advisor.'
+        });
+      }
+
+      if (Number(runtimeStats?.restartCount || 0) >= 3) {
+        rootCauses.push({
+          code: 'CONTAINER_CRASH_LOOP',
+          confidence: 0.92,
+          severity: 'critical',
+          title: 'Bucle de reinicios del contenedor (CrashLoop)',
+          evidence: `El contenedor acumula ${runtimeStats.restartCount} reinicios (status=${runtimeStats.status || 'unknown'}).`,
+          affectedComponent: 'container'
+        });
+        if (depStatus?.previous) {
+          addFix({
+            action: 'rollback_release',
+            safe: true,
+            automated: true,
+            tool: 'culkibo_auto_remediate',
+            args: { action: 'rollback_release', projectId: project.id, dryRun: true },
+            dryRunRequired: true,
+            rationale: 'Revertir a la versión previa sana para cortar el bucle de reinicios.'
+          });
+        }
+      } else if (depStatus?.current && runtimeStats && runtimeStats.running === false) {
+        rootCauses.push({
+          code: 'CONTAINER_STOPPED',
+          confidence: 0.88,
+          severity: 'critical',
+          title: 'Contenedor de producción detenido',
+          evidence: `Existe release activa (${depStatus.current.id || depStatus.current.containerName}) pero running=false.`,
+          affectedComponent: 'container'
+        });
+        addFix({
+          action: 'restart_service',
+          safe: true,
+          automated: true,
+          tool: 'culkibo_auto_remediate',
+          args: { action: 'restart_service', projectId: project.id, dryRun: true },
+          dryRunRequired: true,
+          rationale: 'Arrancar el contenedor de producción detenido y restaurar su ruta en Caddy.'
+        });
+      }
+
+      if (runtimeStats?.health === 'unhealthy') {
+        rootCauses.push({
+          code: 'CONTAINER_UNHEALTHY',
+          confidence: 0.87,
+          severity: 'high',
+          title: 'Healthcheck del contenedor en estado unhealthy',
+          evidence: `Docker health=${runtimeStats.health} en ${runtimeStats.containerName || project.id}.`,
+          affectedComponent: 'container'
+        });
+        addFix({
+          action: 'restart_service',
+          safe: true,
+          automated: true,
+          tool: 'culkibo_auto_remediate',
+          args: { action: 'restart_service', projectId: project.id, dryRun: true },
+          dryRunRequired: true,
+          rationale: 'Reiniciar el servicio y ejecutar smoke checks post-reinicio.'
+        });
+      }
+
+      if (latestDep && (latestDep.status === 'error' || latestDep.status === 'failed' || latestDep.status === 'fallido')) {
+        rootCauses.push({
+          code: 'RECENT_DEPLOY_FAILED',
+          confidence: 0.9,
+          severity: 'high',
+          title: 'El despliegue más reciente falló',
+          evidence: `Despliegue ${latestDep.id} falló en fase '${latestDep.stage || 'unknown'}'${latestDep.commit ? ` (commit ${String(latestDep.commit).slice(0, 8)})` : ''}: ${latestDep.error || 'ver logs'}.`,
+          affectedComponent: 'deployment'
+        });
+        if (depStatus?.previous) {
+          addFix({
+            action: 'rollback_release',
+            safe: true,
+            automated: true,
+            tool: 'culkibo_auto_remediate',
+            args: { action: 'rollback_release', projectId: project.id, dryRun: true },
+            dryRunRequired: true,
+            rationale: 'Garantizar tráfico en la release anterior verificada mientras se corrige el commit fallido.'
+          });
+        }
+      }
+
+      if (connLogHits.length > 0) {
+        rootCauses.push({
+          code: 'UPSTREAM_OR_DB_CONNECTION_ERROR',
+          confidence: 0.78,
+          severity: 'high',
+          title: 'Errores de conexión a base de datos o upstream en logs',
+          evidence: `${connLogHits.length} líneas con ECONNREFUSED/ETIMEDOUT/502-504.`,
+          affectedComponent: 'network'
+        });
+      } else if (crashLogHits.length > 0 && rootCauses.every((r) => r.code !== 'CONTAINER_CRASH_LOOP')) {
+        rootCauses.push({
+          code: 'APPLICATION_RUNTIME_ERRORS',
+          confidence: 0.75,
+          severity: 'high',
+          title: 'Excepciones fatales en stdout/stderr de la aplicación',
+          evidence: `${crashLogHits.length} líneas fatales detectadas en los últimos ${logLines} logs.`,
+          affectedComponent: 'application'
+        });
+      }
+
+      // LiveSync 2.0 conflictos
+      try {
+        const syncStatus = liveSyncEngine.getStatus(project.id);
+        const conflicts = Array.isArray(syncStatus?.recentConflicts) ? syncStatus.recentConflicts : [];
+        signals.liveSync = { conflictCount: conflicts.length, recentConflicts: conflicts.slice(0, 5) };
+        if (conflicts.length > 0) {
+          rootCauses.push({
+            code: 'LIVESYNC_CONFLICTS_DETECTED',
+            confidence: 0.7,
+            severity: 'warning',
+            title: 'Conflictos concurrentes en LiveSync 2.0',
+            evidence: `${conflicts.length} conflicto(s) reciente(s) en The Forge.`,
+            affectedComponent: 'sync'
+          });
+        }
+      } catch (e) {
+        signals.liveSync = { conflictCount: 0 };
+      }
+
+      // Flota SSH (si el proyecto corre en nodo remoto)
+      const serverId = project.serverId || 'local';
+      if (serverId !== 'local') {
+        const fleet = lazySvc('serverFleetManager');
+        const srv = fleet && typeof fleet.getServer === 'function' ? sanitizeFleetServer(fleet.getServer(serverId)) : null;
+        signals.fleet = srv || { id: serverId, status: 'unknown' };
+        if (srv && srv.status && srv.status !== 'online' && srv.status !== 'healthy') {
+          rootCauses.push({
+            code: 'FLEET_NODE_UNHEALTHY',
+            confidence: 0.93,
+            severity: 'critical',
+            title: `Nodo remoto de flota '${srv.name || serverId}' degradado (${srv.status})`,
+            evidence: `El proyecto está asignado al nodo '${serverId}' cuyo estado es '${srv.status}'.`,
+            affectedComponent: 'fleet'
+          });
+        }
+      } else {
+        signals.fleet = { id: 'local', status: 'online' };
+      }
+    }
+
+    // 2. Monitores de Uptime e incidentes abiertos
+    const um = lazySvc('uptimeMonitor');
+    if (um && typeof um.listMonitors === 'function') {
+      const rawMons = um.listMonitors(project ? { projectId: project.id } : {});
+      const monitors = (Array.isArray(rawMons) ? rawMons : []).filter((m) => {
+        if (project && m.projectId !== project.id) return false;
+        return canAccessProject(principal, m.projectId);
+      });
+      const openIncidents = typeof um.listIncidents === 'function'
+        ? (um.listIncidents({ status: 'open' }) || []).filter((inc) => {
+            if (project && inc.projectId && inc.projectId !== project.id) return false;
+            return canAccessProject(principal, inc.projectId);
+          })
+        : [];
+      const downMonitors = monitors.filter((m) => m.status === 'down' || m.lastStatus === 'down');
+      signals.uptime = {
+        totalMonitors: monitors.length,
+        downCount: downMonitors.length,
+        downMonitors: downMonitors.map((m) => ({ id: m.id, name: m.name, url: m.url || m.host, status: m.status })),
+        openIncidents: openIncidents.slice(0, 10)
+      };
+      if (downMonitors.length > 0 || openIncidents.length > 0) {
+        rootCauses.push({
+          code: 'UPTIME_MONITOR_DOWN',
+          confidence: 0.91,
+          severity: 'critical',
+          title: `${downMonitors.length || openIncidents.length} monitor(es) de uptime caídos o incidente abierto`,
+          evidence: downMonitors.length > 0
+            ? `Monitores caídos: ${downMonitors.map((m) => m.name || m.id).join(', ')}.`
+            : `${openIncidents.length} incidente(s) abiertos en uptimeMonitor.`,
+          affectedComponent: 'uptime'
+        });
+        if (project) {
+          addFix({
+            action: 'restart_service',
+            safe: true,
+            automated: true,
+            tool: 'culkibo_auto_remediate',
+            args: { action: 'restart_service', projectId: project.id, dryRun: true },
+            dryRunRequired: true,
+            rationale: 'Reiniciar el servicio para recuperar el endpoint monitorizado.'
+          });
+        }
+      }
+    }
+
+    // 3. Smart Sleep + Cost/RAM Advisor
+    const sa = lazySvc('sleepAdvisor');
+    const isSleeping = project && sa && typeof sa.isSleeping === 'function' ? Boolean(sa.isSleeping(project.id)) : false;
+    if (isSleeping && project) {
+      rootCauses.push({
+        code: 'PROJECT_SLEEPING',
+        confidence: 0.97,
+        severity: 'warning',
+        title: 'El proyecto está hibernado por Smart Sleep',
+        evidence: `sleepAdvisor.isSleeping('${project.id}') === true.`,
+        affectedComponent: 'sleep'
+      });
+      addFix({
+        action: 'wake_service',
+        safe: true,
+        automated: true,
+        tool: 'culkibo_auto_remediate',
+        args: { action: 'wake_service', projectId: project.id, dryRun: true },
+        dryRunRequired: true,
+        rationale: 'Despertar el contenedor desde Smart Sleep sin reconstruir.'
+      });
+    }
+    if (sa && typeof sa.analyzeResources === 'function') {
+      try {
+        const advisor = await sa.analyzeResources(allowedProjectIds !== null ? { projectIds: allowedProjectIds } : {});
+        signals.resources = {
+          sleeping: isSleeping,
+          freeRamPct: advisor?.host?.freeMemPct ?? advisor?.summary?.freeMemPct ?? null,
+          reclaimableRamMb: advisor?.reclaimableRamMb ?? 0,
+          recommendationsCount: Array.isArray(advisor?.recommendations) ? advisor.recommendations.length : 0
+        };
+        const freePct = Number(signals.resources.freeRamPct);
+        if (Number.isFinite(freePct) && freePct >= 0 && freePct < 10) {
+          rootCauses.push({
+            code: 'HOST_MEMORY_PRESSURE',
+            confidence: 0.89,
+            severity: 'critical',
+            title: `Presión severa de memoria en el host (${freePct}% RAM libre)`,
+            evidence: `Queda menos de 10% de RAM libre en el servidor (recuperable: ${signals.resources.reclaimableRamMb} MB).`,
+            affectedComponent: 'host'
+          });
+          addFix({
+            action: 'doctor_fix',
+            safe: true,
+            automated: true,
+            tool: 'culkibo_auto_remediate',
+            args: { action: 'doctor_fix', doctorFixAction: 'prune_buildkit', dryRun: true },
+            dryRunRequired: true,
+            rationale: 'Liberar caché/contenedores huérfanos y evaluar Smart Sleep para recuperar RAM.'
+          });
+        }
+      } catch (e) {
+        signals.resources = { sleeping: isSleeping, error: e.message };
+      }
+    } else {
+      signals.resources = {
+        sleeping: isSleeping,
+        totalRamMb: Math.round(os.totalmem() / 1048576),
+        freeRamMb: Math.round(os.freemem() / 1048576)
+      };
+    }
+
+    // 4. System Doctor (Caddy, Docker, disco, seguridad)
+    if (includeDoctor) {
+      try {
+        const doc = await systemDoctor.runDoctor();
+        const failing = (doc.checks || []).filter((c) => c.status === 'fail' || c.status === 'warn');
+        signals.doctor = {
+          summary: doc.summary,
+          issues: failing.map((c) => ({ name: c.name, status: c.status, summary: c.summary, fixAction: c.fixAction || null }))
+        };
+        for (const issue of failing) {
+          if (issue.status === 'fail' || issue.fixAction) {
+            rootCauses.push({
+              code: `DOCTOR_${String(issue.name || 'CHECK').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`,
+              confidence: issue.status === 'fail' ? 0.88 : 0.72,
+              severity: issue.status === 'fail' ? 'high' : 'warning',
+              title: `System Doctor: ${issue.name} (${issue.status})`,
+              evidence: issue.summary || issue.detail || '',
+              affectedComponent: 'system'
+            });
+            if (issue.fixAction && DOCTOR_FIX_CANONICAL_ACTIONS.includes(/** @type {any} */ (issue.fixAction))) {
+              addFix({
+                action: 'doctor_fix',
+                safe: true,
+                automated: true,
+                tool: 'culkibo_auto_remediate',
+                args: { action: 'doctor_fix', doctorFixAction: issue.fixAction, dryRun: true },
+                dryRunRequired: true,
+                rationale: `Aplicar reparación oficial '${issue.fixAction}' sugerida por System Doctor.`
+              });
+            }
+          }
+        }
+      } catch (e) {
+        signals.doctor = { error: e.message };
+      }
+    }
+
+    // 5. Dominio e Ingress
+    const targetHostname = args.hostname
+      ? String(args.hostname).trim()
+      : (project ? domainManager.listDomains().find((d) => d.projectId === project.id)?.hostname || null : null);
+    if (targetHostname) {
+      const route = domainManager.resolveRoute(targetHostname);
+      if (args.probeDomain === true || Boolean(args.hostname)) {
+        try {
+          const diag = await ingressManager.diagnoseDomain(targetHostname);
+          signals.domain = { hostname: targetHostname, hasRoute: Boolean(route), diagnosis: diag };
+          const failedChecks = (diag?.checks || []).filter((c) => c.status === 'fail');
+          if (!route || failedChecks.length > 0) {
+            rootCauses.push({
+              code: 'DOMAIN_INGRESS_FAILURE',
+              confidence: 0.86,
+              severity: 'high',
+              title: `Fallo de enrutado o TLS en '${targetHostname}'`,
+              evidence: !route ? 'No hay ruta registrada en domainManager.' : `${failedChecks.length} comprobación(es) fallidas en diagnoseDomain.`,
+              affectedComponent: 'ingress'
+            });
+            addFix({
+              action: 'reconcile_ingress',
+              safe: true,
+              automated: true,
+              tool: 'culkibo_auto_remediate',
+              args: { action: 'reconcile_ingress', dryRun: true },
+              dryRunRequired: true,
+              rationale: 'Reconciliar atómicamente rutas y TLS en Caddy.'
+            });
+          }
+        } catch (e) {
+          signals.domain = { hostname: targetHostname, hasRoute: Boolean(route), error: e.message };
+        }
+      } else {
+        signals.domain = { hostname: targetHostname, hasRoute: Boolean(route), probed: false };
+      }
+    }
+
+    const sevRank = { critical: 3, high: 2, warning: 1 };
+    rootCauses.sort((a, b) => (sevRank[b.severity] - sevRank[a.severity]) || (b.confidence - a.confidence));
+
+    const severity = rootCauses.some((r) => r.severity === 'critical')
+      ? 'critical'
+      : rootCauses.some((r) => r.severity === 'high')
+        ? 'degraded'
+        : rootCauses.length > 0
+          ? 'warning'
+          : 'healthy';
+
+    const summary = rootCauses.length === 0
+      ? `Sin anomalías críticas detectadas${project ? ` en '${project.name}'` : ' en la instancia'}.`
+      : `Detectadas ${rootCauses.length} causa(s) probable(s) [${severity}]: principal '${rootCauses[0].code}' — ${rootCauses[0].title}.`;
+
+    return {
+      incidentId,
+      diagnosedAt,
+      scope: project ? project.id : 'instance',
+      severity,
+      summary,
+      signals,
+      rootCauses,
+      remediationPlan
+    };
+  }
+
+  /**
+   * Ejecución real de `culkibo_auto_remediate` tras validar `confirmToken` HMAC-SHA256 de un solo uso.
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   * @param {any} args
+   */
+  async executeAutoRemediate(principal, args) {
+    const action = String(args.action || '');
+    if (!AUTO_REMEDIATE_ACTIONS.includes(/** @type {any} */ (action))) {
+      throw new McpToolError('INVALID_ARGUMENT', `Acción de remediación no permitida: '${action}'.`, {
+        retryable: true,
+        remediation: `Usa una acción permitida: ${AUTO_REMEDIATE_ACTIONS.join(', ')}.`
+      });
+    }
+
+    if (!args.confirmToken) {
+      throw new McpToolError(
+        'CONFIRMATION_REQUIRED',
+        `culkibo_auto_remediate requiere previsualización dryRun: true y un confirmToken HMAC-SHA256 de un solo uso antes de ejecutar '${action}'.`,
+        {
+          retryable: true,
+          remediation: `Llama primero a culkibo_auto_remediate con { action: "${action}"${args.projectId ? `, projectId: "${args.projectId}"` : ''}, dryRun: true } para obtener confirmToken y luego repítelo con dryRun: false.`
+        }
+      );
+    }
+
+    if (!GLOBAL_REMEDIATE_ACTIONS.has(action) && !args.projectId) {
+      throw new McpToolError('MISSING_ARGUMENT', `La acción '${action}' requiere projectId.`, {
+        retryable: true,
+        remediation: 'Pasa projectId obtenido desde culkibo_list_projects o culkibo_diagnose_incident.'
+      });
+    }
+
+    this.verifyAndConsumeRemediationToken(String(args.confirmToken), principal, args);
+
+    const project = args.projectId ? projectManager.getById(String(args.projectId)) : null;
+    if (!GLOBAL_REMEDIATE_ACTIONS.has(action) && !project) {
+      throw projectNotFoundError(args.projectId);
+    }
+
+    /** @type {any} */
+    let actionResult = null;
+    if (action === 'rollback_release' && project) {
+      actionResult = await deployManager.rollback(project.id);
+    } else if (action === 'restart_service' && project) {
+      /** @type {any} */
+      let stopped = null;
+      try { stopped = await deployManager.stopProduction(project.id); } catch (e) { stopped = { stopped: false, error: e.message }; }
+      const started = await deployManager.startProduction(project.id);
+      actionResult = { restarted: Boolean(started && started.started !== false), stop: stopped, start: started };
+    } else if (action === 'wake_service' && project) {
+      const sa = requireLazySvc('sleepAdvisor', 'Smart Sleep');
+      actionResult = await sa.wakeProject(project.id, { trigger: 'mcp_auto_remediate' });
+    } else if (action === 'toggle_maintenance' && project) {
+      const enabled = args.maintenanceEnabled !== false;
+      projectManager.update(project.id, { maintenanceMode: enabled });
+      await projectManager.flushToDisk();
+      const ingress = await ingressManager.reconcile();
+      actionResult = { success: true, projectId: project.id, maintenanceMode: enabled, ingress };
+    } else if (action === 'reconcile_ingress') {
+      actionResult = await ingressManager.reconcile();
+    } else if (action === 'doctor_fix') {
+      const rawFix = String(args.doctorFixAction || '');
+      const fixAct = rawFix === 'prune_build_cache' ? 'prune_buildkit' : rawFix;
+      if (!DOCTOR_FIX_CANONICAL_ACTIONS.includes(/** @type {any} */ (fixAct))) {
+        throw new McpToolError('MISSING_ARGUMENT', 'Falta doctorFixAction válido para action="doctor_fix".', {
+          retryable: true,
+          remediation: `Pasa doctorFixAction con uno de: ${DOCTOR_FIX_CANONICAL_ACTIONS.join(', ')}.`
+        });
+      }
+      actionResult = await systemDoctor.applyFix(fixAct);
+    }
+
+    // Verificación post-remediación opcional
+    /** @type {any} */
+    let postVerification = null;
+    if (args.verifyAfter !== false && project) {
+      try {
+        const checks = Array.isArray(project.smokeTests)
+          ? project.smokeTests
+          : (Array.isArray(project.smokeTests?.checks) ? project.smokeTests.checks : []);
+        if (checks.length > 0 && typeof deployManager.runSmokeTestsForProject === 'function') {
+          postVerification = { kind: 'smoke_tests', ...(await deployManager.runSmokeTestsForProject(project.id)) };
+        } else {
+          const st = await deployManager.status(project.id);
+          postVerification = { kind: 'deploy_status', maintenanceMode: Boolean(projectManager.getById(project.id)?.maintenanceMode), current: st?.current || null };
+        }
+      } catch (e) {
+        postVerification = { kind: 'verification_error', error: e.message };
+      }
+    }
+
+    return {
+      executed: true,
+      dryRun: false,
+      action,
+      projectId: project ? project.id : null,
+      result: actionResult,
+      postVerification
+    };
   }
 
   /**
@@ -2471,31 +3870,58 @@ class McpServer extends EventEmitter {
       if (args.role) {
         const targetRank = ROLE_RANK[String(args.role).toLowerCase()] || 999;
         if (String(args.role).toLowerCase() === 'owner' && principal.role !== 'owner') {
-          throw new McpToolError('FORBIDDEN', 'Solo un owner puede otorgar o gestionar el rol owner.', { retryable: false });
+          throw new McpToolError('FORBIDDEN', 'Solo un owner puede otorgar o gestionar el rol owner.', {
+            retryable: false,
+            remediation: 'Usa un rol <= admin o pide a un owner que realice esta operación.'
+          });
         }
         if (toolName === 'culkibo_rbac_manage_token' && targetRank > callerRank) {
-          throw new McpToolError('FORBIDDEN', 'No puedes emitir un token con un rol superior al tuyo.', { retryable: false });
+          throw new McpToolError('FORBIDDEN', 'No puedes emitir un token con un rol superior al tuyo.', {
+            retryable: false,
+            remediation: `Emite el token con rol '${principal.role}' o inferior.`
+          });
         }
         if (toolName !== 'culkibo_rbac_manage_token' && principal.role !== 'owner' && targetRank >= callerRank) {
-          throw new McpToolError('FORBIDDEN', 'Un admin solo puede gestionar o invitar roles developer y viewer.', { retryable: false });
+          throw new McpToolError('FORBIDDEN', 'Un admin solo puede gestionar o invitar roles developer y viewer.', {
+            retryable: false,
+            remediation: 'Indica role "developer" o "viewer", o solicita la operación a un owner.'
+          });
         }
       }
     }
 
     if (toolName === 'culkibo_export_instance_snapshot' && args.includeSecrets === true && principal.role !== 'owner') {
-      throw new McpToolError('FORBIDDEN', 'Exportar snapshots de instancia con secretos sin redactar requiere rol owner.', { retryable: false });
+      throw new McpToolError('FORBIDDEN', 'Exportar snapshots de instancia con secretos sin redactar requiere rol owner.', {
+        retryable: false,
+        remediation: 'Usa includeSecrets: false para exportar un snapshot redactado o autentícate como owner.'
+      });
+    }
+
+    if (toolName === 'culkibo_auto_remediate' && GLOBAL_REMEDIATE_ACTIONS.has(String(args.action || ''))) {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', `La remediación global '${args.action}' requiere rol admin/owner sin restricción de proyectos.`, {
+          retryable: false,
+          remediation: 'Usa una acción por proyecto (rollback_release, restart_service, wake_service, toggle_maintenance) o autentícate como admin/owner.'
+        });
+      }
     }
 
     // Aislamiento de equipo en argumentos explícitos (teamId y serverId) antes de dryRun
     if (principal.teamId && args.teamId && String(args.teamId) !== principal.teamId) {
-      throw new McpToolError('FORBIDDEN', 'No tienes acceso al equipo especificado.', { retryable: false });
+      throw new McpToolError('FORBIDDEN', 'No tienes acceso al equipo especificado.', {
+        retryable: false,
+        remediation: 'Omite teamId o usa el teamId que devuelve culkibo_rbac_whoami.'
+      });
     }
     if (principal.teamId && args.serverId && String(args.serverId) !== 'local') {
       const fleet = lazySvc('serverFleetManager');
       if (fleet && typeof fleet.getServer === 'function') {
         const srv = fleet.getServer(String(args.serverId));
         if (!srv || (srv.teamId && srv.teamId !== principal.teamId)) {
-          throw new McpToolError('FORBIDDEN', 'No tienes acceso al servidor especificado.', { retryable: false });
+          throw new McpToolError('FORBIDDEN', 'No tienes acceso al servidor especificado.', {
+            retryable: false,
+            remediation: 'Consulta los servidores accesibles con culkibo_fleet_list_servers.'
+          });
         }
       }
     }
@@ -2506,7 +3932,8 @@ class McpServer extends EventEmitter {
     // Un token acotado a `projectIds` concretos NUNCA puede escapar a mutaciones globales sin proyecto objetivo.
     if (Array.isArray(principal.projectIds) && tool && !tool.annotations?.readOnlyHint && refs.length === 0) {
       throw new McpToolError('FORBIDDEN', 'Un token acotado a proyectos concretos no puede ejecutar mutaciones globales.', {
-        retryable: false
+        retryable: false,
+        remediation: 'Incluye un projectId autorizado por tu token o utiliza un token sin restricción de projectIds.'
       });
     }
 
@@ -2515,23 +3942,33 @@ class McpServer extends EventEmitter {
     let minEffectiveProjectRank = callerRank;
     for (const ref of refs) {
       if (ref.missing && hasRestrictedScope) {
-        throw new McpToolError('FORBIDDEN', 'No tienes acceso al recurso especificado.', { retryable: false });
+        throw new McpToolError('FORBIDDEN', 'No tienes acceso al recurso especificado.', {
+          retryable: false,
+          remediation: 'Verifica los recursos autorizados con culkibo_list_projects o culkibo_rbac_whoami.'
+        });
       }
       const effRole = resolveEffectiveProjectRole(principal, ref.projectId);
       if (!effRole) {
-        throw new McpToolError('FORBIDDEN', 'No tienes acceso al proyecto especificado.', { retryable: false });
+        throw new McpToolError('FORBIDDEN', 'No tienes acceso al proyecto especificado.', {
+          retryable: false,
+          remediation: 'Usa culkibo_list_projects para listar únicamente los proyectos accesibles por tu credencial.'
+        });
       }
       const effRank = ROLE_RANK[effRole] || 0;
       if (effRank < minRank) {
         throw new McpToolError('FORBIDDEN', `Tu rol efectivo ('${effRole}') sobre el proyecto no autoriza '${toolName}'.`, {
-          retryable: false
+          retryable: false,
+          remediation: `Esta operación exige rol '${policy.minRole}' sobre el proyecto; consulta tus permisos con culkibo_rbac_whoami.`
         });
       }
       if (effRank < minEffectiveProjectRank) minEffectiveProjectRank = effRank;
     }
 
     if ((toolName === 'culkibo_deploy_production' || toolName === 'culkibo_env_promote') && args.overrideFreeze === true && minEffectiveProjectRank < ROLE_RANK.admin) {
-      throw new McpToolError('FORBIDDEN', 'Solo admin u owner pueden omitir una ventana de deploy freeze.', { retryable: false });
+      throw new McpToolError('FORBIDDEN', 'Solo admin u owner pueden omitir una ventana de deploy freeze.', {
+        retryable: false,
+        remediation: 'Espera a que termine la ventana con culkibo_deploy_freeze (action: "list") o pide override a un admin/owner.'
+      });
     }
 
     if (toolName === 'culkibo_env_promote' && String(args.toEnv || '').toLowerCase() === 'production' && minEffectiveProjectRank < ROLE_RANK.admin) {
@@ -2539,7 +3976,10 @@ class McpServer extends EventEmitter {
       const envs = em && typeof em.listEnvironments === 'function' ? em.listEnvironments(args.projectId) : null;
       const prodEnv = Array.isArray(envs) ? envs.find((e) => e.name === 'production') : null;
       if (!prodEnv || prodEnv.protected !== false) {
-        throw new McpToolError('FORBIDDEN', 'Promocionar a producción protegida requiere rol admin u owner.', { retryable: false });
+        throw new McpToolError('FORBIDDEN', 'Promocionar a producción protegida requiere rol admin u owner.', {
+          retryable: false,
+          remediation: 'Solicita la promoción a un admin/owner o promociona primero a staging.'
+        });
       }
     }
   }
@@ -2791,10 +4231,227 @@ class McpServer extends EventEmitter {
         break;
       }
 
+      case 'culkibo_auto_remediate': {
+        const action = String(args.action || '');
+        const isGlobal = GLOBAL_REMEDIATE_ACTIONS.has(action);
+        Object.assign(target, { action, projectId: project ? project.id : (args.projectId || null), doctorFixAction: args.doctorFixAction || null });
+        if (!isGlobal && !project) {
+          blockers.push('PROJECT_REQUIRED');
+          warnings.push(`La acción '${action}' requiere un projectId válido.`);
+        }
+        if (action === 'rollback_release' && project) {
+          const st = await deployManager.status(project.id);
+          effects.push(`Revertirá la release activa de '${project.name}' a la versión previa en Caddy.`);
+          if (!st?.previous) {
+            blockers.push('NO_PREVIOUS_RELEASE');
+            warnings.push('No existe una release previa registrada para revertir.');
+          }
+          preview.currentStatus = st;
+          riskLevel = 'high';
+          reversible = true;
+        } else if (action === 'restart_service' && project) {
+          effects.push(`Detendrá y arrancará el contenedor de producción de '${project.name}' (stopProduction + startProduction).`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'wake_service' && project) {
+          effects.push(`Despertará el servicio '${project.name}' desde Smart Sleep.`);
+          riskLevel = 'low';
+          reversible = true;
+        } else if (action === 'toggle_maintenance' && project) {
+          const en = args.maintenanceEnabled !== false;
+          const domains = domainManager.listDomains().filter((d) => d.projectId === project.id).map((d) => d.hostname);
+          effects.push(en
+            ? `Activará modo mantenimiento HTTP 503 en ${domains.length} dominio(s) de '${project.name}'.`
+            : `Restaurará tráfico normal en ${domains.length} dominio(s) de '${project.name}'.`);
+          preview.domains = domains;
+          riskLevel = en ? 'high' : 'low';
+          reversible = true;
+        } else if (action === 'reconcile_ingress') {
+          effects.push('Reconciliará atómicamente todas las rutas y políticas TLS en Caddy.');
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'doctor_fix') {
+          const rawFix = String(args.doctorFixAction || '');
+          const fixAct = rawFix === 'prune_build_cache' ? 'prune_buildkit' : rawFix;
+          if (!DOCTOR_FIX_CANONICAL_ACTIONS.includes(/** @type {any} */ (fixAct))) {
+            blockers.push('MISSING_DOCTOR_ACTION');
+            warnings.push(`Indica doctorFixAction: ${DOCTOR_FIX_CANONICAL_ACTIONS.join(', ')}.`);
+          } else {
+            effects.push(`Ejecutará la reparación de System Doctor '${fixAct}'.`);
+          }
+          riskLevel = fixAct === 'prune_buildkit' || fixAct === 'clean_orphans' ? 'medium' : 'low';
+          reversible = fixAct === 'reconcile_caddy' || fixAct === 'start_caddy';
+        }
+        if (blockers.length === 0) {
+          const minted = this.mintRemediationToken(principal, args);
+          return {
+            dryRun: true,
+            executed: false,
+            tool: toolName,
+            action,
+            projectId: project ? project.id : null,
+            wouldExecute: true,
+            riskLevel,
+            reversible,
+            target,
+            effects,
+            blockers,
+            warnings,
+            preview,
+            confirmToken: minted.confirmToken,
+            confirmTokenExpiresAt: minted.confirmTokenExpiresAt,
+            postVerification: null,
+            nextStep: `Confirma el plan y llama a culkibo_auto_remediate con los mismos parámetros, dryRun: false y confirmToken: "${minted.confirmToken}" antes de ${minted.confirmTokenExpiresAt}.`
+          };
+        }
+        return {
+          dryRun: true,
+          executed: false,
+          tool: toolName,
+          action,
+          projectId: project ? project.id : null,
+          wouldExecute: false,
+          riskLevel,
+          reversible,
+          target,
+          effects,
+          blockers,
+          warnings,
+          preview,
+          postVerification: null,
+          nextStep: `Resuelve los bloqueos (${blockers.join(', ')}) antes de ejecutar culkibo_auto_remediate.`
+        };
+      }
+
+      case 'culkibo_manage_production_service': {
+        if (!project) throw projectNotFoundError(args.projectId);
+        Object.assign(target, { projectId: project.id, projectName: project.name, action: args.action });
+        effects.push(`Ejecutará '${args.action}' sobre el contenedor Citadel de '${project.name}' usando stopProduction/startProduction.`);
+        preview.deployStatus = await deployManager.status(project.id);
+        riskLevel = args.action === 'stop' || args.action === 'hibernate' ? 'high' : 'medium';
+        reversible = true;
+        break;
+      }
+
+      case 'culkibo_manage_crons': {
+        if (!project) throw projectNotFoundError(args.projectId);
+        Object.assign(target, { projectId: project.id, action: args.action, cronId: args.cronId || null });
+        effects.push(`Ejecutará '${args.action}' sobre Cron Jobs de '${project.name}'.`);
+        riskLevel = args.action === 'delete' ? 'high' : 'low';
+        reversible = args.action !== 'delete';
+        break;
+      }
+
+      case 'culkibo_manage_previews': {
+        if (!project) throw projectNotFoundError(args.projectId);
+        Object.assign(target, { projectId: project.id, action: args.action, branch: args.branch || null, previewId: args.previewId || null });
+        effects.push(`Ejecutará '${args.action}' sobre Preview Deployments de '${project.name}'.`);
+        riskLevel = args.action === 'destroy' ? 'high' : 'medium';
+        reversible = args.action !== 'destroy';
+        break;
+      }
+
+      case 'culkibo_status_page_manage': {
+        Object.assign(target, { action: args.action, slug: args.slug });
+        effects.push(`Ejecutará '${args.action}' sobre la página de estado pública '/status/${args.slug}'.`);
+        riskLevel = args.action === 'delete' ? 'high' : 'medium';
+        reversible = args.action !== 'delete';
+        break;
+      }
+
+      case 'culkibo_manage_domain': {
+        Object.assign(target, { action: args.action, hostname: args.hostname || null, id: args.id || null, projectId: args.projectId || null });
+        effects.push(`Ejecutará '${args.action}' sobre dominio '${args.hostname || args.id || '(list)'}' y reconciliará Caddy.`);
+        riskLevel = args.action === 'delete' ? 'high' : 'medium';
+        reversible = args.action !== 'delete';
+        break;
+      }
+
+      case 'culkibo_switch_traffic': {
+        const citadel = Number(args.citadelPercent ?? 100);
+        const forge = args.forgePercent !== undefined ? Number(args.forgePercent) : Math.max(0, 100 - citadel);
+        Object.assign(target, { forgePercent: forge, citadelPercent: citadel });
+        effects.push(`Conmutará el tráfico a ${citadel}% Citadel / ${forge}% Forge y reconciliará Caddy.`);
+        riskLevel = 'high';
+        reversible = true;
+        break;
+      }
+
+      case 'culkibo_database_restore': {
+        const db = databaseManager.list().find((d) => d.id === args.databaseId);
+        Object.assign(target, { databaseId: args.databaseId, name: db?.name || null, backupId: args.backupId || null, remoteKey: args.remoteKey || null });
+        if (!args.backupId && !args.remoteKey) blockers.push('MISSING_BACKUP_REF');
+        effects.push(`Restaurará la base de datos '${db?.name || args.databaseId}'${args.createSafetySnapshot !== false ? ' creando snapshot de seguridad previo' : ' SIN snapshot de seguridad'}.`);
+        riskLevel = 'high';
+        reversible = args.createSafetySnapshot !== false;
+        break;
+      }
+
+      case 'culkibo_uninstall_catalog_service': {
+        Object.assign(target, { installationId: args.installationId, deleteVolumes: Boolean(args.deleteVolumes) });
+        effects.push(`Desinstalará servicio del catálogo '${args.installationId}'${args.deleteVolumes ? ' incluyendo volúmenes persistentes (IRREVERSIBLE)' : ''}.`);
+        riskLevel = 'high';
+        reversible = !args.deleteVolumes;
+        break;
+      }
+
+      case 'culkibo_cancel_deployment': {
+        if (!project) throw projectNotFoundError(args.projectId);
+        Object.assign(target, { projectId: project.id, projectName: project.name });
+        effects.push(`Abortará el despliegue/build en curso de '${project.name}' y liberará la ranura del semáforo.`);
+        riskLevel = 'medium';
+        reversible = true;
+        break;
+      }
+
+      case 'culkibo_prune_build_cache': {
+        Object.assign(target, { keepStorageGb: args.keepStorageGb ?? 10, untilHours: args.untilHours ?? null });
+        effects.push(`Podará la caché BuildKit de Docker conservando ${args.keepStorageGb ?? 10} GB.`);
+        riskLevel = 'medium';
+        reversible = false;
+        break;
+      }
+
+      case 'culkibo_manage_webhook': {
+        if (!project) throw projectNotFoundError(args.projectId);
+        Object.assign(target, { projectId: project.id, action: args.action });
+        effects.push(args.action === 'rotate_deploy_hook'
+          ? `Rotará el deployHookToken de '${project.name}' invalidando el token CI/CD anterior.`
+          : `Consultará los endpoints webhook de '${project.name}'.`);
+        riskLevel = args.action === 'rotate_deploy_hook' ? 'high' : 'low';
+        reversible = args.action !== 'rotate_deploy_hook';
+        break;
+      }
+
+      case 'culkibo_manage_wildcard_dns01': {
+        Object.assign(target, { action: args.action, domain: args.domain || null });
+        effects.push(`Ejecutará '${args.action}' sobre política TLS wildcard DNS-01${args.domain ? ` de '${args.domain}'` : ''}.`);
+        riskLevel = args.action === 'remove' ? 'high' : 'medium';
+        reversible = true;
+        break;
+      }
+
+      case 'culkibo_link_database': {
+        if (!project) throw projectNotFoundError(args.projectId);
+        Object.assign(target, { projectId: project.id, databaseId: args.databaseId, action: args.action || 'link' });
+        effects.push(`${args.action === 'unlink' ? 'Desvinculará' : 'Vinculará'} la base de datos '${args.databaseId}' de '${project.name}'.`);
+        riskLevel = args.action === 'unlink' ? 'high' : 'low';
+        reversible = true;
+        break;
+      }
+
+      case 'culkibo_manage_watcher': {
+        Object.assign(target, { action: args.action, directory: args.directory || null });
+        effects.push(`Ejecutará '${args.action}' sobre el vigilante de ficheros de The Forge.`);
+        riskLevel = args.action === 'stop' ? 'medium' : 'low';
+        reversible = true;
+        break;
+      }
+
       default: {
         Object.assign(target, redactForAudit(args));
         effects.push(`Ejecutará la herramienta destructiva '${toolName}' con los parámetros validados.`);
-        if (toolName === 'culkibo_restore_backup' || toolName === 'culkibo_database_restore' || toolName === 'culkibo_uninstall_catalog_service') {
+        if (toolName === 'culkibo_restore_backup') {
           riskLevel = 'high';
           reversible = false;
         }
@@ -2900,7 +4557,10 @@ class McpServer extends EventEmitter {
     let isDryRun = false;
     try {
       if (context.signal && context.signal.aborted) {
-        throw new McpToolError('CANCELLED', 'La invocación de herramienta fue cancelada por el cliente.', { retryable: true });
+        throw new McpToolError('CANCELLED', 'La invocación de herramienta fue cancelada por el cliente.', {
+          retryable: true,
+          remediation: 'Reintenta la invocación cuando el cliente esté listo para recibir la respuesta.'
+        });
       }
       if (!tool) {
         throw new McpToolError('UNKNOWN_TOOL', `Esta instalación de Culkibo no expone ninguna herramienta llamada '${toolName}'.`, {
@@ -3003,9 +4663,12 @@ class McpServer extends EventEmitter {
           break;
         }
 
-        case 'culkibo_deploy_project':
-          res = projectManager.activate(args.projectId); // Simplified deploy
+        case 'culkibo_deploy_project': {
+          const project = projectManager.getById(args.projectId);
+          if (!project) throw projectNotFoundError(args.projectId);
+          res = redactProjectSecrets(projectManager.activate(args.projectId));
           break;
+        }
 
         case 'culkibo_list_pods':
           res = containerOrchestrator.getPods();
@@ -3029,12 +4692,18 @@ class McpServer extends EventEmitter {
         case 'culkibo_manage_domain':
           if (args.action === 'list') {
             res = {
-              domains: domainManager.listDomains().filter((d) => canAccessProject(principal, d.projectId))
+              domains: domainManager.listDomains().filter((d) => {
+                if (principal.isSuperAdmin) return true;
+                if (!d.projectId) return false;
+                return canAccessProject(principal, d.projectId);
+              })
             };
           } else if (args.action === 'add') {
             res = await domainManager.addDomain({
               hostname: args.hostname,
+              ...(args.projectId ? { projectId: String(args.projectId) } : {}),
               targetPod: args.targetPod || 'forge',
+              ...(args.targetPort !== undefined ? { targetPort: Number(args.targetPort) } : {}),
               cloudflareProxied: args.cloudflareProxied ?? true,
               cloudflareZoneId: args.cloudflareZoneId
             });
@@ -3104,7 +4773,10 @@ class McpServer extends EventEmitter {
                 const inProjects = !path.relative(projectsRoot, resolved).startsWith('..') && !path.isAbsolute(path.relative(projectsRoot, resolved));
                 const inCwd = !path.relative(cwdRoot, resolved).startsWith('..') && !path.isAbsolute(path.relative(cwdRoot, resolved));
                 if (!inProjects && !inCwd) {
-                  throw new Error('Solo se permite observar directorios dentro del espacio de trabajo de Culkibo');
+                  throw new McpToolError('FORBIDDEN_PATH', 'Solo se permite observar directorios dentro del espacio de trabajo de Culkibo.', {
+                    retryable: false,
+                    remediation: 'Pasa una ruta dentro del directorio actual o de la carpeta projects/ de Culkibo.'
+                  });
                 }
               }
               watchDir = resolved;
@@ -3159,10 +4831,39 @@ class McpServer extends EventEmitter {
             all: args.all !== false,
             projectId: args.projectId
           });
+          if (principal.isSuperAdmin) {
+            res = { containers: allContainers };
+            break;
+          }
+          // Fail-closed: `dockerManager.listContainers` no incluye `projectId` por defecto, así que
+          // asociamos cada contenedor por `c.projectId` o por nombre/prefijo registrado del proyecto permitido.
+          const allowedProjects = projectManager.getAll().filter((p) => canAccessProject(principal, p.id, p));
+          const allowedProjectIdSet = new Set(allowedProjects.map((p) => p.id));
+          const allowedContainerNames = new Set();
+          for (const p of allowedProjects) {
+            const st = deployManager.getState(p.id);
+            if (st?.current?.containerName) allowedContainerNames.add(String(st.current.containerName).replace(/^\/+/, ''));
+            if (st?.previous?.containerName) allowedContainerNames.add(String(st.previous.containerName).replace(/^\/+/, ''));
+          }
+          const matchesAllowedContainer = (c) => {
+            if (!c || typeof c !== 'object') return false;
+            if (c.projectId) return allowedProjectIdSet.has(String(c.projectId));
+            const names = Array.isArray(c.names) ? c.names : (c.name ? [c.name] : []);
+            for (const rawName of names) {
+              const cleanName = String(rawName || '').replace(/^\/+/, '');
+              if (!cleanName) continue;
+              if (allowedContainerNames.has(cleanName)) return true;
+              for (const pid of allowedProjectIdSet) {
+                const safePid = String(pid).toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+                if (cleanName.includes(pid) || cleanName.startsWith(`culkibo_${safePid}`) || cleanName.startsWith(`culkibo-${safePid}`) || cleanName.startsWith(`culkibo_prev_${safePid}`)) {
+                  return true;
+                }
+              }
+            }
+            return false;
+          };
           res = {
-            containers: principal.isSuperAdmin
-              ? allContainers
-              : allContainers.filter((c) => canAccessProject(principal, c?.projectId))
+            containers: allContainers.filter(matchesAllowedContainer)
           };
           break;
         }
@@ -3420,6 +5121,9 @@ class McpServer extends EventEmitter {
               yamlText: args.yamlText,
               projectName: args.projectName || ''
             });
+            if (principal.teamId && res?.project?.id) {
+              projectManager.update(res.project.id, { teamId: principal.teamId });
+            }
             await projectManager.flushToDisk();
           } else {
             res = universalImporter.parseDockerCompose(args.yamlText);
@@ -3540,15 +5244,25 @@ class McpServer extends EventEmitter {
           const project = projectManager.getById(args.projectId);
           if (!project) throw projectNotFoundError(args.projectId);
           if (args.action === 'stop' || args.action === 'hibernate') {
-            res = await deployManager.stop(project.id);
-          } else if (args.action === 'start' || args.action === 'restart') {
-            res = await deployManager.restart(project.id);
+            const stopRes = await deployManager.stopProduction(project.id);
+            res = { projectId: project.id, action: args.action, ...stopRes };
+          } else if (args.action === 'start') {
+            const startRes = await deployManager.startProduction(project.id);
+            res = { projectId: project.id, action: 'start', ...startRes };
+          } else if (args.action === 'restart') {
+            /** @type {any} */
+            let stopRes = null;
+            try { stopRes = await deployManager.stopProduction(project.id); } catch (e) { stopRes = { stopped: false, error: e.message }; }
+            const startRes = await deployManager.startProduction(project.id);
+            res = { projectId: project.id, action: 'restart', restarted: Boolean(startRes && startRes.started !== false), stop: stopRes, start: startRes };
           }
           break;
         }
 
         case 'culkibo_system_doctor_fix': {
-          res = await systemDoctor.applyFix(String(args.action));
+          const rawAction = String(args.action);
+          const mappedAction = rawAction === 'prune_build_cache' ? 'prune_buildkit' : rawAction;
+          res = await systemDoctor.applyFix(mappedAction);
           break;
         }
 
@@ -3625,10 +5339,10 @@ class McpServer extends EventEmitter {
           if (args.action === 'list') {
             res = { policies: ingressManager.listWildcardPolicies() };
           } else if (args.action === 'add') {
-            if (!args.domain) throw new McpToolError('MISSING_ARGUMENT', 'Falta domain para añadir política wildcard.', { retryable: true });
+            if (!args.domain) throw new McpToolError('MISSING_ARGUMENT', 'Falta domain para añadir política wildcard.', { retryable: true, remediation: 'Pasa domain (p. ej. "midominio.com") junto a action: "add".' });
             res = await ingressManager.addWildcardPolicy(args.domain, { includeApex: args.includeApex !== false });
           } else if (args.action === 'remove') {
-            if (!args.domain) throw new McpToolError('MISSING_ARGUMENT', 'Falta domain para eliminar política wildcard.', { retryable: true });
+            if (!args.domain) throw new McpToolError('MISSING_ARGUMENT', 'Falta domain para eliminar política wildcard.', { retryable: true, remediation: 'Lista políticas con action: "list" y pasa el domain exacto con action: "remove".' });
             res = await ingressManager.removeWildcardPolicy(args.domain);
           }
           break;
@@ -3719,24 +5433,24 @@ class McpServer extends EventEmitter {
               enabled: args.enabled !== false
             });
           } else if (args.action === 'toggle') {
-            if (!args.cronId) throw new McpToolError('MISSING_ARGUMENT', 'Falta cronId para toggle.', { retryable: true });
+            if (!args.cronId) throw new McpToolError('MISSING_ARGUMENT', 'Falta cronId para toggle.', { retryable: true, remediation: 'Lista los cron jobs con action: "list" y pasa el campo id en cronId.' });
             const ownsCron = cronManager.list(project.id).some((c) => c.id === args.cronId);
             if (!ownsCron) {
-              throw new McpToolError(principal.isSuperAdmin ? 'NOT_FOUND' : 'FORBIDDEN', `El cron '${args.cronId}' no pertenece al proyecto '${project.id}'.`, { retryable: false });
+              throw new McpToolError(principal.isSuperAdmin ? 'NOT_FOUND' : 'FORBIDDEN', `El cron '${args.cronId}' no pertenece al proyecto '${project.id}'.`, { retryable: false, remediation: 'Consulta los cronId válidos del proyecto con culkibo_manage_crons (action: "list").' });
             }
             res = cronManager.update(args.cronId, { enabled: Boolean(args.enabled) });
           } else if (args.action === 'run') {
-            if (!args.cronId) throw new McpToolError('MISSING_ARGUMENT', 'Falta cronId para run.', { retryable: true });
+            if (!args.cronId) throw new McpToolError('MISSING_ARGUMENT', 'Falta cronId para run.', { retryable: true, remediation: 'Lista los cron jobs con action: "list" y pasa el campo id en cronId.' });
             const ownsCron = cronManager.list(project.id).some((c) => c.id === args.cronId);
             if (!ownsCron) {
-              throw new McpToolError(principal.isSuperAdmin ? 'NOT_FOUND' : 'FORBIDDEN', `El cron '${args.cronId}' no pertenece al proyecto '${project.id}'.`, { retryable: false });
+              throw new McpToolError(principal.isSuperAdmin ? 'NOT_FOUND' : 'FORBIDDEN', `El cron '${args.cronId}' no pertenece al proyecto '${project.id}'.`, { retryable: false, remediation: 'Consulta los cronId válidos del proyecto con culkibo_manage_crons (action: "list").' });
             }
             res = await cronManager.runNow(args.cronId);
           } else if (args.action === 'delete') {
-            if (!args.cronId) throw new McpToolError('MISSING_ARGUMENT', 'Falta cronId para delete.', { retryable: true });
+            if (!args.cronId) throw new McpToolError('MISSING_ARGUMENT', 'Falta cronId para delete.', { retryable: true, remediation: 'Lista los cron jobs con action: "list" y pasa el campo id en cronId.' });
             const ownsCron = cronManager.list(project.id).some((c) => c.id === args.cronId);
             if (!ownsCron) {
-              throw new McpToolError(principal.isSuperAdmin ? 'NOT_FOUND' : 'FORBIDDEN', `El cron '${args.cronId}' no pertenece al proyecto '${project.id}'.`, { retryable: false });
+              throw new McpToolError(principal.isSuperAdmin ? 'NOT_FOUND' : 'FORBIDDEN', `El cron '${args.cronId}' no pertenece al proyecto '${project.id}'.`, { retryable: false, remediation: 'Consulta los cronId válidos del proyecto con culkibo_manage_crons (action: "list").' });
             }
             res = cronManager.remove(args.cronId);
           }
@@ -3862,7 +5576,10 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_fleet_remove_server': {
           if (args.serverId === 'local') {
-            throw new McpToolError('INVALID_ARGUMENT', 'No se puede eliminar el nodo local.', { retryable: false });
+            throw new McpToolError('INVALID_ARGUMENT', 'No se puede eliminar el nodo local.', {
+              retryable: false,
+              remediation: 'Usa culkibo_fleet_list_servers para elegir un serverId remoto distinto de "local".'
+            });
           }
           const fleet = requireLazySvc('serverFleetManager', 'Flota Multi-Servidor');
           const assigned = projectManager.getAll().filter((p) => (p.serverId || 'local') === args.serverId);
@@ -3980,7 +5697,7 @@ class McpServer extends EventEmitter {
             ? (args.teamId ? String(args.teamId) : 'team_default')
             : (principal.teamId || 'team_default');
           if (args.action === 'update_role') {
-            if (!args.role) throw new McpToolError('MISSING_ARGUMENT', 'Falta role para update_role.', { retryable: true });
+            if (!args.role) throw new McpToolError('MISSING_ARGUMENT', 'Falta role para update_role.', { retryable: true, remediation: 'Pasa role ("viewer", "developer", "admin" u "owner") junto a action: "update_role".' });
             res = tm.updateMemberRole(actorAuth, teamId, String(args.memberId), String(args.role));
           } else if (args.action === 'set_projects') {
             res = tm.updateMemberProjects(actorAuth, teamId, String(args.memberId), Array.isArray(args.projectIds) ? args.projectIds.map(String) : null);
@@ -4024,7 +5741,7 @@ class McpServer extends EventEmitter {
               teamId
             });
           } else if (args.action === 'revoke') {
-            if (!args.tokenId) throw new McpToolError('MISSING_ARGUMENT', 'Falta tokenId para revoke.', { retryable: true });
+            if (!args.tokenId) throw new McpToolError('MISSING_ARGUMENT', 'Falta tokenId para revoke.', { retryable: true, remediation: 'Consulta los IDs con culkibo_rbac_list_tokens y pasa tokenId.' });
             res = tm.revokeApiToken(actorAuth, String(args.tokenId));
           }
           break;
@@ -4120,7 +5837,19 @@ class McpServer extends EventEmitter {
             if (args.projectId && m.projectId !== args.projectId) return false;
             return canAccessProject(principal, m.projectId);
           });
-          const statusPages = typeof um.listStatusPages === 'function' ? um.listStatusPages() : [];
+          const rawPages = typeof um.listStatusPages === 'function' ? um.listStatusPages() : [];
+          let statusPages = Array.isArray(rawPages) ? rawPages : [];
+          if (!principal.isSuperAdmin) {
+            const visibleMonitorIds = new Set(
+              (Array.isArray(um.listMonitors({})) ? um.listMonitors({}) : [])
+                .filter((m) => canAccessProject(principal, m.projectId))
+                .map((m) => m.id)
+            );
+            statusPages = statusPages.filter((page) => {
+              const mids = Array.isArray(page?.monitorIds) ? page.monitorIds : [];
+              return mids.length > 0 && mids.every((id) => visibleMonitorIds.has(id));
+            });
+          }
           res = { monitors, statusPages };
           break;
         }
@@ -4166,14 +5895,14 @@ class McpServer extends EventEmitter {
               monitorIds: Array.isArray(args.monitorIds) ? args.monitorIds.map(String) : []
             });
           } else if (args.action === 'publish_incident') {
-            if (!args.incidentTitle) throw new McpToolError('MISSING_ARGUMENT', 'Falta incidentTitle para publish_incident.', { retryable: true });
+            if (!args.incidentTitle) throw new McpToolError('MISSING_ARGUMENT', 'Falta incidentTitle para publish_incident.', { retryable: true, remediation: 'Incluye incidentTitle y opcionalmente severity/message.' });
             res = um.publishStatusIncident(String(args.slug), {
               title: String(args.incidentTitle),
               severity: args.severity ? String(args.severity) : 'minor',
               message: args.message ? String(args.message) : ''
             });
           } else if (args.action === 'resolve_incident') {
-            if (!args.incidentId) throw new McpToolError('MISSING_ARGUMENT', 'Falta incidentId para resolve_incident.', { retryable: true });
+            if (!args.incidentId) throw new McpToolError('MISSING_ARGUMENT', 'Falta incidentId para resolve_incident.', { retryable: true, remediation: 'Consulta los incidentes con culkibo_uptime_list_monitors o culkibo://uptime y pasa incidentId.' });
             res = um.resolveStatusIncident(String(args.slug), String(args.incidentId));
           } else if (args.action === 'delete') {
             res = um.deleteStatusPage(String(args.slug));
@@ -4202,7 +5931,42 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_gitops_plan': {
           const gm = requireLazySvc('gitopsManager', 'Motor GitOps culkibo.yaml');
-          res = gm.planApply(String(args.yamlText), { prune: Boolean(args.prune) });
+          const rawPlan = gm.planApply(String(args.yamlText), { prune: Boolean(args.prune) });
+          if (principal.isSuperAdmin) {
+            res = rawPlan;
+            break;
+          }
+          // Anti-IDOR / anti-enumeración: filtrar `create`/`update`/`delete` para no filtrar recursos ajenos al ACL
+          const accessibleProjects = projectManager.getAll().filter((p) => canAccessProject(principal, p.id, p));
+          const allowedIds = new Set(accessibleProjects.map((p) => p.id));
+          const allowedNames = new Set(accessibleProjects.map((p) => String(p.name || '').toLowerCase()));
+          const allProjectIds = new Set(projectManager.getAll().map((p) => p.id));
+          const allProjectNames = new Set(projectManager.getAll().map((p) => String(p.name || '').toLowerCase()));
+          const keepPlanItem = (item, isDelete = false) => {
+            if (!item || typeof item !== 'object') return false;
+            const pid = item.projectId || (item.kind === 'project' ? item.id : null);
+            const pname = item.projectName || (item.kind === 'project' ? item.name : null);
+            if (pid) {
+              if (allowedIds.has(String(pid))) return true;
+              if (allProjectIds.has(String(pid))) return false;
+              return !isDelete;
+            }
+            if (pname) {
+              const lc = String(pname).toLowerCase();
+              if (allowedNames.has(lc)) return true;
+              if (allProjectNames.has(lc)) return false;
+              return !isDelete;
+            }
+            // Recursos sin proyecto asociado en delete[] se ocultan siempre a principales restringidos
+            return !isDelete && !Array.isArray(principal.projectIds);
+          };
+          res = {
+            ...rawPlan,
+            create: Array.isArray(rawPlan.create) ? rawPlan.create.filter((it) => keepPlanItem(it, false)) : [],
+            update: Array.isArray(rawPlan.update) ? rawPlan.update.filter((it) => keepPlanItem(it, false)) : [],
+            delete: Array.isArray(rawPlan.delete) ? rawPlan.delete.filter((it) => keepPlanItem(it, true)) : [],
+            scopedToPrincipal: true
+          };
           break;
         }
 
@@ -4222,8 +5986,12 @@ class McpServer extends EventEmitter {
           const vpsMonthlyEur = args.monthlyServerCostEur !== undefined
             ? Number(args.monthlyServerCostEur)
             : (args.vpsMonthlyEur !== undefined ? Number(args.vpsMonthlyEur) : undefined);
+          const allowedProjectIds = this._accessibleProjectIds(principal);
           if (sa && typeof sa.analyzeResources === 'function') {
-            const report = await sa.analyzeResources(vpsMonthlyEur !== undefined ? { vpsMonthlyEur } : {});
+            const report = await sa.analyzeResources({
+              ...(vpsMonthlyEur !== undefined ? { vpsMonthlyEur } : {}),
+              ...(allowedProjectIds !== null ? { projectIds: allowedProjectIds } : {})
+            });
             res = {
               summary: report.summary || report,
               recommendations: Array.isArray(report.recommendations) ? report.recommendations : [],
@@ -4234,8 +6002,9 @@ class McpServer extends EventEmitter {
           } else {
             const totalRamMb = Math.round(os.totalmem() / 1048576);
             const freeRamMb = Math.round(os.freemem() / 1048576);
+            const projectsCount = allowedProjectIds !== null ? allowedProjectIds.length : projectManager.getAll().length;
             res = {
-              summary: { totalRamMb, freeRamMb, usedRamMb: totalRamMb - freeRamMb, projectsCount: projectManager.getAll().length },
+              summary: { totalRamMb, freeRamMb, usedRamMb: totalRamMb - freeRamMb, projectsCount },
               recommendations: [],
               reclaimableRamMb: 0,
               estimatedMonthlySavingsEur: 0,
@@ -4247,6 +6016,7 @@ class McpServer extends EventEmitter {
 
         case 'culkibo_sleep_status': {
           const sa = lazySvc('sleepAdvisor');
+          const allowedProjectIds = this._accessibleProjectIds(principal);
           if (args.projectId) {
             const project = projectManager.getById(args.projectId);
             if (!project) throw projectNotFoundError(args.projectId);
@@ -4257,11 +6027,16 @@ class McpServer extends EventEmitter {
               sleepServiceAvailable: Boolean(sa)
             };
           } else if (sa && typeof sa.listPolicies === 'function') {
-            const allPolicies = sa.listPolicies();
+            const allPolicies = sa.listPolicies(allowedProjectIds !== null ? { projectIds: allowedProjectIds } : {});
             const policies = (Array.isArray(allPolicies) ? allPolicies : []).filter((p) => canAccessProject(principal, p.projectId));
+            const rawCandidates = typeof sa.getSleepCandidates === 'function'
+              ? sa.getSleepCandidates(allowedProjectIds !== null ? { projectIds: allowedProjectIds } : {})
+              : [];
+            const candidates = (Array.isArray(rawCandidates) ? rawCandidates : [])
+              .filter((c) => principal.isSuperAdmin || (c?.projectId && canAccessProject(principal, c.projectId)));
             res = {
               policies,
-              candidates: typeof sa.getSleepCandidates === 'function' ? sa.getSleepCandidates() : []
+              candidates
             };
           } else {
             res = { policies: [], candidates: [], sleepServiceAvailable: false };
@@ -4308,7 +6083,10 @@ class McpServer extends EventEmitter {
           const project = projectManager.getById(args.projectId);
           if (!project) throw projectNotFoundError(args.projectId);
           if (typeof liveSyncEngine.rollbackFile !== 'function') {
-            throw new McpToolError('SERVICE_UNAVAILABLE', 'LiveSync 2.0 rollbackFile no está disponible en esta versión.', { retryable: true });
+            throw new McpToolError('SERVICE_UNAVAILABLE', 'LiveSync 2.0 rollbackFile no está disponible en esta versión.', {
+              retryable: true,
+              remediation: 'Comprueba la versión del daemon con culkibo_system_doctor o usa culkibo_rollback_sync.'
+            });
           }
           res = liveSyncEngine.rollbackFile(project.id, String(args.filePath), Number(args.seq), {
             actor: principal.userId || 'mcp'
@@ -4362,7 +6140,10 @@ class McpServer extends EventEmitter {
             });
           }
           if (typeof deployManager.runSmokeTests !== 'function') {
-            throw new McpToolError('SERVICE_UNAVAILABLE', 'El ejecutor runSmokeTests de deployManager no está disponible todavía.', { retryable: true });
+            throw new McpToolError('SERVICE_UNAVAILABLE', 'El ejecutor runSmokeTests de deployManager no está disponible todavía.', {
+              retryable: true,
+              remediation: 'Verifica el estado del servicio con culkibo_system_doctor.'
+            });
           }
           let upstream = `http://127.0.0.1:${project.forgePort || 3000}`;
           if (target === 'citadel') {
@@ -4372,7 +6153,10 @@ class McpServer extends EventEmitter {
           } else if (target === 'canary' && typeof deployManager.getCanaryState === 'function') {
             const canary = deployManager.getCanaryState(project.id);
             if (!canary?.canaryDial) {
-              throw new McpToolError('CANARY_NOT_ACTIVE', `No hay un despliegue canario activo para '${project.id}'.`, { retryable: false });
+              throw new McpToolError('CANARY_NOT_ACTIVE', `No hay un despliegue canario activo para '${project.id}'.`, {
+                retryable: false,
+                remediation: 'Inicia un despliegue canario con culkibo_canary_rollout (action: "start") o usa target: "citadel".'
+              });
             }
             upstream = canary.canaryDial.startsWith('http') ? canary.canaryDial : `http://${canary.canaryDial}`;
           }
@@ -4387,6 +6171,7 @@ class McpServer extends EventEmitter {
           if (args.action === 'status') {
             res = {
               projectId: project.id,
+              ok: true,
               config: project.canary || null,
               active: typeof deployManager.getCanaryState === 'function' ? deployManager.getCanaryState(project.id) : null
             };
@@ -4400,19 +6185,56 @@ class McpServer extends EventEmitter {
             };
             projectManager.update(project.id, { canary: canaryCfg });
             await projectManager.flushToDisk();
-            if (typeof deployManager.startCanary === 'function') {
-              res = await deployManager.startCanary(project, canaryCfg);
-            } else {
-              res = await deployManager.deploy(project, { canary: canaryCfg, trigger: 'mcp_canary' });
-            }
+            const depRes = await deployManager.deploy(project, { canary: canaryCfg, trigger: 'mcp_canary' });
+            res = { projectId: project.id, ok: depRes?.status !== 'error' && depRes?.status !== 'failed', ...depRes };
           } else if (args.action === 'advance') {
-            if (typeof deployManager.advanceCanary !== 'function') {
-              throw new McpToolError('SERVICE_UNAVAILABLE', 'advanceCanary no está disponible todavía en deployManager.', { retryable: true });
+            const canary = typeof deployManager.getCanaryState === 'function' ? deployManager.getCanaryState(project.id) : null;
+            if (!canary) {
+              throw new McpToolError('CANARY_NOT_ACTIVE', `No hay ningún despliegue canario activo para '${project.id}'.`, {
+                retryable: false,
+                remediation: 'Inicia primero un rollout canario con culkibo_canary_rollout (action: "start").'
+              });
             }
-            res = await deployManager.advanceCanary(project.id);
+            const steps = Array.isArray(canary.steps) && canary.steps.length > 0 ? canary.steps : [10, 50, 100];
+            const currentWeight = Number(canary.weight || 0);
+            const nextStepWeight = args.weightPercent !== undefined
+              ? Math.min(100, Math.max(1, Number(args.weightPercent)))
+              : (steps.find((w) => Number(w) > currentWeight) ?? 100);
+            if (nextStepWeight >= 100) {
+              const promoted = await deployManager.promoteCanary(project.id);
+              res = { projectId: project.id, action: 'advance', promoted: true, previousWeight: currentWeight, nextWeight: 100, ...promoted };
+            } else {
+              const hostnames = typeof deployManager.hostnamesFor === 'function'
+                ? deployManager.hostnamesFor(project.id)
+                : domainManager.listDomains().filter((d) => d.projectId === project.id).map((d) => d.hostname);
+              const routeRes = await deployManager.switchCanaryRoute(
+                { id: canary.deploymentId, projectId: project.id },
+                hostnames,
+                { stableDial: canary.stableDial, canaryDial: canary.canaryDial, canaryWeight: nextStepWeight },
+                project
+              );
+              const liveRef = /** @type {any} */ (deployManager).activeCanaries?.get?.(project.id);
+              if (liveRef && routeRes?.ok !== false) {
+                liveRef.weight = nextStepWeight;
+                const matchedIdx = steps.findIndex((w) => Number(w) >= nextStepWeight);
+                if (matchedIdx >= 0) liveRef.stepIndex = matchedIdx;
+              }
+              res = {
+                projectId: project.id,
+                action: 'advance',
+                ok: routeRes?.ok !== false,
+                deploymentId: canary.deploymentId,
+                previousWeight: currentWeight,
+                nextWeight: nextStepWeight,
+                route: routeRes
+              };
+            }
           } else if (args.action === 'promote') {
             if (typeof deployManager.promoteCanary !== 'function') {
-              throw new McpToolError('SERVICE_UNAVAILABLE', 'promoteCanary no está disponible todavía en deployManager.', { retryable: true });
+              throw new McpToolError('SERVICE_UNAVAILABLE', 'promoteCanary no está disponible todavía en deployManager.', {
+                retryable: true,
+                remediation: 'Comprueba la versión del daemon con culkibo_system_doctor.'
+              });
             }
             res = await deployManager.promoteCanary(project.id);
           } else if (args.action === 'abort') {
@@ -4444,7 +6266,10 @@ class McpServer extends EventEmitter {
               const added = windows.map((w) => dm.addFreezeWindow(w));
               res = { success: true, scope: 'global', added, windows: dm.listFreezeWindows() };
             } else {
-              throw new McpToolError('SERVICE_UNAVAILABLE', 'Las ventanas freeze globales no están disponibles todavía en deployManager.', { retryable: true });
+              throw new McpToolError('SERVICE_UNAVAILABLE', 'Las ventanas freeze globales no están disponibles todavía en deployManager.', {
+                retryable: true,
+                remediation: 'Indica projectId para configurar ventanas de freeze a nivel de proyecto.'
+              });
             }
           } else if (args.action === 'remove') {
             if (project) {
@@ -4466,6 +6291,22 @@ class McpServer extends EventEmitter {
               res = { success: true, scope: 'global', windows: [] };
             }
           }
+          break;
+        }
+
+        // --- MCP 2.1: I. Meta-Discovery y Autocuración Autónoma (3) ---
+        case 'culkibo_search_tools': {
+          res = this.searchTools(principal, args);
+          break;
+        }
+
+        case 'culkibo_diagnose_incident': {
+          res = await this.diagnoseIncident(principal, args);
+          break;
+        }
+
+        case 'culkibo_auto_remediate': {
+          res = await this.executeAutoRemediate(principal, args);
           break;
         }
 
@@ -4605,7 +6446,10 @@ class McpServer extends EventEmitter {
     };
     const reqScope = resourceScopes[clean];
     if (reqScope && !principal.isSuperAdmin && !scopeMatches(principal.scopes, reqScope, clean, false)) {
-      throw new McpToolError('FORBIDDEN', `Acceso denegado al recurso '${clean}' para los scopes del token.`, { retryable: false });
+      throw new McpToolError('FORBIDDEN', `Acceso denegado al recurso '${clean}' para los scopes del token.`, {
+        retryable: false,
+        remediation: 'Consulta tus scopes efectivos con culkibo_rbac_whoami o solicita un token con el scope de lectura correspondiente.'
+      });
     }
     /** @type {any} */
     let data = null;
@@ -4617,8 +6461,12 @@ class McpServer extends EventEmitter {
     } else if (clean === 'culkibo://doctor') {
       data = await systemDoctor.runDoctor();
     } else if (clean === 'culkibo://domains') {
-      const domains = domainManager.listDomains().filter((d) => canAccessProject(principal, d.projectId));
-      data = { domains, wildcardPolicies: ingressManager.listWildcardPolicies() };
+      const domains = domainManager.listDomains().filter((d) => {
+        if (principal.isSuperAdmin) return true;
+        if (!d.projectId) return false;
+        return canAccessProject(principal, d.projectId);
+      });
+      data = { domains, wildcardPolicies: principal.isSuperAdmin ? ingressManager.listWildcardPolicies() : [] };
     } else if (clean === 'culkibo://fleet') {
       const fleet = lazySvc('serverFleetManager');
       const visibleProjects = projectManager.getAll().filter((p) => canAccessProject(principal, p.id, p));
@@ -4646,7 +6494,14 @@ class McpServer extends EventEmitter {
         const allMonitors = um.listMonitors();
         const monitors = (Array.isArray(allMonitors) ? allMonitors : [])
           .filter((m) => canAccessProject(principal, m.projectId));
-        const statusPages = typeof um.listStatusPages === 'function' ? um.listStatusPages() : [];
+        const rawPages = typeof um.listStatusPages === 'function' ? um.listStatusPages() : [];
+        const visibleMonitorIds = new Set(monitors.map((m) => m.id));
+        const statusPages = principal.isSuperAdmin
+          ? (Array.isArray(rawPages) ? rawPages : [])
+          : (Array.isArray(rawPages) ? rawPages : []).filter((page) => {
+              const mids = Array.isArray(page?.monitorIds) ? page.monitorIds : [];
+              return mids.length > 0 && mids.every((id) => visibleMonitorIds.has(id));
+            });
         const openIncidents = typeof um.listIncidents === 'function'
           ? (um.listIncidents({ status: 'open' }) || []).filter((inc) => canAccessProject(principal, inc.projectId))
           : [];
@@ -4789,13 +6644,13 @@ class McpServer extends EventEmitter {
     if (name === 'culkibo_incident_triage') {
       const hostHint = args && args.hostname ? ` y dominio ${String(args.hostname)}` : '';
       return {
-        description: 'Triaje sistemático de incidentes en producción con rollback seguro',
+        description: 'Triaje sistemático de incidentes en producción con diagnóstico correlacionado y remediación segura',
         messages: [
           {
             role: 'user',
             content: {
               type: 'text',
-              text: `Realiza el triaje del incidente para el proyecto ${pid}${hostHint}: 1) Lee los recursos culkibo://uptime, culkibo://pods y culkibo://fleet; 2) Ejecuta culkibo_diagnose_domain (si aplica), culkibo_get_container_logs, culkibo_get_deployment_logs y culkibo_cost_advisor para detectar OOM, saturación de disco/RAM o errores recientes; 3) Comprueba cambios recientes o colisiones en LiveSync con culkibo_sync_conflicts y culkibo_sync_file_history; 4) Previsualiza un rollback seguro con culkibo_rollback_deployment (dryRun: true) o culkibo_sync_rollback_file (dryRun: true); 5) Pide confirmación explícita antes de activar culkibo_toggle_maintenance o publicar un incidente con culkibo_status_page_manage.`
+              text: `Realiza el triaje del incidente para el proyecto ${pid}${hostHint}: 1) Ejecuta culkibo_diagnose_incident para correlacionar contenedor (OOM/CrashLoop), despliegues recientes, logs redactados, uptime, RAM/disco, System Doctor, dominio, flota y LiveSync; 2) Amplía detalle si hace falta con culkibo_cost_advisor, culkibo_get_deployment_logs y culkibo_sync_conflicts; 3) Previsualiza el fix recomendado con culkibo_auto_remediate (dryRun: true) para obtener el plan y el confirmToken de un solo uso; 4) Pide confirmación explícita antes de aplicar culkibo_auto_remediate con dryRun: false y confirmToken.`
             }
           }
         ]
@@ -4845,7 +6700,7 @@ class McpServer extends EventEmitter {
   // -------------------------------------------------------------------------
   /**
    * @param {any} request
-   * @param {{ auth?: any, transport?: string }} [context]
+   * @param {{ auth?: any, transport?: string, profile?: string | null }} [context]
    */
   async handleJsonRpc(request, context = {}) {
     if (!request || typeof request !== 'object' || Array.isArray(request) || typeof request.method !== 'string') {
@@ -4876,13 +6731,28 @@ class McpServer extends EventEmitter {
     }
 
     if (method === 'tools/list') {
-      return {
-        jsonrpc: '2.0',
-        id: safeId,
-        result: {
-          tools: this.getToolsForPrincipal(context.auth)
-        }
-      };
+      try {
+        const profile = params?.profile || context.profile || 'all';
+        const tools = this.getToolsForPrincipal(context.auth, {
+          profile,
+          query: typeof params?.query === 'string' ? params.query : null,
+          readOnlyOnly: params?.readOnlyOnly === true,
+          limit: typeof params?.limit === 'number' ? params.limit : null
+        });
+        return {
+          jsonrpc: '2.0',
+          id: safeId,
+          result: {
+            tools
+          }
+        };
+      } catch (err) {
+        return {
+          jsonrpc: '2.0',
+          id: safeId,
+          error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: err.details || {} }
+        };
+      }
     }
 
     if (method === 'tools/call') {
@@ -4950,13 +6820,14 @@ class McpServer extends EventEmitter {
       this._discoverCache = {
         supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
         capabilities: {
-          tools: { listChanged: false },
+          tools: { listChanged: false, filtering: true },
           resources: { listChanged: false },
           prompts: { listChanged: false }
         },
         instructions: [
-          'Culkibo es un orquestador cloud autohospedado (MCP 2.0: 104 herramientas anotadas, 7 recursos y 5 prompts). Gestiona proyectos, pods (The Forge y The Citadel), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, dominios, TLS, BDs y migraciones.',
-          'Empieza por culkibo_rbac_whoami, culkibo_list_projects y culkibo_list_pods (o lee culkibo://projects, culkibo://fleet, culkibo://uptime y culkibo://environments) antes de modificar nada.',
+          'Culkibo es un orquestador cloud autohospedado (MCP 2.1: 107 herramientas anotadas, 7 recursos y 5 prompts). Gestiona proyectos, pods (The Forge y The Citadel), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, diagnóstico autónomo de incidentes y remediación segura.',
+          'Para reducir el consumo de contexto en >=80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all, usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
+          'Para incidentes en producción llama primero a culkibo_diagnose_incident y aplica fixes seguros en dos fases con culkibo_auto_remediate (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false).',
           'Las herramientas destructivas y de despliegue soportan dryRun: true para previsualizar el radio de impacto (DryRunPlan) sin mutar estado ni disparar webhooks; confírmalas siempre con la persona usuaria antes de aplicarlas.',
           'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation: úsalo para decidir si reintentar o corregir los argumentos.'
         ].join(' '),
@@ -4971,7 +6842,7 @@ class McpServer extends EventEmitter {
    * Despacha una petición JSON-RPC de la revisión 2026-07-28.
    *
    * @param {any} request mensaje JSON-RPC completo
-   * @param {{ transport?: string, clientInfo?: any, isCancelled?: () => boolean, signal?: AbortSignal, onProgress?: (msg: string) => void, auth?: any }} context
+   * @param {{ transport?: string, clientInfo?: any, isCancelled?: () => boolean, signal?: AbortSignal, onProgress?: (msg: string) => void, auth?: any, profile?: string | null }} context
    */
   async handleModernRpc(request, context = {}) {
     if (!request || typeof request !== 'object' || Array.isArray(request) || typeof request.method !== 'string') {
@@ -5001,12 +6872,30 @@ class McpServer extends EventEmitter {
     }
 
     if (method === 'tools/list') {
-      const tools = this.getToolsForPrincipal(principal);
-      return ok({
-        tools,
-        ttlMs: principal.isSuperAdmin ? 60000 : 0,
-        cacheScope: principal.isSuperAdmin ? 'public' : 'private'
-      });
+      try {
+        const rawProfile = params?.profile !== undefined ? params.profile : (context.profile || 'all');
+        const profile = this.normalizeProfile(rawProfile);
+        const query = typeof params?.query === 'string' ? params.query.trim() : null;
+        const readOnlyOnly = params?.readOnlyOnly === true;
+        const limit = typeof params?.limit === 'number' && Number.isFinite(params.limit) ? params.limit : null;
+        const tools = this.getToolsForPrincipal(principal, { profile, query, readOnlyOnly, limit });
+        return ok({
+          tools,
+          ...(profile !== 'all' || query ? { profile } : {}),
+          ttlMs: principal.isSuperAdmin && !query ? 60000 : 0,
+          cacheScope: principal.isSuperAdmin && !query ? 'public' : 'private'
+        });
+      } catch (err) {
+        return {
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: ERROR_CODES.INVALID_PARAMS,
+            message: err.message,
+            data: err.details || { allowedProfiles: VALID_TOOL_PROFILES }
+          }
+        };
+      }
     }
 
     if (method === 'tools/call') {
@@ -5069,12 +6958,18 @@ class McpServer extends EventEmitter {
     };
   }
 
-  getClientConfigs(serverUrl = 'http://localhost:3030', { includeAuthPlaceholder = false } = {}) {
+  getClientConfigs(serverUrl = 'http://localhost:3030', { includeAuthPlaceholder = false, profile = 'all' } = {}) {
     const cleanUrl = String(serverUrl || 'http://localhost:3030').replace(/\/+$/, '');
     const cliEntry = path.resolve(__dirname, '..', '..', 'bin', 'culkibo.js');
     const isRemote = !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(cleanUrl);
     const needAuth = includeAuthPlaceholder || isRemote;
     const remoteHeaders = needAuth ? { Authorization: 'Bearer TU_CULKIBO_TOKEN' } : undefined;
+    const safeProfile = VALID_TOOL_PROFILES.includes(/** @type {any} */ (String(profile || 'all').toLowerCase()))
+      ? String(profile || 'all').toLowerCase()
+      : 'all';
+    const mcpEndpoint = safeProfile !== 'all'
+      ? `${cleanUrl}/api/mcp?profile=${safeProfile}`
+      : `${cleanUrl}/api/mcp`;
 
     return {
       claudeDesktop: {
@@ -5084,6 +6979,7 @@ class McpServer extends EventEmitter {
             args: [cliEntry, 'mcp'],
             env: {
               CULKIBO_API_URL: cleanUrl,
+              ...(safeProfile !== 'all' ? { CULKIBO_MCP_PROFILE: safeProfile } : {}),
               ...(needAuth ? { CULKIBO_TOKEN: 'TU_CULKIBO_TOKEN' } : {})
             }
           }
@@ -5093,7 +6989,7 @@ class McpServer extends EventEmitter {
       cursorOrWindsurf: {
         mcpServers: {
           culkibo: {
-            url: `${cleanUrl}/api/mcp`,
+            url: mcpEndpoint,
             ...(remoteHeaders ? { headers: remoteHeaders } : {})
           }
         }
@@ -5102,14 +6998,14 @@ class McpServer extends EventEmitter {
         servers: {
           culkibo: {
             type: 'http',
-            url: `${cleanUrl}/api/mcp`,
+            url: mcpEndpoint,
             ...(remoteHeaders ? { headers: remoteHeaders } : {})
           }
         }
       },
       claudeCodeCli: needAuth
-        ? `claude mcp add --transport http culkibo ${cleanUrl}/api/mcp --header "Authorization: Bearer TU_CULKIBO_TOKEN"`
-        : `claude mcp add --transport http culkibo ${cleanUrl}/api/mcp`,
+        ? `claude mcp add --transport http culkibo "${mcpEndpoint}" --header "Authorization: Bearer TU_CULKIBO_TOKEN"`
+        : `claude mcp add --transport http culkibo "${mcpEndpoint}"`,
       // Solo para clientes que aún no hablan 2026-07-28. Ver README.
       legacySse: {
         deprecated: true,
@@ -5125,7 +7021,9 @@ class McpServer extends EventEmitter {
       protocol: {
         current: PROTOCOL_VERSION,
         supported: SUPPORTED_PROTOCOL_VERSIONS,
-        endpoint: `${cleanUrl}/api/mcp`,
+        endpoint: mcpEndpoint,
+        profile: safeProfile,
+        profiles: VALID_TOOL_PROFILES,
         legacyEndpoint: `${cleanUrl}/api/mcp/sse`,
         wsUrl: `${cleanUrl.replace(/^http/, 'ws')}/ws/sync`
       }
@@ -5146,10 +7044,13 @@ const mcpServer = Object.assign(new McpServer(), {
     ERROR_CODES,
     MODERN_METHODS,
     NAME_BEARING_METHODS,
-    SERVER_INFO
+    SERVER_INFO,
+    VALID_TOOL_PROFILES
   },
   McpToolError,
   TOOL_POLICIES,
+  TOOL_PROFILES,
+  VALID_TOOL_PROFILES,
   normalizePrincipal,
   lazySvc,
   redactForAudit

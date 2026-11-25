@@ -1,6 +1,6 @@
 {
   "name": "culkibo",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Orquestador cloud autohospedado para la era de los agentes de IA: recarga en caliente, SSL wildcard por Cloudflare y control nativo por MCP",
   "main": "server/index.js",
   "bin": {

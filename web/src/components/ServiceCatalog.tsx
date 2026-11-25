@@ -73,9 +73,10 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
 
   const [secrets, setSecrets] = useState<Record<string, ServiceSecrets>>({});
   const [logs, setLogs] = useState<Record<string, { output: string; role: string }>>({});
-  const [statsMap, setStatsMap] = useState<Record<string, Array<{ role: string; containerName: string; cpuPercent: number | null; memoryUsage: string; status?: string }>>>({});
+  const [statsMap, setStatsMap] = useState<Record<string, Array<{ role: string; containerName?: string; name?: string; cpuPercent: number | null; memoryUsage: string; status?: string }>>>({});
   const [envTarget, setEnvTarget] = useState<ServiceInstallation | null>(null);
   const [envText, setEnvText] = useState('');
+  const [envTemplateKeys, setEnvTemplateKeys] = useState<string[]>([]);
   const [updateTarget, setUpdateTarget] = useState<ServiceInstallation | null>(null);
   const [updateImageInput, setUpdateImageInput] = useState('');
   const [copied, setCopied] = useState<string | null>(null);
@@ -160,6 +161,11 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
     [templates]
   );
 
+  const templateById = useMemo(
+    () => new Map(templates.map((t) => [t.id, t])),
+    [templates]
+  );
+
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return templates.filter((t) => {
@@ -196,14 +202,18 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
     window.setTimeout(() => setCopied(null), 1800);
   };
 
-  const handleInstall = async (template: ServiceTemplate, name: string, domain: string) => {
+  const handleInstall = async (template: ServiceTemplate, name: string, domain: string, envOverrides?: Record<string, string>) => {
     setChosen(null);
     await guard(`install-${template.id}`, async () => {
-      await api.installService({
+      const payload: Parameters<typeof api.installService>[0] & { env?: Record<string, string> } = {
         templateId: template.id,
         name: name.trim() || template.name,
         domain: domain.trim() || null,
-      });
+      };
+      if (envOverrides && Object.keys(envOverrides).length > 0) {
+        payload.env = envOverrides;
+      }
+      await api.installService(payload);
       onNotify(`Instalando ${template.name}. Sigue el progreso en «Instalados».`, 'info');
       setTab('instalados');
       await load();
@@ -244,9 +254,16 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
   });
 
   const openEnvEditor = (inst: ServiceInstallation) => guard(`env-${inst.id}`, async () => {
-    const res = await api.getInstallationEnv(inst.id);
-    const merged = res.overrides && Object.keys(res.overrides).length > 0 ? res.overrides : (res.env || {});
-    setEnvText(Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('\n'));
+    const res = (await api.getInstallationEnv(inst.id)) as {
+      overrides?: Record<string, string>;
+      customEnv?: Record<string, string>;
+      templateKeys?: string[];
+      env?: Record<string, string>;
+    };
+    // Solo cargar overrides reales (nunca los valores enmascarados «••••••••» de la plantilla).
+    const overrides = res.overrides ?? res.customEnv ?? {};
+    setEnvText(Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join('\n'));
+    setEnvTemplateKeys(res.templateKeys ?? Object.keys(res.env || {}));
     setEnvTarget(inst);
   });
 
@@ -478,6 +495,11 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                       <p className="text-xs text-slate-500 mt-0.5">{t.categoryLabel}</p>
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
+                      {t.sidecars.length > 0 && (
+                        <span className="text-[10px] font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-md px-1.5 py-0.5 tabular-nums">
+                          +{t.sidecars.length} aux
+                        </span>
+                      )}
                       {t.totalMemoryMb <= 512 && (
                         <span className="text-[10px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-1.5 py-0.5">
                           Ligero
@@ -534,6 +556,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
       {tab === 'instalados' && (
         <InstalledList
           installations={installations}
+          templateById={templateById}
           busy={busy}
           secrets={secrets}
           logs={logs}
@@ -545,8 +568,9 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
           onToggleStats={(inst) => { void toggleStats(inst); }}
           onEditEnv={(inst) => { void openEnvEditor(inst); }}
           onUpdateImage={(inst) => {
+            const tpl = templateById.get(inst.templateId);
             setUpdateTarget(inst);
-            setUpdateImageInput(inst.image);
+            setUpdateImageInput(tpl && tpl.image !== inst.image ? tpl.image : inst.image);
           }}
           onControl={(inst, action) => {
             void guard(`ctl-${inst.id}`, async () => {
@@ -572,7 +596,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
         <InstallDialog
           template={chosen}
           onCancel={() => setChosen(null)}
-          onConfirm={(t, name, domain) => { void handleInstall(t, name, domain); }}
+          onConfirm={(t, name, domain, envOverrides) => { void handleInstall(t, name, domain, envOverrides); }}
         />
       )}
 
@@ -623,15 +647,21 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
         open={Boolean(envTarget)}
         onClose={() => setEnvTarget(null)}
         title={`Variables de ${envTarget?.name || ''}`}
-        subtitle="Añade o sobrescribe variables CLAVE=valor; el contenedor se recreará conservando volúmenes."
+        subtitle="Añade o sobrescribe variables CLAVE=valor; los secretos generados se conservan automáticamente."
         maxWidthClass="max-w-lg"
       >
         <form onSubmit={handleSaveEnv} className="p-5 space-y-4 text-xs">
+          {envTemplateKeys.length > 0 && (
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-[11px] text-slate-600">
+              <span className="font-medium text-slate-700">Claves de plantilla disponibles: </span>
+              <span className="font-mono">{envTemplateKeys.join(', ')}</span>
+            </div>
+          )}
           <textarea
             value={envText}
             onChange={(e) => setEnvText(e.target.value)}
             rows={8}
-            placeholder={'TZ=Europe/Madrid\nCUSTOM_OPTION=true'}
+            placeholder={'TZ=UTC\nCUSTOM_OPTION=true'}
             className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-xs focus:bg-white"
             spellCheck={false}
           />
@@ -691,11 +721,24 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
 const InstallDialog: React.FC<{
   template: ServiceTemplate;
   onCancel: () => void;
-  onConfirm: (t: ServiceTemplate, name: string, domain: string) => void;
+  onConfirm: (t: ServiceTemplate, name: string, domain: string, envOverrides?: Record<string, string>) => void;
 }> = ({ template, onCancel, onConfirm }) => {
   const [name, setName] = useState(template.name);
   const [domain, setDomain] = useState('');
+  const [showAdvancedEnv, setShowAdvancedEnv] = useState(false);
+  const [envInput, setEnvInput] = useState('');
   const [serverIp, setServerIp] = useState<string | null>(null);
+
+  const parseEnvInput = (): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const line of envInput.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const idx = trimmed.indexOf('=');
+      if (idx > 0) out[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1);
+    }
+    return out;
+  };
 
   useEffect(() => {
     let active = true;
@@ -792,6 +835,26 @@ const InstallDialog: React.FC<{
           </div>
         )}
 
+        <div>
+          <button
+            type="button"
+            onClick={() => setShowAdvancedEnv((v) => !v)}
+            className="text-xs font-medium text-slate-600 hover:text-slate-900 underline cursor-pointer"
+          >
+            {showAdvancedEnv ? 'Ocultar variables iniciales' : 'Variables de entorno iniciales (opcional)'}
+          </button>
+          {showAdvancedEnv && (
+            <textarea
+              value={envInput}
+              onChange={(e) => setEnvInput(e.target.value)}
+              rows={4}
+              placeholder={'TZ=UTC\nSMTP_HOST=smtp.ejemplo.com'}
+              className="mt-2 w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg font-mono text-xs focus:bg-white"
+              spellCheck={false}
+            />
+          )}
+        </div>
+
         <p className="text-[11px] text-slate-500">
           {template.licence} · <a href={template.website} target="_blank" rel="noreferrer" className="underline hover:text-slate-900">{template.website}</a>
         </p>
@@ -803,7 +866,7 @@ const InstallDialog: React.FC<{
         </button>
         <button
           type="button"
-          onClick={() => onConfirm(template, name, domain)}
+          onClick={() => onConfirm(template, name, domain, parseEnvInput())}
           className="px-4 py-2 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 cursor-pointer"
         >
           Instalar {template.name}
@@ -872,10 +935,11 @@ const RemoveDialog: React.FC<{
 
 const InstalledList: React.FC<{
   installations: ServiceInstallation[];
+  templateById: Map<string, ServiceTemplate>;
   busy: string | null;
   secrets: Record<string, ServiceSecrets>;
   logs: Record<string, { output: string; role: string }>;
-  statsMap: Record<string, Array<{ role: string; containerName: string; cpuPercent: number | null; memoryUsage: string; status?: string }>>;
+  statsMap: Record<string, Array<{ role: string; containerName?: string; name?: string; cpuPercent: number | null; memoryUsage: string; status?: string }>>;
   copied: string | null;
   onCopy: (text: string, key: string) => void;
   onToggleSecrets: (i: ServiceInstallation) => void;
@@ -890,6 +954,7 @@ const InstalledList: React.FC<{
   onBrowse: () => void;
 }> = ({
   installations,
+  templateById,
   busy,
   secrets,
   logs,
@@ -927,6 +992,8 @@ const InstalledList: React.FC<{
         const sec = secrets[inst.id];
         const log = logs[inst.id];
         const stats = statsMap[inst.id];
+        const tpl = templateById.get(inst.templateId);
+        const hasDrift = Boolean(tpl && tpl.image !== inst.image);
 
         return (
           <section key={inst.id} className="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -938,6 +1005,17 @@ const InstalledList: React.FC<{
                   <span className={`text-xs font-medium ${style.text}`}>{style.label}</span>
                   <span className="text-xs text-slate-300">·</span>
                   <span className="text-xs text-slate-500">{inst.templateName}</span>
+                  {hasDrift && tpl && (
+                    <button
+                      type="button"
+                      onClick={() => onUpdateImage(inst)}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-2 py-0.5 hover:bg-amber-100 cursor-pointer"
+                      title={`Actualizar a ${tpl.image}`}
+                    >
+                      <ArrowUpCircle className="w-3 h-3" />
+                      <span>Actualización: {tpl.image.split(':').pop()}</span>
+                    </button>
+                  )}
                 </div>
 
                 <div className="mt-2 flex items-center gap-3 flex-wrap text-xs">
@@ -1005,17 +1083,20 @@ const InstalledList: React.FC<{
               <div className="border-t border-slate-200 bg-slate-50 px-5 py-3.5 text-xs space-y-2">
                 <div className="font-semibold text-slate-800">Consumo en vivo</div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-                  {stats.map((c) => (
-                    <div key={c.containerName} className="bg-white border border-slate-200 rounded-lg p-3 space-y-1">
+                  {stats.map((c, idx) => {
+                    const cname = c.containerName || c.name || `${c.role}-${idx}`;
+                    return (
+                    <div key={cname} className="bg-white border border-slate-200 rounded-lg p-3 space-y-1">
                       <div className="font-medium text-slate-900 flex items-center justify-between gap-2">
                         <span>{c.role}</span>
-                        <span className="font-mono text-[11px] text-slate-400 truncate">{c.containerName}</span>
+                        <span className="font-mono text-[11px] text-slate-400 truncate">{cname}</span>
                       </div>
                       <div className="font-mono text-slate-700 tabular-nums">
                         CPU: {c.cpuPercent != null ? `${c.cpuPercent}%` : '—'} · RAM: {c.memoryUsage || '—'}
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}

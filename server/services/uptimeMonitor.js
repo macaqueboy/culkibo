@@ -681,6 +681,7 @@ class UptimeMonitor extends EventEmitter {
       lastCheckedAt: m.lastCheckedAt || null,
       lastStatusCode: m.lastStatusCode ?? null,
       lastError: m.lastError || null,
+      incidentOpen: Boolean(m.activeIncidentId),
       activeIncidentId: m.activeIncidentId || null,
       activeIncident,
       createdAt: m.createdAt,
@@ -1275,6 +1276,22 @@ class UptimeMonitor extends EventEmitter {
     this._save();
     this._invalidateCache(cleanSlug);
     return { ...inc };
+  }
+
+  /**
+   * Lista los incidentes manuales publicados en una página pública de estado.
+   * @param {string} slug
+   */
+  listPageIncidents(slug) {
+    this._ensureLoaded();
+    const cleanSlug = String(slug || '').trim().toLowerCase();
+    const page = this.statusPages.get(cleanSlug);
+    if (!page) {
+      const err = new Error(`Página de estado no encontrada: ${cleanSlug}`);
+      /** @type {any} */ (err).status = 404;
+      throw err;
+    }
+    return Array.isArray(page.incidents) ? page.incidents.map((i) => ({ ...i })) : [];
   }
 
   /** @param {string} slug */

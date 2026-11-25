@@ -1,5 +1,12 @@
 const { monitorEventLoopDelay, performance } = require('perf_hooks');
 const os = require('os');
+const metricsHistory = require('./metricsHistory');
+const {
+  readHostMemoryStats,
+  readDiskStats,
+  readHostCpuTotals,
+  computeHostCpuDelta
+} = metricsHistory;
 
 /**
  * Recolector de telemetría real en tiempo de ejecución (cero dependencias externas).
@@ -111,8 +118,11 @@ class MetricsCollector {
       : null;
     this.lastEluRatio = 0;
 
-    // Process CPU/mem cache (250 ms)
+    // Process & host CPU/mem cache (250 ms)
     this.lastCpuSample = null;
+    this._lastHostCpuTotals = readHostCpuTotals();
+    /** @type {number | null} */
+    this._lastHostCpuPct = null;
     /** @type {{ at: number, data: any } | null} */
     this._procCache = null;
 
@@ -125,7 +135,7 @@ class MetricsCollector {
     this._promBufCache = null;
 
     // History ring (max 60 samples, 1 per 5s)
-    /** @type {Array<{ ts: number, rps: number, p50Ms: number, p95Ms: number, rssMb: number, heapMb: number, elLagMs: number, cpuPercent: number }>} */
+    /** @type {Array<{ ts: number, rps: number, p50Ms: number, p95Ms: number, rssMb: number, heapMb: number, elLagMs: number, cpuPercent: number, hostCpuPct?: number, hostRamPct?: number, diskUsedPct?: number | null, errorRatePct?: number }>} */
     this.history = [];
     this._lastHistoryAt = 0;
 
@@ -319,8 +329,18 @@ class MetricsCollector {
       this.lastEluRatio = Number((delta.utilization || 0).toFixed(4));
     }
 
-    const totalMemMb = HOST_TOTAL_MEM_MB;
-    const freeMemMb = Math.round(os.freemem() / 1024 / 1024);
+    const hostMem = readHostMemoryStats();
+    const disk = readDiskStats();
+    const hostCpuNow = readHostCpuTotals();
+    const hostCpuDelta = computeHostCpuDelta(this._lastHostCpuTotals, hostCpuNow);
+    if (hostCpuDelta !== null && (hostCpuNow.total - this._lastHostCpuTotals.total) >= 10) {
+      this._lastHostCpuPct = hostCpuDelta;
+      this._lastHostCpuTotals = hostCpuNow;
+    }
+
+    const totalMemMb = hostMem.totalMb || HOST_TOTAL_MEM_MB;
+    const freeMemMb = hostMem.availableMb;
+    const usedMemMb = hostMem.usedMb;
 
     const data = {
       pid: process.pid,
@@ -340,8 +360,15 @@ class MetricsCollector {
       heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
       heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
       hostMemoryTotalMb: totalMemMb,
-      hostMemoryUsedMb: totalMemMb - freeMemMb,
+      hostMemoryUsedMb: usedMemMb,
       hostMemoryFreeMb: freeMemMb,
+      hostMemoryAvailableMb: hostMem.availableMb,
+      hostMemoryUsedPct: hostMem.usedPct,
+      hostMemorySource: hostMem.source,
+      hostCpuPercent: this._lastHostCpuPct,
+      diskUsedPct: disk.usedPct,
+      diskFreeGb: disk.freeGb,
+      diskTotalGb: disk.totalGb,
       hostCpus: HOST_CPUS,
       loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
       measured: true
@@ -408,6 +435,38 @@ class MetricsCollector {
       .sort((a, b) => b.count - a.count)
       .slice(0, 12);
 
+    const errorRatePct = this.requestsTotal > 0
+      ? Number((((this.status4xx + this.status5xx) / this.requestsTotal) * 100).toFixed(2))
+      : 0;
+    const error5xxRatePct = this.requestsTotal > 0
+      ? Number(((this.status5xx / this.requestsTotal) * 100).toFixed(2))
+      : 0;
+
+    // Sembrar historial en memoria con puntos persistidos recientes si el daemon acaba de arrancar
+    if (this.history.length === 0 && metricsHistory && typeof metricsHistory.query === 'function') {
+      try {
+        const persisted = metricsHistory.query({ range: '1h', includeMarkers: false });
+        if (persisted && Array.isArray(persisted.points) && persisted.points.length > 0) {
+          for (const p of persisted.points.slice(-HISTORY_CAP)) {
+            this.history.push({
+              ts: p.ts,
+              rps: p.rps,
+              p50Ms: p.p50Ms,
+              p95Ms: p.p95Ms,
+              rssMb: p.rssMb,
+              heapMb: p.heapMb,
+              elLagMs: p.elLagMs,
+              cpuPercent: p.hostCpuPct,
+              hostCpuPct: p.hostCpuPct,
+              hostRamPct: p.hostRamPct,
+              diskUsedPct: p.diskUsedPct,
+              errorRatePct: p.errorRatePct
+            });
+          }
+        }
+      } catch (e) {}
+    }
+
     // Muestreo histórico (máx 1 punto cada 5 s)
     if (now - this._lastHistoryAt >= 5000 || this.history.length === 0) {
       this._lastHistoryAt = now;
@@ -419,7 +478,11 @@ class MetricsCollector {
         rssMb: proc.memoryMb,
         heapMb: proc.heapUsedMb,
         elLagMs: el.p95Ms ?? 0,
-        cpuPercent: proc.cpuPercent ?? 0
+        cpuPercent: proc.cpuPercent ?? 0,
+        hostCpuPct: proc.hostCpuPercent ?? 0,
+        hostRamPct: proc.hostMemoryUsedPct ?? 0,
+        diskUsedPct: proc.diskUsedPct ?? null,
+        errorRatePct
       });
       if (this.history.length > HISTORY_CAP) {
         this.history.shift();
@@ -434,6 +497,8 @@ class MetricsCollector {
         requestsTotal: this.requestsTotal,
         inFlight: this.inFlight,
         rps,
+        errorRatePct,
+        error5xxRatePct,
         status: {
           '2xx': this.status2xx,
           '3xx': this.status3xx,
@@ -557,6 +622,22 @@ class MetricsCollector {
     lines.push(`culkibo_caddy_route_swaps_total ${snap.caddy.swapsTotal || 0}`);
     lines.push('');
 
+    lines.push('# HELP culkibo_host_memory_used_percent Host RAM utilization percent based on Linux MemAvailable.');
+    lines.push('# TYPE culkibo_host_memory_used_percent gauge');
+    lines.push(`culkibo_host_memory_used_percent ${snap.process.hostMemoryUsedPct ?? 0}`);
+    lines.push('# HELP culkibo_host_cpu_percent Host CPU utilization percent.');
+    lines.push('# TYPE culkibo_host_cpu_percent gauge');
+    lines.push(`culkibo_host_cpu_percent ${snap.process.hostCpuPercent ?? 0}`);
+    if (snap.process.diskUsedPct !== null && snap.process.diskUsedPct !== undefined) {
+      lines.push('# HELP culkibo_disk_used_percent Data volume disk utilization percent.');
+      lines.push('# TYPE culkibo_disk_used_percent gauge');
+      lines.push(`culkibo_disk_used_percent ${snap.process.diskUsedPct}`);
+    }
+    lines.push('# HELP culkibo_http_error_rate_percent Percentage of HTTP 4xx+5xx responses.');
+    lines.push('# TYPE culkibo_http_error_rate_percent gauge');
+    lines.push(`culkibo_http_error_rate_percent ${snap.http.errorRatePct ?? 0}`);
+    lines.push('');
+
     lines.push('# HELP culkibo_security_events_total Security & abuse control events by category.');
     lines.push('# TYPE culkibo_security_events_total counter');
     lines.push(`culkibo_security_events_total{kind="auth_failures"} ${snap.security?.authFailures || 0}`);
@@ -586,10 +667,21 @@ class MetricsCollector {
     return buf;
   }
 
+  /** Queries persisted 2-tier metrics history (`15m`, `1h`, `6h`, `24h`, `7d`). */
+  getHistory(opts = {}) {
+    return metricsHistory.query(opts);
+  }
+
+  /** Records a deploy/rollback marker into persisted metrics history. */
+  recordDeployMarker(marker = {}) {
+    return metricsHistory.recordDeployMarker(marker);
+  }
+
   stop() {
     try { this.eld.disable(); } catch (e) {}
+    try { metricsHistory.stop(); } catch (e) {}
   }
 }
 
-const metricsCollectorInstance = Object.assign(new MetricsCollector(), { canonicalizeRoute });
+const metricsCollectorInstance = Object.assign(new MetricsCollector(), { canonicalizeRoute, MetricsCollector });
 module.exports = metricsCollectorInstance;

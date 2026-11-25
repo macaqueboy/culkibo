@@ -7,8 +7,10 @@ const path = require('path');
 
 const uptimeModule = require('../server/services/uptimeMonitor');
 const sleepModule = require('../server/services/sleepAdvisor');
+const notificationModule = require('../server/services/notificationService');
 
 const { UptimeMonitor, PUBLIC_STATUS_CSP } = uptimeModule;
+const { NotificationService } = notificationModule;
 const {
   SleepAdvisor,
   renderWakingHtml,
@@ -759,6 +761,163 @@ async function testUptimeSleep() {
     // Disable policy -> scheduler stops cleanly
     advisor.setPolicy('proj_web', { enabled: false });
     assert.strictEqual(advisor._timer, null, 'Scheduler must stop when all policies are disabled');
+
+    // -----------------------------------------------------------------------
+    // 7. Deep Integration: Real NotificationService wiring, cron schedule sleep/wake,
+    //    handleWakeRequest browser 800ms HTML hold + real HTTP proxy forwarding
+    // -----------------------------------------------------------------------
+    {
+      // A. Real NotificationService receives uptime_down & uptime_recovered without stripping config keys
+      const sentNotifBodies = [];
+      const realNotif = new NotificationService({
+        configFile: path.join(tmpDir, 'notif-uptime.json'),
+        historyFile: path.join(tmpDir, 'notif-uptime-hist.json'),
+        postFn: async (_url, body) => {
+          sentNotifBodies.push(typeof body === 'string' ? JSON.parse(body) : body);
+          return true;
+        }
+      });
+      realNotif.setConfig({
+        enabled: true,
+        events: { uptime_down: true, uptime_recovered: true },
+        channels: { webhook: { enabled: true, url: 'https://93.184.216.34/uptime-hook' } }
+      });
+      const wiredUptime = new UptimeMonitor({
+        storeFile: path.join(tmpDir, 'uptime-wired.json'),
+        autoStart: false,
+        resolveProjectPort: () => verifiedHttpPort,
+        notifier: realNotif
+      });
+      try {
+        const wMon = await wiredUptime.createMonitor({
+          name: 'Wired API',
+          type: 'http',
+          allowLocalProject: true,
+          projectId: 'proj_api',
+          healthPath: '/health',
+          retries: 1,
+          intervalSec: 30,
+          public: true
+        });
+        httpMode = 'fail_500';
+        await wiredUptime.runCheck(wMon.id);
+        assert.strictEqual(wiredUptime.getMonitor(wMon.id).incidentOpen, true, 'incidentOpen boolean must mirror activeIncidentId');
+        httpMode = 'ok';
+        await wiredUptime.runCheck(wMon.id);
+        assert.strictEqual(wiredUptime.getMonitor(wMon.id).incidentOpen, false);
+        assert.strictEqual(sentNotifBodies.length, 2, 'Real NotificationService must deliver both uptime_down and uptime_recovered');
+
+        // listPageIncidents check
+        wiredUptime.saveStatusPage({ slug: 'wired-page', title: 'Wired Status', monitorIds: [wMon.id] });
+        const pi = wiredUptime.publishStatusIncident('wired-page', { title: 'Test Inc', severity: 'minor' });
+        assert.strictEqual(wiredUptime.listPageIncidents('wired-page').length, 1);
+        wiredUptime.resolveStatusIncident('wired-page', pi.id);
+      } finally {
+        wiredUptime.stop();
+      }
+
+      // B. SleepAdvisor cron schedule evaluation (sleepCron -> sleep, wakeCron -> wake)
+      dockerCalls.length = 0;
+      const schedDate = new Date(2026, 4, 15, 2, 30, 0); // 02:30 local
+      advisor.setPolicy('proj_web', {
+        enabled: true,
+        mode: 'stop',
+        idleMinutes: 60,
+        schedule: { sleepCron: '30 2 * * *', wakeCron: '0 8 * * *' }
+      });
+      const schedSleep = await advisor.checkIdleProjects({ now: schedDate.getTime() });
+      assert.ok(schedSleep.slept.includes('proj_web'), 'sleepCron matching 02:30 must sleep proj_web');
+      assert.strictEqual(advisor.isSleeping('proj_web'), true);
+
+      const wakeDate = new Date(2026, 4, 15, 8, 0, 0); // 08:00 local
+      const schedWake = await advisor.checkIdleProjects({ now: wakeDate.getTime() });
+      assert.ok(schedWake.woken.includes('proj_web'), 'wakeCron matching 08:00 must wake proj_web');
+      assert.strictEqual(advisor.isSleeping('proj_web'), false);
+
+      // C. handleWakeRequest real HTTP proxy forwarding (strips secret header, forwards wake-path & host)
+      let proxiedHeaders = null;
+      let proxiedUrl = null;
+      const wakeTargetServer = http.createServer((req, res) => {
+        proxiedHeaders = req.headers;
+        proxiedUrl = req.url;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ proxied: true }));
+      });
+      await new Promise((resolve) => wakeTargetServer.listen(0, '127.0.0.1', resolve));
+      const wakeTargetPort = /** @type {net.AddressInfo} */ (wakeTargetServer.address()).port;
+      mockDeployStore.proj_web.current.hostPort = wakeTargetPort;
+
+      try {
+        await advisor.sleepProject('proj_web', { mode: 'pause' });
+        const proxyServer = http.createServer((req, res) => {
+          advisor.handleWakeRequest(req, res, 'proj_web');
+        });
+        await new Promise((resolve) => proxyServer.listen(0, '127.0.0.1', resolve));
+        const proxyPort = /** @type {net.AddressInfo} */ (proxyServer.address()).port;
+
+        try {
+          const proxyResp = await new Promise((resolve, reject) => {
+            const r = http.request({
+              hostname: '127.0.0.1',
+              port: proxyPort,
+              path: '/_culkibo/wake/proj_web',
+              method: 'GET',
+              headers: {
+                'Accept': 'application/json',
+                'X-Culkibo-Wake-Secret': secret,
+                'X-Culkibo-Wake-Host': 'app.example.com',
+                'X-Culkibo-Wake-Path': '/api/v1/orders?page=2'
+              }
+            }, (res) => {
+              let data = '';
+              res.on('data', (c) => { data += c; });
+              res.on('end', () => resolve({ status: res.statusCode, body: data }));
+            });
+            r.on('error', reject);
+            r.end();
+          });
+          assert.strictEqual(proxyResp.status, 200);
+          assert.ok(proxyResp.body.includes('"proxied":true'));
+          assert.strictEqual(proxiedUrl, '/api/v1/orders?page=2', 'handleWakeRequest must forward X-Culkibo-Wake-Path');
+          assert.strictEqual(proxiedHeaders.host, 'app.example.com', 'handleWakeRequest must restore X-Culkibo-Wake-Host');
+          assert.strictEqual(proxiedHeaders['x-culkibo-wake-secret'], undefined, 'Wake secret MUST be stripped before forwarding to app container');
+
+          // Browser slow-wake (>800ms) returns branded waking HTML with 503 + CSP
+          await advisor.sleepProject('proj_web', { mode: 'pause' });
+          wakeDelayMs = 1100;
+          const htmlResp = await new Promise((resolve, reject) => {
+            const r = http.request({
+              hostname: '127.0.0.1',
+              port: proxyPort,
+              path: '/_culkibo/wake/proj_web',
+              method: 'GET',
+              headers: {
+                'Accept': 'text/html',
+                'X-Culkibo-Wake-Secret': secret
+              }
+            }, (res) => {
+              let data = '';
+              res.on('data', (c) => { data += c; });
+              res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+            });
+            r.on('error', reject);
+            r.end();
+          });
+          wakeDelayMs = 0;
+          assert.strictEqual(htmlResp.status, 503, 'Slow browser wake (>800ms) must return 503 branded HTML');
+          assert.strictEqual(htmlResp.headers['content-security-policy'], WAKING_PAGE_CSP);
+          assert.ok(htmlResp.body.includes('Waking service'), 'Branded waking HTML must be served');
+        } finally {
+          await new Promise((resolve) => proxyServer.close(resolve));
+        }
+      } finally {
+        await new Promise((resolve) => wakeTargetServer.close(resolve));
+      }
+
+      advisor.setPolicy('proj_web', { enabled: false });
+      console.log('  ✓ Real NotificationService uptime delivery, cron schedule sleep/wake & live HTTP handleWakeRequest proxy/HTML hold verified');
+    }
+
     advisor.stop();
 
     console.log('  ✓ VPS Cost & RAM Advisor (OOM risk, idle auto-sleep, oversized cap, SaaS-vs-VPS ledger & Doctor summary) verified');

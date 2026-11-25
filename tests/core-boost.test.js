@@ -370,7 +370,24 @@ async function testDeployFreezeWindows(tmpRoot) {
   await dm.awaitDrain('proj_freeze');
   assert.strictEqual(rb.status, 'activo', 'Rollback debe permitirse siempre durante ventanas de congelación');
 
-  console.log('  ✓ Freeze Windows: overnight/tz, bloqueo 423, overrideFreeze auditado y rollback exento');
+  // Ventana puntual (`kind: 'once'`), `blockTriggers` selectivo y ventanas globales CRUD
+  const onceWin = dm.addFreezeWindow({
+    name: 'Black Friday',
+    kind: 'once',
+    startAt: '2026-11-27T00:00:00Z',
+    endAt: '2026-11-28T00:00:00Z',
+    tz: 'UTC',
+    blockTriggers: ['webhook'],
+    reason: 'Congelación Black Friday solo webhooks'
+  });
+  assert.ok(onceWin.id);
+  const plainProj = { id: 'proj_bf', name: 'BF', freezeWindows: [] };
+  assert.strictEqual(dm.evaluateFreezeStatus(plainProj, { now: '2026-11-27T12:00:00Z', trigger: 'webhook' }).frozen, true);
+  assert.strictEqual(dm.evaluateFreezeStatus(plainProj, { now: '2026-11-27T12:00:00Z', trigger: 'manual' }).frozen, false);
+  assert.strictEqual(dm.removeFreezeWindow(onceWin.id).removed, true);
+  assert.strictEqual(dm.evaluateFreezeStatus(plainProj, { now: '2026-11-27T12:00:00Z', trigger: 'webhook' }).frozen, false);
+
+  console.log('  ✓ Freeze Windows: overnight/tz, once/blockTriggers, globales, bloqueo 423, overrideFreeze auditado y rollback exento');
 }
 
 // ---------------------------------------------------------------------------
@@ -378,11 +395,38 @@ async function testDeployFreezeWindows(tmpRoot) {
 // ---------------------------------------------------------------------------
 async function testPostDeploySmokeTests(tmpRoot) {
   let seenHostHeader = null;
+  let transientCount = 0;
   const appServer = await startMockServer((req, res) => {
     seenHostHeader = req.headers.host || null;
     if (req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: { ok: true }, version: 'v2-ready' }));
+      return;
+    }
+    if (req.url === '/transient') {
+      transientCount++;
+      if (transientCount === 1) {
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end('warming up');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('RECOVERED_OK');
+      return;
+    }
+    if (req.url === '/huge') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      // 400 KB: supera el límite estricto de 256 KB
+      res.end('HEAD_MARKER_' + 'A'.repeat(400 * 1024) + '_TAIL_MARKER');
+      return;
+    }
+    if (req.url === '/echo' && req.method === 'POST') {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end(`ECHO:${Buffer.concat(chunks).toString('utf8')}`);
+      });
       return;
     }
     if (req.url === '/slow') {
@@ -493,11 +537,35 @@ async function testPostDeploySmokeTests(tmpRoot) {
     assert.strictEqual(okDep.status, 'activo');
     assert.strictEqual(switched, true);
     assert.ok(okDep.smokeTestResults && okDep.smokeTestResults.ok === true && okDep.smokeTestResults.passed === 1);
+
+    // Retries recuperan fallo transitorio 503 -> 200; POST + bodyNotContains; límite 256 KB truncado
+    transientCount = 0;
+    const retryRes = await dm.runSmokeTests(`127.0.0.1:${appServer.port}`, [
+      { name: 'transient-recover', path: '/transient', expectStatus: 200, expectBodyContains: 'RECOVERED_OK', retries: 2 },
+      { name: 'post-echo', method: 'POST', path: '/echo', body: 'ping-42', expectStatus: 200, expectBodyContains: 'ECHO:ping-42', bodyNotContains: 'ERROR' },
+      { name: 'cap-256kb', path: '/huge', expectStatus: 200, expectBodyContains: 'HEAD_MARKER_', bodyNotContains: '_TAIL_MARKER' }
+    ]);
+    assert.strictEqual(retryRes.ok, true, `Retries/POST/256KB cap debía pasar: ${JSON.stringify(retryRes)}`);
+    assert.strictEqual(retryRes.checks[0].attempts, 2, 'Debe haberse recuperado exactamente en el 2º intento');
+
+    // failPolicy='warn' registra fallo pero permite promocionar
+    switched = false;
+    const warnDep = await dm.deploy({
+      id: 'proj_smk',
+      name: 'Smoke Warn',
+      domains: ['smk.ejemplo.com'],
+      envVars: {},
+      smokeTests: { enabled: true, failPolicy: 'warn', checks: [{ path: '/broken', expectStatus: 200 }] }
+    }, { contextDir, drainTimeoutMs: 5, stopGraceSeconds: 0 });
+    await dm.awaitDrain('proj_smk');
+    assert.strictEqual(warnDep.status, 'activo', 'failPolicy=warn debe promocionar pese a smoke test fallido');
+    assert.strictEqual(switched, true);
+    assert.strictEqual(warnDep.smokeTestResults.ok, false);
   } finally {
     await appServer.close();
   }
 
-  console.log('  ✓ Smoke Tests: pass/fail, latencia, SSRF bloqueado y aborto previo a cutover');
+  console.log('  ✓ Smoke Tests: pass/fail, retries, POST, 256KB cap, failPolicy=warn, latencia, SSRF y aborto previo a cutover');
 }
 
 // ---------------------------------------------------------------------------
@@ -621,11 +689,119 @@ async function testCanaryAutoGuard(tmpRoot) {
     assert.strictEqual(dmFail.getCanaryState('proj_can_fail'), null);
     const rbAudit = auditLogger.query({ action: 'deploy.canary_rollback', limit: 5 });
     assert.ok(rbAudit.length >= 1, 'El auto-rollback canario debe quedar auditado');
+
+    // C) Canario multi-paso [10, 50, 100] + promoción manual y aborto por OOMKilled
+    const dmMulti = makeSandbox();
+    const multiEvents = [];
+    dmMulti.store['proj_can_multi'] = { current: { ...stableRelease }, previous: null, history: [] };
+    dmMulti.detectStrategy = async () => ({
+      builder: 'dockerfile', stack: 'dockerfile', dockerfile: 'Dockerfile',
+      containerPort: 3000, healthPath: '/', injectHealthcheck: false, reason: 'mock'
+    });
+    dmMulti.runBuild = async () => ({ ok: true });
+    dmMulti.ensureNetwork = async () => true;
+    dmMulti.findFreePort = async () => canaryServer.port;
+    dmMulti.resolveUpstream = async ({ containerName, containerPort }) => ({ dial: `${containerName}:${containerPort}`, mode: 'network' });
+    dmMulti.waitForHealth = async () => ({ healthy: true, attempts: 1, status: 200 });
+    dmMulti.switchCanaryRoute = async (_dep, _hosts, { canaryWeight }) => {
+      multiEvents.push(`step:${canaryWeight}`);
+      return { ok: true, weights: [100 - canaryWeight, canaryWeight] };
+    };
+    dmMulti.switchRoute = async (dep, _hosts, dial) => {
+      multiEvents.push(`full:${dial}`);
+      dep.routeSwitched = true;
+      return { ok: true };
+    };
+    dmMulti.runDocker = async (args) => {
+      if (args[0] === 'inspect') return { code: 0, stdout: 'true|false|0\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    canaryHealthy = true;
+    const multiRes = await dmMulti.deploy({
+      id: 'proj_can_multi',
+      name: 'Multi Canary',
+      domains: ['canmulti.ejemplo.com'],
+      envVars: {},
+      canary: { enabled: true, steps: [10, 50, 100], stepDurationMs: 25, checksPerStep: 1, maxErrorRate: 0 }
+    }, { contextDir, drainTimeoutMs: 5, stopGraceSeconds: 0 });
+    await dmMulti.awaitDrain('proj_can_multi');
+    assert.strictEqual(multiRes.status, 'activo');
+    assert.deepStrictEqual(multiEvents.slice(0, 2), ['step:10', 'step:50'], 'Debe recorrer cada paso progresivo antes de 100%');
+
+    // D) OOMKilled durante observación canaria dispara auto-rollback instantáneo
+    const dmOom = makeSandbox();
+    const oomEvents = [];
+    dmOom.store['proj_can_oom'] = { current: { ...stableRelease }, previous: null, history: [] };
+    dmOom.detectStrategy = async () => ({
+      builder: 'dockerfile', stack: 'dockerfile', dockerfile: 'Dockerfile',
+      containerPort: 3000, healthPath: '/', injectHealthcheck: false, reason: 'mock'
+    });
+    dmOom.runBuild = async () => ({ ok: true });
+    dmOom.ensureNetwork = async () => true;
+    dmOom.findFreePort = async () => canaryServer.port;
+    dmOom.resolveUpstream = async ({ containerName, containerPort }) => ({ dial: `${containerName}:${containerPort}`, mode: 'network' });
+    dmOom.waitForHealth = async () => ({ healthy: true, attempts: 1, status: 200 });
+    dmOom.switchCanaryRoute = async (_dep, _hosts, { canaryWeight }) => {
+      oomEvents.push(`canary:${canaryWeight}`);
+      return { ok: true, weights: [100 - canaryWeight, canaryWeight] };
+    };
+    dmOom.switchRoute = async (dep, _hosts, dial) => {
+      oomEvents.push(`restore:${dial}`);
+      dep.routeSwitched = true;
+      return { ok: true };
+    };
+    dmOom.runDocker = async (args) => {
+      if (args[0] === 'inspect') return { code: 0, stdout: 'false|true|0\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const oomRes = await dmOom.deploy({
+      id: 'proj_can_oom',
+      name: 'OOM Canary',
+      domains: ['canoom.ejemplo.com'],
+      envVars: {},
+      canary: { enabled: true, weightPercent: 10, stepDurationMs: 25, checksPerStep: 1, maxErrorRate: 0 }
+    }, { contextDir });
+    assert.strictEqual(oomRes.status, 'fallido');
+    assert.ok(/OOMKilled/.test(oomRes.error));
+    assert.deepStrictEqual(oomEvents, ['canary:10', 'restore:culkibo_can_v1:3000']);
+
+    // E) promoteCanary() manual despierta observación larga y promociona de inmediato
+    const dmManual = makeSandbox();
+    dmManual.store['proj_can_man'] = { current: { ...stableRelease }, previous: null, history: [] };
+    dmManual.detectStrategy = async () => ({
+      builder: 'dockerfile', stack: 'dockerfile', dockerfile: 'Dockerfile',
+      containerPort: 3000, healthPath: '/', injectHealthcheck: false, reason: 'mock'
+    });
+    dmManual.runBuild = async () => ({ ok: true });
+    dmManual.ensureNetwork = async () => true;
+    dmManual.findFreePort = async () => canaryServer.port;
+    dmManual.resolveUpstream = async ({ containerName, containerPort }) => ({ dial: `${containerName}:${containerPort}`, mode: 'network' });
+    dmManual.waitForHealth = async () => ({ healthy: true, attempts: 1, status: 200 });
+    dmManual.switchCanaryRoute = async () => ({ ok: true, weights: [90, 10] });
+    dmManual.switchRoute = async (dep) => { dep.routeSwitched = true; return { ok: true }; };
+    dmManual.runDocker = async (args) => {
+      if (args[0] === 'inspect') return { code: 0, stdout: 'true|false|0\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const manPromise = dmManual.deploy({
+      id: 'proj_can_man',
+      name: 'Manual Canary',
+      domains: ['canman.ejemplo.com'],
+      envVars: {},
+      canary: { enabled: true, weightPercent: 10, stepDurationMs: 15000, checksPerStep: 1 }
+    }, { contextDir, drainTimeoutMs: 5, stopGraceSeconds: 0 });
+    await new Promise((r) => setTimeout(r, 30));
+    const promCall = dmManual.promoteCanary('proj_can_man');
+    assert.strictEqual(promCall.ok, true);
+    const manRes = await manPromise;
+    await dmManual.awaitDrain('proj_can_man');
+    assert.strictEqual(manRes.status, 'activo');
+    assert.strictEqual(manRes.canaryResult.promoted, true);
   } finally {
     await canaryServer.close();
   }
 
-  console.log('  ✓ Canary Auto-Guard: tráfico progresivo, auto-promoción al 100% y auto-rollback <5 ms');
+  console.log('  ✓ Canary Auto-Guard: tráfico progresivo multi-paso, promote manual, OOMKilled y auto-rollback <5 ms');
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +967,22 @@ async function testRemoteFleetRouting(tmpRoot) {
     }, { contextDir });
     assert.strictEqual(bindMountFail.status, 'fallido');
     assert.ok(/montajes locales/.test(bindMountFail.error));
+
+    // Cordón de mantenimiento / drenaje en nodo remoto bloquea _deploy() ANTES de abrir túnel Docker
+    let tunnelOpenedOnDraining = false;
+    const dmMaint = makeSandbox();
+    dmMaint._getFleetManager = () => ({
+      getServer: (sid) => ({ id: sid, maintenanceState: 'draining' }),
+      acquireDockerTunnel: async () => { tunnelOpenedOnDraining = true; throw new Error('should not open'); }
+    });
+    const maintDep = await dmMaint.deploy({
+      ...remoteProject,
+      id: 'proj_fleet_draining'
+    }, { contextDir });
+    assert.strictEqual(maintDep.status, 'fallido');
+    assert.strictEqual(maintDep.errorCode, 'SERVER_MAINTENANCE');
+    assert.ok(/draining/.test(maintDep.error));
+    assert.strictEqual(tunnelOpenedOnDraining, false, 'Un nodo en draining/maintenance debe rechazarse antes de abrir túnel SSH');
 
     // checkProductionHealth() debe saltar proyectos sleeping y serverId !== 'local'
     const dmHealth = makeSandbox();

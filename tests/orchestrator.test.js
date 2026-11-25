@@ -46,12 +46,23 @@ async function testOrchestrator() {
   assert.ok(syncRes.syncDurationMs <= 35, `La detección tardó ${syncRes.syncDurationMs}ms, esperado <= 35ms`);
   console.log(`  ✓ Detección y clasificación en ${syncRes.syncDurationMs}ms (modo ${syncRes.mode}, sin retardo fabricado)`);
 
-  // 3. Traffic switching between Forge & Citadel
+  // 3. Traffic switching between Forge & Citadel (+ negative input rejection)
   const switchRes = await containerOrchestrator.switchTraffic({ forgePercent: 30, citadelPercent: 70 });
   assert.strictEqual(switchRes.success, true);
   assert.strictEqual(switchRes.trafficAllocation.forge, 30);
   assert.strictEqual(switchRes.trafficAllocation.citadel, 70);
-  console.log('  ✓ Traffic routing switch passed (30% Forge / 70% Citadel)');
+  await assert.rejects(
+    () => containerOrchestrator.switchTraffic({}),
+    /forgePercent|citadelPercent|0 y 100/i,
+    'switchTraffic sin porcentajes debe rechazarse'
+  );
+  await assert.rejects(
+    () => containerOrchestrator.switchTraffic({ forgePercent: 'not-a-number' }),
+    /número|válido|0 y 100/i,
+    'switchTraffic con NaN debe rechazarse'
+  );
+  assert.deepStrictEqual(containerOrchestrator.trafficAllocation, { forge: 30, citadel: 70 }, 'Un fallo en switchTraffic no debe mutar la asignación');
+  console.log('  ✓ Traffic routing switch passed (30% Forge / 70% Citadel + NaN/empty rejected)');
 
   // 4. Legacy deployRelease() ya no simula despliegues falsos con setTimeout:
   //    los despliegues reales viven en deployManager.
@@ -71,28 +82,61 @@ async function testOrchestrator() {
   assert.ok(logs[0].message);
   console.log(`  ✓ Logs buffer passed (${logs.length} logs sampled)`);
 
-  // 6. Real Chokidar file watcher on disk
+  // 6. Real Chokidar file watcher on disk (with genuine event assertion — never a blind sleep)
   const fs = require('fs');
   const path = require('path');
   const os = require('os');
+  assert.throws(() => containerOrchestrator.watchDirectory(''), /required/i);
+  assert.throws(() => containerOrchestrator.watchDirectory(path.join(os.tmpdir(), `culkibo-missing-${Date.now()}`)), /does not exist/i);
+
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-watch-'));
   try {
     const watchRes = containerOrchestrator.watchDirectory(tempDir);
     assert.strictEqual(watchRes.success, true);
     assert.strictEqual(containerOrchestrator.getWatcherStatus().isWatching, true);
-    console.log('  ✓ Chokidar live directory watcher initialized');
 
-    // Create file in watched directory to trigger hot-sync
+    // Wait for chokidar 'ready' before writing, so initial scan doesn't swallow the add event
+    const activeWatcher = containerOrchestrator.watchers.get(path.resolve(tempDir));
+    assert.ok(activeWatcher, 'Active chokidar watcher instance must be registered');
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('Chokidar watcher did not emit ready within 5s')), 5000);
+      activeWatcher.once('ready', () => { clearTimeout(t); resolve(undefined); });
+    });
+    console.log('  ✓ Chokidar live directory watcher initialized & ready');
+
+    // Register real event listener BEFORE writing file and assert the HOT_SYNC log actually fires
+    const reloadsBefore = containerOrchestrator.pods.forge.hotReloadsCount;
+    const detectedPromise = new Promise((resolve, reject) => {
+      const timeoutMs = process.platform === 'win32' ? 6000 : 3000;
+      const timer = setTimeout(() => {
+        containerOrchestrator.off('log', onLog);
+        reject(new Error(`Chokidar did not emit HOT_SYNC log for test-component.ts within ${timeoutMs}ms`));
+      }, timeoutMs);
+      const onLog = (entry) => {
+        if (entry && entry.level === 'HOT_SYNC' && String(entry.message || '').includes('test-component.ts')) {
+          clearTimeout(timer);
+          containerOrchestrator.off('log', onLog);
+          resolve(entry);
+        }
+      };
+      containerOrchestrator.on('log', onLog);
+    });
+
     const testFile = path.join(tempDir, 'test-component.ts');
     fs.writeFileSync(testFile, 'export const test = 1;', 'utf8');
 
-    // Small delay for chokidar event
-    await new Promise(r => setTimeout(r, 120));
+    const detectedEntry = await detectedPromise;
+    assert.ok(detectedEntry.message.includes('test-component.ts'), 'HOT_SYNC log must identify changed file');
+    assert.ok(
+      containerOrchestrator.pods.forge.hotReloadsCount > reloadsBefore,
+      'hotReloadsCount must increment on real chokidar detection'
+    );
 
     await containerOrchestrator.stopWatching();
     assert.strictEqual(containerOrchestrator.getWatcherStatus().isWatching, false);
-    console.log('  ✓ Chokidar file watcher detected modification & stopped cleanly');
+    console.log('  ✓ Chokidar file watcher genuinely detected test-component.ts (HOT_SYNC asserted) & stopped cleanly');
   } finally {
+    await containerOrchestrator.stopWatching().catch(() => {});
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch (e) {}

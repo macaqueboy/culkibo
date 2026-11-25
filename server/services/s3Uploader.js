@@ -67,6 +67,129 @@ function sha256Hex(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+function sha256Base64(data) {
+  return crypto.createHash('sha256').update(data).digest('base64');
+}
+
+/**
+ * Sanitiza un mapa de metadatos de usuario a cabeceras `x-amz-meta-*` seguras
+ * para SigV4 (sin CRLF ni claves inválidas).
+ * @param {Record<string, any> | null | undefined} metadata
+ * @returns {Record<string, string>}
+ */
+function sanitizeMetadataHeaders(metadata) {
+  /** @type {Record<string, string>} */
+  const headers = {};
+  if (!metadata || typeof metadata !== 'object') return headers;
+  for (const [rawKey, rawVal] of Object.entries(metadata)) {
+    if (rawVal === undefined || rawVal === null) continue;
+    const cleanKey = String(rawKey).trim().toLowerCase().replace(/^x-amz-meta-/, '');
+    if (!/^[a-z0-9_-]{1,64}$/.test(cleanKey)) {
+      throw new Error(`Clave de metadato S3 inválida: ${rawKey}`);
+    }
+    const cleanVal = String(rawVal).replace(/[\r\n\0]+/g, ' ').trim().slice(0, 1024);
+    if (!cleanVal) continue;
+    headers[`x-amz-meta-${cleanKey}`] = cleanVal;
+  }
+  return headers;
+}
+
+const VALID_STORAGE_CLASSES = new Set([
+  'STANDARD_IA', 'ONEZONE_IA', 'INTELLIGENT_TIERING', 'GLACIER_IR', 'GLACIER', 'DEEP_ARCHIVE'
+]);
+
+/**
+ * Construye el documento XML S3 `LifecycleConfiguration` con validación estricta
+ * de reglas (expiración, aborto de multiparts huérfanos, versiones no actuales y transiciones).
+ * @param {Array<{
+ *   id: string,
+ *   prefix?: string,
+ *   status?: 'Enabled' | 'Disabled',
+ *   expirationDays?: number,
+ *   abortIncompleteMultipartUploadDays?: number,
+ *   noncurrentVersionExpirationDays?: number,
+ *   transitions?: Array<{ days: number, storageClass: string }>
+ * }>} rules
+ * @returns {string}
+ */
+function buildLifecycleXml(rules) {
+  if (!Array.isArray(rules) || rules.length === 0 || rules.length > 100) {
+    throw new Error('Lifecycle S3 requiere entre 1 y 100 reglas');
+  }
+  const seenIds = new Set();
+  const xmlRules = rules.map((r, idx) => {
+    if (!r || typeof r !== 'object') throw new Error(`Regla lifecycle #${idx + 1} inválida`);
+    const id = String(r.id || '').trim();
+    if (!id || id.length > 255 || /[\r\n\0]/.test(id)) {
+      throw new Error(`ID de regla lifecycle inválido en #${idx + 1}`);
+    }
+    if (seenIds.has(id)) throw new Error(`ID de regla lifecycle duplicado: ${id}`);
+    seenIds.add(id);
+
+    const status = r.status === 'Disabled' ? 'Disabled' : 'Enabled';
+    if (r.status !== undefined && r.status !== 'Enabled' && r.status !== 'Disabled') {
+      throw new Error(`Estado de regla lifecycle inválido: ${r.status}`);
+    }
+    const prefix = String(r.prefix ?? '').replace(/[\r\n\0]/g, '');
+
+    /** @type {string[]} */
+    const actions = [];
+    if (r.expirationDays !== undefined && r.expirationDays !== null) {
+      const days = Number(r.expirationDays);
+      if (!Number.isInteger(days) || days < 1 || days > 36500) {
+        throw new Error(`expirationDays inválido en regla ${id}`);
+      }
+      actions.push(`<Expiration><Days>${days}</Days></Expiration>`);
+    }
+    if (r.abortIncompleteMultipartUploadDays !== undefined && r.abortIncompleteMultipartUploadDays !== null) {
+      const days = Number(r.abortIncompleteMultipartUploadDays);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) {
+        throw new Error(`abortIncompleteMultipartUploadDays inválido en regla ${id}`);
+      }
+      actions.push(
+        `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${days}</DaysAfterInitiation></AbortIncompleteMultipartUpload>`
+      );
+    }
+    if (r.noncurrentVersionExpirationDays !== undefined && r.noncurrentVersionExpirationDays !== null) {
+      const days = Number(r.noncurrentVersionExpirationDays);
+      if (!Number.isInteger(days) || days < 1 || days > 36500) {
+        throw new Error(`noncurrentVersionExpirationDays inválido en regla ${id}`);
+      }
+      actions.push(
+        `<NoncurrentVersionExpiration><NoncurrentDays>${days}</NoncurrentDays></NoncurrentVersionExpiration>`
+      );
+    }
+    if (Array.isArray(r.transitions)) {
+      for (const tr of r.transitions) {
+        const days = Number(tr && tr.days);
+        const sc = String(tr && tr.storageClass || '').trim().toUpperCase();
+        if (!Number.isInteger(days) || days < 1 || days > 36500) {
+          throw new Error(`Días de transición inválidos en regla ${id}`);
+        }
+        if (!VALID_STORAGE_CLASSES.has(sc)) {
+          throw new Error(`StorageClass S3 no permitido en regla ${id}: ${sc}`);
+        }
+        actions.push(`<Transition><Days>${days}</Days><StorageClass>${sc}</StorageClass></Transition>`);
+      }
+    }
+    if (actions.length === 0) {
+      throw new Error(`La regla lifecycle ${id} debe definir al menos una acción`);
+    }
+
+    const filterXml = prefix
+      ? `<Filter><Prefix>${xmlEscape(prefix)}</Prefix></Filter>`
+      : '<Filter/>';
+    return `<Rule><ID>${xmlEscape(id)}</ID>${filterXml}<Status>${status}</Status>${actions.join('')}</Rule>`;
+  });
+
+  return (
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">' +
+    xmlRules.join('') +
+    '</LifecycleConfiguration>'
+  );
+}
+
 function hmac(key, data) {
   return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
 }
@@ -332,6 +455,12 @@ class S3Client {
             const val = rawHeaders[String(name || '').toLowerCase()];
             if (Array.isArray(val)) return val.join(', ');
             return val === undefined ? null : String(val);
+          },
+          entries() {
+            return Object.entries(rawHeaders).map(([k, v]) => [
+              k.toLowerCase(),
+              Array.isArray(v) ? v.join(', ') : (v === undefined ? '' : String(v))
+            ]);
           }
         };
         /** @type {any} */
@@ -456,17 +585,31 @@ class S3Client {
     throw lastError || new Error(`S3 ${method} falló sin respuesta`);
   }
 
-  async putObject(key, body, contentType = 'application/octet-stream') {
+  /**
+   * @param {string} key
+   * @param {Buffer | string} body
+   * @param {string} [contentType]
+   * @param {{ metadata?: Record<string, any> | null, checksumSha256?: boolean }} [opts]
+   */
+  async putObject(key, body, contentType = 'application/octet-stream', { metadata = null, checksumSha256 = true } = {}) {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
     const contentMd5 = crypto.createHash('md5').update(buf).digest('base64');
+    const sha256B64 = sha256Base64(buf);
+    /** @type {Record<string, string>} */
+    const headers = {
+      'content-type': contentType,
+      'content-md5': contentMd5,
+      ...(checksumSha256 ? { 'x-amz-checksum-sha256': sha256B64 } : {}),
+      ...sanitizeMetadataHeaders(metadata)
+    };
     const res = await this.request('PUT', key, {
-      headers: { 'content-type': contentType, 'content-md5': contentMd5 },
+      headers,
       body: buf,
       expectStatus: [200]
     });
     const etag = res.headers.get('etag');
     try { await res.body?.cancel?.(); } catch (e) {}
-    return { key, etag, size: buf.length };
+    return { key, etag, size: buf.length, checksumSha256: sha256B64 };
   }
 
   async deleteObject(key) {
@@ -479,22 +622,68 @@ class S3Client {
     const res = await this.request('HEAD', key, { expectStatus: [200, 404] });
     try { await res.body?.cancel?.(); } catch (e) {}
     if (res.status === 404) return null;
+    /** @type {Record<string, string>} */
+    const metadata = {};
+    if (res.headers && typeof res.headers.entries === 'function') {
+      for (const [hKey, hVal] of res.headers.entries()) {
+        if (hKey.startsWith('x-amz-meta-')) {
+          metadata[hKey.slice('x-amz-meta-'.length)] = hVal;
+        }
+      }
+    }
     return {
       key,
       sizeBytes: Number(res.headers.get('content-length') || 0),
       etag: res.headers.get('etag'),
-      lastModified: res.headers.get('last-modified')
+      lastModified: res.headers.get('last-modified'),
+      checksumSha256: res.headers.get('x-amz-checksum-sha256') || null,
+      metadata
     };
+  }
+
+  /**
+   * Aplica una política de ciclo de vida S3 (`PUT /?lifecycle`) con Content-MD5 y SHA-256.
+   * @param {Parameters<typeof buildLifecycleXml>[0]} rules
+   */
+  async putBucketLifecycle(rules) {
+    const xml = buildLifecycleXml(rules);
+    const buf = Buffer.from(xml, 'utf8');
+    const contentMd5 = crypto.createHash('md5').update(buf).digest('base64');
+    const sha256B64 = sha256Base64(buf);
+    const res = await this.request('PUT', '', {
+      query: { lifecycle: '' },
+      headers: {
+        'content-type': 'application/xml',
+        'content-md5': contentMd5,
+        'x-amz-checksum-sha256': sha256B64
+      },
+      body: buf,
+      expectStatus: [200, 204],
+      allowEmptyKey: true
+    });
+    try { await res.body?.cancel?.(); } catch (e) {}
+    return { applied: true, rulesCount: rules.length, xml };
   }
 
   // -------------------------------------------------------------------------
   // Multipart
   // -------------------------------------------------------------------------
 
-  async createMultipartUpload(key, contentType = 'application/octet-stream') {
+  /**
+   * @param {string} key
+   * @param {string} [contentType]
+   * @param {{ metadata?: Record<string, any> | null, checksumSha256?: boolean }} [opts]
+   */
+  async createMultipartUpload(key, contentType = 'application/octet-stream', { metadata = null, checksumSha256 = true } = {}) {
+    /** @type {Record<string, string>} */
+    const headers = {
+      'content-type': contentType,
+      ...(checksumSha256 ? { 'x-amz-checksum-algorithm': 'SHA256' } : {}),
+      ...sanitizeMetadataHeaders(metadata)
+    };
     const res = await this.request('POST', key, {
       query: { uploads: '' },
-      headers: { 'content-type': contentType },
+      headers,
       body: Buffer.alloc(0),
       expectStatus: [200]
     });
@@ -504,13 +693,27 @@ class S3Client {
     return uploadId;
   }
 
-  async uploadPart(key, uploadId, partNumber, chunk) {
-    // Escalar timeout si partSize creció para volcados >80 GB y enviar Content-MD5 (Object Lock)
+  /**
+   * @param {string} key
+   * @param {string} uploadId
+   * @param {number} partNumber
+   * @param {Buffer} chunk
+   * @param {{ checksumSha256?: boolean }} [opts]
+   */
+  async uploadPart(key, uploadId, partNumber, chunk, { checksumSha256 = true } = {}) {
+    // Escalar timeout si partSize creció para volcados >80 GB y enviar Content-MD5 + SHA-256 (Object Lock)
     const scaledTimeout = Math.max(this.timeoutMs, Math.ceil((chunk.length / (1024 * 1024)) * 15000));
     const contentMd5 = crypto.createHash('md5').update(chunk).digest('base64');
+    const sha256Raw = crypto.createHash('sha256').update(chunk).digest();
+    const sha256B64 = sha256Raw.toString('base64');
+    /** @type {Record<string, string>} */
+    const headers = {
+      'content-md5': contentMd5,
+      ...(checksumSha256 ? { 'x-amz-checksum-sha256': sha256B64 } : {})
+    };
     const res = await this.request('PUT', key, {
       query: { partNumber: String(partNumber), uploadId },
-      headers: { 'content-md5': contentMd5 },
+      headers,
       body: chunk,
       expectStatus: [200],
       timeoutMs: Math.min(30 * 60 * 1000, scaledTimeout)
@@ -518,7 +721,7 @@ class S3Client {
     const etag = res.headers.get('etag');
     try { await res.body?.cancel?.(); } catch (e) {}
     if (!etag) throw new Error(`La parte ${partNumber} no devolvió ETag`);
-    return { partNumber, etag };
+    return { partNumber, etag, checksumSha256: sha256B64, checksumSha256Raw: sha256Raw };
   }
 
   /** Lista objetos remotos del bucket (ListObjectsV2) con paginación y unescape XML seguro. */
@@ -573,7 +776,12 @@ class S3Client {
         parts
           .slice()
           .sort((a, b) => a.partNumber - b.partNumber)
-          .map((p) => `<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${xmlEscape(p.etag)}</ETag></Part>`)
+          .map(
+            (p) =>
+              `<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${xmlEscape(p.etag)}</ETag>` +
+              (p.checksumSha256 ? `<ChecksumSHA256>${xmlEscape(p.checksumSha256)}</ChecksumSHA256>` : '') +
+              '</Part>'
+          )
           .join('') +
         '</CompleteMultipartUpload>',
       'utf8'
@@ -615,15 +823,15 @@ class S3Client {
   /**
    * @param {string} key
    * @param {string} filePath
-   * @param {{ contentType?: string, onProgress?: ((p: any) => void) | null }} [opts]
+   * @param {{ contentType?: string, onProgress?: ((p: any) => void) | null, metadata?: Record<string, any> | null, checksumSha256?: boolean }} [opts]
    */
-  async uploadFile(key, filePath, { contentType = 'application/octet-stream', onProgress = null } = {}) {
+  async uploadFile(key, filePath, { contentType = 'application/octet-stream', onProgress = null, metadata = null, checksumSha256 = true } = {}) {
     const stat = await fs.promises.stat(filePath);
     const total = stat.size;
 
     if (total <= this.partSizeBytes) {
       const body = await fs.promises.readFile(filePath);
-      const out = await this.putObject(key, body, contentType);
+      const out = await this.putObject(key, body, contentType, { metadata, checksumSha256 });
       if (onProgress) onProgress({ uploaded: total, total, part: 1, parts: 1 });
       return { ...out, sizeBytes: total, multipart: false };
     }
@@ -641,8 +849,10 @@ class S3Client {
     }
     const partCount = Math.ceil(total / partSize);
 
-    const uploadId = await this.createMultipartUpload(key, contentType);
+    const uploadId = await this.createMultipartUpload(key, contentType, { metadata, checksumSha256 });
     const parts = [];
+    /** @type {Buffer[]} */
+    const rawPartHashes = [];
     const handle = await fs.promises.open(filePath, 'r');
     // Reutilizar un solo buffer de parte en todo el bucle (reduce presión de GC en subidas multi-GB)
     const partBuf = Buffer.alloc(partSize);
@@ -657,13 +867,22 @@ class S3Client {
           totalRead += bytesRead;
         }
         const chunk = totalRead === partBuf.length ? partBuf : partBuf.subarray(0, totalRead);
-        parts.push(await this.uploadPart(key, uploadId, i + 1, chunk));
+        const uploadedPart = await this.uploadPart(key, uploadId, i + 1, chunk, { checksumSha256 });
+        if (uploadedPart.checksumSha256Raw) rawPartHashes.push(uploadedPart.checksumSha256Raw);
+        parts.push({
+          partNumber: uploadedPart.partNumber,
+          etag: uploadedPart.etag,
+          ...(checksumSha256 ? { checksumSha256: uploadedPart.checksumSha256 } : {})
+        });
         uploaded += totalRead;
         if (onProgress) onProgress({ uploaded, total, part: i + 1, parts: partCount });
       }
       await handle.close();
       const out = await this.completeMultipartUpload(key, uploadId, parts);
-      return { ...out, sizeBytes: total, multipart: true, parts: partCount };
+      const compositeSha256 = rawPartHashes.length === partCount
+        ? `${sha256Base64(Buffer.concat(rawPartHashes))}-${partCount}`
+        : null;
+      return { ...out, sizeBytes: total, multipart: true, parts: partCount, checksumSha256: compositeSha256 };
     } catch (err) {
       try { await handle.close(); } catch (e) {}
       await this.abortMultipartUpload(key, uploadId);
@@ -671,16 +890,18 @@ class S3Client {
     }
   }
 
-  /** Descarga a disco en streaming de forma atómica (.tmp -> rename) verificando Content-Length y sin deadlocks ENOSPC. */
-  async downloadFile(key, destPath) {
+  /** Descarga a disco en streaming de forma atómica (.tmp -> rename) verificando Content-Length, SHA-256 y sin deadlocks ENOSPC. */
+  async downloadFile(key, destPath, { expectedSha256Hex = null } = {}) {
     const res = await this.request('GET', key, { expectStatus: [200], timeoutMs: 2 * 3600 * 1000 });
     await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
     if (!res.body) throw new Error('La respuesta S3 no contiene cuerpo descargable');
     const declaredLenRaw = res.headers.get('content-length');
     const declaredLen = declaredLenRaw != null ? parseInt(declaredLenRaw, 10) : null;
+    const remoteChecksumB64 = res.headers.get('x-amz-checksum-sha256') || null;
     const tmpPath = `${destPath}.tmp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const out = fs.createWriteStream(tmpPath, { mode: 0o600 });
     const reader = res.body.getReader();
+    const hasher = crypto.createHash('sha256');
     let bytes = 0;
     /** @type {Error | null} */
     let streamErr = null;
@@ -691,8 +912,10 @@ class S3Client {
         const { done, value } = await reader.read();
         if (done) break;
         if (streamErr) throw streamErr;
-        bytes += value.length;
-        if (!out.write(Buffer.from(value))) {
+        const chunkBuf = Buffer.from(value);
+        bytes += chunkBuf.length;
+        hasher.update(chunkBuf);
+        if (!out.write(chunkBuf)) {
           await new Promise((resolve, reject) => {
             if (streamErr) return reject(streamErr);
             if (out.destroyed || out.errored) return reject(out.errored || new Error('Stream de destino cerrado'));
@@ -738,8 +961,17 @@ class S3Client {
       if (declaredLen !== null && Number.isFinite(declaredLen) && bytes !== declaredLen) {
         throw new Error(`Descarga S3 truncada: recibidos ${bytes} bytes de ${declaredLen} declarados`);
       }
+      const digestRaw = hasher.digest();
+      const digestHex = digestRaw.toString('hex');
+      const digestB64 = digestRaw.toString('base64');
+      if (expectedSha256Hex && digestHex !== String(expectedSha256Hex).toLowerCase()) {
+        throw new Error(`Checksum SHA-256 de descarga S3 no coincide (corrupción detectada)`);
+      }
+      if (remoteChecksumB64 && !remoteChecksumB64.includes('-') && digestB64 !== remoteChecksumB64) {
+        throw new Error(`Cabecera x-amz-checksum-sha256 de S3 no coincide con el archivo descargado`);
+      }
       await fs.promises.rename(tmpPath, destPath);
-      return { key, destPath, sizeBytes: bytes };
+      return { key, destPath, sizeBytes: bytes, sha256: digestHex, checksumSha256: digestB64 };
     } catch (err) {
       try { await reader.cancel(); } catch (e) {}
       try { out.destroy(); } catch (e) {}
@@ -770,6 +1002,9 @@ module.exports = {
   canonicalQueryString,
   rfc3986,
   sha256Hex,
+  sha256Base64,
+  sanitizeMetadataHeaders,
+  buildLifecycleXml,
   amzDates,
   redactKey,
   xmlField,

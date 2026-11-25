@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const projectManager = require('./projectManager');
 const githubService = require('./githubService');
 const deployManager = require('./deployManager');
@@ -9,6 +11,44 @@ let _previewManager = null;
 function getPreviewManager() {
   if (!_previewManager) _previewManager = require('./previewManager');
   return _previewManager;
+}
+
+/** @type {any} */
+let _gitopsManager = null;
+function getGitOpsManager() {
+  if (!_gitopsManager) _gitopsManager = require('./gitopsManager');
+  return _gitopsManager;
+}
+
+const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
+  ? path.resolve(process.env.CULKIBO_DATA_DIR)
+  : path.resolve(__dirname, '..', '..');
+
+/** Comprueba si el push tocó el archivo `culkibo.yaml` (o `project.gitopsManifestPath`) configurado. */
+function didChangeGitOpsManifest(project, changedFiles) {
+  const mode = String(project?.gitopsAutoSync || 'off').trim().toLowerCase();
+  if (mode !== 'plan' && mode !== 'apply') return false;
+  if (!Array.isArray(changedFiles) || changedFiles.length === 0) return false;
+  const manifestPath = String(project?.gitopsManifestPath || 'culkibo.yaml')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+  if (!manifestPath) return false;
+  return changedFiles.some((f) => String(f || '').replace(/\\/g, '/').replace(/^\/+/, '') === manifestPath);
+}
+
+/** Resuelve el directorio de trabajo local de un proyecto para leer `culkibo.yaml`. */
+function resolveProjectRepoDir(project) {
+  if (project && typeof project.localPath === 'string' && project.localPath.trim()) {
+    const p = path.resolve(project.localPath.trim());
+    if (fs.existsSync(p)) return p;
+  }
+  const cleanId = String(project?.id || '').trim();
+  if (cleanId && /^[a-zA-Z0-9_-]{1,80}$/.test(cleanId)) {
+    const candidate = path.join(ROOT_BASE_DIR, 'projects', cleanId);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -121,7 +161,18 @@ function resolveMatchingProjects({ queryProjectId = null, repoUrls = [] } = {}) 
 /**
  * Despacha un push ya autenticado para uno o varios proyectos del mismo repo.
  */
-async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, author, deliveryId = null, changedFiles = [] }) {
+async function dispatchPush({
+  provider,
+  projects,
+  branch,
+  commitSha,
+  commitMsg,
+  author,
+  deliveryId = null,
+  changedFiles = [],
+  manifestYaml = null,
+  gitopsManager = null
+}) {
   const shortSha = String(commitSha || `c_${Date.now().toString(36)}`).slice(0, 7);
   const now = new Date().toISOString();
   const label = provider.charAt(0).toUpperCase() + provider.slice(1);
@@ -153,7 +204,7 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
     };
   }
 
-  const eligibleProjects = branchProjects.filter((p) => p.autoDeploy !== false);
+  const eligibleProjects = branchProjects.filter((p) => p.autoDeploy !== false || didChangeGitOpsManifest(p, changedFiles));
   if (eligibleProjects.length === 0) {
     containerOrchestrator.addLog('INFO', 'citadel', `[${label}:Webhook] Push recibido pero el auto-despliegue está deshabilitado para '${branchProjects[0].name}'.`, new Date(), branchProjects[0].id);
     return {
@@ -166,7 +217,7 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
     };
   }
 
-  const pathEligible = eligibleProjects.filter((p) => matchesWatchPaths(p.watchPaths, changedFiles));
+  const pathEligible = eligibleProjects.filter((p) => matchesWatchPaths(p.watchPaths, changedFiles) || didChangeGitOpsManifest(p, changedFiles));
   if (pathEligible.length === 0) {
     containerOrchestrator.addLog('INFO', 'citadel', `[${label}:Webhook] Push ignorado (${shortSha}): ningún archivo coincide con watchPaths.`, new Date(), eligibleProjects[0].id);
     return {
@@ -195,17 +246,49 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
     }
     allDuplicates = false;
 
+    // GitOps auto-plan / non-destructive reconcile cuando el push modifica `culkibo.yaml` (opt-in por proyecto)
+    /** @type {any} */
+    let gitopsResult = null;
+    if (didChangeGitOpsManifest(target, changedFiles)) {
+      try {
+        const gm = gitopsManager || getGitOpsManager();
+        const repoDir = resolveProjectRepoDir(target);
+        gitopsResult = await gm.reconcileWebhookManifest({
+          project: target,
+          yamlText: typeof manifestYaml === 'string' ? manifestYaml : null,
+          repoDir,
+          manifestPath: target.gitopsManifestPath || 'culkibo.yaml',
+          provider,
+          commitSha,
+          branch,
+          actor: `webhook:${provider}`
+        });
+        containerOrchestrator.addLog(
+          'INFO',
+          'citadel',
+          `[${label}:GitOps] ${gitopsResult.mode === 'apply' ? 'Reconciliado' : 'Plan calculado'} para ${target.name} (${shortSha}) · prune=false`,
+          new Date(),
+          target.id
+        );
+      } catch (gitopsErr) {
+        gitopsResult = { ok: false, error: gitopsErr.message || String(gitopsErr) };
+        containerOrchestrator.addLog('WARN', 'citadel', `[${label}:GitOps] Error procesando culkibo.yaml para ${target.name}: ${gitopsResult.error}`, new Date(), target.id);
+      }
+    }
+
     const repoName = target.gitRepo || target.name;
     containerOrchestrator.addLog('INFO', 'citadel', `[${label}:Webhook] Push recibido en ${repoName} (${branch}) por ${author}: "${String(commitMsg || '').trim()}" (${shortSha})`, new Date(), target.id);
-    containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Iniciando despliegue automatizado para ${target.name}...`, new Date(), target.id);
 
     /** @type {{ dispatched: boolean, queued: boolean, reason: string | null }} */
     let pipeline = { dispatched: false, queued: false, reason: null };
-    if (!target.gitRepo) {
+    if (target.autoDeploy === false) {
+      pipeline.reason = 'autoDeploy deshabilitado (solo GitOps ejecutado)';
+    } else if (!target.gitRepo) {
       pipeline.reason = 'El proyecto no tiene repositorio configurado';
     } else if (!dockerProbe.available) {
       pipeline.reason = dockerProbe.reason;
     } else {
+      containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Iniciando despliegue automatizado para ${target.name}...`, new Date(), target.id);
       try {
         const started = deployManager.enqueue(target, {
           commit: /^[0-9a-f]{7,40}$/i.test(String(commitSha || '')) ? String(commitSha) : null,
@@ -218,7 +301,7 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
       }
     }
 
-    if (pipeline.reason) {
+    if (pipeline.reason && target.autoDeploy !== false) {
       containerOrchestrator.addLog('WARN', 'citadel', `[Citadel:Deploy] No se lanza la construcción de imagen: ${pipeline.reason}.`, new Date(), target.id);
     } else if (pipeline.queued) {
       containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Ya hay un despliegue en curso; ${shortSha} queda en cola y se construirá al terminar.`, new Date(), target.id);
@@ -230,7 +313,9 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
       author: String(author || label),
       timestamp: now
     };
-    projectManager.update(target.id, { lastDeployedAt: now, lastCommit });
+    if (projectManager.getById(target.id)) {
+      projectManager.update(target.id, { lastDeployedAt: now, lastCommit });
+    }
 
     containerOrchestrator.emit('github_deploy', {
       provider,
@@ -240,7 +325,8 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
       commit: shortSha,
       author: lastCommit.author,
       message: lastCommit.message,
-      timestamp: now
+      timestamp: now,
+      ...(gitopsResult ? { gitops: gitopsResult } : {})
     });
 
     containerOrchestrator.addLog(
@@ -248,7 +334,7 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
       'citadel',
       pipeline.dispatched || pipeline.queued
         ? `[${label}:Webhook] Despliegue en curso para ${target.name} (${shortSha}); sigue el progreso en la pestaña Despliegues.`
-        : `[${label}:Webhook] Despliegue completado para ${target.name} (${shortSha})`,
+        : `[${label}:Webhook] Push procesado para ${target.name} (${shortSha})`,
       new Date(),
       target.id
     );
@@ -256,7 +342,8 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
     dispatched.push({
       projectId: target.id,
       pipeline: pipeline.dispatched ? 'building' : pipeline.queued ? 'queued' : 'registro',
-      pipelineReason: pipeline.reason
+      pipelineReason: pipeline.reason,
+      ...(gitopsResult ? { gitops: gitopsResult } : {})
     });
   }
 
@@ -292,38 +379,109 @@ async function dispatchPush({ provider, projects, branch, commitSha, commitMsg, 
   };
 }
 
-/** Despacha eventos de Pull Request / Merge Request hacia Preview Deployments. */
-async function dispatchPullRequest({ provider, projects, action, prNumber, branch, commitSha, isFork = false }) {
-  const pm = getPreviewManager();
+/**
+ * Despacha eventos de Pull Request / Merge Request hacia Preview Deployments.
+ * - Deduplicación por `githubService.claimDelivery` (evita builds dobles en reintentos).
+ * - Ejecución asíncrona no bloqueante por defecto (responde HTTP 202 al instante para
+ *   no agotar el timeout de 10 s de GitHub/GitLab webhooks).
+ */
+async function dispatchPullRequest({
+  provider,
+  projects,
+  action,
+  prNumber,
+  branch,
+  commitSha = null,
+  isFork = false,
+  deliveryId = null,
+  awaitCompletion = false,
+  previewManager: previewMgrOverride = null
+}) {
+  const pm = previewMgrOverride || getPreviewManager();
+  /** @type {any[]} */
   const results = [];
+  let queuedCount = 0;
+
   for (const project of projects) {
     const cfg = project.previewDeployments || {};
     if (!cfg.enabled) {
       results.push({ projectId: project.id, action: 'skipped', reason: 'previews_disabled' });
       continue;
     }
-    if (action === 'closed' || action === 'merged') {
-      try {
-        const res = await pm.destroyPreview(project.id, { prNumber, branch });
-        results.push({ projectId: project.id, action: 'destroyed', ...res });
-      } catch (e) {
-        results.push({ projectId: project.id, action: 'destroy_skipped', reason: e.message });
+
+    const isDestroy = action === 'closed' || action === 'merged';
+    const isDeploy = action === 'opened' || action === 'synchronize' || action === 'reopened' || action === 'update';
+    if (!isDestroy && !isDeploy) {
+      results.push({ projectId: project.id, action: 'ignored', reason: `action_${action}` });
+      continue;
+    }
+
+    if (isDeploy && isFork && !cfg.allowForks) {
+      containerOrchestrator.addLog('WARN', 'citadel', `[${provider}:Preview] PR #${prNumber} desde fork bloqueada por seguridad (allowForks=false).`, new Date(), project.id);
+      results.push({ projectId: project.id, action: 'blocked', reason: 'fork_pr_blocked' });
+      continue;
+    }
+
+    // Deduplicación fail-safe por entrega PR (deliveryId explícito o tupla PR+acción+SHA)
+    const effectiveDeliveryId = deliveryId
+      ? `pr:${String(deliveryId).slice(0, 80)}`
+      : `pr:${prNumber ?? branch}:${action}:${commitSha ? String(commitSha).slice(0, 16) : 'head'}`;
+    const claim = githubService.claimDelivery(project.id, { deliveryId: effectiveDeliveryId });
+    if (!claim.fresh) {
+      containerOrchestrator.addLog('INFO', 'citadel', `[${provider}:Preview] ${claim.reason} (PR #${prNumber}); entrega ignorada.`, new Date(), project.id);
+      results.push({ projectId: project.id, action: 'duplicate_skipped', duplicate: true, reason: claim.reason });
+      continue;
+    }
+
+    if (isDestroy) {
+      if (awaitCompletion) {
+        try {
+          const res = await pm.destroyPreview(project.id, { prNumber, branch });
+          results.push({ projectId: project.id, action: 'destroyed', ...res });
+        } catch (e) {
+          results.push({ projectId: project.id, action: 'destroy_skipped', reason: e.message });
+        }
+      } else {
+        queuedCount++;
+        Promise.resolve()
+          .then(() => pm.destroyPreview(project.id, { prNumber, branch }))
+          .catch((e) => {
+            containerOrchestrator.addLog('WARN', 'citadel', `[${provider}:Preview] Error destruyendo preview PR #${prNumber}: ${e && e.message ? e.message : String(e)}`, new Date(), project.id);
+          });
+        results.push({ projectId: project.id, action: 'destroy_queued', async: true, prNumber, branch });
       }
-    } else if (action === 'opened' || action === 'synchronize' || action === 'reopened' || action === 'update') {
-      if (isFork && !cfg.allowForks) {
-        containerOrchestrator.addLog('WARN', 'citadel', `[${provider}:Preview] PR #${prNumber} desde fork bloqueada por seguridad (allowForks=false).`, new Date(), project.id);
-        results.push({ projectId: project.id, action: 'blocked', reason: 'fork_pr_blocked' });
-        continue;
-      }
-      try {
-        const res = await pm.deployPreview(project, { prNumber, branch, commit: commitSha, isFork });
-        results.push({ projectId: project.id, action: 'preview_deployed', preview: res });
-      } catch (e) {
-        results.push({ projectId: project.id, action: 'preview_error', error: e.message });
+    } else if (isDeploy) {
+      if (awaitCompletion) {
+        try {
+          const res = await pm.deployPreview(project, { prNumber, branch, commit: commitSha, isFork });
+          results.push({ projectId: project.id, action: 'preview_deployed', preview: res });
+        } catch (e) {
+          results.push({ projectId: project.id, action: 'preview_error', error: e.message });
+        }
+      } else {
+        queuedCount++;
+        Promise.resolve()
+          .then(() => pm.deployPreview(project, { prNumber, branch, commit: commitSha, isFork }))
+          .catch((e) => {
+            containerOrchestrator.addLog('WARN', 'citadel', `[${provider}:Preview] Error desplegando preview PR #${prNumber}: ${e && e.message ? e.message : String(e)}`, new Date(), project.id);
+          });
+        results.push({ projectId: project.id, action: 'preview_queued', async: true, prNumber, branch });
       }
     }
   }
-  return { status: 200, body: { success: true, provider, event: 'pull_request', prNumber, branch, results } };
+
+  return {
+    status: queuedCount > 0 ? 202 : 200,
+    body: {
+      success: true,
+      provider,
+      event: 'pull_request',
+      prNumber,
+      branch,
+      queued: queuedCount,
+      results
+    }
+  };
 }
 
 /**
@@ -371,7 +529,8 @@ async function handleGitLabWebhook(req) {
       prNumber: attrs.iid || attrs.id,
       branch: attrs.source_branch || '',
       commitSha: attrs.last_commit?.id || null,
-      isFork
+      isFork,
+      deliveryId: req.headers['x-gitlab-event-uuid'] || null
     });
   }
 
@@ -434,7 +593,8 @@ async function handleGiteaWebhook(req) {
       prNumber: pr.number,
       branch: pr.head?.ref || '',
       commitSha: pr.head?.sha || null,
-      isFork
+      isFork,
+      deliveryId: req.headers['x-gitea-delivery'] || null
     });
   }
 
@@ -533,7 +693,8 @@ async function handleBitbucketWebhook(req) {
       prNumber: pr.id,
       branch: pr.source?.branch?.name || '',
       commitSha: pr.source?.commit?.hash || null,
-      isFork
+      isFork,
+      deliveryId: req.headers['x-request-uuid'] || null
     });
   }
 
@@ -601,6 +762,7 @@ module.exports = {
   verifyHmacSha256,
   normalizeRepoSlug,
   matchesWatchPaths,
+  didChangeGitOpsManifest,
   resolveMatchingProjects,
   dispatchPush,
   dispatchPullRequest,

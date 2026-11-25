@@ -21,9 +21,109 @@ import { copyToClipboard } from '../lib/clipboard';
 import { HelpTip } from './HelpTip';
 
 type ClientTab = 'cursor' | 'claude' | 'vscode' | 'cli';
+type McpProfile = 'core' | 'deploy' | 'ops' | 'security' | 'all';
+
+const PROFILE_OPTIONS: ReadonlyArray<{ id: McpProfile; label: string; hint: string }> = [
+  { id: 'core', label: 'Core (Recomendado)', hint: '16 herramientas esenciales + culkibo_search_tools (-82% contexto)' },
+  { id: 'deploy', label: 'Deploy & CI/CD', hint: 'Despliegues, Canary, Smoke, Previews, Freeze y Entornos' },
+  { id: 'ops', label: 'Ops & Self-Healing', hint: 'Diagnóstico autónomo, remediación, logs, Docker, Uptime y Sleep' },
+  { id: 'security', label: 'Security & RBAC', hint: 'Equipos, tokens, TLS/wildcard, Basic Auth, snapshots y Doctor' },
+  { id: 'all', label: 'Todas (107)', hint: 'Catálogo completo sin filtrado de perfil' },
+];
+
+const PROFILE_TOOL_SETS: Record<Exclude<McpProfile, 'all'>, ReadonlySet<string>> = {
+  core: new Set([
+    'culkibo_search_tools', 'culkibo_rbac_whoami', 'culkibo_list_projects', 'culkibo_get_project',
+    'culkibo_create_project', 'culkibo_set_project_env', 'culkibo_deploy_production', 'culkibo_list_deployments',
+    'culkibo_rollback_deployment', 'culkibo_get_container_logs', 'culkibo_get_deployment_logs', 'culkibo_manage_domain',
+    'culkibo_list_databases', 'culkibo_system_doctor', 'culkibo_diagnose_incident', 'culkibo_auto_remediate',
+  ]),
+  deploy: new Set([
+    'culkibo_search_tools', 'culkibo_rbac_whoami', 'culkibo_list_projects', 'culkibo_get_project',
+    'culkibo_create_project', 'culkibo_add_resource', 'culkibo_set_project_env', 'culkibo_deploy_strategy',
+    'culkibo_deploy_production', 'culkibo_list_deployments', 'culkibo_rollback_deployment', 'culkibo_cancel_deployment',
+    'culkibo_get_deploy_queue', 'culkibo_get_deployment_logs', 'culkibo_get_container_logs', 'culkibo_manage_previews',
+    'culkibo_smoke_test_configure', 'culkibo_smoke_test_run', 'culkibo_canary_rollout', 'culkibo_deploy_freeze',
+    'culkibo_env_list', 'culkibo_env_promote',
+  ]),
+  ops: new Set([
+    'culkibo_search_tools', 'culkibo_rbac_whoami', 'culkibo_list_projects', 'culkibo_get_project',
+    'culkibo_list_pods', 'culkibo_get_logs', 'culkibo_get_container_logs', 'culkibo_get_observability',
+    'culkibo_system_doctor', 'culkibo_system_doctor_fix', 'culkibo_docker_status', 'culkibo_docker_containers',
+    'culkibo_manage_production_service', 'culkibo_toggle_maintenance', 'culkibo_diagnose_domain', 'culkibo_ingress_status',
+    'culkibo_reconcile_ingress', 'culkibo_uptime_list_monitors', 'culkibo_status_page_manage', 'culkibo_cost_advisor',
+    'culkibo_sleep_status', 'culkibo_sleep_manage', 'culkibo_fleet_list_servers', 'culkibo_diagnose_incident',
+    'culkibo_auto_remediate',
+  ]),
+  security: new Set([
+    'culkibo_search_tools', 'culkibo_rbac_whoami', 'culkibo_team_list_members', 'culkibo_team_invite_member',
+    'culkibo_team_update_member', 'culkibo_rbac_list_tokens', 'culkibo_rbac_manage_token', 'culkibo_system_doctor',
+    'culkibo_system_doctor_fix', 'culkibo_diagnose_domain', 'culkibo_ingress_status', 'culkibo_manage_wildcard_dns01',
+    'culkibo_set_domain_basic_auth', 'culkibo_manage_webhook', 'culkibo_deploy_freeze', 'culkibo_list_databases',
+    'culkibo_database_list_backups', 'culkibo_export_instance_snapshot', 'culkibo_diagnose_incident',
+  ]),
+};
+
+function appendProfileToUrl(rawUrl: string, profile: McpProfile): string {
+  if (!rawUrl || profile === 'all') return rawUrl;
+  const cleaned = rawUrl.replace(/([?&])profile=[^&]*(&?)/, (_m, sep, trail) => (trail ? sep : '')).replace(/[?&]$/, '');
+  const joiner = cleaned.includes('?') ? '&' : '?';
+  return `${cleaned}${joiner}profile=${profile}`;
+}
+
+function applyProfileToClientConfig(cfg: any, profile: McpProfile): any {
+  if (!cfg || typeof cfg !== 'object') return cfg;
+  const clone = JSON.parse(JSON.stringify(cfg));
+  if (clone.cursorOrWindsurf?.mcpServers?.culkibo?.url) {
+    clone.cursorOrWindsurf.mcpServers.culkibo.url = appendProfileToUrl(clone.cursorOrWindsurf.mcpServers.culkibo.url, profile);
+  }
+  if (clone.vscodeCopilot?.servers?.culkibo?.url) {
+    clone.vscodeCopilot.servers.culkibo.url = appendProfileToUrl(clone.vscodeCopilot.servers.culkibo.url, profile);
+  }
+  if (typeof clone.claudeCodeCli === 'string') {
+    clone.claudeCodeCli = clone.claudeCodeCli.replace(/https?:\/\/[^\s"]+api\/mcp(?:\?profile=[a-z]+)?/i, (u: string) => appendProfileToUrl(u, profile));
+  }
+  if (clone.claudeDesktop?.mcpServers?.culkibo?.env) {
+    if (profile === 'all') delete clone.claudeDesktop.mcpServers.culkibo.env.CULKIBO_MCP_PROFILE;
+    else clone.claudeDesktop.mcpServers.culkibo.env.CULKIBO_MCP_PROFILE = profile;
+  }
+  return clone;
+}
+
+function extractMcpErrorEnvelope(toolResult: any): { code?: string; message?: string; remediation?: string | null; retryable?: boolean } | null {
+  if (!toolResult || typeof toolResult !== 'object') return null;
+  const metaErr = toolResult?.result?._meta?.['dev.culkibo/error'] || toolResult?._meta?.['dev.culkibo/error'];
+  if (metaErr && typeof metaErr === 'object') return metaErr;
+  if (toolResult?.result?.isError && Array.isArray(toolResult?.result?.content)) {
+    const firstText = toolResult.result.content[0]?.text;
+    if (typeof firstText === 'string') {
+      try {
+        const parsed = JSON.parse(firstText);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch {
+        // Texto plano sin JSON estructurado
+      }
+    }
+  }
+  const fallbackRem = toolResult?.remediation || toolResult?.result?.remediation || toolResult?.error?.data?.remediation;
+  if (fallbackRem) {
+    return {
+      code: toolResult?.error?.code ? String(toolResult.error.code) : undefined,
+      remediation: String(fallbackRem),
+    };
+  }
+  return null;
+}
 
 function classifyMcpToolGroup(name: string): string {
   const n = name.toLowerCase();
+  if (n.includes('diagnose_incident') || n.includes('auto_remediate') || n.includes('search_tools')) return 'Autocuración y Descubrimiento IA';
+  if (n.includes('fleet_')) return 'Flota Multi-Servidor (SSH)';
+  if (n.includes('rbac_') || n.includes('team_')) return 'Equipos, RBAC y Tokens';
+  if (n.includes('uptime_') || n.includes('status_page')) return 'Uptime y Páginas de Estado';
+  if (n.includes('gitops_') || n.includes('_env_')) return 'GitOps y Entornos';
+  if (n.includes('sleep_') || n.includes('cost_advisor')) return 'Smart Sleep y Cost Advisor';
+  if (n.includes('smoke_') || n.includes('canary_') || n.includes('freeze')) return 'Smoke Tests, Canary y Freeze';
   if (n.includes('sync') || n.includes('forge') || n.includes('merkle')) return 'Live Sync (The Forge)';
   if (n.includes('domain') || n.includes('ssl') || n.includes('tls') || n.includes('caddy') || n.includes('ingress') || n.includes('wildcard') || n.includes('tunnel') || n.includes('cloudflare')) return 'Dominios, TLS y Caddy';
   if (n.includes('database') || n.includes('_db') || n.includes('backup') || n.includes('snapshot') || n.includes('restore') || n.includes('s3')) return 'Bases de datos y Backups';
@@ -65,10 +165,12 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
   const [mcpConfig, setMcpConfig] = useState<any>(null);
   const [remoteInfo, setRemoteInfo] = useState<RemoteAccessInfo | null>(null);
   const [connectionScope, setConnectionScope] = useState<'local' | 'remote'>('local');
+  const [selectedProfile, setSelectedProfile] = useState<McpProfile>('core');
   const [clientTab, setClientTab] = useState<ClientTab>('cursor');
   const [toolSearch, setToolSearch] = useState('');
   const [selectedTool, setSelectedTool] = useState<string>('culkibo_list_projects');
   const [toolArgs, setToolArgs] = useState<string>('{}');
+  const [dryRunMode, setDryRunMode] = useState<boolean>(false);
   const [jsonError, setJsonError] = useState<string | null>(null);
   const [toolResult, setToolResult] = useState<any>(null);
   const [executing, setExecuting] = useState(false);
@@ -154,18 +256,36 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     setJsonError(null);
     const spec = tools.find((t) => t.name === toolName);
     const defaults = buildDefaultArgsFromSchema(spec);
+    const canDryRun = Boolean(spec?.inputSchema?.properties?.dryRun);
+    const defaultDry = canDryRun && Boolean(spec?.annotations?.destructiveHint || toolName === 'culkibo_auto_remediate');
+    setDryRunMode(defaultDry);
+    if (defaultDry) {
+      defaults.dryRun = true;
+    }
     setToolArgs(Object.keys(defaults).length > 0 ? JSON.stringify(defaults, null, 2) : '{}');
   };
 
   const isDestructive = Boolean(currentToolSpec?.annotations?.destructiveHint);
   const isReadOnly = Boolean(currentToolSpec?.annotations?.readOnlyHint);
+  const supportsDryRun = Boolean(currentToolSpec?.inputSchema?.properties?.dryRun);
+
+  const handleToggleDryRun = (enabled: boolean) => {
+    setDryRunMode(enabled);
+    setConfirmDestructive(false);
+    try {
+      const parsed = JSON.parse(toolArgs || '{}');
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (enabled) parsed.dryRun = true;
+        else delete parsed.dryRun;
+        setToolArgs(JSON.stringify(parsed, null, 2));
+        setJsonError(null);
+      }
+    } catch {
+      // Si el JSON estaba a medio editar, el valor se aplicará al ejecutar
+    }
+  };
 
   const handleExecuteTool = async () => {
-    if (isDestructive && !confirmDestructive) {
-      setConfirmDestructive(true);
-      return;
-    }
-    setConfirmDestructive(false);
     setJsonError(null);
     let parsedArgs: Record<string, unknown> = {};
     try {
@@ -174,6 +294,16 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       setJsonError(`JSON inválido: ${err.message}`);
       return;
     }
+    if (supportsDryRun && dryRunMode) {
+      parsedArgs = { ...parsedArgs, dryRun: true };
+    }
+    const effectiveDryRun = Boolean(supportsDryRun && parsedArgs.dryRun === true);
+
+    if (isDestructive && !effectiveDryRun && !confirmDestructive) {
+      setConfirmDestructive(true);
+      return;
+    }
+    setConfirmDestructive(false);
 
     setExecuting(true);
     setToolResult(null);
@@ -184,6 +314,19 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       setToolResult({ error: err?.message || 'Error ejecutando la herramienta' });
     } finally {
       setExecuting(false);
+    }
+  };
+
+  const handleLoadConfirmToken = (token: string) => {
+    setDryRunMode(false);
+    setConfirmDestructive(false);
+    try {
+      const parsed = JSON.parse(toolArgs || '{}');
+      const next = { ...(parsed && typeof parsed === 'object' ? parsed : {}), dryRun: false, confirmToken: token };
+      setToolArgs(JSON.stringify(next, null, 2));
+      setJsonError(null);
+    } catch {
+      setToolArgs(JSON.stringify({ dryRun: false, confirmToken: token }, null, 2));
     }
   };
 
@@ -199,20 +342,35 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     onNotify?.('Configuración copiada al portapapeles', 'success');
   };
 
-  const activeConfigs = connectionScope === 'remote' && remoteInfo?.clientConfigs
+  const baseConfigs = connectionScope === 'remote' && remoteInfo?.clientConfigs
     ? remoteInfo.clientConfigs
     : mcpConfig;
+  const activeConfigs = useMemo(
+    () => applyProfileToClientConfig(baseConfigs, selectedProfile),
+    [baseConfigs, selectedProfile]
+  );
+
+  const profileStats = useMemo(() => {
+    const allBytes = tools.length > 0 ? JSON.stringify({ tools }).length : 0;
+    const subset = selectedProfile === 'all'
+      ? tools
+      : tools.filter((t) => PROFILE_TOOL_SETS[selectedProfile].has(String(t.name || '')));
+    const subBytes = subset.length > 0 ? JSON.stringify({ tools: subset }).length : 0;
+    const estTokens = Math.round(subBytes / 4);
+    const savedPct = allBytes > 0 ? Math.max(0, Math.round((1 - subBytes / allBytes) * 100)) : 0;
+    return { count: subset.length, total: tools.length, estTokens, savedPct };
+  }, [tools, selectedProfile]);
 
   const snippetByTab: Record<ClientTab, { title: string; subtitle: string; code: string }> = {
     cursor: {
       title: 'Cursor / Windsurf / Antigravity (Streamable HTTP)',
-      subtitle: 'Pégalo en la configuración MCP de tu editor (protocolo MCP 2026-07-28):',
+      subtitle: `Pégalo en la configuración MCP de tu editor (protocolo MCP 2026-07-28 · perfil ${selectedProfile}):`,
       code: activeConfigs ? JSON.stringify(activeConfigs.cursorOrWindsurf || {}, null, 2) : 'Cargando configuración…',
     },
     claude: {
       title: 'Claude Desktop (claude_desktop_config.json)',
       subtitle: connectionScope === 'remote'
-        ? 'Usa este bloque con mcp-remote para conectar Claude Desktop a tu servidor remoto:'
+        ? 'Usa este bloque con el puente stdio de Culkibo para conectar Claude Desktop a tu servidor remoto:'
         : 'Abre Ajustes → Desarrollador → Editar configuración y pega este bloque:',
       code: activeConfigs ? JSON.stringify(activeConfigs.claudeDesktop || {}, null, 2) : 'Cargando configuración…',
     },
@@ -224,7 +382,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     cli: {
       title: 'Claude Code CLI',
       subtitle: 'Ejecútalo en tu terminal para registrar Culkibo:',
-      code: activeConfigs?.claudeCodeCli || `claude mcp add --transport http culkibo ${window.location.origin}/api/mcp`,
+      code: activeConfigs?.claudeCodeCli || `claude mcp add --transport http culkibo "${appendProfileToUrl(`${window.location.origin}/api/mcp`, selectedProfile)}"`,
     },
   };
 
@@ -294,6 +452,35 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               >
                 Remoto (VPS)
               </button>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <span className="text-[11px] font-medium text-slate-600">Perfil de contexto (`?profile=`)</span>
+              {profileStats.total > 0 && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-indigo-50 text-indigo-700 border border-indigo-200 tabular-nums">
+                  {profileStats.count}/{profileStats.total} herramientas · ~{(profileStats.estTokens / 1000).toFixed(1)}k tok
+                  {profileStats.savedPct > 0 ? ` (-${profileStats.savedPct}%)` : ''}
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5 text-[11px]">
+              {PROFILE_OPTIONS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  title={p.hint}
+                  onClick={() => setSelectedProfile(p.id)}
+                  className={`px-2 py-1 rounded-md font-medium border cursor-pointer transition-colors ${
+                    selectedProfile === p.id
+                      ? 'bg-emerald-600 text-white border-emerald-600'
+                      : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
             </div>
           </div>
 
@@ -414,13 +601,35 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               </div>
             )}
 
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Argumentos (JSON)</label>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <label className="block text-xs font-medium text-slate-700">Argumentos (JSON)</label>
+                {supportsDryRun && (
+                  <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={dryRunMode}
+                      onChange={(e) => handleToggleDryRun(e.target.checked)}
+                      className="rounded border-slate-300 text-slate-900 focus:ring-slate-500 cursor-pointer"
+                    />
+                    <span>Simular sin cambios (`dryRun`)</span>
+                  </label>
+                )}
+              </div>
               <textarea
                 value={toolArgs}
                 onChange={(e) => {
-                  setToolArgs(e.target.value);
+                  const next = e.target.value;
+                  setToolArgs(next);
                   setConfirmDestructive(false);
+                  try {
+                    const parsed = JSON.parse(next || '{}');
+                    if (supportsDryRun && parsed && typeof parsed === 'object') {
+                      setDryRunMode(parsed.dryRun === true);
+                    }
+                  } catch {
+                    // JSON parcial mientras escribe
+                  }
                 }}
                 rows={3}
                 className="w-full p-3 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
@@ -452,7 +661,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               onClick={() => void handleExecuteTool()}
               disabled={executing || !effectiveToolName}
               className={`w-full py-2 px-4 rounded-lg text-white font-medium text-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 ${
-                confirmDestructive ? 'bg-red-600 hover:bg-red-700' : 'bg-slate-900 hover:bg-slate-800'
+                confirmDestructive
+                  ? 'bg-red-600 hover:bg-red-700'
+                  : (supportsDryRun && dryRunMode ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-900 hover:bg-slate-800')
               }`}
             >
               {executing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
@@ -461,21 +672,44 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                   ? 'Ejecutando…'
                   : confirmDestructive
                     ? 'Confirmar y ejecutar acción destructiva'
-                    : 'Ejecutar herramienta'}
+                    : (supportsDryRun && dryRunMode ? 'Previsualizar plan (dryRun)' : 'Ejecutar herramienta')}
               </span>
             </button>
 
             {toolResult && (() => {
-              const remediation =
-                toolResult?.remediation ||
-                toolResult?.result?.remediation ||
-                toolResult?.error?.data?.remediation ||
-                null;
+              const errEnv = extractMcpErrorEnvelope(toolResult);
+              const remediation = errEnv?.remediation || null;
+              const mintedToken = toolResult?.result?.structuredContent?.confirmToken || null;
               return (
                 <div className="space-y-2">
                   {remediation && (
-                    <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900">
-                      <strong>Cómo solucionarlo:</strong> {String(remediation)}
+                    <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <strong>Cómo solucionarlo:</strong>
+                        {errEnv?.code && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-100 border border-amber-300 font-mono text-[10px]">
+                            {errEnv.code}
+                          </span>
+                        )}
+                        {errEnv?.retryable !== undefined && (
+                          <span className="px-1.5 py-0.5 rounded bg-white border border-amber-200 text-[10px]">
+                            {errEnv.retryable ? 'Reintentable' : 'No reintentable'}
+                          </span>
+                        )}
+                      </div>
+                      <p>{String(remediation)}</p>
+                    </div>
+                  )}
+                  {typeof mintedToken === 'string' && mintedToken.startsWith('ckr_') && (
+                    <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 flex items-center justify-between gap-2 flex-wrap">
+                      <span>Plan validado con token de confirmación de un solo uso (5 min).</span>
+                      <button
+                        type="button"
+                        onClick={() => handleLoadConfirmToken(mintedToken)}
+                        className="px-2.5 py-1 rounded-md bg-emerald-700 hover:bg-emerald-800 text-white font-medium text-[11px] cursor-pointer"
+                      >
+                        Cargar confirmToken (dryRun: false)
+                      </button>
                     </div>
                   )}
                   <pre className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-800 max-h-48 overflow-y-auto">

@@ -49,6 +49,10 @@ const IGNORED_FILES = new Set(['.DS_Store', 'Thumbs.db']);
 
 const MAX_FILES_PER_FRAME = 500;
 const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MiB por fichero en un frame
+const MAX_CHUNKED_FILE_BYTES = 100 * 1024 * 1024; // 100 MiB máximo para carga troceada con SHA-256
+const MAX_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB máximo por trozo
+const MAX_ACTIVE_CHUNK_UPLOADS = 16;
+const CHUNK_UPLOAD_TTL_MS = 5 * 60 * 1000;
 const MAX_PATCH_HISTORY = 25;
 const MAX_LATENCY_SAMPLES = 200;
 
@@ -645,9 +649,10 @@ function classifyChanges(relPaths) {
 let tempSeq = 0;
 
 /**
- * Escritura atómica en disco: temporal en el mismo directorio + rename (POSIX),
- * o escritura directa con `fstatSync` en Windows NTFS para evitar bloqueos del AV
- * y capturar el nuevo `(mtimeMs, size)` en una sola apertura de descriptor.
+ * Escritura atómica en disco (POSIX y Windows NTFS): escribe primero en un temporal
+ * en el mismo directorio, cierra el descriptor y realiza `renameSync` con reintentos
+ * cortos ante bloqueos transitorios del AV en Windows. Jamás trunca el archivo destino
+ * in-place para evitar lecturas corruptas a mitad de escritura.
  *
  * @param {string} absPath
  * @param {Buffer} buffer
@@ -659,25 +664,6 @@ function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
   if (!ensuredDirs || !ensuredDirs.has(dir)) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     if (ensuredDirs) ensuredDirs.add(dir);
-  }
-  if (process.platform === 'win32') {
-    const maxAttempts = 4;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const fd = fs.openSync(absPath, 'w');
-        try {
-          if (buffer.length > 0) fs.writeSync(fd, buffer, 0, buffer.length, 0);
-          const st = fs.fstatSync(fd);
-          return { mtimeMs: st.mtimeMs, size: st.size };
-        } finally {
-          fs.closeSync(fd);
-        }
-      } catch (err) {
-        const transient = err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES');
-        if (!transient || attempt === maxAttempts) throw err;
-        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); } catch (e) {}
-      }
-    }
   }
   const tempPath = `${absPath}.culkibo-sync-${process.pid}-${++tempSeq}.tmp`;
   /** @type {{ mtimeMs: number, size: number } | null} */
@@ -701,14 +687,15 @@ function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
     }
   }
   let renamed = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  const maxAttempts = process.platform === 'win32' ? 5 : 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       fs.renameSync(tempPath, absPath);
       renamed = true;
       break;
     } catch (err) {
-      if (attempt < 3 && err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES')) {
-        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * attempt); } catch (e) {}
+      if (attempt < maxAttempts && err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES')) {
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * attempt); } catch (e) {}
         continue;
       }
       break;
@@ -736,6 +723,22 @@ function writeFileAtomic(absPath, buffer, ensuredDirs = null) {
   } catch (e) {
     return null;
   }
+}
+
+/** Calcula SHA-256 de un fichero grande en streaming síncrono con búfer fijo de 256 KiB (0 picos RAM). */
+function sha256FileSync(absPath) {
+  const hasher = crypto.createHash('sha256');
+  const buf = Buffer.allocUnsafe(256 * 1024);
+  const fd = fs.openSync(absPath, 'r');
+  try {
+    let bytesRead = 0;
+    while ((bytesRead = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+      hasher.update(bytesRead === buf.length ? buf : buf.subarray(0, bytesRead));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hasher.digest('hex');
 }
 
 /** Caché por (absPath -> { mtimeMs, size, hash }) para árboles Merkle ultrarrápidos. */
@@ -784,7 +787,7 @@ function computeMerkleTree(baseDir) {
         const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
         try {
           const st = fs.statSync(abs);
-          if (st.size > MAX_FILE_BYTES) continue;
+          if (st.size > MAX_CHUNKED_FILE_BYTES) continue;
           scannedFiles++;
           totalBytes += st.size;
           const cached = merkleFileCache.get(abs);
@@ -794,8 +797,7 @@ function computeMerkleTree(baseDir) {
             merkleFileCache.set(abs, cached);
             files[rel] = cached.hash;
           } else {
-            const buf = fs.readFileSync(abs);
-            const h = sha256(buf);
+            const h = st.size > MAX_FILE_BYTES ? sha256FileSync(abs) : sha256(fs.readFileSync(abs));
             files[rel] = h;
             if (merkleFileCache.size >= MAX_MERKLE_CACHE_ENTRIES) {
               const oldest = merkleFileCache.keys().next().value;
@@ -1189,12 +1191,24 @@ class LiveSyncEngine extends EventEmitter {
         lastActiveMs: Date.now(),
         cachedRealBaseKey: /** @type {string | null} */ (null),
         cachedRealBase: /** @type {string | null} */ (null),
-        verifiedDirs: /** @type {Set<string>} */ (new Set())
+        verifiedDirs: /** @type {Set<string>} */ (new Set()),
+        chunkUploads: /** @type {Map<string, any>} */ (new Map())
       };
       this.sessions.set(projectId, s);
     }
     s.lastActiveMs = Date.now();
     return s;
+  }
+
+  /** Limpia temporales de cargas troceadas caducadas o huérfanas. */
+  _cleanupChunkUploads(session, onlyExpired = true) {
+    if (!session || !session.chunkUploads || session.chunkUploads.size === 0) return;
+    const now = Date.now();
+    for (const [uid, up] of Array.from(session.chunkUploads.entries())) {
+      if (onlyExpired && (now - up.updatedAtMs) < CHUNK_UPLOAD_TTL_MS) continue;
+      session.chunkUploads.delete(uid);
+      try { if (up.tempPath && fs.existsSync(up.tempPath)) fs.unlinkSync(up.tempPath); } catch (e) {}
+    }
   }
 
   /** Libera buffers en RAM y elimina sesiones abandonadas desconectadas tras `maxIdleMs`. */
@@ -1225,6 +1239,7 @@ class LiveSyncEngine extends EventEmitter {
         s.clientSeqMap.clear();
       }
       if (s.verifiedDirs) s.verifiedDirs.clear();
+      this._cleanupChunkUploads(s, false);
       if (idleFor >= maxIdleMs * 4) {
         this.sessions.delete(pid);
         evicted++;
@@ -1364,8 +1379,25 @@ class LiveSyncEngine extends EventEmitter {
         preparedByRel.set(rel, { rel, abs, op, buffer: null, hash: null, baseSha256, stat });
       }
     }
-    // Deduplicación last-write-wins: evita duplicar entradas en undoEntries si una ruta se repite en la misma trama
+    // Deduplicación last-write-wins y ordenación segura para renombres sólo de mayúsculas/minúsculas
+    // (en NTFS/APFS un delete `App.tsx` DEBE ejecutarse ANTES del upsert `app.tsx` para no borrar el nuevo fichero).
     const prepared = Array.from(preparedByRel.values());
+    const upsertLower = new Set(prepared.filter((p) => p.op === 'upsert').map((p) => p.rel.toLowerCase()));
+    const hasCaseCollision = prepared.some((p) => p.op === 'delete' && upsertLower.has(p.rel.toLowerCase()));
+    if (hasCaseCollision) {
+      const deleteLower = new Set(prepared.filter((p) => p.op === 'delete').map((p) => p.rel.toLowerCase()));
+      prepared.sort((a, b) => {
+        if (a.op === b.op) return 0;
+        return a.op === 'delete' ? -1 : 1;
+      });
+      // En sistemas insensibles a mayúsculas (NTFS/APFS), invalidar el `stat` previo del upsert
+      // tras borrar la capitalización anterior para garantizar que el fichero se recree con el nuevo nombre.
+      for (const p of prepared) {
+        if (p.op === 'upsert' && deleteLower.has(p.rel.toLowerCase())) {
+          p.stat = null;
+        }
+      }
+    }
 
     const prevLastSeq = session.lastSeq;
     let reconcileRequired = false;
@@ -2450,8 +2482,337 @@ class LiveSyncEngine extends EventEmitter {
     };
   }
 
+  // =========================================================================
+  // CHUNKED UPLOAD (>10 MiB hasta 100 MiB) CON VERIFICACIÓN SHA-256 ATÓMICA
+  // =========================================================================
+
+  /**
+   * Inicia una carga troceada para ficheros grandes (>10 MiB, hasta 100 MiB) sin
+   * mantener el fichero entero en memoria ni sobrepasar el límite de frame WS.
+   *
+   * @param {string} projectId
+   * @param {{ path: string, totalBytes: number, sha256: string, baseSha256?: string | null, clientId?: string | null, clientName?: string | null }} meta
+   * @param {{ targetDir?: string | null }} [options]
+   */
+  startChunkedUpload(projectId, meta, options = {}) {
+    const session = this.getOrCreateSession(projectId);
+    this._cleanupChunkUploads(session, true);
+    if (session.chunkUploads.size >= MAX_ACTIVE_CHUNK_UPLOADS) {
+      const err = new Error(`Demasiadas cargas troceadas simultáneas (máximo ${MAX_ACTIVE_CHUNK_UPLOADS})`);
+      /** @type {any} */ (err).code = 'TOO_MANY_UPLOADS';
+      throw err;
+    }
+
+    const baseDir = this.resolveTargetDir(projectId, options.targetDir || null);
+    const { rel, abs } = resolveSafeFilePath(baseDir, meta && meta.path);
+
+    const totalBytes = Number(meta && meta.totalBytes);
+    if (!Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > MAX_CHUNKED_FILE_BYTES) {
+      const err = new Error(`totalBytes inválido para carga troceada (0..${MAX_CHUNKED_FILE_BYTES}): ${meta && meta.totalBytes}`);
+      /** @type {any} */ (err).code = 'FILE_TOO_LARGE';
+      throw err;
+    }
+    const expectedSha256 = String((meta && meta.sha256) || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+      const err = new Error('startChunkedUpload requiere un sha256 hexadecimal válido de 64 caracteres');
+      /** @type {any} */ (err).code = 'INVALID_SHA256';
+      throw err;
+    }
+
+    const dir = path.dirname(abs);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const uploadId = `chk_${Date.now().toString(36)}_${crypto.randomBytes(6).toString('hex')}`;
+    const tempPath = `${abs}.culkibo-sync-chunk-${uploadId}.tmp`;
+    fs.writeFileSync(tempPath, Buffer.alloc(0));
+
+    const nowMs = Date.now();
+    session.chunkUploads.set(uploadId, {
+      uploadId,
+      rel,
+      abs,
+      baseDir,
+      tempPath,
+      totalBytes,
+      expectedSha256,
+      baseSha256: meta && meta.baseSha256 ? String(meta.baseSha256) : null,
+      clientId: meta && meta.clientId ? String(meta.clientId) : null,
+      clientName: meta && meta.clientName ? String(meta.clientName) : null,
+      receivedBytes: 0,
+      nextIndex: 0,
+      hasher: crypto.createHash('sha256'),
+      startedAtMs: nowMs,
+      updatedAtMs: nowMs
+    });
+
+    return {
+      ok: true,
+      uploadId,
+      path: rel,
+      totalBytes,
+      maxChunkBytes: MAX_CHUNK_BYTES
+    };
+  }
+
+  /**
+   * Añade un trozo secuencial (`index === nextIndex`) a una carga troceada activa.
+   *
+   * @param {string} projectId
+   * @param {{ uploadId: string, index: number, data: Buffer | string, encoding?: 'base64' | 'utf8' }} part
+   */
+  appendChunk(projectId, part) {
+    const session = this.getOrCreateSession(projectId);
+    const uploadId = String((part && part.uploadId) || '');
+    const upload = session.chunkUploads.get(uploadId);
+    if (!upload) {
+      const err = new Error(`Carga troceada no encontrada o expirada: ${uploadId}`);
+      /** @type {any} */ (err).code = 'UPLOAD_NOT_FOUND';
+      throw err;
+    }
+    const index = Number(part && part.index);
+    if (!Number.isInteger(index) || index !== upload.nextIndex) {
+      const err = new Error(`Índice de trozo fuera de orden: esperado ${upload.nextIndex}, recibido ${index}`);
+      /** @type {any} */ (err).code = 'OUT_OF_ORDER_CHUNK';
+      throw err;
+    }
+    const buf = Buffer.isBuffer(part.data)
+      ? part.data
+      : Buffer.from(String(part.data || ''), part.encoding === 'utf8' ? 'utf8' : 'base64');
+    if (buf.length > MAX_CHUNK_BYTES) {
+      const err = new Error(`Trozo supera el máximo permitido (${MAX_CHUNK_BYTES} bytes)`);
+      /** @type {any} */ (err).code = 'CHUNK_TOO_LARGE';
+      throw err;
+    }
+    if (upload.receivedBytes + buf.length > upload.totalBytes) {
+      const err = new Error(`Los bytes recibidos superan totalBytes (${upload.totalBytes})`);
+      /** @type {any} */ (err).code = 'CHUNK_OVERFLOW';
+      throw err;
+    }
+
+    if (buf.length > 0) {
+      fs.appendFileSync(upload.tempPath, buf);
+      upload.hasher.update(buf);
+      upload.receivedBytes += buf.length;
+    }
+    upload.nextIndex++;
+    upload.updatedAtMs = Date.now();
+
+    return {
+      ok: true,
+      uploadId,
+      index,
+      receivedBytes: upload.receivedBytes,
+      totalBytes: upload.totalBytes
+    };
+  }
+
+  /**
+   * Verifica tamaño y SHA-256 final y promueve atómicamente el fichero troceado a su ruta destino.
+   *
+   * @param {string} projectId
+   * @param {{ uploadId: string }} req
+   * @param {{ targetDir?: string | null, deferEmit?: boolean }} [options]
+   */
+  commitChunkedUpload(projectId, req, options = {}) {
+    const startedNs = process.hrtime.bigint();
+    const session = this.getOrCreateSession(projectId);
+    const uploadId = String((req && req.uploadId) || '');
+    const upload = session.chunkUploads.get(uploadId);
+    if (!upload) {
+      const err = new Error(`Carga troceada no encontrada o expirada: ${uploadId}`);
+      /** @type {any} */ (err).code = 'UPLOAD_NOT_FOUND';
+      throw err;
+    }
+
+    const cleanupTemp = () => {
+      session.chunkUploads.delete(uploadId);
+      try { if (upload.tempPath && fs.existsSync(upload.tempPath)) fs.unlinkSync(upload.tempPath); } catch (e) {}
+    };
+
+    if (upload.receivedBytes !== upload.totalBytes) {
+      cleanupTemp();
+      const err = new Error(`Carga troceada incompleta: recibidos ${upload.receivedBytes} de ${upload.totalBytes} bytes`);
+      /** @type {any} */ (err).code = 'INCOMPLETE_UPLOAD';
+      throw err;
+    }
+
+    const actualSha = upload.hasher.digest('hex');
+    if (actualSha !== upload.expectedSha256) {
+      cleanupTemp();
+      const err = new Error(`Checksum SHA-256 inválido en carga troceada para ${upload.rel}`);
+      /** @type {any} */ (err).code = 'CHECKSUM_MISMATCH';
+      throw err;
+    }
+
+    // Re-verificación anti-TOCTOU/symlink antes de mover el temporal al destino final
+    const baseDir = this.resolveTargetDir(projectId, options.targetDir || upload.baseDir || null);
+    let safe;
+    try {
+      safe = resolveSafeFilePath(baseDir, upload.rel);
+    } catch (e) {
+      cleanupTemp();
+      throw e;
+    }
+
+    let renamed = false;
+    const maxAttempts = process.platform === 'win32' ? 5 : 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        fs.renameSync(upload.tempPath, safe.abs);
+        renamed = true;
+        break;
+      } catch (err) {
+        if (attempt < maxAttempts && err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES')) {
+          try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * attempt); } catch (e) {}
+          continue;
+        }
+        break;
+      }
+    }
+    if (!renamed) {
+      try {
+        fs.copyFileSync(upload.tempPath, safe.abs);
+      } finally {
+        try { if (fs.existsSync(upload.tempPath)) fs.unlinkSync(upload.tempPath); } catch (e) {}
+      }
+    }
+    session.chunkUploads.delete(uploadId);
+
+    /** @type {{ mtimeMs: number, size: number } | null} */
+    let postStat = null;
+    try {
+      const st = fs.statSync(safe.abs);
+      postStat = { mtimeMs: st.mtimeMs, size: st.size };
+    } catch (e) {}
+    deleteSessionFileCache(session, safe.abs);
+    putMerkleCache(safe.abs, postStat, actualSha);
+
+    const nowMs = Date.now();
+    const appliedAt = new Date(nowMs).toISOString();
+    const seq = ++session.lastSeq;
+    const classification = classifyChanges([upload.rel]);
+    const applyMs = Number((Number(process.hrtime.bigint() - startedNs) / 1e6).toFixed(2));
+
+    session.framesApplied++;
+    session.filesWritten++;
+    session.bytesSynced += upload.totalBytes;
+    session.lastPath = classification.path;
+    session.lastReason = classification.reason;
+    session.lastAppliedAt = appliedAt;
+    session.lastApplyMs = applyMs;
+    recordFileTouch(session, upload.rel, {
+      clientId: upload.clientId,
+      clientName: upload.clientName,
+      seq,
+      atMs: nowMs,
+      at: appliedAt,
+      sha256: actualSha,
+      op: 'upsert'
+    });
+    session.recentFrames.unshift({
+      seq,
+      at: appliedAt,
+      appliedAt,
+      clientId: upload.clientId,
+      clientName: upload.clientName,
+      written: 1,
+      deleted: 0,
+      dedupSkipped: 0,
+      bytesWritten: upload.totalBytes,
+      applyMs,
+      mode: classification.path,
+      files: [upload.rel],
+      totalFiles: 1,
+      chunked: true
+    });
+    if (session.recentFrames.length > MAX_RECENT_FRAMES) session.recentFrames.pop();
+
+    const result = {
+      applied: true,
+      chunked: true,
+      projectId,
+      uploadId,
+      seq,
+      serverSeq: seq,
+      path: upload.rel,
+      written: 1,
+      deleted: 0,
+      dedupSkipped: 0,
+      bytesWritten: upload.totalBytes,
+      sha256: actualSha,
+      changedFiles: [upload.rel],
+      conflicts: [],
+      mode: classification.path,
+      reason: classification.reason,
+      triggerFiles: classification.triggerFiles,
+      applyMs
+    };
+    if (!options.deferEmit) {
+      this.emitApplied(result);
+    }
+    return result;
+  }
+
+  /** Aborta una carga troceada y elimina su fichero temporal. */
+  abortChunkedUpload(projectId, { uploadId }) {
+    const session = this.getOrCreateSession(projectId);
+    const uid = String(uploadId || '');
+    const upload = session.chunkUploads.get(uid);
+    if (!upload) return { aborted: false, uploadId: uid };
+    session.chunkUploads.delete(uid);
+    try { if (upload.tempPath && fs.existsSync(upload.tempPath)) fs.unlinkSync(upload.tempPath); } catch (e) {}
+    return { aborted: true, uploadId: uid };
+  }
+
+  /**
+   * Despachador unificado de mensajes WS de carga troceada (`chunk_start`, `chunk_part`, `chunk_commit`, `chunk_abort`)
+   * para conectar con `/ws/sync` en `server/index.js`.
+   *
+   * @param {string} projectId
+   * @param {any} msg
+   * @param {{ targetDir?: string | null, clientId?: string | null, clientName?: string | null, deferEmit?: boolean }} [options]
+   */
+  handleChunkMessage(projectId, msg, options = {}) {
+    const type = String(msg && msg.type || '');
+    if (type === 'chunk_start') {
+      const res = this.startChunkedUpload(projectId, {
+        path: msg.path,
+        totalBytes: msg.totalBytes,
+        sha256: msg.sha256,
+        baseSha256: msg.baseSha256 || null,
+        clientId: options.clientId || null,
+        clientName: options.clientName || null
+      }, { targetDir: options.targetDir || null });
+      return { type: 'chunk_ack', op: 'start', reqId: msg.reqId || null, ...res };
+    }
+    if (type === 'chunk_part') {
+      const res = this.appendChunk(projectId, {
+        uploadId: msg.uploadId,
+        index: msg.index,
+        data: msg.data,
+        encoding: msg.encoding || 'base64'
+      });
+      return { type: 'chunk_ack', op: 'part', reqId: msg.reqId || null, ...res };
+    }
+    if (type === 'chunk_commit') {
+      const res = this.commitChunkedUpload(projectId, { uploadId: msg.uploadId }, {
+        targetDir: options.targetDir || null,
+        deferEmit: options.deferEmit
+      });
+      return { type: 'chunk_ack', op: 'commit', reqId: msg.reqId || null, ...res };
+    }
+    if (type === 'chunk_abort') {
+      const res = this.abortChunkedUpload(projectId, { uploadId: msg.uploadId });
+      return { type: 'chunk_ack', op: 'abort', reqId: msg.reqId || null, ...res };
+    }
+    const err = new Error(`Mensaje de carga troceada no soportado: ${type}`);
+    /** @type {any} */ (err).code = 'UNKNOWN_CHUNK_OP';
+    throw err;
+  }
+
   /** Limpia el estado en memoria de una sesión (usado por pruebas). */
   resetSession(projectId) {
+    const s = this.sessions.get(projectId);
+    if (s) this._cleanupChunkUploads(s, false);
     this.sessions.delete(projectId);
     this.targetOverrides.delete(projectId);
   }
@@ -2464,11 +2825,16 @@ const liveSyncEngineInstance = Object.assign(new LiveSyncEngine(), {
   computeMerkleTree,
   diffMerkleTrees,
   sha256,
+  sha256FileSync,
+  writeFileAtomic,
   decodeCompressedPayload,
   decodeBinarySyncFrame,
   FRAME_MAGIC_RAW,
   FRAME_MAGIC_BROTLI,
   FRAME_MAGIC_GZIP,
+  MAX_FILE_BYTES,
+  MAX_CHUNKED_FILE_BYTES,
+  MAX_CHUNK_BYTES,
   MAX_DECOMPRESSED_FRAME_BYTES,
   MAX_FRAME_META_BYTES
 });

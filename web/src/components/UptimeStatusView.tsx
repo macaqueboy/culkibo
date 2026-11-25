@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import {
   api,
+  apiFetch,
   type UptimeMonitor,
   type PublicStatusPage,
   type ResourceAdvisorReport,
@@ -74,8 +75,9 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const [busyId, setBusyId] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Add Monitor modal
+  // Add/Edit Monitor modal
   const [monitorModalOpen, setMonitorModalOpen] = useState(false);
+  const [editingMonitorId, setEditingMonitorId] = useState<string | null>(null);
   const [monForm, setMonForm] = useState({
     name: '',
     type: 'http' as 'http' | 'tcp' | 'managed_project',
@@ -83,11 +85,20 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
     host: '',
     port: '443',
     projectId: '',
+    healthPath: '/',
     intervalSec: '60',
     expectedStatus: '200',
     keyword: '',
     maxLatencyMs: '3000',
     public: true,
+  });
+
+  // Manual status page incident modal
+  const [incidentSlug, setIncidentSlug] = useState<string | null>(null);
+  const [incidentForm, setIncidentForm] = useState({
+    title: '',
+    severity: 'minor' as 'minor' | 'major' | 'critical' | 'maintenance',
+    message: '',
   });
 
   // Status Page Builder modal
@@ -125,17 +136,43 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
       setAdvisor(advRes);
 
       if (projList.length > 0) {
-        const policyEntries = await Promise.all(
-          projList.slice(0, 20).map(async (p) => {
-            const pol = await api.getSleepPolicy(p.id).catch(() => null);
-            return pol ? ([p.id, pol] as const) : null;
-          })
-        );
-        const map: Record<string, SleepPolicy> = {};
-        for (const entry of policyEntries) {
-          if (entry) map[entry[0]] = entry[1];
+        // Prefer bulk GET /api/sleep to avoid N+1 requests; fallback to batched per-project reads for ALL projects
+        let loadedBulk = false;
+        try {
+          const bulkRes = await apiFetch('/api/sleep');
+          if (bulkRes.ok) {
+            const bulkData = await bulkRes.json();
+            const list: SleepPolicy[] = Array.isArray(bulkData)
+              ? bulkData
+              : Array.isArray(bulkData?.policies)
+                ? bulkData.policies
+                : [];
+            const map: Record<string, SleepPolicy> = {};
+            for (const pol of list) {
+              if (pol && pol.projectId) map[pol.projectId] = pol;
+            }
+            setSleepPolicies(map);
+            loadedBulk = true;
+          }
+        } catch {}
+
+        if (!loadedBulk) {
+          const map: Record<string, SleepPolicy> = {};
+          const chunkSize = 10;
+          for (let i = 0; i < projList.length; i += chunkSize) {
+            const chunk = projList.slice(i, i + chunkSize);
+            const entries = await Promise.all(
+              chunk.map(async (p) => {
+                const pol = await api.getSleepPolicy(p.id).catch(() => null);
+                return pol ? ([p.id, pol] as const) : null;
+              })
+            );
+            for (const entry of entries) {
+              if (entry) map[entry[0]] = entry[1];
+            }
+          }
+          setSleepPolicies(map);
         }
-        setSleepPolicies(map);
       }
     } finally {
       setLoading(false);
@@ -157,6 +194,46 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
     onNotify(label, 'success');
   };
 
+  const openNewMonitor = () => {
+    setEditingMonitorId(null);
+    setMonForm({
+      name: '',
+      type: 'http',
+      url: '',
+      host: '',
+      port: '443',
+      projectId: projects[0]?.id || '',
+      healthPath: '/',
+      intervalSec: '60',
+      expectedStatus: '200',
+      keyword: '',
+      maxLatencyMs: '3000',
+      public: true,
+    });
+    setMonitorModalOpen(true);
+  };
+
+  const openEditMonitor = (mon: UptimeMonitor) => {
+    const monAny = mon as any;
+    const isManaged = Boolean(monAny.allowLocalProject || mon.type === 'managed_project');
+    setEditingMonitorId(mon.id);
+    setMonForm({
+      name: mon.name || '',
+      type: isManaged ? 'managed_project' : (mon.type === 'tcp' ? 'tcp' : 'http'),
+      url: mon.url || '',
+      host: mon.host || '',
+      port: String(mon.port ?? 443),
+      projectId: mon.projectId || projects[0]?.id || '',
+      healthPath: monAny.healthPath || '/',
+      intervalSec: String(mon.intervalSec || 60),
+      expectedStatus: String(mon.expectedStatus ?? 200),
+      keyword: mon.keyword || '',
+      maxLatencyMs: mon.maxLatencyMs != null ? String(mon.maxLatencyMs) : '3000',
+      public: mon.public !== false,
+    });
+    setMonitorModalOpen(true);
+  };
+
   const handleCreateMonitor = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!monForm.name.trim()) return;
@@ -165,34 +242,122 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
       const intervalSec = Math.max(30, Number.parseInt(monForm.intervalSec, 10) || 60);
       const expectedStatus = Number.parseInt(monForm.expectedStatus, 10) || 200;
       const maxLatencyMs = Number.parseInt(monForm.maxLatencyMs, 10) || undefined;
-      await api.createUptimeMonitor({
+      const cleanHealthPath = (monForm.healthPath.trim() || '/').startsWith('/')
+        ? (monForm.healthPath.trim() || '/')
+        : `/${monForm.healthPath.trim()}`;
+      const body = {
         name: monForm.name.trim(),
         type: monForm.type,
         ...(monForm.type === 'http' ? { url: monForm.url.trim(), expectedStatus, keyword: monForm.keyword.trim() || undefined } : {}),
         ...(monForm.type === 'tcp' ? { host: monForm.host.trim(), port: Number.parseInt(monForm.port, 10) || 443 } : {}),
-        ...(monForm.type === 'managed_project' ? { projectId: monForm.projectId, expectedStatus } : {}),
+        ...(monForm.type === 'managed_project'
+          ? { projectId: monForm.projectId, allowLocalProject: true, healthPath: cleanHealthPath, expectedStatus }
+          : {}),
         intervalSec,
         maxLatencyMs,
         public: monForm.public,
-      });
+      };
+      if (editingMonitorId) {
+        const res = await apiFetch(`/api/uptime/monitors/${encodeURIComponent(editingMonitorId)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const d = await res.json().catch(() => ({}));
+          throw new Error(d.error || 'No se pudo actualizar el monitor');
+        }
+        onNotify('Monitor de disponibilidad actualizado', 'success');
+      } else {
+        const res = await apiFetch('/api/uptime/monitors', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const d = await res.json().catch(() => ({}));
+          throw new Error(d.error || 'No se pudo crear el monitor');
+        }
+        onNotify('Monitor de disponibilidad creado y activo', 'success');
+      }
       setMonitorModalOpen(false);
-      setMonForm({
-        name: '',
-        type: 'http',
-        url: '',
-        host: '',
-        port: '443',
-        projectId: projects[0]?.id || '',
-        intervalSec: '60',
-        expectedStatus: '200',
-        keyword: '',
-        maxLatencyMs: '3000',
-        public: true,
-      });
-      onNotify('Monitor de disponibilidad creado y activo', 'success');
+      setEditingMonitorId(null);
       await loadAll();
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'No se pudo crear el monitor', 'error');
+      onNotify(err instanceof Error ? err.message : 'No se pudo guardar el monitor', 'error');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handlePublishPageIncident = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!incidentSlug || !incidentForm.title.trim()) return;
+    setBusyId(`inc-${incidentSlug}`);
+    try {
+      const res = await apiFetch(`/api/uptime/pages/${encodeURIComponent(incidentSlug)}/incidents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: incidentForm.title.trim(),
+          severity: incidentForm.severity,
+          message: incidentForm.message.trim(),
+        }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error || 'No se pudo publicar el incidente en la página de estado');
+      }
+      setIncidentSlug(null);
+      setIncidentForm({ title: '', severity: 'minor', message: '' });
+      onNotify('Incidente publicado en la página pública de estado', 'success');
+      await loadAll();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Error al publicar el incidente', 'error');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleResolvePageIncident = async (slug: string, incidentId: string) => {
+    setBusyId(`res-inc-${incidentId}`);
+    try {
+      const res = await apiFetch(`/api/uptime/pages/${encodeURIComponent(slug)}/incidents/${encodeURIComponent(incidentId)}/resolve`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error('No se pudo resolver el incidente');
+      onNotify('Incidente marcado como resuelto', 'success');
+      await loadAll();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Error al resolver el incidente', 'error');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleApplyRecommendation = async (rec: any) => {
+    const action = rec?.action;
+    const pid = rec?.projectId || action?.projectId;
+    if (!pid) return;
+    setBusyId(`rec-${rec.id || pid}`);
+    try {
+      if (action?.kind === 'enable_sleep' || rec.type === 'auto_sleep_candidate' || rec.category === 'auto_sleep') {
+        await api.saveSleepPolicy(pid, {
+          enabled: true,
+          mode: action?.suggestedMode === 'pause' ? 'pause' : 'stop',
+          idleMinutes: Number(action?.suggestedIdleMinutes) || 15,
+          excludeCrons: true,
+        });
+        onNotify(`Auto-Sleep activado para ${rec.projectName || rec.target || pid}`, 'success');
+      } else if (action?.kind === 'resize_memory' || rec.recommendedMemoryMb) {
+        const nextMb = Number(action?.recommendedMemoryMb || rec.recommendedMemoryMb);
+        if (!Number.isFinite(nextMb) || nextMb < 64) return;
+        await api.updateProject(pid, { memoryMb: nextMb });
+        onNotify(`Límite de RAM actualizado a ${nextMb} MB para ${rec.projectName || rec.target || pid}`, 'success');
+      }
+      await loadAll();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'No se pudo aplicar la recomendación', 'error');
     } finally {
       setBusyId(null);
     }
@@ -343,8 +508,15 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const handleSleepNow = async (proj: Project) => {
     setBusyId(`sleep-${proj.id}`);
     try {
-      await api.sleepProject(proj.id);
-      onNotify(`${proj.name} puesto en reposo (despertará automáticamente al recibir tráfico)`, 'success');
+      const res: any = await api.sleepProject(proj.id);
+      if (res && (res.slept === false || res.blocked === true || res.sleeping === false)) {
+        onNotify(
+          res.reason || res.error || `No se pudo suspender ${proj.name} porque tiene operaciones activas`,
+          'error'
+        );
+      } else {
+        onNotify(`${proj.name} puesto en reposo (despertará automáticamente al recibir tráfico)`, 'success');
+      }
       await loadAll();
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'No se pudo suspender el proyecto', 'error');
@@ -356,8 +528,12 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const handleWakeNow = async (proj: Project) => {
     setBusyId(`wake-${proj.id}`);
     try {
-      await api.wakeProject(proj.id);
-      onNotify(`${proj.name} reactivado y en línea`, 'success');
+      const res: any = await api.wakeProject(proj.id);
+      if (res && (res.woken === false || res.awake === false)) {
+        onNotify(res.error || `No se pudo reactivar ${proj.name}`, 'error');
+      } else {
+        onNotify(`${proj.name} reactivado y en línea`, 'success');
+      }
       await loadAll();
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'No se pudo despertar el proyecto', 'error');
@@ -368,7 +544,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
 
   const summary = useMemo(() => {
     const upCount = monitors.filter((m) => m.status === 'up').length;
-    const incidents = monitors.filter((m) => m.incidentOpen || m.status === 'down').length;
+    const incidents = monitors.filter((m) => Boolean(m.incidentOpen || m.activeIncidentId || m.status === 'down')).length;
     const uptimes = monitors.map((m) => m.uptime24h).filter((x): x is number => typeof x === 'number');
     const avgUptime = uptimes.length > 0 ? uptimes.reduce((a, b) => a + b, 0) / uptimes.length : null;
     const p95s = monitors.map((m) => m.p95LatencyMs).filter((x): x is number => typeof x === 'number');
@@ -474,10 +650,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setMonForm((f) => ({ ...f, projectId: f.projectId || projects[0]?.id || '' }));
-                  setMonitorModalOpen(true);
-                }}
+                onClick={openNewMonitor}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" />
@@ -495,7 +668,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
               </p>
               <button
                 type="button"
-                onClick={() => setMonitorModalOpen(true)}
+                onClick={openNewMonitor}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 text-white text-xs font-medium cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" /> Crear primer monitor
@@ -538,6 +711,14 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                         >
                           <RefreshCw className={`w-3.5 h-3.5 ${busyId === `chk-${mon.id}` ? 'animate-spin' : ''}`} />
                           <span>Comprobar</span>
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Editar monitor ${mon.name}`}
+                          onClick={() => openEditMonitor(mon)}
+                          className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 cursor-pointer"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
                         </button>
                         <button
                           type="button"
@@ -690,6 +871,26 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
 
                     {p.description && <p className="text-xs text-slate-600">{p.description}</p>}
 
+                    {Array.isArray((p as any).incidents) && (p as any).incidents.filter((i: any) => i.status === 'open').length > 0 && (
+                      <div className="space-y-1.5">
+                        {(p as any).incidents
+                          .filter((i: any) => i.status === 'open')
+                          .map((inc: any) => (
+                            <div key={inc.id} className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 text-[11px]">
+                              <span className="text-amber-900 font-medium truncate">{inc.title}</span>
+                              <button
+                                type="button"
+                                disabled={busyId === `res-inc-${inc.id}`}
+                                onClick={() => void handleResolvePageIncident(p.slug, inc.id)}
+                                className="px-2 py-0.5 rounded bg-white border border-amber-300 text-amber-900 font-medium hover:bg-amber-100 cursor-pointer shrink-0"
+                              >
+                                Resolver
+                              </button>
+                            </div>
+                          ))}
+                      </div>
+                    )}
+
                     <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-100 mt-auto">
                       <a
                         href={`/status/${encodeURIComponent(p.slug)}`}
@@ -715,6 +916,17 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                       >
                         {copiedKey === `md-${p.slug}` ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                         <span>Badge SVG</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIncidentSlug(p.slug);
+                          setIncidentForm({ title: '', severity: 'minor', message: '' });
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-amber-50 border border-slate-200 hover:border-amber-200 text-xs text-slate-700 hover:text-amber-900 cursor-pointer"
+                      >
+                        <AlertTriangle className="w-3.5 h-3.5" />
+                        <span>Incidente</span>
                       </button>
                       <button
                         type="button"
@@ -841,17 +1053,30 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
               </div>
               <div className="divide-y divide-slate-100">
                 {advisor.recommendations.map((rec, idx) => {
+                  const recAny = rec as any;
                   const recSavings = rec.estimatedMonthlySavingsEur ?? rec.estimatedSavingsEur;
+                  const canApply = Boolean(
+                    (rec.projectId || recAny.action?.projectId) &&
+                    (recAny.action?.kind === 'enable_sleep' ||
+                      recAny.action?.kind === 'resize_memory' ||
+                      recAny.type === 'auto_sleep_candidate' ||
+                      recAny.recommendedMemoryMb)
+                  );
+                  const applyLabel =
+                    rec.actionLabel ||
+                    (recAny.action?.kind === 'enable_sleep' || recAny.type === 'auto_sleep_candidate'
+                      ? 'Activar Auto-Sleep'
+                      : recAny.recommendedMemoryMb
+                        ? `Ajustar a ${recAny.recommendedMemoryMb} MB`
+                        : 'Aplicar');
+                  const isCrit = rec.severity === 'critical';
+                  const isWarn = rec.severity === 'high' || rec.severity === 'warn' || rec.severity === 'medium';
                   return (
-                    <div key={rec.id || `${rec.category}-${idx}`} className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                    <div key={rec.id || `${rec.category || recAny.type}-${idx}`} className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
                       <div className="flex items-start gap-2.5 min-w-0">
                         <AlertTriangle
                           className={`w-4 h-4 shrink-0 mt-0.5 ${
-                            rec.severity === 'critical'
-                              ? 'text-red-600'
-                              : rec.severity === 'warn'
-                                ? 'text-amber-600'
-                                : 'text-emerald-600'
+                            isCrit ? 'text-red-600' : isWarn ? 'text-amber-600' : 'text-emerald-600'
                           }`}
                         />
                         <div className="min-w-0">
@@ -859,7 +1084,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                           <p className="text-slate-500 mt-0.5 leading-relaxed">{rec.detail}</p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 shrink-0 tabular-nums">
+                      <div className="flex items-center gap-2 shrink-0 tabular-nums flex-wrap">
                         {rec.reclaimableRamMb ? (
                           <span className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 font-mono text-[11px]">
                             +{Math.round(rec.reclaimableRamMb)} MB RAM
@@ -870,6 +1095,16 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                             {formatEur(recSavings)}/mes
                           </span>
                         ) : null}
+                        {canApply && (
+                          <button
+                            type="button"
+                            disabled={busyId === `rec-${rec.id || rec.projectId}`}
+                            onClick={() => void handleApplyRecommendation(recAny)}
+                            className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-medium cursor-pointer disabled:opacity-50"
+                          >
+                            {busyId === `rec-${rec.id || rec.projectId}` ? 'Aplicando…' : applyLabel}
+                          </button>
+                        )}
                       </div>
                     </div>
                   );
@@ -962,11 +1197,14 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
         </div>
       )}
 
-      {/* Modal: Añadir Monitor */}
+      {/* Modal: Añadir / Editar Monitor */}
       <Modal
         open={monitorModalOpen}
-        onClose={() => setMonitorModalOpen(false)}
-        title="Nuevo monitor de disponibilidad"
+        onClose={() => {
+          setMonitorModalOpen(false);
+          setEditingMonitorId(null);
+        }}
+        title={editingMonitorId ? 'Editar monitor de disponibilidad' : 'Nuevo monitor de disponibilidad'}
         subtitle="Las URLs externas se validan contra SSRF y DNS rebinding en cada sondeo."
         maxWidthClass="max-w-lg"
       >
@@ -1038,20 +1276,31 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
           )}
 
           {monForm.type === 'managed_project' && (
-            <label className="block">
-              <span className="font-medium text-slate-700">Proyecto Culkibo</span>
-              <select
-                required
-                value={monForm.projectId}
-                onChange={(e) => setMonForm({ ...monForm, projectId: e.target.value })}
-                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-900"
-              >
-                <option value="">Selecciona un proyecto…</option>
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </select>
-            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="block">
+                <span className="font-medium text-slate-700">Proyecto Culkibo</span>
+                <select
+                  required
+                  value={monForm.projectId}
+                  onChange={(e) => setMonForm({ ...monForm, projectId: e.target.value })}
+                  className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-900"
+                >
+                  <option value="">Selecciona un proyecto…</option>
+                  {projects.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="font-medium text-slate-700">Ruta de salud (healthPath)</span>
+                <input
+                  value={monForm.healthPath}
+                  onChange={(e) => setMonForm({ ...monForm, healthPath: e.target.value })}
+                  placeholder="/health"
+                  className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 font-mono text-slate-900"
+                />
+              </label>
+            </div>
           )}
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -1123,7 +1372,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
               disabled={busyId === 'create-monitor'}
               className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
             >
-              {busyId === 'create-monitor' ? 'Creando…' : 'Crear monitor'}
+              {busyId === 'create-monitor' ? 'Guardando…' : (editingMonitorId ? 'Guardar cambios' : 'Crear monitor')}
             </button>
           </div>
         </form>
@@ -1301,6 +1550,62 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
               className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
             >
               Guardar política
+            </button>
+          </div>
+        </form>
+      </Modal>
+      {/* Modal: Publicar incidente manual en página de estado */}
+      <Modal
+        open={Boolean(incidentSlug)}
+        onClose={() => setIncidentSlug(null)}
+        title={`Publicar incidente en /status/${incidentSlug || ''}`}
+        subtitle="Visible al público en la página de estado sin exponer detalles técnicos internos."
+        maxWidthClass="max-w-md"
+      >
+        <form onSubmit={handlePublishPageIncident} className="p-5 space-y-4 text-xs">
+          <label className="block">
+            <span className="font-medium text-slate-700">Título del incidente</span>
+            <input
+              required
+              value={incidentForm.title}
+              onChange={(e) => setIncidentForm({ ...incidentForm, title: e.target.value })}
+              placeholder="Mantenimiento programado de base de datos"
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-slate-900"
+            />
+          </label>
+          <label className="block">
+            <span className="font-medium text-slate-700">Severidad</span>
+            <select
+              value={incidentForm.severity}
+              onChange={(e) => setIncidentForm({ ...incidentForm, severity: e.target.value as any })}
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-900"
+            >
+              <option value="maintenance">Mantenimiento</option>
+              <option value="minor">Menor (Degradado)</option>
+              <option value="major">Mayor (Interrupción)</option>
+              <option value="critical">Crítico</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="font-medium text-slate-700">Mensaje público</span>
+            <textarea
+              rows={3}
+              value={incidentForm.message}
+              onChange={(e) => setIncidentForm({ ...incidentForm, message: e.target.value })}
+              placeholder="Estamos realizando tareas breves de actualización."
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-slate-900"
+            />
+          </label>
+          <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+            <button type="button" onClick={() => setIncidentSlug(null)} className="px-3.5 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 cursor-pointer">
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={busyId !== null}
+              className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+            >
+              Publicar incidente
             </button>
           </div>
         </form>

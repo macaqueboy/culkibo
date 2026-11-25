@@ -205,11 +205,17 @@ async function testMetricsAndBugs() {
         dockerStopCalled = true;
         return { code: 0, stdout: '', stderr: '' };
       };
-      await deployManager.drainAndRetire(
-        { id: 'dep_guard', projectId: fakePid, logLines: [] },
-        { containerName: 'culkibo-live-rollback-guard' },
-        { drainTimeoutMs: 10, stopGraceSeconds: 1 }
-      );
+      // Keep the Node event loop referenced while drainAndRetire awaits its unref'd drain timer
+      const keepAlive = setInterval(() => {}, 50);
+      try {
+        await deployManager.drainAndRetire(
+          { id: 'dep_guard', projectId: fakePid, logLines: [] },
+          { containerName: 'culkibo-live-rollback-guard' },
+          { drainTimeoutMs: 10, stopGraceSeconds: 1 }
+        );
+      } finally {
+        clearInterval(keepAlive);
+      }
       assert.strictEqual(dockerStopCalled, false, 'drainAndRetire must NOT stop a container that is currently active after fast rollback');
     } finally {
       deployManager.runDocker = origRunDocker;
@@ -259,7 +265,87 @@ async function testMetricsAndBugs() {
     console.log('✅ 10. Live security headers, Prometheus /metrics, /api/observability/snapshot, /api/system/doctor & ws-ticket verified');
   }
 
-  console.log('\n🎉 All 10 Observability, Doctor & Deep Bug-Regression assertions PASSED!\n');
+  // 11. Deep metricsCollector verification: route cardinality, percentiles, ring wraparound (>1024), error-rate & Prometheus gauges
+  {
+    const { MetricsCollector, canonicalizeRoute } = metricsCollector;
+    assert.strictEqual(canonicalizeRoute('/api/projects/proj_abc123/deploy?force=1'), '/api/projects/:id/deploy');
+    assert.strictEqual(canonicalizeRoute('/api/projects/p1/sync/files/abc'), '/api/projects/:id/sync/:subId');
+    assert.strictEqual(canonicalizeRoute('/assets/app.js?v=9'), '/static');
+    assert.strictEqual(canonicalizeRoute('/metrics?fresh=1'), '/metrics');
+
+    const mc = new MetricsCollector();
+    try {
+      // Push 1100 samples (> 1024 RING_SIZE) to prove zero-overflow ring wraparound & accurate percentiles
+      for (let i = 1; i <= 1100; i++) {
+        mc.recordFastPath('GET', '/api/projects', i % 20 === 0 ? 500 : (i % 10 === 0 ? 404 : 200), i % 100);
+      }
+      mc.recordCaddySwap(2.5, false);
+      mc.recordCaddySwap(99, true); // noop skip must not pollute latency ring
+
+      const snap = mc.getSnapshot(true);
+      assert.strictEqual(snap.http.requestsTotal, 1100);
+      assert.strictEqual(snap.http.status['5xx'], 55);
+      assert.strictEqual(snap.http.status['4xx'], 55);
+      assert.strictEqual(snap.http.errorRatePct, 10);
+      assert.strictEqual(snap.http.error5xxRatePct, 5);
+      assert.strictEqual(snap.http.latencyMs.samples, 1024, 'Latency ring must wrap and cap strictly at 1024');
+      assert.ok(snap.http.latencyMs.p50 >= 45 && snap.http.latencyMs.p50 <= 55, `Expected p50 ~50, got ${snap.http.latencyMs.p50}`);
+      assert.ok(snap.http.latencyMs.p95 >= 93 && snap.http.latencyMs.p95 <= 97, `Expected p95 ~95, got ${snap.http.latencyMs.p95}`);
+      assert.strictEqual(snap.caddy.swapsTotal, 1);
+      assert.strictEqual(snap.caddy.noopSkips, 1);
+      assert.strictEqual(snap.caddy.swapLatencyMs.samples, 1);
+
+      const promText = mc.getPrometheusText(true);
+      assert.ok(promText.includes('culkibo_host_memory_used_percent'), 'Prometheus must expose host memory used percent');
+      assert.ok(promText.includes('culkibo_host_cpu_percent'), 'Prometheus must expose host CPU percent');
+      assert.ok(promText.includes('culkibo_http_error_rate_percent 10'), 'Prometheus must expose HTTP error rate percent');
+    } finally {
+      mc.stop();
+    }
+    console.log('✅ 11. metricsCollector canonicalizeRoute, 1024-ring wraparound percentiles, error-rate & Prometheus gauges verified');
+  }
+
+  // 12. Deep systemDoctor verification: Linux MemAvailable, sleepAdvisor fixAction propagation & applyFix validation
+  {
+    const fakeSnap = { process: { memoryMb: 42 } };
+    const memOk = systemDoctor.checkHostMemory(fakeSnap, () => 'MemTotal: 4096000 kB\nMemFree: 100000 kB\nMemAvailable: 2560000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n');
+    assert.strictEqual(memOk.status, 'ok', 'Linux MemAvailable (62.5% free) must be ok even when MemFree is low');
+    assert.strictEqual(memOk.metrics.source, 'proc_meminfo');
+
+    const memCrit = systemDoctor.checkHostMemory(fakeSnap, () => 'MemTotal: 4096000 kB\nMemFree: 50000 kB\nMemAvailable: 100000 kB\nSwapTotal: 1024000 kB\nSwapFree: 100000 kB\n');
+    assert.strictEqual(memCrit.status, 'fail', 'Low MemAvailable (<128 MB) must trigger fail');
+
+    const costCheck = await systemDoctor.checkCostAndFleet({
+      snap: fakeSnap,
+      sleepAdvisorMod: {
+        getDoctorSummary: async () => ({
+          status: 'warn',
+          summary: '2 contenedores ociosos',
+          detail: 'Activa Auto-Sleep para liberar 256 MB',
+          fixAction: 'review_sleep_candidates',
+          fixLabel: 'Revisar Auto-Sleep',
+          metrics: { reclaimableRamMb: 256, monthlySavingsEur: 18, idleCandidatesCount: 2, oomRiskCount: 0 }
+        })
+      },
+      fleetManagerMod: { listServers: () => [] }
+    });
+    assert.strictEqual(costCheck.status, 'warn');
+    assert.strictEqual(costCheck.fixAction, 'review_sleep_candidates', 'checkCostAndFleet must propagate sleepAdvisor fixAction');
+    assert.strictEqual(costCheck.fixLabel, 'Revisar Auto-Sleep');
+
+    const reviewRes = await systemDoctor.applyFix('review_sleep_candidates');
+    assert.strictEqual(reviewRes.ok, true);
+    assert.ok(Array.isArray(reviewRes.candidates));
+
+    await assert.rejects(
+      () => systemDoctor.applyFix('nonexistent_action_xyz'),
+      (err) => err && err.status === 400,
+      'Unknown doctor fixAction must reject with HTTP 400'
+    );
+    console.log('✅ 12. systemDoctor MemAvailable, sleepAdvisor fixAction propagation & applyFix verified');
+  }
+
+  console.log('\n🎉 All 12 Observability, Doctor & Deep Bug-Regression assertions PASSED!\n');
 }
 
 if (require.main === module) {

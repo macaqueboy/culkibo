@@ -1149,7 +1149,8 @@ class GitOpsManager extends EventEmitter {
    *   includeDomains?: boolean,
    *   includeCrons?: boolean,
    *   includeMonitors?: boolean,
-   *   redactAllEnv?: boolean
+   *   redactAllEnv?: boolean,
+   *   schemaUrl?: string | null
    * }} [opts]
    */
   exportStack(opts = {}) {
@@ -1381,7 +1382,10 @@ class GitOpsManager extends EventEmitter {
     if (crons.length > 0) manifest.crons = crons;
     if (monitors.length > 0) manifest.monitors = monitors;
 
-    const yaml = serializeSafeYaml(manifest, 0) + '\n';
+    const schemaHeader = opts.schemaUrl && /^[^\r\n\0]+$/.test(String(opts.schemaUrl))
+      ? `# yaml-language-server: $schema=${String(opts.schemaUrl).trim()}\n`
+      : '';
+    const yaml = schemaHeader + serializeSafeYaml(manifest, 0) + '\n';
     const manifestHash = hashManifest(manifest);
 
     return {
@@ -1399,6 +1403,143 @@ class GitOpsManager extends EventEmitter {
       },
       manifest,
       yaml
+    };
+  }
+
+  /**
+   * Devuelve el JSON Schema (Draft 2020-12) oficial de `culkibo.yaml` v1 para
+   * autocompletado y validación en tiempo real en VS Code / JetBrains / SchemaStore.
+   */
+  getJsonSchema() {
+    return {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      $id: 'https://culkibo.dev/schema/culkibo.yaml.json',
+      title: 'Culkibo Declarative GitOps Manifest (culkibo.yaml v1)',
+      type: 'object',
+      additionalProperties: false,
+      required: ['version', 'projects'],
+      properties: {
+        version: { type: 'integer', const: 1, description: 'Schema version (must be 1).' },
+        name: { type: 'string', minLength: 1, maxLength: 80, description: 'Logical GitOps stack name.' },
+        vaultRefs: {
+          type: 'array',
+          uniqueItems: true,
+          items: { type: 'string', pattern: '^[A-Za-z_][A-Za-z0-9_]{0,127}$' },
+          description: 'List of secret keys referenced via ${vault.KEY}.'
+        },
+        projects: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['name'],
+            properties: {
+              id: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,80}$' },
+              name: { type: 'string', minLength: 1, maxLength: 120 },
+              description: { type: 'string', maxLength: 300 },
+              gitRepo: { type: 'string', maxLength: 512 },
+              gitBranch: { type: 'string', default: 'main' },
+              buildCommand: { type: 'string' },
+              startCommand: { type: 'string' },
+              baseDirectory: { type: 'string', default: '/' },
+              containerPort: { type: 'integer', minimum: 1, maximum: 65535 },
+              healthPath: { type: 'string', pattern: '^/[A-Za-z0-9._~\\-/]*$', default: '/' },
+              memoryMb: { type: 'integer', minimum: 64, maximum: 65536 },
+              cpus: { type: 'number', exclusiveMinimum: 0, maximum: 64 },
+              serverId: { type: 'string', pattern: '^[a-z0-9_-]{1,64}$', default: 'local' },
+              autoDeploy: { type: 'boolean', default: true },
+              maintenanceMode: { type: 'boolean', default: false },
+              domains: { type: 'array', items: { type: 'string' } },
+              env: {
+                type: 'object',
+                additionalProperties: { type: ['string', 'number', 'boolean'] }
+              },
+              environments: {
+                type: 'object',
+                additionalProperties: {
+                  type: 'object',
+                  properties: {
+                    branch: { type: 'string' },
+                    serverId: { type: 'string', pattern: '^[a-z0-9_-]{1,64}$' },
+                    protected: { type: 'boolean' },
+                    requireApproval: { type: 'boolean' },
+                    domains: { type: 'array', items: { type: 'string' } },
+                    env: { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean'] } }
+                  }
+                }
+              }
+            }
+          }
+        },
+        databases: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['engine'],
+            properties: {
+              id: { type: 'string' },
+              name: { type: 'string', maxLength: 63 },
+              engine: { type: 'string', enum: Array.from(ALLOWED_DB_ENGINES) },
+              image: { type: 'string', description: 'Pinned container image tag (no :latest).' },
+              projectId: { type: 'string' },
+              dbName: { type: 'string', pattern: '^[a-z][a-z0-9_]{0,62}$' },
+              username: { type: 'string', pattern: '^[a-z][a-z0-9_]{0,62}$' },
+              generateSecret: { type: 'boolean', default: true }
+            }
+          }
+        },
+        domains: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['hostname'],
+            properties: {
+              hostname: { type: 'string', maxLength: 253 },
+              projectId: { type: ['string', 'null'] },
+              targetPort: { type: 'integer', minimum: 1, maximum: 65535, default: 3000 },
+              routingMode: { type: 'string', enum: ['direct_dns', 'cloudflare_proxy', 'cloudflare_tunnel'], default: 'direct_dns' },
+              cloudflareProxied: { type: 'boolean', default: false },
+              canonicalRedirect: { type: 'string', enum: ['none', 'www_to_apex', 'apex_to_www'], default: 'none' },
+              securityHeaders: { type: 'boolean', default: true }
+            }
+          }
+        },
+        crons: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['name', 'schedule'],
+            properties: {
+              name: { type: 'string', minLength: 1, maxLength: 80 },
+              projectId: { type: ['string', 'null'] },
+              schedule: { type: 'string' },
+              mode: { type: 'string', enum: ['exec', 'http'], default: 'exec' },
+              command: { type: 'string' },
+              workdir: { type: 'string' },
+              httpPath: { type: 'string', pattern: '^/' },
+              httpMethod: { type: 'string', enum: ['GET', 'POST'], default: 'POST' },
+              enabled: { type: 'boolean', default: true }
+            }
+          }
+        },
+        monitors: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['name'],
+            properties: {
+              name: { type: 'string', minLength: 1, maxLength: 80 },
+              projectId: { type: ['string', 'null'] },
+              type: { type: 'string', enum: ['http', 'tcp', 'managed_project'], default: 'http' },
+              url: { type: 'string', format: 'uri' },
+              host: { type: 'string' },
+              intervalSec: { type: 'integer', minimum: 30, default: 60 },
+              expectedStatus: { type: 'integer', minimum: 100, maximum: 599, default: 200 },
+              enabled: { type: 'boolean', default: true },
+              public: { type: 'boolean', default: false }
+            }
+          }
+        }
+      }
     };
   }
 
@@ -2664,17 +2805,189 @@ class GitOpsManager extends EventEmitter {
   }
 
   // =========================================================================
+  // 5b. WEBHOOK-TRIGGERED GITOPS AUTO-PLAN / NON-DESTRUCTIVE RECONCILE
+  // =========================================================================
+
+  /**
+   * Lee de forma segura un archivo `culkibo.yaml` contenido dentro de `repoDir`
+   * (bloquea path traversal, symlinks externos y archivos >256 KB).
+   * @param {string} repoDir
+   * @param {string} [manifestPath]
+   * @returns {{ found: boolean, absPath: string | null, yamlText: string | null }}
+   */
+  readRepoManifestSafe(repoDir, manifestPath = 'culkibo.yaml') {
+    const cleanRel = String(manifestPath || 'culkibo.yaml').trim().replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!cleanRel || cleanRel.includes('\0') || cleanRel.split('/').includes('..') || /^[A-Za-z]:/.test(cleanRel)) {
+      throw new Error(`Ruta de manifiesto GitOps inválida: "${manifestPath}"`);
+    }
+    const base = path.resolve(String(repoDir || ''));
+    if (!base || !fs.existsSync(base)) {
+      return { found: false, absPath: null, yamlText: null };
+    }
+    const realBase = fs.realpathSync(base);
+    const candidate = path.resolve(realBase, cleanRel);
+    const relCheck = path.relative(realBase, candidate);
+    if (!relCheck || relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
+      throw new Error(`Escape de directorio bloqueado en manifiesto GitOps: "${manifestPath}"`);
+    }
+    if (!fs.existsSync(candidate)) {
+      return { found: false, absPath: null, yamlText: null };
+    }
+    const lstat = fs.lstatSync(candidate);
+    if (lstat.isSymbolicLink() || !lstat.isFile()) {
+      throw new Error(`El manifiesto GitOps "${cleanRel}" no puede ser un enlace simbólico ni directorio`);
+    }
+    const realCandidate = fs.realpathSync(candidate);
+    const relReal = path.relative(realBase, realCandidate);
+    if (!relReal || relReal.startsWith('..') || path.isAbsolute(relReal)) {
+      throw new Error(`Escape por symlink bloqueado en manifiesto GitOps: "${manifestPath}"`);
+    }
+    if (lstat.size > MAX_YAML_BYTES) {
+      throw new Error(`El manifiesto GitOps "${cleanRel}" supera el límite de ${Math.round(MAX_YAML_BYTES / 1024)} KB`);
+    }
+    return {
+      found: true,
+      absPath: realCandidate,
+      yamlText: fs.readFileSync(realCandidate, 'utf8')
+    };
+  }
+
+  /**
+   * Reconciliación GitOps disparada por webhook Git (opt-in por proyecto).
+   * - `project.gitopsAutoSync === 'plan'`: ejecuta `planApply` puro (0 mutaciones).
+   * - `project.gitopsAutoSync === 'apply'`: ejecuta `applyStack` con `prune: false` y
+   *   `confirmDestructive: false` FIJOS (un push Git JAMÁS borra BDs ni entornos protegidos).
+   * - Cualquier otro valor (`'off'`, ausente): fail-closed (no hace nada).
+   *
+   * @param {{
+   *   project: any,
+   *   yamlText?: string | null,
+   *   repoDir?: string | null,
+   *   manifestPath?: string | null,
+   *   provider?: string,
+   *   commitSha?: string | null,
+   *   branch?: string | null,
+   *   actor?: string | null
+   * }} opts
+   */
+  async reconcileWebhookManifest(opts) {
+    const project = opts && opts.project;
+    if (!project || typeof project !== 'object') {
+      throw new Error('Se requiere un proyecto válido para reconciliación GitOps por webhook');
+    }
+    const mode = String(project.gitopsAutoSync || 'off').trim().toLowerCase();
+    if (mode !== 'plan' && mode !== 'apply') {
+      return {
+        ok: true,
+        mode: 'off',
+        skipped: true,
+        applied: false,
+        reason: 'gitopsAutoSync deshabilitado para este proyecto'
+      };
+    }
+
+    const manifestPath = String(opts.manifestPath || project.gitopsManifestPath || 'culkibo.yaml').trim() || 'culkibo.yaml';
+    let rawYaml = typeof opts.yamlText === 'string' && opts.yamlText.trim() ? opts.yamlText : null;
+    if (!rawYaml) {
+      if (!opts.repoDir) {
+        return {
+          ok: true,
+          mode,
+          skipped: true,
+          applied: false,
+          reason: `No se proporcionó directorio local ni contenido de ${manifestPath}`
+        };
+      }
+      const loaded = this.readRepoManifestSafe(opts.repoDir, manifestPath);
+      if (!loaded.found || !loaded.yamlText) {
+        return {
+          ok: true,
+          mode,
+          skipped: true,
+          applied: false,
+          reason: `Manifiesto ${manifestPath} no encontrado en el repositorio`
+        };
+      }
+      rawYaml = loaded.yamlText;
+    }
+
+    const stackId = normalizeStackId(project.gitopsStackId || project.id || project.name);
+    const provider = String(opts.provider || 'git');
+    const actor = String(opts.actor || `webhook:${provider}`).slice(0, 80);
+
+    if (mode === 'plan') {
+      const plan = this.planApply(rawYaml, { prune: false, confirmDestructive: false, stackId });
+      this._audit('gitops.webhook_plan', stackId, {
+        projectId: project.id,
+        provider,
+        branch: opts.branch || null,
+        commitSha: opts.commitSha || null,
+        manifestPath,
+        manifestHash: plan.manifestHash,
+        summary: plan.summary
+      });
+      const payload = {
+        ok: true,
+        mode: 'plan',
+        applied: false,
+        prune: false,
+        stackId,
+        manifestPath,
+        manifestHash: plan.manifestHash,
+        summary: plan.summary,
+        warnings: plan.warnings,
+        plan
+      };
+      this.emit('webhook_plan', payload);
+      return payload;
+    }
+
+    // Modo 'apply': SIEMPRE no destructivo (prune: false, confirmDestructive: false)
+    /** @type {any} */
+    const result = await this.applyStack(rawYaml, {
+      dryRun: false,
+      prune: false,
+      confirmDestructive: false,
+      stackId,
+      actor
+    });
+    this._audit('gitops.webhook_applied', stackId, {
+      projectId: project.id,
+      provider,
+      branch: opts.branch || null,
+      commitSha: opts.commitSha || null,
+      manifestPath,
+      manifestHash: result.manifestHash,
+      appliedCounts: result.appliedCounts
+    });
+    const payload = {
+      ok: true,
+      mode: 'apply',
+      applied: true,
+      prune: false,
+      stackId,
+      manifestPath,
+      manifestHash: result.manifestHash,
+      appliedCounts: result.appliedCounts,
+      warnings: result.warnings,
+      result
+    };
+    this.emit('webhook_applied', payload);
+    return payload;
+  }
+
+  // =========================================================================
   // 6. EXTERNAL IMPORTER BRIDGE (`convertExternalToCulkiboYaml`)
   // =========================================================================
 
   /**
    * Convierte configuraciones externas (`docker-compose`, `render`, `railway`, `vercel`,
-   * `netlify`, `dokploy`, `env`, `auto`) a un manifiesto `culkibo.yaml` v1 seguro
-   * y libre de secretos usando `universalImporter`.
+   * `netlify`, `fly`, `heroku`, `procfile`, `dokploy`, `env`, `auto`) a un manifiesto
+   * `culkibo.yaml` v1 seguro y libre de secretos usando `universalImporter`.
    *
    * @param {string} platform
    * @param {string} rawText
-   * @param {{ name?: string, envText?: string }} [opts]
+   * @param {{ name?: string, envText?: string, procfileText?: string, profiles?: string[], includeProfiled?: boolean }} [opts]
    */
   convertExternalToCulkiboYaml(platform, rawText, opts = {}) {
     const importer = this._getUniversalImporter();
@@ -2694,6 +3007,8 @@ class GitOpsManager extends EventEmitter {
     const databases = [];
     /** @type {any[]} */
     const domains = [];
+    /** @type {any[]} */
+    const crons = [];
 
     /** @param {Record<string, any>} rawEnv */
     const sanitizeImportedEnv = (rawEnv) => {
@@ -2706,7 +3021,11 @@ class GitOpsManager extends EventEmitter {
           continue;
         }
         const v = rawEnv[k] == null ? '' : String(rawEnv[k]);
-        if (shouldRedactEnvForGit(k, v, false)) {
+        const refs = extractVaultRefs(v);
+        if (refs.length > 0) {
+          for (const r of refs) vaultRefs.add(r);
+          clean[k] = v;
+        } else if (shouldRedactEnvForGit(k, v, false)) {
           vaultRefs.add(k);
           clean[k] = `\${vault.${k}}`;
         } else {
@@ -2717,11 +3036,23 @@ class GitOpsManager extends EventEmitter {
     };
 
     let detectedPlatform = plat;
+    const looksLikeRender = /^\s*services\s*:/m.test(text) && (
+      /buildCommand\s*:/m.test(text) ||
+      /startCommand\s*:/m.test(text) ||
+      /^\s*-?\s*type\s*:\s*(?:web|worker|cron|pserv|static)\b/m.test(text)
+    );
 
-    if (plat === 'docker-compose' || plat === 'compose' || (plat === 'auto' && /^\s*services\s*:/m.test(text) && !/buildCommand\s*:/m.test(text))) {
+    if (plat === 'docker-compose' || plat === 'compose' || (plat === 'auto' && /^\s*services\s*:/m.test(text) && !looksLikeRender)) {
       detectedPlatform = 'docker-compose';
       const parsed = importer.parseDockerCompose(text);
+      const activeProfiles = new Set((Array.isArray(opts.profiles) ? opts.profiles : []).map((p) => String(p).trim()).filter(Boolean));
+      const includeProfiled = Boolean(opts.includeProfiled);
+
       for (const svc of parsed.services || []) {
+        if (!includeProfiled && Array.isArray(svc.profiles) && svc.profiles.length > 0 && !svc.profiles.some((p) => activeProfiles.has(p))) {
+          warnings.push(`Servicio Compose "${svc.name}" omitido por perfil (${svc.profiles.join(', ')})`);
+          continue;
+        }
         if (Array.isArray(svc.warnings)) warnings.push(...svc.warnings);
         if (svc.kind === 'database' && svc.dbEngine && ALLOWED_DB_ENGINES.has(svc.dbEngine)) {
           databases.push({
@@ -2730,7 +3061,18 @@ class GitOpsManager extends EventEmitter {
             generateSecret: true
           });
         } else {
-          const cleanEnv = sanitizeImportedEnv(svc.envVars || {});
+          const mergedEnv = { ...(svc.envVars || {}) };
+          // Mapear secretos Compose v3 a referencias ${vault.SECRET_NAME}
+          for (const sec of Array.isArray(svc.secrets) ? svc.secrets : []) {
+            const rawSecName = typeof sec === 'string' ? sec : sec?.source;
+            if (!rawSecName) continue;
+            const envKey = String(rawSecName).toUpperCase().replace(/[^A-Z0-9_]/g, '_').replace(/^([^A-Z_])/, 'SECRET_$1').slice(0, 120);
+            if (ENV_KEY_RE.test(envKey) && !DANGEROUS_HOST_ENV_KEYS.has(envKey)) {
+              vaultRefs.add(envKey);
+              mergedEnv[envKey] = `\${vault.${envKey}}`;
+            }
+          }
+          const cleanEnv = sanitizeImportedEnv(mergedEnv);
           /** @type {Record<string, any>} */
           const proj = {
             name: String(svc.name || 'app').slice(0, 80),
@@ -2739,6 +3081,9 @@ class GitOpsManager extends EventEmitter {
             autoDeploy: true
           };
           if (svc.containerPort) proj.containerPort = Number(svc.containerPort);
+          if (svc.healthPath && svc.healthPath !== '/') proj.healthPath = svc.healthPath;
+          if (svc.resources && svc.resources.memoryMb) proj.memoryMb = Number(svc.resources.memoryMb);
+          if (svc.resources && svc.resources.cpus) proj.cpus = Number(svc.resources.cpus);
           if (Object.keys(cleanEnv).length > 0) proj.env = cleanEnv;
           projects.push(proj);
         }
@@ -2763,49 +3108,143 @@ class GitOpsManager extends EventEmitter {
       const parsed = importer.parsePlatformConfig({
         platform: plat,
         configText: text,
-        envText: opts.envText || ''
+        envText: opts.envText || '',
+        procfileText: opts.procfileText || ''
       });
       detectedPlatform = parsed.platform || plat;
       if (Array.isArray(parsed.notes)) warnings.push(...parsed.notes);
 
-      const cleanEnv = sanitizeImportedEnv(parsed.envVars || {});
-      const projName = opts.name || parsed.name || `${detectedPlatform}-app`;
-      const projId = `proj_${normalizeStackId(projName).replace(/-/g, '_')}`;
-      /** @type {Record<string, any>} */
-      const proj = {
-        id: projId,
-        name: projName,
-        gitBranch: parsed.gitBranch || 'main',
-        serverId: 'local',
-        autoDeploy: true
-      };
-      if (parsed.gitRepo) proj.gitRepo = parsed.gitRepo;
-      if (parsed.buildCommand) proj.buildCommand = parsed.buildCommand;
-      if (parsed.startCommand) proj.startCommand = parsed.startCommand;
-      if (parsed.baseDirectory && parsed.baseDirectory !== '/') proj.baseDirectory = parsed.baseDirectory;
-      if (parsed.port) proj.containerPort = Number(parsed.port);
-      if (parsed.healthPath && parsed.healthPath !== '/') proj.healthPath = parsed.healthPath;
-      if (Object.keys(cleanEnv).length > 0) proj.env = cleanEnv;
-      projects.push(proj);
+      // Multi-service Render Blueprints
+      if (detectedPlatform === 'render' && Array.isArray(parsed.services) && parsed.services.length > 0) {
+        /** @type {string | null} */
+        let primaryProjId = null;
+        for (let idx = 0; idx < parsed.services.length; idx++) {
+          const svc = parsed.services[idx];
+          const mergedSvcEnv = idx === 0
+            ? { ...(parsed.envVars || {}), ...(svc.envVars || {}) }
+            : (svc.envVars || {});
+          const cleanEnv = sanitizeImportedEnv(mergedSvcEnv);
+          const sName = svc.name || 'render-service';
+          const sId = `proj_${normalizeStackId(sName).replace(/-/g, '_')}`;
+          if (!primaryProjId) primaryProjId = sId;
+          /** @type {Record<string, any>} */
+          const proj = {
+            id: sId,
+            name: sName,
+            gitBranch: svc.gitBranch || 'main',
+            serverId: 'local',
+            autoDeploy: true
+          };
+          if (svc.gitRepo) proj.gitRepo = svc.gitRepo;
+          if (svc.buildCommand) proj.buildCommand = svc.buildCommand;
+          if (svc.startCommand) proj.startCommand = svc.startCommand;
+          if (svc.baseDirectory && svc.baseDirectory !== '/') proj.baseDirectory = svc.baseDirectory;
+          if (svc.port) proj.containerPort = Number(svc.port);
+          if (svc.healthPath && svc.healthPath !== '/') proj.healthPath = svc.healthPath;
+          if (Object.keys(cleanEnv).length > 0) proj.env = cleanEnv;
+          projects.push(proj);
+        }
+        const seenDbEngines = new Set();
+        for (const db of Array.isArray(parsed.databases) ? parsed.databases : []) {
+          if (ALLOWED_DB_ENGINES.has(db.engine)) {
+            seenDbEngines.add(db.engine);
+            const dbNameClean = db.dbName && DB_IDENT_RE.test(db.dbName) ? db.dbName : undefined;
+            const userClean = db.username && DB_IDENT_RE.test(db.username) ? db.username : undefined;
+            databases.push({
+              name: String(db.name || 'render_pg').slice(0, 63),
+              engine: db.engine,
+              ...(db.image ? { image: db.image } : {}),
+              ...(primaryProjId ? { projectId: primaryProjId } : {}),
+              ...(dbNameClean ? { dbName: dbNameClean } : {}),
+              ...(userClean ? { username: userClean } : {}),
+              generateSecret: true
+            });
+          }
+        }
+        for (const rec of parsed.recommendedDatabases || []) {
+          if (ALLOWED_DB_ENGINES.has(rec.engine) && !seenDbEngines.has(rec.engine)) {
+            seenDbEngines.add(rec.engine);
+            databases.push({ name: `${rec.engine}_main`, engine: rec.engine, ...(primaryProjId ? { projectId: primaryProjId } : {}), generateSecret: true });
+          }
+        }
+        for (const cr of Array.isArray(parsed.crons) ? parsed.crons : []) {
+          try {
+            parseCron(cr.schedule);
+            parseSafeCommandArgv(cr.command);
+            crons.push({
+              name: String(cr.name).slice(0, 80),
+              ...(primaryProjId ? { projectId: primaryProjId } : {}),
+              schedule: cr.schedule,
+              mode: 'exec',
+              command: cr.command,
+              enabled: true
+            });
+          } catch (e) {
+            warnings.push(`Cron Render "${cr.name}" omitido por validación: ${e.message}`);
+          }
+        }
+      } else {
+        const cleanEnv = sanitizeImportedEnv(parsed.envVars || {});
+        const projName = opts.name || parsed.name || `${detectedPlatform}-app`;
+        const projId = `proj_${normalizeStackId(projName).replace(/-/g, '_')}`;
+        /** @type {Record<string, any>} */
+        const proj = {
+          id: projId,
+          name: projName,
+          gitBranch: parsed.gitBranch || 'main',
+          serverId: 'local',
+          autoDeploy: true
+        };
+        if (parsed.description) proj.description = String(parsed.description).slice(0, 300);
+        if (parsed.gitRepo) proj.gitRepo = parsed.gitRepo;
+        if (parsed.buildCommand) proj.buildCommand = parsed.buildCommand;
+        if (parsed.startCommand) proj.startCommand = parsed.startCommand;
+        if (parsed.baseDirectory && parsed.baseDirectory !== '/') proj.baseDirectory = parsed.baseDirectory;
+        if (parsed.port) proj.containerPort = Number(parsed.port);
+        if (parsed.healthPath && parsed.healthPath !== '/') proj.healthPath = parsed.healthPath;
+        if (parsed.memoryMb) proj.memoryMb = Number(parsed.memoryMb);
+        if (parsed.cpus) proj.cpus = Number(parsed.cpus);
+        if (Object.keys(cleanEnv).length > 0) proj.env = cleanEnv;
+        projects.push(proj);
 
-      for (const rawHost of parsed.domains || []) {
-        try {
-          const host = this._validateHostname(String(rawHost));
-          domains.push({
-            hostname: host,
-            projectId: projId,
-            targetPort: Number(parsed.port) || 3000,
-            routingMode: 'direct_dns',
-            cloudflareProxied: false,
-            canonicalRedirect: 'none',
-            securityHeaders: true
-          });
-        } catch (e) {}
-      }
+        // Workers adicionales (p. ej. Heroku Procfile `worker:`)
+        if (Array.isArray(parsed.workers)) {
+          for (const w of parsed.workers) {
+            if (!w || !w.name || !w.command) continue;
+            const wName = `${projName}-${w.name}`.slice(0, 80);
+            const wId = `proj_${normalizeStackId(wName).replace(/-/g, '_')}`;
+            projects.push({
+              id: wId,
+              name: wName,
+              gitBranch: parsed.gitBranch || 'main',
+              ...(parsed.gitRepo ? { gitRepo: parsed.gitRepo } : {}),
+              startCommand: w.command,
+              serverId: 'local',
+              autoDeploy: true,
+              ...(Object.keys(cleanEnv).length > 0 ? { env: cleanEnv } : {})
+            });
+          }
+        }
 
-      for (const rec of parsed.recommendedDatabases || []) {
-        if (ALLOWED_DB_ENGINES.has(rec.engine)) {
-          databases.push({ name: `${rec.engine}_main`, engine: rec.engine, projectId: projId, generateSecret: true });
+        for (const rawHost of parsed.domains || []) {
+          try {
+            const host = this._validateHostname(String(rawHost));
+            domains.push({
+              hostname: host,
+              projectId: projId,
+              targetPort: Number(parsed.port) || 3000,
+              routingMode: 'direct_dns',
+              cloudflareProxied: false,
+              canonicalRedirect: 'none',
+              securityHeaders: true
+            });
+          } catch (e) {}
+        }
+
+        for (const rec of parsed.recommendedDatabases || []) {
+          if (ALLOWED_DB_ENGINES.has(rec.engine)) {
+            databases.push({ name: `${rec.engine}_main`, engine: rec.engine, projectId: projId, generateSecret: true });
+          }
         }
       }
     }
@@ -2819,7 +3258,8 @@ class GitOpsManager extends EventEmitter {
       ...(sortedVaultRefs.length > 0 ? { vaultRefs: sortedVaultRefs } : {}),
       projects,
       ...(databases.length > 0 ? { databases } : {}),
-      ...(domains.length > 0 ? { domains } : {})
+      ...(domains.length > 0 ? { domains } : {}),
+      ...(crons.length > 0 ? { crons } : {})
     };
 
     const yaml = serializeSafeYaml(manifest, 0) + '\n';

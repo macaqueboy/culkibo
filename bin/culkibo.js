@@ -24,7 +24,11 @@ const svc = {
   get mcpServer() { return require('../server/services/mcpServer'); },
   get dockerManager() { return require('../server/services/dockerManager'); },
   get dbBackupManager() { return require('../server/services/dbBackupManager'); },
+  get databaseManager() { return require('../server/services/databaseManager'); },
   get projectManager() { return require('../server/services/projectManager'); },
+  get environmentManager() { return require('../server/services/environmentManager'); },
+  get gitopsManager() { return require('../server/services/gitopsManager'); },
+  get universalImporter() { return require('../server/services/universalImporter'); },
   get caddyManager() { return require('../server/services/caddyManager'); },
   get deployManager() { return require('../server/services/deployManager'); },
   get catalogManager() { return require('../server/services/catalogManager'); },
@@ -51,7 +55,335 @@ const program = new Command();
 program
   .name('culkibo')
   .description('Culkibo — Orquestador cloud autohospedado para desarrollar con agentes de IA')
-  .version('1.0.0');
+  .version('1.0.0')
+  .option('--json', 'Salida estructurada en JSON (scripts, CI/CD y agentes de IA)')
+  .option('--api-url <url>', 'URL del daemon/VPS Culkibo remoto (o env CULKIBO_API_URL)')
+  .option('--token <token>', 'Token Bearer de autenticación (o env CULKIBO_TOKEN)');
+
+/** @param {any} [cmdOpts] */
+function isJsonMode(cmdOpts) {
+  return Boolean((cmdOpts && cmdOpts.json) || program.opts().json);
+}
+
+/** @param {any} payload */
+function printJson(payload) {
+  process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+}
+
+/** @param {any} err @param {any} [cmdOpts] */
+function failCli(err, cmdOpts) {
+  const message = err && err.message ? err.message : String(err);
+  const code = err && err.code ? String(err.code) : 'CLI_ERROR';
+  if (isJsonMode(cmdOpts)) {
+    printJson({ ok: false, error: message, code });
+  } else {
+    console.error(`\x1b[31m❌ ${message}\x1b[0m`);
+  }
+  process.exitCode = 1;
+}
+
+/** @param {any} [cmdOpts] */
+function getRemoteConfig(cmdOpts) {
+  const rootOpts = program.opts();
+  const rawUrl = String((cmdOpts && cmdOpts.apiUrl) || rootOpts.apiUrl || process.env.CULKIBO_API_URL || '').trim().replace(/\/+$/, '');
+  const token = String((cmdOpts && cmdOpts.token) || rootOpts.token || process.env.CULKIBO_TOKEN || '').trim();
+  return { apiUrl: rawUrl || null, token: token || null };
+}
+
+/**
+ * Invoca la API HTTP del daemon/VPS Culkibo cuando `CULKIBO_API_URL` o `--api-url` está activo.
+ * @param {{ apiUrl: string | null, token: string | null }} remote
+ * @param {string} method
+ * @param {string} apiPath
+ * @param {any} [body]
+ * @returns {Promise<any>}
+ */
+async function remoteApiRequest(remote, method, apiPath, body) {
+  const base = String(remote.apiUrl || '').replace(/\/api$/, '');
+  const url = `${base}${apiPath.startsWith('/') ? apiPath : `/${apiPath}`}`;
+  /** @type {Record<string, string>} */
+  const headers = { Accept: 'application/json' };
+  if (remote.token) headers.Authorization = `Bearer ${remote.token}`;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const res = await fetch(url, {
+    method,
+    headers,
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(30000)
+  });
+  const text = await res.text();
+  /** @type {any} */
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch (e) { parsed = { raw: text }; }
+  if (!res.ok) {
+    const err = new Error((parsed && (parsed.error || parsed.message)) || `HTTP ${res.status} en ${method} ${apiPath}`);
+    /** @type {any} */ (err).status = res.status;
+    /** @type {any} */ (err).code = (parsed && parsed.code) || `HTTP_${res.status}`;
+    throw err;
+  }
+  return parsed;
+}
+
+/** Lee stdin completo (para `culkibo env set <project> --stdin KEY`). */
+function readStdinText() {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { data += chunk; });
+    process.stdin.on('end', () => resolve(data.replace(/\r?\n$/, '')));
+    process.stdin.on('error', reject);
+  });
+}
+
+/** Parsea pares `KEY=VALUE` de argumentos CLI. @param {string[]} pairs */
+function parseEnvAssignments(pairs) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const raw of pairs || []) {
+    const str = String(raw || '');
+    const eq = str.indexOf('=');
+    if (eq <= 0) {
+      throw new Error(`Formato inválido "${str}". Usa CLAVE=VALOR.`);
+    }
+    const key = str.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) {
+      throw new Error(`Nombre de variable inválido: "${key}"`);
+    }
+    out[key] = str.slice(eq + 1);
+  }
+  return out;
+}
+
+/**
+ * Autodetecta el stack de un directorio local (Node/Next/Nuxt/SvelteKit/Astro/Vite/Bun,
+ * Python uv/Poetry/pip, Go, Rust, Deno, PHP/Laravel, Elixir, Java, Dockerfile, Compose,
+ * Fly.io, Render, Heroku) sin dependencias externas.
+ * @param {string} targetDir
+ */
+function detectLocalStack(targetDir) {
+  const dir = path.resolve(targetDir || process.cwd());
+  const entries = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+  const lowerSet = new Set(entries.map((e) => e.toLowerCase()));
+  const baseName = path.basename(dir) || 'culkibo-app';
+  const cleanName = baseName.replace(/[^a-zA-Z0-9 _-]/g, '-').trim().slice(0, 80) || 'culkibo-app';
+  const slugId = `proj_${baseName.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^[^a-z0-9]+|_+$/g, '').slice(0, 48) || 'app'}`;
+
+  /** @type {any} */
+  const info = {
+    dir,
+    id: slugId,
+    name: cleanName,
+    framework: 'generic',
+    runtime: 'unknown',
+    packageManager: null,
+    buildCommand: '',
+    startCommand: '',
+    containerPort: 3000,
+    healthPath: '/',
+    detectedFiles: [],
+    recommendedDatabases: [],
+    env: {},
+    vaultRefs: []
+  };
+
+  if (lowerSet.has('bun.lockb') || lowerSet.has('bun.lock')) info.packageManager = 'bun';
+  else if (lowerSet.has('pnpm-lock.yaml')) info.packageManager = 'pnpm';
+  else if (lowerSet.has('yarn.lock')) info.packageManager = 'yarn';
+  else if (lowerSet.has('package-lock.json')) info.packageManager = 'npm';
+
+  const runPrefix = info.packageManager === 'bun' ? 'bun run'
+    : info.packageManager === 'pnpm' ? 'pnpm'
+    : info.packageManager === 'yarn' ? 'yarn'
+    : 'npm run';
+
+  if (lowerSet.has('dockerfile')) {
+    info.framework = 'Dockerfile';
+    info.runtime = 'docker';
+    info.containerPort = 8080;
+    info.detectedFiles.push('Dockerfile');
+  }
+
+  if (lowerSet.has('package.json')) {
+    info.detectedFiles.push('package.json');
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      if (pkg.name && typeof pkg.name === 'string') {
+        info.name = pkg.name.replace(/^@[^/]+\//, '').slice(0, 80) || info.name;
+      }
+      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+      const scripts = pkg.scripts || {};
+      info.runtime = info.packageManager === 'bun' ? 'bun' : 'node';
+      if (deps.next || lowerSet.has('next.config.js') || lowerSet.has('next.config.mjs') || lowerSet.has('next.config.ts')) {
+        info.framework = 'Next.js';
+        info.buildCommand = scripts.build ? `${runPrefix} build` : 'npm run build';
+        info.startCommand = scripts.start ? `${runPrefix} start` : 'npm start';
+        info.containerPort = 3000;
+      } else if (deps.nuxt || lowerSet.has('nuxt.config.ts') || lowerSet.has('nuxt.config.js')) {
+        info.framework = 'Nuxt';
+        info.buildCommand = `${runPrefix} build`;
+        info.startCommand = 'node .output/server/index.mjs';
+        info.containerPort = 3000;
+      } else if (deps['@sveltejs/kit'] || lowerSet.has('svelte.config.js')) {
+        info.framework = 'SvelteKit';
+        info.buildCommand = `${runPrefix} build`;
+        info.startCommand = 'node build/index.js';
+        info.containerPort = 3000;
+      } else if (deps.astro || lowerSet.has('astro.config.mjs') || lowerSet.has('astro.config.ts')) {
+        info.framework = 'Astro';
+        info.buildCommand = `${runPrefix} build`;
+        info.startCommand = scripts.start ? `${runPrefix} start` : 'node ./dist/server/entry.mjs';
+        info.containerPort = 4321;
+      } else if (deps.vite || lowerSet.has('vite.config.ts') || lowerSet.has('vite.config.js')) {
+        info.framework = 'Vite';
+        info.buildCommand = `${runPrefix} build`;
+        info.startCommand = scripts.preview ? `${runPrefix} preview` : '';
+        info.containerPort = 4173;
+      } else if (info.framework === 'generic') {
+        info.framework = 'Node.js';
+        if (scripts.build) info.buildCommand = `${runPrefix} build`;
+        info.startCommand = scripts.start ? (info.packageManager === 'npm' || !info.packageManager ? 'npm start' : `${runPrefix} start`) : (pkg.main ? `node ${pkg.main}` : 'node index.js');
+        info.containerPort = 3000;
+      }
+    } catch (e) {}
+  } else if (lowerSet.has('pyproject.toml') || lowerSet.has('requirements.txt')) {
+    info.runtime = 'python';
+    info.framework = lowerSet.has('uv.lock') ? 'Python (uv)' : lowerSet.has('poetry.lock') ? 'Python (Poetry)' : 'Python';
+    info.containerPort = 8000;
+    info.buildCommand = lowerSet.has('uv.lock') ? 'uv sync --frozen' : 'pip install -r requirements.txt';
+    info.startCommand = lowerSet.has('manage.py') ? 'gunicorn app.wsgi:application --bind 0.0.0.0:8000' : 'uvicorn main:app --host 0.0.0.0 --port 8000';
+    info.detectedFiles.push(lowerSet.has('pyproject.toml') ? 'pyproject.toml' : 'requirements.txt');
+  } else if (lowerSet.has('go.mod')) {
+    info.runtime = 'go';
+    info.framework = 'Go';
+    info.buildCommand = 'go build -o server .';
+    info.startCommand = './server';
+    info.containerPort = 8080;
+    info.detectedFiles.push('go.mod');
+  } else if (lowerSet.has('cargo.toml')) {
+    info.runtime = 'rust';
+    info.framework = 'Rust';
+    info.buildCommand = 'cargo build --release';
+    info.startCommand = './target/release/app';
+    info.containerPort = 8080;
+    info.detectedFiles.push('Cargo.toml');
+  } else if (lowerSet.has('deno.json') || lowerSet.has('deno.jsonc')) {
+    info.runtime = 'deno';
+    info.framework = 'Deno';
+    info.startCommand = 'deno run --allow-net --allow-env main.ts';
+    info.containerPort = 8000;
+    info.detectedFiles.push('deno.json');
+  } else if (lowerSet.has('composer.json')) {
+    info.runtime = 'php';
+    info.framework = lowerSet.has('artisan') ? 'Laravel' : 'PHP';
+    info.containerPort = 8080;
+    info.detectedFiles.push('composer.json');
+  } else if (lowerSet.has('mix.exs')) {
+    info.runtime = 'elixir';
+    info.framework = 'Elixir / Phoenix';
+    info.containerPort = 4000;
+    info.detectedFiles.push('mix.exs');
+  } else if (lowerSet.has('pom.xml') || lowerSet.has('build.gradle') || lowerSet.has('build.gradle.kts')) {
+    info.runtime = 'java';
+    info.framework = lowerSet.has('pom.xml') ? 'Java (Maven)' : 'Java (Gradle)';
+    info.containerPort = 8080;
+    info.detectedFiles.push(lowerSet.has('pom.xml') ? 'pom.xml' : 'build.gradle');
+  } else if (lowerSet.has('index.html')) {
+    info.runtime = 'static';
+    info.framework = 'Static HTML';
+    info.containerPort = 80;
+    info.detectedFiles.push('index.html');
+  }
+
+  // Enriquecer con configuración existente de plataforma si existe en el directorio
+  for (const candidate of ['fly.toml', 'Procfile', 'render.yaml', 'railway.toml', 'railway.json']) {
+    const p = path.join(dir, candidate);
+    if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+      info.detectedFiles.push(candidate);
+      try {
+        const parsed = svc.universalImporter.parsePlatformConfig({ platform: 'auto', configText: fs.readFileSync(p, 'utf8') });
+        if (parsed.healthPath && parsed.healthPath !== '/') info.healthPath = parsed.healthPath;
+        if (parsed.port && info.framework === 'generic') info.containerPort = parsed.port;
+        if (parsed.startCommand && !info.startCommand) info.startCommand = parsed.startCommand;
+        if (parsed.buildCommand && !info.buildCommand) info.buildCommand = parsed.buildCommand;
+      } catch (e) {}
+    }
+  }
+
+  // Leer claves de .env.example o .env (JÁMAS escribir secretos en claro en culkibo.yaml)
+  for (const envName of ['.env.example', '.env']) {
+    const ep = path.join(dir, envName);
+    if (fs.existsSync(ep) && fs.statSync(ep).isFile()) {
+      info.detectedFiles.push(envName);
+      try {
+        const { envVars, recommendedDatabases } = svc.universalImporter.parseEnvText(fs.readFileSync(ep, 'utf8'));
+        for (const db of recommendedDatabases) {
+          if (!info.recommendedDatabases.some((d) => d.engine === db.engine)) {
+            info.recommendedDatabases.push(db);
+          }
+        }
+        const gitops = svc.gitopsManager;
+        for (const [k, v] of Object.entries(envVars)) {
+          if (info.env[k] !== undefined) continue;
+          if (gitops.shouldRedactEnvForGit(k, v, false)) {
+            info.env[k] = `\${vault.${k}}`;
+            if (!info.vaultRefs.includes(k)) info.vaultRefs.push(k);
+          } else {
+            info.env[k] = v;
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  info.vaultRefs.sort();
+  return info;
+}
+
+/** Genera un manifiesto `culkibo.yaml` v1 seguro y validado a partir de la detección local. */
+function generateStarterManifest(detected, opts = {}) {
+  const gitops = svc.gitopsManager;
+  const projectName = String(opts.name || detected.name || 'culkibo-app').trim().slice(0, 80);
+  const projectId = `proj_${projectName.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^[^a-z0-9]+|_+$/g, '').slice(0, 48) || 'app'}`;
+  const stackName = `${projectName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 56) || 'app'}-stack`;
+
+  /** @type {Record<string, any>} */
+  const proj = {
+    id: projectId,
+    name: projectName,
+    gitBranch: 'main',
+    serverId: 'local',
+    autoDeploy: true,
+    containerPort: Number(detected.containerPort) || 3000
+  };
+  if (detected.buildCommand) proj.buildCommand = detected.buildCommand;
+  if (detected.startCommand) proj.startCommand = detected.startCommand;
+  if (detected.healthPath && detected.healthPath !== '/') proj.healthPath = detected.healthPath;
+  if (detected.env && Object.keys(detected.env).length > 0) proj.env = detected.env;
+
+  const databases = (detected.recommendedDatabases || [])
+    .filter((d) => ['postgres', 'mysql', 'mariadb', 'valkey', 'redis', 'mongodb'].includes(d.engine))
+    .map((d) => ({
+      name: `${projectId.replace(/^proj_/, '').slice(0, 32)}_${d.engine}`,
+      engine: d.engine,
+      projectId,
+      generateSecret: true
+    }));
+
+  /** @type {Record<string, any>} */
+  const manifest = {
+    version: 1,
+    name: stackName,
+    ...(detected.vaultRefs && detected.vaultRefs.length > 0 ? { vaultRefs: detected.vaultRefs } : {}),
+    projects: [proj],
+    ...(databases.length > 0 ? { databases } : {})
+  };
+
+  const schemaUrl = opts.schemaUrl || 'http://127.0.0.1:3030/api/gitops/schema.json';
+  const yaml = `# yaml-language-server: $schema=${schemaUrl}\n${gitops.serializeSafeYaml(manifest, 0)}\n`;
+  // Auto-validar con nuestro parser estricto
+  gitops.validateManifest(gitops.parseSafeYaml(yaml));
+  return { manifest, yaml, projectId, stackName };
+}
 
 // Comando start
 program
@@ -84,18 +416,33 @@ program
   .command('status')
   .description('Muestra el estado operativo del demonio de Culkibo')
   .option('-p, --port <port>', 'Puerto del daemon', process.env.PORT || '3030')
+  .option('--json', 'Salida JSON')
   .action(async (options) => {
     const port = parseInt(options.port, 10) || 3030;
+    const remote = getRemoteConfig(options);
+    const targetUrl = remote.apiUrl ? `${remote.apiUrl.replace(/\/api$/, '')}/api/health` : `http://127.0.0.1:${port}/api/health`;
+    /** @type {Record<string, string>} */
+    const headers = remote.token ? { Authorization: `Bearer ${remote.token}` } : {};
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      const res = await fetch(targetUrl, { headers, signal: AbortSignal.timeout(5000) });
+      const data = await res.json().catch(() => ({}));
+      if (isJsonMode(options)) {
+        printJson({ ok: res.ok, status: res.status, url: targetUrl, health: data });
+        if (!res.ok) process.exitCode = 1;
+        return;
+      }
       if (res.ok) {
-        console.log(`\x1b[32m✅ Culkibo está en ejecución y saludable en http://127.0.0.1:${port} (HTTP 200).\x1b[0m`);
+        console.log(`\x1b[32m✅ Culkibo está en ejecución y saludable en ${targetUrl.replace('/api/health', '')} (HTTP 200).\x1b[0m`);
       } else {
-        console.log(`\x1b[33m⚠️ Culkibo responde en :${port} pero reporta estado HTTP ${res.status}.\x1b[0m`);
+        console.log(`\x1b[33m⚠️ Culkibo responde en ${targetUrl} pero reporta estado HTTP ${res.status}.\x1b[0m`);
         process.exitCode = 1;
       }
     } catch (err) {
-      console.log(`\x1b[31m❌ Culkibo está detenido o inalcanzable en el puerto ${port}.\x1b[0m`);
+      if (isJsonMode(options)) {
+        printJson({ ok: false, url: targetUrl, error: err && err.message ? err.message : String(err) });
+      } else {
+        console.log(`\x1b[31m❌ Culkibo está detenido o inalcanzable en ${targetUrl}.\x1b[0m`);
+      }
       process.exitCode = 1;
     }
   });
@@ -128,43 +475,62 @@ program
     console.log('\x1b[33m🛑 Para detener el servidor, presione Ctrl+C en la terminal activa o termine el proceso de Node con Stop-Process / kill.\x1b[0m');
   });
 
-// Comando doctor (reutiliza systemDoctor.runDoctor() con opción --fix)
+// Comando doctor (reutiliza systemDoctor.runDoctor() con opción --fix y --json)
 program
   .command('doctor')
   .description('Ejecuta el diagnóstico real completo del sistema (Node, Docker, Caddy, disco, RAM, TLS, seguridad)')
   .option('--fix <action>', 'Ejecuta una remediación automática (reconcile_caddy | start_caddy | clean_tmp | clean_orphans | prune_buildkit)')
+  .option('--json', 'Salida JSON estructurada (exit code 1 si hay fallos)')
   .action(async (options) => {
-    const systemDoctor = require('../server/services/systemDoctor');
+    const remote = getRemoteConfig(options);
     if (options.fix) {
       try {
-        const fixRes = await systemDoctor.applyFix(options.fix);
-        console.log(`\x1b[32m✅ ${fixRes.message}\x1b[0m`);
+        const fixRes = remote.apiUrl
+          ? await remoteApiRequest(remote, 'POST', '/api/system/doctor/fix', { action: options.fix })
+          : await require('../server/services/systemDoctor').applyFix(options.fix);
+        if (isJsonMode(options)) {
+          printJson({ ok: true, action: options.fix, ...fixRes });
+        } else {
+          console.log(`\x1b[32m✅ ${fixRes.message}\x1b[0m`);
+        }
       } catch (err) {
-        console.error(`\x1b[31m❌ Error ejecutando remediación "${options.fix}":\x1b[0m ${err.message}`);
-        process.exit(1);
+        failCli(err, options);
       }
       return;
     }
 
-    console.log('\n\x1b[36m🩺 DIAGNÓSTICO INTEGRAL DE CULKIBO\x1b[0m');
-    console.log('==================================================');
-    const report = await systemDoctor.runDoctor();
-    for (const c of report.checks) {
-      const badge = c.status === 'ok'
-        ? '\x1b[32m  ✓\x1b[0m'
-        : c.status === 'warn'
-          ? '\x1b[33m  ⚠\x1b[0m'
-          : '\x1b[31m  ✗\x1b[0m';
-      console.log(`${badge} \x1b[1m${c.name}:\x1b[0m ${c.summary}`);
-      if (c.status !== 'ok') {
-        console.log(`      ${c.detail}`);
-        if (c.fixAction) {
-          console.log(`      \x1b[36m→ Solución 1 clic:\x1b[0m culkibo doctor --fix ${c.fixAction}`);
+    try {
+      const report = remote.apiUrl
+        ? await remoteApiRequest(remote, 'GET', '/api/system/doctor')
+        : await require('../server/services/systemDoctor').runDoctor();
+      const failCount = Number(report?.summary?.fail || 0);
+      if (isJsonMode(options)) {
+        printJson({ ok: failCount === 0, ...report });
+        if (failCount > 0) process.exitCode = 1;
+        return;
+      }
+      console.log('\n\x1b[36m🩺 DIAGNÓSTICO INTEGRAL DE CULKIBO\x1b[0m');
+      console.log('==================================================');
+      for (const c of report.checks || []) {
+        const badge = c.status === 'ok'
+          ? '\x1b[32m  ✓\x1b[0m'
+          : c.status === 'warn'
+            ? '\x1b[33m  ⚠\x1b[0m'
+            : '\x1b[31m  ✗\x1b[0m';
+        console.log(`${badge} \x1b[1m${c.name}:\x1b[0m ${c.summary}`);
+        if (c.status !== 'ok') {
+          console.log(`      ${c.detail}`);
+          if (c.fixAction) {
+            console.log(`      \x1b[36m→ Solución 1 clic:\x1b[0m culkibo doctor --fix ${c.fixAction}`);
+          }
         }
       }
+      console.log('==================================================');
+      console.log(`Resumen: ${report.summary.ok} OK · ${report.summary.warn} avisos · ${failCount} fallos (${report.durationMs} ms)\n`);
+      if (failCount > 0) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
     }
-    console.log('==================================================');
-    console.log(`Resumen: ${report.summary.ok} OK · ${report.summary.warn} avisos · ${report.summary.fail} fallos (${report.durationMs} ms)\n`);
   });
 
 // Comando watch
@@ -200,29 +566,38 @@ const podCmd = program.command('pod').description('Gestión de entornos de Desar
 podCmd
   .command('list')
   .description('Muestra el estado y métricas en tiempo real de los entornos')
-  .action(() => {
-    const data = svc.containerOrchestrator.getPods();
-    console.log('\n--- Estado de Entornos Culkibo ---');
-    console.table([
-      {
-        Entorno: 'Desarrollo (:3001)',
-        Estado: data.pods.forge.status === 'running' ? 'Activo' : data.pods.forge.status,
-        Latencia: `${data.pods.forge.latencyMs}ms`,
-        CPU: `${data.pods.forge.cpuPercent}%`,
-        Memoria: `${data.pods.forge.memoryMb}MB`,
-        Puerto: data.pods.forge.port,
-        Tráfico: `${data.trafficAllocation.forge}%`
-      },
-      {
-        Entorno: 'Producción (:8080)',
-        Estado: data.pods.citadel.status === 'running' ? 'Activo' : data.pods.citadel.status,
-        Latencia: `${data.pods.citadel.latencyMs}ms`,
-        CPU: `${data.pods.citadel.cpuPercent}%`,
-        Memoria: `${data.pods.citadel.memoryMb}MB`,
-        Puerto: data.pods.citadel.port,
-        Tráfico: `${data.trafficAllocation.citadel}%`
-      }
-    ]);
+  .option('--json', 'Salida JSON')
+  .action(async (options) => {
+    try {
+      const remote = getRemoteConfig(options);
+      const data = remote.apiUrl
+        ? await remoteApiRequest(remote, 'GET', '/api/pods')
+        : svc.containerOrchestrator.getPods();
+      if (isJsonMode(options)) return printJson({ ok: true, ...data });
+      console.log('\n--- Estado de Entornos Culkibo ---');
+      console.table([
+        {
+          Entorno: 'Desarrollo (:3001)',
+          Estado: data.pods.forge.status === 'running' ? 'Activo' : data.pods.forge.status,
+          Latencia: `${data.pods.forge.latencyMs}ms`,
+          CPU: `${data.pods.forge.cpuPercent}%`,
+          Memoria: `${data.pods.forge.memoryMb}MB`,
+          Puerto: data.pods.forge.port,
+          Tráfico: `${data.trafficAllocation.forge}%`
+        },
+        {
+          Entorno: 'Producción (:8080)',
+          Estado: data.pods.citadel.status === 'running' ? 'Activo' : data.pods.citadel.status,
+          Latencia: `${data.pods.citadel.latencyMs}ms`,
+          CPU: `${data.pods.citadel.cpuPercent}%`,
+          Memoria: `${data.pods.citadel.memoryMb}MB`,
+          Puerto: data.pods.citadel.port,
+          Tráfico: `${data.trafficAllocation.citadel}%`
+        }
+      ]);
+    } catch (err) {
+      failCli(err, options);
+    }
   });
 
 podCmd
@@ -263,17 +638,27 @@ const domainCmd = program.command('domain').description('Gestión de dominios, C
 domainCmd
   .command('list')
   .description('Lista los dominios configurados y el estado de sus certificados')
-  .action(() => {
-    const domains = svc.domainManager.listDomains();
-    console.log('\n--- Dominios Configurados en Culkibo ---');
-    console.table(domains.map(d => ({
-      Dominio: d.hostname,
-      Entorno: d.targetPod === 'forge' ? 'Desarrollo' : 'Producción',
-      Puerto: d.targetPort,
-      Cloudflare: d.cloudflareProxied ? 'Proxy Activo (Nube Naranja ☁️)' : 'Solo DNS',
-      SSL: d.sslStatus === 'active' ? 'Activo' : d.sslStatus,
-      Validez: d.certClaim && d.certClaim.daysRemaining != null ? `${d.certClaim.daysRemaining} días` : 'N/D'
-    })));
+  .option('--json', 'Salida JSON')
+  .action(async (options) => {
+    try {
+      const remote = getRemoteConfig(options);
+      const raw = remote.apiUrl
+        ? await remoteApiRequest(remote, 'GET', '/api/domains')
+        : svc.domainManager.listDomains();
+      const domains = Array.isArray(raw) ? raw : (raw?.domains || []);
+      if (isJsonMode(options)) return printJson({ ok: true, count: domains.length, domains });
+      console.log('\n--- Dominios Configurados en Culkibo ---');
+      console.table(domains.map(d => ({
+        Dominio: d.hostname,
+        Entorno: d.targetPod === 'forge' ? 'Desarrollo' : 'Producción',
+        Puerto: d.targetPort,
+        Cloudflare: d.cloudflareProxied ? 'Proxy Activo (Nube Naranja ☁️)' : 'Solo DNS',
+        SSL: d.sslStatus === 'active' ? 'Activo' : d.sslStatus,
+        Validez: d.certClaim && d.certClaim.daysRemaining != null ? `${d.certClaim.daysRemaining} días` : 'N/D'
+      })));
+    } catch (err) {
+      failCli(err, options);
+    }
   });
 
 domainCmd
@@ -345,19 +730,68 @@ domainCmd
     }
   });
 
-// Comandos de Backup y Restauración
+// Comandos de Backup y Restauración (proyectos + bases de datos gestionadas)
 program
-  .command('backup <projectId>')
-  .description('Genera un paquete de respaldo exportable de un proyecto')
-  .action(async (projectId) => {
+  .command('backup [projectId]')
+  .description('Genera o lista respaldos exportables de un proyecto o base de datos (--db <dbId>)')
+  .option('--db <dbId>', 'Ejecutar o listar respaldo de una base de datos gestionada')
+  .option('--list', 'Listar respaldos existentes sin crear uno nuevo')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, options) => {
     try {
-      console.log(`[Culkibo Backup] Exportando proyecto ${projectId}...`);
-      const res = await svc.dbBackupManager.exportProject(projectId);
-      console.log(`\x1b[32m✅ Respaldo generado con éxito:\x1b[0m ${res.fullPath}`);
-      console.log(`   Recursos: ${res.resourcesCount} | Dominios: ${res.domainsCount}`);
+      const remote = getRemoteConfig(options);
+      if (options.db) {
+        const dbId = String(options.db).trim();
+        if (options.list) {
+          const backups = remote.apiUrl
+            ? await remoteApiRequest(remote, 'GET', `/api/databases/${encodeURIComponent(dbId)}/backups`)
+            : svc.databaseManager.listBackups(dbId);
+          if (isJsonMode(options)) return printJson({ ok: true, dbId, backups });
+          const rows = Array.isArray(backups) ? backups : (backups?.backups || []);
+          console.table(rows.map((b) => ({
+            ID: b.id,
+            Archivo: b.fileName || b.name || '—',
+            TamanoBytes: b.sizeBytes ?? '—',
+            Cifrado: b.encrypted ? 'AES-GCM' : 'no',
+            Fecha: b.createdAt || '—'
+          })));
+          return;
+        }
+        const res = remote.apiUrl
+          ? await remoteApiRequest(remote, 'POST', `/api/databases/${encodeURIComponent(dbId)}/backups`, { trigger: 'cli' })
+          : await svc.databaseManager.runBackup(dbId, { trigger: 'cli' });
+        if (isJsonMode(options)) return printJson({ ok: true, dbId, backup: res });
+        console.log(`\x1b[32m✅ Backup de BD ${dbId} generado:\x1b[0m ${res.fileName || res.id || 'OK'}`);
+        return;
+      }
+
+      if (options.list) {
+        const backups = remote.apiUrl
+          ? await remoteApiRequest(remote, 'GET', '/api/backup/list')
+          : await svc.dbBackupManager.listBackups();
+        if (isJsonMode(options)) return printJson({ ok: true, backups });
+        const rows = Array.isArray(backups) ? backups : (backups?.backups || []);
+        console.table(rows.map((b) => ({
+          Archivo: b.fileName || b.name || b,
+          Proyecto: b.projectId || '—',
+          Tamano: b.sizeBytes ?? '—',
+          Fecha: b.createdAt || '—'
+        })));
+        return;
+      }
+
+      if (!projectId) {
+        throw new Error('Especifica <projectId>, --db <dbId> o --list');
+      }
+      if (!isJsonMode(options)) console.log(`[Culkibo Backup] Exportando proyecto ${projectId}...`);
+      const res = remote.apiUrl
+        ? await remoteApiRequest(remote, 'POST', `/api/backup/export/${encodeURIComponent(projectId)}`, {})
+        : await svc.dbBackupManager.exportProject(projectId);
+      if (isJsonMode(options)) return printJson({ ok: true, ...res });
+      console.log(`\x1b[32m✅ Respaldo generado con éxito:\x1b[0m ${res.fullPath || res.fileName || 'OK'}`);
+      console.log(`   Recursos: ${res.resourcesCount ?? 0} | Dominios: ${res.domainsCount ?? 0}`);
     } catch (err) {
-      console.error(`❌ Error al exportar respaldo:`, err.message);
-      process.exitCode = 1;
+      failCli(err, options);
     }
   });
 
@@ -381,28 +815,40 @@ const dockerCmd = program.command('docker').description('Comandos de inspección
 dockerCmd
   .command('status')
   .description('Comprueba la conexión con el daemon de Docker')
-  .action(async () => {
-    const status = await svc.dockerManager.checkDockerStatus(true);
-    console.log('\n--- Estado del Motor Docker ---');
-    console.log(`Modo:         ${status.mode === 'docker_native' ? '\x1b[32mNativo (Docker Daemon)\x1b[0m' : '\x1b[33mSandbox de Procesos Ultrarrápido\x1b[0m'}`);
-    console.log(`Versión:      ${status.clientVersion || 'N/D'}`);
-    console.log(`Contenedores: ${status.containersRunning || 0} activos`);
-    console.log(`Mensaje:      ${status.message}\n`);
+  .option('--json', 'Salida JSON')
+  .action(async (options) => {
+    try {
+      const status = await svc.dockerManager.checkDockerStatus(true);
+      if (isJsonMode(options)) return printJson({ ok: true, ...status });
+      console.log('\n--- Estado del Motor Docker ---');
+      console.log(`Modo:         ${status.mode === 'docker_native' ? '\x1b[32mNativo (Docker Daemon)\x1b[0m' : '\x1b[33mSandbox de Procesos Ultrarrápido\x1b[0m'}`);
+      console.log(`Versión:      ${status.clientVersion || 'N/D'}`);
+      console.log(`Contenedores: ${status.containersRunning || 0} activos`);
+      console.log(`Mensaje:      ${status.message}\n`);
+    } catch (err) {
+      failCli(err, options);
+    }
   });
 
 dockerCmd
   .command('list')
   .description('Lista contenedores en ejecución')
-  .action(async () => {
-    const list = await svc.dockerManager.listContainers({ all: false });
-    console.log('\n--- Contenedores Activos ---');
-    console.table(list.map(c => ({
-      ID: c.id?.substring(0, 12) || 'N/D',
-      Imagen: c.image || 'N/D',
-      Estado: c.status || c.state || 'Up',
-      Puertos: c.ports || 'N/D',
-      Modo: c.mode || 'N/D'
-    })));
+  .option('--json', 'Salida JSON')
+  .action(async (options) => {
+    try {
+      const list = await svc.dockerManager.listContainers({ all: false });
+      if (isJsonMode(options)) return printJson({ ok: true, count: list.length, containers: list });
+      console.log('\n--- Contenedores Activos ---');
+      console.table(list.map(c => ({
+        ID: c.id?.substring(0, 12) || 'N/D',
+        Imagen: c.image || 'N/D',
+        Estado: c.status || c.state || 'Up',
+        Puertos: c.ports || 'N/D',
+        Modo: c.mode || 'N/D'
+      })));
+    } catch (err) {
+      failCli(err, options);
+    }
   });
 
 // Ingress resolution inspector
@@ -494,44 +940,100 @@ program
   .command('deploy <projectId>')
   .description('Despliega un proyecto a producción (Docker BuildKit + healthcheck + swap Caddy)')
   .option('--no-git-sync', 'Desplegar el árbol local tal cual (promoción desde Forge)')
+  .option('--json', 'Salida JSON')
   .action(async (projectId, options) => {
     try {
+      const remote = getRemoteConfig(options);
+      if (remote.apiUrl) {
+        const res = await remoteApiRequest(remote, 'POST', `/api/projects/${encodeURIComponent(projectId)}/deploy`, {
+          gitSync: options.gitSync
+        });
+        if (isJsonMode(options)) return printJson({ ok: true, remote: true, ...res });
+        console.log(`\x1b[32m✅ Despliegue remoto lanzado para ${projectId}\x1b[0m (${res.message || res.status || 'en curso'})`);
+        return;
+      }
       const project = svc.projectManager.getById(projectId);
       if (!project) {
-        console.error(`❌ Proyecto "${projectId}" no encontrado.`);
-        process.exit(1);
+        failCli(new Error(`Proyecto "${projectId}" no encontrado.`), options);
+        return;
       }
       const result = await svc.deployManager.deploy(project, { gitSync: options.gitSync, trigger: 'cli' });
       if (result.status === 'activo') {
-        console.log(`\x1b[32m✅ Despliegue ${result.id} activo en ${result.durationMs} ms (${result.upstream || 'sin ruta'})\x1b[0m`);
+        if (isJsonMode(options)) {
+          printJson({ ok: true, deployment: result });
+        } else {
+          console.log(`\x1b[32m✅ Despliegue ${result.id} activo en ${result.durationMs} ms (${result.upstream || 'sin ruta'})\x1b[0m`);
+        }
         // Esperar al drenaje para no dejar el contenedor anterior vivo al terminar el proceso CLI
         await svc.deployManager.awaitDrain(project.id);
       } else {
-        console.error(`❌ Despliegue fallido: ${result.error}`);
-        process.exit(1);
+        failCli(new Error(`Despliegue fallido: ${result.error}`), options);
       }
     } catch (err) {
-      console.error(`❌ Error al desplegar: ${err.message}`);
-      process.exit(1);
+      failCli(err, options);
     }
   });
 
 program
   .command('rollback <projectId>')
-  .description('Revierte un proyecto a la versión de producción anterior por conmutación de ruta')
-  .action(async (projectId) => {
-    const project = svc.projectManager.getById(projectId);
-    if (!project) {
-      console.error(`❌ Proyecto "${projectId}" no encontrado.`);
-      process.exit(1);
-    }
+  .description('Revierte un proyecto a la versión de producción anterior o a un --release específico')
+  .option('-r, --release <deploymentId>', 'ID exacto de release histórica a restaurar')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, options) => {
     try {
-      const result = await svc.deployManager.rollback(project.id);
-      console.log(`\x1b[32m✅ Rollback completado (${result.id})\x1b[0m`);
+      const remote = getRemoteConfig(options);
+      const rbOpts = options.release ? { deploymentId: String(options.release).trim() } : {};
+      if (remote.apiUrl) {
+        const res = await remoteApiRequest(remote, 'POST', `/api/projects/${encodeURIComponent(projectId)}/rollback`, rbOpts);
+        if (isJsonMode(options)) return printJson({ ok: true, remote: true, ...res });
+        console.log(`\x1b[32m✅ Rollback remoto completado (${res.id || res.deploymentId || 'OK'})\x1b[0m`);
+        return;
+      }
+      const project = svc.projectManager.getById(projectId);
+      if (!project) {
+        failCli(new Error(`Proyecto "${projectId}" no encontrado.`), options);
+        return;
+      }
+      const result = await svc.deployManager.rollback(project.id, rbOpts);
+      if (isJsonMode(options)) {
+        printJson({ ok: true, rollback: result });
+      } else {
+        console.log(`\x1b[32m✅ Rollback completado (${result.id})\x1b[0m`);
+      }
       await svc.deployManager.awaitDrain(project.id);
     } catch (err) {
-      console.error(`❌ Error en rollback: ${err.message}`);
-      process.exit(1);
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('releases <projectId>')
+  .description('Lista el historial de despliegues/releases de un proyecto (compatible con rollback --release)')
+  .option('-n, --limit <n>', 'Número máximo de releases a listar', '20')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, options) => {
+    try {
+      const limit = Math.max(1, Math.min(100, parseInt(options.limit, 10) || 20));
+      const remote = getRemoteConfig(options);
+      const raw = remote.apiUrl
+        ? await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}/deployments?limit=${limit}`)
+        : svc.deployManager.listDeployments(projectId, limit);
+      const deployments = Array.isArray(raw) ? raw : (raw?.deployments || raw?.history || []);
+      if (isJsonMode(options)) return printJson({ ok: true, projectId, count: deployments.length, releases: deployments });
+      if (deployments.length === 0) {
+        console.log(`Sin despliegues registrados para "${projectId}".`);
+        return;
+      }
+      console.table(deployments.map((d) => ({
+        ID: d.id,
+        Estado: d.status || '—',
+        Version: d.version || '—',
+        Commit: d.git?.commit ? String(d.git.commit).slice(0, 7) : '—',
+        DuracionMs: d.durationMs ?? '—',
+        Fecha: d.finishedAt || d.startedAt || '—'
+      })));
+    } catch (err) {
+      failCli(err, options);
     }
   });
 
@@ -540,8 +1042,10 @@ const catalogCmd = program.command('catalog').description('Catálogo de servicio
 catalogCmd
   .command('list')
   .description('Lista las plantillas disponibles en el catálogo')
-  .action(() => {
+  .option('--json', 'Salida JSON')
+  .action((options) => {
     const templates = svc.catalogManager.listTemplates();
+    if (isJsonMode(options)) return printJson({ ok: true, count: templates.length, templates });
     console.table(templates.map(t => ({
       ID: t.id,
       Nombre: t.name,
@@ -824,15 +1328,612 @@ program
     });
   });
 
+// ===========================================================================
+// DX CLOUD-NATIVE: init, up, logs, env, exec
+// ===========================================================================
+
+// culkibo init [dir]: autodetecta stack y genera culkibo.yaml + .culkiboignore
+program
+  .command('init [directorio]')
+  .description('Autodetecta el stack local y genera un manifiesto declarativo culkibo.yaml + .culkiboignore')
+  .option('-n, --name <nombre>', 'Nombre del proyecto')
+  .option('--force', 'Sobrescribir culkibo.yaml si ya existe')
+  .option('--schema-url <url>', 'URL de JSON Schema para autocompletado en IDE')
+  .option('--json', 'Salida JSON')
+  .action((directorio = process.cwd(), options) => {
+    try {
+      const targetDir = path.resolve(directorio);
+      if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
+        throw new Error(`El directorio no existe: ${targetDir}`);
+      }
+      const manifestPath = path.join(targetDir, 'culkibo.yaml');
+      if (fs.existsSync(manifestPath) && !options.force) {
+        throw new Error(`Ya existe ${manifestPath}. Usa --force para sobrescribirlo.`);
+      }
+      const detected = detectLocalStack(targetDir);
+      const generated = generateStarterManifest(detected, {
+        name: options.name,
+        schemaUrl: options.schemaUrl
+      });
+      fs.writeFileSync(manifestPath, generated.yaml, 'utf8');
+
+      const ignorePath = path.join(targetDir, '.culkiboignore');
+      let createdIgnore = false;
+      if (!fs.existsSync(ignorePath) || options.force) {
+        const defaultIgnore = [
+          '# Generado por culkibo init — ficheros excluidos de Live Sync',
+          '.env',
+          '.env.*.local',
+          '*.log',
+          'tmp/',
+          '.DS_Store',
+          'Thumbs.db',
+          ''
+        ].join('\n');
+        fs.writeFileSync(ignorePath, defaultIgnore, 'utf8');
+        createdIgnore = true;
+      }
+
+      const payload = {
+        ok: true,
+        directory: targetDir,
+        manifestPath,
+        ignorePath: createdIgnore ? ignorePath : null,
+        projectId: generated.projectId,
+        stackName: generated.stackName,
+        framework: detected.framework,
+        runtime: detected.runtime,
+        containerPort: detected.containerPort,
+        vaultRefs: detected.vaultRefs,
+        databases: (generated.manifest.databases || []).map((d) => d.engine)
+      };
+      if (isJsonMode(options)) return printJson(payload);
+      console.log(`\n\x1b[32m✅ Proyecto inicializado con Culkibo\x1b[0m`);
+      console.log(`   Stack detectado: ${detected.framework} (puerto ${detected.containerPort})`);
+      console.log(`   Manifiesto:      ${manifestPath}`);
+      if (createdIgnore) console.log(`   Ignore Sync:     ${ignorePath}`);
+      if (detected.vaultRefs.length > 0) {
+        console.log(`   Secretos Vault:  ${detected.vaultRefs.join(', ')} (referenciados como \${vault.*})`);
+      }
+      console.log(`   Siguiente paso:  culkibo up\n`);
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// culkibo up [dir]: reconcilia culkibo.yaml + despliega o inicia Live Sync en 1 comando
+program
+  .command('up [directorio]')
+  .description('Reconcilia culkibo.yaml y despliega (o sincroniza con --sync) el proyecto en un solo comando')
+  .option('-f, --file <file>', 'Ruta al manifiesto declarativo', 'culkibo.yaml')
+  .option('-p, --project <projectId>', 'Proyecto concreto del manifiesto a desplegar')
+  .option('--dry-run', 'Simula el plan GitOps sin aplicar cambios ni desplegar')
+  .option('--no-deploy', 'Aplicar sólo el manifiesto GitOps sin lanzar build/deploy')
+  .option('--no-git-sync', 'Desplegar el árbol local tal cual sin git pull')
+  .option('--sync', 'Iniciar Live Sync en vivo tras reconciliar el manifiesto')
+  .option('--prune', 'Eliminar recursos no declarados en culkibo.yaml')
+  .option('--confirm-destructive', 'Confirmar eliminaciones destructivas con --prune')
+  .option('--json', 'Salida JSON')
+  .action(async (directorio = process.cwd(), options) => {
+    try {
+      const baseDir = path.resolve(directorio);
+      const manifestPath = path.isAbsolute(options.file) ? options.file : path.join(baseDir, options.file);
+      if (!fs.existsSync(manifestPath)) {
+        throw new Error(`No se encontró ${manifestPath}. Ejecuta "culkibo init" primero.`);
+      }
+      const yamlText = fs.readFileSync(manifestPath, 'utf8');
+      const remote = getRemoteConfig(options);
+
+      if (options.dryRun) {
+        const plan = remote.apiUrl
+          ? await remoteApiRequest(remote, 'POST', '/api/gitops/plan', { yamlText, prune: Boolean(options.prune) })
+          : svc.gitopsManager.planApply(yamlText, { prune: Boolean(options.prune), confirmDestructive: Boolean(options.confirmDestructive) });
+        if (isJsonMode(options)) return printJson({ ok: true, dryRun: true, plan });
+        console.log(`\n🔍 Plan GitOps (${plan.stackName || 'stack'}): +${plan.summary?.create ?? 0} crear · ~${plan.summary?.update ?? 0} actualizar · -${plan.summary?.delete ?? 0} eliminar\n`);
+        return;
+      }
+
+      const applied = remote.apiUrl
+        ? await remoteApiRequest(remote, 'POST', '/api/gitops/apply', {
+          yamlText,
+          dryRun: false,
+          prune: Boolean(options.prune),
+          confirmDestructive: Boolean(options.confirmDestructive)
+        })
+        : await svc.gitopsManager.applyStack(yamlText, {
+          dryRun: false,
+          prune: Boolean(options.prune),
+          confirmDestructive: Boolean(options.confirmDestructive),
+          actor: 'cli:up'
+        });
+
+      const targetProjectId = options.project
+        || (applied.managedResources && applied.managedResources.projectIds && applied.managedResources.projectIds[0])
+        || null;
+
+      if (options.sync) {
+        if (!targetProjectId) throw new Error('No se encontró ningún proyecto en culkibo.yaml para iniciar Live Sync');
+        const wsUrl = remote.apiUrl
+          ? remote.apiUrl.replace(/^http/i, 'ws').replace(/\/api$/, '') + '/ws/sync'
+          : (process.env.CULKIBO_SYNC_URL || 'ws://127.0.0.1:3030/ws/sync');
+        const client = new svc.LiveSyncClient({
+          projectId: targetProjectId,
+          sourceDir: baseDir,
+          wsUrl,
+          token: remote.token || null
+        });
+        await client.start();
+        const rec = await client.reconcileFull();
+        if (isJsonMode(options)) {
+          printJson({ ok: true, applied, sync: { projectId: targetProjectId, wsUrl, merkle: rec.rootDigest, changed: rec.changed } });
+        } else {
+          console.log(`\x1b[32m✅ Stack reconciliado + Live Sync activo para ${targetProjectId}\x1b[0m (Merkle ${rec.rootDigest.slice(0, 12)})`);
+        }
+        const stopSync = async () => { await client.stop(); process.exit(0); };
+        process.once('SIGINT', stopSync);
+        process.once('SIGTERM', stopSync);
+        return;
+      }
+
+      /** @type {any} */
+      let deployment = null;
+      if (options.deploy !== false && targetProjectId) {
+        if (remote.apiUrl) {
+          deployment = await remoteApiRequest(remote, 'POST', `/api/projects/${encodeURIComponent(targetProjectId)}/deploy`, {
+            gitSync: options.gitSync
+          });
+        } else {
+          const project = svc.projectManager.getById(targetProjectId);
+          if (project) {
+            if (!project.localPath && !project.gitRepo) {
+              svc.projectManager.update(project.id, { localPath: baseDir });
+            }
+            const refreshed = svc.projectManager.getById(targetProjectId) || project;
+            deployment = await svc.deployManager.deploy(refreshed, { gitSync: options.gitSync, trigger: 'cli:up' });
+            if (deployment.status === 'activo') {
+              await svc.deployManager.awaitDrain(refreshed.id);
+            }
+          }
+        }
+      }
+
+      if (isJsonMode(options)) {
+        return printJson({ ok: true, stackId: applied.stackId, appliedCounts: applied.appliedCounts, projectId: targetProjectId, deployment });
+      }
+      console.log(`\x1b[32m✅ Stack "${applied.stackName || applied.stackId}" reconciliado\x1b[0m (+${applied.appliedCounts?.created ?? 0} ~${applied.appliedCounts?.updated ?? 0} -${applied.appliedCounts?.deleted ?? 0})`);
+      if (deployment) {
+        console.log(`   Despliegue (${targetProjectId}): ${deployment.status || deployment.message || 'iniciado'}`);
+      }
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// culkibo logs <projectId>: inspecciona o sigue en tiempo real los logs del contenedor
+program
+  .command('logs <projectId>')
+  .description('Muestra o sigue en vivo (-f) los logs de ejecución de un proyecto')
+  .option('-f, --follow', 'Seguir los logs en tiempo real')
+  .option('-n, --tail <lines>', 'Número de líneas recientes', '100')
+  .option('--since <since>', 'Filtrar desde marca temporal o duración (ej. 10m, 1h)')
+  .option('--previous', 'Leer logs del contenedor de la release anterior')
+  .option('--no-timestamps', 'Omitir marcas de tiempo')
+  .option('--json', 'Salida JSON / NDJSON')
+  .action(async (projectId, options) => {
+    try {
+      const tail = Math.max(1, Math.min(5000, parseInt(options.tail, 10) || 100));
+      const target = options.previous ? 'previous' : 'current';
+      const remote = getRemoteConfig(options);
+
+      if (options.follow) {
+        if (remote.apiUrl) {
+          const base = remote.apiUrl.replace(/\/api$/, '');
+          const streamUrl = `${base}/api/projects/${encodeURIComponent(projectId)}/runtime/logs/stream?tail=${tail}&target=${target}`;
+          /** @type {Record<string, string>} */
+          const headers = { Accept: 'text/event-stream' };
+          if (remote.token) headers.Authorization = `Bearer ${remote.token}`;
+          const ac = new AbortController();
+          process.once('SIGINT', () => ac.abort());
+          process.once('SIGTERM', () => ac.abort());
+          const res = await fetch(streamUrl, { headers, signal: ac.signal });
+          if (!res.ok || !res.body) throw new Error(`Error abriendo stream SSE (HTTP ${res.status})`);
+          const decoder = new TextDecoder();
+          let buf = '';
+          for await (const chunk of res.body) {
+            buf += decoder.decode(chunk, { stream: true });
+            const lines = buf.split(/\r?\n/);
+            buf = lines.pop() || '';
+            for (const ln of lines) {
+              if (!ln.startsWith('data:')) continue;
+              const rawData = ln.slice(5).trim();
+              if (!rawData) continue;
+              if (isJsonMode(options)) {
+                process.stdout.write(rawData + '\n');
+              } else {
+                try {
+                  const parsed = JSON.parse(rawData);
+                  if (parsed.line !== undefined) console.log(parsed.line);
+                } catch (e) {
+                  console.log(rawData);
+                }
+              }
+            }
+          }
+          return;
+        }
+
+        const stream = svc.deployManager.streamRuntimeLogs(projectId, {
+          tail,
+          target,
+          onLine: (payload) => {
+            if (isJsonMode(options)) {
+              process.stdout.write(JSON.stringify(payload) + '\n');
+            } else {
+              console.log(typeof payload === 'string' ? payload : (payload.line ?? JSON.stringify(payload)));
+            }
+          },
+          onEnd: () => process.exit(0)
+        });
+        const stop = () => { try { stream.close(); } catch (e) {} process.exit(0); };
+        process.once('SIGINT', stop);
+        process.once('SIGTERM', stop);
+        return;
+      }
+
+      let result;
+      if (remote.apiUrl) {
+        const qs = new URLSearchParams({ tail: String(tail), target, timestamps: options.timestamps === false ? '0' : '1' });
+        if (options.since) qs.set('since', String(options.since));
+        result = await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}/runtime/logs?${qs.toString()}`);
+      } else {
+        result = await svc.deployManager.getRuntimeLogs(projectId, {
+          tail,
+          since: options.since || null,
+          timestamps: options.timestamps !== false,
+          target
+        });
+      }
+      if (isJsonMode(options)) return printJson({ ok: result.ok !== false, projectId, ...result });
+      const lines = Array.isArray(result.lines) ? result.lines : (typeof result.logs === 'string' ? result.logs.split(/\r?\n/) : []);
+      if (lines.length === 0) {
+        console.log(result.error || `Sin logs disponibles para ${projectId}.`);
+        if (result.ok === false) process.exitCode = 1;
+        return;
+      }
+      for (const l of lines) console.log(typeof l === 'string' ? l : (l.line || JSON.stringify(l)));
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// culkibo env <list|set|unset|push|pull>: gestión segura de variables y Vault cifrado
+const envCmd = program.command('env').description('Gestiona variables de entorno y secretos cifrados del Vault (list, set, unset, push, pull)');
+
+envCmd
+  .command('list <projectId>')
+  .description('Lista claves de entorno (valores sensibles enmascarados por defecto)')
+  .option('-e, --env <slug>', 'Entorno aislado (ej. production, staging)')
+  .option('--vault', 'Listar secretos compartidos del Vault AES-256-GCM (solo metadatos/huellas)')
+  .option('--reveal', 'Mostrar valores en claro de variables del proyecto')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, options) => {
+    try {
+      const remote = getRemoteConfig(options);
+      if (options.vault) {
+        const secrets = remote.apiUrl
+          ? await remoteApiRequest(remote, 'GET', '/api/vault')
+          : svc.environmentManager.listVaultSecrets();
+        const list = Array.isArray(secrets) ? secrets : (secrets?.secrets || []);
+        if (isJsonMode(options)) return printJson({ ok: true, vault: true, count: list.length, secrets: list });
+        console.table(list.map((s) => ({ Key: s.key, Scope: s.scope || 'both', Fingerprint: s.fingerprint, UpdatedAt: s.updatedAt || '—' })));
+        return;
+      }
+
+      if (options.env) {
+        const envSlug = String(options.env).trim();
+        if (remote.apiUrl) {
+          const envs = await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}/environments`);
+          const found = (envs?.environments || envs || []).find((e) => e.name === envSlug);
+          if (!found) throw new Error(`Entorno "${envSlug}" no encontrado en ${projectId}`);
+          if (isJsonMode(options)) return printJson({ ok: true, projectId, environment: envSlug, keys: found.envKeys || [] });
+          console.table((found.envKeys || []).map((k) => ({ Key: k, Value: '[encrypted]' })));
+          return;
+        }
+        const envObj = svc.environmentManager.getEnvironment(projectId, envSlug);
+        if (!envObj) throw new Error(`Entorno "${envSlug}" no encontrado en ${projectId}`);
+        const keys = Array.isArray(envObj.envKeys) ? envObj.envKeys : [];
+        if (isJsonMode(options)) return printJson({ ok: true, projectId, environment: envSlug, count: keys.length, keys });
+        console.table(keys.map((k) => ({ Key: k, Value: '[encrypted:AES-256-GCM]' })));
+        return;
+      }
+
+      const project = remote.apiUrl
+        ? await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}`)
+        : svc.projectManager.getById(projectId);
+      if (!project) throw new Error(`Proyecto "${projectId}" no encontrado.`);
+      const rawEnv = project.envVars || {};
+      const gitops = svc.gitopsManager;
+      /** @type {Record<string, string>} */
+      const displayEnv = {};
+      for (const k of Object.keys(rawEnv).sort()) {
+        const v = String(rawEnv[k] ?? '');
+        const isSecret = gitops.shouldRedactEnvForGit(k, v, false);
+        displayEnv[k] = (options.reveal || !isSecret) ? v : '[REDACTED]';
+      }
+      if (isJsonMode(options)) return printJson({ ok: true, projectId, count: Object.keys(displayEnv).length, env: displayEnv });
+      console.table(Object.entries(displayEnv).map(([Key, Value]) => ({ Key, Value })));
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+envCmd
+  .command('set <projectId> [pairs...]')
+  .description('Establece variables KEY=VALUE (o lee un secreto por --stdin KEY)')
+  .option('-e, --env <slug>', 'Entorno aislado destino (ej. production, staging)')
+  .option('--vault', 'Guardar directamente en el Vault compartido AES-256-GCM')
+  .option('--scope <scope>', 'Alcance en Vault (runtime | build | both)', 'both')
+  .option('--stdin <key>', 'Leer el valor de esta clave desde stdin (sin exponerlo en argv)')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, pairs, options) => {
+    try {
+      const updates = parseEnvAssignments(pairs || []);
+      if (options.stdin) {
+        const key = String(options.stdin).trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) throw new Error(`Clave --stdin inválida: "${key}"`);
+        updates[key] = await readStdinText();
+      }
+      const keys = Object.keys(updates);
+      if (keys.length === 0) throw new Error('Proporciona al menos un par CLAVE=VALOR o --stdin CLAVE');
+
+      const remote = getRemoteConfig(options);
+      if (options.vault) {
+        /** @type {any[]} */
+        const saved = [];
+        for (const [k, v] of Object.entries(updates)) {
+          const meta = remote.apiUrl
+            ? await remoteApiRequest(remote, 'PUT', `/api/vault/${encodeURIComponent(k)}`, { value: v, scope: options.scope })
+            : svc.environmentManager.setVaultSecret(k, v, { scope: options.scope, actor: 'cli' });
+          saved.push({ key: k, fingerprint: meta.fingerprint || meta.secret?.fingerprint || null });
+        }
+        if (isJsonMode(options)) return printJson({ ok: true, vault: true, updated: keys, secrets: saved });
+        console.log(`\x1b[32m✅ ${keys.length} secreto(s) cifrado(s) en Vault:\x1b[0m ${keys.join(', ')}`);
+        return;
+      }
+
+      if (options.env) {
+        const envSlug = String(options.env).trim();
+        if (remote.apiUrl) {
+          await remoteApiRequest(remote, 'PUT', `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(envSlug)}`, {
+            envVars: updates
+          });
+        } else {
+          svc.environmentManager.upsertEnvironment(projectId, envSlug, { envVars: updates, actor: 'cli' });
+        }
+        if (isJsonMode(options)) return printJson({ ok: true, projectId, environment: envSlug, updated: keys });
+        console.log(`\x1b[32m✅ ${keys.length} variable(s) actualizadas en ${projectId}/${envSlug}:\x1b[0m ${keys.join(', ')}`);
+        return;
+      }
+
+      if (remote.apiUrl) {
+        const cur = await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}`);
+        const merged = { ...(cur?.envVars || {}), ...updates };
+        await remoteApiRequest(remote, 'PUT', `/api/projects/${encodeURIComponent(projectId)}`, { envVars: merged });
+      } else {
+        const project = svc.projectManager.getById(projectId);
+        if (!project) throw new Error(`Proyecto "${projectId}" no encontrado.`);
+        svc.projectManager.update(project.id, { envVars: { ...(project.envVars || {}), ...updates } });
+        await svc.projectManager.flushToDisk();
+      }
+      if (isJsonMode(options)) return printJson({ ok: true, projectId, updated: keys });
+      console.log(`\x1b[32m✅ ${keys.length} variable(s) guardadas en ${projectId}:\x1b[0m ${keys.join(', ')}`);
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+envCmd
+  .command('unset <projectId> <keys...>')
+  .description('Elimina una o más variables de entorno (o secretos con --vault)')
+  .option('-e, --env <slug>', 'Entorno aislado')
+  .option('--vault', 'Eliminar del Vault compartido')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, keys, options) => {
+    try {
+      const remote = getRemoteConfig(options);
+      if (options.vault) {
+        for (const k of keys) {
+          if (remote.apiUrl) await remoteApiRequest(remote, 'DELETE', `/api/vault/${encodeURIComponent(k)}`);
+          else svc.environmentManager.deleteVaultSecret(k, { actor: 'cli' });
+        }
+        if (isJsonMode(options)) return printJson({ ok: true, vault: true, removed: keys });
+        console.log(`\x1b[32m✅ Eliminado(s) del Vault:\x1b[0m ${keys.join(', ')}`);
+        return;
+      }
+
+      if (options.env) {
+        const envSlug = String(options.env).trim();
+        if (remote.apiUrl) {
+          await remoteApiRequest(remote, 'PUT', `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(envSlug)}`, {
+            unsetEnvKeys: keys
+          });
+        } else {
+          svc.environmentManager.upsertEnvironment(projectId, envSlug, { unsetEnvKeys: keys, actor: 'cli' });
+        }
+        if (isJsonMode(options)) return printJson({ ok: true, projectId, environment: envSlug, removed: keys });
+        console.log(`\x1b[32m✅ Eliminadas de ${projectId}/${envSlug}:\x1b[0m ${keys.join(', ')}`);
+        return;
+      }
+
+      if (remote.apiUrl) {
+        const cur = await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}`);
+        const nextEnv = { ...(cur?.envVars || {}) };
+        for (const k of keys) delete nextEnv[k];
+        await remoteApiRequest(remote, 'PUT', `/api/projects/${encodeURIComponent(projectId)}`, { envVars: nextEnv });
+      } else {
+        const project = svc.projectManager.getById(projectId);
+        if (!project) throw new Error(`Proyecto "${projectId}" no encontrado.`);
+        const nextEnv = { ...(project.envVars || {}) };
+        for (const k of keys) delete nextEnv[k];
+        svc.projectManager.update(project.id, { envVars: nextEnv });
+        await svc.projectManager.flushToDisk();
+      }
+      if (isJsonMode(options)) return printJson({ ok: true, projectId, removed: keys });
+      console.log(`\x1b[32m✅ Eliminadas de ${projectId}:\x1b[0m ${keys.join(', ')}`);
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+envCmd
+  .command('push <projectId>')
+  .description('Importa un fichero .env local hacia un proyecto, entorno (--env) o Vault (--vault)')
+  .option('-f, --file <path>', 'Ruta del fichero .env', '.env')
+  .option('-e, --env <slug>', 'Entorno aislado destino')
+  .option('--vault', 'Cifrar todas las claves en el Vault compartido')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, options) => {
+    try {
+      const envPath = path.resolve(options.file || '.env');
+      if (!fs.existsSync(envPath)) throw new Error(`No existe el fichero ${envPath}`);
+      const { envVars } = svc.universalImporter.parseEnvText(fs.readFileSync(envPath, 'utf8'));
+      const keys = Object.keys(envVars);
+      if (keys.length === 0) throw new Error(`No se encontraron variables válidas en ${envPath}`);
+
+      const remote = getRemoteConfig(options);
+      if (options.vault) {
+        for (const [k, v] of Object.entries(envVars)) {
+          if (remote.apiUrl) await remoteApiRequest(remote, 'PUT', `/api/vault/${encodeURIComponent(k)}`, { value: v });
+          else svc.environmentManager.setVaultSecret(k, v, { actor: 'cli:env-push' });
+        }
+      } else if (options.env) {
+        const envSlug = String(options.env).trim();
+        if (remote.apiUrl) {
+          await remoteApiRequest(remote, 'PUT', `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(envSlug)}`, { envVars });
+        } else {
+          svc.environmentManager.upsertEnvironment(projectId, envSlug, { envVars, actor: 'cli:env-push' });
+        }
+      } else {
+        if (remote.apiUrl) {
+          const cur = await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}`);
+          await remoteApiRequest(remote, 'PUT', `/api/projects/${encodeURIComponent(projectId)}`, { envVars: { ...(cur?.envVars || {}), ...envVars } });
+        } else {
+          const project = svc.projectManager.getById(projectId);
+          if (!project) throw new Error(`Proyecto "${projectId}" no encontrado.`);
+          svc.projectManager.update(project.id, { envVars: { ...(project.envVars || {}), ...envVars } });
+          await svc.projectManager.flushToDisk();
+        }
+      }
+      if (isJsonMode(options)) return printJson({ ok: true, projectId, file: envPath, target: options.vault ? 'vault' : (options.env || 'project'), pushedCount: keys.length, keys });
+      console.log(`\x1b[32m✅ ${keys.length} variable(s) subidas desde ${envPath}\x1b[0m`);
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+envCmd
+  .command('pull <projectId>')
+  .description('Descarga las variables del proyecto o entorno a un fichero .env local (modo seguro por defecto)')
+  .option('-f, --file <path>', 'Ruta del fichero de salida', '.env.culkibo')
+  .option('-e, --env <slug>', 'Entorno aislado origen')
+  .option('--reveal', 'Escribir valores reales (sin enmascarar secretos como ${vault.KEY})')
+  .option('--json', 'Salida JSON (nunca imprime valores secretos sin --reveal)')
+  .action(async (projectId, options) => {
+    try {
+      const outPath = path.resolve(options.file || '.env.culkibo');
+      const remote = getRemoteConfig(options);
+      /** @type {Record<string, string>} */
+      let sourceEnv = {};
+
+      if (options.env) {
+        const envSlug = String(options.env).trim();
+        if (remote.apiUrl) {
+          throw new Error('env pull sobre --env cifrado remoto requiere descarga vía panel web o acceso local con .vault.key');
+        }
+        const resolved = svc.environmentManager.resolveEnvForProject(projectId, { envName: envSlug, phase: 'runtime' });
+        sourceEnv = resolved.env || {};
+      } else {
+        const project = remote.apiUrl
+          ? await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}`)
+          : svc.projectManager.getById(projectId);
+        if (!project) throw new Error(`Proyecto "${projectId}" no encontrado.`);
+        sourceEnv = project.envVars || {};
+      }
+
+      const gitops = svc.gitopsManager;
+      /** @type {string[]} */
+      const lines = ['# Generado por culkibo env pull'];
+      /** @type {string[]} */
+      const redactedKeys = [];
+      const keys = Object.keys(sourceEnv).sort();
+      for (const k of keys) {
+        const rawVal = String(sourceEnv[k] ?? '');
+        const isSecret = gitops.shouldRedactEnvForGit(k, rawVal, false);
+        let writtenVal = rawVal;
+        if (isSecret && !options.reveal) {
+          writtenVal = `\${vault.${k}}`;
+          redactedKeys.push(k);
+        }
+        const needsQuote = /[\s#"'\r\n]/.test(writtenVal);
+        lines.push(`${k}=${needsQuote ? JSON.stringify(writtenVal) : writtenVal}`);
+      }
+      fs.writeFileSync(outPath, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+      if (isJsonMode(options)) {
+        return printJson({ ok: true, projectId, file: outPath, count: keys.length, redactedCount: redactedKeys.length, revealed: Boolean(options.reveal) });
+      }
+      console.log(`\x1b[32m✅ ${keys.length} variable(s) escritas en ${outPath}\x1b[0m${redactedKeys.length > 0 ? ` (${redactedKeys.length} secreto(s) redactados como \${vault.*}; usa --reveal para incluir valores)` : ''}`);
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// culkibo exec <projectId> <command...>: ejecuta un comando seguro sin shell en el contenedor
+program
+  .command('exec <projectId> <command...>')
+  .description('Ejecuta un comando de mantenimiento dentro del contenedor de producción (argv seguro, 0 shell)')
+  .option('-w, --workdir <dir>', 'Directorio de trabajo dentro del contenedor')
+  .option('--timeout <ms>', 'Tiempo máximo en ms', '30000')
+  .option('--json', 'Salida JSON')
+  .action(async (projectId, commandParts, options) => {
+    try {
+      const cmdStr = Array.isArray(commandParts) ? commandParts.join(' ') : String(commandParts || '');
+      const timeoutMs = Math.max(1000, Math.min(300000, parseInt(options.timeout, 10) || 30000));
+      const remote = getRemoteConfig(options);
+      const res = remote.apiUrl
+        ? await remoteApiRequest(remote, 'POST', `/api/projects/${encodeURIComponent(projectId)}/runtime/exec`, {
+          command: cmdStr,
+          workdir: options.workdir || null,
+          timeoutMs
+        })
+        : await svc.deployManager.execInContainer(projectId, {
+          command: cmdStr,
+          workdir: options.workdir || null,
+          timeoutMs
+        });
+      if (isJsonMode(options)) {
+        printJson({ ok: res.ok !== false && (res.exitCode === undefined || res.exitCode === 0), projectId, ...res });
+        if (res.exitCode && res.exitCode !== 0) process.exitCode = res.exitCode;
+        return;
+      }
+      if (res.stdout) process.stdout.write(res.stdout.endsWith('\n') ? res.stdout : `${res.stdout}\n`);
+      if (res.stderr) process.stderr.write(res.stderr.endsWith('\n') ? res.stderr : `${res.stderr}\n`);
+      if (res.exitCode && res.exitCode !== 0) process.exitCode = res.exitCode;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
 // Flota Multi-Servidor (SSH sin shell)
 program
   .command('fleet <action> [serverId]')
   .description('Gestiona nodos VPS remotos por SSH (list, probe, keys)')
-  .action(async (action, serverId) => {
+  .option('--json', 'Salida JSON')
+  .action(async (action, serverId, options) => {
     try {
       const fleet = require('../server/services/serverFleetManager');
       if (action === 'list') {
         const list = fleet.listServers({ includeLocal: true });
+        if (isJsonMode(options)) return printJson({ ok: true, count: list.length, servers: list });
         console.table(list.map((s) => ({
           ID: s.id,
           Nombre: s.name,
@@ -843,56 +1944,74 @@ program
         })));
       } else if (action === 'probe' && serverId) {
         const res = await fleet.probeServer(serverId, { force: true });
-        console.log(JSON.stringify(res, null, 2));
+        printJson(res);
       } else if (action === 'keys') {
-        console.table(fleet.listKeys().map((k) => ({
+        const keys = fleet.listKeys();
+        if (isJsonMode(options)) return printJson({ ok: true, count: keys.length, keys });
+        console.table(keys.map((k) => ({
           ID: k.id,
           Nombre: k.name,
           Tipo: k.keyType,
           Huella: k.fingerprint
         })));
       } else {
-        console.error('Acción inválida. Usa: list | probe <serverId> | keys');
-        process.exit(1);
+        failCli(new Error('Acción inválida. Usa: list | probe <serverId> | keys'), options);
       }
     } catch (err) {
-      console.error(`❌ Error en fleet: ${err.message}`);
-      process.exit(1);
+      failCli(err, options);
     }
   });
 
 // GitOps declarativo (culkibo.yaml)
 program
   .command('gitops <action> [file]')
-  .description('Exporta, simula o aplica pilas completas declarativas (export, plan <file>, apply <file>, drift)')
+  .description('Exporta, valida, simula, aplica o inspecciona pilas declarativas (export, plan <file>, apply <file>, drift, schema)')
   .option('--prune', 'Eliminar recursos no declarados en el manifiesto')
   .option('--confirm-destructive', 'Confirmar operaciones destructivas con --prune')
+  .option('--json', 'Salida JSON')
   .action(async (action, file, options) => {
     try {
-      const gitops = require('../server/services/gitopsManager');
-      if (action === 'export') {
-        const res = gitops.exportStack({});
-        console.log(res.yaml);
+      const remote = getRemoteConfig(options);
+      const gitops = svc.gitopsManager;
+      if (action === 'schema') {
+        printJson(gitops.getJsonSchema());
+      } else if (action === 'export') {
+        const res = remote.apiUrl
+          ? await remoteApiRequest(remote, 'POST', '/api/gitops/export', {})
+          : gitops.exportStack({});
+        if (isJsonMode(options)) printJson(res);
+        else console.log(res.yaml);
       } else if (action === 'plan' && file) {
         const yamlText = fs.readFileSync(path.resolve(file), 'utf8');
-        console.log(JSON.stringify(gitops.planApply(yamlText, { prune: Boolean(options.prune) }), null, 2));
+        const res = remote.apiUrl
+          ? await remoteApiRequest(remote, 'POST', '/api/gitops/plan', { yamlText, prune: Boolean(options.prune) })
+          : gitops.planApply(yamlText, { prune: Boolean(options.prune) });
+        printJson(res);
       } else if (action === 'apply' && file) {
         const yamlText = fs.readFileSync(path.resolve(file), 'utf8');
-        const res = await gitops.applyStack(yamlText, {
-          dryRun: false,
-          prune: Boolean(options.prune),
-          confirmDestructive: Boolean(options.confirmDestructive)
-        });
-        console.log(JSON.stringify(res, null, 2));
+        const res = remote.apiUrl
+          ? await remoteApiRequest(remote, 'POST', '/api/gitops/apply', {
+            yamlText,
+            dryRun: false,
+            prune: Boolean(options.prune),
+            confirmDestructive: Boolean(options.confirmDestructive)
+          })
+          : await gitops.applyStack(yamlText, {
+            dryRun: false,
+            prune: Boolean(options.prune),
+            confirmDestructive: Boolean(options.confirmDestructive)
+          });
+        printJson(res);
       } else if (action === 'drift') {
-        console.log(JSON.stringify(gitops.detectDrift(), null, 2));
+        const res = remote.apiUrl
+          ? await remoteApiRequest(remote, 'GET', '/api/gitops/drift')
+          : gitops.detectDrift();
+        printJson(res);
       } else {
-        console.error('Acción inválida. Usa: export | plan <archivo.yaml> | apply <archivo.yaml> | drift');
-        process.exit(1);
+        failCli(new Error('Acción inválida. Usa: export | plan <archivo.yaml> | apply <archivo.yaml> | drift | schema'), options);
       }
     } catch (err) {
-      console.error(`❌ Error en gitops: ${err.message}`);
-      process.exit(1);
+      failCli(err, options);
     }
   });
 
@@ -900,11 +2019,14 @@ program
 program
   .command('uptime <action> [id]')
   .description('Consulta monitores sintéticos y páginas públicas de estado (list, check <id>, pages)')
-  .action(async (action, id) => {
+  .option('--json', 'Salida JSON')
+  .action(async (action, id, options) => {
     try {
       const um = require('../server/services/uptimeMonitor');
       if (action === 'list') {
-        console.table(um.listMonitors().map((m) => ({
+        const monitors = um.listMonitors();
+        if (isJsonMode(options)) return printJson({ ok: true, count: monitors.length, monitors });
+        console.table(monitors.map((m) => ({
           ID: m.id,
           Nombre: m.name,
           Tipo: m.type,
@@ -913,20 +2035,30 @@ program
           P95ms: m.stats?.p95Ms ?? '—'
         })));
       } else if (action === 'check' && id) {
-        console.log(JSON.stringify(await um.runCheck(id), null, 2));
+        printJson(await um.runCheck(id));
       } else if (action === 'pages') {
-        console.table(um.listStatusPages().map((p) => ({ Slug: p.slug, Titulo: p.title, URL: `/status/${p.slug}` })));
+        const pages = um.listStatusPages();
+        if (isJsonMode(options)) return printJson({ ok: true, count: pages.length, pages });
+        console.table(pages.map((p) => ({ Slug: p.slug, Titulo: p.title, URL: `/status/${p.slug}` })));
       } else {
-        console.error('Acción inválida. Usa: list | check <monitorId> | pages');
-        process.exit(1);
+        failCli(new Error('Acción inválida. Usa: list | check <monitorId> | pages'), options);
       }
     } catch (err) {
-      console.error(`❌ Error en uptime: ${err.message}`);
-      process.exit(1);
+      failCli(err, options);
     }
   });
 
-program.parseAsync(process.argv).catch((err) => {
-  console.error(`\x1b[31m❌ Error ejecutando CLI:\x1b[0m ${err && err.message ? err.message : String(err)}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  program.parseAsync(process.argv).catch((err) => {
+    failCli(err, program.opts());
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  program,
+  detectLocalStack,
+  generateStarterManifest,
+  parseEnvAssignments,
+  remoteApiRequest
+};

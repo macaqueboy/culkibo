@@ -129,7 +129,12 @@ function getService(name) {
       break;
     case 'deployManager':
       svc = require('./services/deployManager');
-      svc.on('deploy_event', (data) => broadcast('deploy_event', data));
+      svc.on('deploy_event', (data) => {
+        broadcast('deploy_event', data);
+        if (data && (data.phase === 'cutover_done' || data.phase === 'rollback_done')) {
+          try { metricsCollector.recordDeployMarker(data); } catch (e) {}
+        }
+      });
       svc.on('deploy_log', (data) => broadcast('deploy_log', data));
       break;
     case 'ingressManager':
@@ -225,6 +230,23 @@ function getService(name) {
       break;
     case 'sleepAdvisor':
       svc = require('./services/sleepAdvisor');
+      break;
+    case 'metricsHistory':
+      svc = require('./services/metricsHistory');
+      break;
+    case 'alertEngine':
+      svc = require('./services/alertEngine');
+      svc.on('alert_fired', (data) => broadcast('alert_fired', data));
+      svc.on('alert_resolved', (data) => broadcast('alert_resolved', data));
+      break;
+    case 'topologyService':
+      svc = require('./services/topologyService');
+      break;
+    case 'oidcService':
+      svc = require('./services/oidcService');
+      break;
+    case 'secretScanner':
+      svc = require('./services/secretScanner');
       break;
     default:
       throw new Error(`Servicio desconocido: ${name}`);
@@ -782,7 +804,8 @@ function ensureWsServers() {
             inSync: verification.inSync,
             fileCount: verification.fileCount,
             targetDir: verification.targetDir,
-            binaryFramesSupported: true
+            binaryFramesSupported: true,
+            chunkedUploadSupported: true
           });
           broadcast('sync_client', { projectId: boundProjectId, connected: true, connectedClients: session.connectedClients });
           return;
@@ -854,6 +877,15 @@ function ensureWsServers() {
             clientName: boundClientName
           });
           safeWsSend(ws, { type: 'rollback_file_ack', ...result });
+          return;
+        }
+
+        if (msg.type === 'start_chunked_upload' || msg.type === 'append_chunk' || msg.type === 'commit_chunked_upload' || msg.type === 'abort_chunked_upload') {
+          const pid = String(msg.projectId || boundProjectId || '');
+          if (!pid) throw new Error(msg.type + ' requiere projectId');
+          assertSyncAccess(pid, 'projects:write');
+          const result = liveSyncEngine.handleChunkMessage(pid, msg, { clientId, clientName: boundClientName });
+          safeWsSend(ws, { type: msg.type + '_ack', ...result });
           return;
         }
 
@@ -948,7 +980,7 @@ function getSystemStatusBuffer() {
   const payload = {
     name: 'Culkibo',
     status: 'operational',
-    version: '1.0.0',
+    version: '1.1.0',
     platform: process.platform,
     arch: process.arch,
     nodeVersion: process.version,
@@ -2481,6 +2513,10 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
           telemetryService.start();
         } catch (e) {}
 
+          // Boot observability v1.1
+          try { const mh = getService('metricsHistory'); if (typeof mh.start === 'function') mh.start(); } catch (e) {}
+          try { const ae = getService('alertEngine'); if (typeof ae.start === 'function') ae.start(); } catch (e) {}
+
         // Limpieza periódica no intrusiva de sesiones Live Sync inactivas (cada 5 min)
         trackTimer(setInterval(() => {
           if (loadedServices.liveSyncEngine && typeof loadedServices.liveSyncEngine.evictIdleSessions === 'function') {
@@ -2583,6 +2619,8 @@ function shutdown(signal = 'SIGTERM') {
     try { if (loadedServices.previewManager) loadedServices.previewManager.stopReaper(); } catch (e) {}
     try { if (loadedServices.uptimeMonitor) loadedServices.uptimeMonitor.shutdown(); } catch (e) {}
     try { if (loadedServices.sleepAdvisor) loadedServices.sleepAdvisor.shutdown(); } catch (e) {}
+    try { if (loadedServices.metricsHistory) loadedServices.metricsHistory.stop(); } catch (e) {}
+    try { if (loadedServices.alertEngine) loadedServices.alertEngine.stop(); } catch (e) {}
     try { if (loadedServices.serverFleetManager) await loadedServices.serverFleetManager.shutdown(); } catch (e) {}
 
     // 2. Dejar de aceptar nuevas conexiones y cerrar WS/SSE activos (sin cortar peticiones HTTP en vuelo)
@@ -2641,6 +2679,7 @@ function shutdown(signal = 'SIGTERM') {
 
     // 5. Volcado final atómico a disco + envío best-effort de telemetría de sesión/fallos (máx 1.5 s)
     try { await telemetryService.flushBestEffort({ timeoutMs: 1500 }); } catch (e) {}
+    try { containerOrchestrator.flushLogsToDisk(); } catch (e) {}
     try { await projectManager.flushToDisk(); } catch (e) {}
     try { auditLogger.flushSync(); } catch (e) {}
 
