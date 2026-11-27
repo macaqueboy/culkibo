@@ -40,6 +40,11 @@ const EMAIL_FAIL_WINDOW_MS = 60 * 1000;
 const EMAIL_FAIL_MAX = 10;
 const EMAIL_FAIL_MAP_CAP = 2000;
 
+// Bloqueo anti fuerza bruta TOTP 6 dígitos por usuario/clave (cierra brecha Runtipi TOTP throttle)
+const TOTP_FAIL_MAX = 5;
+const TOTP_LOCKOUT_MS = 15 * 60 * 1000;
+const TOTP_FAIL_MAP_CAP = 2000;
+
 // TOTP 2FA (RFC 6238) + Recovery Codes + MFA Challenge
 const TOTP_STEP_SECONDS = 30;
 const TOTP_DIGITS = 6;
@@ -625,6 +630,8 @@ class TeamManager extends EventEmitter {
     this._signingKey = null;
     /** @type {Map<string, { count: number, resetAt: number }>} */
     this._emailFailMap = new Map();
+    /** @type {Map<string, { count: number, lockedUntil: number, lastFailAt: number }>} */
+    this._totpFailMap = new Map();
     /** @type {Set<string>} */
     this._usedMfaChallenges = new Set();
     /** @type {number} */
@@ -858,17 +865,46 @@ class TeamManager extends EventEmitter {
 
   /**
    * Verifica un segundo factor (TOTP con anti-replay O código de recuperación single-use).
+   * Aplica bloqueo estricto anti fuerza bruta por usuario (`<= 5` fallos → bloqueo 15 min,
+   * cerrando la brecha Runtipi TOTP throttle).
    * @param {any} user
-   * @param {{ code?: string, recoveryCode?: string, timestampMs?: number }} factor
+   * @param {{ code?: string, recoveryCode?: string, timestampMs?: number, nowMs?: number }} factor
    * @returns {{ ok: boolean, usedRecoveryCode: boolean, replayed: boolean, matchedStep: number | null }}
    */
   _verifyUserSecondFactor(user, factor = {}) {
     if (!user || !user.totp || !user.totp.enabled || !user.totp.secretEnc) {
       return { ok: false, usedRecoveryCode: false, replayed: false, matchedStep: null };
     }
+    const throttleKey = String(user.id || user.email || '');
+    const nowMs = typeof factor.nowMs === 'number' && Number.isFinite(factor.nowMs) ? factor.nowMs : Date.now();
+    const totpLock = this._checkTotpLockout(throttleKey, nowMs);
+    if (totpLock.blocked) {
+      const err = httpError(
+        'Demasiados intentos TOTP fallidos. Cuenta bloqueada temporalmente durante 15 minutos.',
+        429,
+        'TOTP_RATE_LIMITED'
+      );
+      /** @type {any} */ (err).retryAfterSec = totpLock.retryAfterSec;
+      throw err;
+    }
+
     if (factor.recoveryCode && String(factor.recoveryCode).trim()) {
       const consumed = this._consumeRecoveryCode(user, String(factor.recoveryCode));
-      return { ok: consumed, usedRecoveryCode: consumed, replayed: false, matchedStep: null };
+      if (consumed) {
+        this._clearTotpFailure(throttleKey);
+        return { ok: true, usedRecoveryCode: true, replayed: false, matchedStep: null };
+      }
+      const failState = this._recordTotpFailure(throttleKey, nowMs);
+      if (failState.locked) {
+        const err = httpError(
+          'Demasiados intentos 2FA fallidos. Cuenta bloqueada temporalmente durante 15 minutos.',
+          429,
+          'TOTP_RATE_LIMITED'
+        );
+        /** @type {any} */ (err).retryAfterSec = failState.retryAfterSec;
+        throw err;
+      }
+      return { ok: false, usedRecoveryCode: false, replayed: false, matchedStep: null };
     }
     if (factor.code && String(factor.code).trim()) {
       const secretBuf = this._decryptTotpSecret(user.id, user.totp.secretEnc);
@@ -878,7 +914,18 @@ class TeamManager extends EventEmitter {
       });
       if (res.valid && res.matchedStep !== null) {
         user.totp.lastUsedStep = res.matchedStep;
+        this._clearTotpFailure(throttleKey);
         return { ok: true, usedRecoveryCode: false, replayed: false, matchedStep: res.matchedStep };
+      }
+      const failState = this._recordTotpFailure(throttleKey, nowMs);
+      if (failState.locked) {
+        const err = httpError(
+          'Demasiados códigos TOTP incorrectos. Cuenta bloqueada temporalmente durante 15 minutos.',
+          429,
+          'TOTP_RATE_LIMITED'
+        );
+        /** @type {any} */ (err).retryAfterSec = failState.retryAfterSec;
+        throw err;
       }
       return { ok: false, usedRecoveryCode: false, replayed: res.replayed, matchedStep: res.matchedStep };
     }
@@ -986,6 +1033,96 @@ class TeamManager extends EventEmitter {
   /** @param {string} email */
   _clearEmailFailure(email) {
     if (email) this._emailFailMap.delete(email);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Anti fuerza bruta TOTP 6 dígitos (<= 5 fallos consecutivos -> bloqueo 15 min)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Comprueba si una clave/usuario está bloqueada por intentos TOTP fallidos.
+   * @param {string} key
+   * @param {number} [nowMs]
+   */
+  _checkTotpLockout(key, nowMs = Date.now()) {
+    if (!key || this._totpFailMap.size === 0) {
+      return { blocked: false, attempts: 0, remaining: TOTP_FAIL_MAX, retryAfterSec: 0 };
+    }
+    const entry = this._totpFailMap.get(key);
+    if (!entry) {
+      return { blocked: false, attempts: 0, remaining: TOTP_FAIL_MAX, retryAfterSec: 0 };
+    }
+    if (entry.lockedUntil > nowMs) {
+      return {
+        blocked: true,
+        attempts: entry.count,
+        remaining: 0,
+        retryAfterSec: Math.max(1, Math.ceil((entry.lockedUntil - nowMs) / 1000))
+      };
+    }
+    if (entry.lockedUntil > 0 && entry.lockedUntil <= nowMs) {
+      this._totpFailMap.delete(key);
+      return { blocked: false, attempts: 0, remaining: TOTP_FAIL_MAX, retryAfterSec: 0 };
+    }
+    return {
+      blocked: false,
+      attempts: entry.count,
+      remaining: Math.max(0, TOTP_FAIL_MAX - entry.count),
+      retryAfterSec: 0
+    };
+  }
+
+  /**
+   * Registra un intento TOTP fallido; al alcanzar `TOTP_FAIL_MAX` (5) bloquea 15 min.
+   * @param {string} key
+   * @param {number} [nowMs]
+   */
+  _recordTotpFailure(key, nowMs = Date.now()) {
+    if (!key) return { count: 0, locked: false, lockedUntil: 0, retryAfterSec: 0 };
+    let entry = this._totpFailMap.get(key);
+    if (!entry || (entry.lockedUntil > 0 && entry.lockedUntil <= nowMs)) {
+      if (this._totpFailMap.size >= TOTP_FAIL_MAP_CAP) {
+        for (const [k, v] of this._totpFailMap.entries()) {
+          if (v.lockedUntil > 0 && v.lockedUntil <= nowMs) this._totpFailMap.delete(k);
+          if (this._totpFailMap.size < TOTP_FAIL_MAP_CAP) break;
+        }
+        if (this._totpFailMap.size >= TOTP_FAIL_MAP_CAP) {
+          const oldest = this._totpFailMap.keys().next().value;
+          if (oldest) this._totpFailMap.delete(oldest);
+        }
+      }
+      entry = { count: 1, lockedUntil: 0, lastFailAt: nowMs };
+    } else {
+      entry.count++;
+      entry.lastFailAt = nowMs;
+      this._totpFailMap.delete(key);
+    }
+    if (entry.count >= TOTP_FAIL_MAX) {
+      entry.lockedUntil = nowMs + TOTP_LOCKOUT_MS;
+    }
+    this._totpFailMap.set(key, entry);
+    const locked = entry.lockedUntil > nowMs;
+    return {
+      count: entry.count,
+      locked,
+      lockedUntil: entry.lockedUntil,
+      retryAfterSec: locked ? Math.max(1, Math.ceil((entry.lockedUntil - nowMs) / 1000)) : 0
+    };
+  }
+
+  /** @param {string} key */
+  _clearTotpFailure(key) {
+    if (key) this._totpFailMap.delete(key);
+  }
+
+  /** @param {string} key @param {number} [nowMs] */
+  checkTotpRateLimit(key, nowMs = Date.now()) {
+    return this._checkTotpLockout(String(key || ''), nowMs);
+  }
+
+  /** @param {string} key */
+  resetTotpRateLimit(key) {
+    this._clearTotpFailure(String(key || ''));
   }
 
   // ---------------------------------------------------------------------------
@@ -1372,7 +1509,8 @@ class TeamManager extends EventEmitter {
       const mfaCheck = this._verifyUserSecondFactor(user, {
         code: input && input.totpCode,
         recoveryCode: input && input.recoveryCode,
-        timestampMs: input && input.timestampMs
+        timestampMs: input && input.timestampMs,
+        nowMs: input && /** @type {any} */ (input).nowMs
       });
       if (!mfaCheck.ok) {
         this._recordEmailFailure(normEmail);
@@ -1473,7 +1611,8 @@ class TeamManager extends EventEmitter {
     const mfaCheck = this._verifyUserSecondFactor(user, {
       code: input && input.code,
       recoveryCode: input && input.recoveryCode,
-      timestampMs: input && input.timestampMs
+      timestampMs: input && input.timestampMs,
+      nowMs: input && /** @type {any} */ (input).nowMs
     });
     if (!mfaCheck.ok) {
       this._recordEmailFailure(user.email);
@@ -1567,13 +1706,28 @@ class TeamManager extends EventEmitter {
       throw httpError('Ejecuta primero setupTotp() antes de activar 2FA', 400, 'TOTP_NOT_INITIALIZED');
     }
 
+    const nowMs = typeof (input && /** @type {any} */ (input).nowMs) === 'number' ? /** @type {any} */ (input).nowMs : Date.now();
+    const totpLock = this._checkTotpLockout(user.id, nowMs);
+    if (totpLock.blocked) {
+      const err = httpError('Demasiados intentos TOTP fallidos. Espera 15 minutos antes de reintentar.', 429, 'TOTP_RATE_LIMITED');
+      /** @type {any} */ (err).retryAfterSec = totpLock.retryAfterSec;
+      throw err;
+    }
+
     const secretBuf = this._decryptTotpSecret(user.id, user.totp.pendingSecretEnc);
     const verified = verifyTotpCode(secretBuf, String((input && input.code) || ''), {
       timestampMs: input && input.timestampMs
     });
     if (!verified.valid || verified.matchedStep === null) {
+      const failState = this._recordTotpFailure(user.id, nowMs);
+      if (failState.locked) {
+        const err = httpError('Demasiados códigos TOTP incorrectos. Cuenta bloqueada temporalmente durante 15 minutos.', 429, 'TOTP_RATE_LIMITED');
+        /** @type {any} */ (err).retryAfterSec = failState.retryAfterSec;
+        throw err;
+      }
       throw httpError('Código TOTP de verificación inválido', 400, 'INVALID_TOTP_CODE');
     }
+    this._clearTotpFailure(user.id);
 
     /** @type {string[]} */
     const recoveryCodes = [];
@@ -1741,6 +1895,7 @@ class TeamManager extends EventEmitter {
     }
 
     targetUser.totp = { enabled: false };
+    this._clearTotpFailure(targetUserId);
     this._rotateUserTokenKey(targetUser);
     this._save();
     this._emitRevoked({ userId: targetUserId, teamId: resolvedTeamId, reason: 'totp_admin_reset' });
@@ -3750,13 +3905,15 @@ class TeamManager extends EventEmitter {
       return { allowed: true, status: 200, reason: 'SELF_AUTH_ROUTE', effectiveRole: principal.role };
     }
 
-    // Gestión de contraseña, sesiones y 2FA propio: estrictamente `session` (nunca un token API `ckp_`)
+    // Gestión de contraseña, sesiones, 2FA y Passkeys propios: estrictamente `session` (nunca un token API `ckp_`)
     if (
       p === '/api/auth/logout' ||
       p === '/api/auth/logout-all' ||
       p === '/api/auth/password' ||
       p === '/api/auth/2fa' ||
-      p.startsWith('/api/auth/2fa/')
+      p.startsWith('/api/auth/2fa/') ||
+      p === '/api/auth/passkeys' ||
+      p.startsWith('/api/auth/passkeys/')
     ) {
       if (!this.isPrincipalStillValid(principal)) {
         return { allowed: false, status: 401, reason: 'PRINCIPAL_REVOKED', effectiveRole: null };
@@ -3838,6 +3995,26 @@ class TeamManager extends EventEmitter {
 
     // Escáner pre-despliegue de fugas de secretos
     if (p === '/api/security/scan-secrets') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+
+    // Escáner SBOM CVE Drift (OSV.dev) -> lectura/escaneo para viewer+
+    if (p === '/api/security/cve-scan' || p === '/api/security/cve-scan/latest') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
+    // Secret Leases, Break-Glass y Auditoría de Rotación (>90d) -> admin/owner
+    if (
+      p === '/api/security/leases' ||
+      p.startsWith('/api/security/leases/') ||
+      p === '/api/security/break-glass' ||
+      p === '/api/security/rotation-audit'
+    ) {
+      return this.authorizeAction(principal, isRead ? 'audit:read' : 'tokens:write');
+    }
+
+    // Exportador Zero Lock-In IaC (OpenTofu / Terraform / Compose) -> developer+
+    if (p === '/api/iac/export') {
       return this.authorizeAction(principal, 'projects:write');
     }
 
@@ -3947,6 +4124,8 @@ module.exports = Object.assign(defaultInstance, {
   MAX_PASSWORD_BYTES,
   TOTP_STEP_SECONDS,
   TOTP_DIGITS,
+  TOTP_FAIL_MAX,
+  TOTP_LOCKOUT_MS,
   RECOVERY_CODES_COUNT,
   roleRank,
   hasMinRole,

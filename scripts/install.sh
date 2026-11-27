@@ -637,12 +637,14 @@ fetch_source() {
     ok "Código clonado desde $REPO_URL"
   fi
 
-  install -d -m 0750 "$DATA_DIR" "$DATA_DIR/certs" "$DATA_DIR/backups" "$INSTALL_DIR/projects"
+  # Permisos 0700 estrictos en directorios de datos/config (cierra Dokploy CVE-2026-129315 / CWE-732)
+  install -d -m 0700 "$DATA_DIR" "$DATA_DIR/certs" "$DATA_DIR/backups"
+  install -d -m 0750 "$INSTALL_DIR/projects"
   chown -R "$RUN_USER":"$RUN_USER" "$INSTALL_DIR"
-  # 0750 en los datos: ahí viven auth.json, las claves de cifrado y los
-  # certificados. Ningún otro usuario del sistema tiene por qué leerlos.
-  chmod 0750 "$DATA_DIR"
-  ok "Permisos aplicados ($RUN_USER, datos en 0750)"
+  # 0700 en los datos: ahí viven auth.json, las claves de cifrado y los
+  # certificados. Ningún otro usuario del sistema tiene acceso de lectura o escritura.
+  chmod 0700 "$DATA_DIR" "$DATA_DIR/certs" "$DATA_DIR/backups"
+  ok "Permisos aplicados ($RUN_USER, datos en 0700)"
 }
 
 # -----------------------------------------------------------------------------
@@ -707,8 +709,8 @@ EOF
     printf 'CULKIBO_REQUIRE_TOKEN=1\n' >> "$ENV_FILE"
   fi
   chown "$RUN_USER":"$RUN_USER" "$ENV_FILE"
-  chmod 0640 "$ENV_FILE"
-  ok "Configuración escrita en .env"
+  chmod 0600 "$ENV_FILE"
+  ok "Configuración escrita en .env (0600)"
 }
 
 install_systemd_unit() {
@@ -740,7 +742,7 @@ ExecStart=/usr/bin/env node $INSTALL_DIR/server/index.js
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
-UMask=0027
+UMask=0077
 
 # El daemon supervisa procesos hijo y sockets: el límite por defecto de 1024
 # descriptores se agota con una veintena de proyectos vigilados.

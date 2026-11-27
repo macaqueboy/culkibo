@@ -4425,6 +4425,204 @@ export const api = {
       'Could not send heartbeat check-in'
     );
   },
+
+  // --- Cycle-8 Enterprise Sovereignty APIs (Passkeys FIDO2, Secret Leases, OSV CVE, OpenTofu IaC, Drift Check, Maintenance & Incidents) ---
+
+  async listPasskeys(): Promise<{ passkeys: PasskeyRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/passkeys`),
+      'Could not load registered passkeys'
+    );
+  },
+
+  async beginPasskeyRegistration(payload: { label?: string; rpId?: string } = {}): Promise<PasskeyRegisterBeginResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/passkeys/register/begin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not start WebAuthn passkey registration'
+    );
+  },
+
+  async revokePasskey(id: string): Promise<{ ok?: boolean; revoked?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/passkeys/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'Could not revoke passkey'
+    );
+  },
+
+  async listSecretLeases(): Promise<{ leases: SecretLeaseRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/leases`),
+      'Could not load secret leases'
+    );
+  },
+
+  async issueSecretLease(payload: { projectId?: string; secretKey: string; scope?: string; ttlSec?: number; reason?: string }): Promise<{ lease: SecretLeaseRecord; token?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/leases`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not issue ephemeral secret lease'
+    );
+  },
+
+  async revokeSecretLease(id: string): Promise<{ ok?: boolean; revoked?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/leases/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'Could not revoke secret lease'
+    );
+  },
+
+  async issueBreakGlass(payload: { reason: string; ttlSec?: number }): Promise<{ lease: SecretLeaseRecord; token?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/break-glass`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not issue break-glass escalation token'
+    );
+  },
+
+  async getSecretRotationAudit(maxAgeDays = 90): Promise<SecretRotationAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/rotation-audit?maxAgeDays=${encodeURIComponent(String(maxAgeDays))}`),
+      'Could not run secret rotation audit'
+    );
+  },
+
+  async runCveScan(payload: { allowNetwork?: boolean; forceRefresh?: boolean } = {}): Promise<CveScanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/cve-scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not scan SBOM CVEs'
+    );
+  },
+
+  async getLatestCveScan(): Promise<CveScanResult | null> {
+    const res = await apiFetch(`${API_BASE}/security/cve-scan/latest`);
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (!data) return null;
+    return (data.scan || (typeof data.scannedPackages === 'number' ? data : null)) as CveScanResult | null;
+  },
+
+  async exportIacEstate(payload: { format?: 'all' | 'terraform' | 'compose' } = { format: 'all' }): Promise<IacExportResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/iac/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not export OpenTofu / Compose IaC bundle'
+    );
+  },
+
+  async checkProjectDrift(projectId: string): Promise<ProjectDriftResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/drift/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      }),
+      'Could not check container configuration drift'
+    );
+  },
+
+  async listMaintenanceWindows(): Promise<{ windows?: MaintenanceWindowRecord[]; maintenanceWindows?: MaintenanceWindowRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/maintenance`),
+      'Could not load maintenance windows'
+    );
+  },
+
+  async createMaintenanceWindow(payload: {
+    title: string;
+    targetIds?: string[];
+    kind?: 'once' | 'recurring';
+    startAt: string;
+    durationMin?: number;
+    intervalDays?: number;
+  }): Promise<{ window?: MaintenanceWindowRecord } & Partial<MaintenanceWindowRecord>> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/maintenance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not schedule maintenance window'
+    );
+  },
+
+  async deleteMaintenanceWindow(id: string): Promise<{ ok?: boolean; deleted?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/maintenance/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'Could not delete maintenance window'
+    );
+  },
+
+  async listUptimeIncidents(): Promise<{ incidents: StatusIncidentRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/incidents`),
+      'Could not load incident timeline'
+    );
+  },
+
+  async createUptimeIncident(payload: {
+    title: string;
+    severity?: 'minor' | 'major' | 'critical';
+    status?: 'investigating' | 'identified' | 'monitoring' | 'resolved';
+    affectedIds?: string[];
+    message?: string;
+  }): Promise<{ incident?: StatusIncidentRecord } & Partial<StatusIncidentRecord>> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/incidents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not log incident'
+    );
+  },
+
+  async updateUptimeIncident(
+    id: string,
+    payload: { status: 'investigating' | 'identified' | 'monitoring' | 'resolved'; message?: string }
+  ): Promise<{ incident?: StatusIncidentRecord } & Partial<StatusIncidentRecord>> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/incidents/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not update incident'
+    );
+  },
+
+  async planGeoFailover(payload: {
+    domain: string;
+    primaryIp: string;
+    secondaryIp: string;
+    consecutiveFailures?: number;
+    ttlSec?: number;
+  }): Promise<GeoFailoverPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/geo-failover/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not build DNS geo-failover plan'
+    );
+  },
 };
 
 // =====================================================================
@@ -5218,4 +5416,130 @@ export interface HeartbeatMonitor {
   status: 'new' | 'up' | 'down' | 'missed' | string;
   lastPingAt?: string | null;
   lastDurationMs?: number | null;
+}
+
+export interface PasskeyRecord {
+  id: string;
+  userId?: string;
+  label: string;
+  alg?: number | string;
+  signCount?: number;
+  createdAt?: string;
+  lastUsedAt?: string | null;
+}
+
+export interface PasskeyRegisterBeginResult {
+  challengeId: string;
+  challenge: string;
+  rpId?: string;
+  publicKey?: Record<string, unknown>;
+  demoRegistered?: PasskeyRecord;
+}
+
+export interface SecretLeaseRecord {
+  id: string;
+  projectId?: string | null;
+  secretKey: string;
+  scope?: string;
+  kind?: 'lease' | 'break_glass' | string;
+  reason?: string;
+  issuedBy?: string;
+  ttlSec?: number;
+  expiresAt: string;
+  revoked?: boolean;
+  createdAt?: string;
+}
+
+export interface SecretRotationAuditResult {
+  totalKeys: number;
+  staleCount: number;
+  maxAgeDays?: number;
+  staleKeys?: Array<{ projectId?: string; projectName?: string; key: string; ageDays?: number }>;
+}
+
+export interface CveFinding {
+  id: string;
+  packageName?: string;
+  purl?: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | string;
+  summary?: string;
+  fixedVersion?: string | null;
+}
+
+export interface CveScanResult {
+  scannedPackages: number;
+  vulnerablePackages: number;
+  totalVulnerabilities: number;
+  bySeverity?: { critical?: number; high?: number; medium?: number; low?: number };
+  offline?: boolean;
+  cached?: boolean;
+  scannedAt?: string;
+  findings?: CveFinding[];
+}
+
+export interface IacExportResult {
+  ok?: boolean;
+  format: string;
+  generatedAt?: string;
+  files: Record<string, string>;
+  stats?: { projects?: number; databases?: number; domains?: number; crons?: number; meshPeers?: number };
+  secretsRedactedCount?: number;
+}
+
+export interface ProjectDriftDiff {
+  field: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | string;
+  declared: unknown;
+  actual: unknown;
+  message?: string;
+}
+
+export interface ProjectDriftResult {
+  ok?: boolean;
+  drifted: boolean;
+  runtimeOffline?: boolean;
+  severity?: string;
+  checkedAt?: string;
+  declaredEnvKeyHash?: string;
+  actualEnvKeyHash?: string;
+  diffs?: ProjectDriftDiff[];
+  reconcilePlan?: {
+    dryRunDefault?: boolean;
+    actionCount?: number;
+    actions?: Array<string | { action?: string; field?: string; summary?: string }>;
+  };
+}
+
+export interface MaintenanceWindowRecord {
+  id: string;
+  title: string;
+  targetIds?: string[];
+  kind: 'once' | 'recurring' | string;
+  startAt: string;
+  durationMin: number;
+  intervalDays?: number;
+  active?: boolean;
+}
+
+export interface StatusIncidentRecord {
+  id: string;
+  title: string;
+  severity: 'minor' | 'major' | 'critical' | string;
+  status: 'investigating' | 'identified' | 'monitoring' | 'resolved' | string;
+  affectedIds?: string[];
+  message?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface GeoFailoverPlanResult {
+  domain: string;
+  primaryIp: string;
+  secondaryIp: string;
+  consecutiveFailures?: number;
+  ttlSec?: number;
+  strategy?: string;
+  summary?: string;
+  steps?: string[];
+  dnsPatch?: Record<string, unknown>;
 }

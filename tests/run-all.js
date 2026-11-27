@@ -42,6 +42,9 @@ const testTimeMachineFinOps = require('./timemachine-finops.test');
 const testTerminalAndShield = require('./terminal-and-shield.test');
 const testMeshAndHealer = require('./mesh-and-healer.test');
 const testCronHeartbeat = require('./cron-heartbeat.test');
+const testPasskeyLeaseCve = require('./passkey-lease-cve.test');
+const testDriftAndIac = require('./drift-and-iac.test');
+const testUptimeMaintenanceCaa = require('./uptime-maintenance-caa.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -109,6 +112,9 @@ async function runAll() {
     { name: 'Zero-Dep Container Web Terminal (/ws/terminal) & Caddy Edge Shield PoW Gate', fn: testTerminalAndShield },
     { name: 'Zero-Config WireGuard Fleet Mesh (x25519) & 20-Pattern Build Auto-Healer', fn: testMeshAndHealer },
     { name: 'Cron 24h Visual Collision Heatmap & Dead-Man\'s-Switch Heartbeats', fn: testCronHeartbeat },
+    { name: 'Zero-Dep WebAuthn Passkeys (FIDO2), Ephemeral Secret Leases & OSV.dev SBOM CVE Drift', fn: testPasskeyLeaseCve },
+    { name: 'Live Container/DB Config Drift Detector, PgBouncer Smart Pool & OpenTofu/Compose IaC Exporter', fn: testDriftAndIac },
+    { name: 'Maintenance Windows (#7704/#8193), Public Incident Timeline, Multi-CAA (#6519), 6-Day ACME & Geo-Failover', fn: testUptimeMaintenanceCaa },
   ];
 
   for (const suite of suites) {

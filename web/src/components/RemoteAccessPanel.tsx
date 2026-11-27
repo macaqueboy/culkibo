@@ -319,7 +319,7 @@ export const RemoteAccessPanel: React.FC<{ onNotify?: (msg: string, type?: 'info
           </button>
         </form>
 
-        {info && info.tunnels.length > 0 && !info.tunnelsMock && (
+        {info && Array.isArray(info.tunnels) && info.tunnels.length > 0 && !info.tunnelsMock && (
           <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden text-xs">
             {info.tunnels.map((t) => {
               const busy = tunnelBusyId === t.id;

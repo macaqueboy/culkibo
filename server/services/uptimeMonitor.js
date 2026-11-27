@@ -23,10 +23,17 @@ const ssrfGuard = require('./ssrfGuard');
  *    intervalo `.unref()` cuando hay >= 1 monitor habilitado.
  */
 
-const DATA_DIR = process.env.CULKIBO_DATA_DIR
-  ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
-  : path.resolve(__dirname, '..', '..', 'data');
+function resolveDefaultDataDir() {
+  return process.env.CULKIBO_DATA_DIR
+    ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
+    : path.resolve(__dirname, '..', '..', 'data');
+}
+const DATA_DIR = resolveDefaultDataDir();
 const STORE_FILE = path.join(DATA_DIR, 'uptime.json');
+const MAINTENANCE_INCIDENTS_FILE_NAME = 'maintenance-incidents.json';
+const MAX_MAINTENANCE_WINDOWS = 100;
+const INCIDENT_STATUSES = Object.freeze(['investigating', 'identified', 'monitoring', 'resolved']);
+const INCIDENT_SEVERITIES = Object.freeze(['minor', 'major', 'critical', 'maintenance']);
 
 const MAX_MONITORS = 100;
 const MAX_CHECKS_PER_MONITOR = 288;
@@ -146,6 +153,7 @@ class UptimeMonitor extends EventEmitter {
   /**
    * @param {{
    *   storeFile?: string,
+   *   maintenanceFile?: string,
    *   autoStart?: boolean,
    *   assertSafeUrl?: typeof ssrfGuard.assertSafeUrl,
    *   safeFetch?: typeof ssrfGuard.safeFetch,
@@ -157,6 +165,8 @@ class UptimeMonitor extends EventEmitter {
    */
   constructor(options = {}) {
     super();
+    this._explicitStoreFile = options.storeFile ? path.resolve(options.storeFile) : null;
+    this._explicitMaintenanceFile = options.maintenanceFile ? path.resolve(options.maintenanceFile) : null;
     this.storeFile = options.storeFile || STORE_FILE;
     this._autoStart = options.autoStart !== false;
     this._assertSafeUrl = options.assertSafeUrl || ssrfGuard.assertSafeUrl;
@@ -172,6 +182,12 @@ class UptimeMonitor extends EventEmitter {
     this.statusPages = new Map();
     /** @type {Array<any>} */
     this.incidents = [];
+    /** @type {Array<any>} */
+    this.maintenanceWindows = [];
+    /** @type {Array<any>} */
+    this.timelineIncidents = [];
+    /** @type {string | null} */
+    this._maintenanceLoadedPath = null;
     /** @type {Map<string, { html: string, buffer: Buffer, etag: string, createdAt: number }>} */
     this._htmlCache = new Map();
     /** @type {Set<string>} */
@@ -181,6 +197,45 @@ class UptimeMonitor extends EventEmitter {
     this._timer = null;
     this._loaded = false;
     this._stopped = false;
+  }
+
+  _resolveMaintenanceFile() {
+    if (this._explicitMaintenanceFile) return this._explicitMaintenanceFile;
+    if (this._explicitStoreFile) {
+      return path.join(path.dirname(this._explicitStoreFile), MAINTENANCE_INCIDENTS_FILE_NAME);
+    }
+    return path.join(resolveDefaultDataDir(), MAINTENANCE_INCIDENTS_FILE_NAME);
+  }
+
+  _ensureMaintenanceLoaded() {
+    const target = this._resolveMaintenanceFile();
+    if (this._maintenanceLoadedPath === target) return;
+    this._maintenanceLoadedPath = target;
+    this.maintenanceWindows = [];
+    this.timelineIncidents = [];
+    const res = ssrfGuard.loadJsonWithBackupSync(target, {
+      validate: (parsed) => Boolean(parsed && typeof parsed === 'object')
+    });
+    if (res.ok && res.data) {
+      if (Array.isArray(res.data.maintenanceWindows)) {
+        this.maintenanceWindows = res.data.maintenanceWindows.slice(0, MAX_MAINTENANCE_WINDOWS);
+      }
+      if (Array.isArray(res.data.timelineIncidents)) {
+        this.timelineIncidents = res.data.timelineIncidents.slice(0, MAX_INCIDENTS);
+      }
+    }
+  }
+
+  _saveMaintenance() {
+    this._ensureMaintenanceLoaded();
+    const target = this._resolveMaintenanceFile();
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      maintenanceWindows: this.maintenanceWindows.slice(0, MAX_MAINTENANCE_WINDOWS),
+      timelineIncidents: this.timelineIncidents.slice(0, MAX_INCIDENTS)
+    };
+    ssrfGuard.atomicWriteJsonSync(target, payload, { mode: 0o600, backup: true });
   }
 
   _ensureLoaded() {
@@ -1037,6 +1092,10 @@ class UptimeMonitor extends EventEmitter {
     monitor.lastStatusCode = statusCode;
     monitor.lastError = errorMsg;
 
+    const suppressedByMaintenance =
+      this.isInMaintenance(monitor.id, now) ||
+      (monitor.projectId ? this.isInMaintenance(monitor.projectId, now) : false);
+
     /** @type {'opened' | 'resolved' | null} */
     let incidentTransition = null;
     /** @type {any} */
@@ -1044,7 +1103,10 @@ class UptimeMonitor extends EventEmitter {
 
     if (status === 'down') {
       monitor.consecutiveFailures = (monitor.consecutiveFailures || 0) + 1;
-      if (monitor.consecutiveFailures >= (monitor.retries || 2)) {
+      if (suppressedByMaintenance) {
+        // Ventana de mantenimiento activa: silenciar tormenta de alertas y no abrir incidente nuevo
+        monitor.status = 'maintenance';
+      } else if (monitor.consecutiveFailures >= (monitor.retries || 2)) {
         monitor.status = 'down';
         if (!monitor.activeIncidentId) {
           incidentRecord = {
@@ -1096,14 +1158,16 @@ class UptimeMonitor extends EventEmitter {
         monitor.activeIncidentId = null;
         incidentTransition = 'resolved';
         this.emit('incident_resolved', { monitorId: monitor.id, incident: incidentRecord });
-        await this._emitNotification({
-          event: 'uptime_recovered',
-          level: 'success',
-          title: `Monitor recuperado: ${monitor.name}`,
-          message: `El monitor "${monitor.name}" ha vuelto a estar operativo (${latencyMs} ms).`,
-          projectId: monitor.projectId || null,
-          projectName: monitor.name
-        });
+        if (!suppressedByMaintenance) {
+          await this._emitNotification({
+            event: 'uptime_recovered',
+            level: 'success',
+            title: `Monitor recuperado: ${monitor.name}`,
+            message: `El monitor "${monitor.name}" ha vuelto a estar operativo (${latencyMs} ms).`,
+            projectId: monitor.projectId || null,
+            projectName: monitor.name
+          });
+        }
       }
     }
 
@@ -1112,28 +1176,379 @@ class UptimeMonitor extends EventEmitter {
     this._invalidateCache();
 
     const stats = this.computeMonitorStats(monitor, now);
-    this.emit('check', { monitorId: monitor.id, check, status: monitor.status, incidentTransition });
+    this.emit('check', { monitorId: monitor.id, check, status: monitor.status, incidentTransition, suppressedByMaintenance });
     return {
       monitorId: monitor.id,
       status: monitor.status,
       check,
       incidentTransition,
       incident: incidentRecord,
+      suppressedByMaintenance,
       stats
     };
   }
 
+  // -------------------------------------------------------------------------
+  // Ventanas de mantenimiento (uptime-kuma#7704 & #8193), Timeline e Incidentes
+  // y Plan Active-Passive DNS Geo-Failover
+  // -------------------------------------------------------------------------
+
   /**
-   * Lista incidentes administrativos recientes.
-   * @param {{ monitorId?: string | null, status?: string | null, limit?: number }} [opts]
+   * Evalúa en vivo si una ventana de mantenimiento está activa en `nowMs`.
+   * Cierra `uptime-kuma#7704` (ventanas recurrentes el mismo día k=0) y
+   * `uptime-kuma#8193` (intervalos >=2d congelados).
+   * @param {any} w
+   * @param {number} [nowMs]
+   * @returns {boolean}
+   */
+  _isWindowActiveAt(w, nowMs = Date.now()) {
+    if (!w || w.enabled === false) return false;
+    const startMs = typeof w.startMs === 'number' && Number.isFinite(w.startMs)
+      ? w.startMs
+      : Date.parse(String(w.startAt || ''));
+    if (!Number.isFinite(startMs)) return false;
+    const durationMin = Math.max(1, Number(w.durationMin) || 60);
+    const durationMs = durationMin * 60 * 1000;
+    if (nowMs < startMs) return false;
+
+    if (w.kind !== 'recurring') {
+      return nowMs >= startMs && nowMs < startMs + durationMs;
+    }
+
+    const intervalDays = Math.max(1, Number(w.intervalDays) || 1);
+    const intervalMs = intervalDays * 24 * 60 * 60 * 1000;
+    const k = Math.floor((nowMs - startMs) / intervalMs);
+    if (k < 0) return false;
+
+    const currentStart = startMs + k * intervalMs;
+    if (nowMs >= currentStart && nowMs < currentStart + durationMs) {
+      return true;
+    }
+    if (k > 0) {
+      const prevStart = startMs + (k - 1) * intervalMs;
+      if (nowMs >= prevStart && nowMs < prevStart + durationMs) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Calcula el próximo inicio (ISO) de una ventana respecto a `nowMs`.
+   * @param {any} w
+   * @param {number} [nowMs]
+   * @returns {string | null}
+   */
+  _computeNextOccurrenceIso(w, nowMs = Date.now()) {
+    if (!w || w.enabled === false) return null;
+    const startMs = typeof w.startMs === 'number' && Number.isFinite(w.startMs)
+      ? w.startMs
+      : Date.parse(String(w.startAt || ''));
+    if (!Number.isFinite(startMs)) return null;
+    const durationMs = Math.max(1, Number(w.durationMin) || 60) * 60 * 1000;
+    if (w.kind !== 'recurring') {
+      return nowMs < startMs + durationMs ? new Date(startMs).toISOString() : null;
+    }
+    const intervalMs = Math.max(1, Number(w.intervalDays) || 1) * 24 * 60 * 60 * 1000;
+    if (nowMs < startMs) return new Date(startMs).toISOString();
+    const k = Math.floor((nowMs - startMs) / intervalMs);
+    const currentStart = startMs + k * intervalMs;
+    if (nowMs < currentStart + durationMs) return new Date(currentStart).toISOString();
+    return new Date(startMs + (k + 1) * intervalMs).toISOString();
+  }
+
+  /**
+   * Crea y persiste una ventana de mantenimiento (`once` o `recurring`).
+   * @param {{
+   *   title: string,
+   *   targetIds?: string[],
+   *   kind?: 'once' | 'recurring',
+   *   startAt?: string | number,
+   *   durationMin?: number,
+   *   intervalDays?: number
+   * }} data
+   */
+  createMaintenanceWindow(data = /** @type {any} */ ({})) {
+    this._ensureMaintenanceLoaded();
+    if (this.maintenanceWindows.length >= MAX_MAINTENANCE_WINDOWS) {
+      throw new Error(`Límite máximo de ${MAX_MAINTENANCE_WINDOWS} ventanas de mantenimiento alcanzado`);
+    }
+    const title = String(data.title || '').trim().slice(0, 120);
+    if (!title) throw new Error('El título de la ventana de mantenimiento es obligatorio');
+
+    const kindRaw = String(data.kind || 'once').trim().toLowerCase();
+    if (kindRaw !== 'once' && kindRaw !== 'recurring') {
+      throw new Error('kind debe ser "once" o "recurring"');
+    }
+
+    const rawStart = data.startAt !== undefined && data.startAt !== null && data.startAt !== ''
+      ? data.startAt
+      : Date.now();
+    const startMs = typeof rawStart === 'number' ? rawStart : Date.parse(String(rawStart));
+    if (!Number.isFinite(startMs)) {
+      throw new Error('startAt debe ser una fecha ISO o marca temporal válida');
+    }
+
+    const durationMinRaw = data.durationMin !== undefined ? Number(data.durationMin) : 60;
+    if (!Number.isFinite(durationMinRaw) || durationMinRaw < 1 || durationMinRaw > 10080) {
+      throw new Error('durationMin debe estar entre 1 y 10080 minutos');
+    }
+    const durationMin = Math.round(durationMinRaw);
+
+    const intervalDaysRaw = data.intervalDays !== undefined ? Number(data.intervalDays) : 1;
+    if (!Number.isFinite(intervalDaysRaw) || intervalDaysRaw < 1 || intervalDaysRaw > 365) {
+      throw new Error('intervalDays debe estar entre 1 y 365 días');
+    }
+    const intervalDays = Math.round(intervalDaysRaw);
+
+    let targetIds = ['*'];
+    if (Array.isArray(data.targetIds) && data.targetIds.length > 0) {
+      targetIds = Array.from(new Set(
+        data.targetIds.map((x) => String(x || '').trim().slice(0, 80)).filter(Boolean)
+      )).slice(0, 100);
+      if (targetIds.length === 0) targetIds = ['*'];
+    }
+
+    const nowIso = new Date().toISOString();
+    const win = {
+      id: `mw_${crypto.randomBytes(6).toString('hex')}`,
+      title,
+      targetIds,
+      kind: /** @type {'once' | 'recurring'} */ (kindRaw),
+      startAt: new Date(startMs).toISOString(),
+      startMs,
+      durationMin,
+      intervalDays,
+      enabled: true,
+      createdAt: nowIso
+    };
+
+    this.maintenanceWindows.unshift(win);
+    this._saveMaintenance();
+    this._invalidateCache();
+    this.emit('maintenance_created', { window: win });
+    return {
+      ...win,
+      targetIds: [...win.targetIds],
+      active: this._isWindowActiveAt(win),
+      nextOccurrenceAt: this._computeNextOccurrenceIso(win)
+    };
+  }
+
+  /**
+   * Lista las ventanas de mantenimiento evaluando estado activo en `nowMs`.
+   * @param {{ nowMs?: number, targetId?: string | null }} [opts]
+   */
+  listMaintenanceWindows(opts = {}) {
+    this._ensureMaintenanceLoaded();
+    const nowMs = typeof opts.nowMs === 'number' && Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+    const targetId = opts.targetId ? String(opts.targetId).trim() : null;
+    let list = this.maintenanceWindows;
+    if (targetId) {
+      list = list.filter((w) => Array.isArray(w.targetIds) && (w.targetIds.includes('*') || w.targetIds.includes(targetId)));
+    }
+    return list.map((w) => ({
+      ...w,
+      targetIds: Array.isArray(w.targetIds) ? [...w.targetIds] : ['*'],
+      active: this._isWindowActiveAt(w, nowMs),
+      nextOccurrenceAt: this._computeNextOccurrenceIso(w, nowMs)
+    }));
+  }
+
+  /**
+   * Elimina una ventana de mantenimiento por ID.
+   * @param {string} id
+   */
+  deleteMaintenanceWindow(id) {
+    this._ensureMaintenanceLoaded();
+    const cleanId = String(id || '').trim();
+    const idx = this.maintenanceWindows.findIndex((w) => w.id === cleanId);
+    if (idx === -1) {
+      const err = new Error(`Ventana de mantenimiento no encontrada: ${cleanId}`);
+      /** @type {any} */ (err).status = 404;
+      throw err;
+    }
+    this.maintenanceWindows.splice(idx, 1);
+    this._saveMaintenance();
+    this._invalidateCache();
+    return { deleted: true, id: cleanId };
+  }
+
+  /**
+   * Comprueba dinámicamente en vivo si `targetId` se encuentra en mantenimiento en `nowMs`.
+   * @param {string | null | undefined} targetId
+   * @param {number} [nowMs]
+   * @returns {boolean}
+   */
+  isInMaintenance(targetId, nowMs = Date.now()) {
+    this._ensureMaintenanceLoaded();
+    const tid = targetId ? String(targetId).trim() : null;
+    const t = typeof nowMs === 'number' && Number.isFinite(nowMs) ? nowMs : Date.now();
+    for (const w of this.maintenanceWindows) {
+      if (!w || w.enabled === false) continue;
+      const targets = Array.isArray(w.targetIds) ? w.targetIds : ['*'];
+      const matches = targets.includes('*') || (tid !== null && targets.includes(tid));
+      if (!matches) continue;
+      if (this._isWindowActiveAt(w, t)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Crea un incidente estructurado con línea temporal (`investigating → identified → monitoring → resolved`).
+   * @param {{
+   *   title: string,
+   *   severity?: 'minor' | 'major' | 'critical' | 'maintenance' | string,
+   *   status?: 'investigating' | 'identified' | 'monitoring' | 'resolved' | string,
+   *   affectedIds?: string[],
+   *   message?: string
+   * }} data
+   */
+  createIncident(data = /** @type {any} */ ({})) {
+    this._ensureMaintenanceLoaded();
+    const title = String(data.title || '').trim().slice(0, 160);
+    if (!title) throw new Error('El título del incidente es obligatorio');
+
+    const sevRaw = String(data.severity || 'major').trim().toLowerCase();
+    const severity = INCIDENT_SEVERITIES.includes(/** @type {any} */ (sevRaw)) ? sevRaw : 'major';
+
+    const stRaw = String(data.status || 'investigating').trim().toLowerCase();
+    if (!INCIDENT_STATUSES.includes(/** @type {any} */ (stRaw))) {
+      throw new Error(`Estado de incidente inválido: ${stRaw} (usa investigating, identified, monitoring o resolved)`);
+    }
+
+    const message = String(data.message || '').trim().slice(0, 1000);
+    const affectedIds = Array.isArray(data.affectedIds)
+      ? Array.from(new Set(data.affectedIds.map((x) => String(x || '').trim().slice(0, 80)).filter(Boolean))).slice(0, 50)
+      : [];
+
+    const nowIso = new Date().toISOString();
+    const initialUpdate = {
+      id: `upd_${crypto.randomBytes(4).toString('hex')}`,
+      status: stRaw,
+      message: message || `Incident opened (${stRaw})`,
+      createdAt: nowIso
+    };
+    const incident = {
+      id: `tinc_${crypto.randomBytes(6).toString('hex')}`,
+      kind: 'timeline',
+      title,
+      severity,
+      status: stRaw,
+      affectedIds,
+      message,
+      updates: [initialUpdate],
+      startedAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      resolvedAt: stRaw === 'resolved' ? nowIso : null
+    };
+
+    this.timelineIncidents.unshift(incident);
+    if (this.timelineIncidents.length > MAX_INCIDENTS) {
+      this.timelineIncidents = this.timelineIncidents.slice(0, MAX_INCIDENTS);
+    }
+    this._saveMaintenance();
+    this._invalidateCache();
+    this.emit('timeline_incident_created', { incident });
+    return {
+      ...incident,
+      affectedIds: [...incident.affectedIds],
+      updates: incident.updates.map((u) => ({ ...u }))
+    };
+  }
+
+  /**
+   * Avanza la línea temporal de un incidente (`investigating → identified → monitoring → resolved`).
+   * @param {string} id
+   * @param {{ status?: 'investigating' | 'identified' | 'monitoring' | 'resolved' | string, message?: string }} patch
+   */
+  updateIncident(id, patch = {}) {
+    this._ensureMaintenanceLoaded();
+    const cleanId = String(id || '').trim();
+    const inc = this.timelineIncidents.find((i) => i.id === cleanId);
+    if (!inc) {
+      const err = new Error(`Incidente no encontrado: ${cleanId}`);
+      /** @type {any} */ (err).status = 404;
+      throw err;
+    }
+
+    const nextStatus = patch.status !== undefined
+      ? String(patch.status || '').trim().toLowerCase()
+      : inc.status;
+    if (!INCIDENT_STATUSES.includes(/** @type {any} */ (nextStatus))) {
+      throw new Error(`Estado de incidente inválido: ${nextStatus} (usa investigating, identified, monitoring o resolved)`);
+    }
+
+    const msg = patch.message !== undefined ? String(patch.message || '').trim().slice(0, 1000) : '';
+    const nowIso = new Date().toISOString();
+
+    inc.status = nextStatus;
+    if (msg) inc.message = msg;
+    inc.updatedAt = nowIso;
+    if (nextStatus === 'resolved') {
+      inc.resolvedAt = inc.resolvedAt || nowIso;
+    } else {
+      inc.resolvedAt = null;
+    }
+    if (!Array.isArray(inc.updates)) inc.updates = [];
+    inc.updates.push({
+      id: `upd_${crypto.randomBytes(4).toString('hex')}`,
+      status: nextStatus,
+      message: msg || `Status updated to ${nextStatus}`,
+      createdAt: nowIso
+    });
+
+    this._saveMaintenance();
+    this._invalidateCache();
+    this.emit('timeline_incident_updated', { incident: inc });
+    return {
+      ...inc,
+      affectedIds: Array.isArray(inc.affectedIds) ? [...inc.affectedIds] : [],
+      updates: inc.updates.map((u) => ({ ...u }))
+    };
+  }
+
+  /**
+   * Construye un plan estructurado Active-Passive Cloudflare DNS Geo-Failover.
+   * @param {{
+   *   domain: string,
+   *   primaryIp: string,
+   *   secondaryIp: string,
+   *   consecutiveFailures?: number,
+   *   ttlSec?: number,
+   *   proxied?: boolean,
+   *   checkIntervalSec?: number
+   * }} input
+   */
+  buildGeoFailoverPlan(input) {
+    return buildGeoFailoverPlan(input);
+  }
+
+  /**
+   * Lista incidentes administrativos y de línea temporal recientes.
+   * @param {{ activeOnly?: boolean, monitorId?: string | null, status?: string | null, limit?: number }} [opts]
    */
   listIncidents(opts = {}) {
     this._ensureLoaded();
-    let list = this.incidents;
-    if (opts.monitorId) list = list.filter((i) => i.monitorId === opts.monitorId);
-    if (opts.status) list = list.filter((i) => i.status === opts.status);
+    this._ensureMaintenanceLoaded();
+    let list = [...this.timelineIncidents, ...this.incidents];
+    if (opts.activeOnly) {
+      list = list.filter((i) => i && i.status !== 'resolved');
+    }
+    if (opts.monitorId) {
+      list = list.filter((i) => i.monitorId === opts.monitorId || (Array.isArray(i.affectedIds) && i.affectedIds.includes(opts.monitorId)));
+    }
+    if (opts.status) {
+      list = list.filter((i) => i.status === opts.status);
+    }
+    list.sort((a, b) => Date.parse(b.updatedAt || b.startedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.startedAt || a.createdAt || 0));
     const limit = Math.max(1, Math.min(MAX_INCIDENTS, Number(opts.limit) || 50));
-    return list.slice(0, limit).map((i) => ({ ...i }));
+    return list.slice(0, limit).map((i) => ({
+      ...i,
+      ...(Array.isArray(i.affectedIds) ? { affectedIds: [...i.affectedIds] } : {}),
+      ...(Array.isArray(i.updates) ? { updates: i.updates.map((u) => ({ ...u })) } : {})
+    }));
   }
 
   // -------------------------------------------------------------------------
@@ -1341,7 +1756,10 @@ class UptimeMonitor extends EventEmitter {
 
     const services = selected.map((m) => {
       const stats = this.computeMonitorStats(m, now);
-      const inMaintenance = this._isProjectInMaintenance(m.projectId);
+      const inMaintenance =
+        this._isProjectInMaintenance(m.projectId) ||
+        this.isInMaintenance(m.id, now) ||
+        (m.projectId ? this.isInMaintenance(m.projectId, now) : false);
       const displayName = String(m.publicName || m.name || 'Servicio').slice(0, 80);
 
       /** @type {'up' | 'degraded' | 'down' | 'maintenance' | 'unknown'} */
@@ -1402,6 +1820,32 @@ class UptimeMonitor extends EventEmitter {
           startedAt: pinc.startedAt
         });
       }
+    }
+
+    // Proyectar incidentes activos de línea temporal (sin filtrar detalles internos ni URLs)
+    this._ensureMaintenanceLoaded();
+    const activeMaintenanceWindows = this.listMaintenanceWindows({ nowMs: now })
+      .filter((w) => w.active)
+      .map((w) => ({
+        title: String(w.title || 'Mantenimiento programado').slice(0, 120),
+        kind: w.kind,
+        startAt: w.startAt,
+        durationMin: w.durationMin
+      }));
+    if (activeMaintenanceWindows.length > 0) hasMaintenance = true;
+
+    for (const tinc of this.timelineIncidents) {
+      if (!tinc || tinc.status === 'resolved') continue;
+      if (tinc.severity === 'maintenance') hasMaintenance = true;
+      else if (tinc.severity === 'critical' || tinc.severity === 'major') hasDown = true;
+      else hasDegraded = true;
+      activeIncidents.push({
+        title: String(tinc.title || 'Incidente activo').slice(0, 160),
+        severity: String(tinc.severity || 'major'),
+        message: String(tinc.message || '').slice(0, 500),
+        status: String(tinc.status || 'investigating'),
+        startedAt: tinc.startedAt || tinc.createdAt
+      });
     }
 
     /** @type {'operational' | 'degraded' | 'outage' | 'maintenance'} */
@@ -1727,10 +2171,128 @@ footer{margin-top:28px;display:flex;justify-content:space-between;flex-wrap:wrap
   }
 }
 
+/**
+ * Construye un plan estructurado Active-Passive Cloudflare DNS Geo-Failover.
+ * @param {{
+ *   domain: string,
+ *   primaryIp: string,
+ *   secondaryIp: string,
+ *   consecutiveFailures?: number,
+ *   ttlSec?: number,
+ *   proxied?: boolean,
+ *   checkIntervalSec?: number
+ * }} input
+ */
+function buildGeoFailoverPlan(input = /** @type {any} */ ({})) {
+  const cleanDomain = String(input.domain || '').trim().toLowerCase().replace(/\.+$/, '');
+  if (!cleanDomain || !HOSTNAME_RE.test(cleanDomain) || !cleanDomain.includes('.') || /[\s\r\n\0]/.test(cleanDomain)) {
+    const err = new Error('Dominio inválido para plan de Geo-Failover DNS');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+
+  const cleanPrimary = String(input.primaryIp || '').trim();
+  const cleanSecondary = String(input.secondaryIp || '').trim();
+  const famPrimary = net.isIP(cleanPrimary);
+  const famSecondary = net.isIP(cleanSecondary);
+  if (!famPrimary || !famSecondary) {
+    const err = new Error('primaryIp y secondaryIp deben ser direcciones IPv4 o IPv6 válidas');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  if (famPrimary !== famSecondary) {
+    const err = new Error('primaryIp y secondaryIp deben pertenecer a la misma familia IP (IPv4 o IPv6)');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  if (cleanPrimary === cleanSecondary) {
+    const err = new Error('primaryIp y secondaryIp no pueden ser iguales');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  if (ssrfGuard.isMetadataIp(cleanPrimary) || ssrfGuard.isMetadataIp(cleanSecondary)) {
+    const err = new Error('IP de metadatos bloqueada por seguridad en plan de Geo-Failover');
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+
+  const consecutiveFailures = Math.min(10, Math.max(1, Math.round(Number(input.consecutiveFailures) || 3)));
+  const ttlSec = Math.min(3600, Math.max(30, Math.round(Number(input.ttlSec) || 60)));
+  const checkIntervalSec = Math.min(300, Math.max(10, Math.round(Number(input.checkIntervalSec) || 30)));
+  const recordType = famPrimary === 6 ? 'AAAA' : 'A';
+  const proxied = Boolean(input.proxied);
+  const estimatedDetectionSec = consecutiveFailures * checkIntervalSec;
+  const estimatedCutoverSec = estimatedDetectionSec + ttlSec;
+
+  return {
+    ok: true,
+    strategy: 'active-passive-dns-failover',
+    provider: 'cloudflare',
+    domain: cleanDomain,
+    recordType,
+    proxied,
+    ttlSec,
+    trigger: {
+      consecutiveFailures,
+      checkIntervalSec,
+      estimatedDetectionSec,
+      estimatedCutoverSec
+    },
+    primary: { ip: cleanPrimary, role: 'active', priority: 1 },
+    secondary: { ip: cleanSecondary, role: 'standby', priority: 2 },
+    steps: [
+      {
+        step: 1,
+        action: 'health_probe',
+        target: cleanPrimary,
+        threshold: `${consecutiveFailures} consecutive failures`
+      },
+      {
+        step: 2,
+        action: 'dns_update',
+        provider: 'cloudflare',
+        recordType,
+        name: cleanDomain,
+        from: cleanPrimary,
+        to: cleanSecondary,
+        ttl: ttlSec,
+        proxied
+      },
+      {
+        step: 3,
+        action: 'verify_cutover',
+        target: cleanSecondary,
+        expectedDnsValue: cleanSecondary
+      },
+      {
+        step: 4,
+        action: 'notify_incident',
+        severity: 'major',
+        message: `DNS Geo-Failover activated for ${cleanDomain}: ${cleanPrimary} -> ${cleanSecondary} (TTL ${ttlSec}s)`
+      }
+    ],
+    rollback: {
+      action: 'dns_update',
+      provider: 'cloudflare',
+      recordType,
+      name: cleanDomain,
+      from: cleanSecondary,
+      to: cleanPrimary,
+      ttl: ttlSec,
+      proxied,
+      requireHealthyConsecutiveChecks: consecutiveFailures
+    },
+    generatedAt: new Date().toISOString()
+  };
+}
+
 const instance = /** @type {any} */ (new UptimeMonitor());
 instance.UptimeMonitor = UptimeMonitor;
 instance.PUBLIC_STATUS_CSP = PUBLIC_STATUS_CSP;
 instance.escapeHtml = escapeHtml;
 instance.SLUG_RE = SLUG_RE;
+instance.buildGeoFailoverPlan = buildGeoFailoverPlan;
+instance.INCIDENT_STATUSES = INCIDENT_STATUSES;
+instance.INCIDENT_SEVERITIES = INCIDENT_SEVERITIES;
 
 module.exports = instance;

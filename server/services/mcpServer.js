@@ -48,7 +48,11 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'finopsOptimizer',
   'buildHealerService',
   'fleetMeshService',
-  'edgeShieldService'
+  'edgeShieldService',
+  'cveDriftService',
+  'secretLeaseService',
+  'driftDetectorService',
+  'iacExporter'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -74,7 +78,7 @@ function lazySvc(name) {
 }
 
 const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars|passphrase|privatekey|private_key|sshkey|ssh_key|invitetoken|invite_token|tokenhash|token_hash|signingsecret|signing_secret|masterkey|master_key|confirmtoken|confirm_token)/i;
-const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck(?:[stihpr]|et)_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck(?:[stihprl]|et|bg)_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_database_credentials',
   'culkibo_github_connect',
@@ -90,7 +94,9 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_edge_tunnel',
   'culkibo_otlp_status',
   'culkibo_shadow_replay',
-  'culkibo_fleet_mesh'
+  'culkibo_fleet_mesh',
+  'culkibo_export_iac',
+  'culkibo_secret_lease'
 ]);
 
 /** @type {Record<string, number>} */
@@ -101,11 +107,12 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas que también soportan `dryRun: true` (37 destructivas + 3 = 40). */
+/** Herramientas no destructivas que también soportan `dryRun: true` (38 destructivas + 3 = 41). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment',
-  'culkibo_heal_build_failure'
+  'culkibo_heal_build_failure',
+  'culkibo_secret_lease'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -161,7 +168,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_verify_attestation',
     'culkibo_shadow_replay',
     'culkibo_time_machine',
-    'culkibo_heal_build_failure'
+    'culkibo_heal_build_failure',
+    'culkibo_triage_playbook',
+    'culkibo_drift_check',
+    'culkibo_export_iac'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -193,6 +203,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_shadow_replay',
     'culkibo_time_machine',
     'culkibo_heal_build_failure',
+    'culkibo_triage_playbook',
+    'culkibo_cve_scan',
+    'culkibo_drift_check',
+    'culkibo_export_iac',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -224,7 +238,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_database_list_backups',
     'culkibo_export_instance_snapshot',
     'culkibo_diagnose_incident',
-    'culkibo_verify_attestation'
+    'culkibo_triage_playbook',
+    'culkibo_verify_attestation',
+    'culkibo_cve_scan',
+    'culkibo_secret_lease'
   ])
 });
 
@@ -288,7 +305,16 @@ const SEARCH_SYNONYMS = Object.freeze({
   timeline: ['cron', 'heartbeat', 'heatmap', 'collision', 'schedule'],
   shield: ['waf', 'bot', 'pow', 'anubis', 'scraper', 'edge', 'caddy'],
   pow: ['shield', 'waf', 'bot', 'anubis', 'challenge'],
-  waf: ['shield', 'bot', 'pow', 'edge', 'caddy']
+  waf: ['shield', 'bot', 'pow', 'edge', 'caddy'],
+  cve: ['osv', 'sbom', 'vulnerability', 'security', 'scan', 'triage'],
+  osv: ['cve', 'sbom', 'vulnerability', 'security', 'scan'],
+  drift: ['config', 'inspect', 'pgbouncer', 'triage', 'reconcile'],
+  pgbouncer: ['drift', 'postgres', 'pool', 'database'],
+  terraform: ['iac', 'opentofu', 'hcl', 'compose', 'export'],
+  opentofu: ['iac', 'terraform', 'hcl', 'compose', 'export'],
+  iac: ['terraform', 'opentofu', 'hcl', 'compose', 'export'],
+  lease: ['secret', 'breakglass', 'rotation', 'vault', 'ephemeral'],
+  triage: ['incident', 'heal', 'drift', 'cve', 'playbook', 'diagnose']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -443,7 +469,13 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_heal_build_failure: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
   culkibo_fleet_mesh: { minRole: 'admin', scope: 'fleet:write', projectScoped: false, secretSensitive: true },
   culkibo_cron_timeline: { minRole: 'viewer', scope: 'crons:read', projectScoped: false },
-  culkibo_edge_shield: { minRole: 'developer', scope: 'domains:write', projectScoped: false }
+  culkibo_edge_shield: { minRole: 'developer', scope: 'domains:write', projectScoped: false },
+  // MCP 2026 Cycle-8: Autonomous Triage, SBOM CVE Drift, Config Drift + PgBouncer, IaC Export & Secret Leases (+5 = 125)
+  culkibo_triage_playbook: { minRole: 'viewer', scope: 'observability:read', projectScoped: true },
+  culkibo_cve_scan: { minRole: 'viewer', scope: 'security:read', projectScoped: false },
+  culkibo_drift_check: { minRole: 'developer', scope: 'deployments:read', projectScoped: true },
+  culkibo_export_iac: { minRole: 'developer', scope: 'gitops:read', projectScoped: false, secretSensitive: true },
+  culkibo_secret_lease: { minRole: 'admin', scope: 'security:write', projectScoped: false, secretSensitive: true }
 });
 
 /**
@@ -3401,6 +3433,147 @@ class McpServer extends EventEmitter {
             difficulty: { type: 'integer', minimum: 1, maximum: 6, description: 'Dificultad en ceros hexadecimales del reto SHA-256 PoW (default 4, rango 1..6)' }
           }
         }
+      },
+
+      // --- MCP 2026 Cycle-8: Autonomous Triage, SBOM CVE Drift, Config Drift + PgBouncer, IaC Export & Secret Leases (+5 -> 125) ---
+      {
+        name: 'culkibo_triage_playbook',
+        title: 'Triaje autónomo unificado (incidente + healer + drift + CVE)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string' },
+            projectName: { type: 'string' },
+            severity: { type: 'string' },
+            summary: { type: 'string' },
+            incident: { type: 'object' },
+            healer: { type: ['object', 'null'] },
+            drift: { type: ['object', 'null'] },
+            cve: { type: ['object', 'null'] },
+            rootCauses: { type: 'array' },
+            remediationSteps: { type: 'array' }
+          }
+        },
+        description: 'Encadena diagnóstico de incidentes, clasificación determinista de logs (20 patrones Build Healer), detección de drift de configuración (kamal#1790) y escaneo SBOM CVE offline en un único dossier priorizado con pasos dryRun seguros (estrictamente filtrado por ACL de proyecto).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto a diagnosticar (controlado por ACL)' },
+            logs: { type: 'string', maxLength: 200000, description: 'Logs opcionales de build/runtime para clasificar con Build Auto-Healer' },
+            actualInspect: { type: 'object', description: 'Objeto opcional tipo docker inspect para comparar config viva contra estado declarado' },
+            includeCveScan: { type: 'boolean', description: 'Incluir resumen SBOM CVE offline/cacheado en el dossier (default true)' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_cve_scan',
+        title: 'Escanear drift CVE del SBOM CycloneDX (OSV.dev)',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            mode: { type: 'string' },
+            scannedComponents: { type: 'number' },
+            vulnerableCount: { type: 'number' },
+            severityCounts: { type: 'object' },
+            vulnerabilities: { type: 'array' }
+          }
+        },
+        description: 'Analiza el SBOM CycloneDX 1.6 en busca de CVEs conocidos vía API batch OSV.dev (24h caché local; por defecto allowNetwork: false para ejecución offline instantánea en MCP).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            allowNetwork: { type: 'boolean', description: 'Permitir consulta HTTP saliente a api.osv.dev/v1/querybatch (default false: modo offline/caché)' },
+            forceRefresh: { type: 'boolean', description: 'Ignorar caché local de 24h cuando allowNetwork es true (default false)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_drift_check',
+        title: 'Detectar drift de contenedor/BD y preset PgBouncer',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: ['string', 'null'] },
+            drift: { type: ['object', 'null'] },
+            pgbouncerPreset: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Compara el estado declarado de un proyecto contra un docker inspect vivo o aportado (digest de imagen, RAM/CPU, exposición 0.0.0.0, hash SHA-256 de nombres de claves env sin secretos, logDriver, stopTimeout — cura kamal#1790) y/o genera un preset gestionado PgBouncer listo para Prisma/Drizzle.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto a auditar contra drift (controlado por ACL)' },
+            actualInspect: { type: 'object', description: 'Payload docker inspect opcional para evaluación determinista offline' },
+            pgbouncerPreset: {
+              type: 'object',
+              description: 'Parámetros opcionales para generar preset PgBouncer ({ name, databaseName, poolMode, maxPreparedStatements, defaultPoolSize })'
+            }
+          }
+        }
+      },
+      {
+        name: 'culkibo_export_iac',
+        title: 'Exportar infraestructura a OpenTofu/Terraform y Compose',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            format: { type: 'string' },
+            files: { type: 'object' },
+            stats: { type: 'object' },
+            secretsRedactedCount: { type: 'number' }
+          }
+        },
+        description: 'Genera sin vendor lock-in bundles OpenTofu/Terraform 1.6+ (main.tf, variables.tf con sensitive=true, outputs.tf), docker-compose.yml portable y .env.example estrictamente acotados por ACL de proyectos y con CERO secretos en claro.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            format: { type: 'string', enum: ['all', 'terraform', 'compose'], description: 'Formato IaC a exportar (default "all")' },
+            projectIds: {
+              type: 'array',
+              maxItems: 100,
+              items: { type: 'string', minLength: 1, maxLength: 128 },
+              description: 'Lista opcional de IDs de proyecto a incluir (validada contra ACL del llamante)'
+            }
+          }
+        }
+      },
+      {
+        name: 'culkibo_secret_lease',
+        title: 'Gestionar leases efímeros de secretos y Break-Glass',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            leases: { type: 'array' },
+            lease: { type: ['object', 'null'] },
+            audit: { type: ['object', 'null'] },
+            revoked: { type: 'boolean' }
+          }
+        },
+        description: 'Lista leases efímeros de secretos, audita antigüedad de rotación (>90 días sin leer valores), emite/revoca leases temporales o tokens Break-Glass auditados (máx. 15 min) con dryRun: true por defecto (solo admin/owner; resultados redactados en auditoría).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'audit_rotation', 'issue', 'revoke', 'break_glass'], description: 'Operación sobre secret leases (default "list")' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto asociado (para list/issue)' },
+            secretKey: { type: 'string', minLength: 1, maxLength: 128, description: 'Nombre de la clave de secreto (requerido para action="issue")' },
+            scope: { type: 'string', enum: ['read', 'write', 'admin'], description: 'Alcance del lease (default "read")' },
+            leaseId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del lease a revocar (requerido para action="revoke")' },
+            ttlSec: { type: 'integer', minimum: 60, maximum: 86400, description: 'Duración en segundos (60..86400; break_glass acotado a <=900s)' },
+            reason: { type: 'string', maxLength: 240, description: 'Justificación auditada (obligatoria >=10 chars para break_glass)' },
+            maxAgeDays: { type: 'integer', minimum: 1, maximum: 3650, description: 'Umbral de antigüedad en días para audit_rotation (default 90)' },
+            includeExpired: { type: 'boolean', description: 'Incluir leases caducados en action="list" (default false)' }
+          }
+        }
       }
     ];
 
@@ -6288,6 +6461,42 @@ class McpServer extends EventEmitter {
         break;
       }
 
+      case 'culkibo_secret_lease': {
+        const action = String(args.action || 'list');
+        const clampedTtl = action === 'break_glass'
+          ? Math.min(900, Math.max(60, Number(args.ttlSec) || 900))
+          : Math.min(86400, Math.max(60, Number(args.ttlSec) || 3600));
+        Object.assign(target, {
+          action,
+          projectId: args.projectId || null,
+          secretKey: args.secretKey || null,
+          leaseId: args.leaseId || null,
+          ttlSec: clampedTtl
+        });
+        if (action === 'issue') {
+          if (!args.projectId) blockers.push('MISSING_PROJECT_ID');
+          if (!args.secretKey) blockers.push('MISSING_SECRET_KEY');
+          effects.push(`Emitirá un lease temporal (${clampedTtl}s) para '${args.secretKey || '?'}' en '${args.projectId || '?'}' (almacena solo hash HMAC-SHA256 en disco).`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'revoke') {
+          if (!args.leaseId) blockers.push('MISSING_LEASE_ID');
+          effects.push(`Revocará inmediatamente el lease '${args.leaseId || '?'}' invalidando su token.`);
+          riskLevel = 'medium';
+          reversible = false;
+        } else if (action === 'break_glass') {
+          if (!args.reason || String(args.reason).trim().length < 10) blockers.push('MISSING_AUDIT_REASON');
+          effects.push(`Emitirá un token Break-Glass de emergencia (máx ${clampedTtl}s <= 15m) disparando alerta de seguridad y entrada inmutable de auditoría.`);
+          riskLevel = 'high';
+          reversible = true;
+        } else {
+          effects.push(`Consultará '${action}' de secret leases sin mutar estado.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
       default: {
         Object.assign(target, redactForAudit(args));
         effects.push(`Ejecutará la herramienta destructiva '${toolName}' con los parámetros validados.`);
@@ -8813,6 +9022,385 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_triage_playbook': {
+          const project = projectManager.getById(String(args.projectId || ''));
+          if (!project) throw projectNotFoundError(args.projectId);
+
+          const incident = await this.diagnoseIncident(principal, {
+            projectId: project.id,
+            includeDoctor: false,
+            logLines: 50
+          });
+
+          /** @type {any} */
+          let healer = null;
+          if (typeof args.logs === 'string' && args.logs.trim().length > 0) {
+            const bh = lazySvc('buildHealerService');
+            if (bh && typeof bh.diagnoseLogs === 'function') {
+              healer = bh.diagnoseLogs(args.logs, { projectId: project.id, projectName: project.name });
+            }
+          }
+
+          /** @type {any} */
+          let drift = null;
+          const dd = lazySvc('driftDetectorService');
+          if (dd && typeof dd.checkProjectDrift === 'function') {
+            try {
+              drift = await dd.checkProjectDrift(project.id, args.actualInspect ? { actualInspect: args.actualInspect } : {});
+            } catch (e) {
+              drift = { ok: false, drifted: false, error: e.message };
+            }
+          }
+
+          /** @type {any} */
+          let cve = null;
+          if (args.includeCveScan !== false) {
+            const cveSvc = lazySvc('cveDriftService');
+            if (cveSvc && typeof cveSvc.scanSbom === 'function') {
+              try {
+                cve = await cveSvc.scanSbom({ allowNetwork: false });
+              } catch (e) {
+                cve = { ok: false, vulnerableCount: 0, error: e.message };
+              }
+            }
+          }
+
+          /** @type {Array<{ source: string, code: string, severity: string, title: string }>} */
+          const rootCauses = [];
+          /** @type {Array<{ priority: number, tool: string, arguments: Record<string, any>, rationale: string }>} */
+          const remediationSteps = [];
+
+          if (Array.isArray(incident?.rootCauses)) {
+            for (const rc of incident.rootCauses) {
+              rootCauses.push({
+                source: 'incident',
+                code: String(rc.code || 'INCIDENT'),
+                severity: String(rc.severity || 'warning'),
+                title: String(rc.title || rc.code || 'Incident detected')
+              });
+            }
+          }
+          if (healer && healer.matched && healer.primary) {
+            rootCauses.push({
+              source: 'build_healer',
+              code: String(healer.primary.code),
+              severity: String(healer.primary.severity || 'high'),
+              title: String(healer.primary.title || healer.primary.code)
+            });
+            remediationSteps.push({
+              priority: 1,
+              tool: 'culkibo_heal_build_failure',
+              arguments: { projectId: project.id, code: healer.primary.code, logs: String(args.logs || '').slice(0, 4000), apply: true, dryRun: true },
+              rationale: `Previsualizar parche seguro para ${healer.primary.code}: ${healer.primary.rootCause || healer.primary.title}`
+            });
+          }
+          if (drift && drift.drifted && Array.isArray(drift.diffs) && drift.diffs.length > 0) {
+            rootCauses.push({
+              source: 'config_drift',
+              code: 'CONFIG_DRIFT_DETECTED',
+              severity: String(drift.severity || 'high'),
+              title: `${drift.diffs.length} diferencia(s) de configuración entre contenedor vivo y estado declarado`
+            });
+            remediationSteps.push({
+              priority: 2,
+              tool: 'culkibo_time_machine',
+              arguments: { action: 'list', projectId: project.id },
+              rationale: 'Inspeccionar último checkpoint sano o reconciliar configuración declarada sin cortes (dryRun).'
+            });
+          }
+          const cveCount = Number(cve?.totalVulnerabilities ?? cve?.vulnerableCount ?? 0);
+          const cveCritCount = Number(cve?.bySeverity?.critical ?? cve?.severityCounts?.critical ?? 0);
+          if (cve && cveCount > 0) {
+            rootCauses.push({
+              source: 'sbom_cve',
+              code: 'SBOM_CVE_DRIFT',
+              severity: cveCritCount > 0 ? 'critical' : 'high',
+              title: `${cveCount} vulnerabilidad(es) CVE reportadas en el SBOM CycloneDX`
+            });
+            remediationSteps.push({
+              priority: 3,
+              tool: 'culkibo_cve_scan',
+              arguments: { allowNetwork: true, forceRefresh: true },
+              rationale: 'Refrescar estado OSV.dev y planificar actualización de dependencias afectadas.'
+            });
+          }
+          if (remediationSteps.length === 0) {
+            remediationSteps.push({
+              priority: 1,
+              tool: 'culkibo_auto_remediate',
+              arguments: { action: 'restart_service', projectId: project.id, dryRun: true },
+              rationale: 'Sin fallos críticos inmediatos; usa dryRun antes de cualquier reinicio o rollback preventivo.'
+            });
+          }
+
+          const sevOrder = { critical: 4, high: 3, degraded: 2, warning: 1, healthy: 0 };
+          let topSev = String(incident?.severity || 'healthy');
+          for (const rc of rootCauses) {
+            if ((sevOrder[/** @type {keyof typeof sevOrder} */ (rc.severity)] || 0) > (sevOrder[/** @type {keyof typeof sevOrder} */ (topSev)] || 0)) {
+              topSev = rc.severity;
+            }
+          }
+
+          res = {
+            projectId: project.id,
+            projectName: project.name,
+            severity: topSev,
+            summary: rootCauses.length === 0
+              ? `Triaje unificado limpio para '${project.name}' (0 fallos críticos en incidente, healer, drift y SBOM CVE).`
+              : `Triaje unificado para '${project.name}' [${topSev}]: ${rootCauses.length} hallazgo(s) correlacionados y ${remediationSteps.length} paso(s) dryRun recomendados.`,
+            incident,
+            healer,
+            drift,
+            cve,
+            rootCauses,
+            remediationSteps
+          };
+          break;
+        }
+
+        case 'culkibo_cve_scan': {
+          const cveSvc = requireLazySvc('cveDriftService', 'Runtime SBOM CVE Drift Scanner');
+          const scan = await cveSvc.scanSbom({
+            allowNetwork: Boolean(args.allowNetwork),
+            forceRefresh: Boolean(args.forceRefresh)
+          });
+          res = {
+            ...scan,
+            ok: scan && scan.ok !== false,
+            mode: String(scan?.source || scan?.mode || (scan?.offline ? 'offline_fallback' : (args.allowNetwork ? 'osv.dev' : 'offline_fallback'))),
+            scannedComponents: Number(scan?.scannedPackages ?? scan?.scannedComponents ?? 0),
+            vulnerableCount: Number(scan?.totalVulnerabilities ?? scan?.vulnerableCount ?? 0),
+            severityCounts: scan?.bySeverity || scan?.severityCounts || { critical: 0, high: 0, medium: 0, low: 0 },
+            vulnerabilities: Array.isArray(scan?.findings)
+              ? scan.findings
+              : (Array.isArray(scan?.vulnerabilities) ? scan.vulnerabilities : [])
+          };
+          break;
+        }
+
+        case 'culkibo_drift_check': {
+          const dd = requireLazySvc('driftDetectorService', 'Container/DB Config Drift Detector');
+          if (!args.projectId && !args.pgbouncerPreset) {
+            throw new McpToolError('MISSING_ARGUMENT', 'Indica projectId (para auditar drift) y/o pgbouncerPreset (para generar configuración PgBouncer).', {
+              retryable: true,
+              remediation: 'Pasa projectId obtenido de culkibo_list_projects o un objeto pgbouncerPreset.'
+            });
+          }
+
+          /** @type {any} */
+          let drift = null;
+          if (args.projectId) {
+            const project = projectManager.getById(String(args.projectId));
+            if (!project) throw projectNotFoundError(args.projectId);
+            drift = await dd.checkProjectDrift(project.id, args.actualInspect ? { actualInspect: args.actualInspect } : {});
+          }
+
+          /** @type {any} */
+          let pgbouncerPreset = null;
+          if (args.pgbouncerPreset && typeof args.pgbouncerPreset === 'object') {
+            try {
+              pgbouncerPreset = dd.buildPgBouncerPreset(args.pgbouncerPreset);
+            } catch (e) {
+              throw new McpToolError('INVALID_ARGUMENT', e.message, {
+                retryable: true,
+                remediation: 'Usa identificadores alfanuméricos válidos para name/databaseName y puertos/límites numéricos en pgbouncerPreset.'
+              });
+            }
+          }
+
+          res = {
+            projectId: args.projectId ? String(args.projectId) : null,
+            drift,
+            pgbouncerPreset
+          };
+          break;
+        }
+
+        case 'culkibo_export_iac': {
+          const iac = requireLazySvc('iacExporter', 'OpenTofu/Terraform & Compose IaC Exporter');
+          const rawFmt = String(args.format || 'all');
+          /** @type {'all' | 'terraform' | 'compose'} */
+          const format = rawFmt === 'terraform' ? 'terraform' : (rawFmt === 'compose' ? 'compose' : 'all');
+          const accessibleIds = this._accessibleProjectIds(principal);
+          /** @type {string[] | null} */
+          let effectiveProjectIds = accessibleIds;
+
+          if (Array.isArray(args.projectIds) && args.projectIds.length > 0) {
+            const requested = args.projectIds.map((id) => String(id));
+            if (accessibleIds !== null) {
+              const allowSet = new Set(accessibleIds);
+              for (const reqId of requested) {
+                if (!allowSet.has(reqId)) {
+                  throw new McpToolError('FORBIDDEN', 'No tienes acceso a uno o más proyectos solicitados para exportar IaC.', {
+                    retryable: false,
+                    remediation: 'Omite projectIds o incluye únicamente proyectos devueltos por culkibo_list_projects.'
+                  });
+                }
+              }
+            }
+            effectiveProjectIds = requested;
+          }
+
+          const exported = iac.exportEstate({
+            format,
+            projectIds: effectiveProjectIds
+          });
+          res = {
+            ...exported,
+            ok: true,
+            format,
+            files: exported?.files || {},
+            stats: exported?.stats || {},
+            secretsRedactedCount: Number(exported?.secretsRedactedCount || 0)
+          };
+          break;
+        }
+
+        case 'culkibo_secret_lease': {
+          const sls = requireLazySvc('secretLeaseService', 'Ephemeral Secret Leases & Break-Glass');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const leases = sls.listLeases({
+              ...(args.projectId ? { projectId: String(args.projectId) } : {}),
+              includeExpired: Boolean(args.includeExpired)
+            });
+            res = {
+              action: 'list',
+              dryRun: false,
+              leases: Array.isArray(leases) ? leases : [],
+              lease: null,
+              audit: null,
+              revoked: false
+            };
+          } else if (action === 'audit_rotation') {
+            const audit = sls.auditSecretRotationAges(projectManager.getAll(), {
+              maxAgeDays: Math.max(1, Number(args.maxAgeDays) || 90)
+            });
+            res = {
+              action: 'audit_rotation',
+              dryRun: false,
+              leases: [],
+              lease: null,
+              audit,
+              revoked: false
+            };
+          } else if (action === 'issue') {
+            if (!args.projectId || !args.secretKey) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="issue" requiere projectId y secretKey.', {
+                retryable: true,
+                remediation: 'Indica projectId y secretKey (y dryRun: false tras confirmar el plan).'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const ttlSec = Math.min(86400, Math.max(60, Number(args.ttlSec) || 3600));
+            const scope = ['read', 'write', 'admin'].includes(String(args.scope || 'read')) ? String(args.scope || 'read') : 'read';
+            if (dryRun) {
+              res = {
+                action: 'issue',
+                dryRun: true,
+                issued: false,
+                leases: [],
+                lease: null,
+                audit: null,
+                revoked: false,
+                wouldIssue: { projectId: String(args.projectId), secretKey: String(args.secretKey), scope, ttlSec }
+              };
+            } else {
+              const issued = sls.issueLease({
+                projectId: String(args.projectId),
+                secretKey: String(args.secretKey),
+                scope,
+                ttlSec,
+                issuedBy: principal.email || principal.userId || principal.role || 'mcp-admin',
+                reason: args.reason ? String(args.reason) : 'Issued via MCP culkibo_secret_lease'
+              });
+              res = {
+                action: 'issue',
+                dryRun: false,
+                issued: true,
+                leases: [],
+                lease: issued.lease || null,
+                token: issued.token,
+                audit: null,
+                revoked: false
+              };
+            }
+          } else if (action === 'revoke') {
+            if (!args.leaseId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="revoke" requiere leaseId.', {
+                retryable: true,
+                remediation: 'Consulta los IDs con culkibo_secret_lease({ action: "list" }) y pasa leaseId.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                action: 'revoke',
+                dryRun: true,
+                leases: [],
+                lease: null,
+                audit: null,
+                revoked: false,
+                wouldRevokeLeaseId: String(args.leaseId)
+              };
+            } else {
+              const rev = sls.revokeLease(String(args.leaseId), {
+                revokedBy: principal.email || principal.userId || principal.role || 'mcp-admin'
+              });
+              res = {
+                action: 'revoke',
+                dryRun: false,
+                leases: [],
+                lease: rev?.lease || null,
+                audit: null,
+                revoked: Boolean(rev && rev.revoked !== false)
+              };
+            }
+          } else {
+            // action === 'break_glass'
+            const reason = String(args.reason || '').trim();
+            if (reason.length < 10) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="break_glass" exige reason de al menos 10 caracteres para auditoría.', {
+                retryable: true,
+                remediation: 'Proporciona un motivo operativo detallado (ej. "INC-402 emergency production DB recovery").'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const ttlSec = Math.min(900, Math.max(60, Number(args.ttlSec) || 900));
+            if (dryRun) {
+              res = {
+                action: 'break_glass',
+                dryRun: true,
+                issued: false,
+                leases: [],
+                lease: null,
+                audit: null,
+                revoked: false,
+                wouldIssueBreakGlass: { ttlSec, reason }
+              };
+            } else {
+              const bg = sls.issueBreakGlassToken({
+                userId: principal.userId || 'owner',
+                username: principal.email || principal.userId || 'mcp-admin',
+                reason,
+                ttlSec
+              });
+              res = {
+                action: 'break_glass',
+                dryRun: false,
+                issued: true,
+                leases: [],
+                lease: bg.lease || null,
+                token: bg.token,
+                audit: null,
+                revoked: false
+              };
+            }
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -9796,7 +10384,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 120 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 125 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

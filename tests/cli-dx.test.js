@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 120);
+    assert.strictEqual(demoJson.datasets.mcpTools, 125);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -667,6 +667,27 @@ async function testCliDx() {
     assert.strictEqual(meshRotJson.dryRun, true);
     assert.strictEqual(meshRotJson.rotated, false);
     console.log('  ✓ Pioneer CLI Cycle-7 verificado (culkibo heal --text/file NODE_HEAP_OOM & kamal#1709, culkibo mesh status/plan/dryRun-rotate)');
+
+    // 12. Pioneer Cycle-8 CLI: `culkibo export-iac --json` (--out atomic write + 0 secrets) y `culkibo cve-scan --json`
+    const iacOutDir = path.join(tmpRoot, 'iac-bundle');
+    const iacCli = await runCli(['export-iac', '--format', 'all', '--out', iacOutDir, '--json'], { env: isolatedEnv });
+    assert.strictEqual(iacCli.status, 0, `culkibo export-iac falló: ${iacCli.stderr} ${iacCli.stdout}`);
+    const iacJson = JSON.parse(iacCli.stdout);
+    assert.strictEqual(iacJson.ok, true);
+    assert.strictEqual(iacJson.format, 'all');
+    assert.ok(iacJson.files && typeof iacJson.files['main.tf'] === 'string' && typeof iacJson.files['docker-compose.yml'] === 'string');
+    assert.ok(fs.existsSync(path.join(iacOutDir, 'main.tf')));
+    assert.ok(fs.existsSync(path.join(iacOutDir, 'variables.tf')));
+    assert.ok(fs.existsSync(path.join(iacOutDir, 'docker-compose.yml')));
+    assert.ok(fs.existsSync(path.join(iacOutDir, '.env.example')));
+
+    const cveCli = await runCli(['cve-scan', '--json'], { env: isolatedEnv });
+    assert.strictEqual(cveCli.status, 0, `culkibo cve-scan falló: ${cveCli.stderr} ${cveCli.stdout}`);
+    const cveJson = JSON.parse(cveCli.stdout);
+    assert.strictEqual(cveJson.ok, true);
+    assert.ok(typeof cveJson.scannedComponents === 'number' && cveJson.scannedComponents > 0);
+    assert.ok(cveJson.severityCounts && typeof cveJson.vulnerableCount === 'number');
+    console.log(`  ✓ Pioneer CLI Cycle-8 verificado (culkibo export-iac ${iacJson.writtenFiles.length} archivos, culkibo cve-scan ${cveJson.scannedComponents} componentes)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

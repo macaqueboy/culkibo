@@ -87,6 +87,11 @@ function getContainerTerminalService() { return _lazyV2.terminal || (_lazyV2.ter
 function getFleetMeshService() { return _lazyV2.mesh || (_lazyV2.mesh = require('../services/fleetMeshService')); }
 function getEdgeShieldService() { return _lazyV2.shield || (_lazyV2.shield = require('../services/edgeShieldService')); }
 function getBuildHealerService() { return _lazyV2.healer || (_lazyV2.healer = require('../services/buildHealerService')); }
+function getPasskeyService() { return _lazyV2.passkey || (_lazyV2.passkey = require('../services/passkeyService')); }
+function getSecretLeaseService() { return _lazyV2.lease || (_lazyV2.lease = require('../services/secretLeaseService')); }
+function getCveDriftService() { return _lazyV2.cvedrift || (_lazyV2.cvedrift = require('../services/cveDriftService')); }
+function getDriftDetectorService() { return _lazyV2.drift || (_lazyV2.drift = require('../services/driftDetectorService')); }
+function getIacExporter() { return _lazyV2.iac || (_lazyV2.iac = require('../services/iacExporter')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -486,6 +491,71 @@ const os = require('os');
 const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
   ? path.resolve(process.env.CULKIBO_DATA_DIR)
   : path.resolve(__dirname, '..', '..');
+
+/**
+ * Verifica contención real de una ruta candidata dentro de `baseDir` usando `fs.realpathSync`.
+ * Bloquea traversal `../`, bytes nulos y enlaces simbólicos/junctions que escapen del directorio raíz
+ * (cierra Dokploy CVE-2026-133520 / GHSA-q7cq-vxv7-449c y Runtipi CVE-2026-47277 / GHSA-qrqj-p7hm-4m66).
+ *
+ * @param {string} baseDir
+ * @param {string} candidatePath
+ * @param {{ allowBase?: boolean }} [opts]
+ * @returns {string}
+ */
+function assertRealPathContained(baseDir, candidatePath, { allowBase = false } = {}) {
+  const rawBase = String(baseDir || '').trim();
+  const rawCand = String(candidatePath || '');
+  if (!rawBase || !rawCand || rawBase.includes('\0') || rawCand.includes('\0') || /[\r\n]/.test(rawCand)) {
+    const err = new Error('Ruta inválida (vacía o con caracteres de control)');
+    /** @type {any} */ (err).status = 400;
+    /** @type {any} */ (err).code = 'INVALID_PATH';
+    throw err;
+  }
+
+  const resolvedBase = path.resolve(rawBase);
+  const resolvedCandidate = path.isAbsolute(rawCand)
+    ? path.resolve(rawCand)
+    : path.resolve(resolvedBase, rawCand);
+
+  const isWithin = (parent, child) => {
+    const normP = process.platform === 'win32' ? parent.toLowerCase() : parent;
+    const normC = process.platform === 'win32' ? child.toLowerCase() : child;
+    const rel = path.relative(normP, normC);
+    if (rel === '' || rel === '.') return Boolean(allowBase);
+    return !rel.startsWith('..') && !path.isAbsolute(rel);
+  };
+
+  if (!isWithin(resolvedBase, resolvedCandidate)) {
+    const err = new Error(`Acceso bloqueado: ruta fuera del directorio permitido (${rawCand.slice(0, 80)})`);
+    /** @type {any} */ (err).status = 403;
+    /** @type {any} */ (err).code = 'PATH_TRAVERSAL_BLOCKED';
+    throw err;
+  }
+
+  const realBase = fs.existsSync(resolvedBase) ? fs.realpathSync(resolvedBase) : resolvedBase;
+
+  // Resolver el ancestro existente más profundo con `fs.realpathSync` para atrapar symlinks intermedios o finales
+  let probe = resolvedCandidate;
+  /** @type {string[]} */
+  const trailing = [];
+  while (!fs.existsSync(probe)) {
+    const parent = path.dirname(probe);
+    if (parent === probe) break;
+    trailing.unshift(path.basename(probe));
+    probe = parent;
+  }
+  const realExisting = fs.existsSync(probe) ? fs.realpathSync(probe) : probe;
+  const realTarget = trailing.length > 0 ? path.join(realExisting, ...trailing) : realExisting;
+
+  if (!isWithin(realBase, realTarget)) {
+    const err = new Error(`Acceso bloqueado: enlace simbólico o ruta escapa del directorio base (${rawCand.slice(0, 80)})`);
+    /** @type {any} */ (err).status = 403;
+    /** @type {any} */ (err).code = 'PATH_TRAVERSAL_BLOCKED';
+    throw err;
+  }
+
+  return realTarget;
+}
 
 const IS_TEST_ENV = process.env.NODE_ENV === 'test';
 function createRateLimiter({ max = 500, windowMs = 60000, prefix = 'global', bypassLoopback = true } = {}) {
@@ -896,9 +966,15 @@ router.get('/projects/:id/deploy/strategy', async (req, res) => {
       : path.join(ROOT_BASE_DIR, 'projects', project.id);
     let contextDir = rootDir;
     if (project.baseDirectory && project.baseDirectory !== '/' && project.baseDirectory !== '.') {
+      const cleanBaseDir = String(project.baseDirectory).replace(/^\/+/, '');
       try {
-        contextDir = assertContainedPath(rootDir, String(project.baseDirectory).replace(/^\/+/, ''));
-      } catch (e) {}
+        contextDir = assertRealPathContained(rootDir, cleanBaseDir);
+      } catch (pathErr) {
+        if (pathErr && /** @type {any} */ (pathErr).code === 'PATH_TRAVERSAL_BLOCKED') {
+          return res.status(403).json({ error: pathErr.message, code: 'PATH_TRAVERSAL_BLOCKED' });
+        }
+        contextDir = assertContainedPath(rootDir, cleanBaseDir);
+      }
     }
     if (!fs.existsSync(contextDir)) {
       return res.json({
@@ -5853,7 +5929,9 @@ router.get('/uptime/incidents', (req, res) => {
   try {
     const principal = getPrincipal(req);
     const um = getUptimeMonitor();
+    const activeOnly = req.query.activeOnly === 'true' || req.query.activeOnly === '1';
     const rawIncidents = um.listIncidents({
+      activeOnly,
       monitorId: req.query.monitorId ? String(req.query.monitorId) : undefined,
       status: req.query.status ? String(req.query.status) : undefined,
       limit: req.query.limit ? parseInt(String(req.query.limit), 10) : 50
@@ -5864,7 +5942,15 @@ router.get('/uptime/incidents', (req, res) => {
     const allowedMonitorIds = new Set(
       um.listMonitors().filter((m) => canAccessMonitor(principal, m, 'projects:read')).map((m) => m.id)
     );
-    const incidents = rawIncidents.filter((inc) => allowedMonitorIds.has(inc.monitorId));
+    const allowedProjIds = new Set(getAllowedProjectIds(req) || []);
+    const incidents = rawIncidents.filter((inc) => {
+      if (inc && inc.kind === 'timeline') {
+        const aff = Array.isArray(inc.affectedIds) ? inc.affectedIds : [];
+        if (aff.length === 0) return true;
+        return aff.some((aid) => allowedMonitorIds.has(aid) || allowedProjIds.has(aid));
+      }
+      return allowedMonitorIds.has(inc.monitorId);
+    });
     res.json({ incidents });
   } catch (err) {
     sendServiceError(err, res, 500);
@@ -7264,5 +7350,363 @@ router.post('/projects/:id/build-healer/apply', heavyOpLimiter, async (req, res)
     sendServiceError(err, res, 400);
   }
 });
+
+// --- CYCLE #8 PIONEER LAZY ROUTES (Passkeys FIDO2, Secret Leases & Break-Glass, OSV CVE Drift, Config Drift + PgBouncer, OpenTofu IaC Export, Maintenance Windows, Timeline Incidents, Geo-Failover, Multi-CAA) ---
+
+// 1. WebAuthn Passkeys (FIDO2, zero-dep CBOR/COSE)
+router.get('/auth/passkeys', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const filterUserId = principal.isSuperAdmin
+      ? (req.query.userId ? String(req.query.userId).trim() : undefined)
+      : String(principal.userId || '');
+    const passkeys = getPasskeyService().listPasskeys(filterUserId);
+    res.json({ passkeys });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/auth/passkeys/register/begin', sensitiveAuthLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const hostRaw = String(req.headers.host || 'localhost:3030').trim();
+    const defaultRpId = hostRaw.split(':')[0].replace(/^\[|\]$/g, '') || 'localhost';
+    const defaultOrigin = typeof req.headers.origin === 'string' && req.headers.origin.trim()
+      ? req.headers.origin.trim()
+      : `${isHttpsRequest(req) ? 'https' : 'http'}://${hostRaw}`;
+    const userId = String(principal.userId || (principal.isSuperAdmin ? (body.userId || 'owner') : ''));
+    if (!userId) return res.status(401).json({ error: 'Usuario no identificado para registrar passkey' });
+    const username = String(body.username || principal.email || principal.name || userId);
+    const out = getPasskeyService().beginRegistration({
+      userId,
+      username,
+      rpId: typeof body.rpId === 'string' && body.rpId.trim() ? body.rpId.trim() : defaultRpId,
+      rpName: typeof body.rpName === 'string' && body.rpName.trim() ? body.rpName.trim() : 'Culkibo',
+      origin: typeof body.origin === 'string' && body.origin.trim() ? body.origin.trim() : defaultOrigin
+    });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/auth/passkeys/register/finish', sensitiveAuthLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const hostRaw = String(req.headers.host || 'localhost:3030').trim();
+    const defaultRpId = hostRaw.split(':')[0].replace(/^\[|\]$/g, '') || 'localhost';
+    const defaultOrigin = typeof req.headers.origin === 'string' && req.headers.origin.trim()
+      ? req.headers.origin.trim()
+      : `${isHttpsRequest(req) ? 'https' : 'http'}://${hostRaw}`;
+    const userId = String(principal.userId || (principal.isSuperAdmin ? (body.userId || 'owner') : ''));
+    if (!userId) return res.status(401).json({ error: 'Usuario no identificado para finalizar registro passkey' });
+    const out = getPasskeyService().finishRegistration({
+      ...body,
+      userId,
+      expectedOrigin: typeof body.expectedOrigin === 'string' && body.expectedOrigin.trim() ? body.expectedOrigin.trim() : defaultOrigin,
+      expectedRpId: typeof body.expectedRpId === 'string' && body.expectedRpId.trim() ? body.expectedRpId.trim() : defaultRpId
+    });
+    res.status(out && out.ok === false ? 400 : 201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/auth/passkeys/:id', sensitiveAuthLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const ownerUserId = principal.isSuperAdmin
+      ? (req.query.userId ? String(req.query.userId).trim() : undefined)
+      : String(principal.userId || '');
+    const out = getPasskeyService().revokePasskey(req.params.id, ownerUserId);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+// 2. Ephemeral Secret Leases, 90d Rotation Audit & 15m Break-Glass
+router.get('/security/leases', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'audit:read')) {
+      return res.status(403).json({ error: 'Solo administradores pueden consultar leases de secretos', code: 'FORBIDDEN' });
+    }
+    const projectId = req.query.projectId ? String(req.query.projectId).trim() : undefined;
+    const includeExpired = req.query.includeExpired === 'true' || req.query.includeExpired === '1';
+    const leases = getSecretLeaseService().listLeases({ projectId, includeExpired });
+    res.json({ leases });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/leases', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'tokens:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden emitir leases de secretos', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertProjectAccess(req, res, String(body.projectId), 'projects:write')) return;
+    const out = getSecretLeaseService().issueLease({
+      ...body,
+      issuedBy: String(principal.email || principal.userId || principal.kind || 'owner')
+    });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/security/leases/:id', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'tokens:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden revocar leases', code: 'FORBIDDEN' });
+    }
+    const out = getSecretLeaseService().revokeLease(req.params.id, {
+      revokedBy: String(principal.email || principal.userId || principal.kind || 'owner')
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+router.post('/security/break-glass', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'tokens:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden emitir tokens Break-Glass', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = getSecretLeaseService().issueBreakGlassToken({
+      userId: String(principal.userId || 'owner'),
+      username: String(principal.email || principal.name || principal.kind || 'owner'),
+      reason: body.reason,
+      ttlSec: body.ttlSec !== undefined ? Number(body.ttlSec) : 900
+    });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/security/rotation-audit', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'audit:read')) {
+      return res.status(403).json({ error: 'Solo administradores pueden auditar rotación de secretos', code: 'FORBIDDEN' });
+    }
+    const allowedIds = getAllowedProjectIds(req);
+    const allProjects = projectManager.getAll();
+    const visibleProjects = allowedIds
+      ? allProjects.filter((p) => p && allowedIds.includes(p.id))
+      : allProjects;
+    const maxAgeDays = req.query.maxAgeDays !== undefined ? Number(req.query.maxAgeDays) : 90;
+    const audit = getSecretLeaseService().auditSecretRotationAges(visibleProjects, { maxAgeDays });
+    res.json(audit);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+// 3. Runtime SBOM CVE Drift Scanner (OSV.dev Batch API)
+router.post('/security/cve-scan', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = await getCveDriftService().scanSbom({
+      sbom: body.sbom,
+      components: body.components,
+      allowNetwork: Boolean(body.allowNetwork),
+      forceRefresh: Boolean(body.forceRefresh)
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/security/cve-scan/latest', (_req, res) => {
+  try {
+    const latest = getCveDriftService().getLastScan();
+    if (!latest) {
+      return res.json({
+        scanned: false,
+        scannedPackages: 0,
+        vulnerablePackages: 0,
+        totalVulnerabilities: 0,
+        bySeverity: { critical: 0, high: 0, medium: 0, low: 0 },
+        offline: true,
+        cached: false,
+        scannedAt: null,
+        findings: []
+      });
+    }
+    res.json({ scanned: true, ...latest });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+// 4. Live Container/DB Config Drift Detector (kamal#1790) & Managed PgBouncer Smart Pool Preset
+router.post('/projects/:id/drift/check', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = await getDriftDetectorService().checkProjectDrift(project.id, {
+      actualInspect: body.actualInspect || undefined
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/pgbouncer-preset', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const preset = getDriftDetectorService().buildPgBouncerPreset(body);
+    res.json(preset);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Zero Lock-In OpenTofu / Terraform HCL & Portable Compose IaC Exporter
+router.post('/iac/export', heavyOpLimiter, (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const allowedIds = getAllowedProjectIds(req);
+    /** @type {string[] | null} */
+    let effectiveProjectIds = null;
+    if (Array.isArray(body.projectIds)) {
+      const requested = body.projectIds.map((x) => String(x || '').trim()).filter(Boolean);
+      effectiveProjectIds = allowedIds
+        ? requested.filter((id) => allowedIds.includes(id))
+        : requested;
+    } else if (allowedIds) {
+      effectiveProjectIds = allowedIds;
+    }
+    const out = getIacExporter().exportEstate({
+      format: typeof body.format === 'string' && body.format.trim() ? body.format.trim() : 'all',
+      projectIds: effectiveProjectIds,
+      snapshot: body.snapshot && typeof body.snapshot === 'object' ? body.snapshot : null
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 6. Maintenance Windows, Timeline Incidents, DNS Geo-Failover & Multi-CAA Pre-Flight
+router.get('/uptime/maintenance', (req, res) => {
+  try {
+    const targetId = req.query.targetId ? String(req.query.targetId).trim() : null;
+    const windows = getUptimeMonitor().listMaintenanceWindows({ targetId });
+    res.json({ windows });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/uptime/maintenance', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'crear ventanas de mantenimiento')) return;
+    const win = getUptimeMonitor().createMaintenanceWindow(req.body || {});
+    res.status(201).json({ success: true, window: win });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/uptime/maintenance/:id', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'eliminar ventanas de mantenimiento')) return;
+    const out = getUptimeMonitor().deleteMaintenanceWindow(req.params.id);
+    res.json({ success: true, ...out });
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+router.delete('/uptime/maintenance', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'eliminar ventanas de mantenimiento')) return;
+    const id = String((req.body && req.body.id) || req.query.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Indica el id de la ventana de mantenimiento' });
+    const out = getUptimeMonitor().deleteMaintenanceWindow(id);
+    res.json({ success: true, ...out });
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+router.post('/uptime/incidents', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'crear incidentes de estado')) return;
+    const incident = getUptimeMonitor().createIncident(req.body || {});
+    res.status(201).json({ success: true, incident });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.patch('/uptime/incidents/:id', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'actualizar incidentes de estado')) return;
+    const incident = getUptimeMonitor().updateIncident(req.params.id, req.body || {});
+    res.json({ success: true, incident });
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+router.patch('/uptime/incidents', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'actualizar incidentes de estado')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const id = String(body.id || req.query.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Indica el id del incidente' });
+    const incident = getUptimeMonitor().updateIncident(id, body);
+    res.json({ success: true, incident });
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+router.post('/uptime/geo-failover/plan', (req, res) => {
+  try {
+    const plan = getUptimeMonitor().buildGeoFailoverPlan(req.body || {});
+    res.json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/domains/:hostname/caa-preflight', async (req, res) => {
+  try {
+    const expectedCa = req.query.expectedCa ? String(req.query.expectedCa) : 'letsencrypt.org';
+    const acmeProfile = req.query.acmeProfile ? String(req.query.acmeProfile) : 'classic';
+    const isWildcard = req.query.wildcard === 'true' || req.query.wildcard === '1';
+    const caa = await ingressManager.checkAllCaaRecords(req.params.hostname, { expectedCa, isWildcard });
+    const acmeProfileSpec = ingressManager.getAcmeProfileSpec(acmeProfile, {
+      echEnabled: req.query.ech === 'true' || req.query.ech === '1'
+    });
+    res.json({ ...caa, acmeProfileSpec });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+/** @type {any} */ (router).assertRealPathContained = assertRealPathContained;
 
 module.exports = router;

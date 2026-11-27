@@ -855,6 +855,7 @@ class CaddyManager {
    *   wildcardPolicies?: any[],
    *   cloudflareDnsTokenEnv?: string,
    *   acmeEmail?: string | null,
+   *   acmeProfile?: 'classic' | 'shortlived' | null,
    *   customCertFiles?: Array<{ certificate: string, key: string, tags?: string[] }>,
    *   isolateInvalid?: boolean,
    *   isolatedErrors?: Array<{ scope: string, subject: string, provider?: string | null, error: string }> | null
@@ -866,10 +867,12 @@ class CaddyManager {
     wildcardPolicies = [],
     cloudflareDnsTokenEnv = 'CF_API_TOKEN',
     acmeEmail = null,
+    acmeProfile = null,
     customCertFiles = [],
     isolateInvalid = false,
     isolatedErrors = null
   } = {}) {
+    const cleanAcmeProfile = acmeProfile === 'shortlived' ? 'shortlived' : null;
     /** @type {any[]} */
     const policies = [];
     /** @type {Set<string>} */
@@ -883,7 +886,8 @@ class CaddyManager {
      *   apiToken?: string | null,
      *   credentialsEnv?: Record<string, string> | null,
      *   credentials?: Record<string, string> | null,
-     *   includeApex?: boolean
+     *   includeApex?: boolean,
+     *   acmeProfile?: 'classic' | 'shortlived' | null
      * }} pol
      */
     const pushWildcardPolicy = (pol) => {
@@ -928,6 +932,7 @@ class CaddyManager {
       seenRoots.add(cleanRoot);
       const subjects = pol.includeApex === false ? [`*.${cleanRoot}`] : [`*.${cleanRoot}`, cleanRoot];
 
+      const effectivePolProfile = pol.acmeProfile === 'shortlived' ? 'shortlived' : cleanAcmeProfile;
       /** @type {any} */
       const acmeIssuer = {
         module: 'acme',
@@ -939,6 +944,7 @@ class CaddyManager {
         }
       };
       if (acmeEmail) acmeIssuer.email = acmeEmail;
+      if (effectivePolProfile === 'shortlived') acmeIssuer.profile = 'shortlived';
 
       policies.push({
         subjects,
@@ -981,7 +987,11 @@ class CaddyManager {
     // Política catch-all bajo demanda con respaldo automático Let's Encrypt + ZeroSSL
     /** @type {any[]} */
     const defaultIssuers = [
-      { module: 'acme', ...(acmeEmail ? { email: acmeEmail } : {}) },
+      {
+        module: 'acme',
+        ...(acmeEmail ? { email: acmeEmail } : {}),
+        ...(cleanAcmeProfile === 'shortlived' ? { profile: 'shortlived' } : {})
+      },
       { module: 'zerossl', ...(acmeEmail ? { email: acmeEmail } : {}) }
     ];
     policies.push({
@@ -1063,6 +1073,7 @@ class CaddyManager {
    *   wildcardPolicies?: any[],
    *   cloudflareDnsTokenEnv?: string,
    *   acmeEmail?: string | null,
+   *   acmeProfile?: 'classic' | 'shortlived' | null,
    *   customCertFiles?: any[],
    *   enableCompression?: boolean,
    *   containerized?: boolean | null,
@@ -1079,6 +1090,7 @@ class CaddyManager {
     wildcardPolicies = [],
     cloudflareDnsTokenEnv = 'CF_API_TOKEN',
     acmeEmail = null,
+    acmeProfile = null,
     customCertFiles = [],
     enableCompression = true,
     containerized = null,
@@ -1097,6 +1109,7 @@ class CaddyManager {
       wildcardPolicies,
       cloudflareDnsTokenEnv,
       acmeEmail,
+      acmeProfile,
       customCertFiles,
       isolateInvalid: true
     });

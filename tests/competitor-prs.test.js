@@ -1053,6 +1053,123 @@ function reqJson(port, method, pth, { token, body } = {}) {
     assert.strictEqual(termTicket.status, 201, 'POST terminal/ticket failed: ' + termTicket.text);
     assert.ok(termTicket.json.ticket && String(termTicket.json.wsPath || '').startsWith('/ws/terminal?ticket='));
 
+    // Cycle-8 Lazy Routes: Passkeys, Secret Leases & Break-Glass, OSV CVE Drift, Config Drift + PgBouncer, IaC Export, Maintenance, Incidents, Geo-Failover, CAA Pre-Flight
+    const pkList = await reqJson(port, 'GET', '/api/auth/passkeys', { token: master });
+    assert.strictEqual(pkList.status, 200, 'GET /api/auth/passkeys failed: ' + pkList.text);
+    assert.ok(Array.isArray(pkList.json.passkeys));
+
+    const pkBegin = await reqJson(port, 'POST', '/api/auth/passkeys/register/begin', {
+      token: master,
+      body: { username: 'owner@example.test', rpId: 'panel.example.test', origin: 'https://panel.example.test' }
+    });
+    assert.strictEqual(pkBegin.status, 200, 'POST /api/auth/passkeys/register/begin failed: ' + pkBegin.text);
+    assert.ok(pkBegin.json.challengeId && pkBegin.json.challenge);
+
+    const leaseCreate = await reqJson(port, 'POST', '/api/security/leases', {
+      token: master,
+      body: { projectId: 'proj_c2_api', secretKey: 'DATABASE_URL', scope: 'read', ttlSec: 3600, reason: 'ci-migration' }
+    });
+    assert.strictEqual(leaseCreate.status, 201, 'POST /api/security/leases failed: ' + leaseCreate.text);
+    assert.ok(leaseCreate.json.lease && leaseCreate.json.lease.id && leaseCreate.json.token);
+
+    const leaseList = await reqJson(port, 'GET', '/api/security/leases', { token: master });
+    assert.strictEqual(leaseList.status, 200);
+    assert.ok(Array.isArray(leaseList.json.leases) && leaseList.json.leases.length >= 1);
+
+    const leaseDel = await reqJson(port, 'DELETE', '/api/security/leases/' + encodeURIComponent(leaseCreate.json.lease.id), { token: master });
+    assert.strictEqual(leaseDel.status, 200, 'DELETE /api/security/leases/:id failed: ' + leaseDel.text);
+
+    const bgRes = await reqJson(port, 'POST', '/api/security/break-glass', {
+      token: master,
+      body: { reason: 'Emergency production DB failover investigation', ttlSec: 900 }
+    });
+    assert.strictEqual(bgRes.status, 201, 'POST /api/security/break-glass failed: ' + bgRes.text);
+    assert.ok(bgRes.json.lease && bgRes.json.token);
+
+    const rotAudit = await reqJson(port, 'GET', '/api/security/rotation-audit?maxAgeDays=90', { token: master });
+    assert.strictEqual(rotAudit.status, 200, 'GET /api/security/rotation-audit failed: ' + rotAudit.text);
+    assert.strictEqual(typeof rotAudit.json.totalKeys, 'number');
+
+    const cveScan = await reqJson(port, 'POST', '/api/security/cve-scan', {
+      token: master,
+      body: { allowNetwork: false }
+    });
+    assert.strictEqual(cveScan.status, 200, 'POST /api/security/cve-scan failed: ' + cveScan.text);
+    assert.ok(cveScan.json.scannedPackages >= 1 && cveScan.json.bySeverity, 'cve-scan must await async scanSbom and return real summary');
+
+    const cveLatest = await reqJson(port, 'GET', '/api/security/cve-scan/latest', { token: master });
+    assert.strictEqual(cveLatest.status, 200);
+    assert.strictEqual(cveLatest.json.scanned, true);
+
+    const driftRes = await reqJson(port, 'POST', '/api/projects/proj_c2_api/drift/check', {
+      token: master,
+      body: {
+        actualInspect: {
+          Config: { Image: 'culkibo/c2:v1', Env: ['A=1', 'DRIFTED_EXTRA=2'], StopTimeout: 10 },
+          HostConfig: {
+            Memory: 1024 * 1024 * 1024,
+            NanoCpus: 1e9,
+            PortBindings: { '3000/tcp': [{ HostIp: '0.0.0.0', HostPort: '21111' }] },
+            LogConfig: { Type: 'json-file' }
+          }
+        }
+      }
+    });
+    assert.strictEqual(driftRes.status, 200, 'POST /drift/check failed: ' + driftRes.text);
+    assert.strictEqual(driftRes.json.drifted, true, 'drift/check must await async checkProjectDrift and detect 0.0.0.0 exposure drift');
+    assert.strictEqual(driftRes.json.severity, 'critical');
+
+    const pgPreset = await reqJson(port, 'POST', '/api/databases/pgbouncer-preset', {
+      token: master,
+      body: { name: 'pg-main', databaseName: 'app_prod' }
+    });
+    assert.strictEqual(pgPreset.status, 200, 'POST /databases/pgbouncer-preset failed: ' + pgPreset.text);
+    assert.strictEqual(pgPreset.json.maxPreparedStatements, 200);
+    assert.ok(String(pgPreset.json.pgbouncerIni || '').includes('pool_mode = transaction'));
+
+    const iacRes = await reqJson(port, 'POST', '/api/iac/export', {
+      token: master,
+      body: { format: 'all' }
+    });
+    assert.strictEqual(iacRes.status, 200, 'POST /api/iac/export failed: ' + iacRes.text);
+    assert.strictEqual(iacRes.json.ok, true);
+    assert.ok(iacRes.json.files && iacRes.json.files['main.tf'] && iacRes.json.files['docker-compose.yml']);
+
+    const mwCreate = await reqJson(port, 'POST', '/api/uptime/maintenance', {
+      token: master,
+      body: { title: 'Weekly Patch', targetIds: ['*'], kind: 'recurring', startAt: new Date().toISOString(), durationMin: 30, intervalDays: 7 }
+    });
+    assert.strictEqual(mwCreate.status, 201, 'POST /api/uptime/maintenance failed: ' + mwCreate.text);
+    assert.ok(mwCreate.json.window && mwCreate.json.window.id);
+    const mwList = await reqJson(port, 'GET', '/api/uptime/maintenance', { token: master });
+    assert.strictEqual(mwList.status, 200);
+    assert.ok(Array.isArray(mwList.json.windows) && mwList.json.windows.length >= 1);
+    const mwDel = await reqJson(port, 'DELETE', '/api/uptime/maintenance/' + encodeURIComponent(mwCreate.json.window.id), { token: master });
+    assert.strictEqual(mwDel.status, 200);
+
+    const incCreate = await reqJson(port, 'POST', '/api/uptime/incidents', {
+      token: master,
+      body: { title: 'API Degraded', severity: 'major', status: 'investigating', message: 'Investigating spike' }
+    });
+    assert.strictEqual(incCreate.status, 201, 'POST /api/uptime/incidents failed: ' + incCreate.text);
+    const incPatch = await reqJson(port, 'PATCH', '/api/uptime/incidents/' + encodeURIComponent(incCreate.json.incident.id), {
+      token: master,
+      body: { status: 'resolved', message: 'Mitigated cleanly' }
+    });
+    assert.strictEqual(incPatch.status, 200, 'PATCH /api/uptime/incidents/:id failed: ' + incPatch.text);
+    assert.strictEqual(incPatch.json.incident.status, 'resolved');
+
+    const geoPlan = await reqJson(port, 'POST', '/api/uptime/geo-failover/plan', {
+      token: master,
+      body: { domain: 'edge.example.test', primaryIp: '203.0.113.10', secondaryIp: '198.51.100.20', consecutiveFailures: 3, ttlSec: 60 }
+    });
+    assert.strictEqual(geoPlan.status, 200, 'POST /api/uptime/geo-failover/plan failed: ' + geoPlan.text);
+    assert.strictEqual(geoPlan.json.strategy, 'active-passive-dns-failover');
+    assert.strictEqual(geoPlan.json.steps.length, 4);
+
+    const badCaa = await reqJson(port, 'GET', '/api/domains/bad_host_no_dot/caa-preflight', { token: master });
+    assert.strictEqual(badCaa.status, 400);
+
     console.log('CYCLE2_HTTP_OK');
   } finally {
     await new Promise((r) => srv.close(r));
@@ -1595,6 +1712,279 @@ function reqJson(port, method, pth, { token, body } = {}) {
     assert.ok(ufwAudit.findings[0].recommendation.includes('10.88.0.0/24'));
   }
   console.log('  ✓ Wave-3, Cycle-6 & Cycle-7 CVEs (8a-8f, 9a-9d): culkibo.protected+BuildKit cap, stale lock PID/TTL reap, GitOps symlink+commitSha, webhook replay/no-204/redact, OIDC JWKS SWR, --stop-timeout/--timeout, Kamal #1709 logDriver, Dokploy #6028/CVE-2026-129433, Kamal #1856 UFW audit');
+
+  // -------------------------------------------------------------------------
+  // 10. Cycle #8 CVE & PR Regressions (docs/COMPETITOR_RADAR_CYCLE7.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const apiRouter = require('../server/routes/api');
+    const { TeamManager, generateTotpCode } = require('../server/services/teamManager');
+    const { parseSafeCommandArgv } = require('../server/services/safeCommand');
+    const { diffContainerConfig } = require('../server/services/driftDetectorService');
+    const { UptimeMonitor } = require('../server/services/uptimeMonitor');
+    const { checkAllCaaRecords } = require('../server/services/ingressManager');
+    const { PasskeyService } = require('../server/services/passkeyService');
+    const { SecretLeaseService } = require('../server/services/secretLeaseService');
+    const { CveDriftService } = require('../server/services/cveDriftService');
+
+    // 10a. Dokploy CVE-2026-129315 (scripts/install.sh) & CVE-2026-133520 / GHSA-q7cq-vxv7-449c (repoPath traversal)
+    const installShPath = path.resolve(__dirname, '..', 'scripts', 'install.sh');
+    const installShText = fs.readFileSync(installShPath, 'utf8');
+    assert.ok(!/chmod\s+(-R\s+)?0?777\b/i.test(installShText), 'scripts/install.sh JAMÁS debe usar chmod 777/0777 (Dokploy CVE-2026-129315)');
+    assert.ok(!/chmod\s+(-R\s+)?a\+rwx\b/i.test(installShText), 'scripts/install.sh JAMÁS debe usar chmod a+rwx');
+    assert.ok(/chmod\s+0?700\s+"\$DATA_DIR"/i.test(installShText), 'scripts/install.sh debe aplicar chmod 0700 sobre $DATA_DIR');
+    assert.ok(/chmod\s+0?600\s+"\$ENV_FILE"/i.test(installShText), 'scripts/install.sh debe aplicar chmod 0600 sobre $ENV_FILE');
+
+    const pathTmp = makeTempDir('culkibo-c8-path-');
+    try {
+      const tenantRoot = path.join(pathTmp, 'tenant-a');
+      const otherTenant = path.join(pathTmp, 'tenant-b');
+      fs.mkdirSync(path.join(tenantRoot, 'src'), { recursive: true });
+      fs.mkdirSync(otherTenant, { recursive: true });
+      fs.writeFileSync(path.join(tenantRoot, 'src', 'index.js'), 'ok', 'utf8');
+      fs.writeFileSync(path.join(otherTenant, 'secret.env'), 'SECRET=1', 'utf8');
+
+      // Contained path succeeds
+      const okPath = apiRouter.assertRealPathContained(tenantRoot, 'src/index.js');
+      assert.ok(okPath.endsWith(path.join('src', 'index.js')));
+
+      // ../ traversal across tenants blocked (Dokploy CVE-2026-133520)
+      assert.throws(
+        () => apiRouter.assertRealPathContained(tenantRoot, '../tenant-b/secret.env'),
+        (err) => err && err.status === 403 && err.code === 'PATH_TRAVERSAL_BLOCKED',
+        'assertRealPathContained debe bloquear ../ cross-tenant traversal (CVE-2026-133520)'
+      );
+
+      // 10b. Runtipi CVE-2026-47277 (GHSA-qrqj-p7hm-4m66): escaping symlink blocked via fs.realpathSync
+      let linkCreated = false;
+      const linkDir = path.join(tenantRoot, 'logo-escape');
+      try {
+        fs.symlinkSync(otherTenant, linkDir, process.platform === 'win32' ? 'junction' : 'dir');
+        linkCreated = true;
+      } catch (e) {}
+      if (linkCreated) {
+        assert.throws(
+          () => apiRouter.assertRealPathContained(tenantRoot, 'logo-escape/secret.env'),
+          (err) => err && err.status === 403 && err.code === 'PATH_TRAVERSAL_BLOCKED',
+          'assertRealPathContained debe bloquear enlaces simbólicos salientes (Runtipi CVE-2026-47277)'
+        );
+      }
+    } finally {
+      fs.rmSync(pathTmp, { recursive: true, force: true });
+    }
+
+    // 10b (part 2). Runtipi TOTP brute-force throttle: <=5 failed 6-digit attempts -> 15 min lockout (TOTP_RATE_LIMITED)
+    const totpTmp = makeTempDir('culkibo-c8-totp-');
+    try {
+      const tm = new TeamManager({ dataDir: totpTmp, bcryptCost: 4 });
+      const boot = tm.bootstrapOwner({ email: 'totp-owner@example.test', password: 'StrongPassword!2026' });
+      const ownerPrincipal = tm.verifySessionToken(boot.sessionToken).principal;
+      const setup = tm.setupTotp(ownerPrincipal, { issuer: 'CulkiboC8' });
+      const baseTs = 1780000000000;
+      const initCode = generateTotpCode(setup.secretBase32, { timestampMs: baseTs }).code;
+      tm.enableTotp(ownerPrincipal, { code: initCode, timestampMs: baseTs, nowMs: baseTs });
+
+      const step1 = tm.login({ email: 'totp-owner@example.test', password: 'StrongPassword!2026' });
+      assert.strictEqual(step1.mfaRequired, true);
+
+      // 4 consecutive bad attempts fail with INVALID_MFA_CODE (not locked yet)
+      const tStep1 = baseTs + 60000;
+      for (let i = 0; i < 4; i++) {
+        assert.throws(
+          () => tm.verifyMfaLogin({ mfaChallengeToken: step1.mfaChallengeToken, code: '000000', timestampMs: tStep1, nowMs: tStep1 }),
+          (err) => err && err.status === 401 && err.code === 'INVALID_MFA_CODE'
+        );
+      }
+      // Valid code on attempt 5 resets consecutive failure counter
+      const validCode1 = generateTotpCode(setup.secretBase32, { timestampMs: tStep1 }).code;
+      const okLogin = tm.verifyMfaLogin({ mfaChallengeToken: step1.mfaChallengeToken, code: validCode1, timestampMs: tStep1, nowMs: tStep1 });
+      assert.ok(okLogin.sessionToken, 'Valid TOTP before 5th failure must succeed and reset failure counter');
+
+      // Now 5 consecutive bad 6-digit attempts -> 5th triggers 15-min lockout (TOTP_RATE_LIMITED)
+      const step2 = tm.login({ email: 'totp-owner@example.test', password: 'StrongPassword!2026' });
+      const tStep2 = tStep1 + 60000;
+      for (let i = 0; i < 4; i++) {
+        assert.throws(
+          () => tm.verifyMfaLogin({ mfaChallengeToken: step2.mfaChallengeToken, code: '111111', timestampMs: tStep2, nowMs: tStep2 }),
+          (err) => err && err.status === 401 && err.code === 'INVALID_MFA_CODE'
+        );
+      }
+      assert.throws(
+        () => tm.verifyMfaLogin({ mfaChallengeToken: step2.mfaChallengeToken, code: '222222', timestampMs: tStep2, nowMs: tStep2 }),
+        (err) => err && err.status === 429 && err.code === 'TOTP_RATE_LIMITED',
+        '5th consecutive failed 6-digit TOTP attempt MUST lock out with 429 TOTP_RATE_LIMITED'
+      );
+      // Even a VALID code during the 15-minute lockout MUST be rejected with 429 TOTP_RATE_LIMITED
+      const validCode2 = generateTotpCode(setup.secretBase32, { timestampMs: tStep2 }).code;
+      assert.throws(
+        () => tm.verifyMfaLogin({ mfaChallengeToken: step2.mfaChallengeToken, code: validCode2, timestampMs: tStep2, nowMs: tStep2 + 5 * 60 * 1000 }),
+        (err) => err && err.status === 429 && err.code === 'TOTP_RATE_LIMITED',
+        'Locked-out account must reject even valid TOTP codes during 15-minute cooldown'
+      );
+      // After 15 minutes + 1s, lockout expires cleanly
+      const tAfterLock = tStep2 + 15 * 60 * 1000 + 1000;
+      const step3 = tm.login({ email: 'totp-owner@example.test', password: 'StrongPassword!2026' });
+      const validCode3 = generateTotpCode(setup.secretBase32, { timestampMs: tAfterLock }).code;
+      const recovered = tm.verifyMfaLogin({ mfaChallengeToken: step3.mfaChallengeToken, code: validCode3, timestampMs: tAfterLock, nowMs: tAfterLock });
+      assert.ok(recovered.sessionToken, 'Valid TOTP after 15-minute lockout expiry must succeed');
+    } finally {
+      fs.rmSync(totpTmp, { recursive: true, force: true });
+    }
+
+    // 10c. Dokku CVE-2026-54636 (cron metacharacter injection) & Kamal #1790 (silent config drift)
+    for (const evilCmd of ['node job.js; id', 'php artisan > /tmp/pwn', 'python3 $(whoami).py']) {
+      assert.throws(
+        () => parseSafeCommandArgv(evilCmd),
+        /Operador de shell|sustituciones de shell/i,
+        `Cron safeCommand debe rechazar metacaracteres (Dokku CVE-2026-54636): ${evilCmd}`
+      );
+    }
+    const digestDeclared = 'sha256:' + 'a'.repeat(64);
+    const digestRunning = 'sha256:' + 'b'.repeat(64);
+    const driftOut = diffContainerConfig(
+      { image: 'app:1.0', imageDigest: digestDeclared, memoryLimitMb: 512, port: 3000, bindAddress: '127.0.0.1', envKeys: ['NODE_ENV'] },
+      {
+        Image: digestRunning,
+        Config: { Image: 'app:1.0', Env: ['NODE_ENV=production', 'EXTRA=1'], StopTimeout: 30 },
+        RepoDigests: [`app@${digestRunning}`],
+        HostConfig: {
+          Memory: 1024 * 1024 * 1024,
+          PortBindings: { '3000/tcp': [{ HostIp: '0.0.0.0', HostPort: '3000' }] },
+          LogConfig: { Type: 'json-file' }
+        }
+      }
+    );
+    assert.strictEqual(driftOut.drifted, true);
+    assert.strictEqual(driftOut.severity, 'critical');
+    assert.ok(driftOut.diffs.some((d) => d.field === 'imageDigest'));
+    assert.ok(driftOut.diffs.some((d) => d.field === 'memoryLimitMb'));
+    assert.ok(driftOut.diffs.some((d) => d.field === 'bindAddress' && d.severity === 'critical'));
+
+    // 10d. Uptime Kuma #7704, #8193, #6519
+    const umTmp = makeTempDir('culkibo-c8-um-');
+    try {
+      const um = new UptimeMonitor({
+        storeFile: path.join(umTmp, 'uptime.json'),
+        maintenanceFile: path.join(umTmp, 'maintenance-incidents.json'),
+        autoStart: false
+      });
+      const startMs = Date.UTC(2026, 7, 1, 10, 0, 0);
+      um.createMaintenanceWindow({
+        title: 'Multi-day window',
+        targetIds: ['mon_1'],
+        kind: 'recurring',
+        startAt: new Date(startMs).toISOString(),
+        durationMin: 60,
+        intervalDays: 3
+      });
+      assert.strictEqual(um.isInMaintenance('mon_1', startMs + 10 * 60 * 1000), true, '#7704 day-0 fires');
+      assert.strictEqual(um.isInMaintenance('mon_1', startMs + 3 * 86400_000 + 10 * 60 * 1000), true, '#8193 >=2d advances');
+      const caaRes = await checkAllCaaRecords('multi.example.test', {
+        expectedCa: 'letsencrypt.org',
+        resolveCaaImpl: async () => [{ issue: 'digicert.com' }, { issue: 'letsencrypt.org' }]
+      });
+      assert.strictEqual(caaRes.allowed, true, '#6519 inspects all CAA records beyond [0]');
+    } finally {
+      fs.rmSync(umTmp, { recursive: true, force: true });
+    }
+
+    // 10e. WebAuthn Ed25519 + Secret Lease fail-closed expiry + OSV.dev batch offline fallback
+    const c8Tmp = makeTempDir('culkibo-c8-sec-');
+    try {
+      const pk = new PasskeyService({ dataDir: c8Tmp });
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+      const rawPub = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+      const rpId = 'panel.example.test';
+      const origin = 'https://panel.example.test';
+      const regBegin = pk.beginRegistration({ userId: 'u_c8', username: 'u_c8@example.test', rpId, origin });
+      const regClientData = Buffer.from(JSON.stringify({ type: 'webauthn.create', challenge: regBegin.challenge, origin }));
+      const rpIdHash = crypto.createHash('sha256').update(rpId).digest();
+      const flagsUp = Buffer.from([0x01]);
+      const cnt0 = Buffer.alloc(4);
+      const authDataReg = Buffer.concat([rpIdHash, flagsUp, cnt0]);
+      const coseEd = new Map([[1, 1], [3, -8], [-1, 6], [-2, rawPub]]);
+      const regFin = pk.finishRegistration({
+        userId: 'u_c8',
+        challengeId: regBegin.challengeId,
+        credentialId: 'cred_ed_c8',
+        clientDataJSON: regClientData.toString('base64url'),
+        publicKeyCose: coseEd,
+        expectedOrigin: origin,
+        expectedRpId: rpId
+      });
+      assert.strictEqual(regFin.ok, true);
+      assert.strictEqual(regFin.credential.alg, -8);
+
+      const authBegin = pk.beginAuthentication({ userId: 'u_c8', rpId });
+      const authClientData = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge: authBegin.challenge, origin }));
+      const cnt1 = Buffer.alloc(4);
+      cnt1.writeUInt32BE(1, 0);
+      const authData1 = Buffer.concat([rpIdHash, flagsUp, cnt1]);
+      const clientHash1 = crypto.createHash('sha256').update(authClientData).digest();
+      const sig1 = crypto.sign(null, Buffer.concat([authData1, clientHash1]), privateKey);
+      const authOk = pk.finishAuthentication({
+        challengeId: authBegin.challengeId,
+        credentialId: 'cred_ed_c8',
+        clientDataJSON: authClientData.toString('base64url'),
+        authenticatorData: authData1.toString('base64url'),
+        signature: sig1.toString('base64url'),
+        expectedOrigin: origin,
+        expectedRpId: rpId
+      });
+      assert.strictEqual(authOk.valid, true);
+      assert.strictEqual(authOk.signCount, 1);
+
+      // Replayed challenge MUST fail closed
+      const replayRes = pk.finishAuthentication({
+        challengeId: authBegin.challengeId,
+        credentialId: 'cred_ed_c8',
+        clientDataJSON: authClientData.toString('base64url'),
+        authenticatorData: authData1.toString('base64url'),
+        signature: sig1.toString('base64url'),
+        expectedOrigin: origin,
+        expectedRpId: rpId
+      });
+      assert.strictEqual(replayRes.valid, false);
+
+      // Regressed signCount (cloning) MUST fail closed
+      const authBegin2 = pk.beginAuthentication({ userId: 'u_c8', rpId });
+      const authClientData2 = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge: authBegin2.challenge, origin }));
+      const authDataRegressed = Buffer.concat([rpIdHash, flagsUp, cnt1]); // same signCount=1 <= storedCount=1
+      const clientHash2 = crypto.createHash('sha256').update(authClientData2).digest();
+      const sig2 = crypto.sign(null, Buffer.concat([authDataRegressed, clientHash2]), privateKey);
+      const cloneRes = pk.finishAuthentication({
+        challengeId: authBegin2.challengeId,
+        credentialId: 'cred_ed_c8',
+        clientDataJSON: authClientData2.toString('base64url'),
+        authenticatorData: authDataRegressed.toString('base64url'),
+        signature: sig2.toString('base64url'),
+        expectedOrigin: origin,
+        expectedRpId: rpId
+      });
+      assert.strictEqual(cloneRes.valid, false);
+
+      // Secret lease fails closed upon expiry
+      const ls = new SecretLeaseService({ dataDir: c8Tmp });
+      const now0 = Date.now();
+      const issued = ls.issueLease({ projectId: 'p1', secretKey: 'API_KEY', ttlSec: 60, issuedBy: 'owner', nowMs: now0 });
+      assert.strictEqual(ls.validateLease(issued.token, { nowMs: now0 + 10_000 }).valid, true);
+      const expiredCheck = ls.validateLease(issued.token, { nowMs: now0 + 120_000 });
+      assert.strictEqual(expiredCheck.valid, false);
+      assert.strictEqual(expiredCheck.reason, 'EXPIRED');
+
+      // OSV CVE Drift offline fallback
+      const cve = new CveDriftService({ dataDir: c8Tmp });
+      const scanRes = await cve.scanSbom({
+        components: [{ purl: 'pkg:npm/express@4.21.2' }],
+        allowNetwork: false
+      });
+      assert.strictEqual(scanRes.scannedPackages, 1);
+      assert.strictEqual(scanRes.offline, true);
+    } finally {
+      fs.rmSync(c8Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #8 CVEs (10a-10e): Dokploy CVE-2026-129315/133520, Runtipi CVE-2026-47277 & TOTP throttle, Dokku CVE-2026-54636 & Kamal #1790, Uptime Kuma #7704/#8193/#6519, WebAuthn/OSV/Lease');
 
   console.log('✅ Suite #23 completada correctamente.\n');
 }

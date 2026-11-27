@@ -32,6 +32,9 @@ import {
   type CronTimelineResult,
   type CronTimelineSlot,
   type HeartbeatMonitor,
+  type MaintenanceWindowRecord,
+  type StatusIncidentRecord,
+  type GeoFailoverPlanResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -83,6 +86,16 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const [hbPeriodSec, setHbPeriodSec] = useState('3600');
   const [hbCreating, setHbCreating] = useState(false);
   const [hbPingingId, setHbPingingId] = useState<string | null>(null);
+  const [maintWindows, setMaintWindows] = useState<MaintenanceWindowRecord[]>([]);
+  const [uptimeIncidents, setUptimeIncidents] = useState<StatusIncidentRecord[]>([]);
+  const [maintTitle, setMaintTitle] = useState('');
+  const [maintDuration, setMaintDuration] = useState('60');
+  const [maintBusy, setMaintBusy] = useState(false);
+  const [incTitle, setIncTitle] = useState('');
+  const [incSeverity, setIncSeverity] = useState<'minor' | 'major' | 'critical'>('minor');
+  const [incBusy, setIncBusy] = useState(false);
+  const [geoPlan, setGeoPlan] = useState<GeoFailoverPlanResult | null>(null);
+  const [geoBusy, setGeoBusy] = useState(false);
 
   const [vpsMonthlyEur, setVpsMonthlyEur] = useState<string>('12');
   const [advisorBusy, setAdvisorBusy] = useState(false);
@@ -137,13 +150,15 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const loadAll = useCallback(async (eurOverride?: number) => {
     try {
       const eur = eurOverride ?? (Number.parseFloat(vpsMonthlyEur) || 12);
-      const [monRes, pageRes, projRes, advRes, cronRes, hbRes] = await Promise.all([
+      const [monRes, pageRes, projRes, advRes, cronRes, hbRes, mwRes, incRes] = await Promise.all([
         api.getUptimeMonitors().catch(() => ({ monitors: [] })),
         api.getStatusPages().catch(() => ({ pages: [] })),
         api.getProjects().catch(() => []),
         api.getResourceAdvisor(eur).catch(() => null),
         api.getCronTimeline(24).catch(() => null),
         api.listHeartbeats().catch(() => ({ heartbeats: [] })),
+        api.listMaintenanceWindows().catch((): { windows?: MaintenanceWindowRecord[]; maintenanceWindows?: MaintenanceWindowRecord[] } => ({ windows: [] })),
+        api.listUptimeIncidents().catch(() => ({ incidents: [] })),
       ]);
       const projList = Array.isArray(projRes) ? projRes : [];
       setMonitors(monRes.monitors || []);
@@ -152,6 +167,9 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
       setAdvisor(advRes);
       if (cronRes) setCronTimeline(cronRes);
       setHeartbeats(Array.isArray(hbRes?.heartbeats) ? hbRes.heartbeats : []);
+      const mwList = Array.isArray(mwRes?.windows) ? mwRes.windows : (Array.isArray(mwRes?.maintenanceWindows) ? mwRes.maintenanceWindows : []);
+      setMaintWindows(mwList);
+      setUptimeIncidents(Array.isArray(incRes?.incidents) ? incRes.incidents : []);
 
       if (projList.length > 0) {
         // Prefer bulk GET /api/sleep to avoid N+1 requests; fallback to batched per-project reads for ALL projects
@@ -616,6 +634,97 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
     }
   };
 
+  const handleScheduleMaintenance = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!maintTitle.trim()) return;
+    setMaintBusy(true);
+    try {
+      const res = await api.createMaintenanceWindow({
+        title: maintTitle.trim(),
+        targetIds: ['*'],
+        kind: 'recurring',
+        startAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+        durationMin: Math.max(5, Number.parseInt(maintDuration, 10) || 60),
+        intervalDays: 7,
+      });
+      const created = res.window || (res.id ? (res as MaintenanceWindowRecord) : null);
+      if (created) setMaintWindows((prev) => [created, ...prev.filter((w) => w.id !== created.id)]);
+      setMaintTitle('');
+      onNotify(`Maintenance window “${created?.title || maintTitle.trim()}” scheduled`, 'success');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Could not schedule maintenance window', 'error');
+    } finally {
+      setMaintBusy(false);
+    }
+  };
+
+  const handleDeleteMaintenance = async (id: string) => {
+    try {
+      await api.deleteMaintenanceWindow(id);
+      setMaintWindows((prev) => prev.filter((w) => w.id !== id));
+      onNotify('Maintenance window deleted', 'info');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Could not delete maintenance window', 'error');
+    }
+  };
+
+  const handleLogIncident = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!incTitle.trim()) return;
+    setIncBusy(true);
+    try {
+      const res = await api.createUptimeIncident({
+        title: incTitle.trim(),
+        severity: incSeverity,
+        status: 'investigating',
+        affectedIds: monitors[0]?.id ? [monitors[0].id] : [],
+        message: 'Initial investigation opened from Culkibo control plane.',
+      });
+      const created = res.incident || (res.id ? (res as StatusIncidentRecord) : null);
+      if (created) setUptimeIncidents((prev) => [created, ...prev.filter((i) => i.id !== created.id)]);
+      setIncTitle('');
+      onNotify(`Incident “${created?.title || incTitle.trim()}” logged`, 'info');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Could not log incident', 'error');
+    } finally {
+      setIncBusy(false);
+    }
+  };
+
+  const handleAdvanceIncident = async (inc: StatusIncidentRecord) => {
+    const order: Array<'investigating' | 'identified' | 'monitoring' | 'resolved'> = ['investigating', 'identified', 'monitoring', 'resolved'];
+    const idx = order.indexOf(inc.status as typeof order[number]);
+    const nextStatus = order[Math.min(order.length - 1, idx + 1)] || 'resolved';
+    try {
+      const res = await api.updateUptimeIncident(inc.id, { status: nextStatus });
+      const updated = res.incident || (res.id ? (res as StatusIncidentRecord) : null);
+      setUptimeIncidents((prev) =>
+        prev.map((item) => (item.id === inc.id ? { ...item, status: updated?.status || nextStatus, updatedAt: new Date().toISOString() } : item))
+      );
+      onNotify(`Incident transitioned → ${nextStatus}`, 'success');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Could not update incident', 'error');
+    }
+  };
+
+  const handlePreviewGeoFailover = async () => {
+    setGeoBusy(true);
+    try {
+      const res = await api.planGeoFailover({
+        domain: 'app.acme-demo.dev',
+        primaryIp: '91.107.194.22',
+        secondaryIp: '157.90.18.44',
+        consecutiveFailures: 3,
+        ttlSec: 60,
+      });
+      setGeoPlan(res);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Could not build geo-failover plan', 'error');
+    } finally {
+      setGeoBusy(false);
+    }
+  };
+
   const summary = useMemo(() => {
     const upCount = monitors.filter((m) => m.status === 'up').length;
     const incidents = monitors.filter((m) => Boolean(m.incidentOpen || m.activeIncidentId || m.status === 'down')).length;
@@ -1054,6 +1163,171 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                 })}
               </div>
             )}
+          </section>
+
+          {/* Maintenance Windows, Public Incident Timeline & DNS Geo-Failover */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('uptime.maintTitle')}</h2>
+                  <p className="text-slate-500 mt-0.5">{t('uptime.maintDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={geoBusy}
+                onClick={() => void handlePreviewGeoFailover()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50 self-start lg:self-auto"
+              >
+                {geoBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Globe className="w-3.5 h-3.5" />}
+                <span>{t('uptime.geoPreview')}</span>
+              </button>
+            </div>
+
+            {geoPlan && (
+              <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 space-y-2">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="font-semibold text-slate-900">
+                    Active-Passive DNS Geo-Failover · <code className="font-mono">{geoPlan.domain}</code> ({geoPlan.primaryIp} → {geoPlan.secondaryIp})
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-600 tabular-nums">
+                    TTL {geoPlan.ttlSec ?? 60}s · {geoPlan.consecutiveFailures ?? 3} probes
+                  </span>
+                </div>
+                {geoPlan.summary && <p className="text-slate-600">{geoPlan.summary}</p>}
+                {Array.isArray(geoPlan.steps) && geoPlan.steps.length > 0 && (
+                  <ul className="list-disc list-inside font-mono text-[11px] text-slate-600 space-y-0.5">
+                    {geoPlan.steps.map((s, idx) => <li key={idx}>{s}</li>)}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-slate-200">
+              {/* Left: Maintenance Windows */}
+              <div className="p-4 sm:p-5 space-y-3">
+                <form onSubmit={(e) => void handleScheduleMaintenance(e)} className="flex items-center gap-1.5 flex-wrap">
+                  <input
+                    type="text"
+                    value={maintTitle}
+                    onChange={(e) => setMaintTitle(e.target.value)}
+                    placeholder="DB vacuum / OS kernel patch"
+                    className="flex-1 min-w-[150px] px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-900"
+                  />
+                  <select
+                    value={maintDuration}
+                    onChange={(e) => setMaintDuration(e.target.value)}
+                    aria-label="Maintenance duration"
+                    className="px-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-700"
+                  >
+                    <option value="30">30m</option>
+                    <option value="60">60m</option>
+                    <option value="120">2h</option>
+                  </select>
+                  <button
+                    type="submit"
+                    disabled={maintBusy || !maintTitle.trim()}
+                    className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>{t('uptime.maintSchedule')}</span>
+                  </button>
+                </form>
+                {maintWindows.length === 0 ? (
+                  <div className="text-slate-500 py-2">{t('uptime.maintEmpty')}</div>
+                ) : (
+                  <div className="space-y-2">
+                    {maintWindows.slice(0, 4).map((w) => (
+                      <div key={w.id} className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-semibold text-slate-900 truncate">{w.title}</span>
+                            <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-600">
+                              {w.kind}{w.intervalDays ? `/${w.intervalDays}d` : ''} · {w.durationMin}m
+                            </span>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteMaintenance(w.id)}
+                          aria-label={`Delete maintenance ${w.title}`}
+                          className="p-1 rounded text-slate-400 hover:text-red-700 cursor-pointer shrink-0"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Right: Public Incident Timeline */}
+              <div className="p-4 sm:p-5 space-y-3">
+                <form onSubmit={(e) => void handleLogIncident(e)} className="flex items-center gap-1.5 flex-wrap">
+                  <input
+                    type="text"
+                    value={incTitle}
+                    onChange={(e) => setIncTitle(e.target.value)}
+                    placeholder="Upstream EU latency spike"
+                    className="flex-1 min-w-[150px] px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-900"
+                  />
+                  <select
+                    value={incSeverity}
+                    onChange={(e) => setIncSeverity(e.target.value as 'minor' | 'major' | 'critical')}
+                    aria-label="Incident severity"
+                    className="px-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-700"
+                  >
+                    <option value="minor">minor</option>
+                    <option value="major">major</option>
+                    <option value="critical">critical</option>
+                  </select>
+                  <button
+                    type="submit"
+                    disabled={incBusy || !incTitle.trim()}
+                    className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>{t('uptime.incLog')}</span>
+                  </button>
+                </form>
+                {uptimeIncidents.length === 0 ? (
+                  <div className="text-slate-500 py-2">{t('uptime.incEmpty')}</div>
+                ) : (
+                  <div className="space-y-2">
+                    {uptimeIncidents.slice(0, 4).map((inc) => (
+                      <div key={inc.id} className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-semibold text-slate-900 truncate">{inc.title}</span>
+                            <span className={`px-1.5 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                              inc.status === 'resolved'
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : 'bg-amber-50 text-amber-800 border-amber-200'
+                            }`}>
+                              {inc.status}
+                            </span>
+                          </div>
+                          {inc.message && <p className="text-[11px] text-slate-500 mt-0.5 truncate">{inc.message}</p>}
+                        </div>
+                        {inc.status !== 'resolved' && (
+                          <button
+                            type="button"
+                            onClick={() => void handleAdvanceIncident(inc)}
+                            className="px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer shrink-0"
+                          >
+                            Next stage →
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </section>
         </div>
       )}

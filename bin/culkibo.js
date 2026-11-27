@@ -48,7 +48,9 @@ const svc = {
   get metricsCollector() { return require('../server/services/metricsCollector'); },
   get sleepAdvisor() { return require('../server/services/sleepAdvisor'); },
   get buildHealerService() { return require('../server/services/buildHealerService'); },
-  get fleetMeshService() { return require('../server/services/fleetMeshService'); }
+  get fleetMeshService() { return require('../server/services/fleetMeshService'); },
+  get iacExporter() { return require('../server/services/iacExporter'); },
+  get cveDriftService() { return require('../server/services/cveDriftService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2871,15 +2873,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 120,
+            mcpTools: 125,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '120 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'Web Terminal, WireGuard Fleet Mesh, Edge PoW Shield, Auto-Healer, Time-Machine & FinOps'
+            '125 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
+            'WebAuthn Passkeys, Secret Leases, OSV CVE Scan, Drift+PgBouncer, OpenTofu IaC, Mesh & Terminal'
           ]
         };
       };
@@ -3283,6 +3285,107 @@ program
           console.log(`\n\x1b[32m✅ Clave x25519 rotada\x1b[0m — nodo ${options.node}\n`);
         }
       }
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-8 CLI: export-iac (OpenTofu/Compose) & cve-scan (OSV.dev SBOM)
+// ===========================================================================
+
+program
+  .command('export-iac')
+  .description('Zero Lock-In IaC Exporter: genera OpenTofu/Terraform (.tf) + docker-compose.yml + .env.example con 0 secretos en claro')
+  .option('-f, --format <fmt>', 'Formato a exportar: all | terraform | compose', 'all')
+  .option('-o, --out <dir>', 'Directorio destino opcional donde escribir atómicamente los archivos generados')
+  .option('-p, --project <id>', 'Exportar únicamente un projectId concreto')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const rawFmt = String(options.format || 'all').toLowerCase();
+      if (rawFmt !== 'all' && rawFmt !== 'terraform' && rawFmt !== 'compose') {
+        throw new Error(`Formato IaC inválido "${options.format}". Usa: all | terraform | compose`);
+      }
+      /** @type {'all' | 'terraform' | 'compose'} */
+      const fmt = rawFmt;
+      const iac = svc.iacExporter;
+      const exported = iac.exportEstate({
+        format: fmt,
+        ...(options.project ? { projectIds: [String(options.project)] } : {})
+      });
+      /** @type {string[]} */
+      const writtenFiles = [];
+      if (options.out) {
+        const outDir = path.resolve(String(options.out));
+        fs.mkdirSync(outDir, { recursive: true });
+        for (const [name, content] of Object.entries(exported.files || {})) {
+          if (!name || name.includes('..') || name.includes('/') || name.includes('\\')) continue;
+          const dest = path.resolve(outDir, name);
+          const rel = path.relative(outDir, dest);
+          if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
+          const tmp = `${dest}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+          fs.writeFileSync(tmp, String(content || ''), { encoding: 'utf8', mode: 0o644 });
+          fs.renameSync(tmp, dest);
+          writtenFiles.push(dest);
+        }
+      }
+
+      const payload = {
+        ...exported,
+        ok: true,
+        format: fmt,
+        writtenFiles
+      };
+      if (isJsonMode(options)) return printJson(payload);
+
+      console.log(`\n\x1b[32m📦 Culkibo Zero-Lock-In IaC Export (${fmt})\x1b[0m`);
+      console.log(`   Archivos:   ${Object.keys(exported.files || {}).join(', ')}`);
+      if (exported.stats) {
+        console.log(`   Recursos:   ${exported.stats.projects ?? 0} proyectos · ${exported.stats.databases ?? 0} BDs · ${exported.stats.domains ?? 0} dominios · ${exported.stats.crons ?? 0} crons`);
+      }
+      console.log(`   Secretos:   ${exported.secretsRedactedCount ?? 0} secretos redactados (0 valores en claro)`);
+      if (writtenFiles.length > 0) {
+        console.log(`   Escritos:   ${writtenFiles.length} archivo(s) en ${path.resolve(String(options.out))}`);
+      }
+      console.log('');
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('cve-scan')
+  .description('Runtime SBOM CVE Drift Scanner: audita CycloneDX 1.6 contra OSV.dev (offline/caché por defecto; --online para consulta live)')
+  .option('--online', 'Habilitar consulta saliente por lotes a https://api.osv.dev/v1/querybatch')
+  .option('--refresh', 'Ignorar caché local de 24h al ejecutar con --online')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (options) => {
+    try {
+      const cveSvc = svc.cveDriftService;
+      const report = await cveSvc.scanSbom({
+        allowNetwork: Boolean(options.online),
+        forceRefresh: Boolean(options.refresh)
+      });
+      const scannedComponents = Number(report?.scannedPackages ?? report?.scannedComponents ?? 0);
+      const vulnerableCount = Number(report?.totalVulnerabilities ?? report?.vulnerableCount ?? 0);
+      const severityCounts = report?.bySeverity || report?.severityCounts || { critical: 0, high: 0, medium: 0, low: 0 };
+      const mode = String(report?.source || report?.mode || (report?.offline ? 'offline_fallback' : (options.online ? 'osv.dev' : 'offline_fallback')));
+      const payload = {
+        ...report,
+        ok: report && report.ok !== false,
+        mode,
+        scannedComponents,
+        vulnerableCount,
+        severityCounts
+      };
+      if (isJsonMode(options)) return printJson(payload);
+
+      console.log(`\n\x1b[36m🛡️  Culkibo Runtime SBOM CVE Scan (${mode})\x1b[0m`);
+      console.log(`   Componentes: ${scannedComponents}`);
+      console.log(`   Hallazgos:   ${vulnerableCount} (critical=${severityCounts.critical ?? 0}, high=${severityCounts.high ?? 0}, medium=${severityCounts.medium ?? 0}, low=${severityCounts.low ?? 0})`);
+      if (report.cached) console.log(`   Caché:       hit (24h TTL)`);
+      console.log('');
     } catch (err) {
       failCli(err, options);
     }

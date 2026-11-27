@@ -69,6 +69,11 @@ import {
   type SecretScanReport,
   type DnsProviderInfo,
   type Http3ProbeResult,
+  type PasskeyRecord,
+  type SecretLeaseRecord,
+  type SecretRotationAuditResult,
+  type CveScanResult,
+  type IacExportResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -250,6 +255,44 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [http3Status, setHttp3Status] = useState<Http3ProbeResult | null>(null);
   const [dnsProviders, setDnsProviders] = useState<DnsProviderInfo[]>([]);
   const [copiedSecKey, setCopiedSecKey] = useState<string | null>(null);
+
+  // Cycle-8 Enterprise Sovereignty (Passkeys FIDO2, Secret Leases & Break-Glass, OSV CVE Drift, OpenTofu IaC Export)
+  const [passkeys, setPasskeys] = useState<PasskeyRecord[]>([]);
+  const [passkeyLabel, setPasskeyLabel] = useState('YubiKey 5C NFC');
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
+  const [passkeyChallenge, setPasskeyChallenge] = useState<string | null>(null);
+
+  const [secretLeases, setSecretLeases] = useState<SecretLeaseRecord[]>([]);
+  const [leaseKeyName, setLeaseKeyName] = useState('DATABASE_URL');
+  const [breakGlassReason, setBreakGlassReason] = useState('Emergency incident production triage');
+  const [leaseBusy, setLeaseBusy] = useState<'lease' | 'audit' | 'breakglass' | null>(null);
+  const [issuedLeaseToken, setIssuedLeaseToken] = useState<string | null>(null);
+  const [rotationAudit, setRotationAudit] = useState<SecretRotationAuditResult | null>(null);
+
+  const [cveScan, setCveScan] = useState<CveScanResult | null>(null);
+  const [cveBusy, setCveBusy] = useState(false);
+  const [cveError, setCveError] = useState<string | null>(null);
+
+  const [iacExport, setIacExport] = useState<IacExportResult | null>(null);
+  const [iacBusy, setIacBusy] = useState(false);
+  const [iacError, setIacError] = useState<string | null>(null);
+  const [iacFileTab, setIacFileTab] = useState<string>('main.tf');
+
+  useEffect(() => {
+    if (tab !== 'security') return;
+    let active = true;
+    Promise.all([
+      api.listPasskeys().catch(() => ({ passkeys: [] })),
+      api.listSecretLeases().catch(() => ({ leases: [] })),
+      api.getLatestCveScan().catch(() => null),
+    ]).then(([pkRes, leaseRes, latestCve]) => {
+      if (!active) return;
+      setPasskeys(Array.isArray(pkRes?.passkeys) ? pkRes.passkeys : []);
+      setSecretLeases(Array.isArray(leaseRes?.leases) ? leaseRes.leases : []);
+      if (latestCve) setCveScan(latestCve);
+    });
+    return () => { active = false; };
+  }, [tab]);
 
   const loadAll = async () => {
     const [sys, gh, cf, ntf, doc, ing, s3, tel] = await Promise.all([
@@ -1026,6 +1069,137 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  // --- Cycle-8 Enterprise Sovereignty Handlers ---
+  const handleRegisterPasskey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPasskeyBusy(true);
+    setPasskeyChallenge(null);
+    try {
+      const res = await api.beginPasskeyRegistration({
+        label: passkeyLabel.trim() || 'Hardware Passkey',
+        rpId: typeof window !== 'undefined' ? window.location.hostname : 'localhost',
+      });
+      if (res.demoRegistered) {
+        setPasskeys((prev) => [res.demoRegistered!, ...prev.filter((p) => p.id !== res.demoRegistered!.id)]);
+        onNotify?.(`Passkey “${res.demoRegistered.label}” registered`, 'success');
+      } else {
+        setPasskeyChallenge(res.challengeId || res.challenge);
+        onNotify?.('WebAuthn registration challenge issued (ES256 / Ed25519)', 'info');
+      }
+    } catch (err: unknown) {
+      onNotify?.(err instanceof Error ? err.message : 'Could not start passkey registration', 'error');
+    } finally {
+      setPasskeyBusy(false);
+    }
+  };
+
+  const handleRevokePasskey = async (id: string) => {
+    try {
+      await api.revokePasskey(id);
+      setPasskeys((prev) => prev.filter((p) => p.id !== id));
+      onNotify?.('Passkey revoked', 'info');
+    } catch (err: unknown) {
+      onNotify?.(err instanceof Error ? err.message : 'Could not revoke passkey', 'error');
+    }
+  };
+
+  const handleIssueLease = async () => {
+    setLeaseBusy('lease');
+    try {
+      const res = await api.issueSecretLease({
+        secretKey: leaseKeyName.trim() || 'DATABASE_URL',
+        scope: 'read',
+        ttlSec: 3600,
+        reason: 'Operator 1h ephemeral lease',
+      });
+      if (res.lease) {
+        setSecretLeases((prev) => [res.lease, ...prev.filter((l) => l.id !== res.lease.id)]);
+      }
+      if (res.token) setIssuedLeaseToken(res.token);
+      onNotify?.(`1h secret lease issued for ${leaseKeyName.trim() || 'DATABASE_URL'}`, 'success');
+    } catch (err: unknown) {
+      onNotify?.(err instanceof Error ? err.message : 'Could not issue secret lease', 'error');
+    } finally {
+      setLeaseBusy(null);
+    }
+  };
+
+  const handleRevokeLease = async (id: string) => {
+    try {
+      await api.revokeSecretLease(id);
+      setSecretLeases((prev) => prev.filter((l) => l.id !== id));
+      onNotify?.('Secret lease revoked', 'info');
+    } catch (err: unknown) {
+      onNotify?.(err instanceof Error ? err.message : 'Could not revoke secret lease', 'error');
+    }
+  };
+
+  const handleRotationAudit = async () => {
+    setLeaseBusy('audit');
+    try {
+      const res = await api.getSecretRotationAudit(90);
+      setRotationAudit(res);
+      onNotify?.(`Rotation audit: ${res.staleCount} stale key(s) > 90d out of ${res.totalKeys}`, res.staleCount > 0 ? 'info' : 'success');
+    } catch (err: unknown) {
+      onNotify?.(err instanceof Error ? err.message : 'Could not run rotation audit', 'error');
+    } finally {
+      setLeaseBusy(null);
+    }
+  };
+
+  const handleBreakGlass = async () => {
+    const cleanReason = breakGlassReason.trim();
+    if (cleanReason.length < 10) {
+      onNotify?.('Break-Glass requires a reason of at least 10 characters', 'error');
+      return;
+    }
+    setLeaseBusy('breakglass');
+    try {
+      const res = await api.issueBreakGlass({ reason: cleanReason, ttlSec: 900 });
+      if (res.lease) {
+        setSecretLeases((prev) => [res.lease, ...prev.filter((l) => l.id !== res.lease.id)]);
+      }
+      if (res.token) setIssuedLeaseToken(res.token);
+      onNotify?.('Audited 15-min Break-Glass token issued (hard-capped 900s)', 'info');
+    } catch (err: unknown) {
+      onNotify?.(err instanceof Error ? err.message : 'Could not issue break-glass token', 'error');
+    } finally {
+      setLeaseBusy(null);
+    }
+  };
+
+  const handleRunCveScan = async () => {
+    setCveBusy(true);
+    setCveError(null);
+    try {
+      const res = await api.runCveScan({ allowNetwork: false });
+      setCveScan(res);
+      onNotify?.(`SBOM CVE scan complete: ${res.totalVulnerabilities} vulnerabilities across ${res.scannedPackages} packages`, res.totalVulnerabilities > 0 ? 'info' : 'success');
+    } catch (err: unknown) {
+      setCveError(err instanceof Error ? err.message : 'Could not scan SBOM CVEs');
+    } finally {
+      setCveBusy(false);
+    }
+  };
+
+  const handleExportIac = async () => {
+    setIacBusy(true);
+    setIacError(null);
+    try {
+      const res = await api.exportIacEstate({ format: 'all' });
+      setIacExport(res);
+      const keys = Object.keys(res.files || {});
+      if (keys.length > 0 && !keys.includes(iacFileTab)) {
+        setIacFileTab(keys[0]);
+      }
+      onNotify?.('OpenTofu (.tf) + Compose IaC bundle exported (0 plaintext secrets)', 'success');
+    } catch (err: unknown) {
+      setIacError(err instanceof Error ? err.message : 'Could not export IaC bundle');
+    } finally {
+      setIacBusy(false);
+    }
+  };
+
   const handleRunSecretScan = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!scanInput.trim()) return;
@@ -1516,7 +1690,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <div className="p-2.5 rounded-lg bg-white/90 border border-slate-200/80">
                     <span className="text-slate-500 block">Fuentes comprobadas</span>
                     <span className="font-mono font-semibold text-slate-900 text-xs">
-                      {auditVerification.filesChecked.length || 1}
+                      {(Array.isArray(auditVerification.filesChecked) ? auditVerification.filesChecked.length : 0) || 1}
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-white/90 border border-slate-200/80">
@@ -1644,7 +1818,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
 
-                {scanReport.findings.length > 0 && (
+                {Array.isArray(scanReport.findings) && scanReport.findings.length > 0 && (
                   <div className="space-y-2 max-h-60 overflow-y-auto">
                     {scanReport.findings.map((f, idx) => (
                       <div key={`${f.ruleId}-${f.line ?? idx}-${idx}`} className="p-3 rounded-lg bg-white border border-slate-200 space-y-1">
@@ -1674,6 +1848,341 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 )}
               </div>
             )}
+          </div>
+
+          {/* 5. WebAuthn Passkeys (FIDO2 · Zero-Dep CBOR/COSE) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Fingerprint className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.passkeyTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                      ES256 / Ed25519 · Zero-Dep CBOR
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.passkeyDesc')}</p>
+                </div>
+              </div>
+              <form onSubmit={(e) => void handleRegisterPasskey(e)} className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <input
+                  type="text"
+                  value={passkeyLabel}
+                  onChange={(e) => setPasskeyLabel(e.target.value)}
+                  placeholder="YubiKey / Touch ID"
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-900 w-40"
+                />
+                <button
+                  type="submit"
+                  disabled={passkeyBusy}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {passkeyBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                  <span>{passkeyBusy ? t('sec.passkeyRegistering') : t('sec.passkeyRegister')}</span>
+                </button>
+              </form>
+            </div>
+
+            {passkeyChallenge && (
+              <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 font-mono text-[11px] text-slate-700">
+                Challenge ready: <span className="font-semibold">{passkeyChallenge}</span> (120s single-use TTL)
+              </div>
+            )}
+
+            {passkeys.length === 0 ? (
+              <div className="text-slate-500">{t('sec.passkeyEmpty')}</div>
+            ) : (
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                {passkeys.map((pk) => (
+                  <div key={pk.id} className="px-4 py-2.5 bg-white flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-slate-900">{pk.label}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600">
+                          {pk.alg === -8 ? 'Ed25519' : 'ES256'}
+                        </span>
+                        <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                          signCount: {pk.signCount ?? 0}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleRevokePasskey(pk.id)}
+                      aria-label={`Revoke passkey ${pk.label}`}
+                      className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-red-50 text-slate-500 hover:text-red-700 cursor-pointer shrink-0"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 6. Ephemeral Secret Leases, 90d Rotation Audit & 15m Break-Glass */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('sec.leaseTitle')}</h2>
+                  <p className="text-slate-500 mt-0.5">{t('sec.leaseDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <input
+                  type="text"
+                  value={leaseKeyName}
+                  onChange={(e) => setLeaseKeyName(e.target.value)}
+                  aria-label="Secret key"
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 w-36"
+                />
+                <button
+                  type="button"
+                  disabled={leaseBusy !== null}
+                  onClick={() => void handleIssueLease()}
+                  className="culkibo-press inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <Key className="w-3.5 h-3.5" />
+                  <span>{t('sec.leaseIssue')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={leaseBusy !== null}
+                  onClick={() => void handleRotationAudit()}
+                  className="culkibo-press inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${leaseBusy === 'audit' ? 'animate-spin' : ''}`} />
+                  <span>{t('sec.leaseAudit')}</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-xl bg-amber-50/60 border border-amber-200">
+              <input
+                type="text"
+                value={breakGlassReason}
+                onChange={(e) => setBreakGlassReason(e.target.value)}
+                placeholder="Audited incident reason (min 10 chars)…"
+                className="flex-1 px-2.5 py-1.5 rounded-lg border border-amber-200 bg-white text-slate-900"
+              />
+              <button
+                type="button"
+                disabled={leaseBusy !== null}
+                onClick={() => void handleBreakGlass()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                <ShieldAlert className="w-3.5 h-3.5" />
+                <span>{t('sec.leaseBreakGlass')}</span>
+              </button>
+            </div>
+
+            {issuedLeaseToken && (
+              <div className="p-3 rounded-xl bg-slate-950 text-emerald-300 border border-slate-800 font-mono text-[11px] flex items-center justify-between gap-2">
+                <span className="truncate">One-time token: {issuedLeaseToken}</span>
+                <button
+                  type="button"
+                  onClick={() => void copySecurityValue(issuedLeaseToken, 'lease_tok', 'Lease token')}
+                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 shrink-0 cursor-pointer"
+                >
+                  {copiedSecKey === 'lease_tok' ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            )}
+
+            {rotationAudit && (
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5 tabular-nums">
+                <div className="font-semibold text-slate-900">
+                  Rotation Audit (&gt;{rotationAudit.maxAgeDays ?? 90}d): {rotationAudit.staleCount} stale / {rotationAudit.totalKeys} total keys
+                </div>
+                {Array.isArray(rotationAudit.staleKeys) && rotationAudit.staleKeys.length > 0 && (
+                  <div className="font-mono text-[11px] text-amber-800 space-y-0.5">
+                    {rotationAudit.staleKeys.slice(0, 5).map((sk, idx) => (
+                      <div key={idx}>• {sk.projectName || sk.projectId || 'vault'}: {sk.key} ({sk.ageDays ?? '>90'}d old)</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {secretLeases.length === 0 ? (
+              <div className="text-slate-500">{t('sec.leaseEmpty')}</div>
+            ) : (
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                {secretLeases.slice(0, 5).map((lease) => (
+                  <div key={lease.id} className="px-4 py-2.5 bg-white flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-mono font-semibold text-slate-900">{lease.secretKey}</span>
+                        <span className={`px-1.5 py-0.5 rounded font-mono text-[10px] border ${
+                          lease.kind === 'break_glass'
+                            ? 'bg-amber-50 text-amber-800 border-amber-200'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
+                        }`}>
+                          {lease.kind === 'break_glass' ? 'BREAK-GLASS' : (lease.scope || 'read')}
+                        </span>
+                        <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                          exp {new Date(lease.expiresAt).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      {lease.reason && <div className="text-[11px] text-slate-500 truncate">{lease.reason}</div>}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleRevokeLease(lease.id)}
+                      className="px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-red-50 text-slate-600 hover:text-red-700 text-[11px] cursor-pointer shrink-0"
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 7. Runtime SBOM CVE Drift Scanner (OSV.dev) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.cveTitle')}</h2>
+                    {cveScan && (
+                      <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600">
+                        {cveScan.offline ? 'Offline / Cached' : 'OSV.dev Live'}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.cveDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={cveBusy}
+                onClick={() => void handleRunCveScan()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {cveBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                <span>{cveBusy ? t('sec.cveScanning') : t('sec.cveScan')}</span>
+              </button>
+            </div>
+
+            {cveError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{cveError}</div>}
+
+            {cveScan && (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 tabular-nums">
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase text-slate-400 font-semibold block">Packages</span>
+                    <span className="font-mono text-sm font-semibold text-slate-900">{cveScan.scannedPackages}</span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-red-50/70 border border-red-200">
+                    <span className="text-[10px] uppercase text-red-600 font-semibold block">Critical</span>
+                    <span className="font-mono text-sm font-semibold text-red-700">{cveScan.bySeverity?.critical ?? 0}</span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-amber-50/70 border border-amber-200">
+                    <span className="text-[10px] uppercase text-amber-700 font-semibold block">High</span>
+                    <span className="font-mono text-sm font-semibold text-amber-800">{cveScan.bySeverity?.high ?? 0}</span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase text-slate-500 font-semibold block">Medium</span>
+                    <span className="font-mono text-sm font-semibold text-slate-800">{cveScan.bySeverity?.medium ?? 0}</span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-emerald-50/70 border border-emerald-200">
+                    <span className="text-[10px] uppercase text-emerald-700 font-semibold block">Low</span>
+                    <span className="font-mono text-sm font-semibold text-emerald-800">{cveScan.bySeverity?.low ?? 0}</span>
+                  </div>
+                </div>
+                {Array.isArray(cveScan.findings) && cveScan.findings.length > 0 && (
+                  <div className="space-y-1.5">
+                    {cveScan.findings.slice(0, 5).map((f, idx) => (
+                      <div key={f.id || idx} className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-between gap-2">
+                        <span className="font-mono font-semibold text-slate-900">{f.id} · {f.packageName || f.purl}</span>
+                        <span className="text-slate-600 truncate">{f.summary}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* 8. Zero Lock-In IaC Exporter (OpenTofu / Terraform + Portable Compose) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <FileCode2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.iacTitle')}</h2>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      <Lock className="w-3 h-3" />
+                      {t('sec.iacZeroSecrets')}
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.iacDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={iacBusy}
+                onClick={() => void handleExportIac()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {iacBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                <span>{iacBusy ? t('sec.iacExporting') : t('sec.iacExport')}</span>
+              </button>
+            </div>
+
+            {iacError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{iacError}</div>}
+
+            {iacExport && iacExport.files && (() => {
+              const fileNames = Object.keys(iacExport.files);
+              const activeFile = fileNames.includes(iacFileTab) ? iacFileTab : (fileNames[0] || 'main.tf');
+              const content = iacExport.files[activeFile] || '';
+              return (
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className="inline-flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200 overflow-x-auto max-w-full">
+                      {fileNames.map((fn) => (
+                        <button
+                          key={fn}
+                          type="button"
+                          onClick={() => setIacFileTab(fn)}
+                          className={`px-2.5 py-1 rounded-md font-mono text-[11px] font-medium cursor-pointer whitespace-nowrap ${
+                            activeFile === fn ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          {fn}
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void copySecurityValue(content, `iac_${activeFile}`, activeFile)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                    >
+                      {copiedSecKey === `iac_${activeFile}` ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>Copy {activeFile}</span>
+                    </button>
+                  </div>
+                  <pre className="p-3.5 rounded-xl bg-slate-950 text-emerald-200 font-mono text-[11px] leading-relaxed overflow-x-auto max-h-60 border border-slate-800">
+                    {content}
+                  </pre>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

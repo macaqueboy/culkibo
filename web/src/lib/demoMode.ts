@@ -87,6 +87,10 @@ interface DemoState {
   checkpoints: Record<string, any[]>;
   heartbeats: any[];
   meshPeers: any[];
+  passkeys: any[];
+  secretLeases: any[];
+  maintenanceWindows: any[];
+  incidents: any[];
 }
 
 function createInitialDemoState(): DemoState {
@@ -560,6 +564,56 @@ function createInitialDemoState(): DemoState {
         keyRotatedAt: t3,
         privateKeyEncrypted: true,
         status: 'connected',
+      },
+    ],
+    passkeys: [
+      {
+        id: 'pk_demo_macbook_es256',
+        userId: 'usr_owner',
+        label: 'MacBook Pro Touch ID (ES256)',
+        alg: -7,
+        signCount: 14,
+        createdAt: t3,
+        lastUsedAt: t1,
+      },
+    ],
+    secretLeases: [
+      {
+        id: 'lease_demo_ci_1',
+        projectId: 'proj_acme_web',
+        secretKey: 'DATABASE_URL',
+        scope: 'read',
+        kind: 'lease',
+        issuedBy: 'owner@acme-demo.dev',
+        reason: 'CI smoke verification read-only lease',
+        ttlSec: 3600,
+        expiresAt: nowIso(1000 * 60 * 48),
+        revoked: false,
+        createdAt: t1,
+      },
+    ],
+    maintenanceWindows: [
+      {
+        id: 'mw_demo_pg_sunday',
+        title: 'Weekly Postgres Vacuum & Index Maintenance',
+        targetIds: ['*'],
+        kind: 'recurring',
+        startAt: nowIso(1000 * 60 * 60 * 6),
+        durationMin: 30,
+        intervalDays: 7,
+        active: false,
+      },
+    ],
+    incidents: [
+      {
+        id: 'inc_demo_cdn',
+        title: 'Elevated Edge TLS Handshake Latency (EU-West)',
+        severity: 'minor',
+        status: 'monitoring',
+        affectedIds: ['mon_app'],
+        message: 'Switched ACME OCSP cache to memory fast-path; p95 latency back to 18 ms.',
+        createdAt: t2,
+        updatedAt: t1,
       },
     ],
   };
@@ -1323,6 +1377,275 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     }
     return jsonResponse({ ok: true, heartbeat: hb || null, status: hb?.status || 'up', lastPingAt: nowIso() });
   }
+
+  // --- Cycle-8 Enterprise Sovereignty APIs (Passkeys FIDO2, Secret Leases, OSV CVE, OpenTofu IaC, Drift Check, Maintenance & Incidents) ---
+  if (pathname === '/api/auth/passkeys' && method === 'GET') {
+    return jsonResponse({ passkeys: s.passkeys });
+  }
+  if (pathname === '/api/auth/passkeys/register/begin' && method === 'POST') {
+    const label = String(body.label || 'YubiKey 5C NFC (Ed25519)').trim();
+    const created = {
+      id: `pk_${Date.now().toString(36)}`,
+      userId: 'usr_owner',
+      label,
+      alg: -8,
+      signCount: 1,
+      createdAt: nowIso(),
+      lastUsedAt: nowIso(),
+    };
+    s.passkeys = [created, ...s.passkeys];
+    return jsonResponse({
+      challengeId: `chg_${Date.now().toString(36)}`,
+      challenge: 'Q3Vsa2lib1dlYkF1dGhuRklETzJDaGFsbGVuZ2VEZW1v',
+      rpId: typeof window !== 'undefined' ? window.location.hostname : 'localhost',
+      publicKey: { rp: { name: 'Culkibo' }, pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -8 }] },
+      demoRegistered: created,
+    }, 201);
+  }
+  const pkDelMatch = pathname.match(/^\/api\/auth\/passkeys\/([^/]+)$/);
+  if (pkDelMatch && method === 'DELETE') {
+    const id = decodeURIComponent(pkDelMatch[1]);
+    s.passkeys = s.passkeys.filter((p) => p.id !== id);
+    return jsonResponse({ ok: true, revoked: true });
+  }
+
+  if (pathname === '/api/security/leases') {
+    if (method === 'POST') {
+      const ttlSec = Math.max(60, Math.min(86400, Number(body.ttlSec) || 3600));
+      const lease = {
+        id: `lease_${Date.now().toString(36)}`,
+        projectId: body.projectId || 'proj_acme_web',
+        secretKey: String(body.secretKey || 'DATABASE_URL'),
+        scope: String(body.scope || 'read'),
+        kind: 'lease',
+        issuedBy: 'owner@acme-demo.dev',
+        reason: String(body.reason || 'Short-lived operator access'),
+        ttlSec,
+        expiresAt: nowIso(ttlSec * 1000),
+        revoked: false,
+        createdAt: nowIso(),
+      };
+      s.secretLeases = [lease, ...s.secretLeases];
+      return jsonResponse({ lease, token: `ckl_demo_${Math.random().toString(36).slice(2, 16)}` }, 201);
+    }
+    return jsonResponse({ leases: s.secretLeases.filter((l) => !l.revoked) });
+  }
+  const leaseDelMatch = pathname.match(/^\/api\/security\/leases\/([^/]+)$/);
+  if (leaseDelMatch && method === 'DELETE') {
+    const id = decodeURIComponent(leaseDelMatch[1]);
+    s.secretLeases = s.secretLeases.map((l) => (l.id === id ? { ...l, revoked: true } : l));
+    return jsonResponse({ ok: true, revoked: true });
+  }
+  if (pathname === '/api/security/break-glass' && method === 'POST') {
+    const reason = String(body.reason || '').trim();
+    if (reason.length < 10) {
+      return jsonResponse({ error: 'Break-Glass requires an audit reason of at least 10 characters.' }, 400);
+    }
+    const ttlSec = Math.min(900, Math.max(60, Number(body.ttlSec) || 900));
+    const lease = {
+      id: `bg_${Date.now().toString(36)}`,
+      projectId: '*',
+      secretKey: 'BREAK_GLASS_EMERGENCY',
+      scope: 'admin:emergency',
+      kind: 'break_glass',
+      issuedBy: 'owner@acme-demo.dev',
+      reason,
+      ttlSec,
+      expiresAt: nowIso(ttlSec * 1000),
+      revoked: false,
+      createdAt: nowIso(),
+    };
+    s.secretLeases = [lease, ...s.secretLeases];
+    return jsonResponse({ lease, token: `ckl_bg_${Math.random().toString(36).slice(2, 16)}` }, 201);
+  }
+  if (pathname === '/api/security/rotation-audit') {
+    return jsonResponse({
+      totalKeys: 11,
+      staleCount: 1,
+      maxAgeDays: 90,
+      staleKeys: [
+        { projectId: 'proj_edge_rust', projectName: 'edge-api-rust', key: 'STRIPE_WEBHOOK_SECRET', ageDays: 112 },
+      ],
+    });
+  }
+
+  if (pathname === '/api/security/cve-scan' || pathname === '/api/security/cve-scan/latest') {
+    return jsonResponse({
+      scannedPackages: 6,
+      vulnerablePackages: 0,
+      totalVulnerabilities: 0,
+      bySeverity: { critical: 0, high: 0, medium: 0, low: 0 },
+      offline: true,
+      cached: true,
+      scannedAt: nowIso(),
+      findings: [],
+    });
+  }
+
+  if (pathname === '/api/iac/export' && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      format: String(body.format || 'all'),
+      generatedAt: nowIso(),
+      secretsRedactedCount: 11,
+      stats: { projects: s.projects.length, databases: s.databases.length, domains: s.domains.length, crons: 3, meshPeers: s.meshPeers.length },
+      files: {
+        'main.tf': [
+          'terraform {',
+          '  required_version = ">= 1.6.0"',
+          '  required_providers {',
+          '    docker = { source = "kreuzwerker/docker", version = "~> 3.0" }',
+          '  }',
+          '}',
+          '',
+          'resource "docker_network" "culkibo_acme_saas_web" {',
+          '  name = "culkibo-net-proj-acme-web"',
+          '}',
+          '',
+          'resource "docker_container" "acme_saas_web" {',
+          '  name         = "culkibo-acme-saas-web"',
+          '  image        = "culkibo/acme-saas-web:sha-8c4f1a"',
+          '  stop_timeout = 30',
+          '  log_driver   = "json-file"',
+          '  log_opts     = { "max-size" = "10m", "max-file" = "3" }',
+          '  env = [',
+          '    "NODE_ENV=production",',
+          '    "DATABASE_URL=${var.acme_saas_web_database_url}",',
+          '  ]',
+          '}',
+        ].join('\n'),
+        'variables.tf': [
+          'variable "acme_saas_web_database_url" {',
+          '  type        = string',
+          '  sensitive   = true',
+          '  description = "Inject via TF_VAR_acme_saas_web_database_url (0 plaintext secrets exported)"',
+          '}',
+        ].join('\n'),
+        'docker-compose.yml': [
+          'services:',
+          '  acme-saas-web:',
+          '    image: culkibo/acme-saas-web:sha-8c4f1a',
+          '    stop_grace_period: 30s',
+          '    logging:',
+          '      driver: json-file',
+          '      options:',
+          '        max-size: "10m"',
+          '        max-file: "3"',
+          '    environment:',
+          '      DATABASE_URL: ${ACME_SAAS_WEB_DATABASE_URL}',
+          '    networks:',
+          '      - culkibo-net-proj-acme-web',
+          'networks:',
+          '  culkibo-net-proj-acme-web:',
+          '    driver: bridge',
+        ].join('\n'),
+        '.env.example': [
+          '# Culkibo Zero-Lock-In Export (0 plaintext secrets)',
+          'ACME_SAAS_WEB_DATABASE_URL=',
+          'ACME_SAAS_WEB_REDIS_URL=',
+          'EDGE_API_RUST_DATABASE_URL=',
+        ].join('\n'),
+      },
+    });
+  }
+
+  const driftMatch = pathname.match(/^\/api\/projects\/([^/]+)\/drift\/check$/);
+  if (driftMatch && method === 'POST') {
+    const pid = decodeURIComponent(driftMatch[1]);
+    const isDrifted = pid === 'proj_ai_worker';
+    return jsonResponse({
+      ok: true,
+      drifted: isDrifted,
+      runtimeOffline: false,
+      severity: isDrifted ? 'high' : 'none',
+      checkedAt: nowIso(),
+      declaredEnvKeyHash: 'sha256:9c41f8e2b7a0d3c6',
+      actualEnvKeyHash: isDrifted ? 'sha256:1b77d2a9e4f1c082' : 'sha256:9c41f8e2b7a0d3c6',
+      diffs: isDrifted
+        ? [
+            { field: 'memoryLimitMb', severity: 'high', declared: 512, actual: 1024, message: 'Live container memory cap (1024 MB) drifted from declared 512 MB.' },
+          ]
+        : [],
+      reconcilePlan: {
+        dryRunDefault: true,
+        actionCount: isDrifted ? 1 : 0,
+        actions: isDrifted ? ['Reconcile container memoryLimitMb 1024 MB -> 512 MB via zero-downtime fast restart'] : [],
+      },
+    });
+  }
+
+  if (pathname === '/api/uptime/maintenance') {
+    if (method === 'POST') {
+      const win = {
+        id: `mw_${Date.now().toString(36)}`,
+        title: String(body.title || 'Scheduled Maintenance Window'),
+        targetIds: Array.isArray(body.targetIds) && body.targetIds.length > 0 ? body.targetIds : ['*'],
+        kind: body.kind === 'once' ? 'once' : 'recurring',
+        startAt: String(body.startAt || nowIso(1000 * 60 * 30)),
+        durationMin: Math.max(5, Number(body.durationMin) || 60),
+        intervalDays: Math.max(1, Number(body.intervalDays) || 7),
+        active: false,
+      };
+      s.maintenanceWindows = [win, ...s.maintenanceWindows];
+      return jsonResponse({ window: win, ...win }, 201);
+    }
+    return jsonResponse({ windows: s.maintenanceWindows, maintenanceWindows: s.maintenanceWindows });
+  }
+  const mwDelMatch = pathname.match(/^\/api\/uptime\/maintenance\/([^/]+)$/);
+  if (mwDelMatch && method === 'DELETE') {
+    const id = decodeURIComponent(mwDelMatch[1]);
+    s.maintenanceWindows = s.maintenanceWindows.filter((w) => w.id !== id);
+    return jsonResponse({ ok: true, deleted: true });
+  }
+
+  if (pathname === '/api/uptime/incidents') {
+    if (method === 'POST') {
+      const inc = {
+        id: `inc_${Date.now().toString(36)}`,
+        title: String(body.title || 'Service Degradation'),
+        severity: String(body.severity || 'minor'),
+        status: String(body.status || 'investigating'),
+        affectedIds: Array.isArray(body.affectedIds) ? body.affectedIds : [],
+        message: String(body.message || 'Investigating elevated latency on upstream edge.'),
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+      s.incidents = [inc, ...s.incidents];
+      return jsonResponse({ incident: inc, ...inc }, 201);
+    }
+    return jsonResponse({ incidents: s.incidents });
+  }
+  const incPatchMatch = pathname.match(/^\/api\/uptime\/incidents\/([^/]+)$/);
+  if (incPatchMatch && method === 'PATCH') {
+    const id = decodeURIComponent(incPatchMatch[1]);
+    const inc = s.incidents.find((i) => i.id === id);
+    if (inc) {
+      if (body.status) inc.status = String(body.status);
+      if (body.message) inc.message = String(body.message);
+      inc.updatedAt = nowIso();
+    }
+    return jsonResponse({ incident: inc || null });
+  }
+
+  if (pathname === '/api/uptime/geo-failover/plan' && method === 'POST') {
+    const dom = String(body.domain || 'app.acme-demo.dev');
+    const primaryIp = String(body.primaryIp || '91.107.194.22');
+    const secondaryIp = String(body.secondaryIp || '157.90.18.44');
+    return jsonResponse({
+      domain: dom,
+      primaryIp,
+      secondaryIp,
+      consecutiveFailures: Number(body.consecutiveFailures) || 3,
+      ttlSec: Number(body.ttlSec) || 60,
+      strategy: 'active-passive-cloudflare-dns',
+      summary: `Fail over ${dom} from ${primaryIp} → ${secondaryIp} after ${Number(body.consecutiveFailures) || 3} failed health probes (TTL ${Number(body.ttlSec) || 60}s).`,
+      steps: [
+        `1. Verify secondary origin ${secondaryIp} passes HTTPS /health probe with <300 ms latency`,
+        `2. PATCH Cloudflare DNS A record for ${dom} -> ${secondaryIp} (TTL ${Number(body.ttlSec) || 60}s, proxied)`,
+        `3. Emit audit-chained failover event & open public status timeline note`,
+      ],
+    });
+  }
   if (pathname.match(/^\/api\/projects\/[^/]+\/sync\/status$/)) {
     return jsonResponse({
       projectId: pathname.split('/')[3],
@@ -1651,44 +1974,48 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (120 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (125 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 120 MCP tools on demand without bloating context (-83%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 125 MCP tools on demand without bloating context (-84%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_triage_playbook', description: 'Autonomous multi-signal triage chaining incidents, Build Healer, Drift Check & SBOM CVE scan', readOnly: true, profile: 'ops' },
+      { name: 'culkibo_cve_scan', description: 'Scan CycloneDX 1.6 SBOM against OSV.dev batch API with 24h cache & offline fallback', readOnly: true, profile: 'security' },
+      { name: 'culkibo_drift_check', description: 'Detect live container/DB config drift vs declared state & generate PgBouncer smart pool presets', readOnly: true, profile: 'ops' },
+      { name: 'culkibo_export_iac', description: 'Export zero lock-in OpenTofu/Terraform HCL + portable Compose with 0 plaintext secrets', readOnly: true, profile: 'deploy' },
+      { name: 'culkibo_secret_lease', description: 'Manage ephemeral secret leases, 90d rotation audits & audited 15m Break-Glass escalation', readOnly: false, profile: 'security' },
       { name: 'culkibo_heal_build_failure', description: 'Deterministic 20-pattern build/runtime root-cause classifier & safe dry-run auto-healer', readOnly: false, profile: 'deploy' },
       { name: 'culkibo_fleet_mesh', description: 'Zero-config WireGuard x25519 fleet mesh status, wg0.conf plan, and key rotation', readOnly: false, profile: 'ops' },
       { name: 'culkibo_cron_timeline', description: '24h cron collision heatmap and Dead-Man’s-Switch heartbeats status', readOnly: true, profile: 'ops' },
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
-      { name: 'culkibo_otlp_status', description: 'Inspect or configure native zero-dep OTLP/HTTP JSON exporter', readOnly: true, profile: 'ops' },
     ];
-    const generated = Array.from({ length: 120 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 125 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 120, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 125, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_smartpack_plan', status: 'ok', durationMs: 3, timestamp: nowIso(-60000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_heal_build_failure', status: 'ok', durationMs: 1, timestamp: nowIso(-180000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_triage_playbook', status: 'ok', durationMs: 4, timestamp: nowIso(-60000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_export_iac', status: 'ok', durationMs: 2, timestamp: nowIso(-180000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 120,
-      profiles: { core: { count: 17, savedPct: 83 } },
+      totalTools: 125,
+      profiles: { core: { count: 17, savedPct: 84 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {
@@ -1761,26 +2088,126 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     });
   }
 
-  // --- Security v1.1 & Settings ---
+  // --- Security v1.1, Remote Access, Team, GitOps, Backups, Notifications & Settings ---
+  if (pathname === '/api/system/remote-access') {
+    return jsonResponse({
+      panelDomain: 'panel.acme-demo.dev',
+      currentOrigin: parsed.origin,
+      recommendedUrl: 'https://panel.acme-demo.dev',
+      serverIp: '91.107.194.22',
+      auth: {
+        authenticated: true,
+        method: 'sandbox',
+        requireTokenAlways: true,
+        tokenConfigured: true,
+        tokenSource: 'data/auth.json',
+        allowedOrigins: [parsed.origin, 'https://panel.acme-demo.dev'],
+      },
+      caddy: { available: true, adminUrl: '127.0.0.1:2019', version: 'v2.11.1', reason: null },
+      cloudflare: { isConfigured: false, hasApiToken: false, accountId: null, tokenMasked: null, useMock: false },
+      tunnels: [],
+      tunnelsMock: false,
+      clientConfigs: {},
+      cliUpdateCommand: 'culkibo config set apiUrl https://panel.acme-demo.dev',
+    });
+  }
+  if (pathname === '/api/auth/me') {
+    return jsonResponse({
+      isSuperAdmin: true,
+      kind: 'session',
+      userId: 'usr_owner',
+      email: 'owner@acme-demo.dev',
+      name: 'Acme Platform Owner',
+      role: 'owner',
+      teamId: 'team_default',
+      scopes: ['*'],
+      projectIds: null,
+      multiUserEnabled: true,
+      usersCount: 2,
+      teamsCount: 1,
+    });
+  }
+  if (pathname === '/api/teams') {
+    return jsonResponse({ teams: [{ id: 'team_default', name: 'Acme Platform', slug: 'acme-platform', role: 'owner', membersCount: 2 }] });
+  }
+  if (pathname.match(/^\/api\/teams\/[^/]+\/members$/)) {
+    return jsonResponse({
+      members: [
+        { id: 'usr_owner', userId: 'usr_owner', email: 'owner@acme-demo.dev', name: 'Acme Owner', role: 'owner', createdAt: nowIso(-1000 * 60 * 60 * 240) },
+        { id: 'usr_dev', userId: 'usr_dev', email: 'dev@acme-demo.dev', name: 'Lead Engineer', role: 'developer', createdAt: nowIso(-1000 * 60 * 60 * 120) },
+      ],
+      invites: [],
+    });
+  }
+  if (pathname.match(/^\/api\/teams\/[^/]+\/invites$/)) {
+    return jsonResponse({ invites: [] });
+  }
+  if (pathname === '/api/auth/tokens') {
+    return jsonResponse({ tokens: [] });
+  }
+  if (pathname === '/api/vault') {
+    return jsonResponse({
+      secrets: [
+        { key: 'STRIPE_SECRET_KEY', scope: 'runtime', description: 'Production Stripe billing secret', updatedAt: nowIso(-1000 * 60 * 60 * 48) },
+      ],
+    });
+  }
+  if (pathname === '/api/gitops/drift') {
+    return jsonResponse({ inSync: true, drifted: false, hasDrift: false, drifts: [], summary: { create: 0, update: 0, delete: 0 } });
+  }
+  if (pathname === '/api/gitops/export' && method === 'POST') {
+    return jsonResponse({ yaml: 'version: 1\nprojects:\n  - name: acme-saas-web\n    branch: main\n', manifestHash: 'sha256:demo1234' });
+  }
+  if (pathname.match(/^\/api\/projects\/[^/]+\/environments$/)) {
+    return jsonResponse({ environments: [{ name: 'production', branch: 'main', varsCount: 5 }, { name: 'staging', branch: 'staging', varsCount: 4 }] });
+  }
+  if (pathname === '/api/backup/list') {
+    return jsonResponse({ backups: [] });
+  }
+  if (pathname === '/api/databases/storage') {
+    return jsonResponse({ configured: false });
+  }
+  if (pathname === '/api/databases/storage/objects') {
+    return jsonResponse({ objects: [] });
+  }
+  if (pathname === '/api/security/secrets/scan' && method === 'POST') {
+    const txt = String(body.text || '');
+    const findings: any[] = [];
+    if (/AKIA[0-9A-Z]{16}|sk_live_|ghp_/i.test(txt)) {
+      findings.push({ ruleId: 'secret-token', severity: 'critical', title: 'High-confidence API credential detected', line: 1, source: 'input', preview: '••••••', remediation: 'Move credential into Culkibo AES-256-GCM Vault (${vault.KEY}).' });
+    }
+    return jsonResponse({ clean: findings.length === 0, summary: { total: findings.length, critical: findings.length, high: 0, medium: 0, low: 0 }, findings });
+  }
   if (pathname === '/api/security/audit-log/verify') {
     return jsonResponse({ valid: true, checkedCount: 48, filesChecked: ['audit-2026-11.jsonl'], anchored: true, firstSeq: 1, lastSeq: 48, headHash: 'sha256:9f84b2c1e0d3a7f6543210fedcba9876', brokenAtSeq: null, brokenAtLine: null, brokenFile: null, reason: null });
   }
-  if (pathname === '/api/security/audit-log' || pathname === '/api/audit') {
-    return jsonResponse({
-      entries: [
-        { id: 'ev_1', source: 'deploy', action: 'deploy.promoted', target: 'acme-saas-web', timestamp: nowIso(-1000 * 60 * 14) },
-        { id: 'ev_2', source: 'ingress', action: 'tls.verified', target: 'app.acme-demo.dev', timestamp: nowIso(-1000 * 60 * 35) },
-      ],
-    });
+  if (pathname === '/api/security/audit-log' || pathname === '/api/system/audit' || pathname === '/api/audit') {
+    const list = [
+      { id: 'ev_1', seq: 48, source: 'deploy', action: 'deploy.promoted', target: 'acme-saas-web', entryHash: '9f84b2c1e0d3a7f6', timestamp: nowIso(-1000 * 60 * 14) },
+      { id: 'ev_2', seq: 47, source: 'ingress', action: 'tls.verified', target: 'app.acme-demo.dev', entryHash: '7a3c19e4b2d80f12', timestamp: nowIso(-1000 * 60 * 35) },
+    ];
+    return jsonResponse({ entries: list, events: list });
   }
   if (pathname === '/api/auth/oidc/providers') {
     return jsonResponse({ providers: [{ id: 'oidc_demo', type: 'oidc', protocol: 'OIDC PKCE S256', name: 'Authentik / Okta SSO', enabled: true, issuerUrl: 'https://sso.acme-demo.dev', defaultRole: 'developer' }] });
   }
   if (pathname === '/api/notifications/config') {
-    return jsonResponse({ enabled: true, events: { deploy_failed: true, service_down: true, tls_expiring: true } });
+    return jsonResponse({
+      enabled: true,
+      events: { deploy_failed: true, deploy_succeeded: true, service_down: true, ssl_issued: true, tls_expiring: true, project_stopped: false },
+      channels: {
+        telegram: { enabled: false, botToken: '', chatId: '', configured: false },
+        discord: { enabled: false, webhookUrl: '', configured: false },
+        slack: { enabled: false, webhookUrl: '', configured: false },
+        webhook: { enabled: false, url: '', configured: false },
+      },
+    });
+  }
+  if (pathname === '/api/notifications/history') {
+    return jsonResponse({ notifications: [] });
   }
   if (pathname === '/api/telemetry/status') {
-    return jsonResponse({ enabled: false, lockedByEnv: false, instanceId: 'sandbox-ephemeral-0000' });
+    return jsonResponse({ enabled: false, persistedEnabled: false, lockedByEnv: false, instanceId: 'sandbox-ephemeral-0000' });
   }
   if (pathname === '/api/github/status') {
     return jsonResponse({ connected: true, username: 'acme-labs', scopes: ['repo', 'admin:repo_hook'] });

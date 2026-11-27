@@ -133,6 +133,8 @@ class IngressManager {
     this.wildcardPolicies = persisted.wildcardPolicies;
     /** @type {string | null} */
     this.acmeEmail = persisted.acmeEmail;
+    /** @type {'classic' | 'shortlived' | null} */
+    this.acmeProfile = persisted.acmeProfile || null;
     /** @type {{ enabled: boolean, tunnelId: string | null, mode: 'per_hostname' | 'all_to_caddy', containerName: string, caddyUpstream: string, lastSyncedAt: string | null }} */
     this.tunnelConfig = persisted.tunnelConfig;
     /** @type {Map<string, { hostname: string, upstream: string, projectId: string, prNumber: number }>} */
@@ -156,11 +158,12 @@ class IngressManager {
   }
 
   _loadConfig() {
-    /** @type {{ panelDomain: string | null, wildcardPolicies: any[], acmeEmail: string | null, tunnelConfig: { enabled: boolean, tunnelId: string | null, mode: 'per_hostname' | 'all_to_caddy', containerName: string, caddyUpstream: string, lastSyncedAt: string | null } }} */
+    /** @type {{ panelDomain: string | null, wildcardPolicies: any[], acmeEmail: string | null, acmeProfile: 'classic' | 'shortlived' | null, tunnelConfig: { enabled: boolean, tunnelId: string | null, mode: 'per_hostname' | 'all_to_caddy', containerName: string, caddyUpstream: string, lastSyncedAt: string | null } }} */
     const out = {
       panelDomain: process.env.CULKIBO_PANEL_DOMAIN ? String(process.env.CULKIBO_PANEL_DOMAIN).trim().toLowerCase() : null,
       wildcardPolicies: [],
       acmeEmail: process.env.CULKIBO_ACME_EMAIL ? String(process.env.CULKIBO_ACME_EMAIL).trim().toLowerCase() : null,
+      acmeProfile: process.env.CULKIBO_ACME_PROFILE === 'shortlived' ? 'shortlived' : null,
       tunnelConfig: {
         enabled: false,
         tunnelId: null,
@@ -346,6 +349,7 @@ class IngressManager {
       askEndpoint: this.askEndpoint(),
       wildcardPolicies: effectivePolicies,
       acmeEmail: this.acmeEmail,
+      ...(this.acmeProfile === 'shortlived' ? { acmeProfile: 'shortlived' } : {}),
       customCertFiles
     };
   }
@@ -1745,7 +1749,209 @@ class IngressManager {
     };
     return this.lastTlsAudit;
   }
+
+  /**
+   * Comprueba TODOS los registros CAA DNS de un dominio antes de emitir TLS
+   * (cierra `uptime-kuma#6519`, que solo inspeccionaba el registro `[0]`).
+   * Conforme a RFC 8659: si no existen registros CAA relevantes, cualquier CA está autorizada;
+   * si existen registros `issue`/`issuewild`, basta con que AL MENOS UNO autorice `expectedCa`.
+   *
+   * @param {string} hostname
+   * @param {{
+   *   expectedCa?: string,
+   *   isWildcard?: boolean,
+   *   resolveCaaImpl?: ((host: string) => Promise<Array<{ critical?: number, issue?: string, issuewild?: string, iodef?: string }>>) | null
+   * }} [opts]
+   */
+  async checkAllCaaRecords(hostname, opts = {}) {
+    return checkAllCaaRecords(hostname, opts);
+  }
+
+  /**
+   * Devuelve la especificación del perfil ACME (`classic` 90d o `shortlived` 6d / 160h GA de Let's Encrypt,
+   * `caddy#7670`) junto con la comprobación ECH sobre HTTP/3 QUIC.
+   *
+   * @param {'classic' | 'shortlived' | string} [profile]
+   * @param {{ echEnabled?: boolean }} [opts]
+   */
+  getAcmeProfileSpec(profile = 'classic', opts = {}) {
+    return getAcmeProfileSpec(profile, opts);
+  }
 }
 
-const ingressManagerInstance = Object.assign(new IngressManager(), { IngressManager });
+/**
+ * Inspecciona TODOS los registros CAA devueltos por `dns.promises.resolveCaa()` (nunca solo `[0]`,
+ * cerrando `uptime-kuma#6519`).
+ *
+ * @param {string} hostname
+ * @param {{
+ *   expectedCa?: string,
+ *   isWildcard?: boolean,
+ *   resolveCaaImpl?: ((host: string) => Promise<Array<{ critical?: number, issue?: string, issuewild?: string, iodef?: string }>>) | null
+ * }} [opts]
+ */
+async function checkAllCaaRecords(hostname, opts = {}) {
+  const raw = String(hostname || '').trim().toLowerCase().replace(/\.+$/, '');
+  const wildcard = Boolean(opts.isWildcard) || raw.startsWith('*.');
+  const cleanHost = raw.replace(/^\*\./, '');
+  if (!cleanHost || /[\s\r\n\0]/.test(cleanHost) || !/^[a-z0-9.-]+$/.test(cleanHost) || !cleanHost.includes('.')) {
+    const err = new Error(`Hostname inválido para comprobación CAA: "${String(hostname || '').slice(0, 80)}"`);
+    /** @type {any} */ (err).status = 400;
+    /** @type {any} */ (err).code = 'INVALID_HOSTNAME';
+    throw err;
+  }
+
+  const expectedCa = String(opts.expectedCa || 'letsencrypt.org').trim().toLowerCase();
+  /** @type {Array<{ critical?: number, issue?: string, issuewild?: string, iodef?: string }>} */
+  let records = [];
+  /** @type {string | null} */
+  let dnsErrorCode = null;
+
+  try {
+    const resolver = typeof opts.resolveCaaImpl === 'function'
+      ? opts.resolveCaaImpl
+      : (h) => getDns().resolveCaa(h);
+    const res = await resolver(cleanHost);
+    records = Array.isArray(res) ? res : [];
+  } catch (err) {
+    const code = err && /** @type {any} */ (err).code ? String(/** @type {any} */ (err).code) : '';
+    if (code === 'ENODATA' || code === 'NODATA' || code === 'ENOTFOUND' || code === 'NXDOMAIN') {
+      records = [];
+      dnsErrorCode = code;
+    } else {
+      throw err;
+    }
+  }
+
+  if (records.length === 0) {
+    return {
+      hostname: cleanHost,
+      expectedCa,
+      isWildcard: wildcard,
+      allowed: true,
+      recordsCount: 0,
+      records: [],
+      matchingRecords: [],
+      blockingRecords: [],
+      dnsCode: dnsErrorCode,
+      reason: 'No CAA records published; issuance is allowed for any CA per RFC 8659.'
+    };
+  }
+
+  const issueRecords = records.filter((r) => r && typeof r.issue === 'string');
+  const issueWildRecords = records.filter((r) => r && typeof r.issuewild === 'string');
+  // RFC 8659 §4: para comodines prevalece `issuewild` si existe; si no, aplica `issue`
+  const relevantTag = (wildcard && issueWildRecords.length > 0) ? 'issuewild' : 'issue';
+  const relevant = relevantTag === 'issuewild' ? issueWildRecords : issueRecords;
+
+  if (relevant.length === 0) {
+    return {
+      hostname: cleanHost,
+      expectedCa,
+      isWildcard: wildcard,
+      allowed: true,
+      recordsCount: records.length,
+      records,
+      matchingRecords: [],
+      blockingRecords: [],
+      reason: `Published CAA records (${records.length}) contain no restricting ${relevantTag} directives; issuance allowed.`
+    };
+  }
+
+  /** @type {Array<{ tag: string, ca: string, raw: string, critical: boolean }>} */
+  const matchingRecords = [];
+  /** @type {Array<{ tag: string, ca: string, raw: string, critical: boolean }>} */
+  const blockingRecords = [];
+
+  for (const rec of relevant) {
+    const rawVal = String(rec[relevantTag] || '').trim();
+    const caDomain = rawVal.split(';')[0].trim().toLowerCase();
+    const entry = {
+      tag: relevantTag,
+      ca: caDomain || ';',
+      raw: rawVal,
+      critical: Boolean(rec.critical)
+    };
+    if (caDomain && caDomain === expectedCa) {
+      matchingRecords.push(entry);
+    } else {
+      blockingRecords.push(entry);
+    }
+  }
+
+  const allowed = matchingRecords.length > 0;
+  const reason = allowed
+    ? `Authorized by ${matchingRecords.length}/${relevant.length} CAA ${relevantTag} record(s) matching ${expectedCa}.`
+    : `Blocked by ${blockingRecords.length} CAA ${relevantTag} record(s) (none authorize ${expectedCa}).`;
+
+  return {
+    hostname: cleanHost,
+    expectedCa,
+    isWildcard: wildcard,
+    allowed,
+    recordsCount: records.length,
+    records,
+    matchingRecords,
+    blockingRecords,
+    reason
+  };
+}
+
+/**
+ * Devuelve las especificaciones del perfil ACME (`classic` 90d o Let's Encrypt GA 6d `160h` `shortlived`,
+ * `caddy#7670`) + metadatos de verificación ECH QUIC.
+ *
+ * @param {'classic' | 'shortlived' | string} [profile]
+ * @param {{ echEnabled?: boolean }} [opts]
+ */
+function getAcmeProfileSpec(profile = 'classic', opts = {}) {
+  const clean = String(profile || 'classic').trim().toLowerCase();
+  const echEnabled = Boolean(opts && opts.echEnabled);
+  if (clean === 'shortlived') {
+    return {
+      profile: 'shortlived',
+      ca: 'letsencrypt.org',
+      validityHours: 160,
+      validityDays: 6,
+      renewBeforeHours: 48,
+      ocspStaplingRequired: false,
+      caddyIssuerProfile: 'shortlived',
+      echQuicCheck: {
+        enabled: echEnabled,
+        requiresHttp3Udp443: true,
+        dnsRecordType: 'HTTPS',
+        alpn: ['h3', 'h2']
+      },
+      summary: "Let's Encrypt GA 6-day (160h) shortlived ACME profile with 48h auto-renewal and ECH QUIC check"
+    };
+  }
+  if (clean === 'classic') {
+    return {
+      profile: 'classic',
+      ca: 'letsencrypt.org',
+      validityHours: 2160,
+      validityDays: 90,
+      renewBeforeHours: 720,
+      ocspStaplingRequired: true,
+      caddyIssuerProfile: null,
+      echQuicCheck: {
+        enabled: echEnabled,
+        requiresHttp3Udp443: true,
+        dnsRecordType: 'HTTPS',
+        alpn: ['h3', 'h2']
+      },
+      summary: 'Standard 90-day ACME certificate profile with 30-day renewal window'
+    };
+  }
+  const err = new Error(`Perfil ACME no soportado: "${clean}". Usa "classic" o "shortlived".`);
+  /** @type {any} */ (err).status = 400;
+  /** @type {any} */ (err).code = 'INVALID_ACME_PROFILE';
+  throw err;
+}
+
+const ingressManagerInstance = Object.assign(new IngressManager(), {
+  IngressManager,
+  checkAllCaaRecords,
+  getAcmeProfileSpec
+});
 module.exports = ingressManagerInstance;
