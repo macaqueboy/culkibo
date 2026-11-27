@@ -91,6 +91,25 @@ const PROTECTED_CONTAINER_LABEL = 'culkibo.protected';
 const MAX_BUILDKIT_KEEP_STORAGE_GB = 20;
 /** TTL por defecto de un bloqueo de despliegue antes de considerarse huérfano/bloqueado (Dokploy BullMQ deadlock). */
 const DEPLOY_LOCK_DEFAULT_TTL_MS = 30 * 60 * 1000;
+/** Drivers de log Docker que aceptan `--log-opt max-size` y `max-file` (kamal#1709). */
+const SIZE_ROTATION_LOG_DRIVERS = new Set(['json-file', 'local']);
+/** Lista blanca de log drivers Docker permitidos en contenedores gestionados. */
+const ALLOWED_LOG_DRIVERS = new Set(['json-file', 'local', 'syslog', 'journald', 'none', 'fluentd', 'gelf', 'awslogs']);
+
+/**
+ * Devuelve un nombre determinista de red bridge aislada por proyecto (`dokploy#6028`)
+ * para impedir colisiones DNS entre proyectos que comparten nombres de servicio como `api` o `web`.
+ * @param {string} projectId
+ * @returns {string}
+ */
+function getProjectNetworkName(projectId) {
+  const clean = String(projectId || 'app')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'app';
+  return `culkibo-net-${clean}`;
+}
 
 /**
  * Comprueba de forma portable si un PID sigue vivo en el sistema operativo.
@@ -248,6 +267,7 @@ const DEFAULTS = {
   drainTimeoutMs: 30000,
   stopGraceSeconds: 30,
   stopGracePeriodSec: 30,
+  logDriver: 'json-file',
   logMaxSizeMb: 10,
   logMaxFiles: 3,
   memoryMb: 1024,
@@ -2994,7 +3014,7 @@ class DeployManager extends EventEmitter {
    * @param {{containerName: string, imageTag: string, hostPort: number, containerPort: number,
    *   envNames?: string[], envFile?: string | null, network?: string | null, memoryMb?: number, cpus?: string | number,
    *   pidsLimit?: number, healthCmd?: string | null, healthStartPeriodSec?: number, healthRetries?: number,
-   *   stopGracePeriodSec?: number, logMaxSizeMb?: number, logMaxFiles?: number,
+   *   stopGracePeriodSec?: number, logDriver?: string, logMaxSizeMb?: number, logMaxFiles?: number,
    *   labels?: Record<string, any>, protectedContainer?: boolean, sleeping?: boolean}} spec
    * @returns {string[]}
    */
@@ -3013,6 +3033,7 @@ class DeployManager extends EventEmitter {
     healthStartPeriodSec = DEFAULTS.healthStartPeriodSec,
     healthRetries = DEFAULTS.healthRetries,
     stopGracePeriodSec = DEFAULTS.stopGracePeriodSec,
+    logDriver = DEFAULTS.logDriver,
     logMaxSizeMb = DEFAULTS.logMaxSizeMb,
     logMaxFiles = DEFAULTS.logMaxFiles,
     labels = {},
@@ -3020,6 +3041,8 @@ class DeployManager extends EventEmitter {
     sleeping = false
   }) {
     const safeStopTimeout = sanitizeBoundedInt(stopGracePeriodSec, DEFAULTS.stopGracePeriodSec, 5, 300);
+    const rawDriver = String(logDriver || DEFAULTS.logDriver).trim().toLowerCase();
+    const safeLogDriver = ALLOWED_LOG_DRIVERS.has(rawDriver) ? rawDriver : DEFAULTS.logDriver;
     const safeLogMaxSizeMb = sanitizeBoundedInt(logMaxSizeMb, DEFAULTS.logMaxSizeMb, 1, 500);
     const safeLogMaxFiles = sanitizeBoundedInt(logMaxFiles, DEFAULTS.logMaxFiles, 1, 20);
     const args = [
@@ -3043,11 +3066,11 @@ class DeployManager extends EventEmitter {
       '--security-opt', 'no-new-privileges',
       '--cap-drop', 'ALL',
       ...(Number(containerPort) < 1024 ? ['--cap-add', 'NET_BIND_SERVICE'] : []),
-      // Sin esto el log JSON de un contenedor hablador llena el disco del VPS;
-      // fijar --log-driver json-file evita fallos en hosts con journald/syslog (Dokku #4388).
-      '--log-driver', 'json-file',
-      '--log-opt', `max-size=${safeLogMaxSizeMb}m`,
-      '--log-opt', `max-file=${safeLogMaxFiles}`
+      // Kamal #1709 / Dokku #4388: emitir max-size/max-file SOLO en drivers compatibles (json-file/local)
+      '--log-driver', safeLogDriver,
+      ...(SIZE_ROTATION_LOG_DRIVERS.has(safeLogDriver)
+        ? ['--log-opt', `max-size=${safeLogMaxSizeMb}m`, '--log-opt', `max-file=${safeLogMaxFiles}`]
+        : [])
     ];
 
     if (network) args.push('--network', network);
@@ -4839,6 +4862,7 @@ class DeployManager extends EventEmitter {
             20
           );
 
+          const logDriver = options.logDriver || project.logDriver || opts.logDriver || DEFAULTS.logDriver;
           const runArgs = this.runArgs({
             containerName: deployment.containerName,
             imageTag: deployment.imageTag,
@@ -4854,6 +4878,7 @@ class DeployManager extends EventEmitter {
             healthStartPeriodSec,
             healthRetries,
             stopGracePeriodSec,
+            logDriver,
             logMaxSizeMb,
             logMaxFiles,
             labels: {
@@ -5728,8 +5753,9 @@ class DeployManager extends EventEmitter {
         ? opts.stopGracePeriodSec
         : (opts && opts.stopGraceSeconds !== undefined ? opts.stopGraceSeconds : DEFAULTS.stopGracePeriodSec);
       const graceSec = sanitizeBoundedInt(rawGrace, DEFAULTS.stopGracePeriodSec, 0, 300);
+      // Coolify #10791 & Dokploy #2227: usar --timeout (no --time/-t deprecado) tras drenar ruta Caddy
       const stop = await this.runDocker(
-        ['stop', '-t', String(graceSec), retiringName],
+        ['stop', '--timeout', String(graceSec), retiringName],
         { timeoutMs: (graceSec + 20) * 1000, env }
       );
       if (stop.code === 0) {
@@ -6508,7 +6534,7 @@ class DeployManager extends EventEmitter {
           5,
           300
         );
-        const res = await this.runDocker(['stop', '-t', String(stopGraceSec), state.current.containerName], { timeoutMs: (stopGraceSec + 20) * 1000, env });
+        const res = await this.runDocker(['stop', '--timeout', String(stopGraceSec), state.current.containerName], { timeoutMs: (stopGraceSec + 20) * 1000, env });
         if (res.code === 0) {
           state.current.status = 'detenido';
           state.current.protected = true;
@@ -7239,9 +7265,12 @@ instance.enforceComposeResourceLimits = enforceComposeResourceLimits;
 instance.buildComposeUpArgs = buildComposeUpArgs;
 instance.isPidAlive = isPidAlive;
 instance.buildSafePruneArgs = buildSafePruneArgs;
+instance.getProjectNetworkName = getProjectNetworkName;
 instance.PROTECTED_CONTAINER_LABEL = PROTECTED_CONTAINER_LABEL;
 instance.MAX_BUILDKIT_KEEP_STORAGE_GB = MAX_BUILDKIT_KEEP_STORAGE_GB;
 instance.DEPLOY_LOCK_DEFAULT_TTL_MS = DEPLOY_LOCK_DEFAULT_TTL_MS;
+instance.SIZE_ROTATION_LOG_DRIVERS = SIZE_ROTATION_LOG_DRIVERS;
+instance.ALLOWED_LOG_DRIVERS = ALLOWED_LOG_DRIVERS;
 instance.helpers = {
   safeSlug,
   isValidEnvName,
@@ -7268,9 +7297,12 @@ instance.helpers = {
   buildComposeUpArgs,
   isPidAlive,
   buildSafePruneArgs,
+  getProjectNetworkName,
   PROTECTED_CONTAINER_LABEL,
   MAX_BUILDKIT_KEEP_STORAGE_GB,
-  DEPLOY_LOCK_DEFAULT_TTL_MS
+  DEPLOY_LOCK_DEFAULT_TTL_MS,
+  SIZE_ROTATION_LOG_DRIVERS,
+  ALLOWED_LOG_DRIVERS
 };
 
 module.exports = instance;

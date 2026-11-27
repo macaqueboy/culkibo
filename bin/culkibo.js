@@ -46,7 +46,9 @@ const svc = {
   get timeMachineService() { return require('../server/services/timeMachineService'); },
   get finopsOptimizer() { return require('../server/services/finopsOptimizer'); },
   get metricsCollector() { return require('../server/services/metricsCollector'); },
-  get sleepAdvisor() { return require('../server/services/sleepAdvisor'); }
+  get sleepAdvisor() { return require('../server/services/sleepAdvisor'); },
+  get buildHealerService() { return require('../server/services/buildHealerService'); },
+  get fleetMeshService() { return require('../server/services/fleetMeshService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2869,15 +2871,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 116,
+            mcpTools: 120,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '116 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'Spatial SVG Topology, SmartPack, Shadow Replay, Time-Machine & FinOps Savings'
+            '120 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'Web Terminal, WireGuard Fleet Mesh, Edge PoW Shield, Auto-Healer, Time-Machine & FinOps'
           ]
         };
       };
@@ -3135,6 +3137,152 @@ program
         console.log(`   Right-sizing tips: ${analysis.recommendations.length} recomendación(es) detectadas`);
       }
       console.log('');
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-7 CLI: heal (20-Pattern Build Healer) & mesh (WireGuard Mesh)
+// ===========================================================================
+
+program
+  .command('heal [logFile]')
+  .description('Build Auto-Healer determinista (20 patrones, 0 LLM, 100% offline): diagnostica logs y genera parches seguros')
+  .option('-t, --text <str>', 'Texto de log directamente como argumento (sin archivo)')
+  .option('-p, --project <id>', 'ID de proyecto opcional para generar/aplicar plan de curación')
+  .option('--apply', 'Aplicar cambios seguros sobre --project (por defecto corre en dry-run)')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (logFile, options) => {
+    try {
+      let logsText = '';
+      if (typeof options.text === 'string' && options.text.length > 0) {
+        logsText = options.text;
+      } else if (logFile === '-' || (!logFile && !process.stdin.isTTY)) {
+        logsText = fs.readFileSync(0, 'utf8');
+      } else if (logFile) {
+        const resolved = path.resolve(String(logFile));
+        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+          throw new Error(`El archivo de logs no existe: ${resolved}`);
+        }
+        logsText = fs.readFileSync(resolved, 'utf8');
+      } else {
+        throw new Error('Proporciona un archivo de logs (`culkibo heal build.log`), `--text "..."` o stdin (`culkibo heal -`).');
+      }
+
+      const bh = svc.buildHealerService;
+      const projectId = options.project ? String(options.project) : null;
+      const diagnosis = bh.diagnoseLogs(logsText, projectId ? { projectId } : {});
+      /** @type {any} */
+      let healingPlan = null;
+      if (projectId) {
+        healingPlan = await bh.applyHealingPlan(projectId, {
+          logs: logsText,
+          ...(diagnosis?.primary?.code ? { code: diagnosis.primary.code } : {}),
+          dryRun: !options.apply
+        });
+      }
+
+      const payload = {
+        ok: true,
+        projectId,
+        dryRun: !options.apply,
+        matched: Boolean(diagnosis && diagnosis.matched),
+        diagnosis,
+        healingPlan
+      };
+
+      if (isJsonMode(options)) return printJson(payload);
+
+      if (!diagnosis || !diagnosis.matched) {
+        console.log(`\n\x1b[33m🩺 Culkibo Build Healer:\x1b[0m No se detectaron patrones conocidos en ${diagnosis?.analyzedLines ?? 0} línea(s) (${diagnosis?.analyzedMs ?? 0} ms).\n`);
+        return;
+      }
+      const p = diagnosis.primary;
+      console.log(`\n\x1b[32m🩺 Culkibo Build Auto-Healer — ${p.code} (${p.severity}, ${Math.round((p.confidence || 0) * 100)}% confianza)\x1b[0m`);
+      console.log(`   Título:      ${p.title}`);
+      console.log(`   Causa raíz:  ${p.rootCause}`);
+      if (p.matchedLine) console.log(`   Evidencia:   ${String(p.matchedLine).slice(0, 140)}`);
+      if (p.patchPreview) {
+        console.log('\n--- Patch Preview ---\n' + p.patchPreview);
+      }
+      if (healingPlan) {
+        console.log(`\n   Plan (${options.apply ? 'APLICADO' : 'DRY-RUN'}): proyecto ${projectId}`);
+      }
+      console.log('');
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('mesh <action>')
+  .description('Zero-Config WireGuard Fleet Mesh (10.88.0.0/24, x25519 AES-256-GCM): status | plan | rotate')
+  .option('--node <id>', 'ID del nodo objetivo (para action="rotate")')
+  .option('--apply', 'Ejecutar rotación real de clave x25519 (por defecto rotate corre en dry-run seguro)')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (action, options) => {
+    try {
+      const act = String(action || '').toLowerCase();
+      if (!['status', 'plan', 'rotate'].includes(act)) {
+        throw new Error(`Acción inválida "${action}". Usa: status | plan | rotate`);
+      }
+
+      const remote = getRemoteConfig(options);
+      if (remote.apiUrl) {
+        /** @type {any} */
+        let remoteRes;
+        if (act === 'status') {
+          remoteRes = await remoteApiRequest(remote, 'GET', '/api/fleet/mesh');
+        } else if (act === 'plan') {
+          remoteRes = await remoteApiRequest(remote, 'POST', '/api/fleet/mesh/plan', { dryRun: true });
+        } else {
+          if (!options.node) throw new Error('rotate requiere --node <nodeId>.');
+          remoteRes = await remoteApiRequest(remote, 'POST', '/api/fleet/mesh/rotate', {
+            nodeId: String(options.node),
+            dryRun: !options.apply
+          });
+        }
+        const payload = { ok: true, action: act, ...remoteRes };
+        if (isJsonMode(options)) return printJson(payload);
+        printJson(payload);
+        return;
+      }
+
+      const fm = svc.fleetMeshService;
+      if (act === 'status') {
+        const status = fm.getStatus();
+        const payload = { ok: true, action: 'status', ...status };
+        if (isJsonMode(options)) return printJson(payload);
+        console.log(`\n\x1b[36m🕸️  Culkibo WireGuard Fleet Mesh — ${status.cidr || '10.88.0.0/24'} (${status.interfaceName || 'wg0'})\x1b[0m`);
+        console.table((status.peers || []).map((p) => ({
+          Node: p.nodeId,
+          Name: p.name || '—',
+          MeshIP: p.meshIp,
+          PublicKey: p.publicKey ? `${String(p.publicKey).slice(0, 16)}…` : '—',
+          Port: p.listenPort || 51820,
+          Status: p.status || 'ready'
+        })));
+      } else if (act === 'plan') {
+        const plan = fm.planMesh(undefined, { dryRun: true });
+        const payload = { ok: true, action: 'plan', dryRun: true, ...plan };
+        if (isJsonMode(options)) return printJson(payload);
+        console.log(`\n\x1b[36m📋 Culkibo WireGuard Mesh Plan (dry-run · 0 private keys exposed)\x1b[0m`);
+        printJson(plan);
+      } else {
+        if (!options.node) {
+          throw new Error('rotate requiere --node <nodeId> (añade --apply para ejecutar rotación real).');
+        }
+        const dryRun = !options.apply;
+        const rotation = fm.rotatePeerKey(String(options.node), { dryRun });
+        const payload = { ...rotation, ok: true, action: 'rotate', nodeId: String(options.node), dryRun };
+        if (isJsonMode(options)) return printJson(payload);
+        if (dryRun) {
+          console.log(`\n\x1b[33m🧪 WireGuard Key Rotation Dry-Run\x1b[0m — nodo ${options.node} (añade --apply para rotar)\n`);
+        } else {
+          console.log(`\n\x1b[32m✅ Clave x25519 rotada\x1b[0m — nodo ${options.node}\n`);
+        }
+      }
     } catch (err) {
       failCli(err, options);
     }

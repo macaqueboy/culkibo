@@ -14,7 +14,8 @@ const domainManager = require('../server/services/domainManager');
 const projectManager = require('../server/services/projectManager');
 const { OidcService, resolveRoleFromClaims } = require('../server/services/oidcService');
 const { SslManager } = require('../server/services/sslManager');
-const { DeployManager, assertDiskHeadroom, parseCgroupV2MemoryStats, readContainerCgroupV2Memory, buildComposeResourceOverride, enforceComposeResourceLimits, buildSafePruneArgs, MAX_BUILDKIT_KEEP_STORAGE_GB } = require('../server/services/deployManager');
+const { DeployManager, assertDiskHeadroom, parseCgroupV2MemoryStats, readContainerCgroupV2Memory, buildComposeResourceOverride, enforceComposeResourceLimits, buildSafePruneArgs, MAX_BUILDKIT_KEEP_STORAGE_GB, getProjectNetworkName } = require('../server/services/deployManager');
+const systemDoctor = require('../server/services/systemDoctor');
 const { GitOpsManager } = require('../server/services/gitopsManager');
 const { ServerFleetManager } = require('../server/services/serverFleetManager');
 const { PreviewManager } = require('../server/services/previewManager');
@@ -1014,6 +1015,44 @@ function reqJson(port, method, pth, { token, body } = {}) {
       await new Promise((r) => srSrv.close(r));
     }
 
+    // Cycle-7 Lazy Routes: Fleet Mesh, Cron Timeline + Heartbeats, Edge Shield Challenge, Build Healer, Container Terminal Ticket
+    const meshRes = await reqJson(port, 'GET', '/api/fleet/mesh', { token: master });
+    assert.strictEqual(meshRes.status, 200, 'GET /api/fleet/mesh failed: ' + meshRes.text);
+    assert.strictEqual(meshRes.json.cidr, '10.88.0.0/24');
+    assert.ok(!meshRes.text.includes('BEGIN PRIVATE KEY'), 'Mesh API must never expose private keys');
+
+    const tlRes = await reqJson(port, 'GET', '/api/crons/timeline?hours=24', { token: master });
+    assert.strictEqual(tlRes.status, 200, 'GET /api/crons/timeline failed: ' + tlRes.text);
+    assert.strictEqual(tlRes.json.hours, 24);
+    assert.strictEqual(tlRes.json.slots.length, 24);
+
+    const shieldChal = await reqJson(port, 'GET', '/api/edge-shield/challenge?format=json&domain=app.example.test', { token: master });
+    assert.strictEqual(shieldChal.status, 200, 'GET /api/edge-shield/challenge failed: ' + shieldChal.text);
+    assert.ok(shieldChal.json.challengeId && shieldChal.json.salt);
+
+    const healDiag = await reqJson(port, 'POST', '/api/projects/proj_c2_api/build-healer/diagnose', {
+      token: master,
+      body: { logs: 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory' }
+    });
+    assert.strictEqual(healDiag.status, 200, 'POST build-healer/diagnose failed: ' + healDiag.text);
+    assert.strictEqual(healDiag.json.matched, true);
+    assert.strictEqual(healDiag.json.primary.code, 'NODE_HEAP_OOM');
+
+    const healApply = await reqJson(port, 'POST', '/api/projects/proj_c2_api/build-healer/apply', {
+      token: master,
+      body: { logs: 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory', dryRun: true }
+    });
+    assert.strictEqual(healApply.status, 200, 'POST build-healer/apply failed: ' + healApply.text);
+    assert.strictEqual(healApply.json.dryRun, true, 'build-healer/apply must await async applyHealingPlan and return dryRun=true');
+    assert.ok(healApply.json.patchPlan && typeof healApply.json.patchPlan === 'object', 'build-healer/apply must return populated patchPlan');
+
+    const termTicket = await reqJson(port, 'POST', '/api/projects/proj_c2_api/terminal/ticket', {
+      token: master,
+      body: { shell: '/bin/sh', cols: 100, rows: 30 }
+    });
+    assert.strictEqual(termTicket.status, 201, 'POST terminal/ticket failed: ' + termTicket.text);
+    assert.ok(termTicket.json.ticket && String(termTicket.json.wsPath || '').startsWith('/ws/terminal?ticket='));
+
     console.log('CYCLE2_HTTP_OK');
   } finally {
     await new Promise((r) => srv.close(r));
@@ -1488,9 +1527,74 @@ function reqJson(port, method, pth, { token, body } = {}) {
     } finally {
       clearInterval(keepLoop);
     }
-    assert.deepStrictEqual(capturedStopArgs, ['stop', '-t', '45', 'c_old_grace'], 'drainAndRetire debe pasar docker stop -t <sec>');
+    assert.deepStrictEqual(capturedStopArgs, ['stop', '--timeout', '45', 'c_old_grace'], 'drainAndRetire debe pasar docker stop --timeout <sec> (Coolify #10791 / Dokploy #2227)');
+
+    // Cycle-7 CVE Regressions (from docs/COMPETITOR_RADAR_CYCLE6.md §3):
+    // 9a. Kamal #1709: Omit --log-opt max-size/max-file on syslog/journald log drivers
+    const syslogArgs = dmLife.runArgs({
+      containerName: 'c_syslog',
+      imageTag: 'culkibo/life:v5',
+      hostPort: 23505,
+      containerPort: 3000,
+      logDriver: 'syslog'
+    });
+    assert.ok(syslogArgs.includes('--log-driver') && syslogArgs.includes('syslog'));
+    assert.ok(!syslogArgs.some((a) => a.includes('max-size=') || a.includes('max-file=')), 'syslog driver MUST NOT receive max-size/max-file log-opts (Kamal #1709)');
+    const journaldArgs = dmLife.runArgs({
+      containerName: 'c_journald',
+      imageTag: 'culkibo/life:v6',
+      hostPort: 23506,
+      containerPort: 3000,
+      logDriver: 'journald'
+    });
+    assert.ok(!journaldArgs.some((a) => a.includes('max-size=') || a.includes('max-file=')), 'journald driver MUST NOT receive max-size/max-file log-opts');
+    const localArgs = dmLife.runArgs({
+      containerName: 'c_local_log',
+      imageTag: 'culkibo/life:v7',
+      hostPort: 23507,
+      containerPort: 3000,
+      logDriver: 'local'
+    }).join(' ');
+    assert.ok(localArgs.includes('--log-driver local') && localArgs.includes('--log-opt max-size=10m'));
+
+    // 9b. Dokploy #6028: Deterministic per-project isolated bridge network (prevents cross-project DNS collision)
+    const netA = getProjectNetworkName('proj_alpha_1');
+    const netB = getProjectNetworkName('proj_beta_2');
+    assert.strictEqual(netA, 'culkibo-net-proj_alpha_1');
+    assert.notStrictEqual(netA, netB);
+
+    // 9c. Dokploy CVE-2026-129433: Reject shell metacharacters in DB serviceName / backup / restore paths
+    for (const evilName of ['pg;id', 'db`whoami`', 'svc$(rm -rf /)', 'db|cat /etc/passwd', '../escape', 'bad name']) {
+      assert.throws(
+        () => databaseManager.assertSafeServiceName(evilName, 'serviceName'),
+        (err) => err && err.code === 'INVALID_SERVICE_NAME',
+        `Debe rechazar serviceName malicioso (CVE-2026-129433): ${evilName}`
+      );
+    }
+    await assert.rejects(
+      () => databaseManager.runBackup('db_1;id'),
+      (err) => err && err.code === 'INVALID_SERVICE_NAME',
+      'runBackup debe rechazar metacaracteres en databaseId antes de invocar Docker'
+    );
+    await assert.rejects(
+      () => databaseManager.provision({ projectId: 'proj_1', engine: 'postgres', name: 'pg', bindAddress: '0.0.0.0' }),
+      (err) => err && err.code === 'PUBLIC_DB_EXPOSE_FORBIDDEN',
+      'provision debe impedir bind 0.0.0.0 sin publicExpose: true'
+    );
+
+    // 9d. Kamal #1856: systemDoctor.auditExposedDatabases flags 0.0.0.0 / publicExpose DBs with UFW_DOCKER_BYPASS_RISK
+    const ufwAudit = systemDoctor.auditExposedDatabases([
+      { id: 'db_safe', name: 'SafePG', engine: 'postgres', exposure: { enabled: false, bindAddress: '127.0.0.1', hostPort: null } },
+      { id: 'db_exposed', name: 'ExposedPG', engine: 'postgres', exposure: { enabled: true, bindAddress: '0.0.0.0', hostPort: 5432 } },
+      { id: 'db_pub', name: 'PublicRedis', engine: 'valkey', publicExpose: true }
+    ]);
+    assert.strictEqual(ufwAudit.safe, false);
+    assert.strictEqual(ufwAudit.exposedCount, 2);
+    assert.strictEqual(ufwAudit.findings[0].severity, 'high');
+    assert.strictEqual(ufwAudit.findings[0].code, 'UFW_DOCKER_BYPASS_RISK');
+    assert.ok(ufwAudit.findings[0].recommendation.includes('10.88.0.0/24'));
   }
-  console.log('  ✓ Wave-3 & Cycle-6 CVEs (8a-8f): culkibo.protected+BuildKit cap, stale lock PID/TTL reap, GitOps symlink+commitSha, webhook replay/no-204/redact, OIDC JWKS SWR, --stop-timeout, bounded log rotation y Local Server (Primary)');
+  console.log('  ✓ Wave-3, Cycle-6 & Cycle-7 CVEs (8a-8f, 9a-9d): culkibo.protected+BuildKit cap, stale lock PID/TTL reap, GitOps symlink+commitSha, webhook replay/no-204/redact, OIDC JWKS SWR, --stop-timeout/--timeout, Kamal #1709 logDriver, Dokploy #6028/CVE-2026-129433, Kamal #1856 UFW audit');
 
   console.log('✅ Suite #23 completada correctamente.\n');
 }

@@ -8,14 +8,49 @@ const { parseCron, nextCronRun } = require('./cronParser');
 const { parseSafeCommandArgv, sanitizeWorkdir } = require('./safeCommand');
 const { atomicWriteJsonSync } = require('./ssrfGuard');
 
-const DATA_DIR = process.env.CULKIBO_DATA_DIR
-  ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
-  : path.resolve(__dirname, '..', '..', 'data');
+function resolveDefaultDataDir() {
+  return process.env.CULKIBO_DATA_DIR
+    ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data')
+    : path.resolve(__dirname, '..', '..', 'data');
+}
+const DATA_DIR = resolveDefaultDataDir();
 const STORE_FILE = path.join(DATA_DIR, 'crons.json');
 const STORE_BAK_FILE = `${STORE_FILE}.bak`;
 const MAX_HISTORY_PER_JOB = 25;
 const MAX_OUTPUT_BYTES = 8 * 1024;
 const TICK_INTERVAL_MS = 30 * 1000;
+const COLLISION_WINDOW_MS = 5 * 60 * 1000;
+
+/** @type {any} */
+let _alertEngine = null;
+function getAlertEngine() {
+  if (!_alertEngine) {
+    try { _alertEngine = require('./alertEngine'); } catch (e) {}
+  }
+  return _alertEngine;
+}
+
+/** @type {any} */
+let _databaseManager = null;
+function getDatabaseManager() {
+  if (!_databaseManager) {
+    try { _databaseManager = require('./databaseManager'); } catch (e) {}
+  }
+  return _databaseManager;
+}
+
+/**
+ * Comparación en tiempo constante para tokens de heartbeat (evita timing attacks).
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function timingSafeTokenEqual(a, b) {
+  const ba = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  if (ba.length === 0 || ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
 
 /** @type {any} */
 let _deployManager = null;
@@ -118,17 +153,68 @@ async function readBoundedText(res, maxBytes = 32 * 1024) {
 }
 
 class CronManager extends EventEmitter {
-  constructor(storeFile = STORE_FILE) {
+  /**
+   * @param {string} [storeFile]
+   * @param {{ heartbeatsFile?: string | null }} [opts]
+   */
+  constructor(storeFile = STORE_FILE, opts = {}) {
     super();
+    this._explicitStoreFile = storeFile !== STORE_FILE ? path.resolve(storeFile) : null;
     this.storeFile = storeFile;
     this.storeBakFile = `${storeFile}.bak`;
+    this._explicitHeartbeatsFile = opts && opts.heartbeatsFile ? path.resolve(opts.heartbeatsFile) : null;
+    this.heartbeatsFile = this._explicitHeartbeatsFile || path.join(path.dirname(storeFile), 'heartbeats.json');
     /** @type {Array<any>} */
     this.jobs = [];
+    /** @type {Array<any>} */
+    this.heartbeats = [];
     /** @type {Set<string>} */
     this.runningJobs = new Set();
     /** @type {ReturnType<typeof setInterval> | null} */
     this._timer = null;
     this._loaded = false;
+    this._heartbeatsLoaded = false;
+    this._heartbeatsLoadedPath = null;
+  }
+
+  _resolveHeartbeatsFile() {
+    if (this._explicitHeartbeatsFile) return this._explicitHeartbeatsFile;
+    if (this._explicitStoreFile) return path.join(path.dirname(this._explicitStoreFile), 'heartbeats.json');
+    return path.join(resolveDefaultDataDir(), 'heartbeats.json');
+  }
+
+  _ensureHeartbeatsLoaded() {
+    const target = this._resolveHeartbeatsFile();
+    if (this._heartbeatsLoaded && this._heartbeatsLoadedPath === target) return;
+    this._heartbeatsLoaded = true;
+    this._heartbeatsLoadedPath = target;
+    this.heartbeatsFile = target;
+    try {
+      if (fs.existsSync(target)) {
+        const parsed = JSON.parse(fs.readFileSync(target, 'utf8'));
+        if (Array.isArray(parsed)) {
+          this.heartbeats = parsed;
+          return;
+        }
+        if (parsed && Array.isArray(parsed.heartbeats)) {
+          this.heartbeats = parsed.heartbeats;
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('[CronManager] Error leyendo heartbeats.json:', e.message);
+    }
+    this.heartbeats = [];
+  }
+
+  _saveHeartbeats() {
+    this._ensureHeartbeatsLoaded();
+    const target = this._resolveHeartbeatsFile();
+    try {
+      atomicWriteJsonSync(target, { version: 1, heartbeats: this.heartbeats }, 0o600);
+    } catch (e) {
+      console.error('[CronManager] No se pudo guardar heartbeats.json:', e.message);
+    }
   }
 
   _ensureLoaded() {
@@ -535,6 +621,401 @@ class CronManager extends EventEmitter {
         this.runNow(job.id, { trigger: 'schedule' }).catch(() => {});
       }
     }
+    try {
+      this.checkMissedHeartbeats(now);
+    } catch (e) {}
+  }
+
+  // =========================================================================
+  // 24h Visual Collision Heatmap & Dead-Man's-Switch Heartbeats (Cycle #7)
+  // =========================================================================
+
+  /**
+   * Proyecta las próximas `hours` (1..168, por defecto 24) de ejecuciones programadas
+   * combinando crons de proyectos y horarios de backup de bases de datos, agrupando
+   * en franjas horarias (`slots[]`) y detectando colisiones de I/O (`collisionWarnings[]`
+   * cuando >= 2 tareas coinciden en la misma ventana de 5 minutos).
+   *
+   * @param {{ hours?: number, projectIds?: string[] | Set<string> | null, nowMs?: number, includeDatabases?: boolean, databases?: any[] | null }} [opts]
+   */
+  getTimeline(opts = {}) {
+    this._ensureLoaded();
+    const hours = Math.max(1, Math.min(168, Math.round(Number(opts.hours) || 24)));
+    const startMs = opts.nowMs != null && Number.isFinite(Number(opts.nowMs)) ? Number(opts.nowMs) : Date.now();
+    const endMs = startMs + hours * 3600 * 1000;
+    const allowedSet = opts.projectIds
+      ? (opts.projectIds instanceof Set ? opts.projectIds : new Set(opts.projectIds))
+      : null;
+
+    /** @type {Array<{ id: string, kind: 'cron' | 'db_backup', name: string, projectId: string | null, schedule: string, heavyIo: boolean }>} */
+    const sources = [];
+    for (const job of this.jobs) {
+      if (!job || !job.enabled || !job.schedule) continue;
+      if (allowedSet && !allowedSet.has(job.projectId)) continue;
+      sources.push({
+        id: job.id,
+        kind: 'cron',
+        name: job.name || job.id,
+        projectId: job.projectId || null,
+        schedule: job.schedule,
+        heavyIo: job.mode === 'exec'
+      });
+    }
+
+    if (opts.includeDatabases !== false) {
+      /** @type {any[]} */
+      let dbs = [];
+      if (Array.isArray(opts.databases)) {
+        dbs = opts.databases;
+      } else {
+        try {
+          const dbm = getDatabaseManager();
+          if (dbm && typeof dbm.list === 'function') dbs = dbm.list();
+        } catch (e) {}
+      }
+      for (const db of dbs) {
+        if (!db || !db.schedule || !db.schedule.enabled || !db.schedule.cron) continue;
+        if (allowedSet && db.projectId && !allowedSet.has(db.projectId)) continue;
+        if (allowedSet && !db.projectId) continue;
+        sources.push({
+          id: `db_backup_${db.id}`,
+          kind: 'db_backup',
+          name: `Backup ${db.name || db.id}`,
+          projectId: db.projectId || null,
+          schedule: db.schedule.cron,
+          heavyIo: true
+        });
+      }
+    }
+
+    /** @type {Array<{ hourIndex: number, startAt: string, endAt: string, count: number, runs: any[] }>} */
+    const slots = [];
+    for (let h = 0; h < hours; h++) {
+      const sMs = startMs + h * 3600 * 1000;
+      slots.push({
+        hourIndex: h,
+        startAt: new Date(sMs).toISOString(),
+        endAt: new Date(sMs + 3600 * 1000).toISOString(),
+        count: 0,
+        runs: []
+      });
+    }
+
+    /** @type {Array<{ id: string, kind: string, name: string, projectId: string | null, schedule: string, runAt: string, runMs: number, heavyIo: boolean }>} */
+    const allRuns = [];
+    const MAX_OCCURRENCES_PER_JOB = 250;
+
+    for (const src of sources) {
+      let cursor = new Date(startMs - 1000);
+      let occ = 0;
+      while (occ < MAX_OCCURRENCES_PER_JOB) {
+        let nextDate;
+        try {
+          nextDate = nextCronRun(src.schedule, cursor);
+        } catch (e) {
+          break;
+        }
+        const runMs = nextDate.getTime();
+        if (!Number.isFinite(runMs) || runMs > endMs) break;
+        if (runMs >= startMs) {
+          const hourIdx = Math.min(hours - 1, Math.floor((runMs - startMs) / (3600 * 1000)));
+          const runObj = {
+            id: src.id,
+            kind: src.kind,
+            name: src.name,
+            projectId: src.projectId,
+            schedule: src.schedule,
+            runAt: nextDate.toISOString(),
+            runMs,
+            heavyIo: src.heavyIo
+          };
+          slots[hourIdx].runs.push({
+            id: runObj.id,
+            kind: runObj.kind,
+            name: runObj.name,
+            projectId: runObj.projectId,
+            schedule: runObj.schedule,
+            runAt: runObj.runAt,
+            heavyIo: runObj.heavyIo
+          });
+          slots[hourIdx].count++;
+          allRuns.push(runObj);
+        }
+        cursor = new Date(runMs + 60 * 1000);
+        occ++;
+      }
+    }
+
+    allRuns.sort((a, b) => a.runMs - b.runMs);
+
+    /** @type {Map<number, typeof allRuns>} */
+    const buckets = new Map();
+    for (const r of allRuns) {
+      const bucketId = Math.floor(r.runMs / COLLISION_WINDOW_MS);
+      let arr = buckets.get(bucketId);
+      if (!arr) {
+        arr = [];
+        buckets.set(bucketId, arr);
+      }
+      arr.push(r);
+    }
+
+    /** @type {Array<any>} */
+    const collisionWarnings = [];
+    for (const [bucketId, runsInWin] of buckets.entries()) {
+      const uniqueIds = new Set(runsInWin.map((r) => r.id));
+      if (uniqueIds.size < 2) continue;
+      const winStartMs = bucketId * COLLISION_WINDOW_MS;
+      const winEndMs = winStartMs + COLLISION_WINDOW_MS;
+      const heavyCount = runsInWin.filter((r) => r.heavyIo).length;
+      collisionWarnings.push({
+        windowStart: new Date(winStartMs).toISOString(),
+        windowEnd: new Date(winEndMs).toISOString(),
+        count: uniqueIds.size,
+        heavyIoCount: heavyCount,
+        severity: uniqueIds.size >= 3 || heavyCount >= 2 ? 'high' : 'medium',
+        jobs: runsInWin.map((r) => ({
+          id: r.id,
+          kind: r.kind,
+          name: r.name,
+          projectId: r.projectId,
+          runAt: r.runAt
+        })),
+        suggestion: 'Stagger overlapping cron or backup schedules by 10–15 minutes to prevent concurrent CPU/disk IO spikes.'
+      });
+      if (collisionWarnings.length >= 50) break;
+    }
+
+    return {
+      hours,
+      generatedAt: new Date(startMs).toISOString(),
+      jobCount: sources.length,
+      totalScheduledRuns: allRuns.length,
+      slots,
+      collisionWarnings
+    };
+  }
+
+  /**
+   * Crea un monitor Dead-Man's-Switch (estilo Healthchecks.io) con token aleatorio de 24 bytes hex.
+   * @param {{ name: string, projectId?: string | null, periodSec?: number, graceSec?: number }} opts
+   */
+  createHeartbeat(opts) {
+    this._ensureHeartbeatsLoaded();
+    const name = String((opts && opts.name) || '').trim().slice(0, 80);
+    if (!name) {
+      const err = new Error('El nombre del heartbeat es obligatorio');
+      /** @type {any} */ (err).status = 400;
+      throw err;
+    }
+    const projectId = opts && opts.projectId ? String(opts.projectId).trim().slice(0, 80) : null;
+    const periodSec = Math.max(1, Math.min(2592000, Math.round(Number(opts && opts.periodSec) || 3600)));
+    const graceRaw = opts && opts.graceSec !== undefined ? Number(opts.graceSec) : 300;
+    const graceSec = Number.isFinite(graceRaw) ? Math.max(0, Math.min(86400, Math.round(graceRaw))) : 300;
+    const token = crypto.randomBytes(24).toString('hex');
+    const nowIso = new Date().toISOString();
+
+    const hb = {
+      id: `hb_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`,
+      name,
+      projectId,
+      token,
+      pingUrl: `/api/heartbeat/${token}`,
+      periodSec,
+      graceSec,
+      status: 'new',
+      startedAt: null,
+      lastPingAt: null,
+      lastDurationMs: null,
+      lastMessage: '',
+      alertActive: false,
+      missedAt: null,
+      resolvedAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+
+    this.heartbeats.push(hb);
+    this._saveHeartbeats();
+    return { ...hb };
+  }
+
+  /**
+   * Lista monitores Dead-Man's-Switch filtrados opcionalmente por `projectIds`.
+   * @param {{ projectIds?: string[] | Set<string> | null }} [opts]
+   */
+  listHeartbeats(opts = {}) {
+    this._ensureHeartbeatsLoaded();
+    const allowedSet = opts && opts.projectIds
+      ? (opts.projectIds instanceof Set ? opts.projectIds : new Set(opts.projectIds))
+      : null;
+    return this.heartbeats
+      .filter((hb) => !allowedSet || (hb.projectId && allowedSet.has(hb.projectId)))
+      .map((hb) => ({ ...hb, pingUrl: `/api/heartbeat/${hb.token}` }));
+  }
+
+  /** @param {string} id */
+  getHeartbeatById(id) {
+    this._ensureHeartbeatsLoaded();
+    return this.heartbeats.find((hb) => hb.id === id) || null;
+  }
+
+  /** @param {string} id */
+  deleteHeartbeat(id) {
+    this._ensureHeartbeatsLoaded();
+    const idx = this.heartbeats.findIndex((hb) => hb.id === id);
+    if (idx === -1) return { deleted: false, id };
+    this.heartbeats.splice(idx, 1);
+    this._saveHeartbeats();
+    return { deleted: true, id };
+  }
+
+  /**
+   * Registra un check-in (`start`, `ok`, `fail`) buscando el token en tiempo constante (`timingSafeEqual`).
+   * @param {string} token
+   * @param {{ state?: 'start' | 'ok' | 'fail' | string, message?: string, nowMs?: number }} [opts]
+   */
+  recordPing(token, opts = {}) {
+    this._ensureHeartbeatsLoaded();
+    const cleanToken = String(token || '').trim();
+    if (!cleanToken) {
+      return { ok: false, found: false, status: 404, error: 'Token de heartbeat inválido' };
+    }
+
+    // Búsqueda en tiempo constante recorriendo todos los heartbeats sin cortar en el primer fallo
+    /** @type {any} */
+    let matched = null;
+    for (const hb of this.heartbeats) {
+      if (timingSafeTokenEqual(hb.token, cleanToken)) {
+        matched = hb;
+      }
+    }
+    if (!matched) {
+      return { ok: false, found: false, status: 404, error: 'Heartbeat no encontrado' };
+    }
+
+    const rawState = String((opts && opts.state) || 'ok').trim().toLowerCase();
+    if (rawState !== 'ok' && rawState !== 'start' && rawState !== 'fail') {
+      return { ok: false, found: true, status: 400, error: `Estado de heartbeat inválido: "${rawState}" (usa start, ok o fail)` };
+    }
+
+    const nowMs = opts && opts.nowMs != null && Number.isFinite(Number(opts.nowMs)) ? Number(opts.nowMs) : Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const message = String((opts && opts.message) || '').replace(/[\r\n\0]+/g, ' ').trim().slice(0, 300);
+    let autoResolved = false;
+
+    if (rawState === 'start') {
+      matched.startedAt = nowMs;
+      matched.status = 'running';
+      matched.lastMessage = message;
+      matched.updatedAt = nowIso;
+    } else if (rawState === 'ok') {
+      if (typeof matched.startedAt === 'number' && Number.isFinite(matched.startedAt)) {
+        matched.lastDurationMs = Math.max(0, nowMs - matched.startedAt);
+        matched.startedAt = null;
+      }
+      matched.lastPingAt = nowMs;
+      matched.status = 'up';
+      matched.lastMessage = message;
+      matched.updatedAt = nowIso;
+      if (matched.alertActive) {
+        matched.alertActive = false;
+        matched.resolvedAt = nowIso;
+        autoResolved = true;
+        this.emit('heartbeat_recovered', {
+          heartbeatId: matched.id,
+          name: matched.name,
+          projectId: matched.projectId,
+          resolvedAt: nowIso
+        });
+      }
+    } else {
+      matched.lastPingAt = nowMs;
+      matched.startedAt = null;
+      matched.status = 'down';
+      matched.lastMessage = message;
+      matched.alertActive = true;
+      matched.updatedAt = nowIso;
+      const failIncident = {
+        type: 'heartbeat_fail',
+        heartbeatId: matched.id,
+        name: matched.name,
+        projectId: matched.projectId,
+        message: message || `Heartbeat "${matched.name}" reported failure`,
+        at: nowIso
+      };
+      this.emit('heartbeat_failed', failIncident);
+      try {
+        const ae = getAlertEngine();
+        if (ae && typeof ae.emit === 'function') ae.emit('heartbeat_alert', failIncident);
+      } catch (e) {}
+    }
+
+    this._saveHeartbeats();
+    return {
+      ok: true,
+      found: true,
+      status: 200,
+      state: rawState,
+      autoResolved,
+      heartbeat: { ...matched, pingUrl: `/api/heartbeat/${matched.token}` }
+    };
+  }
+
+  /**
+   * Detecta heartbeats que superaron `lastPingAt + (periodSec + graceSec) * 1000`,
+   * los marca como `missed` y dispara una alerta deduplicada una sola vez hasta recuperación.
+   *
+   * @param {number} [nowMs]
+   * @param {{ onAlert?: (incident: any) => void }} [opts]
+   */
+  checkMissedHeartbeats(nowMs = Date.now(), opts = {}) {
+    this._ensureHeartbeatsLoaded();
+    const checkMs = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+    /** @type {Array<any>} */
+    const missed = [];
+    let dirty = false;
+
+    for (const hb of this.heartbeats) {
+      if (hb.lastPingAt == null) continue;
+      const deadlineMs = Number(hb.lastPingAt) + (Number(hb.periodSec) + Number(hb.graceSec)) * 1000;
+      if (checkMs > deadlineMs) {
+        const wasAlertActive = Boolean(hb.alertActive);
+        if (hb.status !== 'missed') {
+          hb.status = 'missed';
+          hb.missedAt = new Date(checkMs).toISOString();
+          hb.updatedAt = hb.missedAt;
+          dirty = true;
+        }
+        const incident = {
+          type: 'heartbeat_missed',
+          heartbeatId: hb.id,
+          name: hb.name,
+          projectId: hb.projectId,
+          overdueSec: Math.round((checkMs - deadlineMs) / 1000),
+          deadlineAt: new Date(deadlineMs).toISOString(),
+          detectedAt: new Date(checkMs).toISOString(),
+          deduplicated: wasAlertActive
+        };
+        missed.push(incident);
+
+        if (!wasAlertActive) {
+          hb.alertActive = true;
+          dirty = true;
+          this.emit('heartbeat_missed', incident);
+          if (opts && typeof opts.onAlert === 'function') {
+            try { opts.onAlert(incident); } catch (e) {}
+          }
+          try {
+            const ae = getAlertEngine();
+            if (ae && typeof ae.emit === 'function') ae.emit('heartbeat_alert', incident);
+          } catch (e) {}
+        }
+      }
+    }
+
+    if (dirty) this._saveHeartbeats();
+    return { checked: this.heartbeats.length, missed };
   }
 
   startScheduler() {

@@ -93,6 +93,47 @@ function checkHostMemory(snap, readProcMeminfo = null) {
   };
 }
 
+/**
+ * Auditoría anti-bypass UFW de Docker (`kamal#1856`):
+ * Docker inyecta reglas `iptables` DNAT antes de `INPUT`, saltándose UFW cuando una BD se enlaza a `0.0.0.0`.
+ * Marca cualquier base de datos gestionada expuesta en `0.0.0.0` / `publicExpose: true` con severidad `high`
+ * y código `UFW_DOCKER_BYPASS_RISK`, recomendando WireGuard Fleet Mesh (`10.88.0.0/24`) o `127.0.0.1`.
+ *
+ * @param {Array<any>} databases
+ */
+function auditExposedDatabases(databases = []) {
+  const list = Array.isArray(databases) ? databases : [];
+  /** @type {Array<{ databaseId: string, name: string, engine: string, bindAddress: string, hostPort: number | null, severity: 'high', code: 'UFW_DOCKER_BYPASS_RISK', recommendation: string }>} */
+  const findings = [];
+  for (const db of list) {
+    if (!db || typeof db !== 'object') continue;
+    const exp = db.exposure && typeof db.exposure === 'object' ? db.exposure : null;
+    const bindRaw = String((exp && exp.bindAddress) || db.bindAddress || '127.0.0.1').trim();
+    const isWildcardBind = bindRaw === '0.0.0.0' || bindRaw === '::' || bindRaw === '*';
+    const isExternalExposure = Boolean(
+      db.publicExpose === true ||
+      isWildcardBind ||
+      (exp && exp.enabled && bindRaw !== '127.0.0.1' && bindRaw !== '::1' && bindRaw !== 'localhost')
+    );
+    if (!isExternalExposure) continue;
+    findings.push({
+      databaseId: String(db.id || db.name || 'unknown'),
+      name: String(db.name || db.id || 'database'),
+      engine: String(db.engine || 'unknown'),
+      bindAddress: isWildcardBind ? bindRaw : (db.publicExpose ? '0.0.0.0' : bindRaw),
+      hostPort: exp && exp.hostPort != null ? Number(exp.hostPort) : (db.hostPort != null ? Number(db.hostPort) : null),
+      severity: 'high',
+      code: 'UFW_DOCKER_BYPASS_RISK',
+      recommendation: 'Bind managed databases to 127.0.0.1 or route cross-node DB traffic through Culkibo WireGuard Fleet Mesh (10.88.0.0/24) instead of 0.0.0.0 (Docker iptables bypasses UFW).'
+    });
+  }
+  return {
+    safe: findings.length === 0,
+    exposedCount: findings.length,
+    findings
+  };
+}
+
 function checkKeyFilePermissions() {
   if (process.platform === 'win32') return { ok: true, issues: [] };
   /** @type {string[]} */
@@ -567,9 +608,9 @@ async function runDoctor() {
   const auth = authStatus();
   const bindHost = process.env.CULKIBO_BIND || process.env.HOST || process.env.CULKIBO_HOST || '127.0.0.1';
   const exposedWithoutToken = bindHost === '0.0.0.0' && !auth.requireTokenAlways;
-  const exposedDbs = (databaseManager.list ? databaseManager.list() : []).filter(
-    (d) => d.exposure && d.exposure.enabled && d.exposure.bindAddress !== '127.0.0.1'
-  );
+  const allManagedDbs = databaseManager.list ? databaseManager.list() : [];
+  const dbExposureAudit = auditExposedDatabases(allManagedDbs);
+  const exposedDbs = dbExposureAudit.findings;
   const permCheck = checkKeyFilePermissions();
   /** @type {'ok' | 'warn' | 'fail'} */
   let secStatus = 'ok';
@@ -585,8 +626,8 @@ async function runDoctor() {
     secDetail = 'Los ficheros de claves deben tener modo 0600 (solo lectura/escritura para el propietario).';
   } else if (exposedDbs.length > 0) {
     secStatus = 'warn';
-    secSummary = `${exposedDbs.length} ${exposedDbs.length === 1 ? 'base de datos expuesta' : 'bases de datos expuestas'} fuera de loopback`;
-    secDetail = 'Revisa la exposición externa de tus bases de datos gestionadas y asegúrate de restringir el cortafuegos.';
+    secSummary = `${exposedDbs.length} ${exposedDbs.length === 1 ? 'base de datos expuesta' : 'bases de datos expuestas'} fuera de loopback (UFW_DOCKER_BYPASS_RISK)`;
+    secDetail = 'Docker iptables omite UFW cuando un puerto escucha en 0.0.0.0. Usa 127.0.0.1 o la malla privada WireGuard Fleet Mesh (10.88.0.0/24).';
   }
   checks.push({
     id: 'security',
@@ -595,7 +636,11 @@ async function runDoctor() {
     summary: secSummary,
     detail: secDetail,
     fixAction: null,
-    fixLabel: null
+    fixLabel: null,
+    metrics: {
+      ufwBypassCount: dbExposureAudit.exposedCount,
+      ufwBypassFindings: dbExposureAudit.findings
+    }
   });
 
   // 6. Dominios y caducidad TLS real
@@ -833,4 +878,4 @@ async function applyFix(action) {
   throw err;
 }
 
-module.exports = { runDoctor, applyFix, checkDiskSpace, checkHostMemory, checkKeyFilePermissions, listOrphanedManagedContainers, checkCostAndFleet };
+module.exports = { runDoctor, applyFix, checkDiskSpace, checkHostMemory, checkKeyFilePermissions, listOrphanedManagedContainers, checkCostAndFleet, auditExposedDatabases };

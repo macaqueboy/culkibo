@@ -22,8 +22,19 @@ import {
   Wrench,
   PauseCircle,
   Rocket,
+  Network,
+  RotateCw,
+  X,
 } from 'lucide-react';
-import { api, type FleetServer, type FleetSshKey, type DirectPushPlanResult } from '../lib/api';
+import {
+  api,
+  type FleetServer,
+  type FleetSshKey,
+  type DirectPushPlanResult,
+  type FleetMeshStatusResult,
+  type FleetMeshPlanResult,
+  type FleetMeshRotateResult,
+} from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
 import { Modal } from './Modal';
@@ -125,6 +136,13 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
   const [directPushLoading, setDirectPushLoading] = useState(false);
   const [directPushError, setDirectPushError] = useState<string | null>(null);
 
+  // WireGuard Fleet Mesh (10.88.0.0/24) state
+  const [mesh, setMesh] = useState<FleetMeshStatusResult | null>(null);
+  const [meshPlan, setMeshPlan] = useState<FleetMeshPlanResult | null>(null);
+  const [meshRotate, setMeshRotate] = useState<FleetMeshRotateResult | null>(null);
+  const [meshBusy, setMeshBusy] = useState<'plan' | 'rotate' | null>(null);
+  const [meshError, setMeshError] = useState<string | null>(null);
+
   const [probingId, setProbingId] = useState<string | null>(null);
   const [probingAll, setProbingAll] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -166,12 +184,14 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
 
   const loadFleet = useCallback(async () => {
     try {
-      const [srvRes, keyRes] = await Promise.all([
+      const [srvRes, keyRes, meshRes] = await Promise.all([
         api.getServers(),
         api.getFleetKeys().catch(() => ({ keys: [] })),
+        api.getFleetMesh().catch(() => null),
       ]);
       setServers(srvRes.servers || []);
       setKeys(keyRes.keys || []);
+      if (meshRes) setMesh(meshRes);
       setLoadError(null);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'No se pudo cargar la flota de servidores');
@@ -185,11 +205,13 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
     Promise.all([
       api.getServers(),
       api.getFleetKeys().catch(() => ({ keys: [] })),
+      api.getFleetMesh().catch(() => null),
     ])
-      .then(([srvRes, keyRes]) => {
+      .then(([srvRes, keyRes, meshRes]) => {
         if (!active) return;
         setServers(srvRes.servers || []);
         setKeys(keyRes.keys || []);
+        if (meshRes) setMesh(meshRes);
         setLoadError(null);
       })
       .catch((err) => {
@@ -456,6 +478,33 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
       setDirectPushError(err instanceof Error ? err.message : 'DirectPush plan error');
     } finally {
       setDirectPushLoading(false);
+    }
+  };
+
+  const handlePreviewMeshPlan = async () => {
+    setMeshBusy('plan');
+    setMeshError(null);
+    try {
+      const plan = await api.planFleetMesh({ dryRun: true, includeRedactedTemplate: true });
+      setMeshPlan(plan);
+    } catch (err: unknown) {
+      setMeshError(err instanceof Error ? err.message : 'WireGuard mesh plan unavailable');
+    } finally {
+      setMeshBusy(null);
+    }
+  };
+
+  const handleDryRunRotateKey = async (nodeId?: string) => {
+    const targetId = nodeId || mesh?.peers?.[0]?.nodeId || servers[0]?.id || 'local';
+    setMeshBusy('rotate');
+    setMeshError(null);
+    try {
+      const res = await api.rotateFleetMeshKey({ nodeId: targetId, dryRun: true });
+      setMeshRotate(res);
+    } catch (err: unknown) {
+      setMeshError(err instanceof Error ? err.message : 'WireGuard key rotation preview unavailable');
+    } finally {
+      setMeshBusy(null);
     }
   };
 
@@ -917,6 +966,169 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
               })}
             </div>
           )}
+
+          {/* Zero-Config WireGuard Fleet Mesh (10.88.0.0/24) Card */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                  <Network className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('fleet.meshTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                      x25519 · AES-256-GCM
+                    </span>
+                    {mesh?.firewallGuard?.blocksPublicDbPorts !== false && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                        <ShieldCheck className="w-3 h-3" />
+                        {t('fleet.meshUfwShield')}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('fleet.meshDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  disabled={meshBusy !== null}
+                  onClick={() => void handlePreviewMeshPlan()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {meshBusy === 'plan' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Terminal className="w-3.5 h-3.5" />}
+                  <span>{meshBusy === 'plan' ? t('fleet.meshPlanning') : t('fleet.meshPreview')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={meshBusy !== null}
+                  onClick={() => void handleDryRunRotateKey()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {meshBusy === 'rotate' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCw className="w-3.5 h-3.5" />}
+                  <span>{meshBusy === 'rotate' ? t('fleet.meshRotating') : t('fleet.meshRotate')}</span>
+                </button>
+              </div>
+            </div>
+
+            {meshError && (
+              <div className="mx-5 mt-3 p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{meshError}</div>
+            )}
+
+            {mesh && Array.isArray(mesh.peers) && mesh.peers.length > 0 ? (
+              <div className="divide-y divide-slate-100">
+                {mesh.peers.map((peer) => (
+                  <div key={peer.nodeId} className="px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-slate-900">{peer.name || peer.nodeId}</span>
+                        <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[11px] font-semibold text-slate-800 tabular-nums">
+                          {peer.meshIp}
+                        </span>
+                        <span className="font-mono text-[10px] text-slate-500">
+                          {peer.endpoint || `:${peer.listenPort || 51820}`}
+                        </span>
+                      </div>
+                      <div className="font-mono text-[11px] text-slate-500 mt-0.5 truncate" title={peer.publicKey}>
+                        pub: {peer.publicKey ? `${peer.publicKey.slice(0, 22)}…` : '—'}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-medium">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                        {peer.status || 'ready'}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={meshBusy !== null}
+                        onClick={() => void handleDryRunRotateKey(peer.nodeId)}
+                        className="px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-[11px] text-slate-700 cursor-pointer disabled:opacity-50"
+                      >
+                        Rotate
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="px-5 py-4 text-slate-500">{t('fleet.meshEmpty')}</div>
+            )}
+
+            {meshPlan && (() => {
+              const wgList = Array.isArray(meshPlan.wgConfigs) ? meshPlan.wgConfigs : null;
+              const firstConfig =
+                wgList?.[0]?.config ||
+                wgList?.[0]?.wgConfig ||
+                meshPlan.configs?.[0]?.wgConfig ||
+                meshPlan.configs?.[0]?.config ||
+                meshPlan.nodes?.[0]?.wgConfig ||
+                meshPlan.nodes?.[0]?.config ||
+                (meshPlan.wgConfigs && !Array.isArray(meshPlan.wgConfigs) ? Object.values(meshPlan.wgConfigs)[0] : null) ||
+                '# wg0.conf ready (redacted private key)';
+              const fp = meshPlan.firewallPlan;
+              const fwRules = Array.isArray(meshPlan.firewallRules)
+                ? meshPlan.firewallRules
+                : Array.isArray(fp)
+                  ? fp
+                  : typeof fp === 'string'
+                    ? fp.split('\n').filter(Boolean)
+                    : fp && typeof fp === 'object'
+                      ? [...(Array.isArray(fp.ufw) ? fp.ufw : []), ...(Array.isArray(fp.rules) ? fp.rules : [])]
+                      : [];
+              return (
+                <div className="p-4 bg-slate-50 border-t border-slate-200 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-slate-900">wg0.conf Preview (0 plaintext private keys)</span>
+                    <button type="button" onClick={() => setMeshPlan(null)} className="text-slate-400 hover:text-slate-700 cursor-pointer">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-emerald-200 font-mono text-[11px] leading-relaxed overflow-x-auto max-h-48 border border-slate-800">
+                    {firstConfig}
+                  </pre>
+                  {fwRules.length > 0 && (
+                    <div className="font-mono text-[11px] text-slate-600 space-y-0.5">
+                      {fwRules.slice(0, 4).map((r, i) => (
+                        <div key={i} className="truncate">• {r}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {meshRotate && (() => {
+              const nextPub = meshRotate.newPublicKey || meshRotate.previewNewPublicKey || meshRotate.newFingerprint || meshRotate.previewNewFingerprint;
+              const steps = Array.isArray(meshRotate.rolloutSteps) && meshRotate.rolloutSteps.length > 0
+                ? meshRotate.rolloutSteps
+                : Array.isArray(meshRotate.rolloutPlan)
+                  ? meshRotate.rolloutPlan
+                  : [];
+              return (
+                <div className="p-4 bg-slate-50 border-t border-slate-200 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-slate-900">
+                      Dry-Run x25519 Key Rotation · {meshRotate.nodeId} (v{meshRotate.nextKeyVersion ?? meshRotate.keyVersion ?? 2})
+                    </span>
+                    <button type="button" onClick={() => setMeshRotate(null)} className="text-slate-400 hover:text-slate-700 cursor-pointer">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  {nextPub && (
+                    <div className="font-mono text-[11px] text-emerald-700 truncate">
+                      next pub: {nextPub}
+                    </div>
+                  )}
+                  {steps.length > 0 && (
+                    <ul className="list-disc list-inside text-[11px] text-slate-600 space-y-0.5">
+                      {steps.map((step, idx) => <li key={idx}>{step}</li>)}
+                    </ul>
+                  )}
+                </div>
+              );
+            })()}
+          </section>
         </>
       )}
 

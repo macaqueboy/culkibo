@@ -4276,6 +4276,155 @@ export const api = {
       'Could not calculate cloud savings comparison'
     );
   },
+
+  // --- Cycle-7 Pioneer APIs (Web Terminal, Build Auto-Healer, WireGuard Mesh, Edge Shield, Cron Timeline & Heartbeats) ---
+
+  async issueTerminalTicket(
+    projectId: string,
+    payload: { shell?: '/bin/sh' | '/bin/bash' | '/bin/ash'; containerName?: string; cols?: number; rows?: number } = {}
+  ): Promise<TerminalTicketResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/terminal/ticket`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not issue container terminal ticket'
+    );
+  },
+
+  async listTerminalSessions(): Promise<{ sessions: TerminalSessionInfo[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/terminal/sessions`),
+      'Could not list terminal sessions'
+    );
+  },
+
+  async diagnoseBuildLogs(
+    projectId: string,
+    payload: { logs: string }
+  ): Promise<BuildHealerDiagnosis> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/build-healer/diagnose`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not diagnose build logs'
+    );
+  },
+
+  async applyBuildHeal(
+    projectId: string,
+    payload: { logs?: string; code?: string; dryRun?: boolean } = { dryRun: true }
+  ): Promise<BuildHealerApplyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/build-healer/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, dryRun: payload.dryRun !== false }),
+      }),
+      'Could not plan build auto-heal'
+    );
+  },
+
+  async getFleetMesh(): Promise<FleetMeshStatusResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/mesh`),
+      'Could not load WireGuard fleet mesh'
+    );
+  },
+
+  async planFleetMesh(payload: { dryRun?: boolean; includeRedactedTemplate?: boolean } = { dryRun: true }): Promise<FleetMeshPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/mesh/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: payload.dryRun !== false, includeRedactedTemplate: payload.includeRedactedTemplate }),
+      }),
+      'Could not generate WireGuard mesh plan'
+    );
+  },
+
+  async rotateFleetMeshKey(payload: { nodeId: string; dryRun?: boolean }): Promise<FleetMeshRotateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/mesh/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodeId: payload.nodeId, dryRun: payload.dryRun !== false }),
+      }),
+      'Could not simulate WireGuard key rotation'
+    );
+  },
+
+  async getEdgeShieldStatus(): Promise<EdgeShieldStatusResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge-shield/status`),
+      'Could not load Edge Bot-Shield status'
+    );
+  },
+
+  async getEdgeShieldChallenge(domain?: string): Promise<EdgeShieldChallengeResult> {
+    const qs = new URLSearchParams({ format: 'json' });
+    if (domain) qs.set('domain', domain);
+    const res = await apiFetch(`${API_BASE}/edge-shield/challenge?${qs.toString()}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      return jsonOrThrow(res, 'Could not issue Edge Shield PoW challenge');
+    }
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Edge Shield challenge error (HTTP ${res.status})`);
+    return {
+      challengeId: 'html-challenge',
+      salt: 'sha256-browser-gate',
+      difficulty: 4,
+      algorithm: 'sha256',
+      domain: domain || 'edge',
+      htmlPreviewBytes: text.length,
+    };
+  },
+
+  async getCronTimeline(hours = 24): Promise<CronTimelineResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/crons/timeline?hours=${encodeURIComponent(String(hours))}`),
+      'Could not load 24h cron timeline'
+    );
+  },
+
+  async listHeartbeats(): Promise<{ heartbeats: HeartbeatMonitor[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/heartbeats`),
+      'Could not load heartbeats'
+    );
+  },
+
+  async createHeartbeat(payload: { name: string; projectId?: string; periodSec?: number; graceSec?: number }): Promise<{ heartbeat?: HeartbeatMonitor } & Partial<HeartbeatMonitor>> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/heartbeats`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not create heartbeat monitor'
+    );
+  },
+
+  async deleteHeartbeat(id: string): Promise<{ ok?: boolean; deleted?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/heartbeats/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      'Could not delete heartbeat monitor'
+    );
+  },
+
+  async pingHeartbeat(token: string, state?: 'start' | 'fail'): Promise<{ ok?: boolean; heartbeat?: HeartbeatMonitor; status?: string; lastPingAt?: string }> {
+    const suffix = state ? `/${encodeURIComponent(state)}` : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/heartbeat/${encodeURIComponent(token)}${suffix}`, { method: 'POST' }),
+      'Could not send heartbeat check-in'
+    );
+  },
 };
 
 // =====================================================================
@@ -4904,4 +5053,169 @@ export interface FinOpsReportResult {
   recommendations?: FinOpsRecommendation[];
   footnote?: string;
   pricingFootnotes?: string[];
+}
+
+export interface TerminalTicketResult {
+  ticket: string;
+  expiresAt: string;
+  wsPath: string;
+  containerName: string;
+  shell: string;
+}
+
+export interface TerminalSessionInfo {
+  sessionId: string;
+  projectId: string;
+  containerName: string;
+  shell: string;
+  username?: string;
+  connectedAt: string;
+}
+
+export interface BuildHealerMatch {
+  code: string;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | string;
+  rootCause: string;
+  confidence: number;
+  matchedLine?: string;
+  patchPreview?: string;
+  autoFixAction?: string;
+}
+
+export interface BuildHealerDiagnosis {
+  matched: boolean;
+  totalMatches: number;
+  primary: BuildHealerMatch | null;
+  matches: BuildHealerMatch[];
+  analyzedLines?: number;
+  analyzedMs?: number;
+}
+
+export interface BuildHealerApplyResult {
+  ok?: boolean;
+  dryRun: boolean;
+  applied?: boolean;
+  code?: string;
+  title?: string;
+  summary?: string;
+  changes?: string[];
+  mutationsSummary?: string[];
+  patchPlan?: {
+    envAdditions?: Record<string, string>;
+    memoryLimitMb?: number | null;
+    logDriver?: string | null;
+    smartPackHint?: string | null;
+  } | null;
+}
+
+export interface FleetMeshPeer {
+  nodeId: string;
+  name: string;
+  meshIp: string;
+  publicKey: string;
+  endpoint?: string | null;
+  listenPort?: number;
+  role?: string;
+  keyVersion?: number;
+  keyRotatedAt?: string | null;
+  privateKeyEncrypted?: boolean;
+  status?: string;
+}
+
+export interface FleetMeshStatusResult {
+  cidr: string;
+  interfaceName: string;
+  peerCount: number;
+  peers: FleetMeshPeer[];
+  firewallGuard?: {
+    blocksPublicDbPorts: boolean;
+    ufwBypassWarning?: string;
+  };
+}
+
+export interface FleetMeshConfigEntry {
+  nodeId: string;
+  name?: string;
+  meshIp?: string;
+  wgConfig?: string;
+  config?: string;
+}
+
+export interface FleetMeshPlanResult {
+  cidr?: string;
+  interfaceName?: string;
+  dryRun?: boolean;
+  configs?: FleetMeshConfigEntry[];
+  wgConfigs?: FleetMeshConfigEntry[] | Record<string, string>;
+  nodes?: FleetMeshConfigEntry[];
+  firewallRules?: string[];
+  firewallPlan?: string | string[] | { ufw?: string[]; nftables?: string[]; rules?: string[] };
+  diff?: { added?: string[]; updated?: string[]; removed?: string[] };
+}
+
+export interface FleetMeshRotateResult {
+  dryRun: boolean;
+  rotated?: boolean;
+  nodeId: string;
+  keyVersion?: number;
+  nextKeyVersion?: number;
+  oldPublicKey?: string;
+  newPublicKey?: string;
+  previewNewPublicKey?: string;
+  oldFingerprint?: string;
+  newFingerprint?: string;
+  previewNewFingerprint?: string;
+  rolloutPlan?: string[] | string;
+  rolloutSteps?: string[];
+  summary?: string;
+}
+
+export interface EdgeShieldStatusResult {
+  enabledCount: number;
+  powEnabledCount: number;
+  blockedPathRules: number | string[];
+  blockedUaPatterns: number | string[];
+  activeChallenges: number;
+  defaultDifficulty?: number;
+}
+
+export interface EdgeShieldChallengeResult {
+  challengeId: string;
+  salt: string;
+  difficulty: number;
+  expiresAt?: string;
+  algorithm: string;
+  domain?: string;
+  htmlPreviewBytes?: number;
+}
+
+export interface CronTimelineSlot {
+  hour?: number;
+  label?: string;
+  isoHour?: string;
+  count?: number;
+  runs?: Array<{ name?: string; jobName?: string; projectId?: string; at?: string }>;
+  hasCollision?: boolean;
+  collisions?: number;
+}
+
+export interface CronTimelineResult {
+  hours: number;
+  totalRuns?: number;
+  slots: CronTimelineSlot[];
+  collisionWarnings?: Array<string | { windowStart?: string; hour?: number; count?: number; jobs?: string[]; message?: string }>;
+}
+
+export interface HeartbeatMonitor {
+  id: string;
+  name: string;
+  projectId?: string | null;
+  token: string;
+  pingUrl?: string;
+  periodSec: number;
+  graceSec: number;
+  status: 'new' | 'up' | 'down' | 'missed' | string;
+  lastPingAt?: string | null;
+  lastDurationMs?: number | null;
 }

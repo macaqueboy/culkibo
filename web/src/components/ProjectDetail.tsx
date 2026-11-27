@@ -45,6 +45,8 @@ import {
   Cpu as CpuIcon,
   History,
   GitCompare,
+  Wrench,
+  Send,
 } from 'lucide-react';
 import {
   api,
@@ -57,7 +59,10 @@ import {
   type TimeMachineCheckpoint,
   type TimeMachineRestoreResult,
   type ShadowReplayReport,
+  type BuildHealerDiagnosis,
+  type BuildHealerApplyResult,
 } from '../lib/api';
+import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -162,8 +167,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [smartPackShowDockerfile, setSmartPackShowDockerfile] = useState(false);
   const [smartPackCopied, setSmartPackCopied] = useState<'ignore' | 'dockerfile' | null>(null);
 
-  // Cycle-5 & Cycle-6 Cockpit Panels (SLSA v1.1, Atomic DB Migrations, Micro-Wasm, Time-Machine, Shadow Replay)
-  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | null>(null);
+  // Cycle-5, Cycle-6 & Cycle-7 Cockpit Panels (SLSA, Migrations, Micro-Wasm, Time-Machine, Shadow Replay, Terminal, Auto-Healer)
+  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | null>(null);
   const [slsaAttest, setSlsaAttest] = useState<ReleaseAttestationResult | null>(null);
   const [slsaVerify, setSlsaVerify] = useState<AttestationVerifyResult | null>(null);
   const [slsaLoading, setSlsaLoading] = useState(false);
@@ -188,6 +193,45 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [shadowReport, setShadowReport] = useState<ShadowReplayReport | null>(null);
   const [shadowLoading, setShadowLoading] = useState(false);
   const [shadowError, setShadowError] = useState<string | null>(null);
+
+  // Cycle-7 Web Terminal state (zero-dep WS /ws/terminal + interactive Sandbox shell)
+  const [termShell, setTermShell] = useState<'/bin/sh' | '/bin/bash'>('/bin/sh');
+  const [termConnected, setTermConnected] = useState(false);
+  const [termConnecting, setTermConnecting] = useState(false);
+  const [termError, setTermError] = useState<string | null>(null);
+  const [termLines, setTermLines] = useState<string[]>([
+    'Culkibo Zero-Dep Container Web Terminal · direct Docker Engine TCP hijack (/ws/terminal)',
+    'Click "Connect Shell" to attach an interactive container session.',
+  ]);
+  const [termInput, setTermInput] = useState('');
+  const [termHistory, setTermHistory] = useState<string[]>([]);
+  const [termHistoryIdx, setTermHistoryIdx] = useState(-1);
+  const termWsRef = useRef<WebSocket | null>(null);
+  const termEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Cycle-7 Build Auto-Healer state (20-pattern deterministic classifier)
+  const [healLogs, setHealLogs] = useState(
+    'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\nServer listening on http://127.0.0.1:3000'
+  );
+  const [healLoading, setHealLoading] = useState(false);
+  const [healApplying, setHealApplying] = useState(false);
+  const [healError, setHealError] = useState<string | null>(null);
+  const [healDiagnosis, setHealDiagnosis] = useState<BuildHealerDiagnosis | null>(null);
+  const [healApplyResult, setHealApplyResult] = useState<BuildHealerApplyResult | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (termWsRef.current) {
+        try {
+          termWsRef.current.close();
+        } catch {
+          // ignore
+        }
+        termWsRef.current = null;
+      }
+    };
+  }, []);
+
   const [project, setProject] = useState<Project | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTabState] = useState<ProjectTabId>(() => normalizeProjectTab(initialTab));
@@ -730,11 +774,161 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
   };
 
-  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow') => {
+  const handleDisconnectTerminal = () => {
+    if (termWsRef.current) {
+      try {
+        termWsRef.current.close();
+      } catch {
+        // ignore
+      }
+      termWsRef.current = null;
+    }
+    setTermConnected(false);
+    setTermLines((prev) => [...prev, '[session disconnected]']);
+  };
+
+  const handleConnectTerminal = async () => {
+    setTermConnecting(true);
+    setTermError(null);
+    try {
+      const ticketRes = await api.issueTerminalTicket(project.id, {
+        shell: termShell,
+        cols: 120,
+        rows: 28,
+      });
+      if (isDemoMode()) {
+        setTermConnected(true);
+        setTermLines([
+          `Connected to ${ticketRes.containerName} (${ticketRes.shell}) · Sandbox interactive shell`,
+          'Type "help", "ls", "env", "uptime", "uname -a", or "clear".',
+        ]);
+        return;
+      }
+      if (termWsRef.current) {
+        try {
+          termWsRef.current.close();
+        } catch {
+          // ignore
+        }
+      }
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${window.location.host}${ticketRes.wsPath}`);
+      termWsRef.current = ws;
+      ws.onopen = () => {
+        setTermConnected(true);
+        setTermLines((prev) => [
+          ...prev,
+          `Attached ${ticketRes.containerName} via ${ticketRes.shell} (HMAC ticket verified)`,
+        ]);
+      };
+      ws.onmessage = (ev) => {
+        const text = typeof ev.data === 'string' ? ev.data : '';
+        if (!text) return;
+        const chunks = text.replace(/\r\n/g, '\n').split('\n');
+        setTermLines((prev) => [...prev.slice(-240), ...chunks]);
+      };
+      ws.onerror = () => {
+        setTermError('WebSocket terminal stream failed (verify container is running and Docker socket is reachable).');
+      };
+      ws.onclose = () => {
+        setTermConnected(false);
+        termWsRef.current = null;
+      };
+    } catch (e: unknown) {
+      setTermError(e instanceof Error ? e.message : 'Could not open container terminal');
+    } finally {
+      setTermConnecting(false);
+    }
+  };
+
+  const handleSendTerminalCmd = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cmd = termInput.trim();
+    if (!cmd) return;
+    setTermHistory((prev) => [cmd, ...prev.slice(0, 39)]);
+    setTermHistoryIdx(-1);
+    setTermInput('');
+
+    if (cmd === 'clear') {
+      setTermLines([]);
+      return;
+    }
+
+    if (isDemoMode() || !termWsRef.current || termWsRef.current.readyState !== WebSocket.OPEN) {
+      const promptLine = `root@${project.name}:/app# ${cmd}`;
+      let out: string[] = [];
+      if (cmd === 'help') {
+        out = ['Available sandbox commands: help, ls, ls -la, env, uptime, whoami, pwd, uname -a, ps, clear'];
+      } else if (cmd === 'ls' || cmd === 'ls -la') {
+        out = ['Dockerfile  package.json  next.config.mjs  src/  public/  node_modules/'];
+      } else if (cmd === 'env') {
+        out = Object.entries(project.envVars || { NODE_ENV: 'production', PORT: '3000' }).map(
+          ([k, v]) => `${k}=${/secret|token|pass|url|key/i.test(k) ? '••••••••' : v}`
+        );
+      } else if (cmd === 'uptime') {
+        out = [' 13:24:08 up 42 days,  6:14,  1 user,  load average: 0.14, 0.11, 0.09'];
+      } else if (cmd === 'whoami') {
+        out = ['node (uid=1000 gid=1000 non-root)'];
+      } else if (cmd === 'pwd') {
+        out = ['/app'];
+      } else if (cmd.startsWith('uname')) {
+        out = ['Linux culkibo-container 6.8.0-49-generic x86_64 GNU/Linux'];
+      } else if (cmd === 'ps' || cmd === 'ps aux') {
+        out = ['PID  RSS    CMD', '  1  48MB   node server.js', ' 18   2MB   /bin/sh'];
+      } else {
+        out = [`${termShell}: executed "${cmd}" (exit 0 · sandbox simulation)`];
+      }
+      setTermLines((prev) => [...prev.slice(-220), promptLine, ...out]);
+      window.requestAnimationFrame(() => termEndRef.current?.scrollIntoView({ block: 'nearest' }));
+      return;
+    }
+
+    termWsRef.current.send(`${cmd}\n`);
+    setTermLines((prev) => [...prev.slice(-220), `$ ${cmd}`]);
+    window.requestAnimationFrame(() => termEndRef.current?.scrollIntoView({ block: 'nearest' }));
+  };
+
+  const handleDiagnoseBuildLogs = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!healLogs.trim()) return;
+    setHealLoading(true);
+    setHealError(null);
+    setHealApplyResult(null);
+    try {
+      const res = await api.diagnoseBuildLogs(project.id, { logs: healLogs });
+      setHealDiagnosis(res);
+    } catch (err: unknown) {
+      setHealError(err instanceof Error ? err.message : 'Build Auto-Healer unavailable');
+    } finally {
+      setHealLoading(false);
+    }
+  };
+
+  const handleDryRunHeal = async () => {
+    setHealApplying(true);
+    setHealError(null);
+    try {
+      const res = await api.applyBuildHeal(project.id, {
+        logs: healLogs,
+        code: healDiagnosis?.primary?.code,
+        dryRun: true,
+      });
+      setHealApplyResult(res);
+    } catch (err: unknown) {
+      setHealError(err instanceof Error ? err.message : 'Could not compute dry-run heal plan');
+    } finally {
+      setHealApplying(false);
+    }
+  };
+
+  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer') => {
     const next = activeCockpit === panel ? null : panel;
     setActiveCockpit(next);
     if (next === 'timemachine' && tmCheckpoints.length === 0 && !tmLoading) {
       void handleLoadTimeMachine();
+    }
+    if (next === 'terminal' && isDemoMode() && !termConnected && !termConnecting) {
+      void handleConnectTerminal();
     }
   };
 
@@ -796,108 +990,199 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
 
   return (
     <div className="space-y-5">
-      {/* Cabecera limpia directamente sobre el lienzo */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div className="flex items-start gap-3 min-w-0">
-          <button
-            type="button"
-            onClick={onBack}
-            aria-label="Volver a proyectos"
-            className="mt-1 p-2 rounded-lg border border-slate-200 bg-white text-slate-500 hover:text-slate-900 hover:bg-slate-50 transition-colors cursor-pointer shrink-0"
-            title="Volver a proyectos"
-          >
-            <ArrowLeft className="w-4 h-4" />
-          </button>
-          <span
-            aria-hidden="true"
-            className="mt-0.5 w-10 h-10 rounded-lg bg-slate-900 text-white font-mono text-xs font-semibold flex items-center justify-center shrink-0"
-          >
-            {monogram}
-          </span>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-2xl font-semibold text-slate-900 tracking-tight truncate">{project.name}</h1>
-              <span
-                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${
-                  project.maintenanceMode
-                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+      {/* Cabecera limpia en 2 filas: identidad + acciones primarias arriba, Cockpit Toolbar abajo */}
+      <div className="flex flex-col gap-3.5">
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+          <div className="flex items-start gap-3 min-w-0 flex-1">
+            <button
+              type="button"
+              onClick={onBack}
+              aria-label={t('pd.backProjects')}
+              className="mt-1 p-2 rounded-lg border border-slate-200 bg-white text-slate-500 hover:text-slate-900 hover:bg-slate-50 transition-colors cursor-pointer shrink-0"
+              title={t('pd.backProjects')}
+            >
+              <ArrowLeft className="w-4 h-4" />
+            </button>
+            <span
+              aria-hidden="true"
+              className="mt-0.5 w-10 h-10 rounded-lg bg-slate-900 text-white font-mono text-xs font-semibold flex items-center justify-center shrink-0"
+            >
+              {monogram}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="text-2xl font-semibold text-slate-900 tracking-tight break-words">{project.name}</h1>
+                <span
+                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border shrink-0 ${
+                    project.maintenanceMode
+                      ? 'bg-amber-50 text-amber-800 border-amber-200'
+                      : project.lastDeployedAt && project.status === 'active'
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : project.localRunning
+                          ? 'bg-amber-50 text-amber-800 border-amber-200'
+                          : 'bg-slate-100 text-slate-600 border-slate-200'
+                  }`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${
+                    project.maintenanceMode
+                      ? 'bg-amber-500'
+                      : project.lastDeployedAt && project.status === 'active'
+                        ? 'bg-emerald-500'
+                        : project.localRunning
+                          ? 'bg-amber-500'
+                          : 'bg-slate-400'
+                  }`} />
+                  {project.maintenanceMode
+                    ? t('pd.statusMaint')
                     : project.lastDeployedAt && project.status === 'active'
-                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      ? t('pd.statusProd')
                       : project.localRunning
-                        ? 'bg-amber-50 text-amber-800 border-amber-200'
-                        : 'bg-slate-100 text-slate-600 border-slate-200'
-                }`}
-              >
-                <span className={`w-1.5 h-1.5 rounded-full ${
-                  project.maintenanceMode
-                    ? 'bg-amber-500'
-                    : project.lastDeployedAt && project.status === 'active'
-                      ? 'bg-emerald-500'
-                      : project.localRunning
-                        ? 'bg-amber-500'
-                        : 'bg-slate-400'
-                }`} />
-                {project.maintenanceMode
-                  ? 'Mantenimiento (503)'
-                  : project.lastDeployedAt && project.status === 'active'
-                    ? 'En producción'
-                    : project.localRunning
-                      ? `En local${project.localPort ? ` :${project.localPort}` : ''}`
-                      : project.status === 'hibernated'
-                        ? 'Hibernado'
-                        : project.status === 'stopped'
-                          ? 'Detenido'
-                          : 'Sin iniciar'}
-              </span>
-            </div>
-            <p className="text-xs text-slate-500 mt-1">
-              {project.description || 'Sin descripción configurada.'}
-              {project.lastDeployedAt && (
-                <span className="ml-2 text-slate-400 tabular-nums">
-                  · Último despliegue: {new Date(project.lastDeployedAt).toLocaleDateString('es-ES')}
+                        ? `${t('pd.statusLocal')}${project.localPort ? ` :${project.localPort}` : ''}`
+                        : project.status === 'hibernated'
+                          ? t('pd.statusHibernated')
+                          : project.status === 'stopped'
+                            ? t('pd.statusStopped')
+                            : t('pd.statusNotStarted')}
                 </span>
+              </div>
+              <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                {project.description || t('pd.noDesc')}
+                {project.lastDeployedAt && (
+                  <span className="ml-2 text-slate-400 tabular-nums whitespace-nowrap">
+                    · {t('pd.lastDeploy')} {new Date(project.lastDeployedAt).toLocaleDateString(locale === 'es' ? 'es-ES' : 'en-US')}
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap shrink-0">
+            {project.maintenanceMode && (
+              <button
+                type="button"
+                onClick={() => void handleToggleMaintenance()}
+                disabled={togglingMaintenance}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <PauseCircle className="w-3.5 h-3.5 text-amber-600" />
+                {t('pd.exitMaint')}
+              </button>
+            )}
+
+            {project.localRunning && project.localPort ? (
+              <a
+                href={`http://${previewHost}:${project.localPort}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 px-3 py-2 rounded-lg text-xs font-medium border border-amber-200 tabular-nums"
+              >
+                <Globe className="w-3.5 h-3.5 text-amber-600" /> {t('pd.openPort')} :{project.localPort}
+              </a>
+            ) : (
+              <button
+                type="button"
+                onClick={handleStart}
+                disabled={loading}
+                className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <Play className="w-3.5 h-3.5" /> {t('pd.startLocal')}
+              </button>
+            )}
+
+            {project.localRunning ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                disabled={loading}
+                className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <Square className="w-3 h-3 fill-red-600 text-red-600" /> {t('pd.stop')}
+              </button>
+            ) : project.status !== 'active' ? (
+              <button
+                type="button"
+                onClick={handleActivate}
+                disabled={loading}
+                className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <Power className="w-3.5 h-3.5 text-emerald-600" /> {t('pd.activate')}
+              </button>
+            ) : null}
+
+            {project.domains && project.domains.length > 0 && (
+              <a
+                href={`https://${project.domains[0]}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors"
+              >
+                <Globe className="w-3.5 h-3.5 text-slate-500" /> {t('pd.openSite')}
+              </a>
+            )}
+
+            {/* Menú Más: Mantenimiento, Hibernar, Detener */}
+            <div className="relative" ref={moreMenuRef}>
+              <button
+                type="button"
+                onClick={() => setMoreMenuOpen((v) => !v)}
+                aria-expanded={moreMenuOpen}
+                aria-haspopup="menu"
+                aria-label="More project actions"
+                className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+              >
+                <MoreHorizontal className="w-4 h-4" />
+              </button>
+              {moreMenuOpen && (
+                <div
+                  role="menu"
+                  className="culkibo-modal-enter absolute right-0 mt-1.5 w-56 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-40"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => { setMoreMenuOpen(false); void handleToggleMaintenance(); }}
+                    disabled={togglingMaintenance}
+                    className="w-full px-3.5 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <PauseCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                    <span>{project.maintenanceMode ? t('pd.exitMaint') : t('pd.menuMaintOn')}</span>
+                  </button>
+                  {project.status === 'active' && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => { setMoreMenuOpen(false); void handleHibernate(); }}
+                      disabled={loading}
+                      className="w-full px-3.5 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    >
+                      <Moon className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      <span>{t('pd.menuHibernate')}</span>
+                    </button>
+                  )}
+                  {(project.status === 'active' || project.localRunning) && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => { setMoreMenuOpen(false); void handleStop(); }}
+                      disabled={loading}
+                      className="w-full px-3.5 py-2 text-left text-xs text-red-700 hover:bg-red-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    >
+                      <Square className="w-3 h-3 fill-red-600 text-red-600 shrink-0" />
+                      <span>{t('pd.menuStop')}</span>
+                    </button>
+                  )}
+                </div>
               )}
-            </p>
+            </div>
           </div>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap shrink-0">
-          {project.maintenanceMode && (
-            <button
-              type="button"
-              onClick={() => void handleToggleMaintenance()}
-              disabled={togglingMaintenance}
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 transition-colors cursor-pointer disabled:opacity-50"
-            >
-              <PauseCircle className="w-3.5 h-3.5 text-amber-600" />
-              Salir de mantenimiento
-            </button>
-          )}
-
-          {project.localRunning && project.localPort ? (
-            <a
-              href={`http://${previewHost}:${project.localPort}`}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 px-3 py-2 rounded-lg text-xs font-medium border border-amber-200 tabular-nums"
-            >
-              <Globe className="w-3.5 h-3.5 text-amber-600" /> Abrir :{project.localPort}
-            </a>
-          ) : (
-            <button
-              type="button"
-              onClick={handleStart}
-              disabled={loading}
-              className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-            >
-              <Play className="w-3.5 h-3.5" /> {t('pd.startLocal')}
-            </button>
-          )}
-
+        {/* Dedicated Pioneer Cockpit Action Toolbar (never collides with title/description) */}
+        <div className="flex items-center gap-1.5 flex-wrap" role="toolbar" aria-label="Project cockpit tools">
           <button
             type="button"
             onClick={handleToggleSmartPack}
-            className={`culkibo-press inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
               smartPackOpen
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
@@ -910,7 +1195,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           <button
             type="button"
             onClick={() => toggleCockpit('slsa')}
-            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
               activeCockpit === 'slsa'
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
@@ -923,7 +1208,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           <button
             type="button"
             onClick={() => toggleCockpit('migration')}
-            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
               activeCockpit === 'migration'
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
@@ -936,7 +1221,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           <button
             type="button"
             onClick={() => toggleCockpit('wasm')}
-            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
               activeCockpit === 'wasm'
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
@@ -949,7 +1234,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           <button
             type="button"
             onClick={() => toggleCockpit('timemachine')}
-            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
               activeCockpit === 'timemachine'
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
@@ -962,7 +1247,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           <button
             type="button"
             onClick={() => toggleCockpit('shadow')}
-            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
               activeCockpit === 'shadow'
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
@@ -972,91 +1257,31 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
             <span>{t('pd.srBtn')}</span>
           </button>
 
-          {project.localRunning ? (
-            <button
-              type="button"
-              onClick={handleStop}
-              disabled={loading}
-              className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-            >
-              <Square className="w-3 h-3 fill-red-600 text-red-600" /> {t('pd.stop')}
-            </button>
-          ) : project.status !== 'active' ? (
-            <button
-              type="button"
-              onClick={handleActivate}
-              disabled={loading}
-              className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-            >
-              <Power className="w-3.5 h-3.5 text-emerald-600" /> {t('pd.activate')}
-            </button>
-          ) : null}
+          <button
+            type="button"
+            onClick={() => toggleCockpit('terminal')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'terminal'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Terminal className="w-3.5 h-3.5" />
+            <span>{t('pd.termBtn')}</span>
+          </button>
 
-          {project.domains && project.domains.length > 0 && (
-            <a
-              href={`https://${project.domains[0]}`}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors"
-            >
-              <Globe className="w-3.5 h-3.5 text-slate-500" /> {t('pd.openSite')}
-            </a>
-          )}
-
-          {/* Menú Más: Mantenimiento, Hibernar, Detener */}
-          <div className="relative" ref={moreMenuRef}>
-            <button
-              type="button"
-              onClick={() => setMoreMenuOpen((v) => !v)}
-              aria-expanded={moreMenuOpen}
-              aria-haspopup="menu"
-              aria-label="Más acciones del proyecto"
-              className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer"
-            >
-              <MoreHorizontal className="w-4 h-4" />
-            </button>
-            {moreMenuOpen && (
-              <div
-                role="menu"
-                className="culkibo-modal-enter absolute right-0 mt-1.5 w-56 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-40"
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { setMoreMenuOpen(false); void handleToggleMaintenance(); }}
-                  disabled={togglingMaintenance}
-                  className="w-full px-3.5 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  <PauseCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                  <span>{project.maintenanceMode ? 'Salir de mantenimiento' : 'Modo mantenimiento (503)'}</span>
-                </button>
-                {project.status === 'active' && (
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => { setMoreMenuOpen(false); void handleHibernate(); }}
-                    disabled={loading}
-                    className="w-full px-3.5 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
-                  >
-                    <Moon className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                    <span>Hibernar proyecto</span>
-                  </button>
-                )}
-                {(project.status === 'active' || project.localRunning) && (
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => { setMoreMenuOpen(false); void handleStop(); }}
-                    disabled={loading}
-                    className="w-full px-3.5 py-2 text-left text-xs text-red-700 hover:bg-red-50 flex items-center gap-2 cursor-pointer disabled:opacity-50"
-                  >
-                    <Square className="w-3 h-3 fill-red-600 text-red-600 shrink-0" />
-                    <span>Detener procesos</span>
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
+          <button
+            type="button"
+            onClick={() => toggleCockpit('healer')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'healer'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Wrench className="w-3.5 h-3.5" />
+            <span>{t('pd.healBtn')}</span>
+          </button>
         </div>
       </div>
 
@@ -1677,6 +1902,236 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               </div>
             );
           })()}
+        </section>
+      )}
+
+      {activeCockpit === 'terminal' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-3.5 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center text-emerald-400 shrink-0">
+                <Terminal className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('pd.termTitle')}</h2>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border ${
+                    termConnected
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-slate-100 text-slate-600 border-slate-200'
+                  }`}>
+                    {termConnected ? (isDemoMode() ? t('pd.termSandbox') : t('pd.termConnected')) : t('pd.termDisconnected')}
+                  </span>
+                </div>
+                <p className="text-slate-500 mt-0.5">{t('pd.termDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+              <select
+                value={termShell}
+                onChange={(e) => setTermShell(e.target.value as '/bin/sh' | '/bin/bash')}
+                disabled={termConnected}
+                aria-label="Container shell"
+                className="px-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-700"
+              >
+                <option value="/bin/sh">/bin/sh</option>
+                <option value="/bin/bash">/bin/bash</option>
+              </select>
+              {termConnected ? (
+                <button
+                  type="button"
+                  onClick={handleDisconnectTerminal}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 font-medium cursor-pointer"
+                >
+                  <Square className="w-3 h-3" />
+                  <span>{t('pd.termDisconnect')}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={termConnecting}
+                  onClick={() => void handleConnectTerminal()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {termConnecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Terminal className="w-3.5 h-3.5" />}
+                  <span>{t('pd.termConnect')}</span>
+                </button>
+              )}
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Web Terminal panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {termError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{termError}</div>}
+
+          <div
+            className="rounded-xl border border-slate-800 overflow-hidden"
+            style={{ backgroundColor: '#0b0e14', color: '#e2e8f0' }}
+          >
+            <div className="p-3.5 font-mono text-[11px] leading-relaxed h-52 overflow-y-auto space-y-0.5">
+              {termLines.map((line, i) => (
+                <div key={i} className="whitespace-pre-wrap break-all">
+                  {line}
+                </div>
+              ))}
+              <div ref={termEndRef} />
+            </div>
+            <form onSubmit={handleSendTerminalCmd} className="flex items-center gap-2 px-3 py-2 border-t border-slate-800 bg-slate-950/80">
+              <span className="font-mono text-emerald-400 text-[11px] shrink-0">
+                {project.name}#
+              </span>
+              <input
+                type="text"
+                value={termInput}
+                onChange={(e) => setTermInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowUp' && termHistory.length > 0) {
+                    e.preventDefault();
+                    const nextIdx = Math.min(termHistory.length - 1, termHistoryIdx + 1);
+                    setTermHistoryIdx(nextIdx);
+                    setTermInput(termHistory[nextIdx] || '');
+                  } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    const nextIdx = termHistoryIdx - 1;
+                    setTermHistoryIdx(nextIdx);
+                    setTermInput(nextIdx >= 0 ? (termHistory[nextIdx] || '') : '');
+                  }
+                }}
+                placeholder={t('pd.termPlaceholder')}
+                className="flex-1 min-w-0 bg-transparent text-slate-100 placeholder:text-slate-500 font-mono text-[11px] border-0 !shadow-none !outline-none"
+              />
+              <button
+                type="submit"
+                disabled={!termInput.trim()}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 text-[11px] font-medium cursor-pointer disabled:opacity-40 shrink-0"
+              >
+                <Send className="w-3 h-3" />
+                <span>Run</span>
+              </button>
+            </form>
+          </div>
+        </section>
+      )}
+
+      {activeCockpit === 'healer' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-3.5 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <Wrench className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.healTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.healDesc')}</p>
+              </div>
+            </div>
+            <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Auto-Healer panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer self-start">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <form onSubmit={(e) => void handleDiagnoseBuildLogs(e)} className="space-y-2.5">
+            <label className="block">
+              <span className="font-medium text-slate-700 block mb-1">{t('pd.healLogsLabel')}</span>
+              <textarea
+                rows={3}
+                value={healLogs}
+                onChange={(e) => setHealLogs(e.target.value)}
+                className="w-full p-2.5 rounded-xl border border-slate-200 bg-white font-mono text-[11px] text-slate-900 leading-relaxed"
+              />
+            </label>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="submit"
+                disabled={healLoading || !healLogs.trim()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {healLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Wrench className="w-3.5 h-3.5" />}
+                <span>{healLoading ? t('pd.healDiagnosing') : t('pd.healDiagnose')}</span>
+              </button>
+              {healDiagnosis?.matched && (
+                <button
+                  type="button"
+                  disabled={healApplying}
+                  onClick={() => void handleDryRunHeal()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {healApplying ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />}
+                  <span>{healApplying ? t('pd.healApplying') : t('pd.healDryRun')}</span>
+                </button>
+              )}
+            </div>
+          </form>
+
+          {healError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{healError}</div>}
+
+          {healDiagnosis && (
+            !healDiagnosis.matched || !healDiagnosis.primary ? (
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-600">{t('pd.healNoMatch')}</div>
+            ) : (
+              <div className="space-y-3">
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold uppercase border ${
+                      healDiagnosis.primary.severity === 'critical' || healDiagnosis.primary.severity === 'high'
+                        ? 'bg-red-50 text-red-700 border-red-200'
+                        : 'bg-amber-50 text-amber-800 border-amber-200'
+                    }`}>
+                      {healDiagnosis.primary.severity}
+                    </span>
+                    <span className="font-mono font-semibold text-slate-900">{healDiagnosis.primary.code}</span>
+                    <span className="font-semibold text-slate-900">{healDiagnosis.primary.title}</span>
+                    <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-mono text-[10px] text-emerald-700 tabular-nums ml-auto">
+                      {Math.round(healDiagnosis.primary.confidence <= 1 ? healDiagnosis.primary.confidence * 100 : healDiagnosis.primary.confidence)}% confidence
+                    </span>
+                  </div>
+                  <p className="text-slate-600 leading-relaxed">{healDiagnosis.primary.rootCause}</p>
+                  {healDiagnosis.primary.patchPreview && (
+                    <pre className="p-2.5 rounded-lg bg-slate-950 text-emerald-300 font-mono text-[11px] overflow-x-auto border border-slate-800">
+                      {healDiagnosis.primary.patchPreview}
+                    </pre>
+                  )}
+                  {healDiagnosis.matches.length > 1 && (
+                    <div className="text-[11px] text-slate-500 font-mono">
+                      +{healDiagnosis.matches.length - 1} secondary pattern(s): {healDiagnosis.matches.slice(1).map((m) => m.code).join(', ')}
+                    </div>
+                  )}
+                </div>
+
+                {healApplyResult && (() => {
+                  const lines = Array.isArray(healApplyResult.mutationsSummary) && healApplyResult.mutationsSummary.length > 0
+                    ? healApplyResult.mutationsSummary
+                    : Array.isArray(healApplyResult.changes) && healApplyResult.changes.length > 0
+                      ? healApplyResult.changes
+                      : [
+                          healApplyResult.patchPlan?.envAdditions
+                            ? `Env additions: ${Object.entries(healApplyResult.patchPlan.envAdditions).map(([k, v]) => `${k}=${v}`).join(', ')}`
+                            : null,
+                          healApplyResult.patchPlan?.memoryLimitMb
+                            ? `Set memoryLimitMb = ${healApplyResult.patchPlan.memoryLimitMb} MB`
+                            : null,
+                          healApplyResult.patchPlan?.logDriver
+                            ? `Set logDriver = ${healApplyResult.patchPlan.logDriver}`
+                            : null,
+                          healApplyResult.patchPlan?.smartPackHint || healApplyResult.summary || null,
+                        ].filter((x): x is string => Boolean(x));
+                  return (
+                    <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 space-y-1">
+                      <div className="font-semibold">{t('pd.healDryRunTitle')}</div>
+                      {lines.length > 0 ? (
+                        <ul className="list-disc list-inside text-[11px] space-y-0.5 font-mono">
+                          {lines.map((l, i) => <li key={i}>{l}</li>)}
+                        </ul>
+                      ) : (
+                        <div className="font-mono text-[11px]">Safe metadata patch ready for apply.</div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )
+          )}
         </section>
       )}
 

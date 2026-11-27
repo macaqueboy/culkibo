@@ -83,6 +83,10 @@ function getWasmMicroRunner() { return _lazyV2.wasm || (_lazyV2.wasm = require('
 function getShadowReplayService() { return _lazyV2.shadow || (_lazyV2.shadow = require('../services/shadowReplayService')); }
 function getTimeMachineService() { return _lazyV2.timemachine || (_lazyV2.timemachine = require('../services/timeMachineService')); }
 function getFinOpsOptimizer() { return _lazyV2.finops || (_lazyV2.finops = require('../services/finopsOptimizer')); }
+function getContainerTerminalService() { return _lazyV2.terminal || (_lazyV2.terminal = require('../services/containerTerminalService')); }
+function getFleetMeshService() { return _lazyV2.mesh || (_lazyV2.mesh = require('../services/fleetMeshService')); }
+function getEdgeShieldService() { return _lazyV2.shield || (_lazyV2.shield = require('../services/edgeShieldService')); }
+function getBuildHealerService() { return _lazyV2.healer || (_lazyV2.healer = require('../services/buildHealerService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -7020,6 +7024,242 @@ router.post('/finops/compare', (req, res) => {
       ? finops.compareCloudCosts(body)
       : finops.analyzeFleetAndProjects(body);
     res.json(comparison);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #7 PIONEER LAZY ROUTES (Terminal, WireGuard Fleet Mesh, Cron Heatmap/Heartbeats, Edge Shield, Build Healer) ---
+
+router.post('/projects/:id/terminal/ticket', heavyOpLimiter, (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const principal = getPrincipal(req);
+    const depState = deployManager.getState(project.id);
+    const defaultContainer = (depState && depState.current && depState.current.containerName)
+      ? depState.current.containerName
+      : `culkibo_${String(project.id).replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
+    const containerName = typeof body.containerName === 'string' && body.containerName.trim()
+      ? body.containerName.trim()
+      : defaultContainer;
+    const ticket = getContainerTerminalService().issueTicket({
+      projectId: project.id,
+      containerName,
+      userId: String(principal.userId || principal.kind || 'owner'),
+      username: String(principal.email || principal.kind || 'operator'),
+      shell: typeof body.shell === 'string' && body.shell.trim() ? body.shell.trim() : '/bin/sh',
+      cols: body.cols !== undefined ? Number(body.cols) : 120,
+      rows: body.rows !== undefined ? Number(body.rows) : 32
+    });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(201).json(ticket);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/terminal/sessions', (req, res) => {
+  try {
+    const allowedIds = getAllowedProjectIds(req);
+    const reqProjectId = req.query.projectId ? String(req.query.projectId).trim() : null;
+    if (reqProjectId && allowedIds && !allowedIds.includes(reqProjectId)) {
+      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    }
+    const allSessions = getContainerTerminalService().listSessions(reqProjectId || undefined);
+    const sessions = allowedIds
+      ? allSessions.filter((s) => s && s.projectId && allowedIds.includes(s.projectId))
+      : allSessions;
+    res.json({ sessions });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.get('/fleet/mesh', (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'consultar malla WireGuard de flota')) return;
+    res.json(getFleetMeshService().getStatus());
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/fleet/mesh/plan', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'planificar malla WireGuard de flota')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== false;
+    res.json(getFleetMeshService().planMesh(Array.isArray(body.servers) ? body.servers : undefined, { dryRun }));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/fleet/mesh/rotate', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'rotar clave WireGuard de flota')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const nodeId = String(body.nodeId || 'local').trim();
+    const dryRun = body.dryRun !== false;
+    res.json(getFleetMeshService().rotatePeerKey(nodeId, { dryRun }));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/crons/timeline', (req, res) => {
+  try {
+    const allowedIds = getAllowedProjectIds(req);
+    const hours = req.query.hours !== undefined ? Number(req.query.hours) : 24;
+    const timeline = cronManager.getTimeline({ hours, projectIds: allowedIds });
+    res.json(timeline);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/heartbeats', (req, res) => {
+  try {
+    const allowedIds = getAllowedProjectIds(req);
+    res.json({ heartbeats: cronManager.listHeartbeats({ projectIds: allowedIds }) });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/heartbeats', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId) {
+      if (!assertProjectAccess(req, res, String(body.projectId), 'projects:write')) return;
+    } else if (denyProjectScopedToken(req, res, 'crear heartbeat global')) {
+      return;
+    }
+    const hb = cronManager.createHeartbeat(body);
+    res.status(201).json(hb);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/heartbeats/:id', (req, res) => {
+  try {
+    const existing = cronManager.getHeartbeatById(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Heartbeat no encontrado' });
+    if (existing.projectId) {
+      if (!assertProjectAccess(req, res, existing.projectId, 'projects:write')) return;
+    } else if (denyProjectScopedToken(req, res, 'eliminar heartbeat global')) {
+      return;
+    }
+    res.json(cronManager.deleteHeartbeat(existing.id));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+/** @param {any} req @param {any} res */
+const handleRouterHeartbeatPing = (req, res) => {
+  try {
+    const state = req.params.state ? String(req.params.state) : 'ok';
+    const message = (req.body && typeof req.body === 'object' && req.body.message)
+      ? String(req.body.message)
+      : (req.query && req.query.msg ? String(req.query.msg) : '');
+    const result = cronManager.recordPing(req.params.token, { state, message });
+    return res.status(result.status || (result.ok ? 200 : 404)).json(result);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+};
+router.get('/heartbeat/:token', handleRouterHeartbeatPing);
+router.post('/heartbeat/:token', handleRouterHeartbeatPing);
+router.get('/heartbeat/:token/:state', handleRouterHeartbeatPing);
+router.post('/heartbeat/:token/:state', handleRouterHeartbeatPing);
+
+router.get('/edge-shield/status', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'estado global de Edge Shield')) return;
+    res.json(getEdgeShieldService().getStatus(domainManager.listDomains()));
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.get('/edge-shield/challenge', (req, res) => {
+  try {
+    const shield = getEdgeShieldService();
+    const domain = String(req.query.domain || req.headers.host || 'localhost').trim().slice(0, 253);
+    const difficulty = req.query.difficulty !== undefined ? Number(req.query.difficulty) : undefined;
+    const challenge = shield.issueChallenge({
+      ip: clientIp(req),
+      userAgent: String(req.headers['user-agent'] || ''),
+      domain,
+      ...(Number.isFinite(difficulty) ? { difficulty } : {})
+    });
+    const wantsHtml = req.query.format === 'html'
+      || (req.query.format !== 'json' && String(req.headers.accept || '').includes('text/html') && !String(req.headers.accept || '').includes('application/json'));
+    if (wantsHtml && typeof shield.renderChallengeHtml === 'function') {
+      const returnUrl = typeof req.query.returnUrl === 'string' && req.query.returnUrl.startsWith('/') ? req.query.returnUrl : '/';
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send(shield.renderChallengeHtml(challenge, returnUrl));
+    }
+    res.json(challenge);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge-shield/verify', (req, res) => {
+  try {
+    const shield = getEdgeShieldService();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = shield.verifySolution({
+      ...body,
+      ip: clientIp(req),
+      userAgent: String(req.headers['user-agent'] || '')
+    });
+    if (out && out.valid && out.cookieHeader) {
+      res.append('Set-Cookie', out.cookieHeader);
+      return res.status(200).json(out);
+    }
+    res.status(403).json(out || { valid: false, reason: 'Invalid PoW solution' });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/build-healer/diagnose', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    let logsText = typeof body.logs === 'string' ? body.logs : (typeof body.text === 'string' ? body.text : '');
+    if (!logsText) {
+      const recent = deployManager.listDeployments(project.id, 1);
+      if (recent && recent[0] && Array.isArray(recent[0].logLines)) {
+        logsText = recent[0].logLines.map((l) => l.message || '').join('\n');
+      }
+    }
+    const diagnosis = getBuildHealerService().diagnoseLogs(logsText, { projectId: project.id, project });
+    res.json(diagnosis);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/build-healer/apply', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== false;
+    const out = await getBuildHealerService().applyHealingPlan(project.id, {
+      logs: typeof body.logs === 'string' ? body.logs : (typeof body.text === 'string' ? body.text : ''),
+      code: typeof body.code === 'string' ? body.code : undefined,
+      dryRun
+    });
+    res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

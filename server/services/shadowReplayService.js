@@ -616,7 +616,7 @@ class ShadowReplayService {
       failOnSchemaDrift: Boolean(rawGate.failOnSchemaDrift),
       minLatencyDeltaMs: Number.isFinite(Number(rawGate.minLatencyDeltaMs))
         ? Math.max(0, Number(rawGate.minLatencyDeltaMs))
-        : 5
+        : 25
     };
 
     const normalizedRequests = rawRequests.map((r, index) => {

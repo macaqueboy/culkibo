@@ -155,6 +155,9 @@ async function testMcp() {
   // 17. MCP 2026 Cycle-6: Shadow Traffic Replay, Whole-Stack Time-Machine & FinOps Savings (116 tools)
   await testMcp2026Cycle6ShadowTimeMachineFinOps();
 
+  // 18. MCP 2026 Cycle-7: Build Auto-Healer, WireGuard Fleet Mesh, Cron Timeline & Edge Bot-Shield (120 tools)
+  await testMcp2026Cycle7HealerMeshTimelineShield();
+
   console.log('✅ All MCP tests passed!\n');
 }
 
@@ -165,9 +168,9 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 116, 'El catálogo MCP 2026 debe tener exactamente 116 herramientas anotadas');
+  assert.strictEqual(tools.length, 120, 'El catálogo MCP 2026 debe tener exactamente 120 herramientas anotadas');
   const uniqueNames = new Set(tools.map(t => t.name));
-  assert.strictEqual(uniqueNames.size, 116, 'No puede haber nombres de herramientas duplicados');
+  assert.strictEqual(uniqueNames.size, 120, 'No puede haber nombres de herramientas duplicados');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -190,11 +193,11 @@ async function testToolAnnotations() {
   const destCount = tools.filter(t => t.annotations.destructiveHint === true).length;
   const dryRunCount = tools.filter(t => Boolean(t.inputSchema?.properties?.dryRun)).length;
   const outputSchemaCount = tools.filter(t => Boolean(t.outputSchema)).length;
-  assert.strictEqual(roCount, 52, `Se esperaban 52 herramientas RO, hay ${roCount}`);
-  assert.strictEqual(mutCount, 64, `Se esperaban 64 herramientas mutadoras, hay ${mutCount}`);
-  assert.strictEqual(destCount, 36, `Se esperaban 36 herramientas destructivas, hay ${destCount}`);
-  assert.strictEqual(dryRunCount, 38, `Se esperaban 38 herramientas con dryRun, hay ${dryRunCount}`);
-  assert.ok(outputSchemaCount >= 69, `Se esperaban >=69 herramientas con outputSchema, hay ${outputSchemaCount}`);
+  assert.strictEqual(roCount, 53, `Se esperaban 53 herramientas RO, hay ${roCount}`);
+  assert.strictEqual(mutCount, 67, `Se esperaban 67 herramientas mutadoras, hay ${mutCount}`);
+  assert.strictEqual(destCount, 37, `Se esperaban 37 herramientas destructivas, hay ${destCount}`);
+  assert.strictEqual(dryRunCount, 40, `Se esperaban 40 herramientas con dryRun, hay ${dryRunCount}`);
+  assert.ok(outputSchemaCount >= 73, `Se esperaban >=73 herramientas con outputSchema, hay ${outputSchemaCount}`);
 
   const byName = Object.fromEntries(tools.map(t => [t.name, t]));
   const mustMutate = [
@@ -405,7 +408,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 116);
+    assert.strictEqual(list.result.tools.length, 120);
 
     // 7b. ?profile=core reduce el tamaño/tokens de tools/list en >=80% y mantiene callable herramientas descubiertas.
     const coreListRes = await fetch(`${endpoint}?profile=core`, {
@@ -734,7 +737,7 @@ async function testMcpV2Capabilities() {
       principal: { userId: 'usr_viewer_1', role: 'viewer', teamId: 'team_default', projectIds: [projA.id], scopes: ['*'] }
     };
     const viewerTools = mcpServer.getToolsForPrincipal(viewerAuth);
-    assert.ok(viewerTools.length > 0 && viewerTools.length < 116);
+    assert.ok(viewerTools.length > 0 && viewerTools.length < 120);
     assert.ok(viewerTools.every(t => t.annotations.readOnlyHint === true), 'viewer solo puede ver herramientas readOnly');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_database_credentials'), 'viewer NO puede ver culkibo_database_credentials');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_rbac_list_tokens'), 'viewer NO puede ver culkibo_rbac_list_tokens');
@@ -742,7 +745,7 @@ async function testMcpV2Capabilities() {
     // Serialized tools cache isolation
     const pubBuf = mcpServer.getToolsSerialized();
     const privBuf = mcpServer.getToolsSerialized(viewerAuth);
-    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 116);
+    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 120);
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).cacheScope, 'private');
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).count, viewerTools.length);
 
@@ -808,7 +811,7 @@ async function testMcpV2Capabilities() {
     const whoamiSuper = await mcpServer.executeTool('culkibo_rbac_whoami', {});
     assert.strictEqual(whoamiSuper.isError, false);
     assert.strictEqual(whoamiSuper.structuredContent.isSuperAdmin, true);
-    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 116);
+    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 120);
 
     const whoamiViewer = await mcpServer.executeTool('culkibo_rbac_whoami', {}, { auth: viewerAuth });
     assert.strictEqual(whoamiViewer.isError, false);
@@ -1038,7 +1041,7 @@ async function testMcpV21Superpowers() {
   let match;
   const caseRe = /case\s+'(culkibo_[a-z0-9_]+)'\s*:/g;
   while ((match = caseRe.exec(switchBlock))) caseNames.add(match[1]);
-  assert.strictEqual(caseNames.size, 116, `Todos los 116 tools deben tener handler en switch (hay ${caseNames.size})`);
+  assert.strictEqual(caseNames.size, 120, `Todos los 120 tools deben tener handler en switch (hay ${caseNames.size})`);
   for (const t of tools) {
     assert.ok(caseNames.has(t.name), `Falta case para ${t.name}`);
   }
@@ -1081,7 +1084,10 @@ async function testMcpV21Superpowers() {
     otlp: require('../server/services/otlpExporter'),
     sr: require('../server/services/shadowReplayService'),
     tms: require('../server/services/timeMachineService'),
-    finops: require('../server/services/finopsOptimizer')
+    finops: require('../server/services/finopsOptimizer'),
+    bh: require('../server/services/buildHealerService'),
+    fm: require('../server/services/fleetMeshService'),
+    es: require('../server/services/edgeShieldService')
   };
   const missingCalls = [];
   const callRe = /\b([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\(/g;
@@ -1108,7 +1114,7 @@ async function testMcpV21Superpowers() {
     const subset = mcpServer.getToolsForPrincipal(null, { profile: prof });
     assert.ok(subset.length > 0, `El perfil ${prof} debe devolver herramientas`);
   }
-  console.log('  ✓ Auditoría automatizada de 116 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
+  console.log('  ✓ Auditoría automatizada de 120 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
 
   // 2. culkibo_search_tools (meta-discovery + aislamiento RBAC)
   const searchSuper = await mcpServer.executeTool('culkibo_search_tools', { query: 'postgres backup', limit: 5 });
@@ -2287,14 +2293,14 @@ async function testMcp2026Cycle4TasksElicitationAndTools() {
     otlpExporter.configure({ endpoint: null, headers: {}, enabled: false, serviceName: 'culkibo-control-plane', allowLoopback: false });
   }
 
-  // 6. ?profile=core maintains -80%+ serialized token savings at 116 tools
+  // 6. ?profile=core maintains -80%+ serialized token savings at 120 tools
   const fullBytes = Buffer.byteLength(JSON.stringify(mcpServer.getToolsForPrincipal(null, { profile: 'all' })), 'utf8');
   const coreTools = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
   const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
   const savedPct = Math.round((1 - coreBytes / fullBytes) * 1000) / 10;
-  assert.strictEqual(mcpServer.getToolsDefinition().length, 116);
-  assert.ok(savedPct >= 80, `?profile=core debe ahorrar >=80% tokens sobre 116 tools (actual: ${savedPct}%)`);
-  console.log(`  ✓ ?profile=core sobre 116 tools: ${coreTools.length}/116 herramientas (-${savedPct}% bytes/tokens)`);
+  assert.strictEqual(mcpServer.getToolsDefinition().length, 120);
+  assert.ok(savedPct >= 80, `?profile=core debe ahorrar >=80% tokens sobre 120 tools (actual: ${savedPct}%)`);
+  console.log(`  ✓ ?profile=core sobre 120 tools: ${coreTools.length}/120 herramientas (-${savedPct}% bytes/tokens)`);
 }
 
 /**
@@ -2531,15 +2537,15 @@ async function testMcp2026Cycle6ShadowTimeMachineFinOps() {
     assert.ok(finopsViewer.structuredContent.analysis && Array.isArray(finopsViewer.structuredContent.analysis.recommendations));
     console.log(`  ✓ culkibo_finops_report verificado (RO RBAC scopedProjects=1, ahorro anual $${finopsViewer.structuredContent.comparison.annualSavingsUsd}/yr = ${finopsViewer.structuredContent.comparison.savingsPct}%)`);
 
-    // 4. Verify ?profile=core achieves >=82% token savings at 116 tools
+    // 4. Verify ?profile=core achieves >=82% token savings at 120 tools
     const allBytes = Buffer.byteLength(JSON.stringify(mcpServer.getToolsForPrincipal(null, { profile: 'all' })), 'utf8');
     const coreSubset = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const coreBytes = Buffer.byteLength(JSON.stringify(coreSubset), 'utf8');
     const pctSaved = Math.round((1 - coreBytes / allBytes) * 1000) / 10;
-    assert.strictEqual(mcpServer.getToolsDefinition().length, 116);
+    assert.strictEqual(mcpServer.getToolsDefinition().length, 120);
     assert.strictEqual(coreSubset.length, 17);
-    assert.ok(pctSaved >= 82, `?profile=core debe ahorrar >=82% tokens en 116 tools (actual: ${pctSaved}%)`);
-    console.log(`  ✓ ?profile=core sobre 116 tools: ${coreSubset.length}/116 herramientas (-${pctSaved}% bytes/tokens)`);
+    assert.ok(pctSaved >= 83, `?profile=core debe ahorrar >=83% tokens en 120 tools (actual: ${pctSaved}%)`);
+    console.log(`  ✓ ?profile=core sobre 120 tools: ${coreSubset.length}/120 herramientas (-${pctSaved}% bytes/tokens)`);
   } finally {
     await Promise.all([
       new Promise((r) => baseSrv.close(() => r(undefined))),
@@ -2551,6 +2557,237 @@ async function testMcp2026Cycle6ShadowTimeMachineFinOps() {
     if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
     else process.env.CULKIBO_DATA_DIR = prevDataDir;
     resetTmCache();
+    try { fs.rmSync(tmpDataRoot, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+/**
+ * MCP 2026 Cycle-7: Build Auto-Healer (`culkibo_heal_build_failure`),
+ * WireGuard Fleet Mesh (`culkibo_fleet_mesh`), Cron 24h Heatmap + Heartbeats (`culkibo_cron_timeline`),
+ * Edge Bot-Shield + Hashcash PoW (`culkibo_edge_shield`), and `-83%+` `?profile=core` over 120 tools.
+ */
+async function testMcp2026Cycle7HealerMeshTimelineShield() {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const projectManager = require('../server/services/projectManager');
+  const cronManager = require('../server/services/cronManager');
+  const fleetMeshService = require('../server/services/fleetMeshService');
+
+  const tmpDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-mcp-c7-'));
+  const prevDataDir = process.env.CULKIBO_DATA_DIR;
+  process.env.CULKIBO_DATA_DIR = tmpDataRoot;
+
+  const resetC7Caches = () => {
+    fleetMeshService._loaded = false;
+    fleetMeshService._masterKey = null;
+    fleetMeshService.state = {
+      version: 1,
+      cidr: '10.88.0.0/24',
+      interfaceName: 'wg0',
+      listenPort: 51820,
+      peers: Object.create(null)
+    };
+    if ('_heartbeatsLoaded' in cronManager) cronManager._heartbeatsLoaded = false;
+    if ('_heartbeatsPath' in cronManager) cronManager._heartbeatsPath = null;
+    if (Array.isArray(cronManager.heartbeats)) cronManager.heartbeats = [];
+  };
+  resetC7Caches();
+
+  const projAllowed = projectManager.create({
+    name: 'Cycle7 Allowed App',
+    teamId: 'team_default',
+    memoryMb: 512,
+    envVars: { NODE_ENV: 'production' }
+  });
+  const projForeign = projectManager.create({
+    name: 'Cycle7 Foreign App',
+    teamId: 'team_default',
+    memoryMb: 512
+  });
+
+  const viewerAuth = {
+    ok: true,
+    method: 'api_token',
+    principal: { userId: 'usr_c7_viewer', role: 'viewer', teamId: 'team_default', projectIds: [projAllowed.id], scopes: ['*'] }
+  };
+  const scopedDevAuth = {
+    ok: true,
+    method: 'api_token',
+    principal: { userId: 'usr_c7_dev', role: 'developer', teamId: 'team_default', projectIds: [projAllowed.id], scopes: ['*'] }
+  };
+  const unscopedDevAuth = {
+    ok: true,
+    method: 'api_token',
+    principal: { userId: 'usr_c7_unscoped_dev', role: 'developer', teamId: 'team_default', projectIds: null, scopes: ['*'] }
+  };
+
+  /** @type {string[]} */
+  const createdHbIds = [];
+  /** @type {string[]} */
+  const createdCronIds = [];
+
+  try {
+    // 1. culkibo_heal_build_failure (20-pattern diagnose + dryRun default + apply dryRun:false + anti-IDOR)
+    const oomLogs = 'FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory\nExit code 137';
+
+    // Viewer blocked + scoped dev blocked on foreign project (anti-IDOR)
+    const healViewer = await mcpServer.executeTool('culkibo_heal_build_failure', {
+      projectId: projAllowed.id,
+      logs: oomLogs
+    }, { auth: viewerAuth });
+    assert.strictEqual(healViewer.isError, true);
+    assert.strictEqual(JSON.parse(healViewer.content[0].text).code, 'FORBIDDEN');
+
+    const healIdor = await mcpServer.executeTool('culkibo_heal_build_failure', {
+      projectId: projForeign.id,
+      logs: oomLogs
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(healIdor.isError, true);
+    assert.strictEqual(JSON.parse(healIdor.content[0].text).code, 'FORBIDDEN');
+
+    // apply: true WITHOUT dryRun: false MUST default to dryRun: true (0 mutations!)
+    const healDefaultDry = await mcpServer.executeTool('culkibo_heal_build_failure', {
+      projectId: projAllowed.id,
+      logs: oomLogs,
+      apply: true
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(healDefaultDry.isError, false);
+    assert.strictEqual(healDefaultDry.structuredContent.matched, true);
+    assert.strictEqual(healDefaultDry.structuredContent.dryRun, true);
+    assert.strictEqual(healDefaultDry.structuredContent.applied, false);
+    assert.strictEqual(healDefaultDry.structuredContent.diagnosis.primary.code, 'NODE_HEAP_OOM');
+    assert.strictEqual(projectManager.getById(projAllowed.id).memoryMb, 512, 'apply sin dryRun:false no debe mutar el proyecto');
+
+    // previewToolPlan via explicit dryRun: true
+    const healPreview = await mcpServer.executeTool('culkibo_heal_build_failure', {
+      projectId: projAllowed.id,
+      logs: oomLogs,
+      apply: true,
+      dryRun: true
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(healPreview.isError, false);
+    assert.strictEqual(healPreview.structuredContent.dryRun, true);
+    assert.strictEqual(healPreview.structuredContent.wouldExecute, true);
+
+    // Explicit apply: true + dryRun: false applies safe patch (raises memoryMb / injects NODE_OPTIONS)
+    const healApplied = await mcpServer.executeTool('culkibo_heal_build_failure', {
+      projectId: projAllowed.id,
+      logs: oomLogs,
+      apply: true,
+      dryRun: false
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(healApplied.isError, false);
+    assert.strictEqual(healApplied.structuredContent.dryRun, false);
+    assert.strictEqual(healApplied.structuredContent.applied, true);
+    assert.ok(projectManager.getById(projAllowed.id).memoryMb > 512, 'applyHealingPlan debe incrementar memoryMb en NODE_HEAP_OOM');
+    console.log('  ✓ culkibo_heal_build_failure verificado (NODE_HEAP_OOM, default dryRun=true, dryRun=false apply y anti-IDOR)');
+
+    // 2. culkibo_fleet_mesh (admin RBAC, status/plan/rotate dryRun default, 0 private key leaks)
+    const meshDevBlocked = await mcpServer.executeTool('culkibo_fleet_mesh', { action: 'status' }, { auth: unscopedDevAuth });
+    assert.strictEqual(meshDevBlocked.isError, true);
+    assert.strictEqual(JSON.parse(meshDevBlocked.content[0].text).code, 'FORBIDDEN');
+
+    const meshStatus = await mcpServer.executeTool('culkibo_fleet_mesh', { action: 'status' });
+    assert.strictEqual(meshStatus.isError, false);
+    assert.strictEqual(meshStatus.structuredContent.cidr, '10.88.0.0/24');
+    assert.strictEqual(meshStatus.structuredContent.interfaceName, 'wg0');
+    assert.ok(meshStatus.structuredContent.peerCount >= 1);
+    const firstPeer = meshStatus.structuredContent.peers[0];
+    assert.ok(typeof firstPeer.publicKey === 'string' && firstPeer.publicKey.length === 44);
+    assert.ok(!('privateKey' in firstPeer) && !('encryptedPrivateKey' in firstPeer), 'Jamás exponer claves privadas WireGuard');
+
+    const meshPlan = await mcpServer.executeTool('culkibo_fleet_mesh', { action: 'plan' });
+    assert.strictEqual(meshPlan.isError, false);
+    assert.strictEqual(meshPlan.structuredContent.dryRun, true);
+    assert.ok(meshPlan.structuredContent.plan && Array.isArray(meshPlan.structuredContent.plan.wgConfigs));
+    assert.ok(meshPlan.structuredContent.plan.wgConfigs[0].config.includes('[REDACT_ON_API]'));
+
+    // Rotate omitting dryRun -> defaults to dryRun: true (keyVersion unchanged!)
+    const meshRotDry = await mcpServer.executeTool('culkibo_fleet_mesh', { action: 'rotate', nodeId: firstPeer.nodeId });
+    assert.strictEqual(meshRotDry.isError, false);
+    assert.strictEqual(meshRotDry.structuredContent.dryRun, true);
+    assert.strictEqual(meshRotDry.structuredContent.rotation.rotated, false);
+
+    // Rotate with dryRun: false -> rotates keypair & audit log redacts result
+    const meshRotReal = await mcpServer.executeTool('culkibo_fleet_mesh', { action: 'rotate', nodeId: firstPeer.nodeId, dryRun: false });
+    assert.strictEqual(meshRotReal.isError, false);
+    assert.strictEqual(meshRotReal.structuredContent.dryRun, false);
+    assert.strictEqual(meshRotReal.structuredContent.rotation.rotated, true);
+    assert.notStrictEqual(meshRotReal.structuredContent.rotation.newPublicKey, firstPeer.publicKey);
+    assert.strictEqual(mcpServer.getAuditLog(1)[0].resultSummary, '[resultado sensible ocultado en auditoría]');
+    console.log('  ✓ culkibo_fleet_mesh verificado (RBAC admin, x25519 44-char pubkey, 0 private keys, dryRun default y rotate real)');
+
+    // 3. culkibo_cron_timeline (RO viewer allowed, ACL-filtered crons & heartbeats, raw token redacted!)
+    const c1 = cronManager.create(projAllowed.id, { name: 'Allowed Backup', schedule: '0 * * * *', mode: 'http', httpPath: '/health' });
+    const c2 = cronManager.create(projForeign.id, { name: 'Foreign Secret Job', schedule: '0 * * * *', mode: 'http', httpPath: '/health' });
+    if (c1?.id) createdCronIds.push(c1.id);
+    if (c2?.id) createdCronIds.push(c2.id);
+
+    const hbAllowed = cronManager.createHeartbeat({ name: 'Allowed Heartbeat', projectId: projAllowed.id, periodSec: 3600, graceSec: 300 });
+    const hbForeign = cronManager.createHeartbeat({ name: 'Foreign Heartbeat', projectId: projForeign.id, periodSec: 3600, graceSec: 300 });
+    createdHbIds.push(hbAllowed.id, hbForeign.id);
+
+    const timelineViewer = await mcpServer.executeTool('culkibo_cron_timeline', { hours: 24, includeHeartbeats: true }, { auth: viewerAuth });
+    assert.strictEqual(timelineViewer.isError, false);
+    assert.strictEqual(timelineViewer.structuredContent.hours, 24);
+    assert.strictEqual(timelineViewer.structuredContent.slots.length, 24);
+    const serializedTimeline = JSON.stringify(timelineViewer.structuredContent);
+    assert.ok(serializedTimeline.includes('Allowed Heartbeat'), 'Debe incluir heartbeats del proyecto autorizado');
+    assert.ok(!serializedTimeline.includes('Foreign Heartbeat'), 'JAMÁS debe filtrar heartbeats de otros proyectos');
+    assert.ok(!serializedTimeline.includes('Foreign Secret Job'), 'JAMÁS debe filtrar crons de otros proyectos');
+    assert.ok(!serializedTimeline.includes(hbAllowed.token), 'JAMÁS debe exponer el token raw de check-in del heartbeat por culkibo_cron_timeline');
+    console.log('  ✓ culkibo_cron_timeline verificado (RO viewer, 24h heatmap, ACL estricto por proyecto y redacción de token heartbeat)');
+
+    // 4. culkibo_edge_shield (developer/admin RBAC, status, compile native Caddy v2.11 subroutes + PoW challenge)
+    const shieldViewer = await mcpServer.executeTool('culkibo_edge_shield', { action: 'status' }, { auth: viewerAuth });
+    assert.strictEqual(shieldViewer.isError, true);
+    assert.strictEqual(JSON.parse(shieldViewer.content[0].text).code, 'FORBIDDEN');
+
+    const shieldStatus = await mcpServer.executeTool('culkibo_edge_shield', { action: 'status' }, { auth: unscopedDevAuth });
+    assert.strictEqual(shieldStatus.isError, false);
+    assert.strictEqual(shieldStatus.structuredContent.status.zeroCaddyPlugins, true);
+
+    const shieldCompile = await mcpServer.executeTool('culkibo_edge_shield', {
+      action: 'compile',
+      domain: 'api.acme.dev',
+      powChallenge: true,
+      difficulty: 4
+    }, { auth: unscopedDevAuth });
+    assert.strictEqual(shieldCompile.isError, false);
+    assert.ok(Array.isArray(shieldCompile.structuredContent.routes) && shieldCompile.structuredContent.routes.length >= 4);
+
+    const shieldChal = await mcpServer.executeTool('culkibo_edge_shield', {
+      action: 'challenge',
+      domain: 'api.acme.dev',
+      difficulty: 3
+    }, { auth: unscopedDevAuth });
+    assert.strictEqual(shieldChal.isError, false);
+    assert.strictEqual(shieldChal.structuredContent.challenge.algorithm, 'sha256');
+    assert.strictEqual(shieldChal.structuredContent.challenge.difficulty, 3);
+    console.log('  ✓ culkibo_edge_shield verificado (RBAC developer/admin, status, compile Caddy v2.11 + PoW y challenge SHA-256)');
+
+    // 5. Final Cycle-7 assertion: exact 120 tools & ?profile=core 17/120 >83% reduction
+    const allTools = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
+    const coreTools = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
+    const savedPct = Math.round((1 - Buffer.byteLength(JSON.stringify(coreTools), 'utf8') / Buffer.byteLength(JSON.stringify(allTools), 'utf8')) * 1000) / 10;
+    assert.strictEqual(allTools.length, 120);
+    assert.strictEqual(coreTools.length, 17);
+    assert.ok(savedPct > 83, `?profile=core debe superar 83% de ahorro en 120 tools (actual: ${savedPct}%)`);
+    console.log(`  ✓ Catálogo Cycle-7 verificado: 120 tools exactas, ?profile=core 17/120 (-${savedPct}% tokens/bytes)`);
+  } finally {
+    for (const cid of createdCronIds) {
+      try { if (typeof cronManager.remove === 'function') cronManager.remove(cid); else if (typeof cronManager.delete === 'function') cronManager.delete(cid); } catch (e) {}
+    }
+    for (const hid of createdHbIds) {
+      try { cronManager.deleteHeartbeat(hid); } catch (e) {}
+    }
+    projectManager.delete(projAllowed.id);
+    projectManager.delete(projForeign.id);
+    await projectManager.flushToDisk();
+    if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+    else process.env.CULKIBO_DATA_DIR = prevDataDir;
+    resetC7Caches();
     try { fs.rmSync(tmpDataRoot, { recursive: true, force: true }); } catch (e) {}
   }
 }

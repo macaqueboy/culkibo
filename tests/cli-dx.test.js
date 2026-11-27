@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 116);
+    assert.strictEqual(demoJson.datasets.mcpTools, 120);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -621,6 +621,52 @@ async function testCliDx() {
     assert.strictEqual(tmRestoreDryJson.dryRun, true);
     assert.strictEqual(tmRestoreDryJson.restored, false);
     console.log(`  ✓ Pioneer CLI Cycle-6 verificado (culkibo finops $${finopsJson.comparison.annualSavingsUsd}/yr, culkibo timemachine list/create/dryRun-restore)`);
+
+    // 11. Pioneer Cycle-7 CLI: `culkibo heal --text "..." --json`, `culkibo mesh status|plan|rotate --json`
+    const healCli = await runCli([
+      'heal',
+      '--text', 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(healCli.status, 0, `culkibo heal falló: ${healCli.stderr} ${healCli.stdout}`);
+    const healJson = JSON.parse(healCli.stdout);
+    assert.strictEqual(healJson.ok, true);
+    assert.strictEqual(healJson.matched, true);
+    assert.strictEqual(healJson.diagnosis.primary.code, 'NODE_HEAP_OOM');
+    assert.ok(typeof healJson.diagnosis.primary.patchPreview === 'string' && healJson.diagnosis.primary.patchPreview.length > 0);
+
+    // File-based offline log diagnosis
+    const sampleLogFile = path.join(tmpRoot, 'fail-build.log');
+    fs.writeFileSync(sampleLogFile, "docker: Error response from daemon: failed to initialize logging driver: unknown log opt 'max-size' for syslog log driver.\n", 'utf8');
+    const healFileCli = await runCli(['heal', sampleLogFile, '--json'], { env: isolatedEnv });
+    assert.strictEqual(healFileCli.status, 0, healFileCli.stderr);
+    const healFileJson = JSON.parse(healFileCli.stdout);
+    assert.strictEqual(healFileJson.matched, true);
+    assert.strictEqual(healFileJson.diagnosis.primary.code, 'DOCKER_LOG_OPT_DRIVER_MISMATCH');
+
+    const meshStatusCli = await runCli(['mesh', 'status', '--json'], { env: isolatedEnv });
+    assert.strictEqual(meshStatusCli.status, 0, `culkibo mesh status falló: ${meshStatusCli.stderr} ${meshStatusCli.stdout}`);
+    const meshStatusJson = JSON.parse(meshStatusCli.stdout);
+    assert.strictEqual(meshStatusJson.ok, true);
+    assert.strictEqual(meshStatusJson.cidr, '10.88.0.0/24');
+    assert.ok(Array.isArray(meshStatusJson.peers) && meshStatusJson.peers.length >= 1);
+    assert.ok(!meshStatusCli.stdout.includes('encryptedPrivateKey'), 'culkibo mesh status jamás debe filtrar claves privadas');
+
+    const meshPlanCli = await runCli(['mesh', 'plan', '--json'], { env: isolatedEnv });
+    assert.strictEqual(meshPlanCli.status, 0, `culkibo mesh plan falló: ${meshPlanCli.stderr} ${meshPlanCli.stdout}`);
+    const meshPlanJson = JSON.parse(meshPlanCli.stdout);
+    assert.strictEqual(meshPlanJson.ok, true);
+    assert.strictEqual(meshPlanJson.dryRun, true);
+    assert.ok(Array.isArray(meshPlanJson.wgConfigs) && meshPlanJson.wgConfigs.length >= 1);
+    assert.ok(meshPlanJson.wgConfigs[0].config.includes('[REDACT_ON_API]'));
+
+    const meshRotateDryCli = await runCli(['mesh', 'rotate', '--node', meshStatusJson.peers[0].nodeId, '--json'], { env: isolatedEnv });
+    assert.strictEqual(meshRotateDryCli.status, 0, `culkibo mesh rotate dry-run falló: ${meshRotateDryCli.stderr} ${meshRotateDryCli.stdout}`);
+    const meshRotJson = JSON.parse(meshRotateDryCli.stdout);
+    assert.strictEqual(meshRotJson.ok, true);
+    assert.strictEqual(meshRotJson.dryRun, true);
+    assert.strictEqual(meshRotJson.rotated, false);
+    console.log('  ✓ Pioneer CLI Cycle-7 verificado (culkibo heal --text/file NODE_HEAP_OOM & kamal#1709, culkibo mesh status/plan/dryRun-rotate)');
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

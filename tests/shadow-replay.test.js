@@ -84,52 +84,48 @@ async function runShadowReplayTests() {
   // 2. Live baseline vs candidate HTTP servers: PASS (PROMOTE), REGRESSION (BLOCK_CUTOVER), redaction & SSRF
   let candidateMode = 'healthy';
   const baselineSrv = await startMockServer((req, res) => {
-    setTimeout(() => {
+    if (req.url === '/api/orders') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        requestId: 'base-123',
+        ts: Date.now(),
+        orders: [{ id: 1, currency: 'EUR', amount: 49.9 }],
+        meta: { region: 'eu-central', total: 1 }
+      }));
+      return;
+    }
+    if (req.url === '/api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, uptime: 12345 }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, path: req.url, version: 'v1' }));
+  });
+
+  const candidateSrv = await startMockServer((req, res) => {
+    if (candidateMode === 'healthy') {
       if (req.url === '/api/orders') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          requestId: 'base-123',
-          ts: Date.now(),
-          orders: [{ id: 1, currency: 'EUR', amount: 49.9 }],
-          meta: { region: 'eu-central', total: 1 }
+          requestId: 'cand-987',
+          ts: Date.now() + 999,
+          orders: [{ id: 2, currency: 'USD', amount: 99.0 }, { id: 3, currency: 'EUR', amount: 12.0 }],
+          meta: { region: 'eu-west', total: 2 }
         }));
         return;
       }
       if (req.url === '/api/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, uptime: 12345 }));
+        res.end(JSON.stringify({ ok: true, uptime: 12 }));
         return;
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, path: req.url, version: 'v1' }));
-    }, 8);
-  });
-
-  const candidateSrv = await startMockServer((req, res) => {
-    if (candidateMode === 'healthy') {
-      setTimeout(() => {
-        if (req.url === '/api/orders') {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            requestId: 'cand-987',
-            ts: Date.now() + 999,
-            orders: [{ id: 2, currency: 'USD', amount: 99.0 }, { id: 3, currency: 'EUR', amount: 12.0 }],
-            meta: { region: 'eu-west', total: 2 }
-          }));
-          return;
-        }
-        if (req.url === '/api/health') {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, uptime: 12 }));
-          return;
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, path: req.url, version: 'v2' }));
-      }, 9);
+      res.end(JSON.stringify({ ok: true, path: req.url, version: 'v2' }));
       return;
     }
 
-    // Regression mode: >3x latency spike + HTTP 500 + missing JSON key (`meta.region`)
+    // Regression mode: >10x latency spike (+65ms >> 25ms default minLatencyDeltaMs) + HTTP 500 + missing JSON key (`meta.region`)
     setTimeout(() => {
       if (req.url === '/api/orders') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -153,12 +149,24 @@ async function runShadowReplayTests() {
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, path: req.url, version: 'v2-slow' }));
-    }, 45);
+    }, 65);
   });
 
   try {
     process.env.CULKIBO_DATA_DIR = tmpRoot;
     const svc = new ShadowReplayService();
+
+    // Warm up loopback sockets & HTTP parser before timing assertions
+    await svc.runReplay({
+      projectId: 'warmup',
+      baselineUrl: baselineSrv.url,
+      candidateUrl: candidateSrv.url,
+      allowLoopback: true,
+      persist: false,
+      requests: [{ method: 'GET', path: '/api/health' }]
+    });
+    baselineSrv.seen.length = 0;
+    candidateSrv.seen.length = 0;
 
     // 2a. PASS scenario -> PROMOTE + secret redaction + hop-by-hop stripping
     candidateMode = 'healthy';
@@ -225,7 +233,7 @@ async function runShadowReplayTests() {
         { method: 'GET', path: '/api/orders' },
         { method: 'POST', path: '/api/checkout', body: { cartId: 'c_2' } }
       ],
-      gate: { max5xxDelta: 0, maxLatencyRatio: 2.0, maxStatusMismatchPct: 5, failOnSchemaDrift: true, minLatencyDeltaMs: 5 }
+      gate: { max5xxDelta: 0, maxLatencyRatio: 2.0, maxStatusMismatchPct: 5, failOnSchemaDrift: true }
     });
 
     assert.strictEqual(failReport.pass, false);

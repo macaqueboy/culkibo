@@ -39,6 +39,9 @@ const testOtlpAndSlsa = require('./otlp-and-slsa.test');
 const testMigrationsAndWasm = require('./migrations-and-wasm.test');
 const testShadowReplay = require('./shadow-replay.test');
 const testTimeMachineFinOps = require('./timemachine-finops.test');
+const testTerminalAndShield = require('./terminal-and-shield.test');
+const testMeshAndHealer = require('./mesh-and-healer.test');
+const testCronHeartbeat = require('./cron-heartbeat.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -103,6 +106,9 @@ async function runAll() {
     { name: 'Atomic Single-Leader DB Migrations, Per-PR Schema Isolation & Micro-Wasm Edge Runtime', fn: testMigrationsAndWasm },
     { name: 'Shadow Traffic Replay & Automatic Cutover Regression Gate', fn: testShadowReplay },
     { name: 'Whole-Stack Time-Machine Checkpoints, Cloud-vs-Self-Hosted FinOps & Coolify v4 Parity', fn: testTimeMachineFinOps },
+    { name: 'Zero-Dep Container Web Terminal (/ws/terminal) & Caddy Edge Shield PoW Gate', fn: testTerminalAndShield },
+    { name: 'Zero-Config WireGuard Fleet Mesh (x25519) & 20-Pattern Build Auto-Healer', fn: testMeshAndHealer },
+    { name: 'Cron 24h Visual Collision Heatmap & Dead-Man\'s-Switch Heartbeats', fn: testCronHeartbeat },
   ];
 
   for (const suite of suites) {

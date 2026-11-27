@@ -1,19 +1,19 @@
 # Culkibo — GitHub SEO & Launch-Tomorrow Go-To-Market Kit
 
-> **Target Repository:** `macaqueboy/culkibo` · **Release Baseline:** `v1.2.0` (Cycle 6 — 100% Push-Button Ready) · **License:** `Apache-2.0`
-> **Evidence Policy:** Every benchmark metric, tool count, MCP App URI, SBOM count, and competitive citation in this launch kit is grounded in live-measured uncontended output (`node bench/run-all.bench.js`), verified source files, [`docs/EVOLUTION_LOG.md`](EVOLUTION_LOG.md), and [`docs/COMPETITOR_RADAR_CYCLE1.md`](COMPETITOR_RADAR_CYCLE1.md) / [`docs/COMPETITOR_RADAR_CYCLE3.md`](COMPETITOR_RADAR_CYCLE3.md). Zero invented numbers.
+> **Target Repository:** `macaqueboy/culkibo` · **Release Baseline:** `v1.2.0` (Cycle 7 — 100% Push-Button Ready) · **License:** `Apache-2.0`
+> **Evidence Policy:** Every benchmark metric, tool count, MCP App URI, SBOM count, and competitive citation in this launch kit is grounded in live-measured uncontended output (`node bench/run-all.bench.js` & `node bench/competitor-comparison.bench.js`), verified source files, [`docs/EVOLUTION_LOG.md`](EVOLUTION_LOG.md), and [`docs/COMPETITOR_RADAR_CYCLE1.md`](COMPETITOR_RADAR_CYCLE1.md) / [`docs/COMPETITOR_RADAR_CYCLE3.md`](COMPETITOR_RADAR_CYCLE3.md) / [`docs/COMPETITOR_RADAR_CYCLE6.md`](COMPETITOR_RADAR_CYCLE6.md). Zero invented numbers.
 
 ---
 
 ## 1. Exact GitHub Repository Metadata (Copy-Paste Ready)
 
-### Repository Description (311 / 350 chars — High-Intent Keyword Optimized)
+### Repository Description (325 / 350 chars — High-Intent Keyword Optimized)
 
 ```text
-The 50 MB, zero-shell, AI-native self-hosted PaaS. 140+ apps, 12 DBs, sub-8ms Live Sync 2.0, Shadow Replay Gate, Time-Machine, FinOps, SmartPack, DirectPush (SSH OCI), EdgeTunnel, OTLP, SLSA v1.1 + SBOM, 0.56ms Wasm, 1-click Coolify v4 migration & 116 MCP tools + MCP Apps for Claude Code & Cursor. Coolify alt.
+The 50 MB, zero-shell, AI-native self-hosted PaaS. 140+ apps, 12 DBs, sub-8ms Live Sync, Web Terminal, WireGuard Mesh, PoW Shield, Auto-Healer, Shadow Replay, Time-Machine, FinOps, DirectPush, OTLP, SLSA v1.1, 0.16ms Wasm, 1-click Coolify v4 migration & 120 MCP tools + MCP Apps for Claude Code & Cursor. Coolify/Dokploy alt.
 ```
 
-> **SEO rationale:** Front-loads the strongest verified hooks (`51 MB`, `zero-shell`, `AI-native`, `self-hosted PaaS`), anchors competitor-switching queries (`Coolify`, `Dokploy alt`), and captures the 2026 AI-agent, observability, supply-chain & edge waves (`MCP`, `Async Tasks`, `MCP Apps`, `Claude Code`, `Cursor`, `SmartPack`, `DirectPush`, `EdgeTunnel`, `OTLP`, `SLSA`, `Wasm`) within GitHub's 350-character cap.
+> **SEO rationale:** Front-loads the strongest verified hooks (`50 MB`, `zero-shell`, `AI-native`, `self-hosted PaaS`), anchors competitor-switching queries (`Coolify/Dokploy alt`), and captures the 2026 AI-agent, edge-shield, mesh, observability & supply-chain waves (`Web Terminal`, `WireGuard Mesh`, `PoW Shield`, `Auto-Healer`, `Shadow Replay`, `Time-Machine`, `FinOps`, `DirectPush`, `OTLP`, `SLSA`, `0.16ms Wasm`, `120 MCP tools`, `MCP Apps`, `Claude Code`, `Cursor`) within GitHub's 350-character cap.
 
 ### Website / Homepage URL
 
@@ -100,26 +100,27 @@ You can explore the entire UI right now in 10 seconds with zero install:
 - Live Browser Sandbox (GitHub Pages): https://macaqueboy.github.io/culkibo/?demo=1&lang=en&theme=dark
 - Or locally in <200ms: `npx culkibo demo`
 
-How Culkibo approaches this differently (all verified on Node 24, 6 runtime npm deps, 0 external deps in telemetry collector):
+How Culkibo approaches this differently (all verified on Node 24, 6 runtime npm deps, 0 external deps in telemetry collector, 44 integrated test suites):
 
-- 50 MB idle RSS, 132.4 ms cold boot, 9,693 req/s authed Bearer+Brotli fast-path / 7,951 req/s health (`Server-Timing: cp;dur=0.02`), 51.9 ms 40-client WS fan-out: Single Node.js daemon paired with Caddy v2.11's JSON Admin API for synchronous, zero-poll route swaps, native HTTP/3, per-domain TLS fault isolation, Pingora-style drain barriers, and 103 Early Hints.
-- Zero shell construction (`shell: false`) + Signed SLSA v1.1 + CycloneDX 1.6 SBOM: Every subprocess (`docker`, `git`, `caddy`, `ssh`, `cron`) goes through tokenized `argv` arrays (`server/services/safeCommand.js`), statically verified on every commit by `node tests/shell-safety.test.js`. Every release ships a cryptographically signed SLSA v1.1 Ed25519 DSSE envelope (`release.slsa.dsse.json` + `culkibo verify`), CycloneDX 1.6 SBOM (`GET /api/system/sbom`), and `CHECKSUMS.sha256`.
-- Sub-8ms Live Sync 2.0 + Fast Env Restart + 0.562 ms Micro-Wasm: Incremental binary WebSocket sync (`/ws/sync`) with Brotli framing (-96.1% wire savings), Merkle verification, and in-memory rollback (1.32 ms server apply / 7.85 ms E2E / 1.91 ms rollback). Runtime-only env edits recreate containers in ~1.5s without rebuilding; lightweight edge handlers run in isolated `0.562 ms` worker_threads Micro-Wasm sandboxes.
-- Three category-defining capabilities competitors still lack (0 new npm deps):
-  - Shadow Traffic Replay & Automatic Cutover Gate: compares baseline vs candidate HTTP responses, JSON schema drift, 5xx delta, and p95 latency ratio to issue an automatic `PROMOTE` / `BLOCK_CUTOVER` verdict before flipping Caddy traffic.
-  - Whole-Stack Time-Machine (`culkibo timemachine`): SHA-256 whole-stack checkpoints (image, env keys, domains, edge rules, crons, limits — 0 plaintext secrets) with structural diff, dry-run preview, and atomic rollback with automatic pre-restore safety checkpoint.
-  - Self-Hosted vs Cloud FinOps Optimizer (`culkibo finops`): detects over-provisioned containers & auto-sleep candidates and calculates transparent annual savings vs published Vercel Pro, Railway, Render & Managed Postgres tiers.
-- Plus SmartPack (18-stack build plans), DirectPush (`culkibo pussh` zero-registry SSH OCI v2), Sovereign EdgeTunnel (`ET1` CGNAT tunnel), Zero-Dep OTLP/HTTP JSON (Tempo/SigNoz/Honeycomb), Atomic Single-Leader DB Migrations + SnapStream + PR DB/Schema Isolation.
-- Native MCP 2026-07-28 + Official Async Tasks + Elicitation + World-First PaaS MCP Apps (`ui://culkibo/*`): 116 tools, 13 playbooks, non-blocking `io.modelcontextprotocol/tasks`, `elicitation/create` schemas, and 3 sandboxed `ext-apps` interactive HTML cards (`topology`, `incident-remediator`, `coolify-migration-diff`, locked-down `default-src 'none'` CSP). `?profile=core` cuts schema context size by >82%.
+- 50–51 MB idle RSS, 132.4 ms cold boot, 9,693 req/s authed Bearer+Brotli fast-path / 7,951 req/s health (`Server-Timing: cp;dur=0.02`), 51.9 ms 40-client WS fan-out: Single Node.js daemon paired with Caddy v2.11's JSON Admin API for synchronous, zero-poll route swaps, native HTTP/3, per-domain TLS fault isolation, Pingora-style drain barriers, 103 Early Hints, and Caddy Native Edge Bot-Shield + Anubis-style SHA-256 Hashcash PoW Gate (zero Caddy plugins).
+- Zero shell construction (`shell: false`) + CVE Immunity + Signed SLSA v1.1 + CycloneDX 1.6 SBOM: Every subprocess (`docker`, `git`, `caddy`, `ssh`, `cron`) goes through tokenized `argv` arrays (`server/services/safeCommand.js`), statically verified by `node tests/shell-safety.test.js` — making Culkibo immune by design to `CVE-2026-129433` (backup/DB shell injection), `kamal#1709` (log-opt crash), and `kamal#1856` (Docker iptables UFW bypass via private bridge + WireGuard Mesh + doctor audit). Every release ships a signed SLSA v1.1 Ed25519 DSSE envelope (`release.slsa.dsse.json` + `culkibo verify`) and CycloneDX 1.6 SBOM (`GET /api/system/sbom`).
+- Sub-8ms Live Sync 2.0 + Fast Env Restart + 0.162 ms Warm p50 Micro-Wasm (`0.192 ms` p95, `64 KiB` RAM): Incremental binary WebSocket sync (`/ws/sync`) with Brotli framing (-96.1% wire savings), Merkle verification, and in-memory rollback (1.32 ms server apply / 7.85 ms E2E / 1.91 ms rollback). Runtime-only env edits recreate containers in ~1.5s without rebuilding; lightweight edge handlers run in isolated `0.162 ms` warm p50 worker_threads Micro-Wasm sandboxes.
+- Zero-dep Pioneer capabilities competitors still lack (still 6 root npm deps!):
+  - Zero-Dep Interactive Container Web Terminal (`/ws/terminal` direct Docker Engine TCP hijack, RBAC `runtime:exec`, single-use ticket, no `node-pty`, plus live simulated shell in `?demo=1`).
+  - Zero-Config WireGuard Fleet Mesh (`culkibo mesh`): native Node `x25519`, AES-256-GCM encrypted keys, private `10.88.0.0/24` L3 overlay + UFW DB bypass doctor.
+  - 20-Pattern Deterministic Build Auto-Healer (`culkibo heal` + MCP `culkibo_heal_build_failure`): diagnoses Node OOM, `127.0.0.1` binds, lockfile drift, `kamal#1709`, Postgres `pg_wal` bloat with dry-run patch previews.
+  - 24h Cron Collision Heatmap & Dead-Man's-Switch Heartbeats (Healthchecks.io-style `/api/heartbeat/:token` + hourly IO collision detection).
+  - Shadow Traffic Replay Gate (`PROMOTE` / `BLOCK_CUTOVER`), Whole-Stack Time-Machine (`culkibo timemachine`), Self-Hosted vs Cloud FinOps Optimizer (`culkibo finops`), SmartPack (18 stacks), DirectPush (`culkibo pussh` SSH OCI v2), Sovereign EdgeTunnel (`ET1`), Zero-Dep OTLP/HTTP JSON, and Atomic Single-Leader DB Migrations + SnapStream + PR DB/Schema Isolation.
+- Native MCP 2026-07-28 + Official Async Tasks + Elicitation + World-First PaaS MCP Apps (`ui://culkibo/*`): 120 tools, 13 playbooks, non-blocking `io.modelcontextprotocol/tasks`, `elicitation/create` schemas, and 3 sandboxed `ext-apps` interactive HTML cards (`topology`, `incident-remediator`, `coolify-migration-diff`, locked-down `default-src 'none'` CSP). `?profile=core` (`17/120` tools) cuts schema context size by >83%.
 - Batteries included without paywalling security: 100% EN/ES Obsidian Dark & Light UI, Spatial SVG Topology Canvas with click-to-link DB injection, 140 pinned catalog apps (0 `:latest`, 0 `docker.sock`), 12 managed DB engines, AES-256-GCM S3/R2 DR drills, 4-role RBAC + TOTP 2FA + OIDC PKCE (`groups` → RBAC + JWKS SWR), hash-chained audit log, multi-server SSH fleet, `culkibo.yaml` GitOps, auto-sleep scale-to-zero, 7-provider DNS-01 wildcard TLS, and a 1-click Coolify v4 migrator (3-tier shared env precedence + Magic Vars + Traefik→Caddy + zero-shell Volume/SQL streaming + `.zip` bundles, verified via full Mock Coolify v4 E2E replay).
 
 Honest caveats:
-- Benchmarks in the README were measured uncontended on Node v24.14.0 (win32/x64); competitor RAM figures are explicitly labeled as documented architecture baselines, not locally executed benchmarks. Reproduce every Culkibo metric with `node bench/run-all.bench.js`, and check `.github/workflows/ci.yml` for our 4-job Linux CI (Node 20/22/24 + Live Caddy v2.11 + Docker BuildKit SmartPack/SBOM + Playwright QA).
+- Benchmarks in the README were measured uncontended on Node v24.14.0 (win32/x64); competitor RAM figures are explicitly labeled as documented architecture baselines, not locally executed benchmarks. Reproduce every Culkibo metric with `node bench/run-all.bench.js` and `node bench/competitor-comparison.bench.js`, and check `.github/workflows/ci.yml` for our 4-job Linux CI (Node 20/22/24 + Live Caddy v2.11 + Docker BuildKit SmartPack/SBOM + Playwright QA).
 - Telemetry is opt-out anonymous crash/health reporting with an 11-phase PII scrubber and `telemetry preview` inspection (`CULKIBO_TELEMETRY=0` or `DO_NOT_TRACK=1` disables it immediately).
 
 Repo: https://github.com/macaqueboy/culkibo
 
-Happy to answer any questions about the Caddy Admin API design, zero-shell static checker, Shadow Traffic Replay gate, Whole-Stack Time-Machine, DirectPush SSH OCI v2 shim, zero-dep OTLP/SLSA implementation, or MCP Tasks & MCP Apps!
+Happy to answer any questions about the Caddy Admin API & PoW shield design, zero-shell static checker, direct Docker TCP Web Terminal hijack, native x25519 WireGuard Mesh, 20-pattern Build Auto-Healer, Shadow Replay gate, Whole-Stack Time-Machine, or MCP Tasks & MCP Apps!
 ```
 
 ---
@@ -128,40 +129,42 @@ Happy to answer any questions about the Caddy Admin API design, zero-shell stati
 
 **Title:**
 ```text
-I built Culkibo v1.2 (Apache-2.0): a 50 MB RAM, zero-shell self-hosted PaaS with 9,693 req/s fast-path, Caddy HTTP/3, 140 apps, Shadow Replay Gate, Whole-Stack Time-Machine, Cloud FinOps, DirectPush & 116 MCP tools (+ live browser demo)
+I built Culkibo v1.2 (Apache-2.0): a 50 MB RAM, zero-shell self-hosted PaaS with Web Terminal, WireGuard Mesh, Caddy PoW Bot-Shield, Build Auto-Healer, Shadow Replay, Time-Machine, 0.16ms Wasm & 120 MCP tools (+ live browser demo)
 ```
 
 **Body:**
 ```markdown
 Hey r/selfhosted!
 
-I wanted a self-hosted PaaS that could actually live comfortably on a cheap **512 MB – 1 GB VPS** without giving up multi-server fleets, RBAC/2FA/OIDC, encrypted S3 backups, or Railway/Linear-grade dark-mode UX — and without needing Docker Hub/GHCR or Cloudflare lock-in.
+I wanted a self-hosted PaaS that could actually live comfortably on a cheap **512 MB – 1 GB VPS** without giving up multi-server fleets, WireGuard mesh networking, RBAC/2FA/OIDC, encrypted S3 backups, or Railway/Linear-grade dark-mode UX — and without needing Docker Hub/GHCR or Cloudflare lock-in.
 
 So I built **Culkibo v1.2** (100% Apache-2.0 open source, zero paywalled self-hosted features, 100% English & Spanish UI with Obsidian Dark/Light mode):
 - **GitHub:** https://github.com/macaqueboy/culkibo
 - **Try in 10s (zero-install browser sandbox):** https://macaqueboy.github.io/culkibo/?demo=1&lang=en&theme=dark (or `npx culkibo demo`)
 
 ### What makes it genuinely different
-- **50 MB idle RSS daemon** (`132.4 ms` cold boot, `9,693 req/s` authed Bearer+Brotli fast-path, **6 runtime npm deps**, **Signed SLSA v1.1 DSSE + CycloneDX 1.6 SBOM**). Reproducible via `node bench/run-all.bench.js`.
-- **Zero shell construction (`shell: false`)**: Every `docker`, `git`, `caddy`, and `ssh` call uses strict `argv` arrays, CI-verified by `tests/shell-safety.test.js`. No shell-injection RCE class.
+- **50–51 MB idle RSS daemon** (`132.4 ms` cold boot, `9,693 req/s` authed Bearer+Brotli fast-path, **6 runtime npm deps**, **44 integrated test suites**, **Signed SLSA v1.1 DSSE + CycloneDX 1.6 SBOM**). Reproducible via `node bench/run-all.bench.js`.
+- **Zero shell construction (`shell: false`)**: Every `docker`, `git`, `caddy`, and `ssh` call uses strict `argv` arrays, CI-verified by `tests/shell-safety.test.js` — immune by design to `CVE-2026-129433` (DB/backup shell injection), `kamal#1709`, and `kamal#1856` (Docker UFW bypass).
 - **Zero-dep breakthroughs no other self-hosted PaaS ships**:
+  - **Zero-Dep Container Web Terminal**: direct Docker Engine TCP hijack over `/ws/terminal` (RBAC `runtime:exec`, no `node-pty`, interactive simulated shell even in `?demo=1`).
+  - **Zero-Config WireGuard Fleet Mesh (`culkibo mesh`)**: native Node `x25519` keys encrypted with AES-256-GCM over a private `10.88.0.0/24` mesh + UFW DB-bypass doctor.
+  - **Caddy Native Edge Bot-Shield & Anubis-style Hashcash PoW Gate**: zero-plugin Caddy v2.11 bad-scanner / AI-scraper matchers + SHA-256 PoW cookie gate (`ckb_shield`).
+  - **20-Pattern Deterministic Build Auto-Healer (`culkibo heal`)**: diagnoses Node OOM, `127.0.0.1` binds, lockfile drift, log-driver crashes & Postgres `pg_wal` bloat with dry-run patch previews.
+  - **24h Cron Collision Heatmap & Dead-Man's-Switch Heartbeats**: visual hourly IO collision bar + Healthchecks.io-style `/api/heartbeat/:token` push endpoints.
   - **Shadow Traffic Replay Gate**: compares baseline vs candidate HTTP status, JSON schema drift & p95 latency to output an automatic `PROMOTE` / `BLOCK_CUTOVER` verdict before flipping Caddy traffic.
   - **Whole-Stack Time-Machine (`culkibo timemachine`)**: SHA-256 whole-stack checkpoints (image, env keys, domains, crons, limits) with structural diff, dry-run preview & atomic rollback.
   - **Self-Hosted vs Cloud FinOps Optimizer (`culkibo finops`)**: container right-sizing + honest annual savings calculator vs Vercel Pro, Railway, Render & Managed Postgres.
-  - **DirectPush (`culkibo pussh`)**: loopback OCI v2 layer-delta push directly over your SSH fleet tunnel — no Docker Hub or GHCR needed.
-  - **Sovereign EdgeTunnel (`culkibo tunnel-agent`)**: self-hosted multiplexed WebSocket tunnel behind CGNAT/homelab NAT (plus 1-click Cloudflare Tunnels if you prefer CF).
-  - **SmartPack (`culkibo smartpack`)**: 18-stack deterministic build plans with automatic `.dockerignore`, BuildKit 1.7 cache mounts, and cgroup RAM/CPU caps so builds never OOM your VPS.
-  - **Zero-Dep OTLP/HTTP JSON**: native traces & metrics to Grafana Tempo / SigNoz / Honeycomb with zero `@opentelemetry/*` packages.
+  - **DirectPush (`culkibo pussh`)** (loopback SSH OCI v2 layer-delta push — zero Docker Hub/GHCR), **Sovereign EdgeTunnel (`ET1`)**, **SmartPack** (18 stacks + cgroup caps), and **Zero-Dep OTLP/HTTP JSON**.
 - **Caddy v2.11 atomic ingress**: Native HTTP/3 (QUIC), **7-provider DNS-01 wildcard TLS** (Cloudflare, Hetzner, DigitalOcean, Route 53, Porkbun, Bunny, DuckDNS), `103 Early Hints`, Basic Auth, IP Allowlists, and ForwardAuth.
 - **140 pinned 1-click catalog apps** (zero `:latest` tags, zero `docker.sock` mounts) + **12 managed database engines** with **Atomic Single-Leader DB Migrations**, **AES-256-GCM S3/R2 DR drills**, **SnapStream** (SQLite WAL-to-S3 streaming), and **PR Preview DB/Schema Isolation**.
 - **Built-in features people keep requesting in Coolify/Dokploy**:
   - Native **Auto-Sleep Scale-to-Zero** (with prune protection so sleeping containers are never wiped)
   - **Runtime-Only Fast Restart** (edit env vars without triggering a 3-minute rebuild!)
   - **Spatial SVG Topology Canvas** with click-to-link `DATABASE_URL` injection
-  - **`0.562 ms` Isolated Micro-Wasm Edge Runtime** for tiny webhook/edge handlers
+  - **`0.162 ms` warm p50 Isolated Micro-Wasm Edge Runtime** (`0.192 ms` p95, `64 KiB` RAM) for tiny webhook/edge handlers
   - **Teams + 4-role RBAC + TOTP 2FA + OIDC SSO (`groups` → role mapping + JWKS SWR) + hash-chained tamper-evident audit log**
 - **1-Click Coolify v4 Migrator (read-only on source, E2E replay tested)**: Resolves 3-tier shared env precedence + Coolify Magic Variables (`SERVICE_FQDN_*`, `SERVICE_PASSWORD_*`), converts Traefik labels into Caddy routes, maps multi-server fleets, and generates zero-shell Volume & SQL transfer commands before you switch DNS.
-- **Sub-8ms Live Sync 2.0 + Native MCP (`2026-07-28`) + Async Tasks + Inline MCP Apps**: Binary hot-sync (`1.32 ms` apply, `7.85 ms` E2E, `-96.1%` Brotli) + **116 MCP tools**, official `io.modelcontextprotocol/tasks`, `elicitation/create`, **13 playbooks**, **3 sandboxed `ui://culkibo/*` MCP Apps**, and `?profile=core` (**-82%+ token savings**) for Claude Code, Cursor, Windsurf, Codex & Antigravity.
+- **Sub-8ms Live Sync 2.0 + Native MCP (`2026-07-28`) + Async Tasks + Inline MCP Apps**: Binary hot-sync (`1.32 ms` apply, `7.85 ms` E2E, `-96.1%` Brotli) + **120 MCP tools**, official `io.modelcontextprotocol/tasks`, `elicitation/create`, **13 playbooks**, **3 sandboxed `ui://culkibo/*` MCP Apps**, and `?profile=core` (`17/120` = **-83%+ token savings**) for Claude Code, Cursor, Windsurf, Codex & Antigravity.
 
 ### Quick try (Docker Compose)
 ```bash
@@ -182,14 +185,14 @@ Would love honest feedback from people running Coolify, Dokploy, CapRover, or Ka
 
 - **Name:** `Culkibo`
 - **Tagline (59 / 60 chars):** `50 MB, zero-shell, AI-native self-hosted PaaS with MCP Apps`
-- **Short Description (258 / 260 chars):**
-  `Deploy 140+ pinned apps, 12 DBs, Caddy HTTP/3, sub-8ms Live Sync, Shadow Replay Gate, Time-Machine, Cloud FinOps, DirectPush (no Docker Hub), OTLP & 0.56ms Wasm on a 50 MB open-source control plane. Built for Claude Code & Cursor with 116 MCP tools + sandbox.`
+- **Short Description (251 / 260 chars):**
+  `Deploy 140+ apps, 12 DBs, Caddy HTTP/3, sub-8ms Live Sync, Web Terminal, WireGuard Mesh, PoW Shield, Auto-Healer, Shadow Replay, Time-Machine, DirectPush, OTLP & 0.16ms Wasm on a 50 MB OSS control plane. Built for Claude Code & Cursor (120 MCP tools).`
 - **Topics:** `Developer Tools`, `Open Source`, `DevOps`, `Artificial Intelligence`, `Cloud Infrastructure`
 - **Gallery Order (5 slides — ALL committed in `docs/assets/`!):**
   1. [`docs/assets/social-preview.png`](assets/social-preview.png) — Hero Architecture & Verified Benchmarks card (`1280×640`)
   2. [`docs/assets/dashboard-dark-en.png`](assets/dashboard-dark-en.png) — Obsidian Dark Mode Dashboard + Live RAM Pill + Onboarding (`1440×900`)
   3. [`docs/assets/topology-dark-en.png`](assets/topology-dark-en.png) — Interactive Spatial SVG Topology Canvas & Click-to-Link DB Injection (`1440×900`)
-  4. [`docs/assets/ai-agent-hub.png`](assets/ai-agent-hub.png) — 100%-English AI Agent Hub (MCP Tools, `-82%` Core Profile, 1-Click Agent Cards & Interactive `ui://culkibo/*` MCP Apps)
+  4. [`docs/assets/ai-agent-hub.png`](assets/ai-agent-hub.png) — 100%-English AI Agent Hub (MCP Tools, `-83%+` Core Profile, 1-Click Agent Cards & Interactive `ui://culkibo/*` MCP Apps)
   5. [`docs/assets/dashboard-light-en.png`](assets/dashboard-light-en.png) — Crisp Light Mode Dashboard (`1440×900`)
 
 ---
@@ -197,35 +200,35 @@ Would love honest feedback from people running Coolify, Dokploy, CapRover, or Ka
 ### Draft D — X / Twitter Launch Thread (6 Posts)
 
 **Post 1 (Hook + attach `docs/assets/social-preview.png`):**
-> I built an open-source, self-hosted PaaS that idles at **50 MB RAM**, boots in **132 ms**, hits **9,693 req/s**, uses **6 runtime deps**, has **0 shell calls** (CI-verified + Signed SLSA v1.1 + CycloneDX 1.6), and ships **116 MCP tools + inline MCP Apps** for Claude Code, Cursor & Antigravity.
+> I built an open-source, self-hosted PaaS that idles at **50–51 MB RAM**, boots in **132 ms**, hits **9,693 req/s**, runs **`0.162 ms` Micro-Wasm**, uses **6 runtime deps**, has **0 shell calls** (CI-verified + Signed SLSA v1.1 + 44 test suites), and ships **120 MCP tools + inline MCP Apps** for Claude Code, Cursor & Antigravity.
 >
 > Meet **Culkibo v1.2** (Apache-2.0) — try the live browser sandbox in 10s (zero install):
 >
 > Thread 🧵👇
 
-**Post 2 (Performance, Shadow Replay Gate, Time-Machine & FinOps + attach `docs/assets/topology-dark-en.png`):**
-> Most self-hosted PaaS dashboards burn 500 MB–1.5 GB RAM just sitting idle, ship blind cutovers, and get hit by shell-injection CVEs.
+**Post 2 (Web Terminal, WireGuard Mesh, Caddy PoW Shield & Auto-Healer + attach `docs/assets/topology-dark-en.png`):**
+> Most self-hosted PaaS dashboards burn 500 MB–1.5 GB RAM, get hit by shell-injection CVEs (`CVE-2026-129433`), and expose DBs past UFW (`kamal#1856`).
 >
-> Culkibo runs on:
-> • 50 MB idle RSS · 132 ms boot · 9,693 req/s Bearer+Brotli (`Server-Timing: cp;dur=0.02`)
-> • **Shadow Traffic Replay Gate**: auto `PROMOTE` / `BLOCK_CUTOVER` on p95/5xx/JSON drift
-> • **Whole-Stack Time-Machine**: SHA-256 stack diff & atomic restore
-> • **Cloud FinOps Calculator**: real annual savings vs Vercel, Railway & Render
+> Culkibo ships all of this in **50 MB RAM** (zero extra npm deps):
+> • **Zero-Dep Web Terminal**: direct Docker TCP hijack `/ws/terminal` (no `node-pty`)
+> • **WireGuard Fleet Mesh (`culkibo mesh`)**: native `x25519` AES-GCM `10.88.0.0/24` + UFW audit
+> • **Caddy Edge Bot-Shield & Anubis PoW Gate**: anti-scraper SHA-256 PoW (zero plugins)
+> • **20-Pattern Build Auto-Healer (`culkibo heal`)** + **24h Cron Heatmap & Heartbeats**
 
-**Post 3 (Sub-8ms Live Sync 2.0 + SmartPack + DirectPush + Sovereign EdgeTunnel + `0.562 ms` Wasm):**
-> Zero Docker Hub lock-in. Zero Cloudflare lock-in. Zero rebuild tax on env edits.
+**Post 3 (Sub-8ms Live Sync 2.0 + Shadow Replay + Time-Machine + DirectPush + `0.162 ms` Wasm):**
+> Zero Docker Hub lock-in. Zero Cloudflare lock-in. Zero blind production cutovers.
 >
-> Built natively into the 50 MB daemon (0 new npm deps):
+> Built natively into the 50 MB daemon:
 > • **Live Sync 2.0**: `1.32 ms` apply · `7.85 ms` E2E · `-96.1%` Brotli · `1.91 ms` rollback
-> • **SmartPack**: 18-stack build plans, auto-`.dockerignore`, BuildKit 1.7 & cgroup caps
-> • **DirectPush (`culkibo pussh`)**: SSH OCI v2 layer-delta push straight to your VPS
-> • **EdgeTunnel**: sovereign CGNAT WebSocket tunnel (`ET1`)
-> • **Micro-Wasm**: `0.562 ms` sandboxed edge handlers + Zero-Dep OTLP + Atomic DB migrations
+> • **Shadow Replay Gate**: auto `PROMOTE` / `BLOCK_CUTOVER` on p95/5xx/JSON drift
+> • **Whole-Stack Time-Machine** + **Cloud FinOps Savings Calculator**
+> • **DirectPush (`culkibo pussh`)**: SSH OCI v2 push + **EdgeTunnel (`ET1`)**
+> • **Micro-Wasm**: `0.162 ms` warm p50 (`0.192 ms` p95, `64 KiB` RAM) + Zero-Dep OTLP
 
 **Post 4 (AI-Agent Native MCP 2026 + Official Async Tasks + World-First PaaS MCP Apps + attach `docs/assets/ai-agent-hub.png`):**
 > Dumping 100+ raw MCP tools into an LLM kills context windows — and blocking 90s Docker builds breaks agent loops.
 >
-> Culkibo solves both with `?profile=core` (**-82%+ tokens** across 116 tools), official **MCP `2026-07-28` Async Tasks (`io.modelcontextprotocol/tasks`)**, `elicitation/create` forms, 13 playbooks, AND **3 sandboxed inline MCP Apps (`ui://culkibo/*`)**.
+> Culkibo solves both with `?profile=core` (`17/120` = **-83%+ tokens** across **120 MCP tools**), official **MCP `2026-07-28` Async Tasks (`io.modelcontextprotocol/tasks`)**, `elicitation/create` forms, 13 playbooks, AND **3 sandboxed inline MCP Apps (`ui://culkibo/*`)**.
 >
 > Connect in 1 command: `culkibo agent-init claude`
 
@@ -240,7 +243,7 @@ Would love honest feedback from people running Coolify, Dokploy, CapRover, or Ka
 **Post 6 (Ethical Open-Core + Zero-Install Sandbox CTA):**
 > Zero "enterprise-paywalling basic security" games:
 >
-> 2FA, OIDC SSO, RBAC, Multi-Server Fleets, Encrypted DR, Shadow Replay, Time-Machine, FinOps, DirectPush, EdgeTunnel, OTLP, Signed SLSA v1.1, CycloneDX SBOM, GitOps, Scale-to-Zero, and all 116 MCP tools + Tasks + 3 MCP Apps are **100% free forever under Apache-2.0**.
+> 2FA, OIDC SSO, RBAC, Web Terminal, WireGuard Mesh, Caddy PoW Shield, Build Auto-Healer, Cron Heartbeats, Shadow Replay, Time-Machine, FinOps, DirectPush, EdgeTunnel, OTLP, Signed SLSA v1.1, CycloneDX SBOM, GitOps, Scale-to-Zero, and all 120 MCP tools + Tasks + 3 MCP Apps are **100% free forever under Apache-2.0**.
 >
 > Try the zero-install sandbox (`npx culkibo demo`) or drop a ⭐ on GitHub:
 > https://github.com/macaqueboy/culkibo
@@ -253,7 +256,7 @@ Culkibo's monetization model is engineered to **build extreme trust with the ope
 
 | Tier | Pricing Target | License Verification | What Is Included |
 | :--- | :--- | :--- | :--- |
-| **Community (OSS)** | **$0 Forever** (`Apache-2.0`) | None required (zero phone-home) | **100% of self-hosted core power with zero artificial limits:** Unlimited projects, 12 DB engines, 140 catalog apps, Live Sync 2.0, SmartPack, DirectPush, Sovereign EdgeTunnel, Zero-Dep OTLP, SLSA v1.1 Attestations, CycloneDX 1.6 SBOM, Atomic DB Migrations, Micro-Wasm Edge Runtime, SnapStream, PR DB/Schema Isolation, Multi-Server SSH Fleet, Teams + 4-role RBAC + ACL, TOTP 2FA, OIDC PKCE SSO (`groups` + JWKS SWR), GitOps `culkibo.yaml`, 113 MCP tools + Async Tasks + 13 playbooks + 3 MCP Apps, AES-256-GCM S3 DR Backups + Drills, Synthetic Uptime + Public Status Pages, Auto-Sleep Scale-to-Zero, 7-provider Wildcard DNS-01, Cloudflare Tunnels, Coolify v4 Migrator. |
+| **Community (OSS)** | **$0 Forever** (`Apache-2.0`) | None required (zero phone-home) | **100% of self-hosted core power with zero artificial limits:** Unlimited projects, 12 DB engines, 140 catalog apps, Live Sync 2.0, Zero-Dep Web Terminal, WireGuard Fleet Mesh, 24h Cron Heatmap & Heartbeats, Caddy Edge Bot-Shield & Hashcash PoW Gate, 20-Pattern Build Auto-Healer, Shadow Replay Gate, Whole-Stack Time-Machine, Cloud FinOps Optimizer, SmartPack, DirectPush, Sovereign EdgeTunnel, Zero-Dep OTLP, SLSA v1.1 Attestations, CycloneDX 1.6 SBOM, Atomic DB Migrations, `0.162 ms` Micro-Wasm Edge Runtime, SnapStream, PR DB/Schema Isolation, Multi-Server SSH Fleet, Teams + 4-role RBAC + ACL, TOTP 2FA, OIDC PKCE SSO (`groups` + JWKS SWR), GitOps `culkibo.yaml`, 120 MCP tools + Async Tasks + 13 playbooks + 3 MCP Apps, AES-256-GCM S3 DR Backups + Drills, Synthetic Uptime + Public Status Pages, Auto-Sleep Scale-to-Zero, 7-provider Wildcard DNS-01, Cloudflare Tunnels, Coolify v4 Migrator. |
 | **Pro** | **$19–$29 / mo** *(or $190 / yr per org)* | **100% Offline Ed25519 Key (`CKL1.*`)** | Everything in Community + **Managed Multi-Region Relay** (`managed_multi_region_relay`), **Custom White-Label Branding** (`custom_branding` on dashboard, status pages & wake screens), and **Priority Diagnostics & Support Bundle** (`priority_support_bundle`). |
 | **Enterprise** | **$149–$299 / mo** *(custom annual SLA)* | **100% Offline Ed25519 Key (`CKL1.*`, air-gap ready)** | Everything in Pro + **Enterprise SCIM 2.0 & SAML 2.0 Pack** (`enterprise_scim_saml` for Okta/Entra ID group sync), **SLA & Signed Compliance Exports** (`sla_support_export` for SOC2/ISO-27001), **Continuous SIEM / Audit Attestation Export** (`compliance_audit_export`), and **Dedicated Architecture & Migration SLA** (`dedicated_onboarding`). |
 | **Culkibo Cloud** | **Usage / Seat Managed** *(starts ~$15 / mo)* | Hosted HA Control Plane (`managed_control_plane`) | Everything in Enterprise + **Zero-maintenance Multi-AZ Managed Control Plane** connecting directly to your own Hetzner/DO/AWS/bare-metal VPS fleet via Culkibo's zero-shell SSH tunnels. |
@@ -269,10 +272,10 @@ Culkibo's monetization model is engineered to **build extreme trust with the ope
    - `punkpeye/awesome-mcp-servers` & `modelcontextprotocol/servers` (DevOps / Cloud Orchestration MCP + Tasks + MCP Apps category)
    - `veggiemonk/awesome-docker` (Docker PaaS / Management)
 2. **Comparison & Migration Guides (SEO Long-Tail Technical Posts on Dev.to / Hashnode / Medium / `culkibo.dev/blog`):**
-   - *"How We Cut Self-Hosted PaaS Idle RAM to 51 MB with Zero Shell Calls, 6 Dependencies & SLSA v1.1 Attestations"*
+   - *"How We Cut Self-Hosted PaaS Idle RAM to 50 MB with Zero Shell Calls, 6 Dependencies & SLSA v1.1 Attestations"*
    - *"Migrating from Coolify v4 to Culkibo Without Downtime: Translating Magic Variables, Traefik Labels & Live SQL Streams"*
-   - *"Cutting MCP Context Bloat by 81% & Shipping Async Tasks + Inline MCP Apps (`ui://`) for DevOps"*
-   - *"Zero-Dep OTLP/HTTP JSON & Registry-Less DirectPush (`culkibo pussh`) in Node.js"*
+   - *"Cutting MCP Context Bloat by 83%+ Across 120 Tools & Shipping Async Tasks + Inline MCP Apps (`ui://`) for DevOps"*
+   - *"Zero-Dep Container Web Terminal (No `node-pty`), Native `x25519` WireGuard Mesh & Caddy Hashcash PoW Shield in Node.js"*
 3. **GitHub Traffic Archival Rule (Critical — 14-Day Retention Limit):**
    - GitHub only retains `views`, `clones`, `referrers`, and `popular/paths` traffic metrics for **14 days**.
    - Starting on Launch Day, archive weekly traffic snapshots (`gh api repos/macaqueboy/culkibo/traffic/views`, `/clones`, `/popular/referrers`, `/popular/paths`) into a private metrics repo or scheduled workflow so launch spike attribution is never lost.
@@ -296,7 +299,7 @@ Culkibo's monetization model is engineered to **build extreme trust with the ope
 REPO="macaqueboy/culkibo"
 
 gh repo edit "$REPO" \
-  --description "The 50 MB, zero-shell, AI-native self-hosted PaaS. 140+ apps, 12 DBs, sub-8ms Live Sync 2.0, Shadow Replay Gate, Time-Machine, FinOps, SmartPack, DirectPush (SSH OCI), EdgeTunnel, OTLP, SLSA v1.1 + SBOM, 0.56ms Wasm, 1-click Coolify v4 migration & 116 MCP tools + MCP Apps for Claude Code & Cursor. Coolify alt." \
+  --description "The 50 MB, zero-shell, AI-native self-hosted PaaS. 140+ apps, 12 DBs, sub-8ms Live Sync, Web Terminal, WireGuard Mesh, PoW Shield, Auto-Healer, Shadow Replay, Time-Machine, FinOps, DirectPush, OTLP, SLSA v1.1, 0.16ms Wasm, 1-click Coolify v4 migration & 120 MCP tools + MCP Apps for Claude Code & Cursor. Coolify/Dokploy alt." \
   --homepage "https://macaqueboy.github.io/culkibo/?demo=1&lang=en&theme=dark" \
   --enable-discussions \
   --enable-issues

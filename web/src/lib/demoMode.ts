@@ -85,6 +85,8 @@ interface DemoState {
   sshKeys: any[];
   installations: any[];
   checkpoints: Record<string, any[]>;
+  heartbeats: any[];
+  meshPeers: any[];
 }
 
 function createInitialDemoState(): DemoState {
@@ -506,6 +508,60 @@ function createInitialDemoState(): DemoState {
         },
       ],
     },
+    heartbeats: [
+      {
+        id: 'hb_pg_nightly',
+        name: 'Nightly Postgres WAL Backup',
+        projectId: 'proj_acme_web',
+        token: 'ckb_hb_9e4f1a2b8c3d7e6f0a1b2c3d',
+        pingUrl: '/api/heartbeat/ckb_hb_9e4f1a2b8c3d7e6f0a1b2c3d',
+        periodSec: 86400,
+        graceSec: 600,
+        status: 'up',
+        lastPingAt: t2,
+        lastDurationMs: 4210,
+      },
+      {
+        id: 'hb_billing_sync',
+        name: 'Stripe Invoice Rollup Cron',
+        projectId: 'proj_edge_rust',
+        token: 'ckb_hb_4d8a7c1e9f0b2a5c6e7d8f9a',
+        pingUrl: '/api/heartbeat/ckb_hb_4d8a7c1e9f0b2a5c6e7d8f9a',
+        periodSec: 3600,
+        graceSec: 300,
+        status: 'up',
+        lastPingAt: t1,
+        lastDurationMs: 840,
+      },
+    ],
+    meshPeers: [
+      {
+        nodeId: 'local',
+        name: 'eu-central-control (Local)',
+        meshIp: '10.88.0.1',
+        publicKey: 'K7x9mQ2vR4pL8nW1cF6tY0bH3jD5zA8eN2sU4wP9qVk=',
+        endpoint: '127.0.0.1:51820',
+        listenPort: 51820,
+        role: 'control-plane',
+        keyVersion: 1,
+        keyRotatedAt: t3,
+        privateKeyEncrypted: true,
+        status: 'connected',
+      },
+      {
+        nodeId: 'srv_hetzner_eu',
+        name: 'hetzner-cpx31-fsn1',
+        meshIp: '10.88.0.2',
+        publicKey: 'M3vP8rT1xN6kJ2wB9hQ4zL7cD0fG5yA1eS8uV2nK4Xo=',
+        endpoint: '91.107.194.22:51820',
+        listenPort: 51820,
+        role: 'worker',
+        keyVersion: 1,
+        keyRotatedAt: t3,
+        privateKeyEncrypted: true,
+        status: 'connected',
+      },
+    ],
   };
 }
 
@@ -1013,6 +1069,260 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       ],
     });
   }
+
+  // --- Cycle-7 Pioneer APIs (Web Terminal, Build Auto-Healer, WireGuard Mesh, Edge Shield, Cron Heatmap & Heartbeats) ---
+  const termTicketMatch = pathname.match(/^\/api\/projects\/([^/]+)\/terminal\/ticket$/);
+  if (termTicketMatch && method === 'POST') {
+    const pid = decodeURIComponent(termTicketMatch[1]);
+    const shell = typeof body.shell === 'string' && ['/bin/sh', '/bin/bash', '/bin/ash'].includes(body.shell) ? body.shell : '/bin/sh';
+    const ticket = `ckb_term_${Math.random().toString(36).slice(2, 12)}`;
+    return jsonResponse({
+      ticket,
+      expiresAt: nowIso(60_000),
+      wsPath: `/ws/terminal?ticket=${ticket}`,
+      containerName: `culkibo-${pid}`,
+      shell,
+    });
+  }
+  if (pathname === '/api/terminal/sessions') {
+    return jsonResponse({ sessions: [] });
+  }
+
+  const healDiagMatch = pathname.match(/^\/api\/projects\/([^/]+)\/build-healer\/diagnose$/);
+  if (healDiagMatch && method === 'POST') {
+    const logs = String(body.logs || '');
+    const matches: any[] = [];
+    if (/heap limit|out of memory|FATAL ERROR/i.test(logs)) {
+      matches.push({
+        code: 'NODE_HEAP_OOM',
+        title: 'Node.js V8 Heap Exhausted During Build',
+        severity: 'high',
+        rootCause: 'Next.js / Webpack exceeded default V8 heap cap inside constrained BuildKit container.',
+        confidence: 97,
+        matchedLine: 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+        patchPreview: '+ NODE_OPTIONS=--max-old-space-size=1536\n+ memoryLimitMb: 2048',
+        autoFixAction: 'Set NODE_OPTIONS=--max-old-space-size=1536 and bump container memory cap',
+      });
+    }
+    if (/127\.0\.0\.1|localhost:\d+|listening on localhost/i.test(logs)) {
+      matches.push({
+        code: 'CONTAINER_BIND_LOCALHOST',
+        title: 'App Bound to Loopback (127.0.0.1) Inside Container',
+        severity: 'high',
+        rootCause: 'Server listens on 127.0.0.1 instead of 0.0.0.0, preventing Caddy reverse proxy reachability.',
+        confidence: 94,
+        matchedLine: 'Server listening on http://127.0.0.1:3000',
+        patchPreview: '+ HOST=0.0.0.0\n+ HOSTNAME=0.0.0.0',
+        autoFixAction: 'Inject HOST=0.0.0.0 and HOSTNAME=0.0.0.0 runtime env vars',
+      });
+    }
+    if (/unknown log opt.*max-size|journald|syslog/i.test(logs)) {
+      matches.push({
+        code: 'DOCKER_LOG_OPT_DRIVER_MISMATCH',
+        title: 'Docker Log Driver Option Mismatch (kamal#1709)',
+        severity: 'high',
+        rootCause: 'Host uses syslog/journald driver which rejects json-file max-size log-opt.',
+        confidence: 96,
+        matchedLine: "unknown log opt 'max-size' for journald log driver",
+        patchPreview: '- --log-opt max-size=10m\n+ logDriver: json-file (or omit size opts for journald)',
+        autoFixAction: 'Auto-guard --log-opt max-size to json-file/local drivers only',
+      });
+    }
+    if (matches.length === 0 && logs.trim().length > 0) {
+      matches.push({
+        code: 'NPM_CI_LOCKFILE_DRIFT',
+        title: 'Lockfile Out of Sync with package.json',
+        severity: 'medium',
+        rootCause: 'Build command ran strict npm ci against a drifted package-lock.json.',
+        confidence: 88,
+        matchedLine: logs.split(/\r?\n/)[0]?.slice(0, 120) || 'Build exited with non-zero status',
+        patchPreview: '- npm ci\n+ npm install --no-audit --no-fund',
+        autoFixAction: 'Switch SmartPack install step to safe lockfile reconcile',
+      });
+    }
+    return jsonResponse({
+      matched: matches.length > 0,
+      totalMatches: matches.length,
+      primary: matches[0] || null,
+      matches,
+      analyzedLines: logs.split(/\r?\n/).length,
+      analyzedMs: 0.42,
+    });
+  }
+
+  const healApplyMatch = pathname.match(/^\/api\/projects\/([^/]+)\/build-healer\/apply$/);
+  if (healApplyMatch && method === 'POST') {
+    const code = String(body.code || 'NODE_HEAP_OOM');
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      applied: body.dryRun === false,
+      code,
+      title: code === 'CONTAINER_BIND_LOCALHOST' ? 'Bind container listener to 0.0.0.0' : 'Raise V8 heap & container memory cap',
+      patchPlan: {
+        envAdditions: { NODE_OPTIONS: '--max-old-space-size=1536', HOST: '0.0.0.0' },
+        memoryLimitMb: 2048,
+        logDriver: 'json-file',
+      },
+      changes: [
+        'Add env NODE_OPTIONS=--max-old-space-size=1536',
+        'Add env HOST=0.0.0.0 (ensures Caddy proxy reachability)',
+        'Set memoryLimitMb=2048 & bounded json-file log rotation',
+      ],
+    });
+  }
+
+  if (pathname === '/api/fleet/mesh' && method === 'GET') {
+    return jsonResponse({
+      cidr: '10.88.0.0/24',
+      interfaceName: 'wg0',
+      peerCount: s.meshPeers.length,
+      peers: s.meshPeers,
+      firewallGuard: {
+        blocksPublicDbPorts: true,
+        ufwBypassWarning: '0 public 0.0.0.0 DB ports exposed — all fleet DB traffic routed via 10.88.0.0/24 (kamal#1856 protected).',
+      },
+    });
+  }
+  if (pathname === '/api/fleet/mesh/plan' && method === 'POST') {
+    return jsonResponse({
+      cidr: '10.88.0.0/24',
+      interfaceName: 'wg0',
+      dryRun: true,
+      configs: s.meshPeers.map((peer) => ({
+        nodeId: peer.nodeId,
+        name: peer.name,
+        meshIp: peer.meshIp,
+        wgConfig: [
+          '[Interface]',
+          `Address = ${peer.meshIp}/24`,
+          `ListenPort = ${peer.listenPort || 51820}`,
+          'PrivateKey = [REDACT_ON_API — decrypted atomically on node from AES-256-GCM vault]',
+          '',
+          ...s.meshPeers
+            .filter((o) => o.nodeId !== peer.nodeId)
+            .map((o) => `[Peer] # ${o.name}\nPublicKey = ${o.publicKey}\nAllowedIPs = ${o.meshIp}/32\nEndpoint = ${o.endpoint}\nPersistentKeepalive = 25`),
+        ].join('\n'),
+      })),
+      firewallRules: [
+        'ufw allow 51820/udp comment "Culkibo WireGuard Mesh"',
+        'ufw allow in on wg0 from 10.88.0.0/24 to any port 5432,6379,3306 proto tcp',
+        'iptables -I DOCKER-USER -i eth0 -p tcp -m multiport --dports 5432,6379,3306 -j DROP',
+      ],
+      diff: { added: [], updated: [], removed: [] },
+    });
+  }
+  if (pathname === '/api/fleet/mesh/rotate' && method === 'POST') {
+    const target = s.meshPeers.find((p) => p.nodeId === body.nodeId) || s.meshPeers[0];
+    const nextPub = 'X9qR4vT2mN8bK1wF6hP3zL5cD7jG0yA4eS2uV9nM8Wk=';
+    return jsonResponse({
+      dryRun: body.dryRun !== false,
+      rotated: body.dryRun === false,
+      nodeId: target?.nodeId || 'local',
+      keyVersion: (target?.keyVersion || 1) + 1,
+      oldPublicKey: target?.publicKey || '',
+      newPublicKey: nextPub,
+      rolloutPlan: [
+        `Generate fresh native Node x25519 keypair for ${target?.name || 'local'}`,
+        'Encrypt private key with AES-256-GCM (AAD wg:<nodeId>) in .fleet-mesh.key (0o600)',
+        'Atomically push updated peer publicKey to all mesh neighbors via SSH tunnel (0 downtime)',
+      ],
+    });
+  }
+
+  if (pathname === '/api/edge-shield/status') {
+    return jsonResponse({
+      enabledCount: 2,
+      powEnabledCount: 1,
+      blockedPathRules: 18,
+      blockedUaPatterns: 14,
+      activeChallenges: 3,
+      defaultDifficulty: 4,
+    });
+  }
+  if (pathname === '/api/edge-shield/challenge') {
+    const dom = parsed.searchParams.get('domain') || s.domains[0]?.hostname || 'app.acme-demo.dev';
+    return jsonResponse({
+      challengeId: `sh_${Date.now().toString(36)}`,
+      salt: `${Math.random().toString(16).slice(2, 18)}9f4a2c1e`,
+      difficulty: 4,
+      expiresAt: nowIso(300_000),
+      algorithm: 'sha256',
+      domain: dom,
+    });
+  }
+
+  if (pathname === '/api/crons/timeline') {
+    const counts = [1, 0, 1, 3, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1];
+    const slots = counts.map((c, h) => ({
+      hour: h,
+      label: `${String(h).padStart(2, '0')}:00`,
+      count: c,
+      hasCollision: c >= 2,
+      collisions: c >= 2 ? 1 : 0,
+      runs: c === 3
+        ? [
+            { name: 'pg-nightly-backup', projectId: 'proj_acme_web' },
+            { name: 's3-snapshot-sync', projectId: 'proj_acme_web' },
+            { name: 'stripe-invoice-rollup', projectId: 'proj_edge_rust' },
+          ]
+        : c === 1
+          ? [{ name: 'health-digest-cron', projectId: 'proj_acme_web' }]
+          : [],
+    }));
+    return jsonResponse({
+      hours: 24,
+      totalRuns: counts.reduce((a, b) => a + b, 0),
+      slots,
+      collisionWarnings: [
+        {
+          hour: 3,
+          count: 3,
+          jobs: ['pg-nightly-backup', 's3-snapshot-sync', 'stripe-invoice-rollup'],
+          message: '03:00 UTC: 3 heavy-IO jobs overlap within 5m — stagger backup & rollup by +15m to avoid disk contention.',
+        },
+      ],
+    });
+  }
+
+  if (pathname === '/api/heartbeats') {
+    if (method === 'POST') {
+      const token = `ckb_hb_${Math.random().toString(16).slice(2, 18)}`;
+      const hb = {
+        id: `hb_${Date.now().toString(36)}`,
+        name: String(body.name || 'Custom Heartbeat'),
+        projectId: body.projectId || null,
+        token,
+        pingUrl: `/api/heartbeat/${token}`,
+        periodSec: Math.max(60, Number(body.periodSec) || 3600),
+        graceSec: Math.max(30, Number(body.graceSec) || 300),
+        status: 'new',
+        lastPingAt: null,
+        lastDurationMs: null,
+      };
+      s.heartbeats = [hb, ...s.heartbeats];
+      return jsonResponse({ heartbeat: hb, ...hb }, 201);
+    }
+    return jsonResponse({ heartbeats: s.heartbeats });
+  }
+  const hbDelMatch = pathname.match(/^\/api\/heartbeats\/([^/]+)$/);
+  if (hbDelMatch && method === 'DELETE') {
+    const id = decodeURIComponent(hbDelMatch[1]);
+    s.heartbeats = s.heartbeats.filter((h) => h.id !== id);
+    return jsonResponse({ ok: true, deleted: true });
+  }
+  const hbPingMatch = pathname.match(/^\/api\/heartbeat\/([^/]+)(?:\/(start|fail))?$/);
+  if (hbPingMatch) {
+    const tok = decodeURIComponent(hbPingMatch[1]);
+    const st = hbPingMatch[2];
+    const hb = s.heartbeats.find((h) => h.token === tok);
+    if (hb) {
+      hb.status = st === 'fail' ? 'down' : 'up';
+      hb.lastPingAt = nowIso();
+      hb.lastDurationMs = st === 'start' ? null : 142;
+    }
+    return jsonResponse({ ok: true, heartbeat: hb || null, status: hb?.status || 'up', lastPingAt: nowIso() });
+  }
   if (pathname.match(/^\/api\/projects\/[^/]+\/sync\/status$/)) {
     return jsonResponse({
       projectId: pathname.split('/')[3],
@@ -1079,6 +1389,7 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ certificates: [] });
   }
   if (pathname === '/api/ingress/status') {
+    const tlsList = s.domains.map((d) => ({ hostname: d.hostname, ...d.tls }));
     return jsonResponse({
       available: true,
       inSync: true,
@@ -1087,8 +1398,10 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       message: 'Caddy HTTP/3 (QUIC) reverse proxy synchronized with 4 published HTTPS routes.',
       routesManaged: s.domains.length,
       drift: { missing: [], unexpected: [], modified: [] },
-      routes: s.domains.map((d) => ({ host: d.hostname, upstreams: [`127.0.0.1:${d.targetPort}`] })),
-      tlsProbes: s.domains.map((d) => ({ hostname: d.hostname, ...d.tls })),
+      routes: s.domains.map((d) => ({ host: d.hostname, hosts: [d.hostname], upstreams: [`127.0.0.1:${d.targetPort}`] })),
+      skipped: [],
+      tls: tlsList,
+      tlsProbes: tlsList,
     });
   }
   if (pathname === '/api/ingress/capabilities') {
@@ -1338,40 +1651,44 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (113 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (120 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 113 MCP tools on demand without bloating context (-81%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 120 MCP tools on demand without bloating context (-83%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_heal_build_failure', description: 'Deterministic 20-pattern build/runtime root-cause classifier & safe dry-run auto-healer', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_fleet_mesh', description: 'Zero-config WireGuard x25519 fleet mesh status, wg0.conf plan, and key rotation', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_cron_timeline', description: '24h cron collision heatmap and Dead-Man’s-Switch heartbeats status', readOnly: true, profile: 'ops' },
+      { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
       { name: 'culkibo_otlp_status', description: 'Inspect or configure native zero-dep OTLP/HTTP JSON exporter', readOnly: true, profile: 'ops' },
     ];
-    const generated = Array.from({ length: 113 - coreTools.length }, (_, i) => ({
-      name: `culkibo_ops_tool_${i + 10}`,
-      description: `Managed PaaS control-plane operation #${i + 10} (RBAC + audit-chained)`,
+    const generated = Array.from({ length: 120 - coreTools.length }, (_, i) => ({
+      name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
+      description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 113, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 120, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
         { id: 'aud_1', toolName: 'culkibo_smartpack_plan', status: 'ok', durationMs: 3, timestamp: nowIso(-60000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_verify_attestation', status: 'ok', durationMs: 2, timestamp: nowIso(-180000), client: 'antigravity' },
+        { id: 'aud_2', toolName: 'culkibo_heal_build_failure', status: 'ok', durationMs: 1, timestamp: nowIso(-180000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 113,
-      profiles: { core: { count: 17, savedPct: 81 } },
+      totalTools: 120,
+      profiles: { core: { count: 17, savedPct: 83 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

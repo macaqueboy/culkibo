@@ -488,6 +488,8 @@ if (typeof onPrincipalRevoked === 'function') {
 let _wss = null;
 /** @type {any} */
 let _syncWss = null;
+/** @type {any} */
+let _terminalWss = null;
 /** @type {ReturnType<typeof setInterval> | null} */
 let heartbeatTimer = null;
 
@@ -780,7 +782,7 @@ function selectSafeWsProtocol(protocols) {
 }
 
 function ensureWsServers() {
-  if (_wss && _syncWss) return { wss: _wss, syncWss: _syncWss };
+  if (_wss && _syncWss && _terminalWss) return { wss: _wss, syncWss: _syncWss, terminalWss: _terminalWss };
   const { WebSocketServer } = require('ws');
   _wss = new WebSocketServer({
     noServer: true,
@@ -795,6 +797,20 @@ function ensureWsServers() {
     maxPayload: 16 * 1024 * 1024,
     perMessageDeflate: false,
     handleProtocols: selectSafeWsProtocol
+  });
+  _terminalWss = new WebSocketServer({
+    noServer: true,
+    clientTracking: false,
+    maxPayload: 1024 * 1024,
+    perMessageDeflate: false
+  });
+  _terminalWss.on('connection', (ws, req) => {
+    try {
+      const termSvc = require('./services/containerTerminalService');
+      termSvc.attachWebSocket(ws, req);
+    } catch (err) {
+      try { ws.close(1011, 'Terminal service unavailable'); } catch (e) {}
+    }
   });
 
   _syncWss.on('connection', (ws, req) => {
@@ -1577,7 +1593,7 @@ function ensureStaticCache() {
 
 function tryServeStaticFastPath(req, res, pathname) {
   if (!ensureStaticCache() || !staticAssetCache) return false;
-  if (pathname.startsWith('/api') || pathname === '/ws' || pathname === '/ws/sync' || pathname === '/health' || pathname === '/metrics') {
+  if (pathname.startsWith('/api') || pathname === '/ws' || pathname === '/ws/sync' || pathname === '/ws/terminal' || pathname === '/health' || pathname === '/metrics') {
     return false;
   }
 
@@ -2073,7 +2089,7 @@ const FAST_AUTHED_GET_ROUTES = new Map([
 
 function tryHandleFastPathGet(req, res, pathname, queryStr) {
   // Fast-path estático para el panel web pre-comprimido (cero carga de Express al abrir el dashboard)
-  if (!pathname.startsWith('/api') && pathname !== '/health' && pathname !== '/metrics' && pathname !== '/ws' && pathname !== '/ws/sync') {
+  if (!pathname.startsWith('/api') && pathname !== '/health' && pathname !== '/metrics' && pathname !== '/ws' && pathname !== '/ws/sync' && pathname !== '/ws/terminal') {
     if (tryServeStaticFastPath(req, res, pathname)) return true;
     return false;
   }
@@ -2373,6 +2389,69 @@ function getApp() {
     res.status(200).set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8').send(metricsCollector.getPrometheusBuffer(fresh));
   });
 
+  // Rutas públicas Cycle #7 sin autenticación (Dead-Man's-Switch check-in por token en tiempo constante + Edge Shield PoW)
+  /** @param {any} req @param {any} res */
+  const handlePublicHeartbeatPing = (req, res) => {
+    try {
+      const cronMgr = getService('cronManager');
+      const state = req.params.state ? String(req.params.state) : 'ok';
+      const message = (req.body && typeof req.body === 'object' && req.body.message)
+        ? String(req.body.message)
+        : (req.query && req.query.msg ? String(req.query.msg) : '');
+      const result = cronMgr.recordPing(req.params.token, { state, message });
+      return res.status(result.status || (result.ok ? 200 : 404)).json(result);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err && err.message ? err.message : 'Heartbeat error' });
+    }
+  };
+  app.get('/api/heartbeat/:token', handlePublicHeartbeatPing);
+  app.post('/api/heartbeat/:token', handlePublicHeartbeatPing);
+  app.get('/api/heartbeat/:token/:state', handlePublicHeartbeatPing);
+  app.post('/api/heartbeat/:token/:state', handlePublicHeartbeatPing);
+
+  app.get('/api/edge-shield/challenge', (req, res) => {
+    try {
+      const shield = require('./services/edgeShieldService');
+      const domain = String(req.query.domain || req.headers.host || 'localhost').trim().slice(0, 253);
+      const difficulty = req.query.difficulty !== undefined ? Number(req.query.difficulty) : undefined;
+      const challenge = shield.issueChallenge({
+        ip: clientIp(req),
+        userAgent: String(req.headers['user-agent'] || ''),
+        domain,
+        ...(Number.isFinite(difficulty) ? { difficulty } : {})
+      });
+      const wantsHtml = req.query.format === 'html'
+        || (req.query.format !== 'json' && String(req.headers.accept || '').includes('text/html') && !String(req.headers.accept || '').includes('application/json'));
+      if (wantsHtml && typeof shield.renderChallengeHtml === 'function') {
+        const returnUrl = typeof req.query.returnUrl === 'string' && req.query.returnUrl.startsWith('/') ? req.query.returnUrl : '/';
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(200).send(shield.renderChallengeHtml(challenge, returnUrl));
+      }
+      return res.status(200).json(challenge);
+    } catch (err) {
+      return res.status(400).json({ error: err && err.message ? err.message : 'Edge shield challenge error' });
+    }
+  });
+
+  app.post('/api/edge-shield/verify', (req, res) => {
+    try {
+      const shield = require('./services/edgeShieldService');
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const out = shield.verifySolution({
+        ...body,
+        ip: clientIp(req),
+        userAgent: String(req.headers['user-agent'] || '')
+      });
+      if (out && out.valid && out.cookieHeader) {
+        res.append('Set-Cookie', out.cookieHeader);
+        return res.status(200).json(out);
+      }
+      return res.status(403).json(out || { valid: false, reason: 'Invalid PoW solution' });
+    } catch (err) {
+      return res.status(400).json({ valid: false, error: err && err.message ? err.message : 'Edge shield verify error' });
+    }
+  });
+
   app.use('/api', authMiddleware);
   app.use('/api', apiRouter);
 
@@ -2616,7 +2695,7 @@ server.on('upgrade', (req, socket, head) => {
   const qIdx = rawUrl.indexOf('?');
   const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
 
-  if (pathname !== '/ws' && pathname !== '/ws/sync') {
+  if (pathname !== '/ws' && pathname !== '/ws/sync' && pathname !== '/ws/terminal') {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
@@ -2629,6 +2708,21 @@ server.on('upgrade', (req, socket, head) => {
     metricsCollector.recordSecurityEvent('wsAuthRejected');
     socket.write(`HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${bf.retryAfterSec}\r\nConnection: close\r\n\r\n`);
     socket.destroy();
+    return;
+  }
+
+  // /ws/terminal autentica mediante ticket HMAC-SHA256 de un solo uso emitido por POST /api/projects/:id/terminal/ticket
+  if (pathname === '/ws/terminal') {
+    if (req.headers.origin && !isOriginAllowed(req.headers.origin, req)) {
+      metricsCollector.recordSecurityEvent('originRejected403');
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const { terminalWss } = ensureWsServers();
+    terminalWss.handleUpgrade(req, socket, head, (ws) => {
+      terminalWss.emit('connection', ws, req);
+    });
     return;
   }
 

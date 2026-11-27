@@ -1916,6 +1916,7 @@ class CaddyManager {
    *   streamCloseDelayMs?: number | null,
    *   streamTimeoutMs?: number | null,
    *   earlyHints?: any,
+   *   edgeShield?: { enabled?: boolean, powChallenge?: boolean, difficulty?: number, blockedPaths?: string[], blockedUserAgents?: string[], blockSqliXss?: boolean, blockAiScrapers?: boolean, challengeEndpoint?: string, domain?: string } | null,
    *   dialTimeoutMs?: number | null,
    *   responseHeaderTimeoutMs?: number | null
    * }} spec
@@ -1953,6 +1954,7 @@ class CaddyManager {
       streamCloseDelayMs = 5000,
       streamTimeoutMs = null,
       earlyHints = null,
+      edgeShield = null,
       dialTimeoutMs = 5000,
       responseHeaderTimeoutMs = null
     } = spec;
@@ -2218,6 +2220,26 @@ class CaddyManager {
       ? this._wrapWithCors(cors, chain)
       : chain;
 
+    // 6b. Edge Bot-Shield & Hashcash PoW Gate (opt-in, 100% nativo Caddy v2.11 sin plugins extra)
+    /** @type {any[]} */
+    let shieldWrapped = corsWrapped;
+    if (edgeShield && edgeShield.enabled) {
+      const edgeShieldService = require('./edgeShieldService');
+      const shieldRoutes = edgeShieldService.compileCaddyShieldRoutes({
+        ...edgeShield,
+        domain: edgeShield.domain || hostnames[0]
+      });
+      if (Array.isArray(shieldRoutes) && shieldRoutes.length > 0) {
+        shieldWrapped = [{
+          handler: 'subroute',
+          routes: [
+            ...shieldRoutes,
+            { handle: corsWrapped }
+          ]
+        }];
+      }
+    }
+
     // 7. IP Allowlist nativo con `subroute` + `not.client_ip` (capa más externa, cero plugins extra)
     const cleanAllowlist = Array.isArray(ipAllowlist)
       ? ipAllowlist.map((x) => String(x || '').trim()).filter(Boolean)
@@ -2238,11 +2260,11 @@ class CaddyManager {
               terminal: true
             },
             {
-              handle: corsWrapped
+              handle: shieldWrapped
             }
           ]
         }]
-      : corsWrapped;
+      : shieldWrapped;
 
     return {
       '@id': this.routeId(projectId),

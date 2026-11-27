@@ -17,6 +17,9 @@ import {
   Radio,
   ShieldCheck,
   Pencil,
+  Clock,
+  HeartPulse,
+  Send,
 } from 'lucide-react';
 import {
   api,
@@ -26,6 +29,9 @@ import {
   type ResourceAdvisorReport,
   type SleepPolicy,
   type Project,
+  type CronTimelineResult,
+  type CronTimelineSlot,
+  type HeartbeatMonitor,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -71,6 +77,12 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const [projects, setProjects] = useState<Project[]>([]);
   const [advisor, setAdvisor] = useState<ResourceAdvisorReport | null>(null);
   const [sleepPolicies, setSleepPolicies] = useState<Record<string, SleepPolicy>>({});
+  const [cronTimeline, setCronTimeline] = useState<CronTimelineResult | null>(null);
+  const [heartbeats, setHeartbeats] = useState<HeartbeatMonitor[]>([]);
+  const [hbName, setHbName] = useState('');
+  const [hbPeriodSec, setHbPeriodSec] = useState('3600');
+  const [hbCreating, setHbCreating] = useState(false);
+  const [hbPingingId, setHbPingingId] = useState<string | null>(null);
 
   const [vpsMonthlyEur, setVpsMonthlyEur] = useState<string>('12');
   const [advisorBusy, setAdvisorBusy] = useState(false);
@@ -125,17 +137,21 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const loadAll = useCallback(async (eurOverride?: number) => {
     try {
       const eur = eurOverride ?? (Number.parseFloat(vpsMonthlyEur) || 12);
-      const [monRes, pageRes, projRes, advRes] = await Promise.all([
+      const [monRes, pageRes, projRes, advRes, cronRes, hbRes] = await Promise.all([
         api.getUptimeMonitors().catch(() => ({ monitors: [] })),
         api.getStatusPages().catch(() => ({ pages: [] })),
         api.getProjects().catch(() => []),
         api.getResourceAdvisor(eur).catch(() => null),
+        api.getCronTimeline(24).catch(() => null),
+        api.listHeartbeats().catch(() => ({ heartbeats: [] })),
       ]);
       const projList = Array.isArray(projRes) ? projRes : [];
       setMonitors(monRes.monitors || []);
       setPages(pageRes.pages || []);
       setProjects(projList);
       setAdvisor(advRes);
+      if (cronRes) setCronTimeline(cronRes);
+      setHeartbeats(Array.isArray(hbRes?.heartbeats) ? hbRes.heartbeats : []);
 
       if (projList.length > 0) {
         // Prefer bulk GET /api/sleep to avoid N+1 requests; fallback to batched per-project reads for ALL projects
@@ -544,6 +560,62 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
     }
   };
 
+  const handleCreateHeartbeat = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!hbName.trim()) return;
+    setHbCreating(true);
+    try {
+      const periodSec = Math.max(60, Number.parseInt(hbPeriodSec, 10) || 3600);
+      const res = await api.createHeartbeat({
+        name: hbName.trim(),
+        periodSec,
+        graceSec: Math.min(900, Math.max(60, Math.round(periodSec * 0.1))),
+      });
+      const created = res.heartbeat || (res.id ? (res as HeartbeatMonitor) : null);
+      if (created) {
+        setHeartbeats((prev) => [created, ...prev.filter((h) => h.id !== created.id)]);
+      }
+      setHbName('');
+      onNotify(`Heartbeat “${created?.name || hbName.trim()}” created`, 'success');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Could not create heartbeat', 'error');
+    } finally {
+      setHbCreating(false);
+    }
+  };
+
+  const handlePingHeartbeat = async (hb: HeartbeatMonitor) => {
+    setHbPingingId(hb.id);
+    try {
+      const res = await api.pingHeartbeat(hb.token);
+      setHeartbeats((prev) =>
+        prev.map((item) =>
+          item.id === hb.id
+            ? { ...item, status: res.heartbeat?.status || res.status || 'up', lastPingAt: res.heartbeat?.lastPingAt || res.lastPingAt || new Date().toISOString() }
+            : item
+        )
+      );
+      onNotify(`Heartbeat “${hb.name}” check-in OK`, 'success');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Heartbeat check-in failed', 'error');
+    } finally {
+      setHbPingingId(null);
+    }
+  };
+
+  const handleDeleteHeartbeat = async (hb: HeartbeatMonitor) => {
+    setHbPingingId(`del-${hb.id}`);
+    try {
+      await api.deleteHeartbeat(hb.id);
+      setHeartbeats((prev) => prev.filter((item) => item.id !== hb.id));
+      onNotify(`Heartbeat “${hb.name}” deleted`, 'info');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Could not delete heartbeat', 'error');
+    } finally {
+      setHbPingingId(null);
+    }
+  };
+
   const summary = useMemo(() => {
     const upCount = monitors.filter((m) => m.status === 'up').length;
     const incidents = monitors.filter((m) => Boolean(m.incidentOpen || m.activeIncidentId || m.status === 'down')).length;
@@ -693,7 +765,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                         <div className="flex items-center gap-2 flex-wrap">
                           <h2 className="text-sm font-semibold text-slate-900 truncate">{mon.name}</h2>
                           <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] uppercase text-slate-600">
-                            {mon.type === 'managed_project' ? 'Proyecto' : mon.type}
+                            {mon.type === 'managed_project' ? t('uptime.projectBadge') : mon.type}
                           </span>
                           <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${st.badge}`}>
                             <span className={`w-1.5 h-1.5 rounded-full ${st.dot}`} />
@@ -788,18 +860,18 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                         <span className="font-mono font-semibold text-slate-900">{formatPct(mon.uptime30d)}</span>
                       </div>
                       <div>
-                        <span className="text-slate-400 block text-[11px]">Latencia p50</span>
+                        <span className="text-slate-400 block text-[11px]">{t('uptime.latP50')}</span>
                         <span className="font-mono font-semibold text-slate-900">{formatMs(mon.p50LatencyMs)}</span>
                       </div>
                       <div>
-                        <span className="text-slate-400 block text-[11px]">Latencia p95</span>
+                        <span className="text-slate-400 block text-[11px]">{t('uptime.latP95')}</span>
                         <span className="font-mono font-semibold text-slate-900">{formatMs(mon.p95LatencyMs)}</span>
                       </div>
                     </div>
 
                     {mon.lastError && (
                       <div className="text-[11px] text-red-700 bg-red-50 border border-red-100 rounded-lg px-2.5 py-1.5 break-words">
-                        Último error: {mon.lastError}
+                        {t('uptime.lastError')} {mon.lastError}
                       </div>
                     )}
                   </article>
@@ -807,6 +879,182 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
               })}
             </div>
           )}
+
+          {/* 24h Cron Collision Heatmap & Dead-Man's-Switch Heartbeats */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                  <Clock className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('uptime.cronTitle')}</h2>
+                    {(() => {
+                      const colCount = cronTimeline?.collisionWarnings?.length ?? 0;
+                      return (
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border tabular-nums ${
+                            colCount > 0
+                              ? 'bg-amber-50 text-amber-800 border-amber-200'
+                              : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          }`}
+                        >
+                          {colCount > 0 ? t('uptime.cronCollisions', { count: colCount }) : t('uptime.cronClean')}
+                        </span>
+                      );
+                    })()}
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('uptime.cronDesc')}</p>
+                </div>
+              </div>
+              <form onSubmit={(e) => void handleCreateHeartbeat(e)} className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <input
+                  type="text"
+                  value={hbName}
+                  onChange={(e) => setHbName(e.target.value)}
+                  placeholder={t('uptime.hbNamePlaceholder')}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-900 w-44"
+                />
+                <select
+                  value={hbPeriodSec}
+                  onChange={(e) => setHbPeriodSec(e.target.value)}
+                  aria-label="Heartbeat period"
+                  className="px-2 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-700 font-mono"
+                >
+                  <option value="300">5m</option>
+                  <option value="3600">1h</option>
+                  <option value="86400">24h</option>
+                </select>
+                <button
+                  type="submit"
+                  disabled={hbCreating || !hbName.trim()}
+                  className="culkibo-press inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>{hbCreating ? t('uptime.hbCreating') : t('uptime.hbCreate')}</span>
+                </button>
+              </form>
+            </div>
+
+            {/* 24h Density Heatmap Bars */}
+            {(() => {
+              const rawSlots: CronTimelineSlot[] = Array.isArray(cronTimeline?.slots) && cronTimeline.slots.length > 0
+                ? cronTimeline.slots.slice(0, 24)
+                : Array.from({ length: 24 }, (_, h): CronTimelineSlot => ({ hour: h, label: `${String(h).padStart(2, '0')}:00`, count: 0, hasCollision: false }));
+              const maxRuns = Math.max(1, ...rawSlots.map((s) => s.count ?? s.runs?.length ?? 0));
+              const warnings = cronTimeline?.collisionWarnings || [];
+              return (
+                <div className="px-5 py-4 border-b border-slate-200 space-y-2.5">
+                  <div className="flex items-end gap-1 h-14" aria-label="24-hour cron density heatmap">
+                    {rawSlots.map((slot, idx) => {
+                      const count = slot.count ?? slot.runs?.length ?? 0;
+                      const isCol = Boolean(slot.hasCollision || (slot.collisions ?? 0) > 0 || count >= 2);
+                      const pct = count === 0 ? 12 : Math.max(28, Math.round((count / maxRuns) * 100));
+                      const lbl = slot.label || `${String(slot.hour ?? idx).padStart(2, '0')}:00`;
+                      return (
+                        <div key={idx} className="flex-1 min-w-0 flex flex-col items-center gap-1 h-full justify-end">
+                          <span
+                            title={`${lbl} · ${count} job(s)${isCol ? ' (collision risk)' : ''}`}
+                            style={{ height: `${pct}%` }}
+                            className={`w-full rounded-t-[3px] transition-all ${
+                              isCol
+                                ? 'bg-amber-500'
+                                : count > 0
+                                  ? 'bg-emerald-500'
+                                  : 'bg-slate-200'
+                            }`}
+                          />
+                          <span className="text-[9px] font-mono text-slate-400 tabular-nums">
+                            {idx % 6 === 0 ? String(slot.hour ?? idx).padStart(2, '0') : ''}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {warnings.length > 0 && (
+                    <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-[11px] flex items-start gap-2">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                      <div className="space-y-0.5 min-w-0">
+                        {warnings.slice(0, 2).map((w, i) => (
+                          <div key={i}>
+                            {typeof w === 'string'
+                              ? w
+                              : (w.message || `Collision at ${w.hour ?? w.windowStart}: ${w.count ?? 2} overlapping jobs`)}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Heartbeats List */}
+            {heartbeats.length === 0 ? (
+              <div className="px-5 py-4 text-slate-500">{t('uptime.hbEmpty')}</div>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {heartbeats.map((hb) => {
+                  const pingPath = hb.pingUrl || `/api/heartbeat/${hb.token}`;
+                  const statusTone =
+                    hb.status === 'up'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : hb.status === 'missed' || hb.status === 'down'
+                        ? 'bg-red-50 text-red-700 border-red-200'
+                        : 'bg-slate-100 text-slate-600 border-slate-200';
+                  return (
+                    <div key={hb.id} className="px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <HeartPulse className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                          <span className="font-semibold text-slate-900">{hb.name}</span>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border uppercase ${statusTone}`}>
+                            {hb.status}
+                          </span>
+                          <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                            every {hb.periodSec}s (+{hb.graceSec}s grace)
+                          </span>
+                        </div>
+                        <div className="font-mono text-[11px] text-slate-500 mt-0.5 truncate">
+                          POST {pingPath}
+                          {hb.lastPingAt ? ` · last check-in ${new Date(hb.lastPingAt).toLocaleTimeString()}` : ''}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => void copy(`${origin}${pingPath}`, `hb-${hb.id}`, 'Heartbeat URL copied')}
+                          className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 cursor-pointer"
+                          title="Copy ping URL"
+                        >
+                          {copiedKey === `hb-${hb.id}` ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={hbPingingId === hb.id}
+                          onClick={() => void handlePingHeartbeat(hb)}
+                          className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                        >
+                          {hbPingingId === hb.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
+                          <span>{hbPingingId === hb.id ? t('uptime.hbPinging') : t('uptime.hbPing')}</span>
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Delete heartbeat ${hb.name}`}
+                          disabled={hbPingingId === `del-${hb.id}`}
+                          onClick={() => void handleDeleteHeartbeat(hb)}
+                          className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-red-50 text-slate-500 hover:text-red-700 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </div>
       )}
 

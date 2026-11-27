@@ -641,6 +641,42 @@ function assertResourceId(value, field) {
   return String(value);
 }
 
+/**
+ * Guardia anti-inyección de comandos en nombres de servicio/BD/backup (Dokploy CVE-2026-129433):
+ * rechaza estrictamente metacaracteres de shell (`;`, `` ` ``, `$`, `|`, `&`, `\n`, `\r`, `\0`, espacios)
+ * y secuencias de traversal (`..`).
+ * @param {any} value
+ * @param {string} [field]
+ * @returns {string}
+ */
+function assertSafeServiceName(value, field = 'serviceName') {
+  const s = String(value == null ? '' : value);
+  if (!s || s.length > 80 || s.includes('..') || s.startsWith('-') || /[;`$|\&\r\n\s<>()\\'"\0]/.test(s) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(s)) {
+    const err = new Error(`${field} contiene caracteres inválidos o metacaracteres de shell bloqueados (CVE-2026-129433)`);
+    /** @type {any} */ (err).code = 'INVALID_SERVICE_NAME';
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  return s;
+}
+
+/**
+ * Valida una etiqueta visible de base de datos rechazando metacaracteres de shell y `..`.
+ * @param {any} value
+ * @param {string} [field]
+ * @returns {string}
+ */
+function assertSafeDisplayName(value, field = 'name') {
+  const s = String(value == null ? '' : value).trim();
+  if (s.includes('..') || /[;`$|\&\r\n\0<>\\]/.test(s)) {
+    const err = new Error(`${field} contiene metacaracteres de shell bloqueados (CVE-2026-129433)`);
+    /** @type {any} */ (err).code = 'INVALID_SERVICE_NAME';
+    /** @type {any} */ (err).status = 400;
+    throw err;
+  }
+  return s.slice(0, 80);
+}
+
 // ---------------------------------------------------------------------------
 // Cifrado en reposo
 // ---------------------------------------------------------------------------
@@ -1441,6 +1477,19 @@ class DatabaseManager extends EventEmitter {
     const projectId = assertResourceId(opts.projectId, 'projectId');
     const username = assertIdentifier(opts.username || 'culkibo', 'Usuario');
     const dbName = engine.noDatabaseName ? null : assertIdentifier(opts.dbName || 'app', 'Nombre de la base de datos');
+    const optsAny = /** @type {any} */ (opts);
+    if (optsAny.serviceName !== undefined && optsAny.serviceName !== null && optsAny.serviceName !== '') {
+      assertSafeServiceName(optsAny.serviceName, 'serviceName');
+    }
+    const safeDisplayName = opts.name !== undefined && opts.name !== null && String(opts.name).trim() !== ''
+      ? assertSafeDisplayName(opts.name, 'name')
+      : `${engine.label} ${engineKey}`;
+    if (optsAny.bindAddress && String(optsAny.bindAddress).trim() !== '127.0.0.1' && optsAny.publicExpose !== true) {
+      const err = new Error('Las bases de datos gestionadas escuchan en red privada / 127.0.0.1 por defecto; exige publicExpose: true explícito para 0.0.0.0');
+      /** @type {any} */ (err).code = 'PUBLIC_DB_EXPOSE_FORBIDDEN';
+      /** @type {any} */ (err).status = 400;
+      throw err;
+    }
 
     if (opts.image !== undefined && opts.image !== null && opts.image !== '') {
       // Referencia de imagen: registro/espacio/nombre:etiqueta. Lista blanca.
@@ -1465,7 +1514,7 @@ class DatabaseManager extends EventEmitter {
       projectId,
       engine: engineKey,
       family: engine.family,
-      name: String(opts.name || `${engine.label} ${engineKey}`).slice(0, 80),
+      name: safeDisplayName,
       image: opts.image || engine.image,
       username,
       dbName,
@@ -2229,9 +2278,13 @@ class DatabaseManager extends EventEmitter {
   /**
    * Ejecuta un volcado completo con cifrado cliente AEAD (`CKB1`) opcional antes de subir a S3/R2.
    * @param {string} id
-   * @param {{ trigger?: string, skipS3?: boolean, skipRetention?: boolean, pinned?: boolean, bypassOpGuard?: boolean, encrypt?: boolean }} [opts]
+   * @param {{ trigger?: string, skipS3?: boolean, skipRetention?: boolean, pinned?: boolean, bypassOpGuard?: boolean, encrypt?: boolean, serviceName?: string }} [opts]
    */
-  async runBackup(id, { trigger = 'manual', skipS3 = false, skipRetention = false, pinned = false, bypassOpGuard = false, encrypt = undefined } = {}) {
+  async runBackup(id, { trigger = 'manual', skipS3 = false, skipRetention = false, pinned = false, bypassOpGuard = false, encrypt = undefined, serviceName = undefined } = {}) {
+    assertSafeServiceName(id, 'databaseId');
+    if (serviceName !== undefined && serviceName !== null && serviceName !== '') {
+      assertSafeServiceName(serviceName, 'serviceName');
+    }
     const record = this.mustGet(id);
     if (this.runningBackups.has(id)) {
       throw new Error('Ya hay una copia en curso para esta base de datos');
@@ -2792,8 +2845,15 @@ class DatabaseManager extends EventEmitter {
    * primero del bucket. Si la copia está cifrada (`CKB1`), descifra y verifica
    * todos los authTag AES-256-GCM ANTES de tocar la base activa.
    */
-  /** @param {string} id @param {{ backupId?: string | null, remoteKey?: string | null, createSafetySnapshot?: boolean, decryptionKey?: Buffer | null }} [opts] */
-  async restore(id, { backupId = null, remoteKey = null, createSafetySnapshot = true, decryptionKey = null } = {}) {
+  /** @param {string} id @param {{ backupId?: string | null, remoteKey?: string | null, createSafetySnapshot?: boolean, decryptionKey?: Buffer | null, serviceName?: string }} [opts] */
+  async restore(id, { backupId = null, remoteKey = null, createSafetySnapshot = true, decryptionKey = null, serviceName = undefined } = {}) {
+    assertSafeServiceName(id, 'databaseId');
+    if (backupId !== null && backupId !== undefined && backupId !== '') {
+      assertSafeServiceName(backupId, 'backupId');
+    }
+    if (serviceName !== undefined && serviceName !== null && serviceName !== '') {
+      assertSafeServiceName(serviceName, 'serviceName');
+    }
     return this.withLock(id, async () => {
       const record = this.mustGet(id);
       const engine = ENGINES[record.engine];
@@ -4648,6 +4708,8 @@ const instance = Object.assign(new DatabaseManager(), {
   DatabaseManager,
   ENGINES,
   PGBOUNCER_IMAGE,
+  assertSafeServiceName,
+  assertSafeDisplayName,
   computeTuningConfig,
   loadOrCreateKey,
   generatePassword,

@@ -36,6 +36,8 @@ import type {
   Project,
   EdgeTunnelStatusResult,
   EdgeTunnelCreateResult,
+  EdgeShieldStatusResult,
+  EdgeShieldChallengeResult,
 } from '../lib/api';
 import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
@@ -85,6 +87,11 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
 
   // Sovereign EdgeTunnel (CGNAT) state
   const [tunnelStatus, setTunnelStatus] = useState<EdgeTunnelStatusResult | null>(null);
+  // Edge Bot-Shield & Hashcash PoW Gate state
+  const [shieldStatus, setShieldStatus] = useState<EdgeShieldStatusResult | null>(null);
+  const [shieldChallenge, setShieldChallenge] = useState<EdgeShieldChallengeResult | null>(null);
+  const [shieldLoading, setShieldLoading] = useState(false);
+  const [shieldError, setShieldError] = useState<string | null>(null);
   const [tunnelName, setTunnelName] = useState('');
   const [tunnelHost, setTunnelHost] = useState('127.0.0.1');
   const [tunnelPort, setTunnelPort] = useState('3000');
@@ -221,8 +228,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       projectId ? Promise.resolve(null) : api.getIngressCapabilities().catch(() => null),
       projectId ? Promise.resolve([]) : api.getProjects().catch(() => []),
       projectId ? Promise.resolve(null) : api.getEdgeTunnelStatus().catch(() => null),
+      projectId ? Promise.resolve(null) : api.getEdgeShieldStatus().catch(() => null),
     ])
-      .then(([domRes, certRes, fastIng, capsRes, projList, tunRes]) => {
+      .then(([domRes, certRes, fastIng, capsRes, projList, tunRes, shRes]) => {
         if (!active) return;
         const list = domRes.domains || [];
         setDomains(list);
@@ -234,6 +242,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
         }
         if (Array.isArray(projList)) setProjects(projList);
         if (tunRes) setTunnelStatus(tunRes);
+        if (shRes) setShieldStatus(shRes);
         setLoading(false);
         if (list.length > 0) {
           setProbingTls(true);
@@ -250,14 +259,27 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
     return () => { active = false; };
   }, [projectId]);
 
+  const handlePreviewShieldChallenge = async () => {
+    setShieldLoading(true);
+    setShieldError(null);
+    try {
+      const res = await api.getEdgeShieldChallenge(domains[0]?.hostname);
+      setShieldChallenge(res);
+    } catch (err: unknown) {
+      setShieldError(err instanceof Error ? err.message : 'Edge Shield challenge unavailable');
+    } finally {
+      setShieldLoading(false);
+    }
+  };
+
   const tlsFor = (hostname: string): TlsProbe | null =>
-    (ingress?.tls || []).find((t) => t.hostname === hostname) || null;
+    (Array.isArray(ingress?.tls) ? ingress.tls : []).find((t) => t?.hostname === hostname) || null;
 
   const routeFor = (hostname: string) =>
-    (ingress?.routes || []).find((r) => r.hosts.includes(hostname)) || null;
+    (Array.isArray(ingress?.routes) ? ingress.routes : []).find((r) => Array.isArray(r?.hosts) && r.hosts.includes(hostname)) || null;
 
   const skippedReasonFor = (hostname: string) =>
-    (ingress?.skipped || []).find((s) => s.hostnames.includes(hostname))?.reason || null;
+    (Array.isArray(ingress?.skipped) ? ingress.skipped : []).find((s) => Array.isArray(s?.hostnames) && s.hostnames.includes(hostname))?.reason || null;
 
   const handleStartCaddy = async () => {
     setStartingCaddy(true);
@@ -803,6 +825,71 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Edge Bot-Shield & Hashcash PoW Gate Pill */}
+      {!projectId && (
+        <section className="culkibo-surface rounded-xl p-4 text-xs space-y-2.5">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-semibold text-slate-900">{t('domains.shieldTitle')}</span>
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-mono font-semibold tabular-nums">
+                    SHA-256 PoW · diff {shieldStatus?.defaultDifficulty ?? 4}
+                  </span>
+                </div>
+                <p className="text-slate-500 mt-0.5">{t('domains.shieldDesc')}</p>
+                {shieldStatus && (
+                  <div className="flex flex-wrap items-center gap-2 mt-1.5 font-mono text-[11px] text-slate-600 tabular-nums">
+                    <span>
+                      {Array.isArray(shieldStatus.blockedPathRules) ? shieldStatus.blockedPathRules.length : shieldStatus.blockedPathRules} scanner rules
+                    </span>
+                    <span>·</span>
+                    <span>
+                      {Array.isArray(shieldStatus.blockedUaPatterns) ? shieldStatus.blockedUaPatterns.length : shieldStatus.blockedUaPatterns} AI-scraper UAs
+                    </span>
+                    <span>·</span>
+                    <span>{shieldStatus.powEnabledCount} PoW gate(s)</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={shieldLoading}
+              onClick={() => void handlePreviewShieldChallenge()}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50 self-start md:self-auto"
+            >
+              {shieldLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
+              <span>{shieldLoading ? t('domains.shieldLoading') : t('domains.shieldPreview')}</span>
+            </button>
+          </div>
+          {shieldError && (
+            <div className="p-2 rounded-lg bg-red-50 border border-red-200 text-red-700">{shieldError}</div>
+          )}
+          {shieldChallenge && (
+            <div className="p-3 rounded-lg bg-slate-950 text-slate-100 border border-slate-800 font-mono text-[11px] flex flex-col sm:flex-row sm:items-center justify-between gap-2 tabular-nums">
+              <div className="truncate">
+                <span className="text-emerald-400">{shieldChallenge.algorithm.toUpperCase()}</span>
+                {' · '}diff={shieldChallenge.difficulty}
+                {' · '}salt={shieldChallenge.salt}
+                {shieldChallenge.domain ? ` · ${shieldChallenge.domain}` : ''}
+              </div>
+              <button
+                type="button"
+                onClick={() => setShieldChallenge(null)}
+                aria-label="Close PoW preview"
+                className="text-slate-400 hover:text-white cursor-pointer self-end sm:self-auto"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </section>
       )}
 
       {/* Filtros */}

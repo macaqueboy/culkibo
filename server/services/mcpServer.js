@@ -45,7 +45,10 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'otlpExporter',
   'shadowReplayService',
   'timeMachineService',
-  'finopsOptimizer'
+  'finopsOptimizer',
+  'buildHealerService',
+  'fleetMeshService',
+  'edgeShieldService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -86,7 +89,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_rbac_manage_token',
   'culkibo_edge_tunnel',
   'culkibo_otlp_status',
-  'culkibo_shadow_replay'
+  'culkibo_shadow_replay',
+  'culkibo_fleet_mesh'
 ]);
 
 /** @type {Record<string, number>} */
@@ -97,10 +101,11 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas que también soportan `dryRun: true` (33 destructivas + 2 = 35). */
+/** Herramientas no destructivas que también soportan `dryRun: true` (37 destructivas + 3 = 40). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
-  'culkibo_rollback_deployment'
+  'culkibo_rollback_deployment',
+  'culkibo_heal_build_failure'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -155,7 +160,8 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_env_promote',
     'culkibo_verify_attestation',
     'culkibo_shadow_replay',
-    'culkibo_time_machine'
+    'culkibo_time_machine',
+    'culkibo_heal_build_failure'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -178,15 +184,19 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_ingress_status',
     'culkibo_reconcile_ingress',
     'culkibo_edge_tunnel',
+    'culkibo_edge_shield',
     'culkibo_uptime_list_monitors',
     'culkibo_status_page_manage',
+    'culkibo_cron_timeline',
     'culkibo_cost_advisor',
     'culkibo_finops_report',
     'culkibo_shadow_replay',
     'culkibo_time_machine',
+    'culkibo_heal_build_failure',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
+    'culkibo_fleet_mesh',
     'culkibo_diagnose_incident',
     'culkibo_auto_remediate'
   ]),
@@ -205,6 +215,8 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_ingress_status',
     'culkibo_manage_wildcard_dns01',
     'culkibo_edge_tunnel',
+    'culkibo_edge_shield',
+    'culkibo_fleet_mesh',
     'culkibo_set_domain_basic_auth',
     'culkibo_manage_webhook',
     'culkibo_deploy_freeze',
@@ -268,7 +280,15 @@ const SEARCH_SYNONYMS = Object.freeze({
   finops: ['cost', 'savings', 'vercel', 'railway', 'render', 'vps', 'hetzner', 'rightsizing', 'advisor'],
   savings: ['finops', 'cost', 'vercel', 'railway', 'render', 'vps', 'advisor'],
   vercel: ['finops', 'cost', 'savings', 'compare'],
-  railway: ['finops', 'cost', 'savings', 'compare']
+  railway: ['finops', 'cost', 'savings', 'compare'],
+  wireguard: ['mesh', 'fleet', 'x25519', 'vpn', 'ufw', 'firewall'],
+  mesh: ['wireguard', 'fleet', 'x25519', 'vpn'],
+  healer: ['heal', 'build', 'diagnose', 'oom', 'dockerfile', 'logs'],
+  heartbeat: ['cron', 'timeline', 'deadman', 'schedule', 'uptime'],
+  timeline: ['cron', 'heartbeat', 'heatmap', 'collision', 'schedule'],
+  shield: ['waf', 'bot', 'pow', 'anubis', 'scraper', 'edge', 'caddy'],
+  pow: ['shield', 'waf', 'bot', 'anubis', 'challenge'],
+  waf: ['shield', 'bot', 'pow', 'edge', 'caddy']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -418,7 +438,12 @@ const TOOL_POLICIES = Object.freeze({
   // MCP 2026 Cycle-6: Shadow Traffic Replay, Whole-Stack Time-Machine & FinOps Savings (+3 = 116)
   culkibo_shadow_replay: { minRole: 'developer', scope: 'deployments:write', projectScoped: true, secretSensitive: true },
   culkibo_time_machine: { minRole: 'developer', scope: 'deployments:write', projectScoped: true, secretSensitive: true },
-  culkibo_finops_report: { minRole: 'viewer', scope: 'advisor:read', projectScoped: false }
+  culkibo_finops_report: { minRole: 'viewer', scope: 'advisor:read', projectScoped: false },
+  // MCP 2026 Cycle-7: Build Auto-Healer, WireGuard Fleet Mesh, Cron Timeline & Edge Bot-Shield (+4 = 120)
+  culkibo_heal_build_failure: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
+  culkibo_fleet_mesh: { minRole: 'admin', scope: 'fleet:write', projectScoped: false, secretSensitive: true },
+  culkibo_cron_timeline: { minRole: 'viewer', scope: 'crons:read', projectScoped: false },
+  culkibo_edge_shield: { minRole: 'developer', scope: 'domains:write', projectScoped: false }
 });
 
 /**
@@ -3273,6 +3298,109 @@ class McpServer extends EventEmitter {
             monthlyBandwidthGb: { type: 'number', minimum: 0, maximum: 1000000, description: 'Tráfico mensual saliente estimado en GB (default 250)' }
           }
         }
+      },
+
+      // --- MCP 2026 Cycle-7: Build Auto-Healer, WireGuard Fleet Mesh, Cron Timeline & Edge Bot-Shield (+4 -> 120) ---
+      {
+        name: 'culkibo_heal_build_failure',
+        title: 'Diagnosticar y sanar fallos de build/runtime',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: ['string', 'null'] },
+            matched: { type: 'boolean' },
+            dryRun: { type: 'boolean' },
+            applied: { type: 'boolean' },
+            diagnosis: { type: 'object' },
+            healingPlan: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Clasifica logs fallidos de build o runtime contra 20 patrones deterministas (sin LLM: Node OOM, bind 127.0.0.1, log-driver mismatch kamal#1709, lockfile drift, pg_wal, musl/glibc, Exit 137, etc.) y planifica o aplica parches seguros de configuración (dryRun: true por defecto).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de proyecto opcional para vincular plan de remediación y control ACL' },
+            logs: { type: 'string', minLength: 1, maxLength: 200000, description: 'Salida stderr/stdout del build o contenedor fallido' },
+            apply: { type: 'boolean', description: 'Generar/aplicar plan de remediación sobre projectId (por defecto solo diagnostica; con dryRun: false aplica cambios seguros)' },
+            code: { type: 'string', maxLength: 80, description: 'Código de patrón opcional para forzar una estrategia de curación concreta' }
+          },
+          required: ['logs']
+        }
+      },
+      {
+        name: 'culkibo_fleet_mesh',
+        title: 'Gestionar malla WireGuard cero-configuración',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            cidr: { type: 'string' },
+            interfaceName: { type: 'string' },
+            peerCount: { type: 'number' },
+            peers: { type: 'array' },
+            plan: { type: ['object', 'null'] },
+            rotation: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Inspecciona, planifica (wg0.conf redactado + reglas UFW anti-bypass kamal#1856) o rota claves x25519 de la malla privada WireGuard 10.88.0.0/24 entre nodos de la flota (solo admin/owner; claves privadas cifradas AES-256-GCM y jamás devueltas; dryRun: true por defecto en rotate).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['status', 'plan', 'rotate'], description: 'Operación sobre la malla WireGuard (default "status")' },
+            nodeId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del nodo cuya clave x25519 se rotará (requerido en action="rotate")' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_cron_timeline',
+        title: 'Heatmap 24h de Crons y Heartbeats Dead-Man-Switch',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            hours: { type: 'number' },
+            slots: { type: 'array' },
+            collisionWarnings: { type: 'array' },
+            heartbeats: { type: 'array' },
+            heartbeatCount: { type: 'number' }
+          }
+        },
+        description: 'Proyecta el mapa de calor de ejecuciones cron/backups para las próximas 1..168 horas detectando ventanas de colisión IO, junto con el estado de monitores Dead-Man-Switch Heartbeats acotados por ACL de proyectos.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            hours: { type: 'integer', minimum: 1, maximum: 168, description: 'Ventana de proyección en horas (default 24, máx 168)' },
+            includeHeartbeats: { type: 'boolean', description: 'Incluir listado de monitores Dead-Man-Switch Heartbeats (default true)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_edge_shield',
+        title: 'Edge Bot-Shield y puerta Hashcash PoW',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            domain: { type: ['string', 'null'] },
+            status: { type: ['object', 'null'] },
+            routes: { type: 'array' },
+            challenge: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Consulta estado del escudo anti-bots/AI-scrapers, compila subrutas nativas Caddy v2.11 sin plugins (bloqueo /.env, /.git, SQLi/XSS, UAs abusivos) o emite un reto SHA-256 Hashcash Proof-of-Work estilo Anubis.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['status', 'compile', 'challenge'], description: 'Acción sobre Edge Bot-Shield (default "status")' },
+            domain: { type: 'string', maxLength: 253, description: 'Dominio objetivo para compilar subrutas o emitir reto PoW' },
+            powChallenge: { type: 'boolean', description: 'Incluir puerta de redirección Hashcash PoW al compilar subrutas Caddy' },
+            difficulty: { type: 'integer', minimum: 1, maximum: 6, description: 'Dificultad en ceros hexadecimales del reto SHA-256 PoW (default 4, rango 1..6)' }
+          }
+        }
       }
     ];
 
@@ -6103,6 +6231,63 @@ class McpServer extends EventEmitter {
         break;
       }
 
+      case 'culkibo_heal_build_failure': {
+        Object.assign(target, {
+          projectId: args.projectId || null,
+          apply: Boolean(args.apply),
+          code: args.code || null,
+          logsLength: typeof args.logs === 'string' ? args.logs.length : 0
+        });
+        const bh = lazySvc('buildHealerService');
+        if (bh && typeof bh.diagnoseLogs === 'function') {
+          const diagnosis = bh.diagnoseLogs(String(args.logs || ''), { projectId: args.projectId || undefined });
+          let healingPlan = null;
+          if (args.projectId && typeof bh.applyHealingPlan === 'function') {
+            try {
+              healingPlan = await bh.applyHealingPlan(String(args.projectId), {
+                logs: String(args.logs || ''),
+                ...(args.code ? { code: String(args.code) } : {}),
+                dryRun: true
+              });
+            } catch (e) {
+              warnings.push(e.message);
+            }
+          }
+          Object.assign(preview, { diagnosis, healingPlan });
+        }
+        effects.push(`Analizará los logs de build/runtime contra 20 patrones deterministas${args.projectId ? ` y previsualizará parches seguros para '${args.projectId}'` : ''} sin mutar estado.`);
+        riskLevel = 'low';
+        reversible = true;
+        break;
+      }
+
+      case 'culkibo_fleet_mesh': {
+        const action = String(args.action || 'status');
+        Object.assign(target, { action, nodeId: args.nodeId || null });
+        const fm = lazySvc('fleetMeshService');
+        if (action === 'rotate') {
+          if (!args.nodeId) {
+            blockers.push('MISSING_NODE_ID');
+          } else if (fm && typeof fm.rotatePeerKey === 'function') {
+            try {
+              const rotPreview = fm.rotatePeerKey(String(args.nodeId), { dryRun: true });
+              if (rotPreview && typeof rotPreview === 'object') Object.assign(preview, rotPreview);
+            } catch (e) {
+              blockers.push('MESH_NODE_NOT_FOUND');
+              warnings.push(e.message);
+            }
+          }
+          effects.push(`Rotará el par de claves x25519 WireGuard del nodo '${args.nodeId || '?'}' (almacenado AES-256-GCM; requiere distribuir nueva clave pública al resto de peers).`);
+          riskLevel = 'high';
+          reversible = false;
+        } else {
+          effects.push(`Consultará '${action}' de la malla privada WireGuard 10.88.0.0/24 sin mutar claves ni archivos.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
       default: {
         Object.assign(target, redactForAudit(args));
         effects.push(`Ejecutará la herramienta destructiva '${toolName}' con los parámetros validados.`);
@@ -8420,6 +8605,214 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_heal_build_failure': {
+          const bh = requireLazySvc('buildHealerService', 'Deterministic 20-Pattern Build Auto-Healer');
+          const logsText = String(args.logs || '');
+          const project = args.projectId ? projectManager.getById(String(args.projectId)) : null;
+          if (args.projectId && !project) throw projectNotFoundError(args.projectId);
+
+          const diagnosis = bh.diagnoseLogs(logsText, {
+            ...(project ? { projectId: project.id, projectName: project.name } : {})
+          });
+
+          const wantsApply = Boolean(args.apply);
+          const dryRun = wantsApply ? (args.dryRun !== false) : true;
+          /** @type {any} */
+          let healingPlan = null;
+          if (project) {
+            try {
+              healingPlan = await bh.applyHealingPlan(project.id, {
+                logs: logsText,
+                ...(args.code ? { code: String(args.code) } : (diagnosis?.primary?.code ? { code: String(diagnosis.primary.code) } : {})),
+                dryRun
+              });
+            } catch (e) {
+              throw new McpToolError('INVALID_ARGUMENT', e.message, {
+                retryable: true,
+                remediation: 'Revisa los parámetros projectId, logs o code y vuelve a intentarlo con dryRun: true.'
+              });
+            }
+          } else if (wantsApply) {
+            throw new McpToolError('MISSING_ARGUMENT', 'apply: true requiere indicar projectId para aplicar el plan de curación.', {
+              retryable: true,
+              remediation: 'Pasa projectId obtenido desde culkibo_list_projects junto con apply: true.'
+            });
+          }
+
+          res = {
+            projectId: project ? project.id : null,
+            matched: Boolean(diagnosis && diagnosis.matched),
+            dryRun,
+            applied: Boolean(wantsApply && !dryRun && healingPlan && healingPlan.applied !== false),
+            diagnosis,
+            healingPlan
+          };
+          break;
+        }
+
+        case 'culkibo_fleet_mesh': {
+          const fm = requireLazySvc('fleetMeshService', 'Zero-Config WireGuard Fleet Mesh');
+          const action = String(args.action || 'status');
+          const stripMeshSecrets = (val, depth = 0) => {
+            if (depth > 6 || val === null || val === undefined || typeof val !== 'object') return val;
+            if (Array.isArray(val)) return val.map((item) => stripMeshSecrets(item, depth + 1));
+            /** @type {Record<string, any>} */
+            const clean = {};
+            for (const [k, v] of Object.entries(val)) {
+              if (/^(?:privateKey|privateKeyPem|privateKeyEnc|_sealedPrivateKey|sealedPrivateKey)$/i.test(k)) continue;
+              clean[k] = stripMeshSecrets(v, depth + 1);
+            }
+            return clean;
+          };
+
+          if (action === 'plan') {
+            const plan = stripMeshSecrets(fm.planMesh(undefined, { dryRun: true }));
+            const status = stripMeshSecrets(fm.getStatus());
+            res = {
+              action: 'plan',
+              dryRun: true,
+              cidr: status.cidr || '10.88.0.0/24',
+              interfaceName: status.interfaceName || 'wg0',
+              peerCount: Number(status.peerCount || (Array.isArray(status.peers) ? status.peers.length : 0)),
+              peers: Array.isArray(status.peers) ? status.peers : [],
+              plan,
+              rotation: null
+            };
+          } else if (action === 'rotate') {
+            if (!args.nodeId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="rotate" requiere nodeId.', {
+                retryable: true,
+                remediation: 'Consulta los nodeId disponibles con culkibo_fleet_mesh({ action: "status" }) y pasa nodeId.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            /** @type {any} */
+            let rotation;
+            try {
+              rotation = stripMeshSecrets(fm.rotatePeerKey(String(args.nodeId), { dryRun }));
+            } catch (e) {
+              throw new McpToolError('NOT_FOUND', e.message, {
+                retryable: false,
+                remediation: 'Consulta los peers existentes con culkibo_fleet_mesh({ action: "status" }).'
+              });
+            }
+            const status = stripMeshSecrets(fm.getStatus());
+            res = {
+              action: 'rotate',
+              dryRun,
+              cidr: status.cidr || '10.88.0.0/24',
+              interfaceName: status.interfaceName || 'wg0',
+              peerCount: Number(status.peerCount || (Array.isArray(status.peers) ? status.peers.length : 0)),
+              peers: Array.isArray(status.peers) ? status.peers : [],
+              plan: null,
+              rotation
+            };
+          } else {
+            const status = stripMeshSecrets(fm.getStatus());
+            res = {
+              action: 'status',
+              dryRun: false,
+              ...status,
+              cidr: status.cidr || '10.88.0.0/24',
+              interfaceName: status.interfaceName || 'wg0',
+              peerCount: Number(status.peerCount || (Array.isArray(status.peers) ? status.peers.length : 0)),
+              peers: Array.isArray(status.peers) ? status.peers : [],
+              plan: null,
+              rotation: null
+            };
+          }
+          break;
+        }
+
+        case 'culkibo_cron_timeline': {
+          const hours = Math.min(168, Math.max(1, Number(args.hours) || 24));
+          const includeHeartbeats = args.includeHeartbeats !== false;
+          const allowedProjectIds = this._accessibleProjectIds(principal);
+
+          const timeline = typeof cronManager.getTimeline === 'function'
+            ? cronManager.getTimeline({ hours, projectIds: allowedProjectIds })
+            : { hours, slots: [], collisionWarnings: [] };
+
+          let heartbeats = [];
+          if (includeHeartbeats && typeof cronManager.listHeartbeats === 'function') {
+            const rawHbs = cronManager.listHeartbeats(allowedProjectIds !== null ? { projectIds: allowedProjectIds } : {});
+            const allowSet = allowedProjectIds !== null ? new Set(allowedProjectIds) : null;
+            heartbeats = (Array.isArray(rawHbs) ? rawHbs : [])
+              .filter((hb) => !allowSet || (hb && hb.projectId && allowSet.has(String(hb.projectId))))
+              .map((hb) => {
+                const { token: _tok, pingUrl: _url, ...safeHb } = hb || {};
+                return {
+                  ...safeHb,
+                  hasToken: Boolean(_tok),
+                  pingUrl: '/api/heartbeat/[REDACTED]'
+                };
+              });
+          }
+
+          res = {
+            ...timeline,
+            hours: Number(timeline?.hours || hours),
+            slots: Array.isArray(timeline?.slots) ? timeline.slots : [],
+            collisionWarnings: Array.isArray(timeline?.collisionWarnings) ? timeline.collisionWarnings : [],
+            heartbeats,
+            heartbeatCount: heartbeats.length
+          };
+          break;
+        }
+
+        case 'culkibo_edge_shield': {
+          const es = requireLazySvc('edgeShieldService', 'Edge Bot-Shield & Hashcash PoW Gate');
+          const action = String(args.action || 'status');
+          const domainName = args.domain ? String(args.domain).trim() : null;
+          const difficulty = args.difficulty !== undefined ? Math.min(6, Math.max(1, Math.round(Number(args.difficulty) || 4))) : 4;
+
+          if (action === 'compile') {
+            const targetDomain = domainName || 'example.com';
+            const compiled = es.compileCaddyShieldRoutes({
+              hostname: targetDomain,
+              edgeShield: {
+                enabled: true,
+                powChallenge: Boolean(args.powChallenge),
+                difficulty
+              }
+            });
+            const routes = Array.isArray(compiled) ? compiled : (Array.isArray(compiled?.routes) ? compiled.routes : []);
+            res = {
+              action: 'compile',
+              domain: targetDomain,
+              status: null,
+              routes,
+              ruleCount: routes.length,
+              challenge: null
+            };
+          } else if (action === 'challenge') {
+            const challenge = es.issueChallenge({
+              ip: '127.0.0.1',
+              userAgent: 'culkibo-mcp-client',
+              domain: domainName || 'default',
+              difficulty
+            });
+            res = {
+              action: 'challenge',
+              domain: domainName || 'default',
+              status: null,
+              routes: [],
+              challenge
+            };
+          } else {
+            const domains = domainManager.listDomains();
+            const status = es.getStatus(domains);
+            res = {
+              action: 'status',
+              domain: domainName,
+              status,
+              routes: [],
+              challenge: null
+            };
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -9403,7 +9796,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 116 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 120 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',
