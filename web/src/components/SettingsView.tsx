@@ -87,6 +87,8 @@ import {
   type SeccompProfileResult,
   type RuncAuditResult,
   type PreDeploySecretScanResult,
+  type MtlsCertRecord,
+  type MtlsVerifyResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -345,6 +347,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [gateResult, setGateResult] = useState<PreDeploySecretScanResult | null>(null);
   const [gateBusy, setGateBusy] = useState(false);
   const [gateError, setGateError] = useState<string | null>(null);
+
+  // Cycle-15: Zero-Trust SPIFFE-Lite mTLS Identity CA (Ed25519)
+  const [mtlsServiceName, setMtlsServiceName] = useState('edge-api-rust');
+  const [mtlsCerts, setMtlsCerts] = useState<MtlsCertRecord[]>([]);
+  const [mtlsLastIssued, setMtlsLastIssued] = useState<{ cert: MtlsCertRecord; signatureB64: string } | null>(null);
+  const [mtlsVerify, setMtlsVerify] = useState<MtlsVerifyResult | null>(null);
+  const [mtlsCaddyPolicy, setMtlsCaddyPolicy] = useState<Record<string, unknown> | null>(null);
+  const [mtlsBusy, setMtlsBusy] = useState<'issue' | 'verify' | 'revoke' | null>(null);
+  const [mtlsError, setMtlsError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -1591,6 +1602,76 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setGateBusy(false);
+    }
+  };
+
+  const handleIssueMtlsCert = async () => {
+    const svc = mtlsServiceName.trim() || 'edge-api-rust';
+    setMtlsBusy('issue');
+    setMtlsError(null);
+    setMtlsVerify(null);
+    try {
+      const res = await api.issueMtlsCert({ serviceName: svc, namespace: 'prod', ttlHours: 24 });
+      if (res?.cert) {
+        setMtlsLastIssued({ cert: res.cert, signatureB64: res.signatureB64 });
+        setMtlsCerts((prev) => [res.cert, ...prev.filter((c) => c.serial !== res.cert.serial)]);
+      }
+      if (res?.caddyClientAuth) setMtlsCaddyPolicy(res.caddyClientAuth);
+      onNotify?.(`Issued short-lived Ed25519 SPIFFE cert (${res.cert?.spiffeId || svc} · 24h TTL)`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'mTLS cert issuance failed';
+      setMtlsError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setMtlsBusy(null);
+    }
+  };
+
+  const handleVerifyMtlsCert = async () => {
+    const target = mtlsLastIssued || (mtlsCerts[0]?.signatureB64 ? { cert: mtlsCerts[0], signatureB64: mtlsCerts[0].signatureB64 } : null);
+    if (!target) {
+      await handleIssueMtlsCert();
+      return;
+    }
+    setMtlsBusy('verify');
+    setMtlsError(null);
+    try {
+      const res = await api.verifyMtlsCert({ cert: target.cert, signatureB64: target.signatureB64 });
+      setMtlsVerify(res);
+      onNotify?.(
+        res.valid
+          ? `mTLS Ed25519 Verified: ${res.spiffeId || target.cert.spiffeId} (${res.code})`
+          : `mTLS Verification Rejected: ${res.code}`,
+        res.valid ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'mTLS verification failed';
+      setMtlsError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setMtlsBusy(null);
+    }
+  };
+
+  const handleRevokeMtlsCert = async () => {
+    const serial = mtlsLastIssued?.cert?.serial || mtlsCerts[0]?.serial;
+    if (!serial) return;
+    setMtlsBusy('revoke');
+    setMtlsError(null);
+    try {
+      await api.revokeMtlsCert(serial, 'operator_revocation');
+      setMtlsCerts((prev) => prev.map((c) => (c.serial === serial ? { ...c, revoked: true, revokedReason: 'operator_revocation' } : c)));
+      if (mtlsLastIssued?.cert?.serial === serial) {
+        const ver = await api.verifyMtlsCert({ cert: mtlsLastIssued.cert, signatureB64: mtlsLastIssued.signatureB64 }).catch(() => null);
+        if (ver) setMtlsVerify(ver);
+      }
+      onNotify?.(`Certificate ${serial} revoked in CRL — subsequent mTLS handshakes rejected (CERT_REVOKED)`, 'info');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'mTLS revocation failed';
+      setMtlsError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setMtlsBusy(null);
     }
   };
 
@@ -3531,6 +3612,91 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               );
             })()}
+          </div>
+
+          {/* 16. Cycle-15: Zero-Trust SPIFFE-Lite mTLS Identity CA (Ed25519) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.mtlsTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      {t('sec.mtlsZeroKey')}
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.mtlsDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <input
+                  type="text"
+                  value={mtlsServiceName}
+                  onChange={(e) => setMtlsServiceName(e.target.value)}
+                  aria-label="Workload service name for SPIFFE cert"
+                  placeholder="edge-api-rust"
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 w-36"
+                />
+                <button
+                  type="button"
+                  disabled={mtlsBusy !== null}
+                  onClick={() => void handleIssueMtlsCert()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {mtlsBusy === 'issue' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+                  <span>{mtlsBusy === 'issue' ? t('sec.mtlsWorking') : t('sec.mtlsIssue')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={mtlsBusy !== null || (!mtlsLastIssued && mtlsCerts.length === 0)}
+                  onClick={() => void handleVerifyMtlsCert()}
+                  className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 hover:bg-slate-100 text-emerald-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>{t('sec.mtlsVerify')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={mtlsBusy !== null || (!mtlsLastIssued && mtlsCerts.length === 0)}
+                  onClick={() => void handleRevokeMtlsCert()}
+                  className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                  <span>{t('sec.mtlsRevoke')}</span>
+                </button>
+              </div>
+            </div>
+
+            {mtlsError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{mtlsError}</div>}
+
+            {(mtlsLastIssued || mtlsVerify) && (
+              <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                <div className="flex flex-wrap items-center gap-2">
+                  {mtlsLastIssued && (
+                    <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      {mtlsLastIssued.cert.spiffeId} · serial:{mtlsLastIssued.cert.serial}
+                    </span>
+                  )}
+                  {mtlsVerify && (
+                    <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-semibold border ${
+                      mtlsVerify.valid
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-red-50 text-red-700 border-red-200'
+                    }`}>
+                      {mtlsVerify.valid ? `VALID · ${mtlsVerify.code}` : `REJECTED · ${mtlsVerify.code}`}
+                    </span>
+                  )}
+                </div>
+                {mtlsCaddyPolicy && (
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 font-mono text-[10px] leading-relaxed overflow-x-auto max-h-44 border border-slate-800">
+                    {JSON.stringify(mtlsCaddyPolicy, null, 2)}
+                  </pre>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}

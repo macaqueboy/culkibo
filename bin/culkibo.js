@@ -62,7 +62,9 @@ const svc = {
   get imageBloatAuditor() { return require('../server/services/imageBloatAuditor'); },
   get piiMaskerService() { return require('../server/services/piiMaskerService'); },
   get preDeploySecretGate() { return require('../server/services/preDeploySecretGate'); },
-  get multiArchPlannerService() { return require('../server/services/multiArchPlannerService'); }
+  get multiArchPlannerService() { return require('../server/services/multiArchPlannerService'); },
+  get runtimeAnomalyService() { return require('../server/services/runtimeAnomalyService'); },
+  get digestPromotionService() { return require('../server/services/digestPromotionService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2885,15 +2887,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 155,
+            mcpTools: 160,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '155 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
-            'Egress/nftables Drift Auditor, DB Replica Fencing, Shannon-Entropy Secret Gate, Multi-Arch Planner & Chaos GameDay'
+            '160 MCP tools (-90% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'SPIFFE-Lite mTLS CA, Feature Flags Kill-Switch, AI RPM+TPM Shield, Falco-Lite Anomaly & @sha256: GitOps Promotion'
           ]
         };
       };
@@ -4061,6 +4063,107 @@ program
       if (result.remediation) console.log(`   Solución:    ${result.remediation}`);
       console.log('');
       if (!compatible) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-15 CLI: anomaly-scan (Falco-Lite) & verify-digest (@sha256:)
+// ===========================================================================
+
+program
+  .command('anomaly-scan [eventsFile]')
+  .description('Falco-Lite Container Runtime Anomaly Detector (10 reglas: xmrig/stratum, reverse shell, /etc/shadow, curl|sh): sale con código 1 si detecta alertas')
+  .option('--cmd <command>', 'Comando de proceso observado (ej. "xmrig -o stratum+tcp://pool:3333")')
+  .option('--port <port>', 'Puerto saliente observado (ej. 3333)')
+  .option('--file <path>', 'Ruta de archivo accedida/escrita (ej. /etc/shadow)')
+  .option('--project <projectId>', 'ID de proyecto asociado', 'cli-scan')
+  .option('--container <name>', 'Nombre de contenedor', 'app')
+  .option('--json', 'Salida JSON estructurada')
+  .action((eventsFile, options) => {
+    try {
+      /** @type {Array<Record<string, any>>} */
+      let events = [];
+      /** @type {string | null} */
+      let sourceFile = null;
+      if (eventsFile) {
+        sourceFile = path.resolve(String(eventsFile));
+        if (!fs.existsSync(sourceFile)) {
+          throw new Error(`Archivo de eventos no encontrado: ${sourceFile}`);
+        }
+        const parsed = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
+        events = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.events) ? parsed.events : [parsed]);
+      } else {
+        /** @type {Record<string, any>} */
+        const evt = {};
+        if (options.cmd) evt.cmd = String(options.cmd);
+        if (options.port !== undefined) evt.port = Number(options.port);
+        if (options.file) {
+          evt.path = String(options.file);
+          evt.file = String(options.file);
+        }
+        if (Object.keys(evt).length === 0) {
+          throw new Error('Proporciona un archivo <eventsFile> o los flags --cmd, --port o --file.');
+        }
+        events.push(evt);
+      }
+
+      const anomSvc = svc.runtimeAnomalyService;
+      const result = anomSvc.inspectRuntimeEvents({
+        projectId: String(options.project || 'cli-scan'),
+        containerName: String(options.container || 'app'),
+        events,
+        persist: false
+      });
+      const clean = Boolean(result && result.clean);
+      const payload = {
+        ...result,
+        ok: clean,
+        ...(sourceFile ? { file: sourceFile } : {})
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!clean) process.exitCode = 1;
+        return;
+      }
+
+      const badge = clean ? '\x1b[32mCLEAN ✅\x1b[0m' : '\x1b[31mANOMALY DETECTED ❌\x1b[0m';
+      console.log(`\n🚨 Culkibo Falco-Lite Runtime Anomaly Detector — [${badge}]`);
+      console.log(`   Risk score:  ${result.riskScore ?? 0}/100 · Alertas: ${Array.isArray(result.alerts) ? result.alerts.length : 0}`);
+      console.log('');
+      if (!clean) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('verify-digest <imageRef>')
+  .description('Immutable OCI Digest Verifier (Kargo Freight): exige @sha256:<64hex> y sale con código 1 en tags mutables (:latest)')
+  .option('--json', 'Salida JSON estructurada')
+  .action((imageRef, options) => {
+    try {
+      const promoSvc = svc.digestPromotionService;
+      const result = promoSvc.validateImmutableDigest(String(imageRef || ''));
+      const valid = Boolean(result && result.valid);
+      const payload = {
+        ...result,
+        ok: valid,
+        imageRef: String(imageRef || '')
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!valid) process.exitCode = 1;
+        return;
+      }
+
+      const badge = valid ? '\x1b[32mIMMUTABLE ✅\x1b[0m' : '\x1b[31mMUTABLE TAG FORBIDDEN ❌\x1b[0m';
+      console.log(`\n📦 Culkibo Immutable Digest Verifier — [${badge}]`);
+      console.log(`   Image:  ${imageRef}`);
+      if (result.code) console.log(`   Code:   ${result.code}`);
+      console.log('');
+      if (!valid) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
     }

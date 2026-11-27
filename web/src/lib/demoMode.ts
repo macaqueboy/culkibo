@@ -121,6 +121,11 @@ interface DemoState {
   oncallIncidents: any[];
   replicaTopologies: Record<string, any>;
   chaosGameDays: Record<string, any[]>;
+  mtlsCerts: any[];
+  rateLimitPolicies: any[];
+  featureFlags: any[];
+  runtimeAnomalies: Record<string, any[]>;
+  digestPromotions: Record<string, any[]>;
 }
 
 function createInitialDemoState(): DemoState {
@@ -1013,6 +1018,30 @@ function createInitialDemoState(): DemoState {
       },
     },
     chaosGameDays: {},
+    mtlsCerts: [
+      {
+        serial: 'CKB-8F4A-1001',
+        spiffeId: 'spiffe://culkibo.internal/ns/prod/sa/edge-api-rust',
+        serviceName: 'edge-api-rust',
+        namespace: 'prod',
+        issuedAt: t1,
+        expiresAt: nowIso(1000 * 60 * 60 * 24),
+        ttlHours: 24,
+        revoked: false,
+        signatureB64: 'ed25519_demo_sig_9e8d7c6b5a4f3e2d1c0b',
+      },
+    ],
+    rateLimitPolicies: [
+      { id: 'rl_free', name: 'Free Tier AI Shield', planTier: 'free', rpmLimit: 30, tpmLimit: 15000, burstMultiplier: 1.2, windowSec: 60 },
+      { id: 'rl_pro', name: 'Pro Tier AI Shield', planTier: 'pro', rpmLimit: 120, tpmLimit: 60000, burstMultiplier: 1.5, windowSec: 60 },
+      { id: 'rl_enterprise', name: 'Enterprise AI Shield', planTier: 'enterprise', rpmLimit: 600, tpmLimit: 300000, burstMultiplier: 2.0, windowSec: 60 },
+    ],
+    featureFlags: [
+      { key: 'ai_streaming_v2', description: 'Zero-buffering SSE token streaming across edge nodes', enabled: true, killed: false, rolloutPct: 35, environment: 'prod', allowTenants: ['acme-pro'], denyTenants: [] },
+      { key: 'instant_checkout_h3', description: 'HTTP/3 0-RTT optimistic cart checkout pipeline', enabled: true, killed: false, rolloutPct: 50, environment: 'prod', allowTenants: [], denyTenants: [] },
+    ],
+    runtimeAnomalies: {},
+    digestPromotions: {},
   };
 }
 
@@ -3947,6 +3976,280 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     }
   }
 
+  // --- Cycle-15: SPIFFE mTLS CA, Edge AI Rate-Limit (RPM+TPM), Feature Flags, Runtime Anomaly & Digest Promotion ---
+  if (pathname === '/api/security/mtls/certs' && method === 'GET') {
+    return jsonResponse({
+      ok: true,
+      trustDomain: 'culkibo.internal',
+      certs: s.mtlsCerts,
+      caddyClientAuth: {
+        mode: 'require_and_verify',
+        trusted_leaf_spiffe_ids: s.mtlsCerts.filter((c) => !c.revoked).map((c) => c.spiffeId),
+      },
+    });
+  }
+  if (pathname === '/api/security/mtls/issue' && method === 'POST') {
+    const svc = String(body.serviceName || 'edge-api-rust').trim() || 'edge-api-rust';
+    const ns = String(body.namespace || 'prod').trim() || 'prod';
+    const ttl = Math.max(1, Math.min(168, Number(body.ttlHours || 24)));
+    const serial = `CKB-${Math.random().toString(16).slice(2, 6).toUpperCase()}-${Date.now().toString().slice(-4)}`;
+    const sig = `ed25519_sig_${serial.toLowerCase().replace(/-/g, '')}_verified`;
+    const cert = {
+      serial,
+      spiffeId: `spiffe://culkibo.internal/ns/${ns}/sa/${svc}`,
+      serviceName: svc,
+      namespace: ns,
+      issuedAt: new Date().toISOString(),
+      expiresAt: nowIso(ttl * 3600000),
+      ttlHours: ttl,
+      revoked: false,
+      signatureB64: sig,
+    };
+    s.mtlsCerts.unshift(cert);
+    return jsonResponse({
+      ok: true,
+      cert,
+      signatureB64: sig,
+      caddyClientAuth: {
+        mode: 'require_and_verify',
+        trust_domain: 'culkibo.internal',
+        allowed_spiffe_ids: [cert.spiffeId],
+        ca_private_key_exposed: false,
+      },
+    });
+  }
+  if (pathname === '/api/security/mtls/verify' && method === 'POST') {
+    const cert = body.cert || {};
+    const found = s.mtlsCerts.find((c) => c.serial === cert.serial);
+    if (found?.revoked) {
+      return jsonResponse({ ok: true, valid: false, code: 'CERT_REVOKED', spiffeId: found.spiffeId, serial: found.serial, remainingMs: 0 });
+    }
+    return jsonResponse({
+      ok: true,
+      valid: true,
+      code: 'CERT_VALID',
+      spiffeId: cert.spiffeId || 'spiffe://culkibo.internal/ns/prod/sa/edge-api-rust',
+      serial: cert.serial || 'CKB-8F4A-1001',
+      remainingMs: 86395000,
+    });
+  }
+  const mtlsRevokeMatch = pathname.match(/^\/api\/security\/mtls\/revoke\/([^/]+)$/);
+  if (mtlsRevokeMatch && method === 'POST') {
+    const serial = decodeURIComponent(mtlsRevokeMatch[1]);
+    const found = s.mtlsCerts.find((c) => c.serial === serial);
+    if (found) {
+      found.revoked = true;
+      found.revokedReason = String(body.reason || 'manual_revoke');
+    }
+    return jsonResponse({ ok: true, revoked: true, serial, cert: found || null });
+  }
+
+  if (pathname === '/api/edge/ratelimits' && method === 'GET') {
+    return jsonResponse({ ok: true, policies: s.rateLimitPolicies });
+  }
+  if (pathname === '/api/edge/ratelimits' && method === 'POST') {
+    const pol = {
+      id: body.id || `rl_${Date.now()}`,
+      name: String(body.name || 'Custom AI Shield'),
+      planTier: String(body.planTier || 'pro'),
+      rpmLimit: Number(body.rpmLimit || 120),
+      tpmLimit: Number(body.tpmLimit || 60000),
+      burstMultiplier: Number(body.burstMultiplier || 1.5),
+      windowSec: Number(body.windowSec || 60),
+    };
+    s.rateLimitPolicies = [pol, ...s.rateLimitPolicies.filter((p) => p.id !== pol.id)];
+    return jsonResponse({ ok: true, policy: pol });
+  }
+  if (pathname === '/api/edge/ratelimits/simulate' && method === 'POST') {
+    const pol = s.rateLimitPolicies.find((p) => p.id === body.policyId) || s.rateLimitPolicies[1] || s.rateLimitPolicies[0];
+    const reqs = Math.max(1, Number(body.requestsCount || 20));
+    const tokPerReq = Math.max(100, Number(body.tokensPerRequest || 5000));
+    const cap = Math.floor((pol.tpmLimit * (pol.burstMultiplier || 1.5)) / tokPerReq);
+    const allowedCount = Math.min(reqs, Math.max(1, cap));
+    const throttledCount = Math.max(0, reqs - allowedCount);
+    const savedUsd = Number(((throttledCount * tokPerReq * 0.000015)).toFixed(2));
+    return jsonResponse({
+      ok: true,
+      policyId: pol.id,
+      totalRequests: reqs,
+      allowedCount,
+      throttledCount,
+      first429AtIndex: throttledCount > 0 ? allowedCount : null,
+      throttleReason: throttledCount > 0 ? 'TPM_WALLET_BUDGET_EXCEEDED' : null,
+      estimatedWalletSavedUsd: savedUsd > 0 ? savedUsd : 1.85,
+      sample429Headers: {
+        'Retry-After': '60',
+        RateLimit: `"${pol.planTier}";r=0;t=60`,
+        'RateLimit-Policy': `"${pol.planTier}";q=${pol.tpmLimit};w=${pol.windowSec || 60}`,
+        'X-RateLimit-Limit': String(pol.tpmLimit),
+        'X-RateLimit-Remaining': '0',
+      },
+      caddyConfig: {
+        handler: 'rate_limit',
+        zone: `culkibo_${pol.planTier}_ai`,
+        rpm_limit: pol.rpmLimit,
+        tpm_limit: pol.tpmLimit,
+        status_code: 429,
+        retry_after_sec: 60,
+      },
+    });
+  }
+
+  if (pathname === '/api/flags' && method === 'GET') {
+    return jsonResponse({ ok: true, flags: s.featureFlags });
+  }
+  if (pathname === '/api/flags' && method === 'POST') {
+    const fl = {
+      key: String(body.key || 'new_flag'),
+      description: String(body.description || ''),
+      enabled: body.enabled !== false,
+      killed: false,
+      rolloutPct: Number(body.rolloutPct ?? 50),
+      environment: String(body.environment || 'prod'),
+      allowTenants: Array.isArray(body.allowTenants) ? body.allowTenants : [],
+      denyTenants: Array.isArray(body.denyTenants) ? body.denyTenants : [],
+    };
+    s.featureFlags = [fl, ...s.featureFlags.filter((f) => f.key !== fl.key)];
+    return jsonResponse({ ok: true, flag: fl });
+  }
+  const flagActionMatch = pathname.match(/^\/api\/flags\/([^/]+)\/(evaluate|kill)$/);
+  if (flagActionMatch && method === 'POST') {
+    const key = decodeURIComponent(flagActionMatch[1]);
+    const act = flagActionMatch[2];
+    const fl = s.featureFlags.find((f) => f.key === key);
+    if (act === 'kill') {
+      if (fl) {
+        fl.killed = true;
+        fl.enabled = false;
+      }
+      return jsonResponse({ ok: true, killed: true, flag: fl || { key, killed: true, enabled: false, rolloutPct: 0 } });
+    }
+    if (!fl) return jsonResponse({ ok: true, key, enabled: false, reason: 'FLAG_NOT_FOUND', bucket: 0 });
+    if (fl.killed) return jsonResponse({ ok: true, key, enabled: false, reason: 'KILL_SWITCH_ACTIVE', bucket: 0 });
+    const bucket = 21.45;
+    const enabled = fl.enabled && (bucket < fl.rolloutPct || (fl.allowTenants || []).includes(body.tenantId));
+    return jsonResponse({
+      ok: true,
+      key,
+      enabled,
+      reason: enabled ? ((fl.allowTenants || []).includes(body.tenantId) ? 'TENANT_ALLOWED' : 'ROLLOUT_MATCH') : 'ROLLOUT_EXCLUDED',
+      bucket,
+      variant: enabled ? 'on' : 'off',
+    });
+  }
+
+  const anomalyMatch = pathname.match(/^\/api\/projects\/([^/]+)\/anomalies(\/inspect)?$/);
+  if (anomalyMatch) {
+    const pid = decodeURIComponent(anomalyMatch[1]);
+    const list = s.runtimeAnomalies[pid] || (s.runtimeAnomalies[pid] = []);
+    if (!anomalyMatch[2] && method === 'GET') {
+      return jsonResponse({ ok: true, alerts: list });
+    }
+    if (anomalyMatch[2] === '/inspect' && method === 'POST') {
+      const events = Array.isArray(body.events) ? body.events : [];
+      const alerts: Array<{ ruleId: string; severity: string; message: string }> = [];
+      for (const ev of events) {
+        const cmd = String(ev?.cmd || '');
+        if (/xmrig|stratum\+tcp|:3333|:4444/i.test(cmd)) {
+          alerts.push({ ruleId: 'CRYPTOMINER_STRATUM_TRAFFIC', severity: 'critical', message: 'Cryptominer binary / stratum+tcp pool traffic detected (dokploy#5156 signature).' });
+        }
+        if (/\/dev\/tcp\/|bash\s+-i|nc\s+-e/i.test(cmd)) {
+          alerts.push({ ruleId: 'REVERSE_SHELL_SPAWN', severity: 'critical', message: 'Interactive reverse shell /dev/tcp egress spawn detected inside container.' });
+        }
+      }
+      const riskScore = Math.min(100, alerts.length * 48);
+      return jsonResponse({
+        ok: true,
+        projectId: pid,
+        containerName: String(body.containerName || 'app'),
+        clean: alerts.length === 0,
+        riskScore,
+        criticalCount: alerts.length,
+        highCount: 0,
+        alerts,
+        recommendedAction: alerts.length > 0 ? 'ISOLATE_AND_ROTATE_SECRETS' : 'NONE',
+      });
+    }
+  }
+
+  const promoBaseMatch = pathname.match(/^\/api\/projects\/([^/]+)\/promotions$/);
+  if (promoBaseMatch) {
+    const pid = decodeURIComponent(promoBaseMatch[1]);
+    const list = s.digestPromotions[pid] || (s.digestPromotions[pid] = []);
+    if (method === 'GET') return jsonResponse({ ok: true, promotions: list });
+    if (method === 'POST') {
+      const imageRef = String(body.imageRef || '');
+      if (!/@sha256:[a-f0-9]{64}$/i.test(imageRef)) {
+        return jsonResponse({
+          ok: false,
+          blocked: true,
+          code: 'MUTABLE_TAG_FORBIDDEN',
+          message: `Mutable tag "${imageRef}" rejected — production promotions require immutable @sha256:<64hex> digest.`,
+        });
+      }
+      const promo = {
+        id: `promo_${Date.now()}`,
+        projectId: pid,
+        imageRef,
+        fromEnv: String(body.fromEnv || 'staging'),
+        toEnv: String(body.toEnv || 'prod'),
+        requester: String(body.requester || 'alice@acme.dev'),
+        approver: null,
+        status: 'pending_approval',
+        previousDigest: body.previousDigest || null,
+      };
+      list.unshift(promo);
+      return jsonResponse({ ok: true, promotion: promo });
+    }
+  }
+  const promoActMatch = pathname.match(/^\/api\/projects\/([^/]+)\/promotions\/([^/]+)\/(approve|execute|rollback)$/);
+  if (promoActMatch && method === 'POST') {
+    const pid = decodeURIComponent(promoActMatch[1]);
+    const promoId = decodeURIComponent(promoActMatch[2]);
+    const act = promoActMatch[3];
+    const list = s.digestPromotions[pid] || [];
+    const promo = list.find((p) => p.id === promoId) || {
+      id: promoId,
+      projectId: pid,
+      imageRef: 'ghcr.io/acme/app@sha256:a3f5c8e1b9d20476a3f5c8e1b9d20476a3f5c8e1b9d20476a3f5c8e1b9d20476',
+      fromEnv: 'staging',
+      toEnv: 'prod',
+      requester: 'alice@acme.dev',
+      approver: null,
+      status: 'pending_approval',
+      previousDigest: 'ghcr.io/acme/app@sha256:91b0d4c2e8a7531091b0d4c2e8a7531091b0d4c2e8a7531091b0d4c2e8a75310',
+    };
+    if (act === 'approve') {
+      if (String(body.approver || '') === promo.requester) {
+        return jsonResponse({
+          ok: false,
+          blocked: true,
+          code: 'DUAL_CONTROL_VIOLATION',
+          message: `Self-approval blocked: requester "${promo.requester}" cannot approve their own production promotion.`,
+        });
+      }
+      promo.approver = String(body.approver || 'bob@acme.dev');
+      promo.status = 'approved';
+      return jsonResponse({ ok: true, promotion: promo });
+    }
+    if (act === 'execute') {
+      promo.status = body.dryRun === false ? 'promoted' : 'dry_run_verified';
+      return jsonResponse({
+        ok: true,
+        dryRun: body.dryRun !== false,
+        promotion: promo,
+        rollbackManifest: {
+          projectId: pid,
+          revertToDigest: promo.previousDigest,
+          targetEnv: promo.toEnv,
+          verifiedBy: promo.approver || 'bob@acme.dev',
+          zeroDowntimeCaddySwitch: true,
+        },
+      });
+    }
+    return jsonResponse({ ok: true, dryRun: body.dryRun !== false, promotion: { ...promo, status: 'rolled_back' } });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -4124,16 +4427,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (155 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (160 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 155 MCP tools on demand without bloating context (-89%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 160 MCP tools on demand without bloating context (-90%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_mtls_mesh', description: 'Zero-Trust SPIFFE-Lite Ed25519 mTLS workload CA with CRL revocation & Caddy require_and_verify JSON', readOnly: false, profile: 'security' },
+      { name: 'culkibo_feature_flags', description: 'OpenFeature-Lite deterministic SHA-256 feature flags with tenant overrides & zero-redeploy kill-switch', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_api_ratelimit', description: 'Edge dual RPM+TPM AI wallet-drain shield emitting IETF RateLimit + 429 Retry-After headers', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_runtime_anomaly', description: '10-rule Falco-Lite runtime detector blocking cryptominer stratum pools & reverse shells (dokploy#5156)', readOnly: true, profile: 'security' },
+      { name: 'culkibo_digest_promotion', description: 'Kargo-style immutable @sha256: GitOps promotion pipeline with dual-control approval & rollback manifest', readOnly: false, profile: 'deploy' },
       { name: 'culkibo_egress_firewall', description: 'Container egress & DOCKER-USER/nftables drift auditor blocking IMDS metadata with anti-lockout SSH/80/443 rules', readOnly: false, profile: 'security' },
       { name: 'culkibo_replica_failover', description: 'Blue/Green DB read-replica promotion & split-brain fencing blocking lagging/unfenced promotions', readOnly: false, profile: 'ops' },
       { name: 'culkibo_secret_gate', description: 'Pre-deploy 12-rule Shannon-entropy & pattern secret gate with zero raw echoes and UUID/SHA benign filters', readOnly: true, profile: 'security' },
@@ -4175,27 +4483,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 155 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 160 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 155, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 160, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_secret_gate', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_egress_firewall', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_mtls_mesh', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_runtime_anomaly', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 155,
-      profiles: { core: { count: 17, savedPct: 89 } },
+      totalTools: 160,
+      profiles: { core: { count: 17, savedPct: 90 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

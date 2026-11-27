@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 155);
+    assert.strictEqual(demoJson.datasets.mcpTools, 160);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -982,7 +982,36 @@ async function testCliDx() {
     const maOkJson = JSON.parse(maOkCli.stdout);
     assert.strictEqual(maOkJson.ok, true);
     assert.strictEqual(maOkJson.compatible, true);
-    console.log(`  ✓ Pioneer CLI Cycle-14 verificado (culkibo secret-scan block=1/benign=0/warn=0, culkibo multiarch-check mismatch=1/ok=0, culkibo demo 155 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-14 verificado (culkibo secret-scan block=1/benign=0/warn=0, culkibo multiarch-check mismatch=1/ok=0)`);
+
+    // 19. Pioneer Cycle-15 CLI: `culkibo anomaly-scan` (cryptominer exit 1 vs clean exit 0) & `culkibo verify-digest` (:latest exit 1 vs @sha256: exit 0)
+    const anomFailCli = await runCli([
+      'anomaly-scan',
+      '--cmd', 'xmrig -o stratum+tcp://pool.minexmr.com:3333',
+      '--port', '3333',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(anomFailCli.status, 1, 'culkibo anomaly-scan debe salir con código 1 ante cryptominer');
+    const anomFailJson = JSON.parse(anomFailCli.stdout);
+    assert.strictEqual(anomFailJson.ok, false);
+    assert.strictEqual(anomFailJson.clean, false);
+    assert.ok(anomFailJson.alerts.some((a) => a.ruleId === 'CRYPTOMINER_STRATUM_TRAFFIC'));
+
+    const anomOkCli = await runCli(['anomaly-scan', '--cmd', 'node dist/server.js', '--port', '3000', '--json'], { env: isolatedEnv });
+    assert.strictEqual(anomOkCli.status, 0, `culkibo anomaly-scan limpio falló: ${anomOkCli.stderr}`);
+    assert.strictEqual(JSON.parse(anomOkCli.stdout).clean, true);
+
+    const digBadCli = await runCli(['verify-digest', 'ghcr.io/acme/api:latest', '--json'], { env: isolatedEnv });
+    assert.strictEqual(digBadCli.status, 1, 'culkibo verify-digest debe salir con código 1 ante :latest');
+    const digBadJson = JSON.parse(digBadCli.stdout);
+    assert.strictEqual(digBadJson.valid, false);
+    assert.strictEqual(digBadJson.code, 'MUTABLE_TAG_FORBIDDEN');
+
+    const validDigestRef = `ghcr.io/acme/api@sha256:${'f'.repeat(64)}`;
+    const digOkCli = await runCli(['verify-digest', validDigestRef, '--json'], { env: isolatedEnv });
+    assert.strictEqual(digOkCli.status, 0, `culkibo verify-digest @sha256: falló: ${digOkCli.stderr}`);
+    assert.strictEqual(JSON.parse(digOkCli.stdout).valid, true);
+    console.log(`  ✓ Pioneer CLI Cycle-15 verificado (culkibo anomaly-scan xmrig=1/clean=0, culkibo verify-digest :latest=1/@sha256=0, culkibo demo 160 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

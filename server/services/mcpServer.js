@@ -81,7 +81,12 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'replicaFailoverService',
   'preDeploySecretGate',
   'multiArchPlannerService',
-  'chaosGameDayService'
+  'chaosGameDayService',
+  'mtlsMeshService',
+  'featureFlagService',
+  'apiRateLimitService',
+  'runtimeAnomalyService',
+  'digestPromotionService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -132,7 +137,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_synthetic_sentinel',
   'culkibo_audit_image_bloat',
   'culkibo_mask_preview_pii',
-  'culkibo_secret_gate'
+  'culkibo_secret_gate',
+  'culkibo_mtls_mesh'
 ]);
 
 /** @type {Record<string, number>} */
@@ -143,7 +149,7 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (41 destructivas + 13 = 54). */
+/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (41 destructivas + 17 = 58). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment',
@@ -161,7 +167,11 @@ const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_oncall_router',
   'culkibo_egress_firewall',
   'culkibo_replica_failover',
-  'culkibo_chaos_gameday'
+  'culkibo_chaos_gameday',
+  'culkibo_mtls_mesh',
+  'culkibo_feature_flags',
+  'culkibo_api_ratelimit',
+  'culkibo_digest_promotion'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -238,7 +248,9 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_oom_forensics',
     'culkibo_secret_gate',
     'culkibo_multiarch_planner',
-    'culkibo_replica_failover'
+    'culkibo_replica_failover',
+    'culkibo_feature_flags',
+    'culkibo_digest_promotion'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -298,6 +310,11 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_replica_failover',
     'culkibo_multiarch_planner',
     'culkibo_chaos_gameday',
+    'culkibo_mtls_mesh',
+    'culkibo_feature_flags',
+    'culkibo_api_ratelimit',
+    'culkibo_runtime_anomaly',
+    'culkibo_digest_promotion',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -345,7 +362,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_audit_image_bloat',
     'culkibo_mask_preview_pii',
     'culkibo_egress_firewall',
-    'culkibo_secret_gate'
+    'culkibo_secret_gate',
+    'culkibo_mtls_mesh',
+    'culkibo_api_ratelimit',
+    'culkibo_runtime_anomaly'
   ])
 });
 
@@ -483,7 +503,15 @@ const SEARCH_SYNONYMS = Object.freeze({
   multiarch: ['arm64', 'amd64', 'manifest', 'buildx', 'qemu', 'exec', 'platform'],
   arm64: ['multiarch', 'amd64', 'manifest', 'buildx', 'qemu', 'platform'],
   chaos: ['gameday', 'toxiproxy', 'fault', 'resilience', 'latency', 'jitter', 'abort'],
-  gameday: ['chaos', 'toxiproxy', 'fault', 'resilience', 'scorecard']
+  gameday: ['chaos', 'toxiproxy', 'fault', 'resilience', 'scorecard'],
+  mtls: ['spiffe', 'spire', 'cert', 'certificate', 'ed25519', 'caddy', 'security', 'mesh'],
+  spiffe: ['mtls', 'cert', 'identity', 'mesh', 'security'],
+  flags: ['feature', 'rollout', 'killswitch', 'openfeature', 'unleash', 'bucket', 'toggle'],
+  ratelimit: ['throttle', '429', 'tpm', 'rpm', 'bucket', 'wallet', 'edge', 'caddy'],
+  anomaly: ['falco', 'cryptominer', 'xmrig', 'shell', 'runtime', 'security', 'intrusion'],
+  cryptominer: ['anomaly', 'falco', 'xmrig', 'stratum', 'runtime', 'security'],
+  promotion: ['digest', 'sha256', 'freight', 'kargo', 'gitops', 'staging', 'prod', 'approval'],
+  digest: ['promotion', 'sha256', 'immutable', 'freight', 'gitops', 'deploy']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -680,7 +708,13 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_replica_failover: { minRole: 'developer', scope: 'databases:write', projectScoped: false },
   culkibo_secret_gate: { minRole: 'developer', scope: 'security:read', projectScoped: false, secretSensitive: true },
   culkibo_multiarch_planner: { minRole: 'developer', scope: 'deployments:read', projectScoped: false },
-  culkibo_chaos_gameday: { minRole: 'developer', scope: 'deployments:write', projectScoped: true }
+  culkibo_chaos_gameday: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
+  // MCP 2026 Cycle-15 Milestone (160 MCP Tools -90% Core!): SPIFFE-Lite mTLS, Feature Flags, AI Rate-Limit Shield, Falco-Lite Anomaly & Digest Promotion (+5 = 160)
+  culkibo_mtls_mesh: { minRole: 'developer', scope: 'security:write', projectScoped: false, secretSensitive: true },
+  culkibo_feature_flags: { minRole: 'developer', scope: 'deployments:write', projectScoped: false },
+  culkibo_api_ratelimit: { minRole: 'developer', scope: 'domains:write', projectScoped: false },
+  culkibo_runtime_anomaly: { minRole: 'developer', scope: 'security:read', projectScoped: true },
+  culkibo_digest_promotion: { minRole: 'developer', scope: 'deployments:write', projectScoped: true }
 });
 
 /**
@@ -4703,6 +4737,167 @@ class McpServer extends EventEmitter {
           },
           required: ['projectId']
         }
+      },
+      // --- MCP 2026 Cycle-15 Milestone (160 MCP Tools -90% Core!): SPIFFE-Lite mTLS, Feature Flags, AI Rate-Limit, Runtime Anomaly & Digest Promotion (+5 = 160) ---
+      {
+        name: 'culkibo_mtls_mesh',
+        title: 'Gestionar identidad Zero-Trust SPIFFE-Lite mTLS y certificados efímeros',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            certs: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'CA Zero-Trust SPIFFE-Lite Ed25519 (coolify#8524, dokploy#2605): emite certificados cortos (1..168h), verifica firmas/CRL (CERT_REVOKED/CERT_EXPIRED), revoca y compila políticas Caddy client_authentication sin exponer jamás la clave privada CA. init/issue/revoke exigen admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'init', 'issue', 'verify', 'revoke', 'compile_caddy'], description: 'Operación mTLS (default "list")' },
+            domain: { type: 'string', maxLength: 128, description: 'Trust domain SPIFFE para init (default "culkibo.internal")' },
+            serviceName: { type: 'string', maxLength: 80, description: 'Nombre del servicio para issue' },
+            namespace: { type: 'string', maxLength: 64, description: 'Namespace SPIFFE (default "prod")' },
+            ttlHours: { type: 'number', minimum: 1, maximum: 168, description: 'Validez del certificado en horas (1..168, default 24)' },
+            cert: { type: 'object', description: 'Descriptor de certificado para verify' },
+            signatureB64: { type: 'string', maxLength: 512, description: 'Firma Ed25519 base64 para verify' },
+            serial: { type: 'string', maxLength: 128, description: 'Número de serie del certificado para revoke' },
+            reason: { type: 'string', maxLength: 200, description: 'Motivo de revocación' },
+            includeRevoked: { type: 'boolean', description: 'Incluir certificados revocados en list' },
+            allowedSpiffeIds: { type: 'array', items: { type: 'string' }, description: 'IDs SPIFFE permitidos para compile_caddy' },
+            mode: { type: 'string', maxLength: 48, description: 'Modo Caddy client_authentication (default "require_and_verify")' },
+            nowMs: { type: 'number', minimum: 0, description: 'Timestamp epoch ms opcional para verificación determinista' },
+            dryRun: { type: 'boolean', description: 'En init/issue/revoke es true por defecto; pasa dryRun: false para aplicar.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_feature_flags',
+        title: 'Evaluar y gestionar Feature Flags declarativos con Kill-Switch instantáneo',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            flags: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Motor OpenFeature-Lite de Feature Flags con bucketing SHA-256 determinista (0..99.99%), allow/deny tenants y kill-switch instantáneo sin redeploy. kill/delete exigen admin; save/kill/delete usan dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'evaluate', 'save', 'kill', 'delete'], description: 'Operación de feature flags (default "list")' },
+            key: { type: 'string', maxLength: 128, description: 'Clave única del flag' },
+            flag: { type: 'object', description: 'Definición de flag (key, description, enabled, rolloutPct, environment, allowTenants, denyTenants, payload, salt) para save' },
+            subjectId: { type: 'string', maxLength: 128, description: 'ID del sujeto/usuario para bucketing en evaluate' },
+            tenantId: { type: 'string', maxLength: 128, description: 'ID de tenant opcional para allow/deny override en evaluate' },
+            environment: { type: 'string', maxLength: 64, description: 'Entorno objetivo (default "prod")' },
+            reason: { type: 'string', maxLength: 200, description: 'Motivo de kill-switch' },
+            dryRun: { type: 'boolean', description: 'En save/kill/delete es true por defecto; pasa dryRun: false para aplicar.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_api_ratelimit',
+        title: 'Compilar y simular Rate-Limits Edge RPM+TPM anti Denial-of-Wallet',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            policies: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Escudo Edge RPM + TPM contra Denial-of-Wallet en APIs de IA con cabeceras IETF RateLimit / RateLimit-Policy / 429 Retry-After, simulador de ráfagas y compilador Caddy. save exige admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'save', 'consume', 'simulate', 'compile_caddy'], description: 'Operación de rate-limit (default "list")' },
+            policyId: { type: 'string', maxLength: 128, description: 'ID de política de rate-limit' },
+            policy: { type: 'object', description: 'Definición de política (id, projectId, name, planTier, rpmLimit, tpmLimit, burstMultiplier, windowSec)' },
+            clientKey: { type: 'string', maxLength: 128, description: 'Clave de cliente/API para consume/simulate' },
+            tokens: { type: 'number', minimum: 0, description: 'Tokens LLM consumidos en la petición (para consume)' },
+            requestsCount: { type: 'integer', minimum: 1, maximum: 1000, description: 'Número de peticiones en simulate' },
+            tokensPerRequest: { type: 'number', minimum: 0, description: 'Tokens LLM por petición en simulate' },
+            intervalMs: { type: 'number', minimum: 0, description: 'Intervalo entre peticiones en ms para simulate' },
+            nowMs: { type: 'number', minimum: 0, description: 'Timestamp epoch ms opcional' },
+            dryRun: { type: 'boolean', description: 'En save es true por defecto; pasa dryRun: false para persistir.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_runtime_anomaly',
+        title: 'Detectar anomalías de runtime Falco-Lite (cryptominers, reverse shells, /etc/shadow)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            projectId: { type: 'string' },
+            anomalies: { type: 'array' },
+            inspection: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Detector Falco-Lite zero-dep de 10 reglas en tiempo real (dokploy#5156): detecta cryptominers xmrig/stratum, reverse shells /dev/tcp, curl|sh, acceso a /etc/shadow, ejecuciones en /tmp y sondeos a docker.sock. ACL estricto por proyecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'inspect'], description: 'Operación de detección de anomalías (default "list")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID del proyecto objetivo (ACL estricto)' },
+            containerName: { type: 'string', maxLength: 128, description: 'Nombre del contenedor inspeccionado' },
+            events: { type: 'array', description: 'Eventos de runtime a inspeccionar ({ type, cmd, port, path, user, privileged })' },
+            persist: { type: 'boolean', description: 'Persistir alertas detectadas en runtime-anomalies.json (default false en inspección RO)' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_digest_promotion',
+        title: 'Promover artefactos inmutables @sha256: con control dual entre entornos',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: 'string' },
+            promotions: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Pipeline GitOps estilo Kargo Freight (dokploy#2097, argo-cd#5290): prohíbe tags mutables :latest (MUTABLE_TAG_FORBIDDEN), verifica paridad de claves env (MISSING_TARGET_ENV_KEYS, cero valores secretos), exige control dual (DUAL_CONTROL_VIOLATION) y ofrece rollback atómico. ACL estricto por proyecto y dryRun: true por defecto en execute/rollback.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'create', 'approve', 'execute', 'rollback'], description: 'Operación de promoción inmutable (default "list")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID del proyecto objetivo (ACL estricto)' },
+            promoId: { type: 'string', maxLength: 128, description: 'ID de la promoción para approve/execute/rollback' },
+            imageRef: { type: 'string', maxLength: 512, description: 'Referencia OCI inmutable con @sha256:<64hex> para create' },
+            fromEnv: { type: 'string', maxLength: 48, description: 'Entorno origen (default "staging")' },
+            toEnv: { type: 'string', maxLength: 48, description: 'Entorno destino (default "prod")' },
+            sourceEnvKeys: { type: 'array', items: { type: 'string' }, description: 'Claves de env presentes en origen (solo nombres, nunca valores)' },
+            targetEnvKeys: { type: 'array', items: { type: 'string' }, description: 'Claves de env presentes en destino' },
+            requester: { type: 'string', maxLength: 128, description: 'Actor solicitante en create' },
+            approver: { type: 'string', maxLength: 128, description: 'Actor aprobador en approve (debe diferir de requester si dual-control)' },
+            actor: { type: 'string', maxLength: 128, description: 'Actor para rollback' },
+            comment: { type: 'string', maxLength: 240, description: 'Comentario de aprobación' },
+            requireDualControl: { type: 'boolean', description: 'Exigir aprobador distinto al solicitante (default true)' },
+            previousDigest: { type: 'string', maxLength: 512, description: 'Digest previo para rollback automático' },
+            dryRun: { type: 'boolean', description: 'En execute/rollback es true por defecto; pasa dryRun: false para aplicar.' }
+          },
+          required: ['projectId']
+        }
       }
     ];
 
@@ -6872,6 +7067,33 @@ class McpServer extends EventEmitter {
       }
     }
 
+    if (toolName === 'culkibo_mtls_mesh' && ['init', 'issue', 'revoke'].includes(String(args.action || ''))) {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', `La acción '${args.action}' de culkibo_mtls_mesh requiere rol admin/owner sin restricción de proyectos.`, {
+          retryable: false,
+          remediation: 'Usa action: "list", "verify" o "compile_caddy", o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_feature_flags' && (args.action === 'kill' || args.action === 'delete')) {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', `La acción '${args.action}' de culkibo_feature_flags requiere rol admin/owner sin restricción de proyectos.`, {
+          retryable: false,
+          remediation: 'Usa action: "list", "evaluate" o "save", o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_api_ratelimit' && args.action === 'save') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Guardar políticas Edge Rate-Limit (save) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "list", "consume", "simulate" o "compile_caddy", o autentícate como admin/owner.'
+        });
+      }
+    }
+
     // Aislamiento de equipo en argumentos explícitos (teamId y serverId) antes de dryRun
     if (principal.teamId && args.teamId && String(args.teamId) !== principal.teamId) {
       throw new McpToolError('FORBIDDEN', 'No tienes acceso al equipo especificado.', {
@@ -8052,6 +8274,75 @@ class McpServer extends EventEmitter {
           reversible = true;
         } else {
           effects.push(`Ejecutará '${action}' de Chaos GameDay sobre '${args.projectId || '?'}' sin mutar estado.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_mtls_mesh': {
+        const action = String(args.action || 'list');
+        Object.assign(target, { action, serviceName: args.serviceName || null, serial: args.serial || null, domain: args.domain || null });
+        if (action === 'issue') {
+          if (!args.serviceName) blockers.push('MISSING_SERVICE_NAME');
+          effects.push(`Emitirá certificado Ed25519 SPIFFE efímero (${args.ttlHours ?? 24}h) para '${args.serviceName || '?'}' sin exponer la clave privada CA.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'revoke') {
+          if (!args.serial) blockers.push('MISSING_CERT_SERIAL');
+          effects.push(`Revocará inmediatamente el certificado '${args.serial || '?'}' en la CRL mTLS.`);
+          riskLevel = 'high';
+          reversible = false;
+        } else {
+          effects.push(`Ejecutará '${action}' del servicio SPIFFE-Lite mTLS.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_feature_flags': {
+        const action = String(args.action || 'list');
+        Object.assign(target, { action, key: args.key || args.flag?.key || null });
+        if (action === 'kill' || action === 'delete') {
+          if (!args.key) blockers.push('MISSING_FLAG_KEY');
+          effects.push(`Ejecutará '${action}' sobre el feature flag '${args.key || '?'}' con efecto inmediato sin redeploy.`);
+          riskLevel = 'high';
+          reversible = action === 'kill';
+        } else {
+          effects.push(`Ejecutará '${action}' de feature flags.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_api_ratelimit': {
+        const action = String(args.action || 'list');
+        Object.assign(target, { action, policyId: args.policyId || args.policy?.id || null });
+        if (action === 'save') {
+          if (!args.policy || typeof args.policy !== 'object') blockers.push('MISSING_RATELIMIT_POLICY');
+          effects.push(`Guardarará la política RPM+TPM '${args.policy?.name || '(sin nombre)'}' en ratelimit-policies.json.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' del escudo RPM+TPM sin mutar políticas.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_digest_promotion': {
+        const action = String(args.action || 'list');
+        Object.assign(target, { action, projectId: args.projectId || null, promoId: args.promoId || null, imageRef: args.imageRef || null });
+        if (action === 'execute' || action === 'rollback') {
+          if (!args.promoId) blockers.push('MISSING_PROMO_ID');
+          effects.push(`Ejecutará '${action}' sobre la promoción inmutable '${args.promoId || '?'}' para '${args.projectId || '?'}'.`);
+          riskLevel = 'high';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' del pipeline de promociones inmutables @sha256:.`);
           riskLevel = 'low';
           reversible = true;
         }
@@ -12956,6 +13247,383 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_mtls_mesh': {
+          const mtlsSvc = requireLazySvc('mtlsMeshService', 'Zero-Trust SPIFFE-Lite mTLS Identity & Short-Lived Cert Lifecycle');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const rawC = mtlsSvc.listWorkloadCerts({ includeRevoked: Boolean(args.includeRevoked) });
+            const certs = Array.isArray(rawC) ? rawC : (Array.isArray(rawC?.certs) ? rawC.certs : []);
+            res = { ok: true, action: 'list', dryRun: false, certs, result: null };
+          } else if (action === 'init') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Inicializar trust domain mTLS requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const domain = String(args.domain || 'culkibo.internal');
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = { ok: true, action: 'init', dryRun: true, certs: [], result: { initialized: false, domain } };
+            } else {
+              const out = mtlsSvc.initTrustDomain(domain);
+              res = { ok: true, action: 'init', dryRun: false, certs: [], result: out };
+            }
+          } else if (action === 'issue') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Emitir certificados mTLS requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            if (!args.serviceName) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="issue" requiere serviceName.', {
+                retryable: true,
+                remediation: 'Pasa serviceName (ej. "payments-api"), namespace y ttlHours (1..168).'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                ok: true,
+                action: 'issue',
+                dryRun: true,
+                certs: [],
+                result: { issued: false, serviceName: String(args.serviceName), namespace: String(args.namespace || 'prod'), ttlHours: Number(args.ttlHours ?? 24) }
+              };
+            } else {
+              const out = mtlsSvc.issueWorkloadCert({
+                serviceName: String(args.serviceName),
+                namespace: args.namespace ? String(args.namespace) : 'prod',
+                ttlHours: args.ttlHours !== undefined ? Number(args.ttlHours) : 24,
+                ...(args.nowMs !== undefined ? { nowMs: Number(args.nowMs) } : {})
+              });
+              res = { ok: true, action: 'issue', dryRun: false, certs: [], result: out };
+            }
+          } else if (action === 'verify') {
+            if (!args.cert || !args.signatureB64) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="verify" requiere cert y signatureB64.', {
+                retryable: true,
+                remediation: 'Pasa el cert y signatureB64 devueltos por action="issue".'
+              });
+            }
+            const out = mtlsSvc.verifyWorkloadCert({
+              cert: args.cert,
+              signatureB64: String(args.signatureB64),
+              ...(args.nowMs !== undefined ? { nowMs: Number(args.nowMs) } : {})
+            });
+            res = { ok: Boolean(out && out.valid), action: 'verify', dryRun: false, certs: [], result: out };
+          } else if (action === 'revoke') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Revocar certificados mTLS requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            if (!args.serial) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="revoke" requiere serial.', {
+                retryable: true,
+                remediation: 'Lista certificados con action="list" y pasa serial.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = { ok: true, action: 'revoke', dryRun: true, certs: [], result: { revoked: false, serial: String(args.serial) } };
+            } else {
+              const out = mtlsSvc.revokeWorkloadCert(String(args.serial), {
+                reason: args.reason ? String(args.reason) : 'manual_revoke',
+                actor: String(principal.email || principal.userId || 'admin'),
+                ...(args.nowMs !== undefined ? { nowMs: Number(args.nowMs) } : {})
+              });
+              res = { ok: Boolean(out && out.ok !== false), action: 'revoke', dryRun: false, certs: [], result: out };
+            }
+          } else {
+            // action === 'compile_caddy'
+            const out = mtlsSvc.compileCaddyMtlsPolicy({
+              allowedSpiffeIds: Array.isArray(args.allowedSpiffeIds) ? args.allowedSpiffeIds.map(String) : [],
+              mode: args.mode ? String(args.mode) : 'require_and_verify'
+            });
+            res = { ok: true, action: 'compile_caddy', dryRun: false, certs: [], result: out };
+          }
+          break;
+        }
+
+        case 'culkibo_feature_flags': {
+          const flagSvc = requireLazySvc('featureFlagService', 'Native OpenFeature-Lite Declarative Feature Flags & Instant Kill-Switch');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const rawF = flagSvc.listFlags();
+            const flags = Array.isArray(rawF) ? rawF : (Array.isArray(rawF?.flags) ? rawF.flags : []);
+            res = { ok: true, action: 'list', dryRun: false, flags, result: null };
+          } else if (action === 'evaluate') {
+            const key = String(args.key || '').trim();
+            if (!key) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="evaluate" requiere key.', {
+                retryable: true,
+                remediation: 'Lista flags con action="list" y pasa key y subjectId.'
+              });
+            }
+            const out = flagSvc.evaluateFlag({
+              key,
+              subjectId: String(args.subjectId || principal.userId || 'anon'),
+              tenantId: args.tenantId ? String(args.tenantId) : null,
+              environment: args.environment ? String(args.environment) : 'prod'
+            });
+            res = { ok: true, action: 'evaluate', dryRun: false, flags: [], result: out };
+          } else if (action === 'save') {
+            const payload = args.flag && typeof args.flag === 'object' ? args.flag : (args.key ? { key: String(args.key) } : null);
+            if (!payload || !payload.key) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="save" requiere flag: { key, ... }.', {
+                retryable: true,
+                remediation: 'Pasa flag con key, enabled, rolloutPct, allowTenants/denyTenants (dryRun: true por defecto).'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = { ok: true, action: 'save', dryRun: true, flags: [], result: { saved: false, wouldSave: { key: String(payload.key) } } };
+            } else {
+              const saved = flagSvc.saveFlag(payload);
+              res = { ok: true, action: 'save', dryRun: false, flags: [], result: { saved: true, flag: saved } };
+            }
+          } else if (action === 'kill') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Activar el kill-switch de feature flags requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const key = String(args.key || '').trim();
+            if (!key) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="kill" requiere key.', {
+                retryable: true,
+                remediation: 'Pasa la clave key del flag a desactivar inmediatamente.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = { ok: true, action: 'kill', dryRun: true, flags: [], result: { killed: false, key } };
+            } else {
+              const killed = flagSvc.killFlag(key, {
+                reason: args.reason ? String(args.reason) : 'emergency_kill',
+                actor: String(principal.email || principal.userId || 'admin')
+              });
+              res = { ok: true, action: 'kill', dryRun: false, flags: [], result: { killed: true, flag: killed } };
+            }
+          } else {
+            // action === 'delete'
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Eliminar feature flags requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const key = String(args.key || '').trim();
+            if (!key) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="delete" requiere key.', {
+                retryable: true,
+                remediation: 'Pasa la clave key del flag a eliminar.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = { ok: true, action: 'delete', dryRun: true, flags: [], result: { deleted: false, key } };
+            } else {
+              const del = flagSvc.deleteFlag(key);
+              res = { ok: true, action: 'delete', dryRun: false, flags: [], result: del };
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_api_ratelimit': {
+          const rlSvc = requireLazySvc('apiRateLimitService', 'Edge API Rate-Limit & AI Wallet-Drain Shield');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const rawP = rlSvc.listRateLimitPolicies();
+            const policies = Array.isArray(rawP) ? rawP : (Array.isArray(rawP?.policies) ? rawP.policies : []);
+            res = { ok: true, action: 'list', dryRun: false, policies, result: null };
+          } else if (action === 'save') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Guardar políticas Rate-Limit requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            if (!args.policy || typeof args.policy !== 'object' || Array.isArray(args.policy)) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="save" requiere policy.', {
+                retryable: true,
+                remediation: 'Pasa policy: { name, planTier, rpmLimit, tpmLimit } (dryRun: true por defecto).'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = { ok: true, action: 'save', dryRun: true, policies: [], result: { saved: false, wouldSave: { name: String(args.policy.name || '') } } };
+            } else {
+              const saved = rlSvc.saveRateLimitPolicy(args.policy);
+              res = { ok: true, action: 'save', dryRun: false, policies: [], result: { saved: true, policy: saved } };
+            }
+          } else if (action === 'consume') {
+            if (!args.policyId || !args.clientKey) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="consume" requiere policyId y clientKey.', {
+                retryable: true,
+                remediation: 'Lista políticas con action="list" y pasa policyId, clientKey y tokens opcional.'
+              });
+            }
+            const out = rlSvc.consumeTokenBucket({
+              policyId: String(args.policyId),
+              clientKey: String(args.clientKey),
+              tokens: args.tokens !== undefined ? Number(args.tokens) : 0,
+              ...(args.nowMs !== undefined ? { nowMs: Number(args.nowMs) } : {})
+            });
+            res = { ok: Boolean(out && out.allowed), action: 'consume', dryRun: false, policies: [], result: out };
+          } else if (action === 'simulate') {
+            if (!args.policyId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="simulate" requiere policyId.', {
+                retryable: true,
+                remediation: 'Pasa policyId junto a requestsCount y tokensPerRequest.'
+              });
+            }
+            const out = rlSvc.simulateBurst({
+              policyId: String(args.policyId),
+              requestsCount: args.requestsCount !== undefined ? Number(args.requestsCount) : 20,
+              tokensPerRequest: args.tokensPerRequest !== undefined ? Number(args.tokensPerRequest) : 5000,
+              intervalMs: args.intervalMs !== undefined ? Number(args.intervalMs) : 50,
+              ...(args.clientKey ? { clientKey: String(args.clientKey) } : {}),
+              ...(args.nowMs !== undefined ? { startMs: Number(args.nowMs) } : {})
+            });
+            res = { ok: true, action: 'simulate', dryRun: false, policies: [], result: out };
+          } else {
+            // action === 'compile_caddy'
+            const pol = args.policy && typeof args.policy === 'object'
+              ? args.policy
+              : (rlSvc.listRateLimitPolicies().find((p) => p && p.id === String(args.policyId || '')) || null);
+            if (!pol) {
+              throw new McpToolError('POLICY_NOT_FOUND', 'Política Rate-Limit no encontrada para compilar a Caddy.', {
+                retryable: true,
+                remediation: 'Pasa un objeto policy o un policyId existente de action="list".'
+              });
+            }
+            const compiled = rlSvc.compileCaddyRateLimitConfig(pol);
+            res = { ok: true, action: 'compile_caddy', dryRun: false, policies: [], result: compiled };
+          }
+          break;
+        }
+
+        case 'culkibo_runtime_anomaly': {
+          const anomSvc = requireLazySvc('runtimeAnomalyService', 'Falco-Lite Container Runtime Anomaly Detector');
+          const action = String(args.action || 'list');
+          const pid = String(args.projectId || '').trim();
+          if (!pid) {
+            throw new McpToolError('MISSING_ARGUMENT', 'culkibo_runtime_anomaly requiere projectId.', {
+              retryable: true,
+              remediation: 'Indica projectId obtenido de culkibo_list_projects.'
+            });
+          }
+          if (!principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a las anomalías de runtime del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'inspect') {
+            const inspection = anomSvc.inspectRuntimeEvents({
+              projectId: pid,
+              containerName: args.containerName ? String(args.containerName) : 'app',
+              events: Array.isArray(args.events) ? args.events : [],
+              persist: Boolean(args.persist)
+            });
+            res = { ok: Boolean(inspection && inspection.clean), action: 'inspect', projectId: pid, anomalies: [], inspection };
+          } else {
+            const rawA = anomSvc.listAnomalies(pid);
+            const anomalies = Array.isArray(rawA) ? rawA : (Array.isArray(rawA?.anomalies) ? rawA.anomalies : []);
+            res = { ok: true, action: 'list', projectId: pid, anomalies, inspection: null };
+          }
+          break;
+        }
+
+        case 'culkibo_digest_promotion': {
+          const promoSvc = requireLazySvc('digestPromotionService', 'Immutable Digest Multi-Env GitOps Promotion Pipeline');
+          const action = String(args.action || 'list');
+          const pid = String(args.projectId || '').trim();
+          if (!pid) {
+            throw new McpToolError('MISSING_ARGUMENT', 'culkibo_digest_promotion requiere projectId.', {
+              retryable: true,
+              remediation: 'Indica projectId obtenido de culkibo_list_projects.'
+            });
+          }
+          if (!principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a promociones de digest del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+
+          if (action === 'list') {
+            const rawP = promoSvc.listPromotions(pid);
+            const promotions = Array.isArray(rawP) ? rawP : (Array.isArray(rawP?.promotions) ? rawP.promotions : []);
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, promotions, result: null };
+          } else if (action === 'create') {
+            if (!args.imageRef) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="create" requiere imageRef con digest @sha256:<64hex>.', {
+                retryable: true,
+                remediation: 'Pasa imageRef inmutable (ej. ghcr.io/org/app@sha256:...).'
+              });
+            }
+            const out = promoSvc.createPromotion({
+              projectId: pid,
+              imageRef: String(args.imageRef),
+              fromEnv: args.fromEnv ? String(args.fromEnv) : 'staging',
+              toEnv: args.toEnv ? String(args.toEnv) : 'prod',
+              sourceEnvKeys: Array.isArray(args.sourceEnvKeys) ? args.sourceEnvKeys.map(String) : [],
+              targetEnvKeys: Array.isArray(args.targetEnvKeys) ? args.targetEnvKeys.map(String) : [],
+              requester: String(args.requester || principal.email || principal.userId || 'dev-requester'),
+              requireDualControl: args.requireDualControl !== false,
+              previousDigest: args.previousDigest ? String(args.previousDigest) : null
+            });
+            res = { ok: Boolean(out && out.ok !== false), action: 'create', dryRun: false, projectId: pid, promotions: [], result: out };
+          } else if (action === 'approve') {
+            if (!args.promoId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="approve" requiere promoId.', {
+                retryable: true,
+                remediation: 'Lista promociones con action="list" y pasa promoId y approver.'
+              });
+            }
+            const out = promoSvc.approvePromotion(String(args.promoId), {
+              approver: String(args.approver || principal.email || principal.userId || 'approver'),
+              comment: args.comment ? String(args.comment) : ''
+            });
+            res = { ok: Boolean(out && out.ok !== false), action: 'approve', dryRun: false, projectId: pid, promotions: [], result: out };
+          } else if (action === 'execute') {
+            if (!args.promoId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="execute" requiere promoId.', {
+                retryable: true,
+                remediation: 'Pasa promoId de una promoción aprobada.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const out = promoSvc.executePromotion(String(args.promoId), { dryRun });
+            res = { ok: Boolean(out && out.ok !== false), action: 'execute', dryRun, projectId: pid, promotions: [], result: out };
+          } else {
+            // action === 'rollback'
+            if (!args.promoId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="rollback" requiere promoId.', {
+                retryable: true,
+                remediation: 'Pasa promoId para revertir a previousDigest.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const out = promoSvc.rollbackPromotion(String(args.promoId), {
+              actor: String(args.actor || principal.email || principal.userId || 'admin'),
+              dryRun
+            });
+            res = { ok: Boolean(out && out.ok !== false), action: 'rollback', dryRun, projectId: pid, promotions: [], result: out };
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -13939,7 +14607,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 155 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), Policy-as-Code Admission de 10 reglas CIS/PSS (culkibo_admission_check), expedientes SOC2/ISO27001/GDPR firmados Ed25519 (culkibo_compliance_bundle), planificador de migración stateful cross-VPS en 4 fases (culkibo_volume_migrate), Geo-Routing y A/B sticky en Caddy v2.11 (culkibo_edge_experiment), scorecard ejecutivo de seguridad (culkibo_security_posture), flujos sintéticos multi-paso y sonda TLS/SNI (culkibo_synthetic_sentinel), linter SQL zero-downtime de 10 reglas DDL (culkibo_lint_sql_migration), autoscaler de workers OOM-safe y circuit breaker 503 (culkibo_worker_autoscaler), auditor de licencias SPDX CycloneDX 1.6 (culkibo_audit_licenses), perfiles OCI seccomp mínimos y guardia runc CVE (culkibo_seccomp_profile), auditor de bloat/secretos en capas OCI (culkibo_audit_image_bloat), leases distribuidos de Cron con fencing tokens (culkibo_cron_lease), enmascarador determinista PII para PR-Preview + pg_anonymizer (culkibo_mask_preview_pii), clasificador forense OOM/Exit-Code de 8 clases (culkibo_oom_forensics), enrutador On-Call con dedup y amortiguación de flapping (culkibo_oncall_router), auditor de egress y drift DOCKER-USER/nftables (culkibo_egress_firewall), failover Blue/Green de réplicas DB con fencing anti split-brain (culkibo_replica_failover), puerta pre-despliegue de secretos por entropía de Shannon (culkibo_secret_gate), planificador multi-arch amd64/arm64 OCI (culkibo_multiarch_planner), simulador Chaos Engineering GameDay con auto-abort (culkibo_chaos_gameday), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 160 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), Policy-as-Code Admission de 10 reglas CIS/PSS (culkibo_admission_check), expedientes SOC2/ISO27001/GDPR firmados Ed25519 (culkibo_compliance_bundle), planificador de migración stateful cross-VPS en 4 fases (culkibo_volume_migrate), Geo-Routing y A/B sticky en Caddy v2.11 (culkibo_edge_experiment), scorecard ejecutivo de seguridad (culkibo_security_posture), flujos sintéticos multi-paso y sonda TLS/SNI (culkibo_synthetic_sentinel), linter SQL zero-downtime de 10 reglas DDL (culkibo_lint_sql_migration), autoscaler de workers OOM-safe y circuit breaker 503 (culkibo_worker_autoscaler), auditor de licencias SPDX CycloneDX 1.6 (culkibo_audit_licenses), perfiles OCI seccomp mínimos y guardia runc CVE (culkibo_seccomp_profile), auditor de bloat/secretos en capas OCI (culkibo_audit_image_bloat), leases distribuidos de Cron con fencing tokens (culkibo_cron_lease), enmascarador determinista PII para PR-Preview + pg_anonymizer (culkibo_mask_preview_pii), clasificador forense OOM/Exit-Code de 8 clases (culkibo_oom_forensics), enrutador On-Call con dedup y amortiguación de flapping (culkibo_oncall_router), auditor de egress y drift DOCKER-USER/nftables (culkibo_egress_firewall), failover Blue/Green de réplicas DB con fencing anti split-brain (culkibo_replica_failover), puerta pre-despliegue de secretos por entropía de Shannon (culkibo_secret_gate), planificador multi-arch amd64/arm64 OCI (culkibo_multiarch_planner), simulador Chaos Engineering GameDay con auto-abort (culkibo_chaos_gameday), CA Zero-Trust SPIFFE-Lite mTLS (culkibo_mtls_mesh), Feature Flags con kill-switch instantáneo (culkibo_feature_flags), escudo Edge API Rate-Limit RPM+TPM anti Denial-of-Wallet (culkibo_api_ratelimit), detector Falco-Lite de anomalías/cryptominers (culkibo_runtime_anomaly), promociones GitOps inmutables @sha256: con control dual (culkibo_digest_promotion), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

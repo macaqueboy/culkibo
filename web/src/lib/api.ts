@@ -5634,6 +5634,229 @@ export const api = {
     }
     throw new Error(data?.error || data?.message || 'Chaos GameDay simulation failed');
   },
+
+  // --- Cycle-15: Zero-Trust SPIFFE mTLS, Edge AI Rate-Limit (RPM+TPM), Feature Flags, Runtime Anomaly, Digest Promotion ---
+
+  async listMtlsCerts(includeRevoked = true): Promise<{
+    ok?: boolean;
+    certs: MtlsCertRecord[];
+    trustDomain?: string;
+    caddyClientAuth?: Record<string, unknown>;
+    caPublicKeyPem?: string;
+  }> {
+    const qs = includeRevoked ? '?includeRevoked=1' : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/mtls/certs${qs}`),
+      'Could not load mTLS workload certificates'
+    );
+  },
+
+  async issueMtlsCert(payload: {
+    serviceName: string;
+    namespace?: string;
+    ttlHours?: number;
+  }): Promise<{ ok?: boolean; cert: MtlsCertRecord; signatureB64: string; caddyClientAuth?: Record<string, unknown> }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/mtls/issue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not issue short-lived mTLS certificate'
+    );
+  },
+
+  async verifyMtlsCert(payload: {
+    cert: MtlsCertRecord;
+    signatureB64: string;
+  }): Promise<MtlsVerifyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/mtls/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not verify mTLS certificate'
+    );
+  },
+
+  async revokeMtlsCert(serial: string, reason = 'manual_revoke'): Promise<{ ok?: boolean; revoked?: boolean; cert?: MtlsCertRecord; serial?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/mtls/revoke/${encodeURIComponent(serial)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      }),
+      'Could not revoke mTLS certificate'
+    );
+  },
+
+  async listEdgeRateLimits(): Promise<{ ok?: boolean; policies: RateLimitPolicyRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/ratelimits`),
+      'Could not load edge rate-limit policies'
+    );
+  },
+
+  async saveEdgeRateLimit(payload: {
+    id?: string;
+    projectId?: string;
+    name: string;
+    planTier?: 'free' | 'pro' | 'enterprise';
+    rpmLimit?: number;
+    tpmLimit?: number;
+    burstMultiplier?: number;
+    windowSec?: number;
+  }): Promise<{ ok?: boolean; policy: RateLimitPolicyRecord }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/ratelimits`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not save rate-limit policy'
+    );
+  },
+
+  async simulateEdgeRateLimit(payload: {
+    policyId?: string;
+    requestsCount?: number;
+    tokensPerRequest?: number;
+    intervalMs?: number;
+    clientKey?: string;
+  }): Promise<RateLimitSimulateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/ratelimits/simulate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Rate-limit simulation failed'
+    );
+  },
+
+  async listFeatureFlags(): Promise<{ ok?: boolean; flags: FeatureFlagRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/flags`),
+      'Could not load feature flags'
+    );
+  },
+
+  async saveFeatureFlag(payload: Partial<FeatureFlagRecord> & { key: string }): Promise<{ ok?: boolean; flag: FeatureFlagRecord }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/flags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not save feature flag'
+    );
+  },
+
+  async evaluateFeatureFlag(
+    key: string,
+    payload: { subjectId: string; tenantId?: string | null; environment?: string }
+  ): Promise<FeatureFlagEvalResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/flags/${encodeURIComponent(key)}/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not evaluate feature flag'
+    );
+  },
+
+  async killFeatureFlag(key: string, reason = 'emergency_kill'): Promise<{ ok?: boolean; flag?: FeatureFlagRecord; killed?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/flags/${encodeURIComponent(key)}/kill`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      }),
+      'Could not trigger feature flag kill-switch'
+    );
+  },
+
+  async inspectProjectAnomalies(
+    projectId: string,
+    payload: { containerName?: string; events: Array<Record<string, unknown>>; persist?: boolean }
+  ): Promise<RuntimeAnomalyInspectResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/anomalies/inspect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Runtime anomaly inspection failed'
+    );
+  },
+
+  async listProjectPromotions(projectId: string): Promise<{ ok?: boolean; promotions: DigestPromotionRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/promotions`),
+      'Could not load digest promotions'
+    );
+  },
+
+  async createProjectPromotion(
+    projectId: string,
+    payload: {
+      imageRef: string;
+      fromEnv?: string;
+      toEnv?: string;
+      sourceEnvKeys?: string[];
+      targetEnvKeys?: string[];
+      requester: string;
+      requireDualControl?: boolean;
+      previousDigest?: string | null;
+    }
+  ): Promise<DigestPromotionActionResult> {
+    const res = await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/promotions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.code === 'MUTABLE_TAG_FORBIDDEN' || data?.code === 'MISSING_TARGET_ENV_KEYS' || data?.blocked === true) {
+      return data as DigestPromotionActionResult;
+    }
+    throw new Error(data?.error || data?.message || 'Could not create digest promotion');
+  },
+
+  async approveProjectPromotion(
+    projectId: string,
+    promoId: string,
+    payload: { approver: string; comment?: string }
+  ): Promise<DigestPromotionActionResult> {
+    const res = await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/promotions/${encodeURIComponent(promoId)}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.code === 'DUAL_CONTROL_VIOLATION' || data?.blocked === true) {
+      return data as DigestPromotionActionResult;
+    }
+    throw new Error(data?.error || data?.message || 'Could not approve digest promotion');
+  },
+
+  async executeProjectPromotion(
+    projectId: string,
+    promoId: string,
+    payload: { dryRun?: boolean } = { dryRun: true }
+  ): Promise<DigestPromotionActionResult> {
+    const res = await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/promotions/${encodeURIComponent(promoId)}/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun: true, ...payload }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.code === 'APPROVAL_REQUIRED' || data?.blocked === true) {
+      return data as DigestPromotionActionResult;
+    }
+    throw new Error(data?.error || data?.message || 'Could not execute digest promotion');
+  },
 };
 
 // =====================================================================
@@ -7457,5 +7680,116 @@ export interface ChaosGameDayResult {
   observedErrorRatePct?: number;
   p95LatencyMs?: number;
   recoverySec?: number;
+  dryRun?: boolean;
+}
+
+// --- Cycle-15 Zero-Trust mTLS, Edge AI Rate-Limit, Feature Flags, Runtime Anomaly & Digest Promotion Types ---
+
+export interface MtlsCertRecord {
+  serial: string;
+  spiffeId: string;
+  serviceName?: string;
+  namespace?: string;
+  issuedAt?: string;
+  expiresAt?: string;
+  ttlHours?: number;
+  revoked?: boolean;
+  revokedReason?: string | null;
+  signatureB64?: string;
+}
+
+export interface MtlsVerifyResult {
+  ok?: boolean;
+  valid: boolean;
+  code: string;
+  spiffeId?: string;
+  serial?: string;
+  remainingMs?: number;
+}
+
+export interface RateLimitPolicyRecord {
+  id: string;
+  projectId?: string;
+  name: string;
+  planTier: 'free' | 'pro' | 'enterprise' | string;
+  rpmLimit: number;
+  tpmLimit: number;
+  burstMultiplier?: number;
+  windowSec?: number;
+}
+
+export interface RateLimitSimulateResult {
+  ok?: boolean;
+  policyId?: string;
+  totalRequests: number;
+  allowedCount: number;
+  throttledCount: number;
+  first429AtIndex?: number | null;
+  throttleReason?: string | null;
+  estimatedWalletSavedUsd?: number;
+  sample429Headers?: Record<string, string>;
+  caddyConfig?: Record<string, unknown>;
+}
+
+export interface FeatureFlagRecord {
+  key: string;
+  description?: string;
+  enabled: boolean;
+  killed?: boolean;
+  rolloutPct: number;
+  environment?: string;
+  allowTenants?: string[];
+  denyTenants?: string[];
+}
+
+export interface FeatureFlagEvalResult {
+  ok?: boolean;
+  key: string;
+  enabled: boolean;
+  reason: string;
+  bucket?: number;
+  variant?: string;
+}
+
+export type RuntimeAnomalyAlertItem = string | {
+  ruleId?: string;
+  severity?: string;
+  message?: string;
+  evidence?: string;
+};
+
+export interface RuntimeAnomalyInspectResult {
+  ok?: boolean;
+  projectId?: string;
+  containerName?: string;
+  clean: boolean;
+  riskScore: number;
+  criticalCount?: number;
+  highCount?: number;
+  alerts?: RuntimeAnomalyAlertItem[];
+  recommendedAction?: string;
+}
+
+export interface DigestPromotionRecord {
+  id: string;
+  projectId?: string;
+  imageRef: string;
+  fromEnv: string;
+  toEnv: string;
+  requester: string;
+  approver?: string | null;
+  status: string;
+  previousDigest?: string | null;
+  rollbackManifest?: Record<string, unknown>;
+}
+
+export interface DigestPromotionActionResult {
+  ok?: boolean;
+  blocked?: boolean;
+  code?: string;
+  message?: string;
+  error?: string;
+  promotion?: DigestPromotionRecord;
+  rollbackManifest?: Record<string, unknown>;
   dryRun?: boolean;
 }

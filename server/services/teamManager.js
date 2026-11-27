@@ -4144,6 +4144,41 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:write');
     }
 
+    // Cycle-15: Zero-Trust SPIFFE-Lite mTLS, OpenFeature Flags, Edge AI Rate-Limit Shield, Falco-Lite Anomalies & Immutable Digest Promotions
+    if (p === '/api/security/mtls/certs') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/security/mtls/issue' || /^\/api\/security\/mtls\/revoke\/[^/]+$/.test(p)) {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/security/mtls/verify') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/flags') {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+    if (/^\/api\/flags\/[^/]+\/evaluate$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (/^\/api\/flags\/[^/]+\/kill$/.test(p) || (m === 'DELETE' && /^\/api\/flags\/[^/]+$/.test(p))) {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/edge/ratelimits') {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'team:write');
+    }
+    if (p === '/api/edge/ratelimits/simulate') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/anomalies$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (/^\/api\/projects\/[^/]+\/anomalies\/inspect$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/promotions(?:\/[^/]+\/(?:approve|execute|rollback))?$/.test(p)) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

@@ -121,6 +121,11 @@ function getReplicaFailoverService() { return _lazyV2.replicas || (_lazyV2.repli
 function getPreDeploySecretGate() { return _lazyV2.secretgate || (_lazyV2.secretgate = require('../services/preDeploySecretGate')); }
 function getMultiArchPlannerService() { return _lazyV2.multiarch || (_lazyV2.multiarch = require('../services/multiArchPlannerService')); }
 function getChaosGameDayService() { return _lazyV2.chaos || (_lazyV2.chaos = require('../services/chaosGameDayService')); }
+function getMtlsMeshService() { return _lazyV2.mtls || (_lazyV2.mtls = require('../services/mtlsMeshService')); }
+function getFeatureFlagService() { return _lazyV2.flags || (_lazyV2.flags = require('../services/featureFlagService')); }
+function getApiRateLimitService() { return _lazyV2.ratelimit || (_lazyV2.ratelimit = require('../services/apiRateLimitService')); }
+function getRuntimeAnomalyService() { return _lazyV2.anomaly || (_lazyV2.anomaly = require('../services/runtimeAnomalyService')); }
+function getDigestPromotionService() { return _lazyV2.promotion || (_lazyV2.promotion = require('../services/digestPromotionService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -9181,6 +9186,301 @@ router.post('/projects/:id/chaos/simulate', heavyOpLimiter, async (req, res) => 
       return res.status(400).json(out);
     }
     res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #15 MILESTONE LAZY ROUTES (160 MCP Tools -90% Core & 68 Suites — 0 boot RAM impact) ---
+
+// 1. Zero-Trust SPIFFE-Lite mTLS Identity CA & Short-Lived Cert Lifecycle (`coolify#8524`, `dokploy#2605`)
+router.get('/security/mtls/certs', async (req, res) => {
+  try {
+    const svc = getMtlsMeshService();
+    const includeRevoked = req.query.includeRevoked === 'true' || req.query.includeRevoked === '1';
+    const raw = await svc.listWorkloadCerts({ includeRevoked });
+    const certs = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.certs) ? raw.certs : []);
+    let caddyPolicy = null;
+    try {
+      const activeSpiffeIds = certs.filter((c) => c && !c.revoked && c.spiffeId).map((c) => c.spiffeId);
+      caddyPolicy = await svc.compileCaddyMtlsPolicy({ allowedSpiffeIds: activeSpiffeIds, mode: 'require_and_verify' });
+    } catch (e) {}
+    res.json({ ok: true, count: certs.length, certs, caddyPolicy });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/mtls/issue', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden emitir certificados mTLS', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'emitir certificados de la CA mTLS global')) return;
+    const out = await getMtlsMeshService().issueWorkloadCert(req.body || {});
+    res.status(201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/mtls/verify', async (req, res) => {
+  try {
+    const out = await getMtlsMeshService().verifyWorkloadCert(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/mtls/revoke/:serial', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden revocar certificados mTLS', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'revocar certificados de la CA mTLS global')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor } = getAuditActor(req);
+    const actorLabel = (typeof body.actor === 'string' && body.actor.trim())
+      ? body.actor.trim()
+      : ((actor && (actor.email || actor.userId || actor.role)) || 'admin');
+    const out = await getMtlsMeshService().revokeWorkloadCert(req.params.serial, {
+      reason: typeof body.reason === 'string' ? body.reason : 'manual_revoke',
+      actor: String(actorLabel),
+      nowMs: body.nowMs !== undefined ? Number(body.nowMs) : undefined
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Native Declarative Feature Flags & Instant Kill-Switch (OpenFeature / Unleash / Flagsmith DNA)
+router.get('/flags', async (_req, res) => {
+  try {
+    const raw = await getFeatureFlagService().listFlags();
+    const flags = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.flags) ? raw.flags : []);
+    res.json({ ok: true, count: flags.length, flags });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/flags', async (req, res) => {
+  try {
+    const out = await getFeatureFlagService().saveFlag(req.body || {});
+    res.status(201).json(out && out.flag ? out : { ok: true, flag: out });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/flags/:key/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getFeatureFlagService().evaluateFlag({
+      ...body,
+      key: req.params.key
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/flags/:key/kill', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden activar el kill-switch de feature flags', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor } = getAuditActor(req);
+    const actorLabel = (typeof body.actor === 'string' && body.actor.trim())
+      ? body.actor.trim()
+      : ((actor && (actor.email || actor.userId || actor.role)) || 'admin');
+    const out = await getFeatureFlagService().killFlag(req.params.key, {
+      reason: typeof body.reason === 'string' ? body.reason : 'emergency_kill',
+      actor: String(actorLabel)
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/flags/:key', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden eliminar feature flags', code: 'FORBIDDEN' });
+    }
+    const out = await getFeatureFlagService().deleteFlag(req.params.key);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Edge API Rate-Limit & AI Wallet-Drain Shield (Dual RPM + TPM, IETF RateLimit Headers)
+router.get('/edge/ratelimits', async (_req, res) => {
+  try {
+    const svc = getApiRateLimitService();
+    const raw = await svc.listRateLimitPolicies();
+    const policies = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.policies) ? raw.policies : []);
+    res.json({ ok: true, count: policies.length, presets: svc.PLAN_PRESETS || {}, policies });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/ratelimits', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden gestionar políticas de rate-limit', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const policy = await getApiRateLimitService().saveRateLimitPolicy(body);
+    res.status(201).json({ ok: true, policy });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/ratelimits/simulate', heavyOpLimiter, async (req, res) => {
+  try {
+    const out = await getApiRateLimitService().simulateBurst(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Falco-Lite Container Runtime Anomaly Detector (`dokploy#5156` Cryptominer / Reverse Shell)
+router.get('/projects/:id/anomalies', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const raw = await getRuntimeAnomalyService().listAnomalies(req.params.id);
+    const anomalies = Array.isArray(raw)
+      ? raw
+      : (Array.isArray(raw && raw.anomalies) ? raw.anomalies : (Array.isArray(raw && raw.alerts) ? raw.alerts : []));
+    res.json({ ok: true, projectId: req.params.id, count: anomalies.length, anomalies });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/projects/:id/anomalies/inspect', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getRuntimeAnomalyService().inspectRuntimeEvents({
+      ...body,
+      projectId: req.params.id
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Immutable Digest Multi-Env GitOps Promotion Pipeline (`dokploy#2097`, Kargo Freight)
+router.get('/projects/:id/promotions', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const raw = await getDigestPromotionService().listPromotions(req.params.id);
+    const promotions = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.promotions) ? raw.promotions : []);
+    res.json({ ok: true, projectId: req.params.id, count: promotions.length, promotions });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/projects/:id/promotions', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor } = getAuditActor(req);
+    const requester = (typeof body.requester === 'string' && body.requester.trim())
+      ? body.requester.trim()
+      : ((actor && (actor.email || actor.userId || actor.role)) || 'operator');
+    const out = await getDigestPromotionService().createPromotion({
+      ...body,
+      projectId: req.params.id,
+      requester: String(requester)
+    });
+    res.status(out && out.ok === false ? (Number(out.status) || 400) : 201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/promotions/:promoId/approve', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const svc = getDigestPromotionService();
+    const projPromos = await svc.listPromotions(req.params.id);
+    const list = Array.isArray(projPromos) ? projPromos : (Array.isArray(projPromos && projPromos.promotions) ? projPromos.promotions : []);
+    if (!list.some((p) => p && p.id === req.params.promoId)) {
+      return res.status(404).json({ error: `Promoción ${req.params.promoId} no encontrada en el proyecto`, code: 'PROMOTION_NOT_FOUND' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor } = getAuditActor(req);
+    const approver = (typeof body.approver === 'string' && body.approver.trim())
+      ? body.approver.trim()
+      : ((actor && (actor.email || actor.userId || actor.role)) || 'approver');
+    const out = await svc.approvePromotion(req.params.promoId, {
+      approver: String(approver),
+      comment: typeof body.comment === 'string' ? body.comment : ''
+    });
+    res.status(out && out.ok === false ? (Number(out.status) || 400) : 200).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/promotions/:promoId/execute', heavyOpLimiter, async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const svc = getDigestPromotionService();
+    const projPromos = await svc.listPromotions(req.params.id);
+    const list = Array.isArray(projPromos) ? projPromos : (Array.isArray(projPromos && projPromos.promotions) ? projPromos.promotions : []);
+    if (!list.some((p) => p && p.id === req.params.promoId)) {
+      return res.status(404).json({ error: `Promoción ${req.params.promoId} no encontrada en el proyecto`, code: 'PROMOTION_NOT_FOUND' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await svc.executePromotion(req.params.promoId, {
+      dryRun: body.dryRun !== undefined ? Boolean(body.dryRun) : true
+    });
+    res.status(out && out.ok === false ? (Number(out.status) || 400) : 200).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/promotions/:promoId/rollback', heavyOpLimiter, async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const svc = getDigestPromotionService();
+    const projPromos = await svc.listPromotions(req.params.id);
+    const list = Array.isArray(projPromos) ? projPromos : (Array.isArray(projPromos && projPromos.promotions) ? projPromos.promotions : []);
+    if (!list.some((p) => p && p.id === req.params.promoId)) {
+      return res.status(404).json({ error: `Promoción ${req.params.promoId} no encontrada en el proyecto`, code: 'PROMOTION_NOT_FOUND' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor } = getAuditActor(req);
+    const actorLabel = (typeof body.actor === 'string' && body.actor.trim())
+      ? body.actor.trim()
+      : ((actor && (actor.email || actor.userId || actor.role)) || 'admin');
+    const out = await svc.rollbackPromotion(req.params.promoId, {
+      actor: String(actorLabel),
+      dryRun: body.dryRun !== undefined ? Boolean(body.dryRun) : true
+    });
+    res.status(out && out.ok === false ? (Number(out.status) || 400) : 200).json(out);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

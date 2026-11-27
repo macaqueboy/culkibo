@@ -39,6 +39,8 @@ import type {
   EdgeShieldStatusResult,
   EdgeShieldChallengeResult,
   EdgeExperimentRecord,
+  RateLimitPolicyRecord,
+  RateLimitSimulateResult,
 } from '../lib/api';
 import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
@@ -98,6 +100,12 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
   const [expBusyId, setExpBusyId] = useState<string | null>(null);
   const [expError, setExpError] = useState<string | null>(null);
   const [expPreviewId, setExpPreviewId] = useState<string | null>(null);
+  // Cycle-15 Edge API Rate-Limit & AI Wallet-Drain Shield (RPM + TPM)
+  const [rlPolicies, setRlPolicies] = useState<RateLimitPolicyRecord[]>([]);
+  const [rlSelectedTier, setRlSelectedTier] = useState<'free' | 'pro' | 'enterprise'>('pro');
+  const [rlSimResult, setRlSimResult] = useState<RateLimitSimulateResult | null>(null);
+  const [rlBusy, setRlBusy] = useState(false);
+  const [rlError, setRlError] = useState<string | null>(null);
   const [tunnelName, setTunnelName] = useState('');
   const [tunnelHost, setTunnelHost] = useState('127.0.0.1');
   const [tunnelPort, setTunnelPort] = useState('3000');
@@ -225,6 +233,46 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
     }
   }, [projectId]);
 
+  const handleSimulateAiBurst = async (overrideTier?: 'free' | 'pro' | 'enterprise') => {
+    const tier = overrideTier || rlSelectedTier;
+    if (overrideTier) setRlSelectedTier(overrideTier);
+    setRlBusy(true);
+    setRlError(null);
+    try {
+      let pol = rlPolicies.find((p) => p.planTier === tier) || rlPolicies[0];
+      if (!pol) {
+        const created = await api.saveEdgeRateLimit({
+          name: `${tier.toUpperCase()} AI API Shield`,
+          planTier: tier,
+          rpmLimit: tier === 'free' ? 30 : tier === 'pro' ? 120 : 600,
+          tpmLimit: tier === 'free' ? 15000 : tier === 'pro' ? 60000 : 300000,
+          burstMultiplier: 1.5,
+          windowSec: 60,
+        });
+        pol = created?.policy;
+        if (pol) setRlPolicies((prev) => [pol, ...prev]);
+      }
+      const res = await api.simulateEdgeRateLimit({
+        policyId: pol?.id || `rl_${tier}`,
+        requestsCount: 20,
+        tokensPerRequest: tier === 'enterprise' ? 25000 : 5000,
+        intervalMs: 50,
+        clientKey: 'tenant_burst_demo',
+      });
+      setRlSimResult(res);
+      onNotify?.(
+        `AI Burst Shield (${tier}): ${res.throttledCount}/${res.totalRequests} throttled (HTTP 429 · $${Number(res.estimatedWalletSavedUsd ?? 0).toFixed(2)} saved)`,
+        'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Rate-limit simulation failed';
+      setRlError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setRlBusy(false);
+    }
+  };
+
   useEffect(() => {
     let active = true;
     Promise.all([
@@ -236,8 +284,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       projectId ? Promise.resolve(null) : api.getEdgeTunnelStatus().catch(() => null),
       projectId ? Promise.resolve(null) : api.getEdgeShieldStatus().catch(() => null),
       api.listEdgeExperiments(projectId).catch(() => ({ experiments: [] })),
+      projectId ? Promise.resolve({ policies: [] }) : api.listEdgeRateLimits().catch(() => ({ policies: [] })),
     ])
-      .then(([domRes, certRes, fastIng, capsRes, projList, tunRes, shRes, expRes]) => {
+      .then(([domRes, certRes, fastIng, capsRes, projList, tunRes, shRes, expRes, rlRes]) => {
         if (!active) return;
         const list = domRes.domains || [];
         setDomains(list);
@@ -251,6 +300,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
         if (tunRes) setTunnelStatus(tunRes);
         if (shRes) setShieldStatus(shRes);
         if (expRes && Array.isArray(expRes.experiments)) setExperiments(expRes.experiments);
+        if (rlRes && Array.isArray(rlRes.policies)) setRlPolicies(rlRes.policies);
         setLoading(false);
         if (list.length > 0) {
           setProbingTls(true);
@@ -1660,6 +1710,114 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   </div>
                 );
               })}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Cycle-15: Edge API Rate-Limit & AI Wallet-Drain Shield (RPM + TPM) */}
+      {!projectId && (
+        <section className="p-5 rounded-2xl bg-white border border-slate-200 space-y-4 text-xs">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                <Zap className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('domains.rlTitle')}</h2>
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                    IETF RateLimit · 429 Retry-After
+                  </span>
+                </div>
+                <p className="text-slate-500 mt-0.5">{t('domains.rlDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+              <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[10px] font-mono">
+                {(['free', 'pro', 'enterprise'] as const).map((tier) => (
+                  <button
+                    key={tier}
+                    type="button"
+                    onClick={() => setRlSelectedTier(tier)}
+                    className={`px-2 py-1 rounded-md uppercase cursor-pointer ${
+                      rlSelectedTier === tier ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {tier}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                disabled={rlBusy}
+                onClick={() => void handleSimulateAiBurst()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {rlBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                <span>{rlBusy ? t('domains.rlSimulating') : t('domains.rlSimBtn')}</span>
+              </button>
+            </div>
+          </div>
+
+          {rlPolicies.length > 0 && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 font-mono text-[11px] tabular-nums">
+              {rlPolicies.slice(0, 3).map((pol) => (
+                <div
+                  key={pol.id}
+                  className={`p-3 rounded-xl border space-y-1 ${
+                    rlSelectedTier === pol.planTier ? 'bg-white border-slate-900' : 'bg-slate-50 border-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-slate-900 uppercase">{pol.planTier}</span>
+                    <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-700 text-[10px]">
+                      {pol.rpmLimit} RPM
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-slate-500">
+                    TPM cap: {Number(pol.tpmLimit).toLocaleString()} tok/min · burst {pol.burstMultiplier ?? 1.5}×
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {rlError && (
+            <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{rlError}</div>
+          )}
+
+          {rlSimResult && (
+            <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+              <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="px-2.5 py-0.5 rounded-full bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                    HTTP 429 · Retry-After: {rlSimResult.sample429Headers?.['Retry-After'] || '60'}s
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    allowed: {rlSimResult.allowedCount} · throttled: {rlSimResult.throttledCount}/{rlSimResult.totalRequests}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                    Wallet Saved: ${Number(rlSimResult.estimatedWalletSavedUsd ?? 0).toFixed(2)}
+                  </span>
+                  {rlSimResult.throttleReason && (
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                      {rlSimResult.throttleReason}
+                    </span>
+                  )}
+                </div>
+                {rlSimResult.sample429Headers && (
+                  <div className="text-[10px] space-y-0.5">
+                    {rlSimResult.sample429Headers.RateLimit && <div>RateLimit: {rlSimResult.sample429Headers.RateLimit}</div>}
+                    {rlSimResult.sample429Headers['RateLimit-Policy'] && <div>RateLimit-Policy: {rlSimResult.sample429Headers['RateLimit-Policy']}</div>}
+                  </div>
+                )}
+              </div>
+              {rlSimResult.caddyConfig && (
+                <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 font-mono text-[10px] leading-relaxed overflow-x-auto max-h-44 border border-slate-800">
+                  {JSON.stringify(rlSimResult.caddyConfig, null, 2)}
+                </pre>
+              )}
             </div>
           )}
         </section>
