@@ -149,6 +149,9 @@ function getService(name) {
       break;
     case 'mcpServer':
       svc = require('./services/mcpServer');
+      if (typeof svc.setMaxListeners === 'function') {
+        svc.setMaxListeners(MAX_LOG_STREAMS_GLOBAL + 10);
+      }
       svc.on('mcp_call', (data) => broadcast('mcp_call', data));
       break;
     case 'mcpStreamableHttp':
@@ -297,7 +300,7 @@ function applySecurityHeaders(req, res, isApiOrMetrics) {
 }
 
 // ---------------------------------------------------------------------------
-// Estado WebSocket (carga perezosa de `ws` al primer upgrade)
+// Estado WebSocket y límite estricto de streams SSE/WS (dokploy#2974 anti-EMFILE)
 // ---------------------------------------------------------------------------
 const clients = new Set();
 const syncClients = new Set();
@@ -306,7 +309,110 @@ const activeSseResponses = new Set();
 let activeSseClients = 0;
 let wsConnectionsTotal = 0;
 let wsBroadcastsTotal = 0;
-const MAX_SSE_CLIENTS = 50;
+const MAX_LOG_STREAMS_PER_PRINCIPAL = 10;
+const MAX_LOG_STREAMS_GLOBAL = 50;
+const MAX_SSE_CLIENTS = MAX_LOG_STREAMS_GLOBAL;
+
+/**
+ * Controlador acotado de descriptores/streams SSE y WS por principal y global (`dokploy#2974`).
+ * Garantiza liberación idempotente en close/error/revocation/shutdown para evitar fugas FD / EMFILE.
+ * @param {{ maxPerPrincipal?: number, maxGlobal?: number }} [opts]
+ */
+function createLogStreamTracker({
+  maxPerPrincipal = MAX_LOG_STREAMS_PER_PRINCIPAL,
+  maxGlobal = MAX_LOG_STREAMS_GLOBAL
+} = {}) {
+  /** @type {Set<any>} */
+  const globalSet = new Set();
+  /** @type {Map<string, Set<any>>} */
+  const byPrincipal = new Map();
+
+  /**
+   * @param {any} req
+   * @param {any} [principal]
+   */
+  const resolvePrincipalKey = (req, principal = null) => {
+    const p = principal || (req && req.auth && req.auth.principal) || (req && req._wsPrincipal) || null;
+    if (p && p.userId) return `user:${p.userId}`;
+    if (p && p.tokenId) return `token:${p.tokenId}`;
+    if (p && p.kind === 'master') return `master:${clientIp(req)}`;
+    return `ip:${clientIp(req)}`;
+  };
+
+  /**
+   * @param {string} principalKey
+   * @param {any} handle
+   * @param {{ enforcePerPrincipal?: boolean }} [acquireOpts]
+   */
+  const acquire = (principalKey, handle, acquireOpts = {}) => {
+    const enforcePerPrincipal = acquireOpts.enforcePerPrincipal !== false;
+    if (globalSet.size >= maxGlobal) {
+      return {
+        ok: false,
+        status: 503,
+        code: 'MAX_GLOBAL_STREAMS',
+        error: `Límite global de streams SSE/WS alcanzado (${maxGlobal})`
+      };
+    }
+    const existingBucket = byPrincipal.get(principalKey);
+    if (enforcePerPrincipal && existingBucket && existingBucket.size >= maxPerPrincipal) {
+      return {
+        ok: false,
+        status: 429,
+        code: 'MAX_PRINCIPAL_STREAMS',
+        error: `Límite de streams simultáneos por usuario alcanzado (${maxPerPrincipal})`
+      };
+    }
+
+    globalSet.add(handle);
+    let bucket = existingBucket;
+    if (!bucket) {
+      bucket = new Set();
+      byPrincipal.set(principalKey, bucket);
+    }
+    bucket.add(handle);
+
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      globalSet.delete(handle);
+      const b = byPrincipal.get(principalKey);
+      if (b) {
+        b.delete(handle);
+        if (b.size === 0) byPrincipal.delete(principalKey);
+      }
+    };
+    return { ok: true, principalKey, release };
+  };
+
+  const getStats = () => {
+    /** @type {Record<string, number>} */
+    const perPrincipalCounts = {};
+    for (const [k, set] of byPrincipal.entries()) {
+      perPrincipalCounts[k] = set.size;
+    }
+    return {
+      activeGlobal: globalSet.size,
+      activePrincipals: byPrincipal.size,
+      maxPerPrincipal,
+      maxGlobal,
+      perPrincipalCounts
+    };
+  };
+
+  const releaseAll = () => {
+    globalSet.clear();
+    byPrincipal.clear();
+  };
+
+  return { resolvePrincipalKey, acquire, getStats, releaseAll };
+}
+
+const logStreamTracker = createLogStreamTracker({
+  maxPerPrincipal: MAX_LOG_STREAMS_PER_PRINCIPAL,
+  maxGlobal: MAX_LOG_STREAMS_GLOBAL
+});
 
 // Revocar todas las sesiones WS, Live Sync, SSE y caché fast-auth al rotar el token maestro
 onTokenRotated(() => {
@@ -318,7 +424,12 @@ onTokenRotated(() => {
     try { ws.close(4001, 'Token rotated'); } catch (e) {}
   }
   for (const res of Array.from(activeSseResponses)) {
-    try { res.end(); } catch (e) {}
+    try {
+      if (typeof /** @type {any} */ (res)._streamCleanup === 'function') {
+        /** @type {any} */ (res)._streamCleanup();
+      }
+      res.end();
+    } catch (e) {}
   }
   activeSseResponses.clear();
 });
@@ -357,8 +468,14 @@ if (typeof onPrincipalRevoked === 'function') {
     }
     for (const res of Array.from(activeSseResponses)) {
       if (matches(res)) {
-        activeSseResponses.delete(res);
-        try { res.end(); } catch (e) {}
+        try {
+          if (typeof /** @type {any} */ (res)._streamCleanup === 'function') {
+            /** @type {any} */ (res)._streamCleanup();
+          } else {
+            activeSseResponses.delete(res);
+          }
+          res.end();
+        } catch (e) {}
       }
     }
   });
@@ -901,17 +1018,28 @@ function ensureWsServers() {
     wsConnectionsTotal++;
     ws.isAlive = true;
     /** @type {any} */ (ws)._authPrincipal = /** @type {any} */ (req)._wsPrincipal || null;
+    const releaseSlot = typeof /** @type {any} */ (req)._wsStreamRelease === 'function'
+      ? /** @type {any} */ (req)._wsStreamRelease
+      : () => {};
+    let wsCleaned = false;
+    const cleanupWs = () => {
+      if (wsCleaned) return;
+      wsCleaned = true;
+      clients.delete(ws);
+      try { releaseSlot(); } catch (e) {}
+    };
+    /** @type {any} */ (ws)._streamCleanup = cleanupWs;
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('error', () => {
-      clients.delete(ws);
+      cleanupWs();
       try { ws.terminate(); } catch (e) {}
     });
 
     try {
       ws.send(getInitialWsPayloadBuf(/** @type {any} */ (ws)._authPrincipal), { binary: false });
     } catch (e) {
-      clients.delete(ws);
+      cleanupWs();
     }
 
     ws.on('message', (message) => {
@@ -923,9 +1051,7 @@ function ensureWsServers() {
       } catch (e) {}
     });
 
-    ws.on('close', () => {
-      clients.delete(ws);
-    });
+    ws.on('close', cleanupWs);
   });
 
   if (!heartbeatTimer) {
@@ -934,12 +1060,18 @@ function ensureWsServers() {
         for (const ws of pool) {
           if (ws.isAlive === false) {
             pool.delete(ws);
+            if (typeof /** @type {any} */ (ws)._streamCleanup === 'function') {
+              try { /** @type {any} */ (ws)._streamCleanup(); } catch (e) {}
+            }
             try { ws.terminate(); } catch (e) {}
             continue;
           }
           ws.isAlive = false;
           try { ws.ping(); } catch (e) {
             pool.delete(ws);
+            if (typeof /** @type {any} */ (ws)._streamCleanup === 'function') {
+              try { /** @type {any} */ (ws)._streamCleanup(); } catch (e2) {}
+            }
             try { ws.terminate(); } catch (e2) {}
           }
         }
@@ -2241,16 +2373,20 @@ function getApp() {
   app.use('/api', authMiddleware);
   app.use('/api', apiRouter);
 
-  // DEPRECADO — transporte HTTP+SSE de la revisión 2024-11-05 (P1-17: cleanup antes de safeWrite).
+  // DEPRECADO — transporte HTTP+SSE de la revisión 2024-11-05 (P1-17 + dokploy#2974 cap por principal y global).
   app.get('/api/mcp/sse', (req, res) => {
-    if (activeSseClients >= MAX_SSE_CLIENTS) {
-      return res.status(503).json({ error: 'Demasiados clientes SSE conectados simultáneamente' });
+    const ssePrincipal = (/** @type {any} */ (req).auth && /** @type {any} */ (req).auth.principal) || null;
+    const principalKey = logStreamTracker.resolvePrincipalKey(req, ssePrincipal);
+    const slot = logStreamTracker.acquire(principalKey, res, { enforcePerPrincipal: true });
+    if (!slot.ok) {
+      if (slot.status === 429) metricsCollector.recordSecurityEvent('rateLimited429');
+      return res.status(slot.status).json({ error: slot.error, code: slot.code });
     }
+    const releaseStream = slot.release;
     if (typeof req.setTimeout === 'function') req.setTimeout(0);
     if (typeof res.setTimeout === 'function') res.setTimeout(0);
     const mcpServer = getService('mcpServer');
     const mcpStreamableHttp = getService('mcpStreamableHttp');
-    const ssePrincipal = (/** @type {any} */ (req).auth && /** @type {any} */ (req).auth.principal) || null;
     /** @type {any} */ (res)._authPrincipal = ssePrincipal;
     activeSseClients++;
     activeSseResponses.add(res);
@@ -2281,7 +2417,9 @@ function getApp() {
       activeSseResponses.delete(res);
       activeSseClients = Math.max(0, activeSseClients - 1);
       mcpServer.off('mcp_call', onMcp);
+      try { if (typeof releaseStream === 'function') releaseStream(); } catch (e) {}
     };
+    /** @type {any} */ (res)._streamCleanup = cleanup;
     const safeWrite = (chunk) => {
       if (res.writableEnded || res.destroyed) return;
       try { res.write(chunk); } catch (e) { cleanup(); }
@@ -2292,6 +2430,9 @@ function getApp() {
     safeWrite(`event: endpoint\ndata: /api/mcp/message\n\n`);
     mcpServer.on('mcp_call', onMcp);
     req.on('close', cleanup);
+    req.on('aborted', cleanup);
+    res.on('close', cleanup);
+    res.on('finish', cleanup);
     res.on('error', cleanup);
   });
 
@@ -2512,6 +2653,32 @@ server.on('upgrade', (req, socket, head) => {
   }
 
   /** @type {any} */ (req)._wsPrincipal = decision.principal || null;
+
+  // dokploy#2974: limitar streams WS de telemetría/logs por principal (10) y global (50) con limpieza garantizada
+  if (pathname === '/ws') {
+    const queryStr = qIdx === -1 ? '' : rawUrl.slice(qIdx + 1);
+    const isExplicitLogStream = /(?:^|&)(?:channel|stream)=logs(?:&|$)/i.test(queryStr);
+    const enforcePerPrincipal =
+      isExplicitLogStream ||
+      process.env.CULKIBO_STRICT_WS_CAP === '1' ||
+      (decision.method !== 'loopback' && decision.method !== 'loopback_origin');
+    const principalKey = logStreamTracker.resolvePrincipalKey(req, decision.principal);
+    const slot = logStreamTracker.acquire(principalKey, socket, { enforcePerPrincipal });
+    if (!slot.ok) {
+      if (slot.status === 429) metricsCollector.recordSecurityEvent('rateLimited429');
+      const statusLine = slot.status === 429 ? '429 Too Many Requests' : '503 Service Unavailable';
+      socket.write(`HTTP/1.1 ${statusLine}\r\nX-Culkibo-Stream-Cap: ${slot.code}\r\nConnection: close\r\n\r\n`);
+      socket.destroy();
+      return;
+    }
+    const releaseWsSlot = slot.release;
+    if (typeof releaseWsSlot === 'function') {
+      /** @type {any} */ (req)._wsStreamRelease = releaseWsSlot;
+      socket.once('close', releaseWsSlot);
+      socket.once('error', releaseWsSlot);
+    }
+  }
+
   const { wss, syncWss } = ensureWsServers();
   const target = pathname === '/ws/sync' ? syncWss : wss;
   // Coalescencia 101 Switching Protocols + initial_state en 1 solo segmento TCP
@@ -2841,12 +3008,19 @@ function shutdown(signal = 'SIGTERM') {
 
     try {
       for (const ws of [...clients, ...syncClients]) {
+        if (typeof /** @type {any} */ (ws)._streamCleanup === 'function') {
+          try { /** @type {any} */ (ws)._streamCleanup(); } catch (e) {}
+        }
         try { ws.close(1001, 'Server shutting down'); } catch (e) {}
       }
       for (const res of Array.from(activeSseResponses)) {
+        if (typeof /** @type {any} */ (res)._streamCleanup === 'function') {
+          try { /** @type {any} */ (res)._streamCleanup(); } catch (e) {}
+        }
         try { res.end(); } catch (e) {}
       }
       activeSseResponses.clear();
+      logStreamTracker.releaseAll();
       if (_wss) _wss.close();
       if (_syncWss) _syncWss.close();
     } catch (e) {}
@@ -2926,11 +3100,16 @@ const exported = {
   startServer,
   shutdown,
   getApp,
+  logStreamTracker,
+  createLogStreamTracker,
+  MAX_LOG_STREAMS_PER_PRINCIPAL,
+  MAX_LOG_STREAMS_GLOBAL,
   getRuntimeMeta: () => ({
     lastWatchdogAt,
     activeWsClients: clients.size,
     activeSyncClients: syncClients.size,
-    activeSseClients
+    activeSseClients,
+    logStreams: logStreamTracker.getStats()
   })
 };
 Object.defineProperty(exported, 'app', { get: getApp, enumerable: true });

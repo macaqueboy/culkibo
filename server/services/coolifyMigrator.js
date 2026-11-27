@@ -2913,6 +2913,286 @@ class CoolifyMigrator {
       migrationReport: plan
     });
   }
+
+  // ===========================================================================
+  // 7. LIVE VOLUME & SQL DATA STREAMER PLAN (`buildVolumeAndDbStreamPlan`)
+  // ===========================================================================
+
+  /**
+   * Genera un plan determinista de streaming en vivo de bases de datos SQL/NoSQL
+   * (PostgreSQL, MySQL, MariaDB, MongoDB, Redis/KeyDB/Dragonfly→Valkey, ClickHouse)
+   * y volúmenes Docker con nombre usando estrictamente arrays `program` + `args[]`
+   * (0 cadenas de shell, 0 contraseñas en `argv`, verificación SHA-256 paso a paso).
+   *
+   * @param {{ apps?: any[], databases?: any[], services?: any[], projects?: any[] }} snapshot
+   * @param {{
+   *   sourceHost?: string | null,
+   *   sourceUser?: string,
+   *   sourcePort?: number | string,
+   *   targetDbContainers?: Record<string, string>,
+   *   targetVolumePrefix?: string,
+   *   helperImage?: string
+   * }} [opts]
+   */
+  buildVolumeAndDbStreamPlan(snapshot, opts = {}) {
+    const SAFE_DOCKER_TOKEN_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+    const SAFE_IDENT_RE = /^[a-zA-Z0-9_.-]{1,80}$/;
+    const SAFE_SSH_HOST_RE = /^[a-zA-Z0-9._:-]{1,253}$/;
+    const SAFE_SSH_USER_RE = /^[a-zA-Z0-9._-]{1,64}$/;
+
+    /** @param {string} raw @param {string} label @param {RegExp} re */
+    const assertSafeToken = (raw, label, re) => {
+      const s = String(raw || '').trim();
+      if (!s || s.startsWith('-') || /[\s\r\n\0;|&$`'"<>\\]/.test(s) || s.includes('..') || !re.test(s)) {
+        throw new Error(`Parámetro inseguro rechazado en buildVolumeAndDbStreamPlan (${label}): "${s.slice(0, 60)}"`);
+      }
+      return s;
+    };
+
+    const sourceHost = opts.sourceHost ? assertSafeToken(opts.sourceHost, 'sourceHost', SAFE_SSH_HOST_RE) : null;
+    const sourceUser = assertSafeToken(opts.sourceUser || 'root', 'sourceUser', SAFE_SSH_USER_RE);
+    const sourcePortNum = Number(opts.sourcePort || 22);
+    if (!Number.isInteger(sourcePortNum) || sourcePortNum < 1 || sourcePortNum > 65535) {
+      throw new Error(`sourcePort inválido: "${opts.sourcePort}"`);
+    }
+    const targetVolumePrefix = assertSafeToken(opts.targetVolumePrefix || 'culkibo_mig_', 'targetVolumePrefix', /^[a-zA-Z0-9_-]{1,32}$/);
+    const helperImage = String(opts.helperImage || 'alpine:3.20').trim();
+    if (!/^[a-zA-Z0-9._\/:-]{1,128}$/.test(helperImage) || helperImage.startsWith('-')) {
+      throw new Error(`helperImage inválido: "${helperImage.slice(0, 60)}"`);
+    }
+    const targetDbContainers = (opts.targetDbContainers && typeof opts.targetDbContainers === 'object') ? opts.targetDbContainers : {};
+
+    /**
+     * Envuelve un comando `{ program, args }` en `ssh` con array de argumentos puro cuando hay `sourceHost`.
+     * @param {{ program: string, args: string[] }} cmd
+     */
+    const wrapRemoteSource = (cmd) => {
+      if (!sourceHost) return null;
+      return {
+        program: 'ssh',
+        args: [
+          '-p', String(sourcePortNum),
+          '-o', 'BatchMode=yes',
+          '-o', 'StrictHostKeyChecking=accept-new',
+          '--',
+          `${sourceUser}@${sourceHost}`,
+          cmd.program,
+          ...cmd.args
+        ]
+      };
+    };
+
+    /** @type {any[]} */
+    const databases = Array.isArray(snapshot && snapshot.databases) ? (snapshot.databases || []) : [];
+    /** @type {any[]} */
+    const apps = Array.isArray(snapshot && snapshot.apps) ? (snapshot.apps || []) : [];
+    /** @type {any[]} */
+    const services = Array.isArray(snapshot && snapshot.services) ? (snapshot.services || []) : [];
+
+    /** @type {any[]} */
+    const databaseStreams = [];
+    /** @type {any[]} */
+    const volumeStreams = [];
+    /** @type {Set<string>} */
+    const seenVolumes = new Set();
+
+    // 1. Streaming SQL / NoSQL por cada base de datos
+    for (const db of databases) {
+      const resolved = this.resolveDatabaseEngine(db);
+      const dbSlug = slugify(db.name || db.uuid || 'db').replace(/-/g, '_');
+      const rawSrcContainer = db.container_name || db.uuid || `coolify_${dbSlug}`;
+      const srcContainer = assertSafeToken(rawSrcContainer, `sourceContainer(${db.name || db.uuid})`, SAFE_DOCKER_TOKEN_RE);
+      const rawTgtContainer = targetDbContainers[db.uuid] || targetDbContainers[db.name] || `culkibo_db_${dbSlug}`;
+      const tgtContainer = assertSafeToken(rawTgtContainer, `targetContainer(${db.name || db.uuid})`, SAFE_DOCKER_TOKEN_RE);
+
+      const rawUser = db.database_user || db.postgres_user || db.mysql_user || db.mariadb_user || db.mongo_initdb_root_username || db.clickhouse_admin_user || (resolved.engine === 'mysql' || resolved.engine === 'mariadb' ? 'root' : 'postgres');
+      const dbUser = assertSafeToken(rawUser, `dbUser(${db.name || db.uuid})`, SAFE_IDENT_RE);
+      const rawDbName = db.database_name || db.postgres_db || db.mysql_database || db.mariadb_database || (resolved.engine === 'clickhouse' ? 'default' : 'postgres');
+      const dbName = assertSafeToken(rawDbName, `dbName(${db.name || db.uuid})`, SAFE_IDENT_RE);
+
+      /** @type {{ program: string, args: string[] }} */
+      let sourceDump;
+      /** @type {{ program: string, args: string[] }} */
+      let targetRestore;
+      /** @type {{ program: string, args: string[] }} */
+      let postVerifyCmd;
+      let authEnvNote = '';
+
+      if (resolved.engine === 'postgres' || resolved.engine === 'pgvector' || resolved.engine === 'timescaledb') {
+        sourceDump = {
+          program: 'docker',
+          args: ['exec', '-i', srcContainer, 'pg_dump', '-U', dbUser, '-d', dbName, '-F', 'c', '-b']
+        };
+        targetRestore = {
+          program: 'docker',
+          args: ['exec', '-i', tgtContainer, 'pg_restore', '-U', dbUser, '-d', dbName, '--clean', '--if-exists', '--no-owner', '--no-privileges', '-e']
+        };
+        postVerifyCmd = {
+          program: 'docker',
+          args: ['exec', tgtContainer, 'psql', '-U', dbUser, '-d', dbName, '-Atc', "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"]
+        };
+        authEnvNote = 'Usa PGPASSWORD del entorno interno del contenedor (jamás pasa contraseñas en argv).';
+      } else if (resolved.engine === 'mysql' || resolved.engine === 'mariadb') {
+        const dumpBin = resolved.engine === 'mariadb' ? 'mariadb-dump' : 'mysqldump';
+        const restoreBin = resolved.engine === 'mariadb' ? 'mariadb' : 'mysql';
+        const dumpArgs = ['exec', '-i', srcContainer, dumpBin, '-u', dbUser, '--single-transaction', '--quick'];
+        if (resolved.engine === 'mysql') dumpArgs.push('--set-gtid-purged=OFF');
+        dumpArgs.push(dbName);
+        sourceDump = { program: 'docker', args: dumpArgs };
+        targetRestore = {
+          program: 'docker',
+          args: ['exec', '-i', tgtContainer, restoreBin, '-u', dbUser, dbName]
+        };
+        postVerifyCmd = {
+          program: 'docker',
+          args: ['exec', tgtContainer, 'mysqladmin', 'ping', '-h', '127.0.0.1', '--silent']
+        };
+        authEnvNote = 'Usa MYSQL_PWD/CULKIBO_MYSQL_PWD interno del contenedor (jamás -p<clave> en argv).';
+      } else if (resolved.engine === 'mongodb') {
+        sourceDump = {
+          program: 'docker',
+          args: ['exec', '-i', srcContainer, 'mongodump', '--archive', '--gzip']
+        };
+        targetRestore = {
+          program: 'docker',
+          args: ['exec', '-i', tgtContainer, 'mongorestore', '--archive', '--gzip', '--drop']
+        };
+        postVerifyCmd = {
+          program: 'docker',
+          args: ['exec', tgtContainer, 'mongosh', '--quiet', '--eval', 'db.adminCommand({ ping: 1 }).ok']
+        };
+        authEnvNote = 'Autenticación mediante MONGO_INITDB_ROOT_* dentro del contenedor.';
+      } else if (resolved.engine === 'valkey') {
+        sourceDump = {
+          program: 'docker',
+          args: ['exec', srcContainer, 'redis-cli', 'SAVE']
+        };
+        targetRestore = {
+          program: 'docker',
+          args: ['cp', `${srcContainer}:/data/dump.rdb`, '-']
+        };
+        postVerifyCmd = {
+          program: 'docker',
+          args: ['exec', tgtContainer, 'valkey-cli', 'DBSIZE']
+        };
+        authEnvNote = 'Usa REDISCLI_AUTH dentro del contenedor; copia atómica de dump.rdb y validación DBSIZE.';
+      } else if (resolved.engine === 'clickhouse') {
+        sourceDump = {
+          program: 'docker',
+          args: ['exec', srcContainer, 'clickhouse-client', '--query', `SHOW TABLES FROM ${dbName}`]
+        };
+        targetRestore = {
+          program: 'docker',
+          args: ['exec', '-i', tgtContainer, 'clickhouse-client', '--database', dbName]
+        };
+        postVerifyCmd = {
+          program: 'docker',
+          args: ['exec', tgtContainer, 'clickhouse-client', '--query', `SELECT count() FROM system.tables WHERE database = '${dbName}'`]
+        };
+        authEnvNote = 'Autenticación mediante CLICKHOUSE_PASSWORD interno del contenedor.';
+      } else {
+        sourceDump = { program: 'docker', args: ['inspect', srcContainer] };
+        targetRestore = { program: 'docker', args: ['inspect', tgtContainer] };
+        postVerifyCmd = { program: 'docker', args: ['inspect', '--format', '{{.State.Running}}', tgtContainer] };
+        authEnvNote = 'Motor genérico: sincroniza el volumen persistente asociado.';
+      }
+
+      databaseStreams.push({
+        id: db.uuid || dbSlug,
+        name: db.name || dbSlug,
+        engine: resolved.engine,
+        originalEngine: resolved.originalType,
+        sourceContainer: srcContainer,
+        targetContainer: tgtContainer,
+        zeroShell: true,
+        authEnvNote,
+        sourceDump,
+        sshSourceDump: wrapRemoteSource(sourceDump),
+        targetRestore,
+        verification: {
+          streamChecksumAlgorithm: 'sha256',
+          streamChecksumStep: 'Pipe stdout de sourceDump → crypto.createHash("sha256") PassThrough → stdin de targetRestore; registrar digest SHA-256 en bitácora de corte.',
+          postRestoreCheck: postVerifyCmd
+        }
+      });
+    }
+
+    // 2. Streaming de volúmenes Docker con nombre de apps, BDs y servicios
+    /** @param {any} resource @param {string} kind */
+    const collectVolumesFrom = (resource, kind) => {
+      const vols = resource.local_persistent_volumes || resource.persistent_volumes || resource.volumes || [];
+      if (!Array.isArray(vols)) return;
+      for (const v of vols) {
+        const rawName = typeof v === 'string' ? v.split(':')[0] : (v && (v.name || v.source));
+        if (!rawName || String(rawName).startsWith('/')) continue;
+        const volName = assertSafeToken(String(rawName), `volume(${resource.name || resource.uuid})`, SAFE_DOCKER_TOKEN_RE);
+        if (seenVolumes.has(volName)) continue;
+        seenVolumes.add(volName);
+
+        const targetVolName = assertSafeToken(`${targetVolumePrefix}${volName}`.slice(0, 127), 'targetVolume', SAFE_DOCKER_TOKEN_RE);
+        const sourceArchive = {
+          program: 'docker',
+          args: ['run', '--rm', '-v', `${volName}:/src:ro`, helperImage, 'tar', '-cf', '-', '-C', '/src', '.']
+        };
+        const targetExtract = {
+          program: 'docker',
+          args: ['run', '--rm', '-i', '-v', `${targetVolName}:/dst`, helperImage, 'tar', '-xf', '-', '-C', '/dst']
+        };
+        const sourceHashCheck = {
+          program: 'docker',
+          args: ['run', '--rm', '-v', `${volName}:/src:ro`, helperImage, 'find', '/src', '-type', 'f', '-exec', 'sha256sum', '{}', '+']
+        };
+        const targetHashCheck = {
+          program: 'docker',
+          args: ['run', '--rm', '-v', `${targetVolName}:/dst:ro`, helperImage, 'find', '/dst', '-type', 'f', '-exec', 'sha256sum', '{}', '+']
+        };
+
+        volumeStreams.push({
+          volumeName: volName,
+          targetVolumeName: targetVolName,
+          mountPath: (v && typeof v === 'object' && v.mount_path) ? String(v.mount_path) : null,
+          ownerResource: resource.name || resource.uuid || kind,
+          ownerType: kind,
+          zeroShell: true,
+          sourceArchive,
+          sshSourceArchive: wrapRemoteSource(sourceArchive),
+          targetExtract,
+          verification: {
+            algorithm: 'sha256',
+            streamChecksumStep: 'Calcular SHA-256 sobre el stream tar en vuelo (Node PassThrough) y comparar conteo/hashes de archivos entre origen y destino.',
+            sourceHashCheck,
+            sshSourceHashCheck: wrapRemoteSource(sourceHashCheck),
+            targetHashCheck
+          }
+        });
+      }
+    };
+
+    for (const a of apps) collectVolumesFrom(a, 'app');
+    for (const d of databases) collectVolumesFrom(d, 'database');
+    for (const s of services) collectVolumesFrom(s, 'service');
+
+    return {
+      ok: true,
+      zeroShell: true,
+      sourceHost,
+      sourcePort: sourceHost ? sourcePortNum : null,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        databases: databaseStreams.length,
+        volumes: volumeStreams.length,
+        totalSteps: databaseStreams.length + volumeStreams.length
+      },
+      databaseStreams,
+      volumeStreams,
+      verificationChecklist: [
+        'Ejecutar cada comando exclusivamente mediante spawn(cmd.program, cmd.args, { shell: false }).',
+        'Conectar stdout de origen a stdin de destino mediante Node stream.pipeline + PassThrough SHA-256.',
+        'Confirmar que ningún secreto/contraseña aparece en argv ni en `ps` del host.',
+        'Ejecutar postRestoreCheck y targetHashCheck antes de iniciar el cutover DNS.'
+      ]
+    };
+  }
 }
 
 const instance = /** @type {any} */ (new CoolifyMigrator());

@@ -35,7 +35,10 @@ const svc = {
   get deployManager() { return require('../server/services/deployManager'); },
   get catalogManager() { return require('../server/services/catalogManager'); },
   get telemetryService() { return require('../server/services/telemetryService'); },
-  get LiveSyncClient() { return require('../server/services/liveSyncClient').LiveSyncClient; }
+  get LiveSyncClient() { return require('../server/services/liveSyncClient').LiveSyncClient; },
+  get smartPackBuilder() { return require('../server/services/smartPackBuilder'); },
+  get directPushRegistry() { return require('../server/services/directPushRegistry'); },
+  get edgeTunnelService() { return require('../server/services/edgeTunnelService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2304,6 +2307,218 @@ program
       } else {
         failCli(new Error('Acción inválida. Usa: list | check <monitorId> | pages'), options);
       }
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CLI: smartpack, pussh (DirectPush OCI v2), tunnel-agent (EdgeTunnel)
+// ===========================================================================
+
+program
+  .command('smartpack [dir]')
+  .description('SmartPack: analiza un repo y emite un build-plan.json determinista + .dockerignore implícito + límites BuildKit')
+  .option('--zstd', 'Activar flags OCI zstd:chunked para capas de arranque rápido')
+  .option('--dockerfile', 'Imprimir también el Dockerfile multi-stage renderizado')
+  .option('--write-ignore', 'Escribir .dockerignore implícito en el directorio si no existe')
+  .option('--json', 'Salida JSON estructurada')
+  .action((dir = process.cwd(), options) => {
+    try {
+      const targetDir = path.resolve(dir || process.cwd());
+      if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
+        throw new Error(`El directorio no existe: ${targetDir}`);
+      }
+      const sp = svc.smartPackBuilder;
+      const plan = sp.generateBuildPlan(targetDir, { zstdChunked: Boolean(options.zstd) });
+      const ignoreObj = plan.dockerignore || sp.generateImplicitDockerignore(plan.stack);
+      const ignorePatterns = Array.isArray(ignoreObj?.patterns) ? ignoreObj.patterns : [];
+      const ignoreContent = typeof ignoreObj?.content === 'string'
+        ? ignoreObj.content
+        : ignorePatterns.join('\n') + '\n';
+
+      let wroteIgnore = false;
+      const ignorePath = path.join(targetDir, '.dockerignore');
+      if (options.writeIgnore && !fs.existsSync(ignorePath)) {
+        fs.writeFileSync(ignorePath, ignoreContent, 'utf8');
+        wroteIgnore = true;
+      }
+
+      const payload = {
+        ok: true,
+        directory: targetDir,
+        stack: plan.stack,
+        label: plan.label,
+        runtime: plan.runtime,
+        containerPort: plan.containerPort,
+        deterministicHash: plan.deterministicHash,
+        plan,
+        dockerignore: ignorePatterns,
+        resourceLimits: plan.resourceLimits,
+        dockerfile: plan.dockerfile,
+        wroteIgnore
+      };
+
+      if (isJsonMode(options)) {
+        return printJson(payload);
+      }
+
+      console.log(`\n\x1b[32m⚡ Culkibo SmartPack — ${plan.label || plan.stack}\x1b[0m`);
+      console.log(`   Directorio:     ${targetDir}`);
+      console.log(`   Stack/Runtime:  ${plan.stack} (${plan.runtime}${plan.runtimeVersion ? ` ${plan.runtimeVersion}` : ''})`);
+      console.log(`   Puerto:         ${plan.containerPort}`);
+      console.log(`   Base/Runtime:   ${plan.baseImage} → ${plan.runtimeImage}`);
+      console.log(`   Hash plan:      ${String(plan.deterministicHash || '').slice(0, 16)}`);
+      if (plan.resourceLimits) {
+        console.log(`   BuildKit caps:  memory=${plan.resourceLimits.memory || 'auto'} · cpus=${plan.resourceLimits.cpus || 'auto'}`);
+      }
+      console.log(`   .dockerignore:  ${ignorePatterns.length} patrones implícitos${wroteIgnore ? ` (escrito en ${ignorePath})` : ''}`);
+      if (options.dockerfile && plan.dockerfile) {
+        console.log('\n--- Dockerfile generado ---\n' + plan.dockerfile);
+      }
+      console.log('');
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('pussh <image>')
+  .description('DirectPush: transfiere capas delta OCI v2 a un nodo SSH sin registro externo (cero Docker Hub/GHCR)')
+  .option('-s, --server <id>', 'ID del servidor destino de la flota (default local)', 'local')
+  .option('-p, --port <port>', 'Puerto loopback local del túnel OCI v2', '5055')
+  .option('--ssh-host <host>', 'Sobrescribir host SSH destino')
+  .option('--ssh-user <user>', 'Sobrescribir usuario SSH destino')
+  .option('--ssh-port <port>', 'Sobrescribir puerto SSH destino')
+  .option('--dry-run', 'Mostrar plan de túnel SSH y pasos argv sin ejecutar')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (image, options) => {
+    try {
+      const dp = svc.directPushRegistry;
+      const localPort = parseInt(String(options.port || '5055'), 10);
+      const sshPort = options.sshPort ? parseInt(String(options.sshPort), 10) : undefined;
+      const plan = dp.planDirectPush({
+        image: String(image),
+        serverId: String(options.server || 'local'),
+        localPort,
+        ...(options.sshHost ? { sshHost: String(options.sshHost) } : {}),
+        ...(options.sshUser ? { sshUser: String(options.sshUser) } : {}),
+        ...(sshPort !== undefined ? { sshPort } : {})
+      });
+
+      if (options.dryRun) {
+        if (isJsonMode(options)) {
+          return printJson({ ok: true, dryRun: true, plan });
+        }
+        console.log(`\n\x1b[36m🚀 DirectPush Plan (${plan.sourceImage} → ${plan.targetImageRef})\x1b[0m`);
+        console.log(`   Servidor: ${plan.serverId} (${plan.tunnel.sshUser}@${plan.tunnel.sshHost}:${plan.tunnel.sshPort})`);
+        for (const step of plan.steps || []) {
+          const tag = step.skippedForLocal ? ' [omitido en local]' : '';
+          console.log(`   ${step.step}. ${step.id}${tag}: ${step.bin} ${(step.argv || []).join(' ')}`);
+        }
+        console.log('');
+        return;
+      }
+
+      // Ejecución real sin shell (spawn con argv explícito y shell: false)
+      /** @type {import('child_process').ChildProcess | null} */
+      let sshTunnelProc = null;
+      const tunnelStep = (plan.steps || []).find((s) => s.id === 'open_ssh_tunnel');
+      const dockerSteps = (plan.steps || []).filter((s) => s.id !== 'open_ssh_tunnel');
+
+      try {
+        if (tunnelStep && !tunnelStep.skippedForLocal) {
+          sshTunnelProc = spawn(tunnelStep.bin, tunnelStep.argv, { stdio: 'ignore', shell: false, windowsHide: true });
+          await new Promise((resolve) => setTimeout(resolve, 600));
+        }
+        for (const step of dockerSteps) {
+          await runSpawnStep(step.bin, step.argv, process.cwd());
+        }
+        if (isJsonMode(options)) {
+          return printJson({ ok: true, dryRun: false, pushed: true, plan });
+        }
+        console.log(`\x1b[32m✅ DirectPush completado:\x1b[0m ${plan.sourceImage} → ${plan.targetImageRef}`);
+      } finally {
+        if (sshTunnelProc && !sshTunnelProc.killed) {
+          try { sshTunnelProc.kill('SIGTERM'); } catch (e) {}
+        }
+      }
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('tunnel-agent')
+  .description('Ejecuta el agente saliente Culkibo EdgeTunnel para exponer un servicio local tras CGNAT sin puertos abiertos')
+  .option('--url <wsUrl>', 'URL WebSocket del servidor EdgeTunnel (o env CULKIBO_TUNNEL_URL)')
+  .option('--token <token>', 'Token HMAC del túnel (o env CULKIBO_TUNNEL_TOKEN; nunca se imprime en logs)')
+  .option('--tunnel-id <id>', 'ID del túnel EdgeTunnel (o query ?tunnelId= en --url)')
+  .option('--target <hostPort>', 'Destino loopback local en formato host:port (ej. 127.0.0.1:3000)')
+  .option('--dry-run', 'Validar configuración y mostrar plan de conexión redactado sin conectar')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (options) => {
+    try {
+      const rawUrl = String(options.url || process.env.CULKIBO_TUNNEL_URL || '').trim();
+      const rawToken = String(options.token || program.opts().token || process.env.CULKIBO_TUNNEL_TOKEN || '').trim();
+      const rawTarget = String(options.target || '').trim();
+      if (!rawUrl) throw new Error('Especifica --url <ws(s)://...> o define CULKIBO_TUNNEL_URL.');
+      const parsedUrl = new URL(rawUrl);
+      if (parsedUrl.protocol !== 'ws:' && parsedUrl.protocol !== 'wss:') {
+        throw new Error(`Protocolo inválido en --url: "${parsedUrl.protocol}" (usa ws:// o wss://).`);
+      }
+      const tunnelId = String(options.tunnelId || parsedUrl.searchParams.get('tunnelId') || process.env.CULKIBO_TUNNEL_ID || 'tun_default').trim();
+      if (!rawToken) throw new Error('Especifica --token <tok> o define CULKIBO_TUNNEL_TOKEN.');
+      if (!rawTarget || !rawTarget.includes(':')) {
+        throw new Error('Especifica --target <host:port> (ej. 127.0.0.1:3000).');
+      }
+      const lastColon = rawTarget.lastIndexOf(':');
+      const targetHost = rawTarget.slice(0, lastColon).replace(/^\[|\]$/g, '').trim() || '127.0.0.1';
+      const targetPort = parseInt(rawTarget.slice(lastColon + 1).trim(), 10);
+
+      const et = svc.edgeTunnelService;
+      const validated = et.validateTunnelTarget(targetHost, targetPort);
+
+      const safeSummary = {
+        ok: true,
+        dryRun: Boolean(options.dryRun),
+        protocol: 'culkibo-edgetunnel/v1',
+        serverUrl: `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`,
+        tunnelId,
+        token: '[REDACTED]',
+        targetHost: validated.targetHost,
+        targetPort: validated.targetPort
+      };
+
+      if (options.dryRun) {
+        if (isJsonMode(options)) return printJson(safeSummary);
+        console.log(`\n\x1b[36m🚇 Culkibo EdgeTunnel Agent (dry-run)\x1b[0m`);
+        console.log(`   Servidor WS: ${safeSummary.serverUrl}`);
+        console.log(`   Túnel ID:    ${safeSummary.tunnelId}`);
+        console.log(`   Token:       [REDACTED]`);
+        console.log(`   Destino:     ${safeSummary.targetHost}:${safeSummary.targetPort}\n`);
+        return;
+      }
+
+      const client = new et.EdgeTunnelClient({
+        serverUrl: rawUrl,
+        tunnelId,
+        token: rawToken,
+        targetHost: validated.targetHost,
+        targetPort: validated.targetPort
+      });
+      await client.connect();
+      if (isJsonMode(options)) {
+        printJson({ ...safeSummary, connected: true });
+      } else {
+        console.log(`\x1b[32m✅ EdgeTunnel conectado\x1b[0m (${safeSummary.tunnelId} → ${safeSummary.targetHost}:${safeSummary.targetPort})`);
+      }
+      const stopAgent = () => {
+        try { client.close(); } catch (e) {}
+        process.exitCode = 0;
+      };
+      process.once('SIGINT', stopAgent);
+      process.once('SIGTERM', stopAgent);
     } catch (err) {
       failCli(err, options);
     }

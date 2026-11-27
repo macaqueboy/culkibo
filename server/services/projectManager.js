@@ -5,10 +5,67 @@ const EventEmitter = require('events');
 const Project = require('../models/Project');
 const containerOrchestrator = require('./containerOrchestrator');
 
+const DEFAULT_PROJECTS_FILE = path.join(__dirname, '..', '..', 'data', 'projects.json');
+const DEFAULT_MIN_DISK_FREE_BYTES = 16 * 1024 * 1024; // 16 MiB pre-write ENOSPC guard (Cosmos#591)
+
+/**
+ * Resuelve la ruta de `projects.json` respetando `CULKIBO_DATA_DIR` (aislamiento 100% en tests/daemons).
+ * @returns {string}
+ */
+function resolveDefaultDataPath() {
+  if (process.env.CULKIBO_DATA_DIR) {
+    return path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'projects.json');
+  }
+  return DEFAULT_PROJECTS_FILE;
+}
+
+/**
+ * Verifica espacio libre en disco antes de una escritura atómica (Cosmos#591 anti-ENOSPC).
+ * @param {string} targetDir
+ * @param {number} [minFreeBytes]
+ * @param {{ statfsImpl?: (p: string) => { bavail: number, bsize: number, blocks?: number } }} [opts]
+ */
+function checkDiskHeadroom(targetDir, minFreeBytes = DEFAULT_MIN_DISK_FREE_BYTES, opts = {}) {
+  const required = Math.max(0, Number(minFreeBytes) || 0);
+  if (required <= 0) return { ok: true, freeBytes: null, requiredBytes: 0, path: targetDir };
+  let probeDir = path.resolve(targetDir || '.');
+  while (probeDir && !fs.existsSync(probeDir)) {
+    const parent = path.dirname(probeDir);
+    if (parent === probeDir) break;
+    probeDir = parent;
+  }
+  const statfsFn = typeof opts.statfsImpl === 'function'
+    ? opts.statfsImpl
+    : (typeof fs.statfsSync === 'function' ? (p) => fs.statfsSync(p) : null);
+  if (!statfsFn) return { ok: true, freeBytes: null, requiredBytes: required, path: probeDir };
+  const st = statfsFn(probeDir);
+  const freeBytes = Number(st.bavail) * Number(st.bsize);
+  if (Number.isFinite(freeBytes) && freeBytes < required) {
+    /** @type {Error & { status?: number, code?: string, freeBytes?: number, requiredBytes?: number, path?: string }} */
+    const err = new Error(
+      `Espacio en disco insuficiente en ${probeDir}: ${(freeBytes / (1024 * 1024)).toFixed(1)} MiB libres < ${(required / (1024 * 1024)).toFixed(1)} MiB requeridos`
+    );
+    err.status = 507;
+    err.code = 'DISK_FULL';
+    err.freeBytes = freeBytes;
+    err.requiredBytes = required;
+    err.path = probeDir;
+    throw err;
+  }
+  return { ok: true, freeBytes, requiredBytes: required, path: probeDir };
+}
+
 class ProjectManager extends EventEmitter {
-  constructor() {
+  /**
+   * @param {{ dataPath?: string | null, dataDir?: string | null, seedDemo?: boolean }} [opts]
+   */
+  constructor(opts = {}) {
     super();
-    this.dataPath = path.join(__dirname, '..', '..', 'data', 'projects.json');
+    this._explicitDataPath = opts.dataPath
+      ? path.resolve(opts.dataPath)
+      : (opts.dataDir ? path.join(path.resolve(opts.dataDir), 'projects.json') : null);
+    this._seedDemo = opts.seedDemo !== undefined ? Boolean(opts.seedDemo) : true;
+    this.dataPath = this._explicitDataPath || resolveDefaultDataPath();
     this.projects = new Map();
     this.savingPromise = null;
     this.pendingSave = false;
@@ -26,6 +83,26 @@ class ProjectManager extends EventEmitter {
     this._projectJsonCache = new Map();
     this.ensureDataDir();
     this.loadProjects();
+  }
+
+  /**
+   * Re-apunta y recarga el almacén desde un directorio de datos aislado (útil en tests / hot-reconfig).
+   * @param {string} dataDir
+   * @param {{ seedDemo?: boolean }} [opts]
+   */
+  reloadFromDataDir(dataDir, opts = {}) {
+    if (this.saveDebounceTimer) {
+      clearTimeout(this.saveDebounceTimer);
+      this.saveDebounceTimer = null;
+    }
+    this._explicitDataPath = path.join(path.resolve(dataDir), 'projects.json');
+    this.dataPath = this._explicitDataPath;
+    if (opts.seedDemo !== undefined) this._seedDemo = Boolean(opts.seedDemo);
+    this.projects.clear();
+    this.invalidateCache();
+    this.ensureDataDir();
+    this.loadProjects();
+    return this.dataPath;
   }
 
   ensureDataDir() {
@@ -95,7 +172,7 @@ class ProjectManager extends EventEmitter {
           this.projects.set(p.id, new Project(p));
         });
       }
-    } else {
+    } else if (this._seedDemo) {
       // Default demo project
       const demo = new Project({
         name: 'Mi Primera App',
@@ -207,6 +284,12 @@ class ProjectManager extends EventEmitter {
       if (!buf || buf.length < 2) {
         throw new Error('Serialización de proyectos vacía; se aborta la escritura');
       }
+
+      // Guardia pre-escritura anti-ENOSPC (Cosmos#591): abortar antes de tocar disco si no hay margen
+      const minFree = process.env.CULKIBO_MIN_FREE_BYTES != null
+        ? Number(process.env.CULKIBO_MIN_FREE_BYTES)
+        : DEFAULT_MIN_DISK_FREE_BYTES;
+      checkDiskHeadroom(path.dirname(this.dataPath), minFree);
 
       tempPath = `${this.dataPath}.${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`;
       await fs.promises.writeFile(tempPath, buf, { mode: 0o600 });
@@ -820,4 +903,8 @@ class ProjectManager extends EventEmitter {
   }
 }
 
-module.exports = new ProjectManager();
+const instance = /** @type {any} */ (new ProjectManager());
+instance.ProjectManager = ProjectManager;
+instance.resolveDefaultDataPath = resolveDefaultDataPath;
+instance.checkDiskHeadroom = checkDiskHeadroom;
+module.exports = instance;

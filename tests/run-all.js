@@ -31,6 +31,8 @@ const testAdversarialFuzz = require('./adversarial-fuzz.test');
 const testCliDx = require('./cli-dx.test');
 const testObservabilityAlerts = require('./observability-alerts.test');
 const testEditionAndBola = require('./edition-and-bola.test');
+const testSmartPackDirectPush = require('./smartpack-directpush.test');
+const testEdgeTunnelSnapStream = require('./edgetunnel-snapstream.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -87,6 +89,8 @@ async function runAll() {
     { name: 'CLI DX (init, up, logs, env, exec, releases, rollback)', fn: testCliDx },
     { name: 'Observability Alerts, Metrics History & Topology', fn: testObservabilityAlerts },
     { name: 'Edition Ed25519 Verifier, CronParser Anti-DoS, Project Secrets & BOLA/IDOR Closure', fn: testEditionAndBola },
+    { name: 'SmartPack Build Intelligence, DirectPush OCI v2 & Edge/FD Hardening', fn: testSmartPackDirectPush },
+    { name: 'Sovereign EdgeTunnel WS, SnapStream SQLite WAL-to-S3 & Preview DB Branching', fn: testEdgeTunnelSnapStream },
   ];
 
   for (const suite of suites) {

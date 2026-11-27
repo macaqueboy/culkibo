@@ -25,6 +25,7 @@ const notificationService = require('./notificationService');
 const cronManager = require('./cronManager');
 const previewManager = require('./previewManager');
 const webhookService = require('./webhookService');
+const mcpAppsRenderer = require('./mcpAppsRenderer');
 
 // Servicios v2 cargados estrictamente bajo demanda para preservar ~61 MB de RAM en reposo.
 const ALLOWED_LAZY_SERVICES = new Set([
@@ -35,7 +36,11 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'uptimeMonitor',
   'sleepAdvisor',
   'secretScanner',
-  'auditLogger'
+  'auditLogger',
+  'smartPackBuilder',
+  'directPushRegistry',
+  'edgeTunnelService',
+  'topologyService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -61,7 +66,7 @@ function lazySvc(name) {
 }
 
 const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars|passphrase|privatekey|private_key|sshkey|ssh_key|invitetoken|invite_token|tokenhash|token_hash|signingsecret|signing_secret|masterkey|master_key|confirmtoken|confirm_token)/i;
-const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck[stihpr]_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck(?:[stihpr]|et)_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_database_credentials',
   'culkibo_github_connect',
@@ -73,7 +78,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_export_instance_snapshot',
   'culkibo_fleet_add_server',
   'culkibo_team_invite_member',
-  'culkibo_rbac_manage_token'
+  'culkibo_rbac_manage_token',
+  'culkibo_edge_tunnel'
 ]);
 
 /** @type {Record<string, number>} */
@@ -124,6 +130,7 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_add_resource',
     'culkibo_set_project_env',
     'culkibo_deploy_strategy',
+    'culkibo_smartpack_plan',
     'culkibo_deploy_production',
     'culkibo_ship_and_verify',
     'culkibo_list_deployments',
@@ -159,6 +166,7 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_diagnose_domain',
     'culkibo_ingress_status',
     'culkibo_reconcile_ingress',
+    'culkibo_edge_tunnel',
     'culkibo_uptime_list_monitors',
     'culkibo_status_page_manage',
     'culkibo_cost_advisor',
@@ -182,6 +190,7 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_diagnose_domain',
     'culkibo_ingress_status',
     'culkibo_manage_wildcard_dns01',
+    'culkibo_edge_tunnel',
     'culkibo_set_domain_basic_auth',
     'culkibo_manage_webhook',
     'culkibo_deploy_freeze',
@@ -220,7 +229,13 @@ const SEARCH_SYNONYMS = Object.freeze({
   antigravity: ['agent', 'kit', 'mcp', 'config', 'export'],
   windsurf: ['agent', 'kit', 'mcp', 'config', 'export'],
   codex: ['agent', 'kit', 'mcp', 'config', 'export'],
-  kit: ['agent', 'export', 'mcp', 'config']
+  kit: ['agent', 'export', 'mcp', 'config'],
+  smartpack: ['build', 'plan', 'dockerfile', 'dockerignore', 'railpack', 'deploy'],
+  railpack: ['smartpack', 'build', 'plan', 'dockerfile'],
+  dockerfile: ['smartpack', 'build', 'plan', 'deploy'],
+  tunnel: ['edge', 'cgnat', 'ingress', 'cloudflare', 'edgetunnel'],
+  cgnat: ['tunnel', 'edge', 'ingress', 'cloudflare'],
+  edgetunnel: ['tunnel', 'edge', 'cgnat', 'ingress']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -360,7 +375,10 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_auto_remediate: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
   // MCP 2026 Pioneer: Autonomous Ship-and-Verify & 1-Click Agent Kit Generator (+2 = 109)
   culkibo_ship_and_verify: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
-  culkibo_export_agent_kit: { minRole: 'viewer', scope: 'tools:read', projectScoped: false }
+  culkibo_export_agent_kit: { minRole: 'viewer', scope: 'tools:read', projectScoped: false },
+  // MCP 2026 Cycle-2: SmartPack Build Intelligence & Sovereign EdgeTunnel (+2 = 111)
+  culkibo_smartpack_plan: { minRole: 'viewer', scope: 'deployments:read', projectScoped: true },
+  culkibo_edge_tunnel: { minRole: 'admin', scope: 'ingress:write', projectScoped: false, secretSensitive: true }
 });
 
 /**
@@ -2758,7 +2776,7 @@ class McpServer extends EventEmitter {
             profiles: { type: 'object' }
           }
         },
-        description: 'Busca semánticamente (ES/EN) entre las 109 herramientas autorizadas de Culkibo para descubrir sus esquemas bajo demanda sin saturar la ventana de contexto (ideal con ?profile=core).',
+        description: 'Busca semánticamente (ES/EN) entre las 111 herramientas autorizadas de Culkibo para descubrir sus esquemas bajo demanda sin saturar la ventana de contexto (ideal con ?profile=core).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2937,14 +2955,79 @@ class McpServer extends EventEmitter {
             }
           }
         }
+      },
+
+      // --- MCP 2026 Cycle-2: SmartPack Build Intelligence & Sovereign EdgeTunnel (+2 -> 111) ---
+      {
+        name: 'culkibo_smartpack_plan',
+        title: 'Generar plan determinista de build (SmartPack)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            directory: { type: 'string' },
+            projectId: { type: ['string', 'null'] },
+            stack: { type: 'string' },
+            plan: { type: 'object' },
+            dockerignore: { type: 'array' },
+            resourceLimits: { type: 'object' },
+            dockerfile: { type: ['string', 'null'] }
+          }
+        },
+        description: 'Analiza un directorio o proyecto con Culkibo SmartPack (cero deps) para emitir un build-plan.json determinista (14+ stacks, cache mounts BuildKit, zstd:chunked, límites cgroup --memory/--cpus, .dockerignore implícito y Dockerfile generado).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', minLength: 1, description: 'ID de proyecto opcional (resuelve su localPath o directorio en projects/)' },
+            directory: { type: 'string', maxLength: 512, description: 'Ruta local dentro del workspace o projects/ (opcional si se pasa projectId)' },
+            includeDockerfile: { type: 'boolean', description: 'Incluir Dockerfile renderizado desde el build plan (default true)' },
+            zstdChunked: { type: 'boolean', description: 'Activar flags OCI zstd:chunked en el plan de exportación (default false)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_edge_tunnel',
+        title: 'Gestionar túneles CGNAT soberanos (EdgeTunnel)',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            status: { type: 'object' },
+            tunnels: { type: 'array' },
+            tunnel: { type: 'object' },
+            revoked: { type: 'boolean' },
+            id: { type: 'string' }
+          }
+        },
+        description: 'Lista, inspecciona, crea o revoca túneles WebSocket multiplexados soberanos (Culkibo EdgeTunnel) para exponer servicios tras CGNAT sin puertos abiertos ni dependencia de Cloudflare (solo admin/owner; soporta dryRun: true).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['status', 'list', 'create', 'revoke'], description: 'Acción sobre EdgeTunnel' },
+            tunnelId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del túnel a revocar (requerido para action="revoke")' },
+            name: { type: 'string', minLength: 1, maxLength: 80, description: 'Nombre descriptivo del túnel (para action="create")' },
+            targetHost: { type: 'string', maxLength: 253, description: 'Host loopback destino del agente (default 127.0.0.1)' },
+            targetPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Puerto destino del servicio local (requerido para action="create")' },
+            hostname: { type: 'string', maxLength: 253, description: 'Dominio público opcional asociado al túnel (RFC 1123)' }
+          },
+          required: ['action']
+        }
       }
     ];
 
-    // Inyección automática de `outputSchema` estructurados y del parámetro opcional `dryRun`
-    // en todas las herramientas destructivas (33) + deploy_production y rollback_deployment (35 en total).
+    // Inyección automática de `outputSchema`, `_meta.ui` (MCP Apps 2026-01-26) y del parámetro opcional `dryRun`
+    // en todas las herramientas destructivas (35) + deploy_production y rollback_deployment (37 en total).
     for (const tool of this._toolsCache) {
       if (!tool.outputSchema && DEFAULT_OUTPUT_SCHEMAS[tool.name]) {
         tool.outputSchema = DEFAULT_OUTPUT_SCHEMAS[tool.name];
+      }
+      const uiResourceUri = mcpAppsRenderer.TOOL_UI_RESOURCE_MAP[tool.name];
+      if (uiResourceUri) {
+        tool._meta = {
+          ...(tool._meta || {}),
+          ui: { resourceUri: uiResourceUri }
+        };
       }
       if (tool.annotations?.destructiveHint === true || EXTRA_DRY_RUN_TOOLS.has(tool.name)) {
         if (!tool.inputSchema) tool.inputSchema = { type: 'object', properties: {} };
@@ -5244,6 +5327,34 @@ class McpServer extends EventEmitter {
         break;
       }
 
+      case 'culkibo_edge_tunnel': {
+        const action = String(args.action || 'status');
+        Object.assign(target, {
+          action,
+          tunnelId: args.tunnelId || null,
+          name: args.name || null,
+          targetHost: args.targetHost || '127.0.0.1',
+          targetPort: args.targetPort ?? null,
+          hostname: args.hostname || null
+        });
+        if (action === 'create') {
+          if (!args.targetPort) blockers.push('MISSING_TARGET_PORT');
+          effects.push(`Creará túnel CGNAT soberano '${args.name || `tunnel-${args.targetPort || '?'}`}' hacia ${args.targetHost || '127.0.0.1'}:${args.targetPort || '?'} y emitirá un token HMAC cket_ de visualización única.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'revoke') {
+          if (!args.tunnelId) blockers.push('MISSING_TUNNEL_ID');
+          effects.push(`Revocará inmediatamente el túnel EdgeTunnel '${args.tunnelId || '?'}' y cerrará sus streams WebSocket activos.`);
+          riskLevel = 'high';
+          reversible = false;
+        } else {
+          effects.push(`Consultará '${action}' de los túneles soberanos EdgeTunnel sin mutar estado.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
       default: {
         Object.assign(target, redactForAudit(args));
         effects.push(`Ejecutará la herramienta destructiva '${toolName}' con los parámetros validados.`);
@@ -7126,6 +7237,99 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        // --- MCP 2026 Cycle-2: SmartPack & Sovereign EdgeTunnel (2) ---
+        case 'culkibo_smartpack_plan': {
+          const sp = requireLazySvc('smartPackBuilder', 'Culkibo SmartPack');
+          let targetDir = process.cwd();
+          let resolvedProjectId = null;
+          if (args.projectId) {
+            const project = projectManager.getById(String(args.projectId));
+            if (!project) throw projectNotFoundError(args.projectId);
+            resolvedProjectId = project.id;
+            targetDir = project.localPath
+              ? path.resolve(String(project.localPath))
+              : path.resolve(__dirname, '..', '..', 'projects', project.id);
+          } else if (args.directory) {
+            const resolved = path.resolve(String(args.directory));
+            if (process.env.CULKIBO_ALLOW_ARBITRARY_SMARTPACK !== '1') {
+              const projectsRoot = path.resolve(__dirname, '..', '..', 'projects');
+              const cwdRoot = path.resolve(process.cwd());
+              const relProj = path.relative(projectsRoot, resolved);
+              const relCwd = path.relative(cwdRoot, resolved);
+              const inProjects = !relProj.startsWith('..') && !path.isAbsolute(relProj);
+              const inCwd = !relCwd.startsWith('..') && !path.isAbsolute(relCwd);
+              if (!inProjects && !inCwd) {
+                throw new McpToolError('FORBIDDEN_PATH', 'Solo se permite analizar directorios dentro del workspace o projects/ de Culkibo.', {
+                  retryable: false,
+                  remediation: 'Pasa un projectId válido o una ruta dentro del directorio actual o projects/.'
+                });
+              }
+            }
+            targetDir = resolved;
+          }
+          const plan = sp.generateBuildPlan(targetDir, { zstdChunked: Boolean(args.zstdChunked) });
+          const dockerignoreObj = plan && plan.dockerignore && typeof plan.dockerignore === 'object'
+            ? plan.dockerignore
+            : (typeof sp.generateImplicitDockerignore === 'function' ? sp.generateImplicitDockerignore(plan?.stack || 'node') : null);
+          const dockerignore = Array.isArray(dockerignoreObj?.patterns)
+            ? dockerignoreObj.patterns
+            : (Array.isArray(dockerignoreObj) ? dockerignoreObj : String(dockerignoreObj || '').split(/\r?\n/).filter(Boolean));
+          const resourceLimits = plan?.resourceLimits || (typeof sp.computeBuildKitResourceLimits === 'function'
+            ? sp.computeBuildKitResourceLimits()
+            : {});
+          const dockerfile = args.includeDockerfile !== false
+            ? (typeof plan?.dockerfile === 'string'
+                ? plan.dockerfile
+                : (typeof sp.renderDockerfileFromPlan === 'function' ? sp.renderDockerfileFromPlan(plan) : null))
+            : null;
+          res = {
+            directory: targetDir,
+            projectId: resolvedProjectId,
+            stack: String(plan?.stack || plan?.framework || 'generic'),
+            plan,
+            dockerignore,
+            resourceLimits,
+            dockerfile
+          };
+          break;
+        }
+
+        case 'culkibo_edge_tunnel': {
+          const et = requireLazySvc('edgeTunnelService', 'Culkibo EdgeTunnel');
+          const action = String(args.action || 'status');
+          if (action === 'status') {
+            const st = et.getStatus();
+            res = { action: 'status', status: st, tunnels: st.tunnels || [] };
+          } else if (action === 'list') {
+            const tunnels = et.listTunnels();
+            res = { action: 'list', tunnels, count: tunnels.length };
+          } else if (action === 'create') {
+            if (!args.targetPort) {
+              throw new McpToolError('MISSING_ARGUMENT', 'Falta targetPort para crear un túnel EdgeTunnel.', {
+                retryable: true,
+                remediation: 'Indica targetPort (1-65535), opcionalmente name, targetHost (default 127.0.0.1) y hostname.'
+              });
+            }
+            const tunnel = et.createTunnel({
+              name: args.name ? String(args.name) : `tunnel-${args.targetPort}`,
+              targetHost: args.targetHost ? String(args.targetHost) : '127.0.0.1',
+              targetPort: Number(args.targetPort),
+              ...(args.hostname ? { hostname: String(args.hostname) } : {})
+            });
+            res = { action: 'create', tunnel };
+          } else if (action === 'revoke') {
+            if (!args.tunnelId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'Falta tunnelId para revocar un túnel EdgeTunnel.', {
+                retryable: true,
+                remediation: 'Consulta los IDs con culkibo_edge_tunnel({ action: "list" }) y pasa tunnelId.'
+              });
+            }
+            const rev = et.revokeTunnel(String(args.tunnelId));
+            res = { action: 'revoke', ...rev };
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -7149,6 +7353,10 @@ class McpServer extends EventEmitter {
         isError: false
       };
       if (res !== null && typeof res === 'object') result.structuredContent = res;
+      const attachedUiUri = mcpAppsRenderer.TOOL_UI_RESOURCE_MAP[toolName];
+      if (attachedUiUri) {
+        result._meta = { ui: { resourceUri: attachedUiUri } };
+      }
       return result;
     } catch (err) {
       const durationMs = performance.now() - start;
@@ -7183,7 +7391,9 @@ class McpServer extends EventEmitter {
    * @param {any} [authOrPrincipal]
    */
   listResources(authOrPrincipal = null) {
-    const all = [
+    const principal = normalizePrincipal(authOrPrincipal);
+    if (principal.role === 'none') return [];
+    const dataResources = [
       {
         uri: 'culkibo://projects',
         name: 'Proyectos de Culkibo',
@@ -7227,7 +7437,15 @@ class McpServer extends EventEmitter {
         mimeType: 'application/json'
       }
     ];
-    const principal = normalizePrincipal(authOrPrincipal);
+    const uiResources = mcpAppsRenderer.MCP_APP_RESOURCES.map((app) => ({
+      uri: app.uri,
+      name: app.name,
+      title: app.title,
+      description: app.description,
+      mimeType: app.mimeType,
+      _meta: app._meta
+    }));
+    const all = [...dataResources, ...uiResources];
     if (principal.isSuperAdmin || principal.scopes.includes('*')) return all;
     /** @type {Record<string, string>} */
     const scopeByUri = {
@@ -7237,19 +7455,29 @@ class McpServer extends EventEmitter {
       'culkibo://domains': 'domains:read',
       'culkibo://fleet': 'fleet:read',
       'culkibo://uptime': 'uptime:read',
-      'culkibo://environments': 'environments:read'
+      'culkibo://environments': 'environments:read',
+      'ui://culkibo/topology': 'projects:read',
+      'ui://culkibo/incident-remediator': 'observability:read',
+      'ui://culkibo/coolify-migration-diff': 'migrations:read'
     };
     return all.filter((r) => scopeMatches(principal.scopes, scopeByUri[r.uri] || 'system:read', r.uri, false));
   }
 
   /**
-   * Lee un recurso MCP filtrando por ACL/RBAC del principal y redactando secretos.
+   * Lee un recurso MCP (JSON `culkibo://*` o MCP App interactiva `ui://culkibo/*`)
+   * filtrando por ACL/RBAC del principal y redactando secretos.
    * @param {string} uri
    * @param {{ auth?: any }} [context]
    */
   async readResource(uri, context = {}) {
     const clean = String(uri || '').trim();
     const principal = normalizePrincipal(context.auth);
+    if (principal.role === 'none') {
+      throw new McpToolError('FORBIDDEN', `Acceso denegado al recurso '${clean}' para credencial no autenticada o revocada.`, {
+        retryable: false,
+        remediation: 'Autentícate con un token válido antes de leer recursos MCP.'
+      });
+    }
     /** @type {Record<string, string>} */
     const resourceScopes = {
       'culkibo://projects': 'projects:read',
@@ -7258,7 +7486,10 @@ class McpServer extends EventEmitter {
       'culkibo://domains': 'domains:read',
       'culkibo://fleet': 'fleet:read',
       'culkibo://uptime': 'uptime:read',
-      'culkibo://environments': 'environments:read'
+      'culkibo://environments': 'environments:read',
+      'ui://culkibo/topology': 'projects:read',
+      'ui://culkibo/incident-remediator': 'observability:read',
+      'ui://culkibo/coolify-migration-diff': 'migrations:read'
     };
     const reqScope = resourceScopes[clean];
     if (reqScope && !principal.isSuperAdmin && !scopeMatches(principal.scopes, reqScope, clean, false)) {
@@ -7266,6 +7497,54 @@ class McpServer extends EventEmitter {
         retryable: false,
         remediation: 'Consulta tus scopes efectivos con culkibo_rbac_whoami o solicita un token con el scope de lectura correspondiente.'
       });
+    }
+
+    // --- MCP Apps (`ui://culkibo/*`, modelcontextprotocol/ext-apps 2026-01-26) ---
+    if (clean === 'ui://culkibo/topology') {
+      const allowedProjectIds = this._accessibleProjectIds(principal);
+      const topoSvc = lazySvc('topologyService');
+      /** @type {any} */
+      let topology = null;
+      if (topoSvc && typeof topoSvc.buildTopology === 'function') {
+        topology = topoSvc.buildTopology({ allowedProjectIds, isSuperAdmin: principal.isSuperAdmin });
+      } else {
+        const visible = projectManager.getAll().filter((p) => canAccessProject(principal, p.id, p));
+        topology = {
+          nodes: visible.map((p) => ({
+            id: `project:${p.id}`,
+            kind: 'project',
+            entityId: p.id,
+            label: p.name || p.id,
+            status: p.status || 'active',
+            health: 'healthy'
+          })),
+          edges: []
+        };
+      }
+      const rendered = mcpAppsRenderer.renderMcpApp(clean, topology);
+      return { contents: [rendered] };
+    }
+    if (clean === 'ui://culkibo/incident-remediator') {
+      const diag = await this.diagnoseIncident(principal, { includeDoctor: false, probeDomain: false });
+      const rendered = mcpAppsRenderer.renderMcpApp(clean, diag);
+      return { contents: [rendered] };
+    }
+    if (clean === 'ui://culkibo/coolify-migration-diff') {
+      const visibleProjects = projectManager.getAll()
+        .filter((p) => canAccessProject(principal, p.id, p))
+        .map((p) => ({ id: p.id, name: p.name, status: p.status || 'active', migrationSource: p.migrationSource || null }));
+      const visibleDbs = databaseManager.list()
+        .filter((d) => principal.isSuperAdmin || canAccessProject(principal, d.projectId))
+        .map((d) => ({ id: d.id, name: d.name, engine: d.engine }));
+      const rendered = mcpAppsRenderer.renderMcpApp(clean, {
+        parityScore: 100,
+        resources: {
+          apps: visibleProjects.filter((p) => p.migrationSource === 'coolify' || visibleProjects.length <= 20),
+          databases: visibleDbs,
+          services: []
+        }
+      });
+      return { contents: [rendered] };
     }
     /** @type {any} */
     let data = null;
@@ -7843,7 +8122,13 @@ class McpServer extends EventEmitter {
           capabilities: {
             tools: { listChanged: false },
             resources: { listChanged: false },
-            prompts: { listChanged: false }
+            prompts: { listChanged: false },
+            extensions: {
+              'io.modelcontextprotocol/ui': {
+                mimeTypes: [mcpAppsRenderer.MCP_APP_MIME_TYPE],
+                specVersion: mcpAppsRenderer.MCP_APPS_SPEC_VERSION
+              }
+            }
           },
           serverInfo: SERVER_INFO,
           instructions: `Este endpoint habla la revisión ${LEGACY_PROTOCOL_VERSION}, deprecada. Culkibo ya sirve la revisión ${PROTOCOL_VERSION} en POST /api/mcp (Streamable HTTP, sin handshake).`
@@ -7943,12 +8228,19 @@ class McpServer extends EventEmitter {
         capabilities: {
           tools: { listChanged: false, filtering: true },
           resources: { listChanged: false },
-          prompts: { listChanged: false }
+          prompts: { listChanged: false },
+          extensions: {
+            'io.modelcontextprotocol/ui': {
+              mimeTypes: [mcpAppsRenderer.MCP_APP_MIME_TYPE],
+              specVersion: mcpAppsRenderer.MCP_APPS_SPEC_VERSION
+            }
+          }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026: 109 herramientas anotadas, 7 recursos y 13 prompts incluyendo 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026: 111 herramientas anotadas, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',
+          'Las herramientas culkibo_list_projects, culkibo_list_pods, culkibo_diagnose_incident y culkibo_migrate_coolify enlazan MCP Apps nativas (ui://culkibo/topology, ui://culkibo/incident-remediator, ui://culkibo/coolify-migration-diff) con mimeType text/html;profile=mcp-app y CSP estricta.',
           'Usa prompts/list para acceder a los 8 playbooks interactivos (deploy_safely, migrate_from_coolify, debug_production_crash, zero_downtime_db_upgrade, security_audit_stack, setup_wildcard_tls_and_tunnel, optimize_ram_and_costs, disaster_recovery_drill) y culkibo_export_agent_kit para generar configs drop-in sin secretos en claro.',
           'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation: úsalo para decidir si reintentar o corregir los argumentos.'
         ].join(' '),

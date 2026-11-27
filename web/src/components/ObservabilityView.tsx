@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
   Bell,
   BellOff,
   Check,
@@ -9,6 +11,7 @@ import {
   Copy,
   Database,
   Globe,
+  Maximize2,
   Network,
   Plus,
   Radio,
@@ -18,6 +21,8 @@ import {
   Trash2,
   Wrench,
   XCircle,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import {
   api,
@@ -28,6 +33,7 @@ import {
   type SystemDoctorReport,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n } from '../lib/i18n';
 
 interface ObservabilityViewProps {
   onNotify: (msg: string, type?: 'success' | 'info' | 'error') => void;
@@ -382,10 +388,15 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
     cooldownMin: '30',
   });
 
-  // Topology state
+  // Topology state (Spatial Pan/Zoom SVG Canvas)
+  const { t } = useI18n();
   const [topology, setTopology] = useState<TopologyGraph | null>(null);
   const [topologyLoading, setTopologyLoading] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [topoZoom, setTopoZoom] = useState<number>(1);
+  const [topoPan, setTopoPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const topoDragRef = useRef<{ startX: number; startY: number; originX: number; originY: number; moved: boolean } | null>(null);
 
   const loadSnapshot = useCallback(async (fresh = false) => {
     try {
@@ -1511,169 +1522,473 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
         </div>
       )}
 
-      {/* TAB 3: VISUAL SERVICE TOPOLOGY / DEPENDENCY MAP */}
+      {/* TAB 3: RAILWAY-CLASS INTERACTIVE SPATIAL SVG TOPOLOGY CANVAS */}
       {activeTab === 'topology' && (
         <div className="space-y-4">
-          <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-            <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <section className="culkibo-surface rounded-2xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div>
-                <h2 className="text-sm font-semibold text-slate-900">Mapa visual de topología y dependencias</h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Flujo en vivo: Dominios/Monitores → Proyectos → Bases de datos / Redis / Catálogo → Servidores.
-                </p>
+                <h2 className="text-sm font-semibold text-slate-900">{t('topo.title')}</h2>
+                <p className="text-xs text-slate-500 mt-0.5">{t('topo.subtitle')}</p>
               </div>
-              <div className="flex items-center gap-2 text-xs">
+              <div className="flex items-center gap-1.5 flex-wrap text-xs">
                 {topology && (
                   <span className="px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200 text-slate-700 font-mono tabular-nums">
-                    {topology.summary.totalNodes} nodos · {topology.summary.totalEdges} enlaces
+                    {topology.summary.totalNodes} nodes · {topology.summary.totalEdges} edges
                   </span>
                 )}
+                <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5">
+                  <button
+                    type="button"
+                    aria-label="Zoom out"
+                    title="Zoom out"
+                    onClick={() => setTopoZoom((z) => Math.max(0.6, Number((z - 0.15).toFixed(2))))}
+                    className="p-1.5 rounded-md text-slate-600 hover:text-slate-900 hover:bg-white transition-colors cursor-pointer"
+                  >
+                    <ZoomOut className="w-3.5 h-3.5" />
+                  </button>
+                  <span className="px-2 font-mono text-[11px] text-slate-700 tabular-nums">
+                    {Math.round(topoZoom * 100)}%
+                  </span>
+                  <button
+                    type="button"
+                    aria-label="Zoom in"
+                    title="Zoom in"
+                    onClick={() => setTopoZoom((z) => Math.min(1.8, Number((z + 0.15).toFixed(2))))}
+                    className="p-1.5 rounded-md text-slate-600 hover:text-slate-900 hover:bg-white transition-colors cursor-pointer"
+                  >
+                    <ZoomIn className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={t('topo.fit')}
+                    title={t('topo.fit')}
+                    onClick={() => {
+                      setTopoZoom(1);
+                      setTopoPan({ x: 0, y: 0 });
+                    }}
+                    className="p-1.5 rounded-md text-slate-600 hover:text-slate-900 hover:bg-white transition-colors cursor-pointer"
+                  >
+                    <Maximize2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
                 <button
                   type="button"
                   onClick={() => void loadTopology()}
                   disabled={topologyLoading}
-                  className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer flex items-center gap-1.5"
+                  className="culkibo-press px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer flex items-center gap-1.5"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${topologyLoading ? 'animate-spin' : ''}`} />
-                  Actualizar mapa
+                  <span>{t('topo.refresh')}</span>
                 </button>
               </div>
             </div>
 
             {topologyLoading && !topology ? (
-              <div className="p-10 text-center text-xs text-slate-500">Construyendo mapa de dependencias…</div>
+              <div className="p-12 text-center text-xs text-slate-500">{t('topo.building')}</div>
             ) : !topology || !topologyLayout || topology.nodes.length === 0 ? (
-              <div className="p-10 text-center text-xs text-slate-500">
-                Crea tu primer proyecto o base de datos para visualizar su topología de red.
-              </div>
+              <div className="p-12 text-center text-xs text-slate-500">{t('topo.empty')}</div>
             ) : (
-              <div className="p-4 overflow-x-auto bg-slate-50/60">
-                <svg
-                  viewBox={`0 0 ${topologyLayout.svgW} ${topologyLayout.svgH}`}
-                  className="w-full min-w-[780px] h-auto select-none"
-                  role="img"
-                  aria-label="Mapa de topología de servicios Culkibo"
+              <div className="grid grid-cols-1 xl:grid-cols-[1fr_300px] divide-y xl:divide-y-0 xl:divide-x divide-slate-200">
+                {/* Interactive Pan & Zoom Spatial SVG Canvas */}
+                <div
+                  className={`relative overflow-hidden select-none min-h-[380px] ${
+                    isPanning ? 'cursor-grabbing' : 'cursor-grab'
+                  }`}
+                  style={{ backgroundColor: 'var(--topo-bg)' }}
+                  onPointerDown={(e) => {
+                    if ((e.target as HTMLElement).closest('[data-topo-node="true"]')) return;
+                    topoDragRef.current = {
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      originX: topoPan.x,
+                      originY: topoPan.y,
+                      moved: false,
+                    };
+                    setIsPanning(true);
+                  }}
+                  onPointerMove={(e) => {
+                    const drag = topoDragRef.current;
+                    if (!drag) return;
+                    const dx = e.clientX - drag.startX;
+                    const dy = e.clientY - drag.startY;
+                    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
+                    setTopoPan({ x: drag.originX + dx, y: drag.originY + dy });
+                  }}
+                  onPointerUp={() => {
+                    topoDragRef.current = null;
+                    setIsPanning(false);
+                  }}
+                  onPointerLeave={() => {
+                    topoDragRef.current = null;
+                    setIsPanning(false);
+                  }}
+                  onWheel={(e) => {
+                    if (e.ctrlKey || e.metaKey) {
+                      e.preventDefault();
+                      const delta = e.deltaY > 0 ? -0.1 : 0.1;
+                      setTopoZoom((z) => Math.min(1.8, Math.max(0.6, Number((z + delta).toFixed(2)))));
+                    }
+                  }}
                 >
-                  {/* Column headers */}
-                  {topologyLayout.cols.map((col) => (
-                    <text
-                      key={col.title}
-                      x={col.x}
-                      y={20}
-                      className="fill-slate-400 text-[11px] font-semibold uppercase tracking-wider"
-                    >
-                      {col.title}
-                    </text>
-                  ))}
-
-                  {/* Curved dependency edges */}
-                  {topology.edges.map((edge) => {
-                    const fromPos = topologyLayout.positioned.get(edge.from);
-                    const toPos = topologyLayout.positioned.get(edge.to);
-                    if (!fromPos || !toPos) return null;
-                    const x1 = fromPos.x + topologyLayout.nodeW;
-                    const y1 = fromPos.y + topologyLayout.nodeH / 2;
-                    const x2 = toPos.x;
-                    const y2 = toPos.y + topologyLayout.nodeH / 2;
-                    const midX = (x1 + x2) / 2;
-                    const isHighlighted = selectedNodeId === edge.from || selectedNodeId === edge.to;
-                    const stroke = HEALTH_STROKE[edge.status] || '#94a3b8';
-                    return (
-                      <g key={edge.id} opacity={selectedNodeId && !isHighlighted ? 0.22 : 0.9}>
-                        <path
-                          d={`M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`}
-                          fill="none"
-                          stroke={stroke}
-                          strokeWidth={isHighlighted ? 2.2 : 1.4}
-                        />
-                        {edge.label && (
-                          <text
-                            x={midX}
-                            y={(y1 + y2) / 2 - 4}
-                            textAnchor="middle"
-                            className="fill-slate-500 text-[9px] font-mono"
-                          >
-                            {edge.label}
-                          </text>
-                        )}
-                      </g>
-                    );
-                  })}
-
-                  {/* Interactive service nodes */}
-                  {Array.from(topologyLayout.positioned.values()).map(({ node, x, y }) => {
-                    const isSelected = selectedNodeId === node.id;
-                    const isConnected =
-                      isSelected ||
-                      !selectedNodeId ||
-                      topology.edges.some(
-                        (e) =>
-                          (e.from === selectedNodeId && e.to === node.id) ||
-                          (e.to === selectedNodeId && e.from === node.id)
-                      );
-                    const strokeColor = isSelected ? '#0f172a' : '#e2e8f0';
-                    const dotColor = HEALTH_STROKE[node.health] || '#94a3b8';
-                    return (
-                      <g
-                        key={node.id}
-                        transform={`translate(${x}, ${y})`}
-                        onClick={() => setSelectedNodeId((prev) => (prev === node.id ? null : node.id))}
-                        className="cursor-pointer"
-                        opacity={isConnected ? 1 : 0.35}
+                  <svg
+                    viewBox={`0 0 ${topologyLayout.svgW} ${Math.max(360, topologyLayout.svgH + 24)}`}
+                    className="w-full h-[420px] xl:h-[460px] block"
+                    role="img"
+                    aria-label={t('topo.title')}
+                  >
+                    <defs>
+                      <pattern id="topo-dots" width="22" height="22" patternUnits="userSpaceOnUse">
+                        <circle cx="2" cy="2" r="1" fill="var(--topo-dot)" />
+                      </pattern>
+                      <marker
+                        id="topo-arrow"
+                        viewBox="0 0 10 10"
+                        refX="8"
+                        refY="5"
+                        markerWidth="5.5"
+                        markerHeight="5.5"
+                        orient="auto-start-reverse"
                       >
-                        <rect
-                          width={topologyLayout.nodeW}
-                          height={topologyLayout.nodeH}
-                          rx={10}
-                          fill="#ffffff"
-                          stroke={strokeColor}
-                          strokeWidth={isSelected ? 2 : 1}
-                        />
-                        <circle cx={16} cy={22} r={4.5} fill={dotColor} />
-                        <text x={28} y={25} className="fill-slate-900 text-[12px] font-semibold">
-                          {node.label.length > 22 ? `${node.label.slice(0, 21)}…` : node.label}
-                        </text>
-                        <text x={28} y={44} className="fill-slate-500 text-[10px] font-mono">
-                          {(node.sublabel || node.kind).slice(0, 26)}
-                        </text>
-                      </g>
-                    );
-                  })}
-                </svg>
+                        <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#71717a" />
+                      </marker>
+                      <marker
+                        id="topo-arrow-healthy"
+                        viewBox="0 0 10 10"
+                        refX="8"
+                        refY="5"
+                        markerWidth="5.5"
+                        markerHeight="5.5"
+                        orient="auto-start-reverse"
+                      >
+                        <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#10b981" />
+                      </marker>
+                    </defs>
+
+                    <rect width="100%" height="100%" fill="url(#topo-dots)" />
+
+                    <g transform={`translate(${topoPan.x}, ${topoPan.y}) scale(${topoZoom})`}>
+                      {/* Column headers */}
+                      {topologyLayout.cols.map((col, idx) => {
+                        const colTitles = [t('topo.colEdge'), t('topo.colProjects'), t('topo.colData'), t('topo.colServers')];
+                        return (
+                          <text
+                            key={col.title}
+                            x={col.x}
+                            y={22}
+                            fill="var(--topo-col-label)"
+                            className="text-[10.5px] font-semibold uppercase tracking-wider"
+                          >
+                            {colTitles[idx] || col.title}
+                          </text>
+                        );
+                      })}
+
+                      {/* Curved dependency edges + animated directional flow pulses */}
+                      {topology.edges.map((edge) => {
+                        const fromPos = topologyLayout.positioned.get(edge.from);
+                        const toPos = topologyLayout.positioned.get(edge.to);
+                        if (!fromPos || !toPos) return null;
+                        const x1 = fromPos.x + topologyLayout.nodeW;
+                        const y1 = fromPos.y + topologyLayout.nodeH / 2;
+                        const x2 = toPos.x - 4;
+                        const y2 = toPos.y + topologyLayout.nodeH / 2;
+                        const dx = Math.max(48, Math.abs(x2 - x1) * 0.45);
+                        const pathD = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+                        const midX = (x1 + x2) / 2;
+                        const midY = (y1 + y2) / 2;
+                        const isHighlighted = selectedNodeId === edge.from || selectedNodeId === edge.to;
+                        const stroke = HEALTH_STROKE[edge.status] || '#71717a';
+                        const isHealthy = edge.status === 'healthy';
+                        return (
+                          <g key={edge.id} opacity={selectedNodeId && !isHighlighted ? 0.18 : 0.95}>
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke={stroke}
+                              strokeOpacity={isHighlighted ? 0.9 : 0.42}
+                              strokeWidth={isHighlighted ? 2.2 : 1.5}
+                              markerEnd={isHealthy ? 'url(#topo-arrow-healthy)' : 'url(#topo-arrow)'}
+                            />
+                            {(isHealthy || isHighlighted) && (
+                              <path
+                                d={pathD}
+                                fill="none"
+                                stroke={stroke}
+                                strokeWidth={isHighlighted ? 2.2 : 1.6}
+                                strokeLinecap="round"
+                                className="culkibo-flow-edge"
+                              />
+                            )}
+                            {edge.label && (
+                              <g transform={`translate(${midX}, ${midY - 8})`}>
+                                <rect
+                                  x={-26}
+                                  y={-8}
+                                  width={52}
+                                  height={15}
+                                  rx={4}
+                                  fill="var(--topo-edge-label-bg)"
+                                  stroke="var(--topo-node-stroke)"
+                                  strokeWidth={0.75}
+                                />
+                                <text
+                                  x={0}
+                                  y={2.5}
+                                  textAnchor="middle"
+                                  fill="var(--topo-muted)"
+                                  className="text-[8.5px] font-mono"
+                                >
+                                  {edge.label.slice(0, 10)}
+                                </text>
+                              </g>
+                            )}
+                          </g>
+                        );
+                      })}
+
+                      {/* Interactive Spatial Nodes with type badge + live status */}
+                      {Array.from(topologyLayout.positioned.values()).map(({ node, x, y }) => {
+                        const isSelected = selectedNodeId === node.id;
+                        const isConnected =
+                          isSelected ||
+                          !selectedNodeId ||
+                          topology.edges.some(
+                            (e) =>
+                              (e.from === selectedNodeId && e.to === node.id) ||
+                              (e.to === selectedNodeId && e.from === node.id)
+                          );
+                        const dotColor = HEALTH_STROKE[node.health] || '#71717a';
+                        const kindAccent: Record<TopologyNode['kind'], string> = {
+                          domain: '#10b981',
+                          monitor: '#06b6d4',
+                          project: '#f59e0b',
+                          database: '#6366f1',
+                          cache: '#ec4899',
+                          catalog: '#8b5cf6',
+                          server: '#64748b',
+                        };
+                        const accent = kindAccent[node.kind] || '#71717a';
+                        return (
+                          <g
+                            key={node.id}
+                            data-topo-node="true"
+                            transform={`translate(${x}, ${y})`}
+                            onClick={() => setSelectedNodeId((prev) => (prev === node.id ? null : node.id))}
+                            className="cursor-pointer"
+                            opacity={isConnected ? 1 : 0.28}
+                          >
+                            {isSelected && (
+                              <rect
+                                x={-3}
+                                y={-3}
+                                width={topologyLayout.nodeW + 6}
+                                height={topologyLayout.nodeH + 6}
+                                rx={14}
+                                fill="none"
+                                stroke={accent}
+                                strokeOpacity={0.45}
+                                strokeWidth={2}
+                              />
+                            )}
+                            <rect
+                              width={topologyLayout.nodeW}
+                              height={topologyLayout.nodeH}
+                              rx={11}
+                              fill="var(--topo-node-bg)"
+                              stroke={isSelected ? 'var(--topo-node-selected)' : 'var(--topo-node-stroke)'}
+                              strokeWidth={isSelected ? 1.8 : 1}
+                            />
+                            {/* Left accent bar */}
+                            <rect x={0.5} y={10} width={3} height={topologyLayout.nodeH - 20} rx={1.5} fill={accent} />
+                            {/* Health dot */}
+                            <circle cx={17} cy={22} r={4} fill={dotColor} />
+                            {/* Node name */}
+                            <text
+                              x={27}
+                              y={25}
+                              fill="var(--topo-text)"
+                              className="text-[11.5px] font-semibold"
+                            >
+                              {node.label.length > 18 ? `${node.label.slice(0, 17)}…` : node.label}
+                            </text>
+                            {/* Type badge pill */}
+                            <rect
+                              x={topologyLayout.nodeW - 56}
+                              y={11}
+                              width={48}
+                              height={16}
+                              rx={4}
+                              fill="var(--topo-badge-bg)"
+                            />
+                            <text
+                              x={topologyLayout.nodeW - 32}
+                              y={22}
+                              textAnchor="middle"
+                              fill="var(--topo-muted)"
+                              className="text-[8px] font-mono uppercase"
+                            >
+                              {node.kind.slice(0, 8)}
+                            </text>
+                            {/* Sublabel */}
+                            <text
+                              x={17}
+                              y={46}
+                              fill="var(--topo-muted)"
+                              className="text-[9.5px] font-mono"
+                            >
+                              {(node.sublabel || node.status).slice(0, 27)}
+                            </text>
+                          </g>
+                        );
+                      })}
+                    </g>
+                  </svg>
+
+                  {/* Bottom-left subtle canvas hint */}
+                  <div className="pointer-events-none absolute bottom-3 left-3 px-2.5 py-1 rounded-lg bg-white/85 border border-slate-200/80 text-[10px] text-slate-500 backdrop-blur-xs">
+                    {t('topo.dragHint')}
+                  </div>
+                </div>
+
+                {/* Railway-style Live Node Inspector Side Panel */}
+                <aside className="p-4 bg-white flex flex-col justify-between gap-4 text-xs">
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                      <span className="font-semibold text-slate-900">{t('topo.inspectorTitle')}</span>
+                      {selectedNode && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedNodeId(null)}
+                          className="text-[11px] text-slate-400 hover:text-slate-700 cursor-pointer"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+
+                    {selectedNode ? (
+                      <div className="space-y-3">
+                        <div className="flex items-start gap-2.5">
+                          <span className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center shrink-0">
+                            {(() => {
+                              const Icon = KIND_ICON[selectedNode.kind] || Activity;
+                              return <Icon className="w-4 h-4 text-slate-700" />;
+                            })()}
+                          </span>
+                          <div className="min-w-0">
+                            <div className="font-semibold text-slate-900 text-sm truncate">{selectedNode.label}</div>
+                            <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                              <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] uppercase text-slate-600">
+                                {selectedNode.kind}
+                              </span>
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-50 border border-slate-200 font-mono text-[10px] text-slate-700">
+                                <span className={`w-1.5 h-1.5 rounded-full ${HEALTH_DOT[selectedNode.health] || HEALTH_DOT.unknown}`} />
+                                {selectedNode.status}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {selectedNode.sublabel && (
+                          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 font-mono text-[11px] text-slate-600">
+                            {selectedNode.sublabel}
+                          </div>
+                        )}
+
+                        {(() => {
+                          const inbound = selectedEdges.filter((e) => e.to === selectedNode.id);
+                          const outbound = selectedEdges.filter((e) => e.from === selectedNode.id);
+                          return (
+                            <div className="space-y-2.5">
+                              {inbound.length > 0 && (
+                                <div className="space-y-1">
+                                  <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                                    {t('topo.inbound')} ({inbound.length})
+                                  </div>
+                                  {inbound.map((e) => {
+                                    const src = topology.nodes.find((n) => n.id === e.from);
+                                    return (
+                                      <button
+                                        key={e.id}
+                                        type="button"
+                                        onClick={() => setSelectedNodeId(e.from)}
+                                        className="w-full px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200/80 flex items-center justify-between gap-2 text-left cursor-pointer"
+                                      >
+                                        <span className="inline-flex items-center gap-1.5 truncate text-slate-700">
+                                          <ArrowLeft className="w-3 h-3 text-slate-400 shrink-0" />
+                                          <span className="truncate">{src?.label || e.from}</span>
+                                        </span>
+                                        <span className="font-mono text-[10px] text-slate-400 shrink-0">{e.label || e.kind}</span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              {outbound.length > 0 && (
+                                <div className="space-y-1">
+                                  <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                                    {t('topo.outbound')} ({outbound.length})
+                                  </div>
+                                  {outbound.map((e) => {
+                                    const dst = topology.nodes.find((n) => n.id === e.to);
+                                    return (
+                                      <button
+                                        key={e.id}
+                                        type="button"
+                                        onClick={() => setSelectedNodeId(e.to)}
+                                        className="w-full px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200/80 flex items-center justify-between gap-2 text-left cursor-pointer"
+                                      >
+                                        <span className="inline-flex items-center gap-1.5 truncate text-slate-700">
+                                          <ArrowRight className="w-3 h-3 text-slate-400 shrink-0" />
+                                          <span className="truncate">{dst?.label || e.to}</span>
+                                        </span>
+                                        <span className="font-mono text-[10px] text-slate-400 shrink-0">{e.label || e.kind}</span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        <p className="text-slate-500 leading-relaxed">{t('topo.inspectorEmpty')}</p>
+                        <div className="grid grid-cols-2 gap-2 tabular-nums">
+                          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                            <span className="text-[10px] text-slate-400 block">{t('topo.colProjects')}</span>
+                            <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.projects}</span>
+                          </div>
+                          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                            <span className="text-[10px] text-slate-400 block">Databases</span>
+                            <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.databases}</span>
+                          </div>
+                          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                            <span className="text-[10px] text-slate-400 block">Domains</span>
+                            <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.domains}</span>
+                          </div>
+                          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                            <span className="text-[10px] text-slate-400 block">Servers</span>
+                            <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.servers}</span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Color Legend */}
+                  <div className="pt-3 border-t border-slate-100 flex flex-wrap gap-x-3 gap-y-1.5 text-[10px] text-slate-500">
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500" />Domain</span>
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-500" />Project</span>
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-indigo-500" />Database</span>
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-500" />Server</span>
+                  </div>
+                </aside>
               </div>
             )}
           </section>
-
-          {selectedNode && (
-            <section className="bg-white border border-slate-200 rounded-xl p-4 text-xs space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  {(() => {
-                    const Icon = KIND_ICON[selectedNode.kind] || Activity;
-                    return <Icon className="w-4 h-4 text-slate-700" />;
-                  })()}
-                  <span className="font-semibold text-slate-900 text-sm">{selectedNode.label}</span>
-                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 font-mono text-[10px]`}>
-                    <span className={`w-1.5 h-1.5 rounded-full ${HEALTH_DOT[selectedNode.health] || HEALTH_DOT.unknown}`} />
-                    {selectedNode.status}
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setSelectedNodeId(null)}
-                  className="text-slate-400 hover:text-slate-700 cursor-pointer"
-                >
-                  Cerrar
-                </button>
-              </div>
-              {selectedEdges.length > 0 && (
-                <div className="text-slate-600">
-                  Conexiones ({selectedEdges.length}):{' '}
-                  {selectedEdges.map((e) => `${e.from.split(':')[1]} → ${e.to.split(':')[1]} (${e.label || e.kind})`).join(' · ')}
-                </div>
-              )}
-            </section>
-          )}
         </div>
       )}
     </div>

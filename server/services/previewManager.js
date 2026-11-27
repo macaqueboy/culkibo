@@ -7,6 +7,29 @@ const portRegistry = require('./portRegistry');
 const { atomicWriteJsonSync, assertContainedPath, formatDockerEnvFile } = require('./ssrfGuard');
 
 const PREVIEW_DOMAIN_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+const SAFE_PG_IDENT_RE = /^[a-z][a-z0-9_]{0,62}$/;
+const SAFE_DOCKER_CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+
+/** Normaliza un fragmento para identificador SQL seguro (PostgreSQL <= 63 chars). */
+function pgIdentSlug(raw, maxLen = 24) {
+  const clean = String(raw || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_{2,}/g, '_')
+    .slice(0, maxLen)
+    .replace(/_+$/g, '');
+  return clean || 'app';
+}
+
+/** Valida estrictamente un identificador PostgreSQL (`^[a-z][a-z0-9_]{0,62}$`). */
+function assertSafePgIdent(val, label) {
+  const s = String(val || '').trim();
+  if (!SAFE_PG_IDENT_RE.test(s)) {
+    throw new Error(`Identificador PostgreSQL inválido para ${label}: "${s.slice(0, 48)}"`);
+  }
+  return s;
+}
 
 const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
   ? path.resolve(process.env.CULKIBO_DATA_DIR)
@@ -95,8 +118,12 @@ class PreviewManager extends EventEmitter {
       this.tmpDir = path.join(DATA_DIR, '.tmp');
     }
     this.storeBakFile = `${this.storeFile}.bak`;
+    this.branchStoreFile = path.join(path.dirname(this.storeFile), 'preview-db-branches.json');
     /** @type {Record<string, Record<string, any>>} */
     this.store = {};
+    /** @type {Record<string, any>} */
+    this._dbBranches = {};
+    this._branchesLoaded = false;
     /** @type {Set<string>} */
     this.inFlightKeys = new Set();
     /**
@@ -397,6 +424,21 @@ class PreviewManager extends EventEmitter {
         }
 
         const linkedDb = dm.resolveLinkedDatabases(project);
+        /** @type {any} */
+        let provisionedDbBranch = null;
+        if (cfg.branchDatabase && record.prNumber != null) {
+          const branchCfg = typeof cfg.branchDatabase === 'object' ? cfg.branchDatabase : {};
+          const branchPlan = this.planPreviewDbBranch(project, record.prNumber, {
+            ...branchCfg,
+            execute: branchCfg.engine === 'sqlite' || branchCfg.engine === 'sqlite3'
+          });
+          if (branchPlan.engine === 'postgres' && branchCfg.execute !== false && Array.isArray(branchPlan.createArgv)) {
+            const branchRun = await dm.runDocker(branchPlan.createArgv, { timeoutMs: 30000, signal: controller.signal });
+            if (branchRun && branchRun.code === 0) branchPlan.provisioned = true;
+          }
+          provisionedDbBranch = branchPlan;
+          record.dbBranch = branchPlan;
+        }
         const scopedPreviewEnv = (cfg.envVars && typeof cfg.envVars === 'object' && !Array.isArray(cfg.envVars))
           ? cfg.envVars
           : {};
@@ -404,6 +446,7 @@ class PreviewManager extends EventEmitter {
           ...linkedDb.injectedEnv,
           ...(project.envVars || {}),
           ...scopedPreviewEnv,
+          ...(provisionedDbBranch && provisionedDbBranch.envOverride ? provisionedDbBranch.envOverride : {}),
           CULKIBO_PREVIEW: '1',
           CULKIBO_PREVIEW_BRANCH: record.branch,
           CULKIBO_PREVIEW_URL: record.url
@@ -577,6 +620,10 @@ class PreviewManager extends EventEmitter {
           await dm.runDocker(['rm', '-f', containerName], { timeoutMs: 15000 }).catch(() => {});
           containerStarted = false;
         }
+        // Si falló o se abortó antes de activar, limpiar rama de BD preview recién creada (cura coolify#12458)
+        if (record.dbBranch && (!previousRecord || previousRecord.status !== 'active')) {
+          await this.teardownPreviewDbBranch(`${project.id}:${identity.key}`, { branchPlan: record.dbBranch }).catch(() => {});
+        }
         const isAborted = buildEntry.cancelled || err?.code === 'PREVIEW_ABORTED' || err?.code === 'PREVIEW_SUPERSEDED';
         if (isAborted) {
           if (buildEntry.destroyed) {
@@ -697,8 +744,314 @@ class PreviewManager extends EventEmitter {
       if (Object.keys(projMap).length === 0) delete this.store[projectId];
       this.save();
     }
-    this.emit('preview_event', { action: 'destroyed', projectId, key, abortedBuild });
-    return { removed: true, abortedBuild, key };
+
+    // Limpieza automática e idempotente de ramas de BD de preview (cura coolify#12458 zombie leaks)
+    /** @type {any} */
+    let dbBranchTeardown = null;
+    try {
+      dbBranchTeardown = await this.teardownPreviewDbBranch(`${projectId}:${key}`, {
+        branchPlan: prev?.dbBranch || null
+      });
+    } catch (e) {}
+
+    this.emit('preview_event', { action: 'destroyed', projectId, key, abortedBuild, dbBranchTeardown });
+    return { removed: true, abortedBuild, key, dbBranchTeardown };
+  }
+
+  _ensureBranchesLoaded() {
+    if (this._branchesLoaded) return;
+    this._branchesLoaded = true;
+    try {
+      if (fs.existsSync(this.branchStoreFile)) {
+        const parsed = JSON.parse(fs.readFileSync(this.branchStoreFile, 'utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          this._dbBranches = parsed;
+          return;
+        }
+      }
+    } catch (e) {}
+    this._dbBranches = {};
+  }
+
+  _saveBranches() {
+    this._ensureBranchesLoaded();
+    try {
+      fs.mkdirSync(path.dirname(this.branchStoreFile), { recursive: true });
+      atomicWriteJsonSync(this.branchStoreFile, this._dbBranches, 0o600);
+    } catch (e) {
+      console.error('[PreviewManager] No se pudo guardar preview-db-branches.json:', e.message);
+    }
+  }
+
+  /**
+   * Planifica (y opcionalmente aprovisiona si `dbConfig.execute === true`) una rama de BD
+   * aislada para una Pull Request (PostgreSQL `CREATE DATABASE ... WITH TEMPLATE ...` vía
+   * `psql -v` parametrizado sin shell, o SQLite Copy-on-Write con `COPYFILE_FICLONE`).
+   *
+   * @param {any} project
+   * @param {number | string} prNumber
+   * @param {{
+   *   engine?: string,
+   *   sourceDb?: string,
+   *   dbName?: string,
+   *   username?: string,
+   *   containerName?: string,
+   *   host?: string,
+   *   port?: number | string,
+   *   sourcePath?: string,
+   *   dbPath?: string,
+   *   execute?: boolean,
+   *   executor?: (argv: string[]) => Promise<{ code: number, stdout?: string, stderr?: string }>
+   * }} [dbConfig]
+   */
+  planPreviewDbBranch(project, prNumber, dbConfig = {}) {
+    if (!project || !project.id) {
+      throw new Error('planPreviewDbBranch requiere un proyecto válido con id');
+    }
+    const cleanPr = String(prNumber == null ? '' : prNumber).replace(/^pr-/i, '').trim();
+    if (!/^[1-9][0-9]{0,7}$/.test(cleanPr)) {
+      throw new Error(`Número de PR inválido para branch DB: "${String(prNumber)}"`);
+    }
+    const key = `pr-${cleanPr}`;
+    const previewId = `${project.id}:${key}`;
+    const rawEngine = String(dbConfig.engine || 'postgres').trim().toLowerCase();
+
+    if (rawEngine === 'sqlite' || rawEngine === 'sqlite3') {
+      const sourcePathRaw = String(dbConfig.sourcePath || dbConfig.dbPath || '').trim();
+      if (!sourcePathRaw || /[\0\r\n]/.test(sourcePathRaw)) {
+        throw new Error('La rama SQLite requiere dbConfig.sourcePath válido');
+      }
+      const sourcePath = path.resolve(sourcePathRaw);
+      const safeProjDir = dnsLabel(project.id, 32);
+      const branchDir = assertContainedPath(this.workDir, path.join(safeProjDir, key));
+      const branchPath = assertContainedPath(branchDir, 'branch.sqlite');
+      const cleanupFiles = [branchPath, `${branchPath}-wal`, `${branchPath}-shm`];
+
+      /** @type {any} */
+      const plan = {
+        ok: true,
+        previewId,
+        projectId: project.id,
+        key,
+        prNumber: Number(cleanPr),
+        engine: 'sqlite',
+        strategy: 'sqlite_cow_clone',
+        zeroShell: true,
+        idempotentTeardown: true,
+        sourcePath,
+        branchPath,
+        cleanupFiles,
+        envOverride: {
+          DATABASE_URL: `file:${branchPath}`,
+          CULKIBO_PREVIEW_DB_BRANCH: previewId
+        },
+        provisioned: false,
+        createdAt: new Date().toISOString()
+      };
+
+      if (dbConfig.execute) {
+        if (!fs.existsSync(sourcePath)) {
+          throw new Error(`Archivo SQLite origen no encontrado: ${sourcePath}`);
+        }
+        fs.mkdirSync(branchDir, { recursive: true, mode: 0o700 });
+        try {
+          fs.copyFileSync(sourcePath, branchPath, fs.constants.COPYFILE_FICLONE);
+        } catch (e) {
+          fs.copyFileSync(sourcePath, branchPath);
+        }
+        const srcWal = `${sourcePath}-wal`;
+        if (fs.existsSync(srcWal)) {
+          try {
+            fs.copyFileSync(srcWal, `${branchPath}-wal`, fs.constants.COPYFILE_FICLONE);
+          } catch (e) {
+            fs.copyFileSync(srcWal, `${branchPath}-wal`);
+          }
+        }
+        plan.provisioned = true;
+        this._ensureBranchesLoaded();
+        this._dbBranches[previewId] = plan;
+        this._saveBranches();
+      }
+      return plan;
+    }
+
+    if (!['postgres', 'postgresql', 'pgvector', 'timescaledb'].includes(rawEngine)) {
+      throw new Error(`Motor no soportado para Preview DB Branching: "${rawEngine}" (usa postgres o sqlite)`);
+    }
+
+    const sourceDbName = assertSafePgIdent(dbConfig.sourceDb || dbConfig.dbName || 'app', 'sourceDb');
+    const username = assertSafePgIdent(dbConfig.username || 'postgres', 'username');
+    const containerName = String(dbConfig.containerName || 'culkibo-postgres').trim();
+    if (!SAFE_DOCKER_CONTAINER_RE.test(containerName)) {
+      throw new Error(`Nombre de contenedor PostgreSQL inválido: "${containerName.slice(0, 60)}"`);
+    }
+    const host = String(dbConfig.host || containerName).trim();
+    if (!/^[a-zA-Z0-9._-]+$/.test(host)) {
+      throw new Error(`Host PostgreSQL inválido: "${host.slice(0, 60)}"`);
+    }
+    const port = Number(dbConfig.port || 5432);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`Puerto PostgreSQL inválido: "${dbConfig.port}"`);
+    }
+
+    const branchDbName = assertSafePgIdent(
+      `culkibo_prev_${pgIdentSlug(project.id, 28)}_pr${cleanPr}`,
+      'branchDbName'
+    );
+
+    // Zero-shell: argumentos parametrizados con variables `psql -v` e identificadores `:"var"`
+    const createSql = 'CREATE DATABASE :"branch_db" WITH TEMPLATE :"template_db" OWNER :"db_owner";';
+    const dropSql = 'DROP DATABASE IF EXISTS :"branch_db" WITH (FORCE);';
+
+    const createArgv = [
+      'exec', '-i', containerName,
+      'psql', '-v', 'ON_ERROR_STOP=1',
+      '-v', `branch_db=${branchDbName}`,
+      '-v', `template_db=${sourceDbName}`,
+      '-v', `db_owner=${username}`,
+      '-U', username, '-d', 'postgres',
+      '-c', createSql
+    ];
+    const teardownArgv = [
+      'exec', '-i', containerName,
+      'psql', '-v', 'ON_ERROR_STOP=1',
+      '-v', `branch_db=${branchDbName}`,
+      '-U', username, '-d', 'postgres',
+      '-c', dropSql
+    ];
+
+    const plan = {
+      ok: true,
+      previewId,
+      projectId: project.id,
+      key,
+      prNumber: Number(cleanPr),
+      engine: 'postgres',
+      strategy: 'postgres_create_database_template',
+      zeroShell: true,
+      idempotentTeardown: true,
+      containerName,
+      sourceDbName,
+      branchDbName,
+      username,
+      host,
+      port,
+      sqlTemplates: {
+        createSql,
+        dropSql
+      },
+      createCommand: { program: 'docker', args: createArgv },
+      teardownCommand: { program: 'docker', args: teardownArgv },
+      createArgv,
+      teardownArgv,
+      envOverride: {
+        DATABASE_URL: `postgresql://${username}:\${vault.DB_PASSWORD}@${host}:${port}/${branchDbName}`,
+        PGDATABASE: branchDbName,
+        CULKIBO_PREVIEW_DB_BRANCH: previewId
+      },
+      provisioned: false,
+      createdAt: new Date().toISOString()
+    };
+
+    // Registrar en el almacén de ramas para que teardownPreviewDbBranch pueda limpiar tras reinicios
+    this._ensureBranchesLoaded();
+    this._dbBranches[previewId] = plan;
+    this._saveBranches();
+
+    return plan;
+  }
+
+  /**
+   * Destruye de forma 100% idempotente la rama de base de datos asociada a una vista previa
+   * (cura `coolify#12458` evitando fugas de BDs huérfanas al cerrar o fallar una PR).
+   *
+   * @param {string | { projectId: string, key?: string, prNumber?: number | string }} previewIdOrTarget
+   * @param {{
+   *   branchPlan?: any,
+   *   dryRun?: boolean,
+   *   executor?: (argv: string[]) => Promise<{ code: number, stdout?: string, stderr?: string }>
+   * }} [opts]
+   */
+  async teardownPreviewDbBranch(previewIdOrTarget, opts = {}) {
+    this._ensureBranchesLoaded();
+    let previewId = '';
+    if (typeof previewIdOrTarget === 'string') {
+      previewId = previewIdOrTarget.trim();
+    } else if (previewIdOrTarget && typeof previewIdOrTarget === 'object') {
+      const k = previewIdOrTarget.key
+        || (previewIdOrTarget.prNumber != null ? `pr-${String(previewIdOrTarget.prNumber).replace(/[^0-9]/g, '')}` : '');
+      if (previewIdOrTarget.projectId && k) previewId = `${previewIdOrTarget.projectId}:${k}`;
+    }
+    if (!previewId) {
+      return { ok: true, previewId: '', destroyed: false, alreadyCleaned: true };
+    }
+
+    const branch = this._dbBranches[previewId] || opts.branchPlan || null;
+    if (!branch) {
+      return { ok: true, previewId, destroyed: false, alreadyCleaned: true };
+    }
+
+    if (branch.engine === 'sqlite') {
+      /** @type {string[]} */
+      const removedFiles = [];
+      const files = Array.isArray(branch.cleanupFiles) && branch.cleanupFiles.length > 0
+        ? branch.cleanupFiles
+        : [branch.branchPath, `${branch.branchPath}-wal`, `${branch.branchPath}-shm`];
+      if (!opts.dryRun) {
+        for (const fp of files) {
+          if (!fp) continue;
+          try {
+            if (fs.existsSync(fp)) {
+              fs.unlinkSync(fp);
+              removedFiles.push(fp);
+            }
+          } catch (e) {}
+        }
+        delete this._dbBranches[previewId];
+        this._saveBranches();
+      }
+      return {
+        ok: true,
+        previewId,
+        engine: 'sqlite',
+        destroyed: !opts.dryRun,
+        alreadyCleaned: false,
+        dryRun: Boolean(opts.dryRun),
+        removedFiles
+      };
+    }
+
+    // PostgreSQL teardown (idempotente gracias a DROP DATABASE IF EXISTS ... WITH (FORCE))
+    const teardownArgv = Array.isArray(branch.teardownArgv) ? branch.teardownArgv : null;
+    /** @type {any} */
+    let execResult = null;
+    if (!opts.dryRun && teardownArgv) {
+      const runner = typeof opts.executor === 'function'
+        ? opts.executor
+        : (argv) => this._getDeployManager().runDocker(argv, { timeoutMs: 20000 });
+      try {
+        execResult = await runner(teardownArgv);
+      } catch (err) {
+        execResult = { code: -1, stderr: err.message };
+      }
+    }
+
+    if (!opts.dryRun) {
+      delete this._dbBranches[previewId];
+      this._saveBranches();
+    }
+
+    return {
+      ok: true,
+      previewId,
+      engine: branch.engine || 'postgres',
+      branchDbName: branch.branchDbName || null,
+      destroyed: !opts.dryRun,
+      alreadyCleaned: false,
+      dryRun: Boolean(opts.dryRun),
+      teardownCommand: { program: 'docker', args: teardownArgv || [] },
+      execResult
+    };
   }
 
   async destroyProjectPreviews(projectId) {

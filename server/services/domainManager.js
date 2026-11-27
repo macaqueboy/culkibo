@@ -312,6 +312,17 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Resuelve la ruta de `domains.json` respetando `CULKIBO_DATA_DIR` (consistente con auth/rbac/projects).
+ * @returns {string}
+ */
+function resolveDefaultDomainsFile() {
+  if (process.env.CULKIBO_DATA_DIR) {
+    return path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'domains.json');
+  }
+  return DOMAINS_FILE;
+}
+
 class DomainManager {
   /**
    * @param {{
@@ -325,7 +336,7 @@ class DomainManager {
   constructor(opts = {}) {
     this.domainsFile = opts.domainsFile
       || (opts.dataDir ? path.join(path.resolve(opts.dataDir), 'domains.json') : null)
-      || (process.env.CULKIBO_DATA_DIR ? path.join(path.resolve(process.env.CULKIBO_DATA_DIR), 'data', 'domains.json') : DOMAINS_FILE);
+      || resolveDefaultDomainsFile();
     this._seedDefaults = opts.seedDefaults !== undefined ? Boolean(opts.seedDefaults) : true;
     this._customSslManager = opts.sslManager || null;
     this._customCloudflareService = opts.cloudflareService || null;
@@ -341,6 +352,21 @@ class DomainManager {
     /** @type {{ sslVersion: number, at: number, etag: string, buffer: Buffer | null, wrappedBuffer: Buffer | null } | null} */
     this._serializedCache = null;
     this.rebuildIndex();
+  }
+
+  /**
+   * Re-apunta y recarga el almacén desde un directorio de datos aislado (tests / CULKIBO_DATA_DIR).
+   * @param {string} dataDir
+   * @param {{ seedDefaults?: boolean }} [opts]
+   */
+  reloadFromDataDir(dataDir, opts = {}) {
+    this.domainsFile = path.join(path.resolve(dataDir), 'domains.json');
+    if (opts.seedDefaults !== undefined) this._seedDefaults = Boolean(opts.seedDefaults);
+    this._corruptReadOnly = false;
+    this.ensureDirectory();
+    this.domains = this.loadDomains();
+    this.rebuildIndex();
+    return this.domainsFile;
   }
 
   _getSsl() {
@@ -1458,6 +1484,7 @@ class DomainManager {
 domainManagerExport: {
   const instance = Object.assign(new DomainManager(), {
     DomainManager,
+    resolveDefaultDomainsFile,
     normalizeAndValidateHostname,
     detectIdnHomograph,
     sanitizeCustomHeaders,

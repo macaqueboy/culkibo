@@ -453,6 +453,45 @@ async function testCliDx() {
     }
     console.log('  ✓ CULKIBO_MCP_PROFILE=core verificado en puente stdio local (2024-11-05 y 2026-07-28) y remoto HTTP');
 
+    // 8. Pioneer Cycle-2 CLI: smartpack, pussh --dry-run, tunnel-agent --dry-run
+    const spCli = await runCli(['smartpack', appDir, '--json'], { env: isolatedEnv });
+    assert.strictEqual(spCli.status, 0, `culkibo smartpack falló: ${spCli.stderr} ${spCli.stdout}`);
+    const spJson = JSON.parse(spCli.stdout);
+    assert.strictEqual(spJson.ok, true);
+    assert.strictEqual(spJson.stack, 'nextjs');
+    assert.ok(Array.isArray(spJson.dockerignore) && spJson.dockerignore.includes('.git') && spJson.dockerignore.includes('node_modules'));
+    assert.ok(typeof spJson.dockerfile === 'string' && spJson.dockerfile.includes('FROM '));
+    assert.ok(spJson.resourceLimits && typeof spJson.deterministicHash === 'string');
+
+    const pusshCli = await runCli(['pussh', 'acme/shop-web:v1.2', '--server', 'srv_eu', '--port', '5055', '--dry-run', '--json'], { env: isolatedEnv });
+    assert.strictEqual(pusshCli.status, 0, `culkibo pussh --dry-run falló: ${pusshCli.stderr} ${pusshCli.stdout}`);
+    const pusshJson = JSON.parse(pusshCli.stdout);
+    assert.strictEqual(pusshJson.ok, true);
+    assert.strictEqual(pusshJson.dryRun, true);
+    assert.strictEqual(pusshJson.plan.schemaVersion, 'culkibo.directpush/v1');
+    assert.strictEqual(pusshJson.plan.shell, false);
+    assert.strictEqual(pusshJson.plan.targetImageRef, '127.0.0.1:5055/acme/shop-web:v1.2');
+    assert.strictEqual(pusshJson.plan.steps.length, 3);
+
+    const tunCli = await runCli([
+      'tunnel-agent',
+      '--url', 'wss://paas.acme.dev/ws/tunnel',
+      '--tunnel-id', 'tun_demo_1',
+      '--token', 'cket_never_print_secret_tunnel_token_999',
+      '--target', '127.0.0.1:3000',
+      '--dry-run',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(tunCli.status, 0, `culkibo tunnel-agent --dry-run falló: ${tunCli.stderr} ${tunCli.stdout}`);
+    assert.ok(!tunCli.stdout.includes('cket_never_print_secret_tunnel_token_999'), 'tunnel-agent JAMÁS puede imprimir el token en claro');
+    const tunJson = JSON.parse(tunCli.stdout);
+    assert.strictEqual(tunJson.ok, true);
+    assert.strictEqual(tunJson.dryRun, true);
+    assert.strictEqual(tunJson.token, '[REDACTED]');
+    assert.strictEqual(tunJson.targetHost, '127.0.0.1');
+    assert.strictEqual(tunJson.targetPort, 3000);
+    console.log('  ✓ Pioneer CLI Cycle-2 verificado (culkibo smartpack, culkibo pussh --dry-run, culkibo tunnel-agent --dry-run)');
+
     console.log('✅ All CLI DX tests passed!\n');
   } finally {
     if (mockServer) await new Promise((r) => mockServer.close(() => r(undefined)));

@@ -40,6 +40,10 @@ import {
   ShieldAlert,
   Radio,
   Link2,
+  Sun,
+  Moon,
+  Monitor,
+  Languages,
 } from 'lucide-react';
 import {
   api,
@@ -71,6 +75,8 @@ import { TeamAccessPanel } from './TeamAccessPanel';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
+import { useI18n } from '../lib/i18n';
+import { useTheme, type ThemeMode } from '../lib/theme';
 
 type SettingsTab = 'remote' | 'team' | 'security' | 'gitops' | 'integrations' | 'backups' | 'notifications' | 'system';
 
@@ -120,6 +126,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onTabChange,
   onRestoreChecklist,
 }) => {
+  const { t, locale, setLocale } = useI18n();
+  const { theme, setTheme } = useTheme();
   const [tab, setTabState] = useState<SettingsTab>(() => normalizeSettingsTab(initialTab));
   const setTab = (next: SettingsTab) => {
     setTabState(next);
@@ -1061,37 +1069,80 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   return (
     <div className="space-y-5 max-w-5xl mx-auto">
-      <div>
-        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Ajustes</h1>
-        <p className="text-sm text-slate-500 mt-1">
-          Acceso remoto, seguridad enterprise (2FA/OIDC/Auditoría), integraciones, backups y sistema.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('settings.title')}</h1>
+          <p className="text-sm text-slate-500 mt-1">{t('settings.subtitle')}</p>
+        </div>
+
+        {/* Quick Appearance & Language strip */}
+        <div className="flex items-center gap-2 flex-wrap shrink-0">
+          <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[11px]">
+            {([
+              { id: 'light', label: t('settings.themeLight'), icon: Sun },
+              { id: 'dark', label: t('settings.themeDark'), icon: Moon },
+              { id: 'system', label: t('settings.themeSystem'), icon: Monitor },
+            ] as const).map((opt) => {
+              const Icon = opt.icon;
+              const active = theme === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setTheme(opt.id as ThemeMode)}
+                  className={`inline-flex items-center gap-1 px-2 py-1 rounded-md font-medium transition-colors cursor-pointer ${
+                    active ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Icon className="w-3 h-3" />
+                  <span>{opt.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[11px]">
+            <Languages className="w-3 h-3 text-slate-400 mx-1.5 shrink-0" />
+            {(['en', 'es'] as const).map((loc) => (
+              <button
+                key={loc}
+                type="button"
+                onClick={() => setLocale(loc)}
+                className={`px-2 py-1 rounded-md font-mono font-semibold uppercase transition-colors cursor-pointer ${
+                  locale === loc ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                {loc}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* Pestañas */}
       <div className="flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-xl text-xs overflow-x-auto no-scrollbar">
         {([
-          { id: 'remote', label: 'Acceso remoto', icon: Globe },
-          { id: 'team', label: 'Equipo y RBAC', icon: Users },
-          { id: 'security', label: 'Seguridad', icon: ShieldCheck },
-          { id: 'gitops', label: 'GitOps', icon: FileCode2 },
-          { id: 'integrations', label: 'Integraciones', icon: Plug },
-          { id: 'backups', label: 'Backups y DR', icon: HardDrive },
-          { id: 'notifications', label: 'Notificaciones', icon: Bell },
-          { id: 'system', label: 'Sistema', icon: Cpu },
-        ] as const).map((t) => {
-          const Icon = t.icon;
+          { id: 'remote', label: t('settings.tabRemote'), icon: Globe },
+          { id: 'team', label: t('settings.tabTeam'), icon: Users },
+          { id: 'security', label: t('settings.tabSecurity'), icon: ShieldCheck },
+          { id: 'gitops', label: t('settings.tabGitops'), icon: FileCode2 },
+          { id: 'integrations', label: t('settings.tabIntegrations'), icon: Plug },
+          { id: 'backups', label: t('settings.tabBackups'), icon: HardDrive },
+          { id: 'notifications', label: t('settings.tabNotifications'), icon: Bell },
+          { id: 'system', label: t('settings.tabSystem'), icon: Cpu },
+        ] as const).map((tabItem) => {
+          const Icon = tabItem.icon;
           return (
             <button
-              key={t.id}
+              key={tabItem.id}
               type="button"
-              onClick={() => setTab(t.id)}
+              onClick={() => setTab(tabItem.id)}
               className={`culkibo-press inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 rounded-lg font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                tab === t.id ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
+                tab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
               <Icon className="w-3.5 h-3.5" />
-              <span>{t.label}</span>
+              <span>{tabItem.label}</span>
             </button>
           );
         })}
@@ -1112,7 +1163,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
                 <div>
                   <div className="flex items-center gap-2 flex-wrap">
-                    <h2 className="text-sm font-semibold text-slate-900">Autenticación en dos pasos (TOTP 2FA)</h2>
+                    <h2 className="text-sm font-semibold text-slate-900">{t('settings.sec2faTitle')}</h2>
                     <span
                       className={`px-2 py-0.5 rounded-full text-[11px] font-medium border ${
                         totpEnabled
@@ -1120,12 +1171,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           : 'bg-slate-100 text-slate-600 border-slate-200'
                       }`}
                     >
-                      {totpEnabled ? 'Activo (RFC 6238)' : 'Pendiente de configurar'}
+                      {totpEnabled ? 'Active (RFC 6238)' : (locale === 'es' ? 'Pendiente' : 'Not configured')}
                     </span>
                   </div>
-                  <p className="text-slate-500 mt-0.5 leading-relaxed">
-                    Protege el plano de control con códigos TOTP de 6 dígitos y códigos de recuperación de un solo uso cifrados con AES-256-GCM.
-                  </p>
+                  <p className="text-slate-500 mt-0.5 leading-relaxed">{t('settings.sec2faDesc')}</p>
                   {identity && (
                     <div className="mt-1.5 text-[11px] text-slate-400 font-mono">
                       Sesión actual: {identity.email || identity.name || 'Administrador local'} ({identity.role})
@@ -1143,7 +1192,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
                   >
                     {totpBusy === 'setup' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
-                    <span>{totpEnabled ? 'Reconfigurar 2FA' : 'Configurar 2FA'}</span>
+                    <span>{totpEnabled ? t('settings.sec2faReconfig') : t('settings.sec2faSetup')}</span>
                   </button>
                 )}
                 <button
@@ -1151,7 +1200,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   onClick={() => setTotpDisableOpen((v) => !v)}
                   className="culkibo-press px-3 py-2 rounded-lg bg-white hover:bg-red-50 border border-slate-200 hover:border-red-200 text-slate-700 hover:text-red-700 font-medium cursor-pointer"
                 >
-                  {totpDisableOpen ? 'Cancelar' : 'Desactivar 2FA'}
+                  {totpDisableOpen ? (locale === 'es' ? 'Cancelar' : 'Cancel') : t('settings.sec2faDisable')}
                 </button>
               </div>
             </div>
@@ -1315,14 +1364,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
                 <div>
                   <div className="flex items-center gap-2 flex-wrap">
-                    <h2 className="text-sm font-semibold text-slate-900">Proveedores SSO (OIDC / OAuth2 PKCE)</h2>
+                    <h2 className="text-sm font-semibold text-slate-900">{t('settings.secOidcTitle')}</h2>
                     <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-[11px] font-medium text-slate-600 tabular-nums">
-                      {oidcProviders.length} {oidcProviders.length === 1 ? 'proveedor' : 'proveedores'}
+                      {oidcProviders.length}
                     </span>
                   </div>
-                  <p className="text-slate-500 mt-0.5">
-                    Verificación criptográfica JWKS nativa (RS256/ES256/EdDSA), PKCE S256 obligatorio y protección contra confusión de algoritmos.
-                  </p>
+                  <p className="text-slate-500 mt-0.5">{t('settings.secOidcDesc')}</p>
                 </div>
               </div>
             </div>
@@ -1396,10 +1443,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <ShieldCheck className="w-4 h-4" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-semibold text-slate-900">Registro de auditoría encadenado (SHA-256)</h2>
-                  <p className="text-slate-500 mt-0.5">
-                    Cada mutación enlaza su huella criptográfica con la entrada anterior (<code className="font-mono">prevHash → entryHash</code>) para detectar cualquier alteración o borrado.
-                  </p>
+                  <h2 className="text-sm font-semibold text-slate-900">{t('settings.secAuditTitle')}</h2>
+                  <p className="text-slate-500 mt-0.5">{t('settings.secAuditDesc')}</p>
                 </div>
               </div>
               <button
@@ -1409,7 +1454,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50 shrink-0"
               >
                 {auditVerifyBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
-                <span>{auditVerifyBusy ? 'Verificando…' : 'Verificar cadena a prueba de manipulaciones'}</span>
+                <span>{auditVerifyBusy ? t('settings.secAuditVerifying') : t('settings.secAuditVerify')}</span>
               </button>
             </div>
 
@@ -1529,10 +1574,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <ScanSearch className="w-4 h-4" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-semibold text-slate-900">Escáner de fugas de secretos (Pre-Despliegue)</h2>
-                  <p className="text-slate-500 mt-0.5">
-                    Detecta claves AWS, Stripe, GitHub, OpenAI/Anthropic, PEM, JWT, URIs de BD y alta entropía Shannon antes de publicar. Los resultados siempre se enmascaran.
-                  </p>
+                  <h2 className="text-sm font-semibold text-slate-900">{t('settings.secScannerTitle')}</h2>
+                  <p className="text-slate-500 mt-0.5">{t('settings.secScannerDesc')}</p>
                 </div>
               </div>
               <button
@@ -1540,7 +1583,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 onClick={handleLoadSafeScannerSample}
                 className="culkibo-press px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer shrink-0"
               >
-                Cargar muestra de prueba
+                {t('settings.secScannerSample')}
               </button>
             </div>
 
@@ -1549,7 +1592,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 rows={5}
                 value={scanInput}
                 onChange={(e) => setScanInput(e.target.value)}
-                placeholder={'Pega aquí un archivo .env, docker-compose.yml, culkibo.yaml o Dockerfile para comprobar fugas…\nReferencias seguras como ${vault.MI_CLAVE} son ignoradas automáticamente.'}
+                placeholder={'Paste .env, docker-compose.yml, culkibo.yaml or Dockerfile text to scan for leaks…\nSafe references like ${vault.MY_KEY} are ignored automatically.'}
                 spellCheck={false}
                 className="w-full p-3.5 bg-slate-50 focus:bg-white border border-slate-200 rounded-xl font-mono text-[11px] leading-relaxed text-slate-900"
               />
@@ -1560,7 +1603,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   className="culkibo-press inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
                 >
                   {scanBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
-                  <span>{scanBusy ? 'Escaneando…' : 'Escanear fugas de secretos'}</span>
+                  <span>{scanBusy ? t('settings.secScannerRunning') : t('settings.secScannerRun')}</span>
                 </button>
               </div>
             </form>

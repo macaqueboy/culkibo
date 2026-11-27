@@ -20,6 +20,7 @@ import {
   Rocket,
   FileCode2,
   ChevronRight,
+  Layers,
 } from 'lucide-react';
 import type { McpAuditEntry, RemoteAccessInfo } from '../lib/api';
 import { api, apiFetch } from '../lib/api';
@@ -44,6 +45,48 @@ interface McpPromptSpec {
   arguments?: McpPromptArg[];
 }
 
+interface McpAppResourceSpec {
+  uri: string;
+  name: string;
+  title?: string;
+  description: string;
+  mimeType: string;
+  _meta?: {
+    ui?: {
+      csp?: { policy?: string };
+      prefersBorder?: boolean;
+      specVersion?: string;
+    };
+  };
+}
+
+const FALLBACK_MCP_APPS: ReadonlyArray<McpAppResourceSpec> = [
+  {
+    uri: 'ui://culkibo/topology',
+    name: 'Culkibo Live Topology App',
+    title: 'Interactive Service, DB, Domain & Fleet Topology',
+    description: 'Mapa interactivo en vivo de dominios, proyectos, bases de datos y flota SSH con puente de diagnóstico y despliegue seguro.',
+    mimeType: 'text/html;profile=mcp-app',
+    _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
+  },
+  {
+    uri: 'ui://culkibo/incident-remediator',
+    name: 'Culkibo Incident Remediator App',
+    title: 'Live OOM/Crash Diagnostics & 2-Phase Safe Remediator',
+    description: 'Correlaciona OOMKilled, CrashLoop, logs y uptime con remediación interactiva en 2 fases (dryRun → confirmToken HMAC).',
+    mimeType: 'text/html;profile=mcp-app',
+    _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
+  },
+  {
+    uri: 'ui://culkibo/coolify-migration-diff',
+    name: 'Culkibo Coolify v4 Migration Diff App',
+    title: 'Coolify v4 Parity Score & Traefik → Caddy Edge Diff',
+    description: 'Visualiza el Parity Score de Coolify v4, traducción redactada de Magic Vars (${vault.*}) y diff Traefik → Caddy.',
+    mimeType: 'text/html;profile=mcp-app',
+    _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
+  },
+];
+
 const PROFILE_OPTIONS: ReadonlyArray<{ id: McpProfile; label: string; short: string; hint: string }> = [
   { id: 'core', label: 'Core (Recomendado)', short: 'Core', hint: '17 herramientas esenciales + culkibo_ship_and_verify + culkibo_search_tools (>81% ahorro)' },
   { id: 'deploy', label: 'Deploy & CI/CD', short: 'Deploy', hint: 'Despliegues, Ship & Verify, Canary, Smoke, Previews, Freeze y Entornos' },
@@ -63,26 +106,27 @@ const PROFILE_TOOL_SETS: Record<Exclude<McpProfile, 'all'>, ReadonlySet<string>>
   deploy: new Set([
     'culkibo_search_tools', 'culkibo_export_agent_kit', 'culkibo_rbac_whoami', 'culkibo_list_projects',
     'culkibo_get_project', 'culkibo_create_project', 'culkibo_add_resource', 'culkibo_set_project_env',
-    'culkibo_deploy_strategy', 'culkibo_deploy_production', 'culkibo_ship_and_verify', 'culkibo_list_deployments',
-    'culkibo_rollback_deployment', 'culkibo_cancel_deployment', 'culkibo_get_deploy_queue', 'culkibo_get_deployment_logs',
-    'culkibo_get_container_logs', 'culkibo_manage_previews', 'culkibo_smoke_test_configure', 'culkibo_smoke_test_run',
-    'culkibo_canary_rollout', 'culkibo_deploy_freeze', 'culkibo_env_list', 'culkibo_env_promote',
+    'culkibo_deploy_strategy', 'culkibo_smartpack_plan', 'culkibo_deploy_production', 'culkibo_ship_and_verify',
+    'culkibo_list_deployments', 'culkibo_rollback_deployment', 'culkibo_cancel_deployment', 'culkibo_get_deploy_queue',
+    'culkibo_get_deployment_logs', 'culkibo_get_container_logs', 'culkibo_manage_previews', 'culkibo_smoke_test_configure',
+    'culkibo_smoke_test_run', 'culkibo_canary_rollout', 'culkibo_deploy_freeze', 'culkibo_env_list', 'culkibo_env_promote',
   ]),
   ops: new Set([
     'culkibo_search_tools', 'culkibo_export_agent_kit', 'culkibo_rbac_whoami', 'culkibo_list_projects',
     'culkibo_get_project', 'culkibo_list_pods', 'culkibo_get_logs', 'culkibo_get_container_logs',
     'culkibo_get_observability', 'culkibo_system_doctor', 'culkibo_system_doctor_fix', 'culkibo_docker_status',
     'culkibo_docker_containers', 'culkibo_manage_production_service', 'culkibo_toggle_maintenance', 'culkibo_diagnose_domain',
-    'culkibo_ingress_status', 'culkibo_reconcile_ingress', 'culkibo_uptime_list_monitors', 'culkibo_status_page_manage',
-    'culkibo_cost_advisor', 'culkibo_sleep_status', 'culkibo_sleep_manage', 'culkibo_fleet_list_servers',
-    'culkibo_diagnose_incident', 'culkibo_auto_remediate',
+    'culkibo_ingress_status', 'culkibo_reconcile_ingress', 'culkibo_edge_tunnel', 'culkibo_uptime_list_monitors',
+    'culkibo_status_page_manage', 'culkibo_cost_advisor', 'culkibo_sleep_status', 'culkibo_sleep_manage',
+    'culkibo_fleet_list_servers', 'culkibo_diagnose_incident', 'culkibo_auto_remediate',
   ]),
   security: new Set([
     'culkibo_search_tools', 'culkibo_export_agent_kit', 'culkibo_rbac_whoami', 'culkibo_team_list_members',
     'culkibo_team_invite_member', 'culkibo_team_update_member', 'culkibo_rbac_list_tokens', 'culkibo_rbac_manage_token',
     'culkibo_system_doctor', 'culkibo_system_doctor_fix', 'culkibo_diagnose_domain', 'culkibo_ingress_status',
-    'culkibo_manage_wildcard_dns01', 'culkibo_set_domain_basic_auth', 'culkibo_manage_webhook', 'culkibo_deploy_freeze',
-    'culkibo_list_databases', 'culkibo_database_list_backups', 'culkibo_export_instance_snapshot', 'culkibo_diagnose_incident',
+    'culkibo_manage_wildcard_dns01', 'culkibo_edge_tunnel', 'culkibo_set_domain_basic_auth', 'culkibo_manage_webhook',
+    'culkibo_deploy_freeze', 'culkibo_list_databases', 'culkibo_database_list_backups', 'culkibo_export_instance_snapshot',
+    'culkibo_diagnose_incident',
   ]),
 };
 
@@ -259,7 +303,7 @@ function buildAgentSnippets(
     '<!-- culkibo-mcp-ops:start -->',
     '## Culkibo AI-Native PaaS Operations (MCP 2026)',
     '',
-    `- Endpoint MCP: \`${endpoint}\` (perfil \`${profile}\`: **${profileStats.count}/${profileStats.total || 109}** herramientas, **-${profileStats.savedPct}%** contexto).`,
+    `- Endpoint MCP: \`${endpoint}\` (perfil \`${profile}\`: **${profileStats.count}/${profileStats.total || 111}** herramientas, **-${profileStats.savedPct}%** contexto).`,
     '- Exporta `CULKIBO_TOKEN` en tu entorno local; nunca guardes tokens maestros en Git.',
     '- Usa `culkibo_search_tools` para descubrir herramientas fuera del perfil activo bajo demanda.',
     '- Usa `culkibo_ship_and_verify` (`dryRun: true` → `confirmToken` → `dryRun: false`) para desplegar con escaneo de secretos, smoke checks y auto-rollback.',
@@ -297,7 +341,7 @@ function buildAgentSnippets(
 
   const codexToml = [
     '# Culkibo MCP 2026 — OpenAI Codex CLI',
-    `# Profile: ${profile} (${profileStats.count}/${profileStats.total || 109} tools, -${profileStats.savedPct}% context)`,
+    `# Profile: ${profile} (${profileStats.count}/${profileStats.total || 111} tools, -${profileStats.savedPct}% context)`,
     '[mcp_servers.culkibo]',
     `url = "${endpoint}"`,
     'bearer_token_env_var = "CULKIBO_TOKEN"',
@@ -379,7 +423,7 @@ function extractMcpErrorEnvelope(toolResult: any): { code?: string; message?: st
 
 function classifyMcpToolGroup(name: string): string {
   const n = name.toLowerCase();
-  if (n.includes('ship_and_verify') || n.includes('export_agent_kit')) return 'MCP 2026 Pioneer (Ship & Agent Kits)';
+  if (n.includes('ship_and_verify') || n.includes('export_agent_kit') || n.includes('smartpack') || n.includes('edge_tunnel')) return 'MCP 2026 Pioneer (Ship, SmartPack, EdgeTunnel & Kits)';
   if (n.includes('diagnose_incident') || n.includes('auto_remediate') || n.includes('search_tools')) return 'Autocuración y Descubrimiento IA';
   if (n.includes('fleet_')) return 'Flota Multi-Servidor (SSH)';
   if (n.includes('rbac_') || n.includes('team_')) return 'Equipos, RBAC y Tokens';
@@ -453,6 +497,10 @@ async function callMcpModernRpc(method: string, params: Record<string, unknown> 
 export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void }> = ({ onNotify }) => {
   const [tools, setTools] = useState<any[]>([]);
   const [prompts, setPrompts] = useState<McpPromptSpec[]>([...FALLBACK_PLAYBOOKS]);
+  const [mcpApps, setMcpApps] = useState<McpAppResourceSpec[]>([...FALLBACK_MCP_APPS]);
+  const [activeAppUri, setActiveAppUri] = useState<string | null>(null);
+  const [activeAppHtml, setActiveAppHtml] = useState<string>('');
+  const [loadingApp, setLoadingApp] = useState(false);
   const [showAllPrompts, setShowAllPrompts] = useState(false);
   const [activePlaybook, setActivePlaybook] = useState<McpPromptSpec | null>(null);
   const [playbookArgs, setPlaybookArgs] = useState<Record<string, string>>({});
@@ -479,12 +527,13 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
 
   const loadMcpData = async () => {
     try {
-      const [toolsRes, auditRes, cfgRes, remRes, promptsRes] = await Promise.all([
+      const [toolsRes, auditRes, cfgRes, remRes, promptsRes, resourcesRes] = await Promise.all([
         api.getMcpTools(),
         api.getMcpAudit(),
         api.getMcpConfig(),
         api.getRemoteAccess().catch(() => null),
         callMcpModernRpc('prompts/list').catch(() => null),
+        callMcpModernRpc('resources/list').catch(() => null),
       ]);
       setTools(toolsRes.tools || []);
       setAuditLog(auditRes.auditLog || []);
@@ -493,6 +542,11 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       const livePrompts = promptsRes?.result?.prompts;
       if (Array.isArray(livePrompts) && livePrompts.length > 0) {
         setPrompts(livePrompts);
+      }
+      const liveResources = resourcesRes?.result?.resources;
+      if (Array.isArray(liveResources)) {
+        const uiApps = liveResources.filter((r: any) => typeof r?.uri === 'string' && r.uri.startsWith('ui://culkibo/'));
+        if (uiApps.length > 0) setMcpApps(uiApps);
       }
     } catch (e) {
       console.error(e);
@@ -507,8 +561,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       api.getMcpConfig(),
       api.getRemoteAccess().catch(() => null),
       callMcpModernRpc('prompts/list').catch(() => null),
+      callMcpModernRpc('resources/list').catch(() => null),
     ])
-      .then(([toolsRes, auditRes, cfgRes, remRes, promptsRes]) => {
+      .then(([toolsRes, auditRes, cfgRes, remRes, promptsRes, resourcesRes]) => {
         if (!active) return;
         setTools(toolsRes.tools || []);
         setAuditLog(auditRes.auditLog || []);
@@ -517,6 +572,11 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
         const livePrompts = promptsRes?.result?.prompts;
         if (Array.isArray(livePrompts) && livePrompts.length > 0) {
           setPrompts(livePrompts);
+        }
+        const liveResources = resourcesRes?.result?.resources;
+        if (Array.isArray(liveResources)) {
+          const uiApps = liveResources.filter((r: any) => typeof r?.uri === 'string' && r.uri.startsWith('ui://culkibo/'));
+          if (uiApps.length > 0) setMcpApps(uiApps);
         }
       })
       .catch((e) => console.error(e));
@@ -529,6 +589,30 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       offMcp();
     };
   }, []);
+
+  const handleToggleMcpAppPreview = async (uri: string) => {
+    if (activeAppUri === uri) {
+      setActiveAppUri(null);
+      setActiveAppHtml('');
+      return;
+    }
+    setActiveAppUri(uri);
+    setActiveAppHtml('');
+    setLoadingApp(true);
+    try {
+      const res = await callMcpModernRpc('resources/read', { uri }, uri);
+      const html = res?.result?.contents?.[0]?.text;
+      if (typeof html === 'string' && html.trim()) {
+        setActiveAppHtml(html);
+      } else {
+        setActiveAppHtml('<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#475569">No se pudo cargar el recurso MCP App desde POST /api/mcp.</body></html>');
+      }
+    } catch {
+      setActiveAppHtml('<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#b91c1c">Error leyendo el recurso MCP App.</body></html>');
+    } finally {
+      setLoadingApp(false);
+    }
+  };
 
   const filteredTools = useMemo(() => {
     const q = toolSearch.trim().toLowerCase();
@@ -872,21 +956,21 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
             </span>
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-indigo-50 text-indigo-700 border border-indigo-200 tabular-nums">
               <Sparkles className="w-3 h-3" />
-              8 playbooks nativos
+              3 MCP Apps · 8 playbooks
             </span>
-            <HelpTip title="Model Context Protocol (MCP 2026)">
+            <HelpTip title="Model Context Protocol (MCP 2026 + MCP Apps)">
               <p>Conecta Antigravity, Claude Code, Cursor, Windsurf o Codex CLI en 1 clic con perfiles de contexto (?profile=core ahorra &gt;81% de tokens) y cero secretos en claro.</p>
-              <p>Incluye {tools.length || 109} herramientas anotadas, Ship &amp; Verify autónomo con confirmToken, 7 recursos en vivo y {prompts.length} playbooks interactivos.</p>
+              <p>Incluye {tools.length || 111} herramientas anotadas, 3 MCP Apps interactivas (ui://culkibo/*), Ship &amp; Verify autónomo con confirmToken, 7 recursos JSON en vivo y {prompts.length} playbooks.</p>
             </HelpTip>
           </div>
           <p className="text-sm text-slate-500 mt-1">
-            PaaS nativo para IA: conecta tu agente en 1 clic, lanza playbooks interactivos y ejecuta despliegues verificados con red de seguridad.
+            PaaS nativo para IA: conecta tu agente en 1 clic, previsualiza MCP Apps interactivas (ext-apps 2026-01-26) y ejecuta despliegues verificados.
           </p>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
           <span className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white text-slate-700 border border-slate-200 tabular-nums">
-            {tools.length || 109} herramientas · {prompts.length} prompts
+            {tools.length || 111} herramientas · {mcpApps.length} apps · {prompts.length} prompts
           </span>
           <button
             type="button"
@@ -954,14 +1038,14 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                       : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
                   }`}
                 >
-                  {p.id === 'all' ? `${p.label} (${tools.length || 109})` : p.label}
+                  {p.id === 'all' ? `${p.label} (${tools.length || 111})` : p.label}
                 </button>
               ))}
             </div>
 
             <div className="flex items-center gap-2 text-[11px] tabular-nums">
               <span className="text-slate-600 font-medium">
-                {profileStats.count}/{profileStats.total || 109} tools · ~{(profileStats.estTokens / 1000).toFixed(1)}k tok
+                {profileStats.count}/{profileStats.total || 111} tools · ~{(profileStats.estTokens / 1000).toFixed(1)}k tok
               </span>
               {profileStats.savedPct > 0 ? (
                 <span className="px-2 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
@@ -1142,13 +1226,127 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
         </div>
       </div>
 
-      {/* 2. Galería interactiva de MCP Playbooks (prompts/list) */}
+      {/* 2. Galería de Interactive MCP Apps (ui://culkibo/* — ext-apps 2026-01-26) */}
+      <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2 flex-wrap">
+              <Layers className="w-4 h-4 text-emerald-600" />
+              <span>2. Interactive MCP Apps (<code className="font-mono text-xs text-slate-600">ui://culkibo/*</code>)</span>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                ext-apps 2026-01-26
+              </span>
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Tarjetas interactivas HTML (<code className="font-mono text-slate-700">text/html;profile=mcp-app</code>) con CSP estricta (<code className="font-mono text-slate-700">default-src &apos;none&apos;</code>) y 0 peticiones externas que Claude, Antigravity y Cursor renderizan inline.
+            </p>
+          </div>
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium bg-slate-50 text-slate-600 border border-slate-200 shrink-0">
+            <Shield className="w-3.5 h-3.5 text-emerald-600" />
+            Sandboxed iframe · 0 external URLs
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {mcpApps.map((app) => {
+            const isOpen = activeAppUri === app.uri;
+            const copyId = `app_uri_${app.uri}`;
+            return (
+              <div
+                key={app.uri}
+                className={`p-4 rounded-xl border transition-colors flex flex-col justify-between gap-3 ${
+                  isOpen
+                    ? 'border-emerald-500 bg-emerald-50/30 ring-1 ring-emerald-500/20'
+                    : 'border-slate-200 bg-white hover:border-slate-300'
+                }`}
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <code className="px-2 py-0.5 rounded bg-slate-900 text-emerald-300 font-mono text-[10px] truncate">
+                      {app.uri}
+                    </code>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600 shrink-0">
+                      CSP strict
+                    </span>
+                  </div>
+                  <h3 className="text-xs font-semibold text-slate-900 leading-snug">
+                    {app.title || app.name}
+                  </h3>
+                  <p className="text-[11px] text-slate-600 leading-relaxed">
+                    {app.description}
+                  </p>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleMcpAppPreview(app.uri)}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium cursor-pointer transition-colors ${
+                      isOpen
+                        ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                        : 'bg-slate-900 hover:bg-slate-800 text-white'
+                    }`}
+                  >
+                    <Eye className="w-3 h-3" />
+                    <span>{isOpen ? 'Ocultar preview' : 'Previsualizar App'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void copyText(app.uri, copyId, `URI ${app.uri} copiada`)}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 cursor-pointer"
+                  >
+                    {copiedKey === copyId ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedKey === copyId ? 'Copiado' : 'Copiar URI'}</span>
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {activeAppUri && (
+          <div className="rounded-xl border border-emerald-200 bg-slate-50 overflow-hidden">
+            <div className="px-4 py-2.5 bg-slate-900 text-slate-100 flex items-center justify-between gap-2 flex-wrap text-xs">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                <span className="font-mono">{activeAppUri}</span>
+                <span className="text-[10px] text-slate-400">sandbox=&quot;&quot; · text/html;profile=mcp-app</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveAppUri(null);
+                  setActiveAppHtml('');
+                }}
+                className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[11px] text-white cursor-pointer"
+              >
+                Cerrar
+              </button>
+            </div>
+            {loadingApp ? (
+              <div className="py-12 flex items-center justify-center gap-2 text-xs text-slate-500">
+                <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+                <span>Cargando recurso MCP App desde POST /api/mcp (resources/read)…</span>
+              </div>
+            ) : (
+              <iframe
+                title={`Culkibo MCP App preview: ${activeAppUri}`}
+                sandbox=""
+                srcDoc={activeAppHtml}
+                className="w-full h-[420px] bg-white border-0 block"
+              />
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 3. Galería interactiva de MCP Playbooks (prompts/list) */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
               <BookOpen className="w-4 h-4 text-indigo-600" />
-              2. Playbooks interactivos MCP (<code className="font-mono text-xs text-slate-600">prompts/list</code>)
+              3. Playbooks interactivos MCP (<code className="font-mono text-xs text-slate-600">prompts/list</code>)
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
               8 flujos de ingeniería probados en batalla listos para invocar desde Claude Code, Antigravity, Cursor o copiar en 1 clic.
@@ -1306,14 +1504,14 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
         )}
       </div>
 
-      {/* 3. Probador interactivo + 4. Registro de auditoría */}
+      {/* 4. Probador interactivo + 5. Registro de auditoría */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        {/* 3. Probador interactivo */}
+        {/* 4. Probador interactivo */}
         <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
               <Terminal className="w-4 h-4 text-slate-600" />
-              3. Probar herramienta en vivo
+              4. Probar herramienta en vivo
             </h2>
             <span className="text-[11px] font-mono text-slate-400">POST /api/mcp</span>
           </div>
@@ -1503,12 +1701,12 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
           </div>
         </div>
 
-        {/* 4. Registro de auditoría en tiempo real */}
+        {/* 5. Registro de auditoría en tiempo real */}
         <div className="bg-white rounded-xl border border-slate-200 overflow-hidden flex flex-col">
           <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2">
               <Radio className="w-4 h-4 text-emerald-600" />
-              <h2 className="text-xs font-semibold text-slate-900">4. Actividad del agente en directo</h2>
+              <h2 className="text-xs font-semibold text-slate-900">5. Actividad del agente en directo</h2>
             </div>
             <div className="flex items-center gap-1.5 text-xs text-slate-500 tabular-nums">
               <Shield className="w-3.5 h-3.5 text-slate-400" />

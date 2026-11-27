@@ -210,6 +210,315 @@ const NON_TERMINAL_STATUSES = new Set([
   'pendiente', 'en_cola', 'sincronizando', 'construyendo', 'pre_deploy', 'arrancando', 'verificando', 'smoke_test', 'canario', 'promocionando', 'post_deploy'
 ]);
 const MAX_RUNTIME_LOG_STREAMS = 20;
+const DEFAULT_MIN_DISK_FREE_BYTES = 64 * 1024 * 1024; // 64 MiB pre-deploy ENOSPC guard (Cosmos#591)
+const STORE_MIN_DISK_FREE_BYTES = 16 * 1024 * 1024;   // 16 MiB pre-write guard for metadata store
+const FORBIDDEN_COMPOSE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Guardia pre-escritura anti-ENOSPC (Cosmos#591): comprueba el espacio libre disponible
+ * mediante `fs.statfsSync` (Node nativo, 0 deps, 0 shell) antes de escribir en disco o desplegar.
+ * Lanza un error HTTP 507 (`code: 'DISK_FULL'`) en lugar de truncar o corromper estado.
+ *
+ * @param {string} targetDir
+ * @param {number} [minFreeBytes]
+ * @param {{ statfsImpl?: (p: string) => { bavail: number, bsize: number, blocks?: number } }} [opts]
+ * @returns {{ ok: true, freeBytes: number | null, totalBytes: number | null, requiredBytes: number, path: string }}
+ */
+function assertDiskHeadroom(targetDir, minFreeBytes = DEFAULT_MIN_DISK_FREE_BYTES, opts = {}) {
+  const required = Math.max(0, Number(minFreeBytes) || 0);
+  let probeDir = path.resolve(targetDir || DATA_DIR || '.');
+  while (probeDir && !fs.existsSync(probeDir)) {
+    const parent = path.dirname(probeDir);
+    if (parent === probeDir) break;
+    probeDir = parent;
+  }
+  if (required <= 0) {
+    return { ok: true, freeBytes: null, totalBytes: null, requiredBytes: 0, path: probeDir };
+  }
+  const statfsFn = typeof opts.statfsImpl === 'function'
+    ? opts.statfsImpl
+    : (typeof fs.statfsSync === 'function' ? (p) => fs.statfsSync(p) : null);
+  if (!statfsFn) {
+    return { ok: true, freeBytes: null, totalBytes: null, requiredBytes: required, path: probeDir };
+  }
+  const st = statfsFn(probeDir);
+  const bsize = Number(st && st.bsize);
+  const bavail = Number(st && st.bavail);
+  const blocks = Number(st && st.blocks);
+  const freeBytes = Number.isFinite(bavail) && Number.isFinite(bsize) ? bavail * bsize : null;
+  const totalBytes = Number.isFinite(blocks) && Number.isFinite(bsize) ? blocks * bsize : null;
+  if (freeBytes !== null && freeBytes < required) {
+    /** @type {Error & { status?: number, code?: string, freeBytes?: number, totalBytes?: number | null, requiredBytes?: number, path?: string }} */
+    const err = new Error(
+      `Espacio en disco insuficiente en ${probeDir}: ${(freeBytes / (1024 * 1024)).toFixed(1)} MiB libres < ${(required / (1024 * 1024)).toFixed(1)} MiB requeridos (ENOSPC prevenido)`
+    );
+    err.status = 507;
+    err.code = 'DISK_FULL';
+    err.freeBytes = freeBytes;
+    err.totalBytes = totalBytes;
+    err.requiredBytes = required;
+    err.path = probeDir;
+    throw err;
+  }
+  return { ok: true, freeBytes, totalBytes, requiredBytes: required, path: probeDir };
+}
+
+/**
+ * Parsea métricas reales de RAM de Linux cgroup v2 (`memory.current`, `memory.max`, `memory.stat`)
+ * restando `inactive_file` (caché de página recuperable) para obtener el working-set real del contenedor
+ * y evitar falsas alarmas de ~95% RAM / OOM (runtipi#2445).
+ *
+ * @param {{
+ *   currentRaw: string | number,
+ *   maxRaw?: string | number | null,
+ *   statRaw?: string | null,
+ *   swapCurrentRaw?: string | number | null
+ * }} raw
+ */
+function parseCgroupV2MemoryStats(raw) {
+  const currentBytes = Math.max(0, parseInt(String(raw && raw.currentRaw != null ? raw.currentRaw : '0').trim(), 10) || 0);
+  const maxStr = String(raw && raw.maxRaw != null ? raw.maxRaw : 'max').trim().toLowerCase();
+  const unlimited = !maxStr || maxStr === 'max' || maxStr === 'unlimited';
+  const parsedLimit = unlimited ? null : (parseInt(maxStr, 10) || null);
+  const limitBytes = parsedLimit && parsedLimit > 0 ? parsedLimit : null;
+  const swapBytes = Math.max(0, parseInt(String(raw && raw.swapCurrentRaw != null ? raw.swapCurrentRaw : '0').trim(), 10) || 0);
+
+  /** @type {Record<string, number>} */
+  const statMap = Object.create(null);
+  const statText = String((raw && raw.statRaw) || '');
+  if (statText) {
+    for (const line of statText.split(/\r?\n/)) {
+      const m = line.trim().match(/^([a-z0-9_]+)\s+(\d+)$/);
+      if (m && !FORBIDDEN_COMPOSE_KEYS.has(m[1])) {
+        statMap[m[1]] = parseInt(m[2], 10) || 0;
+      }
+    }
+  }
+
+  const inactiveFileBytes = statMap.inactive_file || 0;
+  const activeFileBytes = statMap.active_file || 0;
+  const anonBytes = statMap.anon || 0;
+  const fileBytes = statMap.file || (activeFileBytes + inactiveFileBytes);
+  const slabBytes = statMap.slab || 0;
+  const oomKills = statMap.oom_kill || 0;
+
+  // Fórmula cAdvisor / Docker v25+ cgroup v2: working_set = max(0, memory.current - inactive_file)
+  const workingSetBytes = Math.max(0, currentBytes - inactiveFileBytes);
+  const usagePercent = limitBytes ? Math.round((workingSetBytes / limitBytes) * 10000) / 100 : null;
+  const rawUsagePercent = limitBytes ? Math.round((currentBytes / limitBytes) * 10000) / 100 : null;
+
+  return {
+    cgroupVersion: 2,
+    currentBytes,
+    workingSetBytes,
+    workingSetMb: Math.round((workingSetBytes / (1024 * 1024)) * 100) / 100,
+    reclaimableCacheBytes: inactiveFileBytes,
+    anonBytes,
+    fileBytes,
+    activeFileBytes,
+    slabBytes,
+    swapBytes,
+    limitBytes,
+    limitMb: limitBytes ? Math.round((limitBytes / (1024 * 1024)) * 100) / 100 : null,
+    unlimited: limitBytes === null,
+    usagePercent,
+    rawUsagePercent,
+    oomKills
+  };
+}
+
+/**
+ * Lee archivos Linux cgroup v2 de un contenedor Docker (0 shell, lectura directa en /sys/fs/cgroup).
+ * Devuelve `null` en hosts no-Linux o si la jerarquía cgroup v2 no está expuesta.
+ *
+ * @param {string} containerId
+ * @param {{ cgroupDir?: string | null }} [opts]
+ */
+function readContainerCgroupV2Memory(containerId, opts = {}) {
+  /** @type {string[]} */
+  const candidates = [];
+  if (opts && opts.cgroupDir) {
+    candidates.push(path.resolve(opts.cgroupDir));
+  } else if (process.platform === 'linux' && typeof containerId === 'string' && /^[a-f0-9]{12,64}$/i.test(containerId.trim())) {
+    const cid = containerId.trim().toLowerCase();
+    candidates.push(
+      `/sys/fs/cgroup/system.slice/docker-${cid}.scope`,
+      `/sys/fs/cgroup/docker/${cid}`
+    );
+  }
+  for (const dir of candidates) {
+    const curPath = path.join(dir, 'memory.current');
+    if (!fs.existsSync(curPath)) continue;
+    try {
+      const currentRaw = fs.readFileSync(curPath, 'utf8');
+      const maxPath = path.join(dir, 'memory.max');
+      const statPath = path.join(dir, 'memory.stat');
+      const swapPath = path.join(dir, 'memory.swap.current');
+      return parseCgroupV2MemoryStats({
+        currentRaw,
+        maxRaw: fs.existsSync(maxPath) ? fs.readFileSync(maxPath, 'utf8') : 'max',
+        statRaw: fs.existsSync(statPath) ? fs.readFileSync(statPath, 'utf8') : '',
+        swapCurrentRaw: fs.existsSync(swapPath) ? fs.readFileSync(swapPath, 'utf8') : '0'
+      });
+    } catch (e) {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Extrae nombres de servicio del bloque `services:` de un archivo Docker Compose YAML (0 deps).
+ * @param {string} composeYaml
+ * @returns {string[]}
+ */
+function extractComposeServiceNames(composeYaml) {
+  const lines = String(composeYaml || '').split(/\r?\n/);
+  /** @type {string[]} */
+  const names = [];
+  let inServices = false;
+  let serviceIndent = -1;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const indent = rawLine.search(/\S/);
+    if (indent === 0) {
+      if (/^services\s*:\s*(?:#.*)?$/.test(trimmed)) {
+        inServices = true;
+        serviceIndent = -1;
+      } else {
+        inServices = false;
+      }
+      continue;
+    }
+    if (!inServices) continue;
+    if (serviceIndent === -1 && !trimmed.startsWith('-')) {
+      serviceIndent = indent;
+    }
+    if (indent === serviceIndent && !trimmed.startsWith('-')) {
+      const m = trimmed.match(/^([a-zA-Z0-9._-]+)\s*:/);
+      if (m && !FORBIDDEN_COMPOSE_KEYS.has(m[1])) {
+        names.push(m[1]);
+      }
+    }
+  }
+  return Array.from(new Set(names));
+}
+
+/**
+ * Genera un archivo override determinista de Docker Compose que inyecta límites cgroup
+ * (`mem_limit`, `memswap_limit`, `cpus`, `pids_limit` y `deploy.resources.limits`) en TODOS
+ * los servicios del stack para que los límites configurados en la UI jamás se descarten
+ * silenciosamente en aplicaciones Compose (coolify#12414).
+ *
+ * @param {string | string[]} composeTextOrServices
+ * @param {{ memoryMb?: number | string | null, cpus?: number | string | null, pidsLimit?: number | string | null }} [limits]
+ */
+function buildComposeResourceOverride(composeTextOrServices, limits = {}) {
+  const rawList = Array.isArray(composeTextOrServices)
+    ? composeTextOrServices
+    : extractComposeServiceNames(String(composeTextOrServices || ''));
+  const services = Array.from(new Set(
+    rawList
+      .map((s) => String(s || '').trim())
+      .filter((s) => /^[a-zA-Z0-9._-]{1,64}$/.test(s) && !FORBIDDEN_COMPOSE_KEYS.has(s))
+  ));
+  if (services.length === 0) {
+    throw new Error('No se encontraron servicios válidos en el archivo Docker Compose para aplicar límites de recursos');
+  }
+
+  const rawMem = limits.memoryMb != null ? Number(limits.memoryMb) : DEFAULTS.memoryMb;
+  const memoryMb = Number.isFinite(rawMem) ? Math.min(65536, Math.max(32, Math.round(rawMem))) : DEFAULTS.memoryMb;
+  const rawCpus = limits.cpus != null ? Number(limits.cpus) : Number(DEFAULTS.cpus);
+  const cpusNum = Number.isFinite(rawCpus) ? Math.min(64, Math.max(0.1, Math.round(rawCpus * 100) / 100)) : Number(DEFAULTS.cpus);
+  const cpusStr = String(cpusNum);
+  const rawPids = limits.pidsLimit != null ? Number(limits.pidsLimit) : DEFAULTS.pidsLimit;
+  const pidsLimit = Number.isFinite(rawPids) ? Math.min(16384, Math.max(16, Math.round(rawPids))) : DEFAULTS.pidsLimit;
+
+  const lines = [
+    '# Culkibo Compose cgroup resource enforcement override (coolify#12414)',
+    'services:'
+  ];
+  for (const svc of services) {
+    lines.push(
+      `  ${svc}:`,
+      `    mem_limit: ${memoryMb}m`,
+      `    memswap_limit: ${memoryMb}m`,
+      `    cpus: ${cpusStr}`,
+      `    pids_limit: ${pidsLimit}`,
+      '    deploy:',
+      '      resources:',
+      '        limits:',
+      `          memory: ${memoryMb}M`,
+      `          cpus: "${cpusStr}"`
+    );
+  }
+  const overrideYaml = lines.join('\n') + '\n';
+  return { services, memoryMb, cpus: cpusStr, pidsLimit, overrideYaml };
+}
+
+/**
+ * Construye argv seguro (`shell: false`) para `docker compose up -d` incluyendo override de límites.
+ * @param {{ composeFile: string, overrideFile?: string | null, projectName?: string, envFile?: string | null }} opts
+ * @returns {string[]}
+ */
+function buildComposeUpArgs(opts) {
+  const args = ['compose'];
+  if (opts.projectName) {
+    args.push('-p', `culkibo_${safeSlug(opts.projectName)}`);
+  }
+  args.push('-f', String(opts.composeFile));
+  if (opts.overrideFile) {
+    args.push('-f', String(opts.overrideFile));
+  }
+  if (opts.envFile) {
+    args.push('--env-file', String(opts.envFile));
+  }
+  args.push('up', '-d', '--remove-orphans');
+  return args;
+}
+
+/**
+ * Lee un archivo `docker-compose.yml` / `compose.yaml`, genera el override con límites cgroup
+ * (`memoryMb`/`cpus`/`pidsLimit`) del proyecto y lo escribe de forma segura en disco (`0o600`).
+ *
+ * @param {string} composePath
+ * @param {any} [project]
+ * @param {{ overrideDir?: string | null, memoryMb?: number, cpus?: string | number, pidsLimit?: number, skipDiskCheck?: boolean }} [opts]
+ */
+function enforceComposeResourceLimits(composePath, project = null, opts = {}) {
+  const absCompose = path.resolve(String(composePath || ''));
+  if (!fs.existsSync(absCompose)) {
+    throw new Error(`Archivo Docker Compose no encontrado: ${absCompose}`);
+  }
+  const yamlText = fs.readFileSync(absCompose, 'utf8');
+  const built = buildComposeResourceOverride(yamlText, {
+    memoryMb: opts.memoryMb !== undefined ? opts.memoryMb : (project && project.memoryMb),
+    cpus: opts.cpus !== undefined ? opts.cpus : (project && project.cpus),
+    pidsLimit: opts.pidsLimit !== undefined ? opts.pidsLimit : DEFAULTS.pidsLimit
+  });
+  const outDir = opts.overrideDir ? path.resolve(opts.overrideDir) : path.dirname(absCompose);
+  if (!opts.skipDiskCheck) {
+    const minFree = process.env.CULKIBO_MIN_FREE_BYTES != null
+      ? Number(process.env.CULKIBO_MIN_FREE_BYTES)
+      : STORE_MIN_DISK_FREE_BYTES;
+    assertDiskHeadroom(outDir, minFree);
+  }
+  fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+  const overridePath = path.join(outDir, `culkibo.limits.${safeSlug((project && project.id) || 'compose')}.override.yml`);
+  fs.writeFileSync(overridePath, built.overrideYaml, { encoding: 'utf8', mode: 0o600 });
+  return {
+    ...built,
+    composePath: absCompose,
+    overridePath,
+    composeArgs: buildComposeUpArgs({
+      composeFile: absCompose,
+      overrideFile: overridePath,
+      projectName: (project && project.id) || path.basename(path.dirname(absCompose))
+    })
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Saneadores
@@ -811,6 +1120,10 @@ class DeployManager extends EventEmitter {
   /** Escritura atómica con permisos 0600 y copia de respaldo `.bak` (throttled cada 5 s). */
   saveStore() {
     try {
+      const minFree = process.env.CULKIBO_MIN_FREE_BYTES != null
+        ? Number(process.env.CULKIBO_MIN_FREE_BYTES)
+        : STORE_MIN_DISK_FREE_BYTES;
+      assertDiskHeadroom(path.dirname(STORE_FILE), minFree);
       const now = Date.now();
       if (now - this._lastBakAt >= 5000 && fs.existsSync(STORE_FILE)) {
         try { fs.copyFileSync(STORE_FILE, STORE_BAK_FILE); this._lastBakAt = now; } catch (e) {}
@@ -3528,6 +3841,14 @@ class DeployManager extends EventEmitter {
   async deploy(project, options = {}) {
     if (!project || !project.id) throw new Error('Proyecto inválido');
 
+    // Guardia pre-despliegue anti-ENOSPC (Cosmos#591): impedir corromper capas o estado si falta espacio
+    if (!options.skipDiskCheck) {
+      const minFree = options.minFreeBytes !== undefined
+        ? Number(options.minFreeBytes)
+        : (process.env.CULKIBO_MIN_FREE_BYTES != null ? Number(process.env.CULKIBO_MIN_FREE_BYTES) : DEFAULT_MIN_DISK_FREE_BYTES);
+      assertDiskHeadroom(DATA_DIR, minFree);
+    }
+
     // Ventanas de congelación de despliegues (nunca bloquean rollback; overrideFreeze queda auditado).
     const freezeTrigger = options.trigger || 'manual';
     const freezeNow = options.now !== undefined ? new Date(options.now) : new Date();
@@ -3619,6 +3940,14 @@ class DeployManager extends EventEmitter {
    */
   enqueue(project, options = {}) {
     if (!project || !project.id) throw new Error('Proyecto inválido');
+
+    // Guardia pre-despliegue anti-ENOSPC (Cosmos#591): impedir corromper capas o estado si falta espacio
+    if (!options.skipDiskCheck) {
+      const minFree = options.minFreeBytes !== undefined
+        ? Number(options.minFreeBytes)
+        : (process.env.CULKIBO_MIN_FREE_BYTES != null ? Number(process.env.CULKIBO_MIN_FREE_BYTES) : DEFAULT_MIN_DISK_FREE_BYTES);
+      assertDiskHeadroom(DATA_DIR, minFree);
+    }
     const freezeTrigger = options.trigger || 'manual';
     const freezeNow = options.now !== undefined ? new Date(options.now) : new Date();
     const freezeCheck = this.evaluateFreezeStatus(project, { now: freezeNow, trigger: freezeTrigger });
@@ -5978,6 +6307,374 @@ class DeployManager extends EventEmitter {
     return task;
   }
 
+  /**
+   * Reinicio rápido solo de runtime (`dokploy#2547`): recrea el contenedor desde la MISMA
+   * `imageTag` ya construida aplicando las variables de entorno actualizadas (sin `docker build`,
+   * sin `git fetch`, sin perder caché) con healthcheck + swap atómico de ruta zero-downtime.
+   *
+   * @param {string | any} projectOrId
+   * @param {{
+   *   envVars?: Record<string, string>,
+   *   persistEnv?: boolean,
+   *   dryRun?: boolean,
+   *   skipDiskCheck?: boolean,
+   *   memoryMb?: number,
+   *   cpus?: string | number,
+   *   healthTimeoutMs?: number,
+   *   healthIntervalMs?: number,
+   *   drainTimeoutMs?: number,
+   *   actor?: string,
+   *   actorIp?: string | null
+   * }} [options]
+   */
+  async fastRestartWithEnv(projectOrId, options = {}) {
+    const startedAt = Date.now();
+    const projectId = (projectOrId && typeof projectOrId === 'object') ? projectOrId.id : projectOrId;
+    if (!projectId || typeof projectId !== 'string') {
+      const err = new Error('Proyecto inválido');
+      /** @type {any} */ (err).status = 400;
+      throw err;
+    }
+
+    const pm = getProjectManager();
+    const liveProject = (projectOrId && typeof projectOrId === 'object')
+      ? projectOrId
+      : (pm && typeof pm.getById === 'function' ? pm.getById(projectId) : null);
+
+    const state = this.getState(projectId);
+    const current = state.current;
+    if (!current || !current.imageTag) {
+      return {
+        restarted: false,
+        rebuilt: false,
+        status: 404,
+        durationMs: Date.now() - startedAt,
+        projectId,
+        error: 'Este proyecto no tiene una imagen desplegada activa; ejecuta un despliegue inicial primero.'
+      };
+    }
+
+    if (!options.skipDiskCheck) {
+      const minFree = process.env.CULKIBO_MIN_FREE_BYTES != null
+        ? Number(process.env.CULKIBO_MIN_FREE_BYTES)
+        : STORE_MIN_DISK_FREE_BYTES;
+      assertDiskHeadroom(DATA_DIR, minFree);
+    }
+
+    const linkedDb = liveProject
+      ? this.resolveLinkedDatabases(liveProject)
+      : { injectedEnv: {}, networks: [], secretValues: [] };
+    /** @type {Record<string, string>} */
+    const rawMergedEnv = {
+      ...linkedDb.injectedEnv,
+      ...((liveProject && liveProject.envVars) || {}),
+      ...(options.envVars && typeof options.envVars === 'object' && !Array.isArray(options.envVars) ? options.envVars : {})
+    };
+    const em = getEnvironmentManager();
+    /** @type {Record<string, string>} */
+    let envVars = rawMergedEnv;
+    if (em && typeof em.resolveVaultReferences === 'function') {
+      try {
+        const resolved = em.resolveVaultReferences(rawMergedEnv);
+        if (resolved && typeof resolved === 'object') {
+          envVars = resolved.resolved && typeof resolved.resolved === 'object' ? resolved.resolved : resolved;
+        }
+      } catch (e) {}
+    }
+
+    const validEnvNames = Object.keys(envVars).filter(isValidEnvName);
+    const inlineEnvNames = validEnvNames.filter((k) => !HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
+    const fileOnlyEnvNames = validEnvNames.filter((k) => HOST_HIJACK_ENV_BLOCKLIST.has(k.toUpperCase()));
+
+    const opts = { ...DEFAULTS, ...options };
+    const rawMem = options.memoryMb != null ? Number(options.memoryMb) : Number(liveProject && liveProject.memoryMb);
+    const safeMemMb = Number.isInteger(rawMem) && rawMem >= 32 && rawMem <= 65536 ? rawMem : opts.memoryMb;
+    const rawCpus = options.cpus != null ? String(options.cpus) : String((liveProject && liveProject.cpus) || '');
+    const safeCpus = /^[0-9]+(\.[0-9]+)?$/.test(rawCpus) ? rawCpus : opts.cpus;
+    const containerPort = current.containerPort || (liveProject && liveProject.containerPort) || DEFAULTS.containerPort;
+    const healthPath = sanitizeHealthPath((liveProject && liveProject.healthPath) || current.healthPath || DEFAULTS.healthPath);
+
+    if (options.dryRun) {
+      const previewArgs = this.runArgs({
+        containerName: `culkibo_${safeSlug(projectId)}_env_preview`,
+        imageTag: current.imageTag,
+        hostPort: current.hostPort || 20000,
+        containerPort,
+        envNames: inlineEnvNames,
+        envFile: fileOnlyEnvNames.length > 0 ? '<ephemeral-0600-env-file>' : null,
+        network: opts.network,
+        memoryMb: safeMemMb,
+        cpus: safeCpus,
+        pidsLimit: opts.pidsLimit
+      });
+      return {
+        restarted: false,
+        dryRun: true,
+        rebuilt: false,
+        durationMs: Date.now() - startedAt,
+        projectId,
+        imageTag: current.imageTag,
+        previousContainerName: current.containerName,
+        envKeysApplied: validEnvNames,
+        memoryMb: safeMemMb,
+        cpus: safeCpus,
+        runArgsPreview: previewArgs
+      };
+    }
+
+    if (this.locks.has(projectId)) {
+      const err = new Error('Hay un despliegue o reinicio en curso para este proyecto; espera a que termine');
+      /** @type {any} */ (err).status = 409;
+      throw err;
+    }
+
+    const task = (async () => {
+      const targetServerId = current.serverId || (liveProject && liveProject.serverId) || 'local';
+      const isRemote = targetServerId !== 'local';
+      const secrets = [
+        ...Object.values(envVars),
+        ...linkedDb.secretValues
+      ].map((v) => String(v || '')).filter(Boolean);
+
+      return this._withRemoteDockerEnv(targetServerId, {}, async (remoteDockerHost, fleet) => {
+        const dockerBaseEnv = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+        const docker = await this.detectDocker({ force: true, env: dockerBaseEnv });
+        if (!docker.available) {
+          return {
+            restarted: false,
+            rebuilt: false,
+            status: 503,
+            durationMs: Date.now() - startedAt,
+            projectId,
+            error: docker.reason || 'Docker no está disponible en este host'
+          };
+        }
+
+        // Confirmar que la imagen actual sigue presente (jamás dispara docker build)
+        const imgCheck = await this.runDocker(['image', 'inspect', current.imageTag], { timeoutMs: 8000, env: dockerBaseEnv });
+        if (imgCheck.code !== 0) {
+          return {
+            restarted: false,
+            rebuilt: false,
+            status: 404,
+            durationMs: Date.now() - startedAt,
+            projectId,
+            imageTag: current.imageTag,
+            error: `La imagen ${current.imageTag} ya no existe localmente; ejecuta un despliegue completo.`
+          };
+        }
+
+        await this.ensureNetwork(opts.network, { env: dockerBaseEnv, cacheKey: isRemote ? targetServerId : null });
+        const nextId = `fr_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+        const nextName = `culkibo_${safeSlug(projectId)}_env_${crypto.randomBytes(3).toString('hex')}`;
+        const nextPort = isRemote
+          ? await this._allocateRemotePort(targetServerId, fleet, remoteDockerHost)
+          : await this.findFreePort(20000, nextId);
+
+        /** @type {string | null} */
+        let envFile = null;
+        this.inFlightContainers.add(nextName);
+        try {
+          if (fileOnlyEnvNames.length > 0) {
+            fs.mkdirSync(TMP_ENV_DIR, { recursive: true, mode: 0o700 });
+            envFile = path.join(TMP_ENV_DIR, `fastenv_${crypto.randomBytes(8).toString('hex')}`);
+            const lines = fileOnlyEnvNames.map((k) => `${k}=${String(envVars[k] == null ? '' : envVars[k]).replace(/[\r\n\0]+/g, ' ')}`);
+            fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+          }
+
+          const runArgs = this.runArgs({
+            containerName: nextName,
+            imageTag: current.imageTag,
+            hostPort: nextPort,
+            containerPort,
+            envNames: inlineEnvNames,
+            envFile,
+            network: opts.network,
+            memoryMb: safeMemMb,
+            cpus: safeCpus,
+            pidsLimit: opts.pidsLimit,
+            labels: {
+              'culkibo.managed': 'true',
+              'com.culkibo.project': safeSlug(projectId),
+              'com.culkibo.project_id': projectId,
+              'com.culkibo.deployment': nextId,
+              'com.culkibo.fast_restart': 'true'
+            }
+          });
+          const childRunEnv = {
+            ...process.env,
+            ...filterSafeHostEnv(envVars),
+            ...(remoteDockerHost ? { DOCKER_HOST: remoteDockerHost } : {})
+          };
+          const runRes = await this.runDocker(runArgs, { timeoutMs: 45000, env: childRunEnv });
+          if (runRes.code !== 0) {
+            const msg = this.redact((runRes.stderr || '').trim() || `docker run falló en fast-restart (${runRes.code})`, secrets);
+            return { restarted: false, rebuilt: false, status: 500, durationMs: Date.now() - startedAt, projectId, error: msg };
+          }
+        } finally {
+          if (envFile) { try { fs.unlinkSync(envFile); } catch (e) {} }
+          if (!isRemote) {
+            this._pendingPorts.delete(nextPort);
+            portRegistry.release(nextPort, nextId);
+          }
+          this.inFlightContainers.delete(nextName);
+        }
+
+        for (const dbNet of linkedDb.networks) {
+          if (dbNet !== opts.network) {
+            await this.runDocker(['network', 'connect', dbNet, nextName], { timeoutMs: 10000, env: dockerBaseEnv }).catch(() => {});
+          }
+        }
+
+        const up = await this.resolveUpstream({
+          containerName: nextName,
+          containerPort,
+          hostPort: nextPort,
+          network: opts.network,
+          env: dockerBaseEnv
+        });
+
+        const health = await this._withHealthTarget(targetServerId, fleet, nextPort, (probePort) =>
+          this.waitForHealth({
+            hostPort: probePort,
+            containerPort,
+            healthPath: healthPath || DEFAULTS.healthPath,
+            containerName: nextName,
+            timeoutMs: opts.healthTimeoutMs,
+            intervalMs: opts.healthIntervalMs,
+            isRemote,
+            dockerEnv: dockerBaseEnv,
+            onProgress: null
+          })
+        );
+        if (!health.healthy) {
+          await this.runDocker(['rm', '-f', nextName], { timeoutMs: 15000, env: dockerBaseEnv }).catch(() => {});
+          return {
+            restarted: false,
+            rebuilt: false,
+            status: 502,
+            durationMs: Date.now() - startedAt,
+            projectId,
+            imageTag: current.imageTag,
+            error: `El contenedor reiniciado no pasó el healthcheck (el contenedor previo sigue sirviendo tráfico): ${health.reason}`
+          };
+        }
+
+        const hostnames = liveProject ? this.hostnamesFor(liveProject) : (current.hostnames || []);
+        const record = {
+          id: nextId,
+          projectId,
+          projectName: (liveProject && liveProject.name) || current.projectName || projectId,
+          containerName: nextName,
+          imageTag: current.imageTag,
+          hostPort: nextPort,
+          containerPort,
+          upstream: up.dial,
+          hostnames,
+          healthPath,
+          serverId: targetServerId,
+          status: 'activo',
+          fastRestart: true,
+          startedAt: new Date(startedAt).toISOString(),
+          finishedAt: new Date().toISOString(),
+          logLines: []
+        };
+
+        let routeSwitched = false;
+        if (hostnames.length > 0) {
+          const switched = await this._withRouteTarget(targetServerId, fleet, (routeOpts) =>
+            this.switchRoute(record, hostnames, up.dial, liveProject, routeOpts)
+          );
+          if (!switched.ok) {
+            await this.runDocker(['rm', '-f', nextName], { timeoutMs: 15000, env: dockerBaseEnv }).catch(() => {});
+            return {
+              restarted: false,
+              rebuilt: false,
+              status: 502,
+              durationMs: Date.now() - startedAt,
+              projectId,
+              error: `No se pudo conmutar la ruta tras el reinicio rápido: ${switched.error}`
+            };
+          }
+          routeSwitched = true;
+        }
+
+        if (options.persistEnv && liveProject && options.envVars && pm && typeof pm.update === 'function') {
+          try {
+            pm.update(projectId, { envVars: { ...(liveProject.envVars || {}), ...options.envVars } });
+          } catch (e) {}
+        }
+
+        const prevRelease = current;
+        state.previous = prevRelease;
+        state.current = {
+          ...prevRelease,
+          id: nextId,
+          containerName: nextName,
+          hostPort: nextPort,
+          containerPort,
+          upstream: up.dial,
+          hostnames,
+          healthPath,
+          status: 'activo',
+          updatedAt: new Date().toISOString()
+        };
+        state.history = [record, ...(state.history || [])].slice(0, 30);
+        this.saveStore();
+
+        if (prevRelease.containerName && prevRelease.containerName !== nextName) {
+          const drain = this.drainAndRetire(record, prevRelease, opts)
+            .catch(() => {})
+            .finally(() => { if (this.drains.get(projectId) === drain) this.drains.delete(projectId); });
+          this.drains.set(projectId, drain);
+        }
+
+        const durationMs = Date.now() - startedAt;
+        this._recordAudit({
+          source: 'deploy',
+          action: 'deploy.fast_restart',
+          resourceId: projectId,
+          ip: options.actorIp || null,
+          status: 200,
+          detail: {
+            imageTag: current.imageTag,
+            previousContainerName: prevRelease.containerName,
+            containerName: nextName,
+            envKeysCount: validEnvNames.length,
+            rebuilt: false,
+            durationMs
+          }
+        });
+        this.emit('deploy_fast_restart', {
+          projectId,
+          imageTag: current.imageTag,
+          containerName: nextName,
+          rebuilt: false,
+          durationMs
+        });
+
+        return {
+          restarted: true,
+          rebuilt: false,
+          durationMs,
+          projectId,
+          imageTag: current.imageTag,
+          previousContainerName: prevRelease.containerName,
+          containerName: nextName,
+          hostPort: nextPort,
+          upstream: up.dial,
+          envKeysApplied: validEnvNames,
+          routeSwitched
+        };
+      });
+    })().finally(() => {
+      if (this.locks.get(projectId) === task) this.locks.delete(projectId);
+      this.drainPending(projectId);
+    });
+    this.locks.set(projectId, task);
+    return task;
+  }
+
   // -------------------------------------------------------------------------
   // 8. Logs en vivo, estadísticas y ejecución segura en contenedor de producción
   // -------------------------------------------------------------------------
@@ -6124,7 +6821,7 @@ class DeployManager extends EventEmitter {
     }
     const [insp, st] = await Promise.all([
       this.runDocker(
-        ['inspect', '-f', '{{.State.Status}}|{{.State.Running}}|{{.State.OOMKilled}}|{{.RestartCount}}|{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}', release.containerName],
+        ['inspect', '-f', '{{.Id}}|{{.State.Status}}|{{.State.Running}}|{{.State.OOMKilled}}|{{.RestartCount}}|{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}', release.containerName],
         { timeoutMs: 8000 }
       ),
       this.runDocker(['stats', '--no-stream', '--format', '{{json .}}', release.containerName], { timeoutMs: 10000 })
@@ -6137,12 +6834,13 @@ class DeployManager extends EventEmitter {
         error: `Contenedor ${release.containerName} no encontrado en Docker`
       };
     }
-    const [status, running, oomKilled, restartCount, startedAt, health] = (insp.stdout || '').trim().split('|');
+    const [containerId, status, running, oomKilled, restartCount, startedAt, health] = (insp.stdout || '').trim().split('|');
     /** @type {any} */
     let statsObj = null;
     if (st.code === 0 && (st.stdout || '').trim()) {
       try { statsObj = JSON.parse((st.stdout || '').trim().split(/\r?\n/)[0]); } catch (e) {}
     }
+    const cgroupMemory = readContainerCgroupV2Memory(containerId || '');
     return {
       ok: true,
       containerName: release.containerName,
@@ -6156,6 +6854,7 @@ class DeployManager extends EventEmitter {
       cpuPercent: statsObj?.CPUPerc || null,
       memUsage: statsObj?.MemUsage || null,
       memPercent: statsObj?.MemPerc || null,
+      cgroupMemory,
       netIO: statsObj?.NetIO || null,
       blockIO: statsObj?.BlockIO || null,
       pids: statsObj?.PIDs || null
@@ -6216,6 +6915,12 @@ class DeployManager extends EventEmitter {
 const instance = /** @type {any} */ (new DeployManager());
 instance.DeployManager = DeployManager;
 instance.DEFAULTS = DEFAULTS;
+instance.assertDiskHeadroom = assertDiskHeadroom;
+instance.parseCgroupV2MemoryStats = parseCgroupV2MemoryStats;
+instance.readContainerCgroupV2Memory = readContainerCgroupV2Memory;
+instance.buildComposeResourceOverride = buildComposeResourceOverride;
+instance.enforceComposeResourceLimits = enforceComposeResourceLimits;
+instance.buildComposeUpArgs = buildComposeUpArgs;
 instance.helpers = {
   safeSlug,
   isValidEnvName,
@@ -6232,7 +6937,14 @@ instance.helpers = {
   evaluateFreezeStatus,
   isInFreezeWindow,
   normalizeSmokeConfig,
-  normalizeCanaryConfig
+  normalizeCanaryConfig,
+  assertDiskHeadroom,
+  parseCgroupV2MemoryStats,
+  readContainerCgroupV2Memory,
+  extractComposeServiceNames,
+  buildComposeResourceOverride,
+  enforceComposeResourceLimits,
+  buildComposeUpArgs
 };
 
 module.exports = instance;

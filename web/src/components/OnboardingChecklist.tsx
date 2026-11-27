@@ -17,6 +17,7 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import { useI18n } from '../lib/i18n';
 
 const DISMISS_KEY = 'culkibo_onboarding_dismissed_v1';
 const MCP_SEEN_KEY = 'culkibo_onboarding_mcp_seen_v1';
@@ -47,6 +48,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
   onNotify,
   restoreTick = 0,
 }) => {
+  const { t, locale } = useI18n();
   const [dismissed, setDismissed] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem(DISMISS_KEY) === '1';
@@ -103,8 +105,9 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
 
   if (dismissed) return null;
 
+  const totalResources = projectsCount + installationsCount;
   const stepInfraDone = Boolean(caddyOk && dockerOk);
-  const stepAppDone = projectsCount > 0 || installationsCount > 0;
+  const stepAppDone = totalResources > 0;
   const stepMcpDone = mcpUsed;
   const stepTlsSecDone = domainsCount > 0;
 
@@ -112,34 +115,38 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
     {
       id: 'infra',
       done: stepInfraDone,
-      title: 'Motor y HTTPS listos',
+      title: t('onb.step1Title'),
       desc: stepInfraDone
-        ? `Docker y Caddy activos${serverIp ? ` en ${serverIp}` : ''}.`
-        : 'Activa Caddy para emitir TLS automático y HTTP/3 sin configurar nada.',
+        ? t('onb.step1Done', { ip: serverIp ? ` (${serverIp})` : '' })
+        : t('onb.step1Todo'),
     },
     {
       id: 'app',
       done: stepAppDone,
-      title: 'Primera app en vivo',
+      title: t('onb.step2Title'),
       desc: stepAppDone
-        ? `${projectsCount + installationsCount} ${projectsCount + installationsCount === 1 ? 'recurso activo' : 'recursos activos'} en tu servidor.`
-        : 'Despliega desde Git, migra Coolify v4 o instala del catálogo (140+ apps).',
+        ? t('onb.step2Done', {
+            count: totalResources,
+            unit: totalResources === 1 ? t('onb.resourceSingular') : t('onb.resourcePlural'),
+          })
+        : t('onb.step2Todo'),
     },
     {
       id: 'mcp',
       done: stepMcpDone,
-      title: 'Agente IA (MCP 2026)',
-      desc: stepMcpDone
-        ? 'Agente conectado al plano de control con 109 herramientas.'
-        : 'Conecta Claude Code, Antigravity o Cursor en 1 clic (~81% menos tokens).',
+      title: t('onb.step3Title'),
+      desc: stepMcpDone ? t('onb.step3Done') : t('onb.step3Todo'),
     },
     {
       id: 'tls',
       done: stepTlsSecDone,
-      title: 'Dominio HTTPS y 2FA',
+      title: t('onb.step4Title'),
       desc: stepTlsSecDone
-        ? `${domainsCount} ${domainsCount === 1 ? 'dominio HTTPS conectado' : 'dominios HTTPS conectados'}.`
-        : 'Publica tu dominio con SSL automático y protege tu cuenta con TOTP 2FA.',
+        ? t('onb.step4Done', {
+            count: domainsCount,
+            unit: domainsCount === 1 ? t('onb.domainSingular') : t('onb.domainPlural'),
+          })
+        : t('onb.step4Todo'),
     },
   ];
 
@@ -152,7 +159,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
     try {
       window.localStorage.setItem(DISMISS_KEY, '1');
     } catch {
-      // ignorar si localStorage no está disponible
+      // ignore
     }
   };
 
@@ -160,7 +167,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
     try {
       window.localStorage.setItem(MCP_SEEN_KEY, '1');
     } catch {
-      // ignorar
+      // ignore
     }
     setMcpUsed(true);
     onOpenAi();
@@ -172,12 +179,17 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
       const res = await api.startIngress();
       if (res.started || res.alreadyRunning) {
         setCaddyOk(true);
-        onNotify?.('Caddy activado: HTTPS automático y HTTP/3 disponibles.', 'success');
+        onNotify?.(
+          locale === 'es'
+            ? 'Caddy activado: HTTPS automático y HTTP/3 disponibles.'
+            : 'Caddy started: automatic HTTPS & HTTP/3 enabled.',
+          'success'
+        );
       } else {
-        onNotify?.(res.message || 'No se pudo iniciar Caddy.', 'error');
+        onNotify?.(res.message || 'Could not start Caddy.', 'error');
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Error al activar Caddy';
+      const msg = err instanceof Error ? err.message : 'Error starting Caddy';
       onNotify?.(msg, 'error');
     } finally {
       setStartingCaddy(false);
@@ -186,10 +198,9 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
 
   return (
     <section
-      aria-label="Guía de puesta en marcha rápida"
+      aria-label={t('onb.title')}
       className="culkibo-surface rounded-2xl overflow-hidden"
     >
-      {/* Barra superior compacta con progreso real */}
       <div className="px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-3 min-w-0 flex-wrap">
           <button
@@ -199,7 +210,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
             className="inline-flex items-center gap-2 text-xs font-semibold text-slate-900 cursor-pointer hover:text-slate-700"
           >
             <Sparkles className={`w-3.5 h-3.5 shrink-0 ${allDone ? 'text-emerald-600' : 'text-amber-500'}`} />
-            <span>{allDone ? 'Entorno listo para producción' : 'Arranque rápido (<2 min)'}</span>
+            <span>{allDone ? t('onb.ready') : t('onb.title')}</span>
             <span
               className={`px-2 py-0.5 rounded-full text-[11px] font-medium border tabular-nums ${
                 allDone
@@ -211,7 +222,6 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
             </span>
           </button>
 
-          {/* Barra de progreso limpia */}
           <div
             aria-hidden="true"
             className="hidden sm:block w-24 h-1.5 rounded-full bg-slate-100 overflow-hidden shrink-0"
@@ -247,13 +257,13 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
               className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-900 hover:bg-slate-800 text-white cursor-pointer disabled:opacity-50"
             >
               {startingCaddy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
-              <span>Activar Caddy</span>
+              <span>{t('onb.activateCaddy')}</span>
             </button>
           )}
           <button
             type="button"
             onClick={() => setExpanded((prev) => !prev)}
-            aria-label={expanded ? 'Contraer guía' : 'Expandir guía'}
+            aria-label={expanded ? 'Collapse guide' : 'Expand guide'}
             className="inline-flex items-center justify-center w-9 h-9 sm:w-8 sm:h-8 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors cursor-pointer"
           >
             {expanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
@@ -261,8 +271,8 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
           <button
             type="button"
             onClick={handleDismiss}
-            aria-label="Ocultar guía de primeros pasos"
-            title="Ocultar (restaurable en Ajustes o Ctrl+K)"
+            aria-label="Dismiss quick start"
+            title="Dismiss (restorable in Settings or Ctrl+K)"
             className="inline-flex items-center justify-center w-9 h-9 sm:w-8 sm:h-8 rounded-lg text-slate-400 hover:text-slate-800 hover:bg-slate-100 transition-colors cursor-pointer"
           >
             <X className="w-4 h-4" />
@@ -270,10 +280,9 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
         </div>
       </div>
 
-      {/* Tarjetas paso a paso accionables */}
       {expanded && (
         <div className="px-4 pb-4 pt-2 border-t border-slate-100 bg-slate-50/55 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2.5">
-          {/* Paso 1: Infraestructura */}
+          {/* Step 1 */}
           <div className="bg-white rounded-xl border border-slate-200/90 p-3.5 flex flex-col justify-between gap-3">
             <div className="space-y-1.5">
               <div className="flex items-center justify-between gap-2">
@@ -285,7 +294,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                       1
                     </span>
                   )}
-                  <span>Motor y HTTPS</span>
+                  <span>{steps[0].title}</span>
                 </span>
                 {serverIp && (
                   <span className="font-mono text-[10px] text-slate-400 tabular-nums truncate max-w-[100px]">
@@ -312,12 +321,12 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                     : 'bg-amber-50 text-amber-800 border-amber-200'
                 }`}
               >
-                Caddy: {caddyOk === null ? '…' : caddyOk ? 'OK' : 'Detenido'}
+                Caddy: {caddyOk === null ? '…' : caddyOk ? 'OK' : 'Stopped'}
               </span>
             </div>
           </div>
 
-          {/* Paso 2: Primera app */}
+          {/* Step 2 */}
           <div className="bg-white rounded-xl border border-slate-200/90 p-3.5 flex flex-col justify-between gap-3">
             <div className="space-y-1.5">
               <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900">
@@ -328,7 +337,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                     2
                   </span>
                 )}
-                <span>Despliega tu primera app</span>
+                <span>{steps[1].title}</span>
               </span>
               <p className="text-[11px] text-slate-500 leading-relaxed">{steps[1].desc}</p>
             </div>
@@ -339,7 +348,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                 className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-medium cursor-pointer"
               >
                 <GitBranch className="w-3 h-3" />
-                <span>Git</span>
+                <span>{t('onb.git')}</span>
               </button>
               <button
                 type="button"
@@ -347,7 +356,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                 className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-[11px] font-medium cursor-pointer"
               >
                 <Download className="w-3 h-3 text-slate-500" />
-                <span>Coolify</span>
+                <span>{t('onb.coolify')}</span>
               </button>
               <button
                 type="button"
@@ -355,12 +364,12 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                 className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-[11px] font-medium cursor-pointer"
               >
                 <Boxes className="w-3 h-3 text-slate-500" />
-                <span>140+ Apps</span>
+                <span>{t('onb.apps140')}</span>
               </button>
             </div>
           </div>
 
-          {/* Paso 3: Conectar MCP IA */}
+          {/* Step 3 */}
           <div className="bg-white rounded-xl border border-slate-200/90 p-3.5 flex flex-col justify-between gap-3">
             <div className="space-y-1.5">
               <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900">
@@ -371,7 +380,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                     3
                   </span>
                 )}
-                <span>Conecta tu Agente IA</span>
+                <span>{steps[2].title}</span>
               </span>
               <p className="text-[11px] text-slate-500 leading-relaxed">{steps[2].desc}</p>
             </div>
@@ -388,7 +397,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
             </div>
           </div>
 
-          {/* Paso 4: Dominio HTTPS + Seguridad 2FA */}
+          {/* Step 4 */}
           <div className="bg-white rounded-xl border border-slate-200/90 p-3.5 flex flex-col justify-between gap-3">
             <div className="space-y-1.5">
               <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900">
@@ -399,7 +408,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                     4
                   </span>
                 )}
-                <span>HTTPS y Seguridad 2FA</span>
+                <span>{steps[3].title}</span>
               </span>
               <p className="text-[11px] text-slate-500 leading-relaxed">{steps[3].desc}</p>
             </div>
@@ -410,7 +419,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                 className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 text-[11px] font-medium cursor-pointer"
               >
                 <Globe className="w-3 h-3 text-slate-500" />
-                <span>Dominio</span>
+                <span>{t('onb.domain')}</span>
               </button>
               {onOpenSecurity && (
                 <button
@@ -419,7 +428,7 @@ export const OnboardingChecklist: React.FC<OnboardingChecklistProps> = ({
                   className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 text-[11px] font-medium cursor-pointer"
                 >
                   <ShieldCheck className="w-3 h-3 text-emerald-600" />
-                  <span>2FA y Auditoría</span>
+                  <span>{t('onb.security2fa')}</span>
                 </button>
               )}
             </div>

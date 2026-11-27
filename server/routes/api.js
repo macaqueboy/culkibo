@@ -68,6 +68,82 @@ function getOidcService() { return _lazyV2.oidc || (_lazyV2.oidc = require('../s
 function getSecretScanner() { return _lazyV2.scanner || (_lazyV2.scanner = require('../services/secretScanner')); }
 function getEditionService() { return _lazyV2.edition || (_lazyV2.edition = require('../services/editionService')); }
 function getBundleArchiver() { return _lazyV2.bundle || (_lazyV2.bundle = require('../services/bundleArchiver')); }
+function getSmartPackBuilder() { return _lazyV2.smartpack || (_lazyV2.smartpack = require('../services/smartPackBuilder')); }
+function getDirectPushRegistry() { return _lazyV2.directpush || (_lazyV2.directpush = require('../services/directPushRegistry')); }
+function getEdgeTunnelService() { return _lazyV2.edgetunnel || (_lazyV2.edgetunnel = require('../services/edgeTunnelService')); }
+function getSqliteStreamBackup() { return _lazyV2.snapstream || (_lazyV2.snapstream = require('../services/sqliteStreamBackup')); }
+
+/**
+ * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
+ * Emite `X-Culkibo-Auth-Circuit: backoff` y `X-Culkibo-Auth-Backoff-Ms` cuando una IP acumula
+ * fallos de autenticación consecutivos para que el polling del frontend se detenga antes de
+ * activar el bloqueo brute-force 429 contra el propio administrador.
+ */
+/** @type {Map<string, { count: number, resetAt: number }>} */
+const _authCircuitByIp = new Map();
+const AUTH_CIRCUIT_WINDOW_MS = 5 * 60 * 1000;
+const AUTH_CIRCUIT_CAP = 1000;
+
+/** @param {any} req */
+function peekAuthCircuit(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  const entry = _authCircuitByIp.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    if (entry) _authCircuitByIp.delete(ip);
+    return { active: false, failures: 0, backoffMs: 0 };
+  }
+  const active = entry.count >= 2;
+  const backoffMs = active ? Math.min(60000, 1000 * Math.pow(2, Math.min(6, entry.count - 1))) : 0;
+  return { active, failures: entry.count, backoffMs };
+}
+
+/**
+ * @param {any} req
+ * @param {any} res
+ * @param {{ blocked?: boolean, retryAfterSec?: number }} [opts]
+ */
+function recordAuthCircuitFailure(req, res, opts = {}) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  let entry = _authCircuitByIp.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    if (_authCircuitByIp.size >= AUTH_CIRCUIT_CAP) {
+      for (const [k, v] of _authCircuitByIp.entries()) {
+        if (v.resetAt <= now) _authCircuitByIp.delete(k);
+        if (_authCircuitByIp.size < AUTH_CIRCUIT_CAP) break;
+      }
+      if (_authCircuitByIp.size >= AUTH_CIRCUIT_CAP) {
+        const oldest = _authCircuitByIp.keys().next().value;
+        if (oldest) _authCircuitByIp.delete(oldest);
+      }
+    }
+    entry = { count: 1, resetAt: now + AUTH_CIRCUIT_WINDOW_MS };
+  } else {
+    entry.count++;
+    entry.resetAt = now + AUTH_CIRCUIT_WINDOW_MS;
+    _authCircuitByIp.delete(ip);
+  }
+  _authCircuitByIp.set(ip, entry);
+
+  const shouldBackoff = Boolean(opts.blocked || entry.count >= 2);
+  const backoffMs = opts.blocked && opts.retryAfterSec
+    ? Math.max(2000, Number(opts.retryAfterSec) * 1000)
+    : (shouldBackoff ? Math.min(60000, 1000 * Math.pow(2, Math.min(6, entry.count - 1))) : 0);
+
+  if (shouldBackoff && res && typeof res.setHeader === 'function') {
+    res.setHeader('X-Culkibo-Auth-Circuit', 'backoff');
+    res.setHeader('X-Culkibo-Auth-Backoff-Ms', String(backoffMs));
+    res.setHeader('X-Culkibo-Auth-Failures', String(entry.count));
+  }
+  return { authCircuit: shouldBackoff ? 'backoff' : 'ok', failures: entry.count, backoffMs };
+}
+
+/** @param {any} req */
+function clearAuthCircuit(req) {
+  const ip = clientIp(req);
+  _authCircuitByIp.delete(ip);
+}
 
 /**
  * Adjunta una cookie de sesión `HttpOnly; SameSite=Strict` (o `Lax` en OIDC redirect)
@@ -1280,6 +1356,94 @@ router.get('/projects/:id/previews/:key/logs', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(404).json({ error: err.message });
+  }
+});
+
+// PR Preview Database Branching (opt-in Postgres TEMPLATE / SQLite CoW, 0 shell)
+router.post('/projects/:id/previews/:prNumber/branch-db', heavyOpLimiter, (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'previews:write');
+    if (!project) return;
+    const prNumber = parseInt(String(req.params.prNumber || ''), 10);
+    if (!Number.isInteger(prNumber) || prNumber < 1 || prNumber > 999999) {
+      return res.status(400).json({ error: 'prNumber debe ser un entero positivo (1..999999)' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    /** @type {Record<string, any>} */
+    const dbConfig = { ...body };
+    if (body.databaseId) {
+      const db = assertDatabaseAccess(req, res, String(body.databaseId), 'databases:read');
+      if (!db) return;
+      dbConfig.engine = dbConfig.engine || db.engine;
+      dbConfig.sourceDbName = dbConfig.sourceDbName || db.dbName;
+      dbConfig.containerName = dbConfig.containerName || db.containerName;
+      dbConfig.username = dbConfig.username || db.username;
+    }
+    const pmAny = /** @type {any} */ (previewManager);
+    if (typeof pmAny.planPreviewDbBranch !== 'function') {
+      return res.status(501).json({ error: 'Preview DB Branching no disponible en este runtime' });
+    }
+    const plan = pmAny.planPreviewDbBranch(project, prNumber, dbConfig);
+    res.json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// Runtime-only Fast Restart con variables actualizadas sin reconstruir imagen (dokploy#2547)
+router.post('/projects/:id/fast-restart', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const principal = getPrincipal(req);
+    const freezeCheck = deployManager.evaluateFreezeStatus(project, { trigger: 'fast_restart' });
+    if (freezeCheck && freezeCheck.frozen) {
+      if (!body.overrideFreeze) {
+        return res.status(423).json({
+          error: `Reinicio bloqueado por ventana de congelación: ${freezeCheck.reason || 'ventana activa'}`,
+          code: 'DEPLOY_FROZEN',
+          freezeWindow: freezeCheck.window
+        });
+      }
+      if (!principal.isSuperAdmin && !getTeamManager().doesPrincipalSatisfyRole(principal, 'admin', project.teamId || principal.teamId).allowed) {
+        return res.status(403).json({
+          error: 'Solo un admin u owner puede anular una ventana de congelación de despliegues',
+          code: 'FREEZE_OVERRIDE_FORBIDDEN'
+        });
+      }
+    }
+
+    const incomingEnv = body.envVars && typeof body.envVars === 'object' && !Array.isArray(body.envVars)
+      ? body.envVars
+      : undefined;
+    const scanMode = body.secretScanMode === 'block' ? 'block' : 'warn';
+    /** @type {any} */
+    let secretScan = null;
+    if (incomingEnv && Object.keys(incomingEnv).length > 0) {
+      secretScan = getSecretScanner().scanDeploymentPayload({ envVars: incomingEnv }, { mode: scanMode });
+      if (secretScan && secretScan.blocked) {
+        return res.status(422).json({
+          error: 'Reinicio bloqueado: el escáner detectó secretos en claro en envVars (usa ${vault.KEY})',
+          code: 'SECRET_LEAK_DETECTED',
+          secretScan
+        });
+      }
+    }
+
+    const result = await deployManager.fastRestartWithEnv(project, {
+      envVars: incomingEnv,
+      persistEnv: Boolean(body.persistEnv),
+      dryRun: Boolean(body.dryRun),
+      memoryMb: body.memoryMb != null ? Number(body.memoryMb) : undefined,
+      cpus: body.cpus != null ? body.cpus : undefined,
+      actor: principal.email || principal.kind || 'operator',
+      actorIp: clientIp(req)
+    });
+    const status = result.status || (result.restarted || result.dryRun ? 200 : 400);
+    res.status(status).json(secretScan ? { ...result, secretScan } : result);
+  } catch (err) {
+    sendServiceError(err, res, 500);
   }
 });
 
@@ -4304,12 +4468,20 @@ router.delete('/catalog/installations/:id', async (req, res) => {
 router.get('/auth/session', (req, res) => {
   const decision = authorizeRequest(req);
   const status = authStatus();
+  const circuit = !decision.ok ? peekAuthCircuit(req) : { active: false, failures: 0, backoffMs: 0 };
+  if (circuit.active) {
+    res.setHeader('X-Culkibo-Auth-Circuit', 'backoff');
+    res.setHeader('X-Culkibo-Auth-Backoff-Ms', String(circuit.backoffMs));
+    res.setHeader('X-Culkibo-Auth-Failures', String(circuit.failures));
+  }
   res.json({
     authenticated: decision.ok,
     method: decision.method || null,
     requireTokenAlways: status.requireTokenAlways,
     tokenConfigured: status.tokenConfigured,
-    tokenSource: status.tokenSource
+    tokenSource: status.tokenSource,
+    authCircuit: circuit.active ? 'backoff' : 'ok',
+    ...(circuit.active ? { backoffMs: circuit.backoffMs } : {})
   });
 });
 
@@ -4318,24 +4490,44 @@ router.post('/auth/verify', (req, res) => {
   if (bf.blocked) {
     metricsCollector.recordSecurityEvent('authBlocked429');
     res.setHeader('Retry-After', String(bf.retryAfterSec));
-    return res.status(429).json({ valid: false, error: 'Demasiados intentos de autenticación fallidos.' });
+    const circuit = recordAuthCircuitFailure(req, res, { blocked: true, retryAfterSec: bf.retryAfterSec });
+    return res.status(429).json({
+      valid: false,
+      error: 'Demasiados intentos de autenticación fallidos.',
+      authCircuit: circuit.authCircuit,
+      backoffMs: circuit.backoffMs
+    });
   }
   const token = String((req.body && req.body.token) || '').trim();
   if (token.startsWith('cks_')) {
     const verified = getTeamManager().verifySessionToken(token);
     if (verified && verified.ok) {
+      clearAuthCircuit(req);
       attachSessionCookie(req, res, token);
       return res.json({ valid: true, method: 'session' });
     }
     recordAuthFailure(req);
     metricsCollector.recordSecurityEvent('authFailures');
-    return res.status(401).json({ valid: false, error: 'Token inválido' });
+    const circuit = recordAuthCircuitFailure(req, res);
+    return res.status(401).json({
+      valid: false,
+      error: 'Token inválido',
+      authCircuit: circuit.authCircuit,
+      backoffMs: circuit.backoffMs
+    });
   }
   if (!tokenMatches(token)) {
     recordAuthFailure(req);
     metricsCollector.recordSecurityEvent('authFailures');
-    return res.status(401).json({ valid: false, error: 'Token inválido' });
+    const circuit = recordAuthCircuitFailure(req, res);
+    return res.status(401).json({
+      valid: false,
+      error: 'Token inválido',
+      authCircuit: circuit.authCircuit,
+      backoffMs: circuit.backoffMs
+    });
   }
+  clearAuthCircuit(req);
   attachVerifiedAuthCookie(req, res);
   res.json({ valid: true });
 });
@@ -4931,19 +5123,29 @@ router.post('/auth/login', authVerifyLimiter, (req, res) => {
   const bf = checkAuthBruteForce(req);
   if (bf.blocked) {
     res.setHeader('Retry-After', String(bf.retryAfterSec));
+    const circuit = recordAuthCircuitFailure(req, res, { blocked: true, retryAfterSec: bf.retryAfterSec });
     return res.status(429).json({
       error: 'Demasiados intentos de autenticación fallidos. Espera antes de reintentar.',
       code: 'AUTH_RATE_LIMITED',
-      retryAfterSec: bf.retryAfterSec
+      retryAfterSec: bf.retryAfterSec,
+      authCircuit: circuit.authCircuit,
+      backoffMs: circuit.backoffMs
     });
   }
   try {
+    if (getOidcService().isPasswordLoginDisabled()) {
+      return res.status(403).json({
+        error: 'El inicio de sesión con contraseña está deshabilitado por política SSO/OIDC',
+        code: 'PASSWORD_LOGIN_DISABLED'
+      });
+    }
     const tm = getTeamManager();
     const result = tm.login({
       ...(req.body || {}),
       ip: clientIp(req),
       ua: req.headers['user-agent'] || ''
     });
+    clearAuthCircuit(req);
     if (result && result.sessionToken) {
       attachSessionCookie(req, res, result.sessionToken);
     }
@@ -4951,6 +5153,7 @@ router.post('/auth/login', authVerifyLimiter, (req, res) => {
   } catch (err) {
     recordAuthFailure(req);
     metricsCollector.recordSecurityEvent('authFailures');
+    recordAuthCircuitFailure(req, res);
     sendServiceError(err, res, 401);
   }
 });
@@ -6153,13 +6356,28 @@ router.post('/auth/2fa/verify', sensitiveAuthLimiter, (req, res) => {
 });
 
 router.get('/auth/oidc/providers', (_req, res) => {
-  try { res.json({ providers: getOidcService().listPublicProviders() }); }
-  catch (err) { sendServiceError(err, res); }
+  try {
+    const oidc = getOidcService();
+    res.json({
+      providers: oidc.listPublicProviders(),
+      disablePasswordLogin: oidc.isPasswordLoginDisabled()
+    });
+  } catch (err) { sendServiceError(err, res); }
 });
 router.get('/auth/oidc/config', (req, res) => {
   try {
     if (denyInstanceGlobalForTenant(req, res, 'configuración OIDC')) return;
-    res.json({ providers: getOidcService().listProviders() });
+    const oidc = getOidcService();
+    res.json({
+      providers: oidc.listProviders(),
+      settings: oidc.getSecuritySettings()
+    });
+  } catch (err) { sendServiceError(err, res); }
+});
+router.put('/auth/oidc/settings', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'política de seguridad OIDC')) return;
+    res.json({ settings: getOidcService().setSecuritySettings(req.body || {}) });
   } catch (err) { sendServiceError(err, res); }
 });
 router.post('/auth/oidc/config', certAndAdminLimiter, (req, res) => {
@@ -6214,6 +6432,7 @@ async function handleOidcCallback(req, res) {
       ua: req.headers['user-agent'] || ''
     });
     if (loginResult && loginResult.sessionToken) {
+      clearAuthCircuit(req);
       attachSessionCookie(req, res, loginResult.sessionToken, {
         sameSite: req.method === 'GET' ? 'Lax' : 'Strict'
       });
@@ -6222,6 +6441,7 @@ async function handleOidcCallback(req, res) {
   } catch (err) {
     recordAuthFailure(req);
     metricsCollector.recordSecurityEvent('authFailures');
+    recordAuthCircuitFailure(req, res);
     sendServiceError(err, res, 401);
   }
 }
@@ -6340,6 +6560,120 @@ router.post('/fleet/placement', (req, res) => {
     if (!principal.isSuperAdmin) body.teamId = principal.teamId;
     res.json(getFleetManager().selectBestServer(body));
   } catch (err) { sendServiceError(err, res); }
+});
+
+// --- CYCLE #2 PIONEER LAZY ROUTES (SmartPack, DirectPush, EdgeTunnel, SnapStream) ---
+
+router.post('/build/smartpack/plan', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    /** @type {Record<string, any>} */
+    const opts = { ...body };
+    if (body.projectId) {
+      const project = assertProjectAccess(req, res, String(body.projectId), 'projects:read');
+      if (!project) return;
+      if (!opts.dirPath && !opts.dir && !opts.files) {
+        opts.dirPath = project.localPath || undefined;
+      }
+      if (opts.containerPort === undefined && project.containerPort) opts.containerPort = project.containerPort;
+      if (opts.memoryMb === undefined && project.memoryMb) opts.memoryMb = project.memoryMb;
+      if (opts.cpus === undefined && project.cpus) opts.cpus = project.cpus;
+    }
+    const targetDir = opts.dirPath || opts.dir || opts.localPath || null;
+    if (targetDir) {
+      if (!assertHostLocalPathAllowed(req, res)) return;
+      opts.dirPath = String(targetDir);
+    }
+    const plan = getSmartPackBuilder().generateBuildPlan(opts);
+    res.json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/deploy/direct-push/plan', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId) {
+      if (!assertProjectAccess(req, res, String(body.projectId), 'deployments:write')) return;
+    } else if (denyInstanceGlobalForTenant(req, res, 'planificar despliegue DirectPush SSH')) {
+      return;
+    }
+    const plan = getDirectPushRegistry().planDirectPush(body);
+    res.json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/edge-tunnel/status', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'estado global de EdgeTunnel')) return;
+    res.json(getEdgeTunnelService().getStatus());
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge-tunnel/tunnels', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'crear túnel EdgeTunnel')) return;
+    const created = getEdgeTunnelService().createTunnel(req.body || {});
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(201).json(created);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/edge-tunnel/tunnels/:id', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'revocar túnel EdgeTunnel')) return;
+    const result = getEdgeTunnelService().revokeTunnel(req.params.id);
+    if (!result || !result.revoked) {
+      return res.status(404).json({ error: 'Túnel EdgeTunnel no encontrado', id: req.params.id });
+    }
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/:id/snapstream/capture', heavyOpLimiter, async (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dbPath = String(body.dbPath || db.dataFile || '').trim();
+    if (!dbPath) {
+      return res.status(400).json({ error: 'Indica dbPath del archivo SQLite para capturar generación SnapStream' });
+    }
+    if (body.dbPath && !assertHostLocalPathAllowed(req, res)) return;
+    if (body.destDir && !assertHostLocalPathAllowed(req, res)) return;
+    const result = await getSqliteStreamBackup().captureGeneration(db.id, dbPath, {
+      encryptionKey: body.encryptionKey,
+      destDir: body.destDir || null,
+      s3Config: body.s3Config || null
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/databases/:id/snapstream/generations', (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:read');
+    if (!db) return;
+    const destDir = req.query.destDir ? String(req.query.destDir) : null;
+    if (destDir && !assertHostLocalPathAllowed(req, res)) return;
+    const snap = getSqliteStreamBackup();
+    const generations = snap.listGenerations(db.id, { destDir });
+    const status = snap.getStatus(db.id, { destDir });
+    res.json({ databaseId: db.id, generations, status });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
 });
 
 module.exports = router;

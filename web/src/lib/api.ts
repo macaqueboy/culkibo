@@ -3986,6 +3986,51 @@ export const api = {
       'No se pudo ejecutar el escáner de secretos'
     );
   },
+
+  // --- Cycle-2 Pioneer Controls (Fast Restart, SmartPack, EdgeTunnel, Edition) ---
+
+  async fastRestartProject(
+    projectId: string,
+    opts: { envVars?: Record<string, string> } = {}
+  ): Promise<FastRestartResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/fast-restart`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      }),
+      'No se pudo reiniciar el contenedor con las nuevas variables'
+    );
+  },
+
+  async getSmartPackPlan(payload: {
+    dir?: string;
+    projectId?: string;
+    files?: string[];
+  } = {}): Promise<SmartPackPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/build/smartpack/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo generar el plan SmartPack'
+    );
+  },
+
+  async getEdgeTunnelStatus(): Promise<EdgeTunnelStatusResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge-tunnel/status`),
+      'No se pudo consultar el estado de EdgeTunnel'
+    );
+  },
+
+  async getEditionStatus(): Promise<EditionStatusResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/system/edition`),
+      'No se pudo consultar la edición de Culkibo'
+    );
+  },
 };
 
 // =====================================================================
@@ -4247,4 +4292,56 @@ export interface SecretScanReport {
     low: number;
   };
   findings: SecretScanFinding[];
+}
+
+// --- Cycle-2 Pioneer Types (Fast Restart, SmartPack, EdgeTunnel, Edition) ---
+
+export interface FastRestartResult {
+  restarted: boolean;
+  rebuilt: boolean;
+  durationMs?: number | null;
+  containerName?: string | null;
+  hostPort?: number | null;
+  upstream?: string | null;
+  message?: string;
+  reason?: string | null;
+}
+
+export interface SmartPackPlanResult {
+  stack: string;
+  runtime?: string | null;
+  packageManager?: string | null;
+  installCommand?: string | null;
+  buildCommand?: string | null;
+  startCommand?: string | null;
+  port?: number | null;
+  cacheMounts?: string[];
+  packages?: string[];
+  zstdChunked?: boolean;
+  dockerignore?: string[];
+  limits?: { memoryMb?: number; cpus?: number | string } | null;
+  dockerfile?: string | null;
+}
+
+export interface EdgeTunnelStatusResult {
+  enabled?: boolean;
+  activeTunnels?: number;
+  connectedAgents?: number;
+  tunnels?: Array<{
+    id: string;
+    name: string;
+    hostname?: string | null;
+    targetHost?: string;
+    targetPort?: number;
+    connected?: boolean;
+    createdAt?: string;
+  }>;
+}
+
+export interface EditionStatusResult {
+  edition: 'oss' | 'pro' | 'enterprise' | string;
+  licensed?: boolean;
+  licensee?: string | null;
+  expiresAt?: string | null;
+  features?: Record<string, boolean>;
 }

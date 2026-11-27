@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import { api, type Project } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n, type Locale } from '../lib/i18n';
 import { CreateProjectModal } from './CreateProjectModal';
 import { OnboardingChecklist } from './OnboardingChecklist';
 
@@ -52,57 +53,6 @@ function isProjectActuallyActive(p: Project): boolean {
   return Boolean(!p.maintenanceMode && ((p.lastDeployedAt && p.status === 'active') || p.localRunning));
 }
 
-function getHonestStatus(p: Project): {
-  label: string;
-  pillClass: string;
-  dotClass: string;
-  isLive?: boolean;
-  isMaintenance?: boolean;
-} {
-  if (p.maintenanceMode) {
-    return {
-      label: 'Mantenimiento',
-      pillClass: 'bg-amber-50 text-amber-800 border-amber-200',
-      dotClass: 'bg-amber-500',
-      isMaintenance: true,
-    };
-  }
-  if (p.lastDeployedAt && p.status === 'active') {
-    return {
-      label: 'En producción',
-      pillClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-      dotClass: 'bg-emerald-500',
-      isLive: true,
-    };
-  }
-  if (p.localRunning) {
-    return {
-      label: p.localPort ? `Local :${p.localPort}` : 'En local',
-      pillClass: 'bg-amber-50 text-amber-800 border-amber-200',
-      dotClass: 'bg-amber-500',
-    };
-  }
-  if (p.status === 'hibernated' || p.status === 'sleeping') {
-    return {
-      label: 'Hibernado',
-      pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
-      dotClass: 'bg-slate-400',
-    };
-  }
-  if (p.status === 'stopped') {
-    return {
-      label: 'Detenido',
-      pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
-      dotClass: 'bg-slate-400',
-    };
-  }
-  return {
-    label: 'Listo',
-    pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
-    dotClass: 'bg-slate-400',
-  };
-}
-
 interface ProjectMetadata {
   cleanGit: string | null;
   monogram: string;
@@ -115,7 +65,7 @@ interface ProjectMetadata {
   summaryTag: string;
 }
 
-function getProjectMetadata(p: Project): ProjectMetadata {
+function getProjectMetadata(p: Project, locale: Locale): ProjectMetadata {
   let rawGit = p.gitRepo || '';
   if (!rawGit && p.resources && Array.isArray(p.resources)) {
     const resWithGit = p.resources.find((r: { gitRepo?: string }) => Boolean(r?.gitRepo));
@@ -150,16 +100,17 @@ function getProjectMetadata(p: Project): ProjectMetadata {
     ? `${p.cpus} vCPU`
     : null;
   const shortCommit = p.lastCommit?.sha ? p.lastCommit.sha.slice(0, 7) : null;
+  const dateLocale = locale === 'es' ? 'es-ES' : 'en-US';
   const lastDeployShort = p.lastDeployedAt
-    ? new Date(p.lastDeployedAt).toLocaleDateString('es-ES', { day: '2-digit', month: 'short' })
+    ? new Date(p.lastDeployedAt).toLocaleDateString(dateLocale, { day: '2-digit', month: 'short' })
     : null;
 
   const parts: string[] = [];
   if (p.gitBranch) parts.push(p.gitBranch);
   if (ramLabel) parts.push(ramLabel);
-  if (totalDbs > 0) parts.push(`${totalDbs} BD`);
-  if (lastDeployShort) parts.push(`Desplegado ${lastDeployShort}`);
-  const summaryTag = parts.join(' · ') || 'Sin desplegar todavía';
+  if (totalDbs > 0) parts.push(`${totalDbs} DB`);
+  if (lastDeployShort) parts.push(lastDeployShort);
+  const summaryTag = parts.join(' · ') || (locale === 'es' ? 'Sin desplegar todavía' : 'Not deployed yet');
 
   return {
     cleanGit,
@@ -189,6 +140,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   externalCreateTrigger,
   checklistRestoreTick = 0,
 }) => {
+  const { t, locale } = useI18n();
   const [localProjects, setLocalProjects] = useState<Project[]>(() => (Array.isArray(parentProjects) ? parentProjects : []));
   const [loading, setLoading] = useState<boolean>(() => !Array.isArray(parentProjects));
   const [startingLocalId, setStartingLocalId] = useState<string | null>(null);
@@ -269,6 +221,57 @@ export const ProjectList: React.FC<ProjectListProps> = ({
 
   const previewHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
 
+  const getHonestStatus = (p: Project): {
+    label: string;
+    pillClass: string;
+    dotClass: string;
+    isLive?: boolean;
+    isMaintenance?: boolean;
+  } => {
+    if (p.maintenanceMode) {
+      return {
+        label: t('projects.statusMaintenance'),
+        pillClass: 'bg-amber-50 text-amber-800 border-amber-200',
+        dotClass: 'bg-amber-500',
+        isMaintenance: true,
+      };
+    }
+    if (p.lastDeployedAt && p.status === 'active') {
+      return {
+        label: t('projects.statusLive'),
+        pillClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        dotClass: 'bg-emerald-500',
+        isLive: true,
+      };
+    }
+    if (p.localRunning) {
+      return {
+        label: p.localPort ? `${t('projects.statusLocal')} :${p.localPort}` : t('projects.statusLocal'),
+        pillClass: 'bg-amber-50 text-amber-800 border-amber-200',
+        dotClass: 'bg-amber-500',
+      };
+    }
+    if (p.status === 'hibernated' || p.status === 'sleeping') {
+      return {
+        label: t('projects.statusHibernated'),
+        pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
+        dotClass: 'bg-slate-400',
+      };
+    }
+    if (p.status === 'stopped') {
+      return {
+        label: t('projects.statusStopped'),
+        pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
+        dotClass: 'bg-slate-400',
+      };
+    }
+    return {
+      label: t('projects.statusReady'),
+      pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
+      dotClass: 'bg-slate-400',
+    };
+  };
+
   const handleStartLocal = async (id: string) => {
     try {
       setStartingLocalId(id);
@@ -276,11 +279,11 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       fetchProjects();
       const port = res?.localPort;
       onNotify?.(
-        port ? `Iniciado en http://${previewHost}:${port}` : 'Proyecto iniciado en local',
+        port ? `Started at http://${previewHost}:${port}` : 'Project started locally',
         'success'
       );
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Error al iniciar en local';
+      const msg = err instanceof Error ? err.message : 'Error starting local preview';
       onNotify?.(msg, 'error');
       fetchProjects();
     } finally {
@@ -293,9 +296,9 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       setStoppingLocalId(id);
       await api.stopProject(id);
       fetchProjects();
-      onNotify?.('Proyecto detenido y puerto liberado', 'info');
+      onNotify?.(locale === 'es' ? 'Proyecto detenido y puerto liberado' : 'Project stopped and port released', 'info');
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Error al detener el proyecto';
+      const msg = err instanceof Error ? err.message : 'Error stopping project';
       onNotify?.(msg, 'error');
       fetchProjects();
     } finally {
@@ -307,10 +310,13 @@ export const ProjectList: React.FC<ProjectListProps> = ({
     try {
       setDeployingId(p.id);
       await api.startDeploy(p.id);
-      onNotify?.(`Despliegue iniciado para ${p.name}`, 'success');
+      onNotify?.(
+        locale === 'es' ? `Despliegue iniciado para ${p.name}` : `Deployment started for ${p.name}`,
+        'success'
+      );
       onSelectProject(p.id, 'deploy');
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'No se pudo iniciar el despliegue';
+      const msg = err instanceof Error ? err.message : 'Could not start deployment';
       onNotify?.(msg, 'error');
     } finally {
       setDeployingId(null);
@@ -322,7 +328,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
     if (!ok) return;
     setCopiedDomainId(id);
     window.setTimeout(() => setCopiedDomainId(null), 1600);
-    onNotify?.(`URL copiada: https://${domain}`, 'success');
+    onNotify?.(`URL copied: https://${domain}`, 'success');
   };
 
   const projects = localProjects;
@@ -330,10 +336,10 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   const metadataMap = useMemo(() => {
     const map = new Map<string, ProjectMetadata>();
     for (const p of projects) {
-      map.set(p.id, getProjectMetadata(p));
+      map.set(p.id, getProjectMetadata(p, locale));
     }
     return map;
-  }, [projects]);
+  }, [projects, locale]);
 
   const stats = useMemo(() => {
     const total = projects.length;
@@ -353,7 +359,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         if (filter === 'local' && !p.localRunning) return false;
 
         if (q) {
-          const meta = metadataMap.get(p.id) || getProjectMetadata(p);
+          const meta = metadataMap.get(p.id) || getProjectMetadata(p, locale);
           const matchName = (p.name || '').toLowerCase().includes(q);
           const matchDesc = (p.description || '').toLowerCase().includes(q);
           const matchDomain = p.domains?.some((d) => d.toLowerCase().includes(q));
@@ -373,22 +379,26 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         }
         return new Date(b.updatedAt || b.createdAt || 0).getTime() - new Date(a.updatedAt || a.createdAt || 0).getTime();
       });
-  }, [projects, metadataMap, filter, deferredSearch, sortBy]);
+  }, [projects, metadataMap, locale, filter, deferredSearch, sortBy]);
 
   const isLoading = loading || Boolean(projectsLoading);
 
+  const summaryLine = locale === 'es'
+    ? `${stats.total} ${stats.total === 1 ? 'proyecto' : 'proyectos'} · ${stats.active} ${stats.active === 1 ? 'activo' : 'activos'} · ${stats.totalDomains} ${stats.totalDomains === 1 ? 'dominio' : 'dominios'}${stats.local > 0 ? ` · ${stats.local} en local` : ''}`
+    : `${stats.total} ${stats.total === 1 ? 'project' : 'projects'} · ${stats.active} active · ${stats.totalDomains} ${stats.totalDomains === 1 ? 'domain' : 'domains'}${stats.local > 0 ? ` · ${stats.local} local` : ''}`;
+
   return (
     <div className="space-y-5">
-      {/* Cabecera limpia sobre el lienzo */}
+      {/* Page header */}
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Proyectos</h1>
+          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('projects.title')}</h1>
           <p className="text-sm text-slate-500 mt-1 tabular-nums">
             {isLoading && projects.length === 0
-              ? 'Cargando espacio de trabajo…'
+              ? t('projects.loading')
               : stats.total === 0
-                ? 'Despliega desde Git, migra Coolify en 1 clic o instala 140+ apps con HTTPS automático.'
-                : `${stats.total} ${stats.total === 1 ? 'proyecto' : 'proyectos'} · ${stats.active} ${stats.active === 1 ? 'activo' : 'activos'} · ${stats.totalDomains} ${stats.totalDomains === 1 ? 'dominio' : 'dominios'}${stats.local > 0 ? ` · ${stats.local} en local` : ''}`}
+                ? t('projects.emptySubtitle')
+                : summaryLine}
           </p>
         </div>
 
@@ -399,7 +409,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
             className="culkibo-press inline-flex items-center gap-1.5 min-h-[44px] sm:min-h-[36px] px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 shadow-2xs cursor-pointer"
           >
             <Download className="w-3.5 h-3.5 text-slate-500" />
-            <span>Importar o migrar</span>
+            <span>{t('projects.importBtn')}</span>
           </button>
 
           <button
@@ -408,12 +418,12 @@ export const ProjectList: React.FC<ProjectListProps> = ({
             className="culkibo-press inline-flex items-center gap-1.5 min-h-[44px] sm:min-h-[36px] px-3.5 py-2 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 shadow-xs cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>Nuevo proyecto</span>
+            <span>{t('projects.newBtn')}</span>
           </button>
         </div>
       </div>
 
-      {/* Guía de puesta en marcha inteligente (<2 min) */}
+      {/* Quick-start strip */}
       <OnboardingChecklist
         projectsCount={stats.total}
         domainsCount={stats.totalDomains}
@@ -428,7 +438,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         restoreTick={checklistRestoreTick}
       />
 
-      {/* Barra de búsqueda y filtros (solo cuando hay proyectos) */}
+      {/* Search & filters */}
       {projects.length > 0 && (
         <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-2.5">
           <div className="relative flex-1 max-w-md">
@@ -436,7 +446,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
             <input
               id="omnibar"
               type="text"
-              placeholder="Buscar proyecto, repositorio o dominio…"
+              placeholder={t('projects.searchPlaceholder')}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="w-full min-h-[44px] sm:min-h-[36px] pl-9 pr-10 py-1.5 bg-white border border-slate-200 rounded-lg text-sm text-slate-900 placeholder:text-slate-400"
@@ -445,7 +455,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
               <button
                 type="button"
                 onClick={() => setSearch('')}
-                aria-label="Limpiar búsqueda"
+                aria-label="Clear search"
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
               >
                 <X className="w-3.5 h-3.5" />
@@ -460,10 +470,10 @@ export const ProjectList: React.FC<ProjectListProps> = ({
           <div className="flex flex-wrap items-center gap-2 justify-between lg:justify-end">
             <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200/90 text-xs overflow-x-auto no-scrollbar max-w-full">
               {([
-                { id: 'all', label: `Todos (${stats.total})` },
-                { id: 'active', label: `Activos (${stats.active})` },
-                { id: 'local', label: `Local (${stats.local})` },
-                { id: 'hibernated', label: `Detenidos (${stats.inactive})` },
+                { id: 'all', label: `${t('projects.filterAll')} (${stats.total})` },
+                { id: 'active', label: `${t('projects.filterActive')} (${stats.active})` },
+                { id: 'local', label: `${t('projects.filterLocal')} (${stats.local})` },
+                { id: 'hibernated', label: `${t('projects.filterStopped')} (${stats.inactive})` },
               ] as const).map((pill) => (
                 <button
                   key={pill.id}
@@ -482,23 +492,23 @@ export const ProjectList: React.FC<ProjectListProps> = ({
 
             <div className="flex items-center gap-2">
               <select
-                aria-label="Ordenar proyectos"
+                aria-label="Sort projects"
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value as 'recent' | 'name' | 'domains' | 'status')}
                 className="bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium rounded-lg px-2.5 py-1.5 min-h-[36px] cursor-pointer"
               >
-                <option value="recent">Más recientes</option>
-                <option value="name">Nombre (A–Z)</option>
-                <option value="domains">Más dominios</option>
-                <option value="status">Estado</option>
+                <option value="recent">{t('projects.sortRecent')}</option>
+                <option value="name">{t('projects.sortName')}</option>
+                <option value="domains">{t('projects.sortDomains')}</option>
+                <option value="status">{t('projects.sortStatus')}</option>
               </select>
 
               <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200/90">
                 <button
                   type="button"
                   onClick={() => setView('grid')}
-                  aria-label="Vista en cuadrícula"
-                  title="Vista en cuadrícula"
+                  aria-label="Grid view"
+                  title="Grid view"
                   className={`p-1.5 rounded-md transition-colors cursor-pointer ${
                     view === 'grid' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-400 hover:text-slate-700'
                   }`}
@@ -508,8 +518,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                 <button
                   type="button"
                   onClick={() => setView('table')}
-                  aria-label="Vista en tabla"
-                  title="Vista en tabla"
+                  aria-label="Table view"
+                  title="Table view"
                   className={`p-1.5 rounded-md transition-colors cursor-pointer ${
                     view === 'table' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-400 hover:text-slate-700'
                   }`}
@@ -522,7 +532,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         </div>
       )}
 
-      {/* Listado de proyectos */}
+      {/* Project list */}
       {isLoading && projects.length === 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {[1, 2, 3].map((i) => (
@@ -545,7 +555,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       ) : filtered.length > 0 && view === 'grid' ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 items-stretch">
           {filtered.map((p) => {
-            const meta = metadataMap.get(p.id) || getProjectMetadata(p);
+            const meta = metadataMap.get(p.id) || getProjectMetadata(p, locale);
             const isStartingThisLocal = startingLocalId === p.id;
             const isDeployingThis = deployingId === p.id;
             const statusMeta = getHonestStatus(p);
@@ -555,7 +565,6 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                 key={p.id}
                 className="culkibo-card group rounded-2xl p-4 flex flex-col justify-between gap-4 min-w-0"
               >
-                {/* Bloque superior: Identidad + Estado + Dominio + Telemetría */}
                 <div className="space-y-3 min-w-0">
                   <div className="flex items-start justify-between gap-2.5">
                     <button
@@ -586,7 +595,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                               {p.localPath}
                             </span>
                           ) : (
-                            <span className="font-sans text-slate-400">Proyecto local</span>
+                            <span className="font-sans text-slate-400">{t('projects.localProject')}</span>
                           )}
                         </span>
                       </span>
@@ -608,7 +617,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                     </span>
                   </div>
 
-                  {/* Dominio HTTPS conectado + copia en 1 clic */}
+                  {/* HTTPS domain pill + 1-click copy */}
                   <div className="min-h-[30px] flex items-center justify-between gap-2 min-w-0">
                     {p.domains && p.domains.length > 0 ? (
                       <div className="flex items-center gap-1 min-w-0 max-w-full">
@@ -617,7 +626,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                           target="_blank"
                           rel="noreferrer"
                           className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200/90 transition-colors max-w-[215px] truncate"
-                          title={`Abrir https://${p.domains[0]}`}
+                          title={`https://${p.domains[0]}`}
                         >
                           <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
                           <span className="truncate">{p.domains[0]}</span>
@@ -626,8 +635,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         <button
                           type="button"
                           onClick={() => void handleCopyDomain(p.id, p.domains[0])}
-                          aria-label={`Copiar https://${p.domains[0]}`}
-                          title="Copiar URL HTTPS"
+                          aria-label={`Copy https://${p.domains[0]}`}
+                          title="Copy HTTPS URL"
                           className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer shrink-0"
                         >
                           {copiedDomainId === p.id ? (
@@ -660,12 +669,12 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         className="inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
                       >
                         <Globe className="w-3.5 h-3.5 text-slate-300" />
-                        <span>Conectar dominio HTTPS</span>
+                        <span>{t('projects.connectDomain')}</span>
                       </button>
                     )}
                   </div>
 
-                  {/* Badges reales de telemetría/runtime (cero datos inventados) */}
+                  {/* Real telemetry chips */}
                   <div className="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-500 tabular-nums">
                     {meta.branch && (
                       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200/80 font-mono text-slate-600">
@@ -682,7 +691,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                     {meta.totalDbs > 0 && (
                       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200/80 font-mono text-slate-600">
                         <Database className="w-2.5 h-2.5 text-slate-400" />
-                        {meta.totalDbs} BD
+                        {meta.totalDbs} DB
                       </span>
                     )}
                     {meta.shortCommit && (
@@ -694,13 +703,13 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                       <span className="text-slate-400 ml-auto">{meta.lastDeployShort}</span>
                     ) : (
                       !meta.branch && !meta.ramLabel && meta.totalDbs === 0 && (
-                        <span className="text-slate-400">Sin desplegar todavía</span>
+                        <span className="text-slate-400">{t('projects.notDeployed')}</span>
                       )
                     )}
                   </div>
                 </div>
 
-                {/* Barra de acciones 1-clic (Deploy / Local + Logs + Sync + Gestionar) */}
+                {/* 1-click footer */}
                 <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-1.5">
                   <div className="flex items-center gap-1.5 min-w-0">
                     {p.localRunning ? (
@@ -711,14 +720,14 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         className="culkibo-press inline-flex items-center gap-1.5 min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg cursor-pointer disabled:opacity-50"
                       >
                         <Square className="w-3 h-3 fill-red-600 text-red-600" />
-                        <span>{stoppingLocalId === p.id ? 'Parando…' : 'Detener'}</span>
+                        <span>{stoppingLocalId === p.id ? t('projects.stopping') : t('projects.stop')}</span>
                       </button>
                     ) : (
                       <button
                         type="button"
                         onClick={() => void handleQuickDeploy(p)}
                         disabled={isDeployingThis}
-                        title="Desplegar a producción (zero-downtime)"
+                        title={t('projects.deploy')}
                         className="culkibo-press inline-flex items-center gap-1.5 min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg cursor-pointer disabled:opacity-50"
                       >
                         {isDeployingThis ? (
@@ -726,7 +735,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         ) : (
                           <Rocket className="w-3.5 h-3.5" />
                         )}
-                        <span>{isDeployingThis ? 'Desplegando…' : 'Desplegar'}</span>
+                        <span>{isDeployingThis ? t('projects.deploying') : t('projects.deploy')}</span>
                       </button>
                     )}
 
@@ -735,8 +744,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         type="button"
                         onClick={() => void handleStartLocal(p.id)}
                         disabled={isStartingThisLocal}
-                        aria-label={`Iniciar vista previa local de ${p.name}`}
-                        title="Iniciar vista previa local"
+                        aria-label={`Start local preview for ${p.name}`}
+                        title="Start local preview"
                         className="culkibo-press inline-flex items-center justify-center w-9 h-9 rounded-lg text-slate-600 bg-slate-50 hover:bg-slate-100 border border-slate-200/80 cursor-pointer disabled:opacity-50"
                       >
                         {isStartingThisLocal ? (
@@ -752,8 +761,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                     <button
                       type="button"
                       onClick={() => onSelectProject(p.id, 'deploy')}
-                      aria-label={`Ver logs de ${p.name}`}
-                      title="Logs y despliegues"
+                      aria-label={`Logs for ${p.name}`}
+                      title="Logs & Deployments"
                       className="inline-flex items-center justify-center w-9 h-9 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors cursor-pointer"
                     >
                       <Terminal className="w-3.5 h-3.5" />
@@ -761,7 +770,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                     <button
                       type="button"
                       onClick={() => onSelectProject(p.id, 'live')}
-                      aria-label={`Abrir Live Sync de ${p.name}`}
+                      aria-label={`Live Sync for ${p.name}`}
                       title="Live Sync <10ms"
                       className="inline-flex items-center justify-center w-9 h-9 rounded-lg text-slate-500 hover:text-amber-600 hover:bg-amber-50 transition-colors cursor-pointer"
                     >
@@ -772,7 +781,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                       onClick={() => onSelectProject(p.id)}
                       className="inline-flex items-center gap-1 min-h-[36px] px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors cursor-pointer"
                     >
-                      <span>Abrir</span>
+                      <span>{t('projects.open')}</span>
                       <ArrowRight className="w-3.5 h-3.5" />
                     </button>
                   </div>
@@ -787,16 +796,16 @@ export const ProjectList: React.FC<ProjectListProps> = ({
             <table className="min-w-full divide-y divide-slate-200">
               <thead className="bg-slate-50/80">
                 <tr>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Proyecto</th>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Estado</th>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Runtime</th>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Dominio</th>
-                  <th className="px-5 py-3 text-right text-xs font-medium text-slate-500">Acciones</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">{t('projects.tableProject')}</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">{t('projects.tableStatus')}</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">{t('projects.tableRuntime')}</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">{t('projects.tableDomain')}</th>
+                  <th className="px-5 py-3 text-right text-xs font-medium text-slate-500">{t('projects.tableActions')}</th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-slate-100">
                 {filtered.map((p) => {
-                  const meta = metadataMap.get(p.id) || getProjectMetadata(p);
+                  const meta = metadataMap.get(p.id) || getProjectMetadata(p, locale);
                   const s = getHonestStatus(p);
                   return (
                     <tr
@@ -819,7 +828,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                           <div className="min-w-0">
                             <div className="text-sm font-medium text-slate-900">{p.name}</div>
                             <div className="text-xs text-slate-400 truncate max-w-[220px] font-mono">
-                              {meta.cleanGit || 'Sin repositorio Git'}
+                              {meta.cleanGit || t('projects.localProject')}
                             </div>
                           </div>
                         </div>
@@ -842,7 +851,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                             {p.domains[0]}
                           </span>
                         ) : (
-                          <span className="text-xs text-slate-400">Sin dominio</span>
+                          <span className="text-xs text-slate-400">{t('projects.noDomain')}</span>
                         )}
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap text-right">
@@ -854,7 +863,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                             type="button"
                             onClick={() => void handleQuickDeploy(p)}
                             disabled={deployingId === p.id}
-                            title="Desplegar"
+                            title={t('projects.deploy')}
                             className="p-1.5 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 cursor-pointer disabled:opacity-50"
                           >
                             {deployingId === p.id ? (
@@ -876,7 +885,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                             onClick={() => onSelectProject(p.id)}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 cursor-pointer"
                           >
-                            <span>Abrir</span>
+                            <span>{t('projects.open')}</span>
                             <ArrowRight className="w-3.5 h-3.5" />
                           </button>
                         </div>
@@ -890,25 +899,24 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         </div>
       ) : null}
 
-      {/* Estado vacío hero con 3 caminos cristalinos */}
+      {/* 3-Path Empty State Hero */}
       {!isLoading && filtered.length === 0 && (
         projects.length === 0 ? (
           <section className="culkibo-surface rounded-2xl p-6 sm:p-8 space-y-6">
             <div className="max-w-xl mx-auto text-center space-y-2">
               <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200/80 text-[11px] font-medium text-slate-700">
                 <Sparkles className="w-3 h-3 text-amber-500" />
-                <span>Zero-Shell · &lt;60 MB RAM · HTTPS Automático</span>
+                <span>{t('projects.heroPill')}</span>
               </div>
               <h2 className="text-xl sm:text-2xl font-semibold text-slate-900 tracking-tight">
-                Elige cómo empezar en 30 segundos
+                {t('projects.heroTitle')}
               </h2>
               <p className="text-sm text-slate-500 leading-relaxed">
-                Migra tu infraestructura actual sin dolor, despliega un repositorio Git con Live Sync o instala un stack del catálogo curado.
+                {t('projects.heroDesc')}
               </p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {/* Camino 1: Importar desde Coolify */}
               <button
                 type="button"
                 onClick={onImportCoolify}
@@ -920,23 +928,20 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                       <Download className="w-5 h-5" />
                     </span>
                     <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200/80 text-[11px] font-medium">
-                      1-Clic
+                      1-Click
                     </span>
                   </div>
                   <div>
-                    <h3 className="text-sm font-semibold text-slate-900">Importar desde Coolify</h3>
-                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                      Trae tus apps, bases de datos y variables mágicas con traducción automática de Traefik a Caddy.
-                    </p>
+                    <h3 className="text-sm font-semibold text-slate-900">{t('projects.pathCoolifyTitle')}</h3>
+                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">{t('projects.pathCoolifyDesc')}</p>
                   </div>
                 </div>
                 <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 group-hover:translate-x-0.5 transition-transform">
-                  <span>Abrir migrador Coolify</span>
+                  <span>{t('projects.pathCoolifyCta')}</span>
                   <ArrowRight className="w-3.5 h-3.5" />
                 </span>
               </button>
 
-              {/* Camino 2: Desplegar repositorio Git */}
               <button
                 type="button"
                 onClick={() => setShowCreateModal(true)}
@@ -952,19 +957,16 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                     </span>
                   </div>
                   <div>
-                    <h3 className="text-sm font-semibold text-slate-900">Desplegar repositorio Git</h3>
-                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                      Conecta GitHub, GitLab o una carpeta local. Detección automática de stack, build BuildKit y SSL nativo.
-                    </p>
+                    <h3 className="text-sm font-semibold text-slate-900">{t('projects.pathGitTitle')}</h3>
+                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">{t('projects.pathGitDesc')}</p>
                   </div>
                 </div>
                 <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 group-hover:translate-x-0.5 transition-transform">
-                  <span>Crear nuevo proyecto</span>
+                  <span>{t('projects.pathGitCta')}</span>
                   <ArrowRight className="w-3.5 h-3.5" />
                 </span>
               </button>
 
-              {/* Camino 3: Catálogo 1-Clic 140+ Apps */}
               <button
                 type="button"
                 onClick={onOpenCatalog || onImportCoolify}
@@ -980,14 +982,12 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                     </span>
                   </div>
                   <div>
-                    <h3 className="text-sm font-semibold text-slate-900">Catálogo 1-Clic (140+ Apps)</h3>
-                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                      WordPress, n8n, Langfuse, Dify, Authentik, Ghost, PostgreSQL… imágenes pineadas sin <code className="font-mono">docker.sock</code>.
-                    </p>
+                    <h3 className="text-sm font-semibold text-slate-900">{t('projects.pathCatalogTitle')}</h3>
+                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">{t('projects.pathCatalogDesc')}</p>
                   </div>
                 </div>
                 <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 group-hover:translate-x-0.5 transition-transform">
-                  <span>Explorar catálogo</span>
+                  <span>{t('projects.pathCatalogCta')}</span>
                   <ArrowRight className="w-3.5 h-3.5" />
                 </span>
               </button>
@@ -1000,7 +1000,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                 className="inline-flex items-center gap-1.5 hover:text-slate-900 transition-colors cursor-pointer"
               >
                 <Globe className="w-3.5 h-3.5 text-slate-400" />
-                <span>Migrar WordPress sin cortes</span>
+                <span>{t('projects.heroWpLink')}</span>
               </button>
               {onOpenAi && (
                 <button
@@ -1009,7 +1009,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                   className="inline-flex items-center gap-1.5 hover:text-slate-900 transition-colors cursor-pointer"
                 >
                   <Bot className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Conectar Claude Code / Antigravity MCP</span>
+                  <span>{t('projects.heroAiLink')}</span>
                 </button>
               )}
             </div>
@@ -1021,8 +1021,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
             </div>
             <h3 className="text-sm font-semibold text-slate-900">
               {search.trim()
-                ? `No hay proyectos que coincidan con «${search.trim()}»`
-                : 'No hay proyectos en este filtro'}
+                ? t('projects.noMatchQuery', { query: search.trim() })
+                : t('projects.noMatchFilter')}
             </h3>
             <button
               type="button"
@@ -1030,7 +1030,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
               className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
             >
               <RefreshCw className="w-3.5 h-3.5" />
-              <span>Restablecer filtros</span>
+              <span>{t('projects.resetFilters')}</span>
             </button>
           </div>
         )

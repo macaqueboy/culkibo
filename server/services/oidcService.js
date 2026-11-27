@@ -33,6 +33,154 @@ const COMPARE_HMAC_KEY = crypto.randomBytes(32);
 
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 const ALLOWED_DEFAULT_ROLES = Object.freeze(['viewer', 'developer', 'admin']);
+/** @type {Record<string, number>} */
+const OIDC_ROLE_RANK = Object.freeze({ viewer: 1, developer: 2, admin: 3 });
+const FORBIDDEN_CLAIM_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+const MAX_GROUP_ROLE_ENTRIES = 64;
+
+/**
+ * Valida y sanea `groupsClaim` (p. ej. `'groups'`, `'roles'`, `'realm_access.roles'`).
+ * @param {any} rawClaim
+ * @returns {string}
+ */
+function sanitizeGroupsClaim(rawClaim) {
+  if (rawClaim === undefined || rawClaim === null || String(rawClaim).trim() === '') {
+    return 'groups';
+  }
+  const clean = String(rawClaim).trim();
+  if (clean.length > 128 || /[\r\n\0]/.test(clean)) {
+    throw oidcError('groupsClaim inválido', 400, 'INVALID_GROUPS_CLAIM');
+  }
+  const segments = clean.split('.');
+  if (segments.length > 4 || segments.some((s) => !s || FORBIDDEN_CLAIM_SEGMENTS.has(s))) {
+    throw oidcError('groupsClaim contiene segmentos reservados o demasiada profundidad', 400, 'INVALID_GROUPS_CLAIM');
+  }
+  return clean;
+}
+
+/**
+ * Valida y sanea el mapa `groupRoleMap` (`{ "<idpGroup>": "viewer"|"developer"|"admin" }`).
+ * Nunca permite mapear a `owner` (invariante de seguridad SSO).
+ * @param {any} rawMap
+ * @returns {Record<string, 'viewer' | 'developer' | 'admin'>}
+ */
+function sanitizeGroupRoleMap(rawMap) {
+  if (rawMap === undefined || rawMap === null) return {};
+  if (typeof rawMap !== 'object' || Array.isArray(rawMap)) {
+    throw oidcError('groupRoleMap debe ser un objeto clave-valor { grupo: rol }', 400, 'INVALID_GROUP_ROLE_MAP');
+  }
+  const entries = Object.entries(rawMap);
+  if (entries.length > MAX_GROUP_ROLE_ENTRIES) {
+    throw oidcError(`groupRoleMap admite un máximo de ${MAX_GROUP_ROLE_ENTRIES} entradas`, 400, 'INVALID_GROUP_ROLE_MAP');
+  }
+  /** @type {Record<string, 'viewer' | 'developer' | 'admin'>} */
+  const out = {};
+  for (const [rawGroup, rawRole] of entries) {
+    const group = String(rawGroup || '').trim();
+    if (!group || group.length > 128 || /[\x00-\x1f\x7f]/.test(group) || FORBIDDEN_CLAIM_SEGMENTS.has(group)) {
+      throw oidcError(`Nombre de grupo OIDC inválido en groupRoleMap: "${group.slice(0, 40)}"`, 400, 'INVALID_GROUP_ROLE_MAP');
+    }
+    const role = String(rawRole || '').trim().toLowerCase();
+    if (role === 'owner') {
+      throw oidcError('groupRoleMap jamás puede asignar rol owner vía SSO', 403, 'OWNER_PROVISION_FORBIDDEN');
+    }
+    if (!ALLOWED_DEFAULT_ROLES.includes(role)) {
+      throw oidcError(`Rol inválido en groupRoleMap para "${group}": ${role}`, 400, 'INVALID_ROLE');
+    }
+    out[group] = /** @type {'viewer' | 'developer' | 'admin'} */ (role);
+  }
+  return out;
+}
+
+/**
+ * Extrae una lista normalizada de grupos desde los claims JWT/UserInfo respetando rutas punteadas seguras.
+ * @param {Record<string, any> | null | undefined} claims
+ * @param {string} [claimPath]
+ * @returns {string[]}
+ */
+function extractGroupsFromClaims(claims, claimPath = 'groups') {
+  if (!claims || typeof claims !== 'object' || Array.isArray(claims)) return [];
+  const pathStr = String(claimPath || 'groups').trim() || 'groups';
+  /** @type {any} */
+  let rawVal;
+  if (Object.prototype.hasOwnProperty.call(claims, pathStr)) {
+    rawVal = claims[pathStr];
+  } else {
+    const segs = pathStr.split('.');
+    if (segs.length > 4 || segs.some((s) => !s || FORBIDDEN_CLAIM_SEGMENTS.has(s))) return [];
+    let cur = /** @type {any} */ (claims);
+    for (const seg of segs) {
+      if (cur && typeof cur === 'object' && Object.prototype.hasOwnProperty.call(cur, seg)) {
+        cur = cur[seg];
+      } else {
+        cur = undefined;
+        break;
+      }
+    }
+    rawVal = cur;
+  }
+  if (typeof rawVal === 'string') {
+    const t = rawVal.trim();
+    return t ? [t] : [];
+  }
+  if (!Array.isArray(rawVal)) return [];
+  /** @type {string[]} */
+  const groups = [];
+  for (const item of rawVal.slice(0, 200)) {
+    if (typeof item === 'string') {
+      const t = item.trim();
+      if (t) groups.push(t);
+    }
+  }
+  return Array.from(new Set(groups));
+}
+
+/**
+ * Resuelve el rol RBAC efectivo desde los claims OIDC del proveedor usando `groupRoleMap`.
+ * Política:
+ *  - Resolución estricta al mayor privilegio entre los grupos mapeados (`admin > developer > viewer`).
+ *  - Jamás escala a `owner` ni fuera de los roles declarados en `groupRoleMap` / `defaultRole`.
+ *  - Si ningún grupo coincide (o `groupRoleMap` está vacío), aplica `defaultRole` acotado a `ALLOWED_DEFAULT_ROLES`.
+ *
+ * @param {any} provider
+ * @param {Record<string, any> | null | undefined} claims
+ * @returns {{ role: 'viewer' | 'developer' | 'admin', matchedGroups: string[], groups: string[], source: 'group_map' | 'default_role' }}
+ */
+function resolveRoleFromClaims(provider, claims) {
+  const rawDefault = String((provider && provider.defaultRole) || 'viewer').trim().toLowerCase();
+  const safeDefault = /** @type {'viewer' | 'developer' | 'admin'} */ (
+    ALLOWED_DEFAULT_ROLES.includes(rawDefault) ? rawDefault : 'viewer'
+  );
+  const claimPath = String((provider && provider.groupsClaim) || 'groups').trim() || 'groups';
+  const map = (provider && provider.groupRoleMap && typeof provider.groupRoleMap === 'object' && !Array.isArray(provider.groupRoleMap))
+    ? provider.groupRoleMap
+    : {};
+  const groups = extractGroupsFromClaims(claims, claimPath);
+
+  /** @type {'viewer' | 'developer' | 'admin' | null} */
+  let bestRole = null;
+  let bestRank = 0;
+  /** @type {string[]} */
+  const matchedGroups = [];
+
+  for (const group of groups) {
+    if (!Object.prototype.hasOwnProperty.call(map, group)) continue;
+    const candidate = String(map[group] || '').trim().toLowerCase();
+    // Defensa en profundidad: aunque el disco fuera manipulado con "owner", se ignora siempre
+    if (!ALLOWED_DEFAULT_ROLES.includes(candidate)) continue;
+    matchedGroups.push(group);
+    const rank = OIDC_ROLE_RANK[candidate] || 0;
+    if (rank > bestRank) {
+      bestRank = rank;
+      bestRole = /** @type {'viewer' | 'developer' | 'admin'} */ (candidate);
+    }
+  }
+
+  if (bestRole) {
+    return { role: bestRole, matchedGroups, groups, source: 'group_map' };
+  }
+  return { role: safeDefault, matchedGroups: [], groups, source: 'default_role' };
+}
 
 /**
  * Algoritmos JWS asimétricos permitidos (NUNCA `none` ni `HS256`/`HS384`/`HS512`).
@@ -292,7 +440,7 @@ class OidcService extends EventEmitter {
     this._explicitKeyFile = options.keyFile ? path.resolve(options.keyFile) : null;
     this._fetchImpl = typeof options.fetchImpl === 'function' ? options.fetchImpl : null;
 
-    /** @type {{ version: number, providers: Record<string, any> } | null} */
+    /** @type {{ version: number, providers: Record<string, any>, settings?: { disablePasswordLogin?: boolean } } | null} */
     this._state = null;
     /** @type {Buffer | null} */
     this._encKey = null;
@@ -327,7 +475,7 @@ class OidcService extends EventEmitter {
       return this._state;
     }
     if (!forWrite) return null;
-    this._state = { version: 1, providers: {} };
+    this._state = { version: 1, providers: {}, settings: { disablePasswordLogin: false } };
     return this._state;
   }
 
@@ -413,6 +561,8 @@ class OidcService extends EventEmitter {
       scopes: Array.isArray(p.scopes) ? [...p.scopes] : [],
       autoProvision: Boolean(p.autoProvision),
       defaultRole: p.defaultRole || 'viewer',
+      groupsClaim: p.groupsClaim || 'groups',
+      groupRoleMap: (p.groupRoleMap && typeof p.groupRoleMap === 'object' && !Array.isArray(p.groupRoleMap)) ? { ...p.groupRoleMap } : {},
       teamId: p.teamId || 'team_default',
       allowedDomains: Array.isArray(p.allowedDomains) ? [...p.allowedDomains] : [],
       enforceLocal2fa: Boolean(p.enforceLocal2fa),
@@ -420,6 +570,66 @@ class OidcService extends EventEmitter {
       createdAt: p.createdAt,
       updatedAt: p.updatedAt
     };
+  }
+
+  /**
+   * Devuelve si el inicio de sesión con contraseña está deshabilitado por política SSO.
+   * Por seguridad anti-lockout, solo se considera activo cuando existe al menos un proveedor SSO habilitado.
+   */
+  isPasswordLoginDisabled() {
+    const state = this._ensureLoaded(false);
+    if (!state || !state.settings || !state.settings.disablePasswordLogin) return false;
+    const hasEnabled = Object.values(state.providers || {}).some((p) => p && p.enabled);
+    return hasEnabled;
+  }
+
+  /** Devuelve configuración global de seguridad SSO (`disablePasswordLogin`). */
+  getSecuritySettings() {
+    const state = this._ensureLoaded(false);
+    const hasEnabledProvider = Boolean(state && Object.values(state.providers || {}).some((p) => p && p.enabled));
+    return {
+      disablePasswordLogin: Boolean(state && state.settings && state.settings.disablePasswordLogin),
+      effectivePasswordLoginDisabled: Boolean(state && state.settings && state.settings.disablePasswordLogin && hasEnabledProvider),
+      hasEnabledProvider
+    };
+  }
+
+  /**
+   * Actualiza la política global SSO (`disablePasswordLogin`).
+   * Impide bloquear el login con contraseña si no hay al menos un proveedor SSO activo.
+   * @param {{ disablePasswordLogin?: boolean }} input
+   */
+  setSecuritySettings(input = {}) {
+    const state = this._ensureLoaded(true);
+    if (!state) throw oidcError('Almacenamiento OIDC no disponible', 500, 'OIDC_STORE_ERROR');
+    if (!state.settings || typeof state.settings !== 'object') {
+      state.settings = { disablePasswordLogin: false };
+    }
+    if (input && input.disablePasswordLogin !== undefined) {
+      const wantDisable = Boolean(input.disablePasswordLogin);
+      if (wantDisable) {
+        const hasEnabled = Object.values(state.providers || {}).some((p) => p && p.enabled);
+        if (!hasEnabled) {
+          throw oidcError(
+            'No puedes deshabilitar el login con contraseña sin tener al menos un proveedor SSO/OIDC habilitado',
+            400,
+            'OIDC_LOCKOUT_PREVENTED'
+          );
+        }
+      }
+      state.settings.disablePasswordLogin = wantDisable;
+    }
+    this._save();
+    return this.getSecuritySettings();
+  }
+
+  /**
+   * Resuelve el rol efectivo RBAC desde los claims OIDC de un proveedor.
+   * @param {any} provider
+   * @param {Record<string, any> | null | undefined} claims
+   */
+  resolveRoleFromClaims(provider, claims) {
+    return resolveRoleFromClaims(provider, claims);
   }
 
   /** Lista pública (sin secretos ni `clientId`) para pintar los botones SSO en la pantalla de login. */
@@ -457,6 +667,9 @@ class OidcService extends EventEmitter {
    *   scopes?: string[],
    *   autoProvision?: boolean,
    *   defaultRole?: string,
+   *   groupsClaim?: string,
+   *   groupRoleMap?: Record<string, string>,
+   *   disablePasswordLogin?: boolean,
    *   teamId?: string,
    *   allowedDomains?: string[],
    *   enforceLocal2fa?: boolean,
@@ -515,12 +728,18 @@ class OidcService extends EventEmitter {
       throw oidcError(`defaultRole inválido: ${defaultRole}`, 400, 'INVALID_ROLE');
     }
 
+    const groupsClaim = sanitizeGroupsClaim(input.groupsClaim);
+    const groupRoleMap = sanitizeGroupRoleMap(input.groupRoleMap);
+
     const allowedDomains = Array.isArray(input.allowedDomains)
       ? Array.from(new Set(input.allowedDomains.map((d) => String(d || '').trim().toLowerCase().replace(/^@/, '')).filter(Boolean)))
       : [];
 
     const state = this._ensureLoaded(true);
     if (!state) throw oidcError('Almacenamiento OIDC no disponible', 500, 'OIDC_STORE_ERROR');
+    if (!state.settings || typeof state.settings !== 'object') {
+      state.settings = { disablePasswordLogin: false };
+    }
     const existing = state.providers[id] || null;
     const nowIso = new Date().toISOString();
 
@@ -551,6 +770,8 @@ class OidcService extends EventEmitter {
       scopes,
       autoProvision: Boolean(input.autoProvision),
       defaultRole,
+      groupsClaim,
+      groupRoleMap,
       teamId: String(input.teamId || 'team_default').trim() || 'team_default',
       allowedDomains,
       enforceLocal2fa: Boolean(input.enforceLocal2fa),
@@ -560,6 +781,17 @@ class OidcService extends EventEmitter {
     };
 
     state.providers[id] = record;
+    if (input.disablePasswordLogin !== undefined) {
+      const wantDisable = Boolean(input.disablePasswordLogin);
+      if (wantDisable && !Object.values(state.providers).some((p) => p && p.enabled)) {
+        throw oidcError(
+          'No puedes deshabilitar el login con contraseña sin tener al menos un proveedor SSO/OIDC habilitado',
+          400,
+          'OIDC_LOCKOUT_PREVENTED'
+        );
+      }
+      state.settings.disablePasswordLogin = wantDisable;
+    }
     this._discoveryCache.delete(id);
     this._jwksCache.delete(id);
     this._save();
@@ -797,6 +1029,8 @@ class OidcService extends EventEmitter {
     let email = '';
     let emailVerified = false;
     let name = '';
+    /** @type {Record<string, any>} */
+    let mergedClaims = {};
 
     if (provider.protocol === 'oidc') {
       if (!tokenData.id_token) {
@@ -828,13 +1062,17 @@ class OidcService extends EventEmitter {
         }
       }
       const c = verified.claims;
+      mergedClaims = { ...c };
       subject = String(c.sub);
       email = typeof c.email === 'string' ? c.email.trim().toLowerCase() : '';
       emailVerified = c.email_verified === true;
       name = String(c.name || c.preferred_username || (email ? email.split('@')[0] : 'SSO User'));
 
-      // Si el id_token no trae correo y existe userinfo_endpoint + access_token, consultar userinfo
-      if (!email && discovery.userinfo_endpoint && tokenData.access_token) {
+      const hasGroupMap = provider.groupRoleMap && Object.keys(provider.groupRoleMap).length > 0;
+      const hasGroupsInToken = extractGroupsFromClaims(mergedClaims, provider.groupsClaim || 'groups').length > 0;
+
+      // Si falta correo o faltan grupos configurados en id_token y existe userinfo_endpoint + access_token, consultar userinfo
+      if ((!email || (hasGroupMap && !hasGroupsInToken)) && discovery.userinfo_endpoint && tokenData.access_token) {
         const uiRes = await this._httpFetch(discovery.userinfo_endpoint, provider, {
           method: 'GET',
           headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: 'application/json' },
@@ -845,7 +1083,10 @@ class OidcService extends EventEmitter {
           if (ui && ui.sub && String(ui.sub) !== subject) {
             throw oidcError('El subject de userinfo no coincide con id_token', 401, 'OIDC_SUB_MISMATCH');
           }
-          if (ui && typeof ui.email === 'string') {
+          if (ui && typeof ui === 'object' && !Array.isArray(ui)) {
+            mergedClaims = { ...ui, ...mergedClaims };
+          }
+          if (!email && ui && typeof ui.email === 'string') {
             email = ui.email.trim().toLowerCase();
             emailVerified = ui.email_verified === true;
           }
@@ -908,6 +1149,8 @@ class OidcService extends EventEmitter {
       }
     }
 
+    const roleResolution = resolveRoleFromClaims(provider, mergedClaims);
+
     return {
       providerId: provider.id,
       providerType: provider.type,
@@ -917,7 +1160,11 @@ class OidcService extends EventEmitter {
       name: name.slice(0, 80),
       teamId: pending.teamId,
       autoProvision: Boolean(provider.autoProvision),
-      defaultRole: provider.defaultRole || 'viewer',
+      defaultRole: roleResolution.role,
+      resolvedRole: roleResolution.role,
+      roleSource: roleResolution.source,
+      groups: roleResolution.groups,
+      matchedGroups: roleResolution.matchedGroups,
       enforceLocal2fa: Boolean(provider.enforceLocal2fa)
     };
   }
@@ -931,5 +1178,9 @@ module.exports = Object.assign(defaultInstance, {
   ALLOWED_JWS_ALGS,
   ALLOWED_DEFAULT_ROLES,
   generatePkcePair,
-  verifyIdToken
+  verifyIdToken,
+  sanitizeGroupRoleMap,
+  sanitizeGroupsClaim,
+  extractGroupsFromClaims,
+  resolveRoleFromClaims
 });

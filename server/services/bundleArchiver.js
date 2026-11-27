@@ -979,30 +979,39 @@ class BundleArchiver {
     const bundleId = `ckb_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
 
     // Resolver fuentes (datos explícitos o carga perezosa de gestores en vivo)
-    let rawProjects = Array.isArray(opts.projects) ? opts.projects : null;
-    if (!rawProjects) {
+    /** @type {any[]} */
+    let rawProjects = [];
+    if (Array.isArray(opts.projects)) {
+      rawProjects = opts.projects;
+    } else {
       const pm = require('./projectManager');
-      const all = pm.getAll();
+      const all = Array.isArray(pm.getAll()) ? pm.getAll() : [];
       rawProjects = Array.isArray(opts.projectIds) && opts.projectIds.length > 0
         ? all.filter((p) => opts.projectIds && opts.projectIds.includes(p.id))
         : all;
     }
     const projectIdSet = new Set(rawProjects.map((p) => p.id).filter(Boolean));
 
-    let rawDomains = Array.isArray(opts.domains) ? opts.domains : null;
-    if (!rawDomains) {
+    /** @type {any[]} */
+    let rawDomains = [];
+    if (Array.isArray(opts.domains)) {
+      rawDomains = opts.domains;
+    } else {
       const dm = require('./domainManager');
-      const allDoms = dm.listDomains();
+      const allDoms = Array.isArray(dm.listDomains()) ? dm.listDomains() : [];
       rawDomains = Array.isArray(opts.projectIds) && opts.projectIds.length > 0
         ? allDoms.filter((d) => d.projectId && projectIdSet.has(d.projectId))
         : allDoms;
     }
 
-    let rawCrons = Array.isArray(opts.crons) ? opts.crons : null;
-    if (!rawCrons) {
+    /** @type {any[]} */
+    let rawCrons = [];
+    if (Array.isArray(opts.crons)) {
+      rawCrons = opts.crons;
+    } else {
       try {
         const cm = require('./cronManager');
-        const allCrons = cm.list();
+        const allCrons = Array.isArray(cm.list()) ? cm.list() : [];
         rawCrons = Array.isArray(opts.projectIds) && opts.projectIds.length > 0
           ? allCrons.filter((c) => c.projectId && projectIdSet.has(c.projectId))
           : allCrons;

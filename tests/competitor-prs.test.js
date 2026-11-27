@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const auth = require('../server/middleware/auth');
 const { hashBcrypt, verifyBcrypt, isBcryptHash } = require('../server/services/bcryptHash');
@@ -10,8 +11,10 @@ const { parseCron } = require('../server/services/cronParser');
 const webhookService = require('../server/services/webhookService');
 const caddyManager = require('../server/services/caddyManager');
 const domainManager = require('../server/services/domainManager');
+const projectManager = require('../server/services/projectManager');
+const { OidcService, resolveRoleFromClaims } = require('../server/services/oidcService');
 const { SslManager } = require('../server/services/sslManager');
-const { DeployManager } = require('../server/services/deployManager');
+const { DeployManager, assertDiskHeadroom, parseCgroupV2MemoryStats, readContainerCgroupV2Memory, buildComposeResourceOverride, enforceComposeResourceLimits } = require('../server/services/deployManager');
 const { PreviewManager } = require('../server/services/previewManager');
 const databaseManager = require('../server/services/databaseManager');
 const dbBackupManager = require('../server/services/dbBackupManager');
@@ -485,6 +488,419 @@ services:
     fs.rmSync(lsTmp, { recursive: true, force: true });
   }
   console.log('  ✓ MCP/Importer/LiveSync: ping/id:0, YAML anchors+docker.sock warning y diff unificado');
+
+  // -------------------------------------------------------------------------
+  // 7. Cycle #2 Competitor-CVE Guardrails, OIDC Groups, CULKIBO_DATA_DIR & Lazy Routes
+  // -------------------------------------------------------------------------
+  // 7a. 100% CULKIBO_DATA_DIR store isolation (ProjectManager + DomainManager)
+  const isoDir = makeTempDir('culkibo-datadir-iso-');
+  const prevDataDirEnv = process.env.CULKIBO_DATA_DIR;
+  try {
+    process.env.CULKIBO_DATA_DIR = isoDir;
+    assert.strictEqual(
+      path.resolve(projectManager.resolveDefaultDataPath()),
+      path.resolve(path.join(isoDir, 'projects.json')),
+      'ProjectManager debe respetar CULKIBO_DATA_DIR'
+    );
+    assert.strictEqual(
+      path.resolve(domainManager.resolveDefaultDomainsFile()),
+      path.resolve(path.join(isoDir, 'domains.json')),
+      'DomainManager debe respetar CULKIBO_DATA_DIR'
+    );
+    const isoPm = new projectManager.ProjectManager({ seedDemo: false });
+    const createdIsoProj = isoPm.create({ id: 'iso_proj_1', name: 'Isolated Project' });
+    await isoPm.flushToDisk(createdIsoProj.id);
+    assert.ok(fs.existsSync(path.join(isoDir, 'projects.json')), 'projects.json debe persistirse dentro de CULKIBO_DATA_DIR');
+
+    const isoDm = new domainManager.DomainManager({ seedDefaults: false });
+    await isoDm.addDomain({ hostname: 'isolated.example.test', targetPod: 'citadel', projectId: 'iso_proj_1' });
+    assert.ok(fs.existsSync(path.join(isoDir, 'domains.json')), 'domains.json debe persistirse dentro de CULKIBO_DATA_DIR');
+  } finally {
+    if (prevDataDirEnv === undefined) delete process.env.CULKIBO_DATA_DIR;
+    else process.env.CULKIBO_DATA_DIR = prevDataDirEnv;
+    fs.rmSync(isoDir, { recursive: true, force: true });
+  }
+
+  // 7b. coolify#12414: Enforce memoryMb/cpus cgroup limits on Docker Compose deployments
+  const composeDir = makeTempDir('culkibo-compose-limits-');
+  try {
+    const composeFile = path.join(composeDir, 'docker-compose.yml');
+    fs.writeFileSync(composeFile, [
+      'services:',
+      '  web:',
+      '    image: node:22-alpine',
+      '  worker:',
+      '    image: node:22-alpine',
+      'volumes:',
+      '  pgdata:'
+    ].join('\n'), 'utf8');
+    const ov = buildComposeResourceOverride(fs.readFileSync(composeFile, 'utf8'), { memoryMb: 512, cpus: 1.5, pidsLimit: 256 });
+    assert.deepStrictEqual(ov.services, ['web', 'worker']);
+    assert.ok(ov.overrideYaml.includes('mem_limit: 512m'));
+    assert.ok(ov.overrideYaml.includes('cpus: 1.5'));
+    assert.ok(ov.overrideYaml.includes('memory: 512M'));
+    assert.ok(ov.overrideYaml.includes('cpus: "1.5"'));
+
+    const enforced = enforceComposeResourceLimits(composeFile, { id: 'proj_c12414', memoryMb: 768, cpus: '2.0' });
+    assert.ok(fs.existsSync(enforced.overridePath), 'Debe escribir archivo override de límites Compose');
+    assert.ok(enforced.composeArgs.includes('-f') && enforced.composeArgs.includes(enforced.overridePath));
+  } finally {
+    fs.rmSync(composeDir, { recursive: true, force: true });
+  }
+
+  // 7c. Cosmos#591: assertDiskHeadroom pre-write ENOSPC guard (HTTP 507 DISK_FULL)
+  {
+    const okDisk = assertDiskHeadroom(os.tmpdir(), 64 * 1024 * 1024, {
+      statfsImpl: () => ({ bavail: 100000, bsize: 4096, blocks: 200000 })
+    });
+    assert.strictEqual(okDisk.ok, true);
+    assert.throws(
+      () => assertDiskHeadroom(os.tmpdir(), 64 * 1024 * 1024, {
+        statfsImpl: () => ({ bavail: 1024, bsize: 4096, blocks: 200000 }) // 4 MiB free < 64 MiB
+      }),
+      (err) => err && err.status === 507 && err.code === 'DISK_FULL' && err.freeBytes === 4 * 1024 * 1024,
+      'assertDiskHeadroom debe lanzar 507 DISK_FULL cuando el espacio libre es insuficiente'
+    );
+  }
+
+  // 7d. runtipi#2445: Linux cgroup v2 accurate working-set RAM parsing (subtract inactive_file page cache)
+  {
+    const mb = 1024 * 1024;
+    const stats = parseCgroupV2MemoryStats({
+      currentRaw: String(950 * mb),
+      maxRaw: String(1024 * mb),
+      statRaw: `anon ${200 * mb}\nfile ${750 * mb}\nactive_file ${50 * mb}\ninactive_file ${700 * mb}\nslab ${20 * mb}\noom_kill 0\n`,
+      swapCurrentRaw: '0'
+    });
+    assert.strictEqual(stats.cgroupVersion, 2);
+    assert.strictEqual(stats.workingSetBytes, 250 * mb, 'Working set debe restar inactive_file (950-700 = 250 MiB)');
+    assert.strictEqual(stats.workingSetMb, 250);
+    assert.ok(stats.usagePercent > 24 && stats.usagePercent < 25, `Uso real debe ser ~24.41%, obtenido ${stats.usagePercent}`);
+    assert.ok(stats.rawUsagePercent > 92, 'Uso bruto antes de descontar page cache era >92%');
+
+    const unlim = parseCgroupV2MemoryStats({ currentRaw: String(64 * mb), maxRaw: 'max', statRaw: '' });
+    assert.strictEqual(unlim.unlimited, true);
+    assert.strictEqual(unlim.limitBytes, null);
+    assert.strictEqual(unlim.usagePercent, null);
+
+    const cgDir = makeTempDir('culkibo-cgv2-');
+    try {
+      fs.writeFileSync(path.join(cgDir, 'memory.current'), String(300 * mb), 'utf8');
+      fs.writeFileSync(path.join(cgDir, 'memory.max'), String(512 * mb), 'utf8');
+      fs.writeFileSync(path.join(cgDir, 'memory.stat'), `anon ${100 * mb}\ninactive_file ${150 * mb}\n`, 'utf8');
+      const fromDisk = readContainerCgroupV2Memory('abcdef123456', { cgroupDir: cgDir });
+      assert.ok(fromDisk && fromDisk.workingSetBytes === 150 * mb);
+    } finally {
+      fs.rmSync(cgDir, { recursive: true, force: true });
+    }
+  }
+
+  // 7e. dokploy#2547: deployManager.fastRestartWithEnv (recreates container with new env, ZERO docker build)
+  {
+    const frDm = new DeployManager();
+    const dockerInvocations = [];
+    frDm.saveStore = () => {};
+    frDm.detectDocker = async () => ({ available: true, version: '27.0.0' });
+    frDm.ensureNetwork = async () => {};
+    frDm.findFreePort = async () => 24567;
+    frDm.resolveUpstream = async ({ hostPort }) => ({ dial: `127.0.0.1:${hostPort}` });
+    frDm.waitForHealth = async () => ({ healthy: true, status: 200 });
+    frDm.switchRoute = async () => ({ ok: true });
+    frDm.drainAndRetire = async () => {};
+    frDm.runDocker = async (args) => {
+      dockerInvocations.push(args);
+      if (args[0] === 'image' && args[1] === 'inspect') return { code: 0, stdout: '[]', stderr: '' };
+      if (args[0] === 'run') return { code: 0, stdout: 'cid_fast_restart_123\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    frDm.store.proj_fr_1 = {
+      current: {
+        id: 'dep_orig_1',
+        projectId: 'proj_fr_1',
+        projectName: 'Fast Restart Demo',
+        containerName: 'culkibo_proj_fr_1_v1',
+        imageTag: 'culkibo/proj_fr_1:v1',
+        hostPort: 24500,
+        containerPort: 3000,
+        upstream: '127.0.0.1:24500',
+        hostnames: ['fast.example.test'],
+        healthPath: '/health',
+        serverId: 'local',
+        status: 'activo'
+      },
+      previous: null,
+      history: []
+    };
+
+    const dryRes = await frDm.fastRestartWithEnv(
+      { id: 'proj_fr_1', name: 'Fast Restart Demo', domains: ['fast.example.test'], envVars: { FEATURE_X: '1' }, memoryMb: 512, cpus: '1.0' },
+      { envVars: { FEATURE_Y: '2' }, dryRun: true }
+    );
+    assert.strictEqual(dryRes.dryRun, true);
+    assert.strictEqual(dryRes.rebuilt, false);
+    assert.ok(dryRes.envKeysApplied.includes('FEATURE_X') && dryRes.envKeysApplied.includes('FEATURE_Y'));
+
+    const liveRes = await frDm.fastRestartWithEnv(
+      { id: 'proj_fr_1', name: 'Fast Restart Demo', domains: ['fast.example.test'], envVars: { FEATURE_X: '1' }, memoryMb: 512, cpus: '1.0' },
+      { envVars: { FEATURE_Y: '2' } }
+    );
+    assert.strictEqual(liveRes.restarted, true);
+    assert.strictEqual(liveRes.rebuilt, false);
+    assert.strictEqual(liveRes.imageTag, 'culkibo/proj_fr_1:v1');
+    assert.strictEqual(liveRes.routeSwitched, true);
+    assert.ok(!dockerInvocations.some((a) => a[0] === 'build' || a[0] === 'buildx'), 'fastRestartWithEnv JAMÁS debe ejecutar docker build');
+    assert.ok(dockerInvocations.some((a) => a[0] === 'run' && a.includes('FEATURE_Y')), 'fastRestartWithEnv debe inyectar nuevas env vars en docker run');
+  }
+
+  // 7f. Enterprise OIDC groups -> RBAC role mapping & disablePasswordLogin lockout guard
+  const oidcTmp = makeTempDir('culkibo-oidc-groups-');
+  try {
+    const oidc = new OidcService({ dataDir: oidcTmp });
+    // Anti-lockout: cannot disable password login with 0 enabled SSO providers
+    assert.throws(
+      () => oidc.setSecuritySettings({ disablePasswordLogin: true }),
+      (err) => err && err.code === 'OIDC_LOCKOUT_PREVENTED',
+      'Debe impedir disablePasswordLogin sin proveedor SSO activo'
+    );
+    // Reject mapping any group to owner
+    assert.throws(
+      () => oidc.configureProvider({
+        id: 'authentik',
+        type: 'authentik',
+        issuerUrl: 'https://auth.example.test/application/o/culkibo',
+        clientId: 'cid',
+        redirectUri: 'https://panel.example.test/api/auth/oidc/callback',
+        groupRoleMap: { superusers: 'owner' }
+      }),
+      (err) => err && err.code === 'OWNER_PROVISION_FORBIDDEN',
+      'groupRoleMap jamás puede asignar rol owner'
+    );
+
+    const prov = oidc.configureProvider({
+      id: 'authentik',
+      type: 'authentik',
+      issuerUrl: 'https://auth.example.test/application/o/culkibo',
+      clientId: 'cid-ent',
+      redirectUri: 'https://panel.example.test/api/auth/oidc/callback',
+      autoProvision: true,
+      defaultRole: 'viewer',
+      groupsClaim: 'groups',
+      groupRoleMap: { 'platform-admins': 'admin', devs: 'developer', readonly: 'viewer' },
+      disablePasswordLogin: true
+    });
+    assert.strictEqual(prov.groupsClaim, 'groups');
+    assert.strictEqual(prov.groupRoleMap['platform-admins'], 'admin');
+    assert.strictEqual(oidc.isPasswordLoginDisabled(), true);
+
+    const rAdmin = resolveRoleFromClaims(prov, { groups: ['readonly', 'devs', 'platform-admins'] });
+    assert.strictEqual(rAdmin.role, 'admin');
+    assert.strictEqual(rAdmin.source, 'group_map');
+    const rDev = resolveRoleFromClaims(prov, { groups: ['devs', 'unknown-team'] });
+    assert.strictEqual(rDev.role, 'developer');
+    const rFallback = resolveRoleFromClaims(prov, { groups: ['other-org'] });
+    assert.strictEqual(rFallback.role, 'viewer');
+    assert.strictEqual(rFallback.source, 'default_role');
+
+    // Nested Keycloak claim path (`realm_access.roles`) + tampered disk `owner` ignored
+    const kcProv = { defaultRole: 'viewer', groupsClaim: 'realm_access.roles', groupRoleMap: { ops: 'developer', evil: 'owner' } };
+    assert.strictEqual(resolveRoleFromClaims(kcProv, { realm_access: { roles: ['ops', 'evil'] } }).role, 'developer');
+    assert.strictEqual(resolveRoleFromClaims(kcProv, { realm_access: { roles: ['evil'] } }).role, 'viewer');
+  } finally {
+    fs.rmSync(oidcTmp, { recursive: true, force: true });
+  }
+
+  // 7g. Cosmos#616 Auth Circuit-Breaker (`X-Culkibo-Auth-Circuit: backoff`), disablePasswordLogin HTTP 403 & Cycle-2 Lazy Routes
+  {
+    const httpTmp = makeTempDir('culkibo-cycle2-http-');
+    const rootDir = path.resolve(__dirname, '..');
+    const runnerPath = path.join(httpTmp, 'cycle2-http-runner.js');
+    fs.writeFileSync(runnerPath, `
+const assert = require('assert');
+const fs = require('fs');
+const http = require('http');
+const path = require('path');
+
+const TMP_DIR = ${JSON.stringify(httpTmp)};
+const ROOT_DIR = ${JSON.stringify(rootDir)};
+process.env.NODE_ENV = 'test';
+process.env.CULKIBO_DATA_DIR = TMP_DIR;
+process.env.CULKIBO_DISABLE_AUDIT_DISK = '1';
+
+const express = require(path.join(ROOT_DIR, 'node_modules', 'express'));
+const auth = require(path.join(ROOT_DIR, 'server/middleware/auth'));
+const projectManager = require(path.join(ROOT_DIR, 'server/services/projectManager'));
+const databaseManager = require(path.join(ROOT_DIR, 'server/services/databaseManager'));
+const deployManager = require(path.join(ROOT_DIR, 'server/services/deployManager'));
+const oidcService = require(path.join(ROOT_DIR, 'server/services/oidcService'));
+const apiRouter = require(path.join(ROOT_DIR, 'server/routes/api'));
+
+function reqJson(port, method, pth, { token, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const raw = body !== undefined ? JSON.stringify(body) : null;
+    const headers = { host: 'panel.example.test' };
+    if (token) headers.authorization = 'Bearer ' + token;
+    if (raw !== null) {
+      headers['content-type'] = 'application/json';
+      headers['content-length'] = Buffer.byteLength(raw);
+    }
+    const r = http.request({ hostname: '127.0.0.1', port, method, path: pth, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = JSON.parse(text); } catch (e) {}
+        resolve({ status: res.statusCode, headers: res.headers, text, json });
+      });
+    });
+    r.on('error', reject);
+    if (raw !== null) r.write(raw);
+    r.end();
+  });
+}
+
+(async () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api', auth.authMiddleware, apiRouter);
+  const srv = await new Promise((res) => { const s = app.listen(0, '127.0.0.1', () => res(s)); });
+  const port = srv.address().port;
+  const master = auth.resolveToken();
+  try {
+    // Cosmos#616: repeated 401 on /auth/verify triggers X-Culkibo-Auth-Circuit: backoff
+    const f1 = await reqJson(port, 'POST', '/api/auth/verify', { body: { token: 'bad_1' } });
+    assert.strictEqual(f1.status, 401);
+    const f2 = await reqJson(port, 'POST', '/api/auth/verify', { body: { token: 'bad_2' } });
+    assert.strictEqual(f2.status, 401);
+    assert.strictEqual(f2.headers['x-culkibo-auth-circuit'], 'backoff');
+    assert.strictEqual(f2.json.authCircuit, 'backoff');
+    const sessBackoff = await reqJson(port, 'GET', '/api/auth/session');
+    assert.strictEqual(sessBackoff.headers['x-culkibo-auth-circuit'], 'backoff');
+
+    // Valid verify clears circuit
+    const okVerify = await reqJson(port, 'POST', '/api/auth/verify', { body: { token: master } });
+    assert.strictEqual(okVerify.status, 200);
+    const sessClean = await reqJson(port, 'GET', '/api/auth/session');
+    assert.strictEqual(sessClean.headers['x-culkibo-auth-circuit'], undefined);
+
+    // OIDC disablePasswordLogin blocks POST /api/auth/login with 403 PASSWORD_LOGIN_DISABLED
+    oidcService.configureProvider({
+      id: 'corp-sso',
+      type: 'authentik',
+      issuerUrl: 'https://sso.example.test/o/culkibo',
+      clientId: 'cid_sso',
+      redirectUri: 'https://panel.example.test/api/auth/oidc/callback',
+      disablePasswordLogin: true
+    });
+    const pubProv = await reqJson(port, 'GET', '/api/auth/oidc/providers');
+    assert.strictEqual(pubProv.status, 200);
+    assert.strictEqual(pubProv.json.disablePasswordLogin, true);
+    const blockedLogin = await reqJson(port, 'POST', '/api/auth/login', { body: { email: 'a@b.test', password: 'Password!123' } });
+    assert.strictEqual(blockedLogin.status, 403);
+    assert.strictEqual(blockedLogin.json.code, 'PASSWORD_LOGIN_DISABLED');
+
+    // Cycle-2 Lazy Routes: SmartPack, DirectPush, EdgeTunnel, SnapStream, FastRestart, Preview DB Branching
+    const proj = projectManager.create({ id: 'proj_c2_api', name: 'Cycle2 API', envVars: { A: '1' } });
+    deployManager.store[proj.id] = {
+      current: { id: 'd1', projectId: proj.id, containerName: 'c_old', imageTag: 'culkibo/c2:v1', hostPort: 21111, containerPort: 3000, hostnames: ['c2.example.test'], status: 'activo' },
+      previous: null,
+      history: []
+    };
+
+    const frRes = await reqJson(port, 'POST', '/api/projects/proj_c2_api/fast-restart', {
+      token: master,
+      body: { dryRun: true, envVars: { B: '2' } }
+    });
+    assert.strictEqual(frRes.status, 200, 'fast-restart dryRun failed: ' + frRes.text);
+    assert.strictEqual(frRes.json.rebuilt, false);
+    assert.strictEqual(frRes.json.dryRun, true);
+
+    const brRes = await reqJson(port, 'POST', '/api/projects/proj_c2_api/previews/42/branch-db', {
+      token: master,
+      body: { engine: 'postgres', sourceDbName: 'app_prod', containerName: 'culkibo_pg_main' }
+    });
+    assert.strictEqual(brRes.status, 200, 'branch-db failed: ' + brRes.text);
+    assert.ok(brRes.json.branchDbName || brRes.json.branchName || brRes.json.engine);
+
+    const spRes = await reqJson(port, 'POST', '/api/build/smartpack/plan', {
+      token: master,
+      body: { files: { 'package.json': JSON.stringify({ name: 'demo', dependencies: { next: '15.0.0' }, scripts: { build: 'next build', start: 'next start' } }) } }
+    });
+    assert.strictEqual(spRes.status, 200, 'smartpack plan failed: ' + spRes.text);
+    assert.ok(spRes.json.stack);
+
+    const dpRes = await reqJson(port, 'POST', '/api/deploy/direct-push/plan', {
+      token: master,
+      body: { image: 'culkibo/c2:v1', serverId: 'srv_eu_1', localPort: 5055 }
+    });
+    assert.strictEqual(dpRes.status, 200, 'direct-push plan failed: ' + dpRes.text);
+
+    const etCreate = await reqJson(port, 'POST', '/api/edge-tunnel/tunnels', {
+      token: master,
+      body: { name: 'HomeNAS', targetHost: '127.0.0.1', targetPort: 8080, hostname: 'nas.example.test' }
+    });
+    assert.strictEqual(etCreate.status, 201, 'edge-tunnel create failed: ' + etCreate.text);
+    const tid = etCreate.json.id || (etCreate.json.tunnel && etCreate.json.tunnel.id);
+    assert.ok(tid);
+    const etStatus = await reqJson(port, 'GET', '/api/edge-tunnel/status', { token: master });
+    assert.strictEqual(etStatus.status, 200);
+    const etDel = await reqJson(port, 'DELETE', '/api/edge-tunnel/tunnels/' + encodeURIComponent(tid), { token: master });
+    assert.strictEqual(etDel.status, 200);
+
+    // SnapStream SQLite capture & listGenerations
+    const sqliteFile = path.join(TMP_DIR, 'sample.sqlite');
+    fs.writeFileSync(sqliteFile, Buffer.from('SQLite format 3\0' + 'x'.repeat(256)));
+    databaseManager.dataFile = path.join(TMP_DIR, 'databases.json');
+    databaseManager.state = {
+      databases: [{
+        id: 'db_sqlite_c2',
+        projectId: proj.id,
+        engine: 'sqlite',
+        name: 'SnapDB',
+        username: '',
+        dbName: 'snap',
+        port: 0,
+        containerName: 'none',
+        volumeName: 'none',
+        networkName: 'none',
+        status: 'running',
+        health: 'healthy',
+        exposure: { enabled: false, bindAddress: '127.0.0.1', hostPort: null },
+        schedule: { enabled: false, cron: null, nextRunAt: null, lastRunAt: null, lastStatus: null },
+        retention: { keepLast: 7 },
+        backups: [],
+        restoreHistory: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }],
+      s3: null
+    };
+    const encKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const snapCap = await reqJson(port, 'POST', '/api/databases/db_sqlite_c2/snapstream/capture', {
+      token: master,
+      body: { dbPath: sqliteFile, encryptionKey: encKey, destDir: path.join(TMP_DIR, 'snap-out') }
+    });
+    assert.strictEqual(snapCap.status, 201, 'snapstream capture failed: ' + snapCap.text);
+    const snapList = await reqJson(port, 'GET', '/api/databases/db_sqlite_c2/snapstream/generations?destDir=' + encodeURIComponent(path.join(TMP_DIR, 'snap-out')), {
+      token: master
+    });
+    assert.strictEqual(snapList.status, 200, 'snapstream generations failed: ' + snapList.text);
+    assert.ok(Array.isArray(snapList.json.generations) && snapList.json.generations.length >= 1);
+
+    console.log('CYCLE2_HTTP_OK');
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+})().catch((err) => { console.error(err); process.exit(1); });
+`, 'utf8');
+    try {
+      const out = execFileSync(process.execPath, [runnerPath], { cwd: rootDir, encoding: 'utf8', timeout: 30000 });
+      assert.ok(out.includes('CYCLE2_HTTP_OK'), `Cycle-2 HTTP check failed:\n${out}`);
+    } finally {
+      fs.rmSync(httpTmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #2: CULKIBO_DATA_DIR, coolify#12414 Compose limits, dokploy#2547 FastRestart, Cosmos#591/#616, runtipi#2445 cgroup v2, OIDC groups & lazy routes');
 
   console.log('✅ Suite #23 completada correctamente.\n');
 }

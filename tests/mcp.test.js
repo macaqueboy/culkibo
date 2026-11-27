@@ -146,6 +146,9 @@ async function testMcp() {
   // 14. MCP 2026 Pioneer: 8 playbooks interactivos, culkibo_ship_and_verify (secret scan + confirmToken + smoke + auto-rollback) y culkibo_export_agent_kit
   await testMcp2026PioneerUpgrades();
 
+  // 15. MCP 2026 Cycle-2: World-First PaaS MCP Apps (ui://culkibo/*), culkibo_smartpack_plan y culkibo_edge_tunnel (111 tools)
+  await testMcp2026Cycle2AppsAndTools();
+
   console.log('✅ All MCP tests passed!\n');
 }
 
@@ -156,9 +159,9 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 109, 'El catálogo MCP 2026 debe tener exactamente 109 herramientas anotadas');
+  assert.strictEqual(tools.length, 111, 'El catálogo MCP 2026 debe tener exactamente 111 herramientas anotadas');
   const uniqueNames = new Set(tools.map(t => t.name));
-  assert.strictEqual(uniqueNames.size, 109, 'No puede haber nombres de herramientas duplicados');
+  assert.strictEqual(uniqueNames.size, 111, 'No puede haber nombres de herramientas duplicados');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -181,11 +184,11 @@ async function testToolAnnotations() {
   const destCount = tools.filter(t => t.annotations.destructiveHint === true).length;
   const dryRunCount = tools.filter(t => Boolean(t.inputSchema?.properties?.dryRun)).length;
   const outputSchemaCount = tools.filter(t => Boolean(t.outputSchema)).length;
-  assert.strictEqual(roCount, 49, `Se esperaban 49 herramientas RO, hay ${roCount}`);
-  assert.strictEqual(mutCount, 60, `Se esperaban 60 herramientas mutadoras, hay ${mutCount}`);
-  assert.strictEqual(destCount, 34, `Se esperaban 34 herramientas destructivas, hay ${destCount}`);
-  assert.strictEqual(dryRunCount, 36, `Se esperaban 36 herramientas con dryRun, hay ${dryRunCount}`);
-  assert.ok(outputSchemaCount >= 62, `Se esperaban >=62 herramientas con outputSchema, hay ${outputSchemaCount}`);
+  assert.strictEqual(roCount, 50, `Se esperaban 50 herramientas RO, hay ${roCount}`);
+  assert.strictEqual(mutCount, 61, `Se esperaban 61 herramientas mutadoras, hay ${mutCount}`);
+  assert.strictEqual(destCount, 35, `Se esperaban 35 herramientas destructivas, hay ${destCount}`);
+  assert.strictEqual(dryRunCount, 37, `Se esperaban 37 herramientas con dryRun, hay ${dryRunCount}`);
+  assert.ok(outputSchemaCount >= 64, `Se esperaban >=64 herramientas con outputSchema, hay ${outputSchemaCount}`);
 
   const byName = Object.fromEntries(tools.map(t => [t.name, t]));
   const mustMutate = [
@@ -396,7 +399,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 109);
+    assert.strictEqual(list.result.tools.length, 111);
 
     // 7b. ?profile=core reduce el tamaño/tokens de tools/list en >=80% y mantiene callable herramientas descubiertas.
     const coreListRes = await fetch(`${endpoint}?profile=core`, {
@@ -633,10 +636,10 @@ async function testMcpV2Capabilities() {
   const mcpStreamableHttp = require('../server/services/mcpStreamableHttp');
   const V = mcpServer.protocol.PROTOCOL_VERSION;
 
-  // 1. 7 Recursos y 5 Prompts
+  // 1. 10 Recursos (7 culkibo://* + 3 ui://culkibo/* MCP Apps) y 13 Prompts
   const resources = mcpServer.listResources();
-  assert.strictEqual(resources.length, 7, `Se esperaban 7 recursos MCP, hay ${resources.length}`);
-  for (const uri of ['culkibo://projects', 'culkibo://pods', 'culkibo://doctor', 'culkibo://domains', 'culkibo://fleet', 'culkibo://uptime', 'culkibo://environments']) {
+  assert.strictEqual(resources.length, 10, `Se esperaban 10 recursos MCP (7 JSON + 3 MCP Apps), hay ${resources.length}`);
+  for (const uri of ['culkibo://projects', 'culkibo://pods', 'culkibo://doctor', 'culkibo://domains', 'culkibo://fleet', 'culkibo://uptime', 'culkibo://environments', 'ui://culkibo/topology', 'ui://culkibo/incident-remediator', 'ui://culkibo/coolify-migration-diff']) {
     assert.ok(resources.some(r => r.uri === uri), `Falta recurso ${uri}`);
   }
   const fleetRes = await mcpServer.readResource('culkibo://fleet');
@@ -725,7 +728,7 @@ async function testMcpV2Capabilities() {
       principal: { userId: 'usr_viewer_1', role: 'viewer', teamId: 'team_default', projectIds: [projA.id], scopes: ['*'] }
     };
     const viewerTools = mcpServer.getToolsForPrincipal(viewerAuth);
-    assert.ok(viewerTools.length > 0 && viewerTools.length < 109);
+    assert.ok(viewerTools.length > 0 && viewerTools.length < 111);
     assert.ok(viewerTools.every(t => t.annotations.readOnlyHint === true), 'viewer solo puede ver herramientas readOnly');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_database_credentials'), 'viewer NO puede ver culkibo_database_credentials');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_rbac_list_tokens'), 'viewer NO puede ver culkibo_rbac_list_tokens');
@@ -733,7 +736,7 @@ async function testMcpV2Capabilities() {
     // Serialized tools cache isolation
     const pubBuf = mcpServer.getToolsSerialized();
     const privBuf = mcpServer.getToolsSerialized(viewerAuth);
-    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 109);
+    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 111);
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).cacheScope, 'private');
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).count, viewerTools.length);
 
@@ -799,7 +802,7 @@ async function testMcpV2Capabilities() {
     const whoamiSuper = await mcpServer.executeTool('culkibo_rbac_whoami', {});
     assert.strictEqual(whoamiSuper.isError, false);
     assert.strictEqual(whoamiSuper.structuredContent.isSuperAdmin, true);
-    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 109);
+    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 111);
 
     const whoamiViewer = await mcpServer.executeTool('culkibo_rbac_whoami', {}, { auth: viewerAuth });
     assert.strictEqual(whoamiViewer.isError, false);
@@ -1029,7 +1032,7 @@ async function testMcpV21Superpowers() {
   let match;
   const caseRe = /case\s+'(culkibo_[a-z0-9_]+)'\s*:/g;
   while ((match = caseRe.exec(switchBlock))) caseNames.add(match[1]);
-  assert.strictEqual(caseNames.size, 109, `Todos los 109 tools deben tener handler en switch (hay ${caseNames.size})`);
+  assert.strictEqual(caseNames.size, 111, `Todos los 111 tools deben tener handler en switch (hay ${caseNames.size})`);
   for (const t of tools) {
     assert.ok(caseNames.has(t.name), `Falta case para ${t.name}`);
   }
@@ -1065,7 +1068,9 @@ async function testMcpV21Superpowers() {
     um: uptimeMonitor,
     gm: gitopsManager,
     sa: sleepAdvisor,
-    dm: deployManager
+    dm: deployManager,
+    sp: require('../server/services/smartPackBuilder'),
+    et: require('../server/services/edgeTunnelService')
   };
   const missingCalls = [];
   const callRe = /\b([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\(/g;
@@ -1092,7 +1097,7 @@ async function testMcpV21Superpowers() {
     const subset = mcpServer.getToolsForPrincipal(null, { profile: prof });
     assert.ok(subset.length > 0, `El perfil ${prof} debe devolver herramientas`);
   }
-  console.log('  ✓ Auditoría automatizada de 109 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
+  console.log('  ✓ Auditoría automatizada de 111 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
 
   // 2. culkibo_search_tools (meta-discovery + aislamiento RBAC)
   const searchSuper = await mcpServer.executeTool('culkibo_search_tools', { query: 'postgres backup', limit: 5 });
@@ -1709,6 +1714,198 @@ async function testMcp2026PioneerUpgrades() {
     console.log('  ✓ Streamable HTTP X-Culkibo-Mcp-Profile header fallback y Vary verificados');
   } finally {
     await new Promise((resolve) => srv.close(resolve));
+  }
+}
+
+/**
+ * MCP 2026 Cycle-2:
+ *  - World-First PaaS MCP Apps (`ui://culkibo/*`, ext-apps 2026-01-26, MIME, strict CSP, 0 external URLs, XSS escaping, postMessage bridge, RBAC)
+ *  - `_meta.ui.resourceUri` linkage on tools & tool results
+ *  - `culkibo_smartpack_plan` (RO, outputSchema, path-boundary guard, real SmartPack plan)
+ *  - `culkibo_edge_tunnel` (admin RBAC, dryRun preview, create/list/status/revoke, cket_ redaction in auditLog)
+ */
+async function testMcp2026Cycle2AppsAndTools() {
+  const express = require('express');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const projectManager = require('../server/services/projectManager');
+  const mcpStreamableHttp = require('../server/services/mcpStreamableHttp');
+  const mcpAppsRenderer = require('../server/services/mcpAppsRenderer');
+  const V = mcpServer.protocol.PROTOCOL_VERSION;
+
+  // 1. Capabilities extension advertised in discover & initialize
+  const discover = mcpServer.getDiscoverResult();
+  assert.ok(discover.capabilities.extensions && discover.capabilities.extensions['io.modelcontextprotocol/ui']);
+  assert.ok(discover.capabilities.extensions['io.modelcontextprotocol/ui'].mimeTypes.includes('text/html;profile=mcp-app'));
+
+  const initRes = await mcpServer.handleJsonRpc({ jsonrpc: '2.0', id: 'ext-init', method: 'initialize', params: {} });
+  assert.ok(initRes.result.capabilities.extensions['io.modelcontextprotocol/ui'].mimeTypes.includes('text/html;profile=mcp-app'));
+
+  // 2. _meta.ui attached to key tools
+  for (const [toolName, expectedUri] of [
+    ['culkibo_list_projects', 'ui://culkibo/topology'],
+    ['culkibo_list_pods', 'ui://culkibo/topology'],
+    ['culkibo_diagnose_incident', 'ui://culkibo/incident-remediator'],
+    ['culkibo_migrate_coolify', 'ui://culkibo/coolify-migration-diff']
+  ]) {
+    const spec = mcpServer.getToolByName(toolName);
+    assert.strictEqual(spec?._meta?.ui?.resourceUri, expectedUri, `${toolName} debe declarar _meta.ui.resourceUri=${expectedUri}`);
+  }
+  const podsExec = await mcpServer.executeTool('culkibo_list_pods', {});
+  assert.strictEqual(podsExec._meta?.ui?.resourceUri, 'ui://culkibo/topology');
+
+  // 3. 3 MCP Apps resources (`ui://culkibo/*`): MIME, strict CSP, 0 external URLs, XSS escaping, postMessage bridge, RBAC
+  const resources = mcpServer.listResources();
+  const uiResources = resources.filter((r) => r.uri.startsWith('ui://culkibo/'));
+  assert.strictEqual(uiResources.length, 3);
+  for (const r of uiResources) {
+    assert.strictEqual(r.mimeType, 'text/html;profile=mcp-app');
+    assert.ok(String(r._meta?.ui?.csp?.policy || '').includes("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"));
+    assert.deepStrictEqual(r._meta?.ui?.csp?.connectDomains, []);
+    assert.deepStrictEqual(r._meta?.ui?.csp?.resourceDomains, []);
+  }
+
+  // XSS + secret-redaction check via temporary project with hostile HTML/script name & secret value
+  const xssProj = projectManager.create({
+    name: '</script><img src=x onerror=alert(1)> EvilApp',
+    description: 'sk_live_never_render_into_mcp_app_999999',
+    teamId: 'team_default'
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.post('/api/mcp', mcpStreamableHttp.handlePost);
+  const srv = await new Promise((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  try {
+    for (const uri of ['ui://culkibo/topology', 'ui://culkibo/incident-remediator', 'ui://culkibo/coolify-migration-diff']) {
+      const httpRead = await fetch(`http://127.0.0.1:${srv.address().port}/api/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'MCP-Protocol-Version': V,
+          'Mcp-Method': 'resources/read',
+          'Mcp-Name': uri
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: `app-${uri}`,
+          method: 'resources/read',
+          params: {
+            uri,
+            _meta: { 'io.modelcontextprotocol/protocolVersion': V, 'io.modelcontextprotocol/clientCapabilities': {} }
+          }
+        })
+      });
+      assert.strictEqual(httpRead.status, 200, `resources/read HTTP falló para ${uri}`);
+      const payload = await httpRead.json();
+      const item = payload.result.contents[0];
+      assert.strictEqual(item.mimeType, 'text/html;profile=mcp-app');
+      assert.ok(item._meta?.ui?.csp?.policy.includes("default-src 'none'"));
+      const html = item.text;
+      assert.ok(html.includes('Content-Security-Policy'));
+      assert.ok(html.includes("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"));
+      assert.ok(html.includes('window.parent.postMessage'), `${uri} debe incluir puente postMessage JSON-RPC`);
+      assert.ok(!/<script[^>]+src=/i.test(html) && !/<link[^>]+href=/i.test(html), `${uri} no puede cargar scripts ni hojas externas`);
+      assert.ok(!html.includes('</script><img'), `${uri} debe escapar cualquier intento de cierre de </script> (XSS)`);
+      assert.ok(!html.includes('sk_live_never_render_into_mcp_app_999999'), `${uri} jamás puede incrustar secretos en claro`);
+    }
+
+    // Unit-level XSS escaping verification on mcpAppsRenderer.safeJsonForScript
+    const escaped = mcpAppsRenderer.safeJsonForScript({ evil: '</script><script>alert(1)</script>', secret: 'cket_abc1234567890' });
+    assert.ok(!escaped.includes('</script>'));
+    assert.ok(escaped.includes('\\u003c/script\\u003e'));
+    assert.ok(!escaped.includes('cket_abc1234567890'));
+
+    // RBAC on ui://culkibo/* (revoked -> 0 & FORBIDDEN; narrow token without migrations:read blocked on coolify-migration-diff)
+    assert.strictEqual(mcpServer.listResources({ ok: false }).length, 0);
+    await assert.rejects(() => mcpServer.readResource('ui://culkibo/topology', { auth: { ok: false } }), /Acceso denegado/);
+    const narrowAuth = {
+      ok: true,
+      method: 'api_token',
+      principal: { userId: 'usr_narrow', role: 'viewer', teamId: 'team_default', projectIds: null, scopes: ['projects:read'] }
+    };
+    const narrowList = mcpServer.listResources(narrowAuth);
+    assert.ok(narrowList.some((r) => r.uri === 'ui://culkibo/topology'));
+    assert.ok(!narrowList.some((r) => r.uri === 'ui://culkibo/coolify-migration-diff'));
+    await assert.rejects(() => mcpServer.readResource('ui://culkibo/coolify-migration-diff', { auth: narrowAuth }), /Acceso denegado/);
+    console.log('  ✓ MCP Apps (ui://culkibo/*): 3 apps HTML verificadas (MIME, CSP estricta, 0 URLs externas, anti-XSS, postMessage, RBAC)');
+  } finally {
+    await new Promise((resolve) => srv.close(resolve));
+    projectManager.delete(xssProj.id);
+    await projectManager.flushToDisk();
+  }
+
+  // 4. culkibo_smartpack_plan (RO, outputSchema, path-boundary security)
+  const spRes = await mcpServer.executeTool('culkibo_smartpack_plan', {
+    directory: path.join(__dirname, '..', 'web'),
+    includeDockerfile: true
+  });
+  assert.strictEqual(spRes.isError, false);
+  const sp = spRes.structuredContent;
+  assert.ok(typeof sp.stack === 'string' && sp.stack.length > 0);
+  assert.ok(sp.plan && typeof sp.plan.deterministicHash === 'string');
+  assert.ok(Array.isArray(sp.dockerignore) && sp.dockerignore.includes('.git'));
+  assert.ok(typeof sp.dockerfile === 'string' && sp.dockerfile.includes('FROM '));
+
+  // Path traversal outside workspace blocked with FORBIDDEN_PATH
+  const spTraversal = await mcpServer.executeTool('culkibo_smartpack_plan', { directory: path.resolve(os.tmpdir(), '..') });
+  assert.strictEqual(spTraversal.isError, true);
+  assert.strictEqual(JSON.parse(spTraversal.content[0].text).code, 'FORBIDDEN_PATH');
+  console.log(`  ✓ culkibo_smartpack_plan verificado (stack=${sp.stack}, ${sp.dockerignore.length} ignore patterns, path guard OK)`);
+
+  // 5. culkibo_edge_tunnel (admin RBAC, dryRun, isolated create/list/status/revoke, cket_ redaction in auditLog)
+  const devAuth = {
+    ok: true,
+    method: 'api_token',
+    principal: { userId: 'usr_et_dev', role: 'developer', teamId: 'team_default', projectIds: null, scopes: ['*'] }
+  };
+  const devBlocked = await mcpServer.executeTool('culkibo_edge_tunnel', { action: 'list' }, { auth: devAuth });
+  assert.strictEqual(devBlocked.isError, true);
+  assert.strictEqual(JSON.parse(devBlocked.content[0].text).code, 'FORBIDDEN');
+
+  const tmpEtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-mcp-et-'));
+  const prevDataDir = process.env.CULKIBO_DATA_DIR;
+  process.env.CULKIBO_DATA_DIR = tmpEtDir;
+  try {
+    const etDry = await mcpServer.executeTool('culkibo_edge_tunnel', {
+      action: 'create',
+      name: 'mcp-dry-tun',
+      targetPort: 3000,
+      dryRun: true
+    });
+    assert.strictEqual(etDry.isError, false);
+    assert.strictEqual(etDry.structuredContent.dryRun, true);
+    assert.strictEqual(etDry.structuredContent.wouldExecute, true);
+
+    const etCreated = await mcpServer.executeTool('culkibo_edge_tunnel', {
+      action: 'create',
+      name: 'mcp-live-tun',
+      targetHost: '127.0.0.1',
+      targetPort: 3456,
+      hostname: 'app.tunnel.test'
+    });
+    assert.strictEqual(etCreated.isError, false);
+    const createdTun = etCreated.structuredContent.tunnel;
+    assert.ok(createdTun && createdTun.id && typeof createdTun.token === 'string' && createdTun.token.startsWith('cket_'));
+    const latestAudit = mcpServer.getAuditLog(1)[0];
+    assert.ok(!JSON.stringify(latestAudit).includes(createdTun.token), 'Token cket_ jamás puede filtrarse al auditLog MCP');
+
+    const etList = await mcpServer.executeTool('culkibo_edge_tunnel', { action: 'list' });
+    assert.strictEqual(etList.isError, false);
+    assert.ok(etList.structuredContent.tunnels.some((t) => t.id === createdTun.id));
+
+    const etRevoke = await mcpServer.executeTool('culkibo_edge_tunnel', { action: 'revoke', tunnelId: createdTun.id });
+    assert.strictEqual(etRevoke.isError, false);
+    assert.strictEqual(etRevoke.structuredContent.revoked, true);
+    console.log('  ✓ culkibo_edge_tunnel verificado (RBAC admin, dryRun, create/list/revoke aislado, cket_ redactado)');
+  } finally {
+    if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+    else process.env.CULKIBO_DATA_DIR = prevDataDir;
+    try { fs.rmSync(tmpEtDir, { recursive: true, force: true }); } catch (e) {}
   }
 }
 

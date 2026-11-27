@@ -10,6 +10,8 @@ import { api, clearAuthToken, getAuthToken, setUnauthorizedHandler, type Project
 import { deployStream } from './lib/deployStream';
 import { liveEvents } from './lib/liveEvents';
 import { setTelemetryCurrentView } from './lib/clientTelemetry';
+import { useI18n } from './lib/i18n';
+import './lib/theme';
 import type { ImportSourceTab } from './components/UniversalImporter';
 
 const ProjectDetail = lazy(() => import('./components/ProjectDetail').then((m) => ({ default: m.ProjectDetail })));
@@ -24,6 +26,33 @@ const LiveLogs = lazy(() => import('./components/LiveLogs').then((m) => ({ defau
 const SettingsView = lazy(() => import('./components/SettingsView').then((m) => ({ default: m.SettingsView })));
 
 export type ToastKind = 'info' | 'success' | 'error';
+type FaviconState = 'healthy' | 'deploying' | 'error';
+
+const DEPLOYING_STATUSES = new Set([
+  'pendiente',
+  'en_cola',
+  'sincronizando',
+  'construyendo',
+  'arrancando',
+  'verificando',
+  'promocionando',
+  'drenando',
+]);
+
+function buildStatusFaviconHref(state: FaviconState): string {
+  const dotColor = state === 'deploying' ? '#F59E0B' : state === 'error' ? '#F43F5E' : '#10B981';
+  const svg = [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">',
+    '<rect width="32" height="32" rx="8" fill="#111113"/>',
+    '<rect x="7.5" y="7" width="3.8" height="18" rx="1.2" fill="#FFFFFF"/>',
+    '<path d="M13 15.1L19.6 7H23.4L16.4 15.6L13 15.1Z" fill="#F59E0B"/>',
+    '<path d="M13 16.9L16.6 16.4L23.5 25H19.4L13 16.9Z" fill="#FFFFFF"/>',
+    `<circle cx="25.5" cy="25.5" r="5.5" fill="#111113"/>`,
+    `<circle cx="25.5" cy="25.5" r="4" fill="${dotColor}"/>`,
+    '</svg>',
+  ].join('');
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
 
 const VALID_VIEWS: ReadonlySet<AppView> = new Set([
   'projects',
@@ -79,7 +108,7 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 const ViewFallback = () => (
-  <div className="space-y-5 animate-pulse" aria-busy="true" aria-label="Cargando vista">
+  <div className="space-y-5 animate-pulse" aria-busy="true" aria-label="Loading view">
     <div className="flex items-center justify-between gap-4">
       <div className="space-y-2">
         <div className="h-6 w-40 rounded-lg bg-slate-200/80" />
@@ -100,6 +129,7 @@ const ViewFallback = () => (
 );
 
 export function App() {
+  const { t, locale } = useI18n();
   const initialRoute = parseHashRoute();
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
@@ -128,6 +158,7 @@ export function App() {
 
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [daemonStats, setDaemonStats] = useState<DaemonHeaderStats | null>(null);
+  const [deployStates, setDeployStates] = useState<Record<string, FaviconState>>({});
   const [toasts, setToasts] = useState<Array<{ id: number; msg: string; kind: ToastKind }>>([]);
   const [aiPulseLabel, setAiPulseLabel] = useState<string | null>(null);
   const [activeSyncCount, setActiveSyncCount] = useState<number>(0);
@@ -137,6 +168,26 @@ export function App() {
   const toastTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
   const aiPulseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncClientsByProjectRef = useRef<Map<string, number>>(new Map());
+
+  const faviconState: FaviconState = (() => {
+    const vals = Object.values(deployStates);
+    if (vals.includes('deploying')) return 'deploying';
+    if (vals.includes('error') || sessionOffline) return 'error';
+    return 'healthy';
+  })();
+
+  // Live Build-Status Tab Favicon (updates inline SVG status dot cleanly)
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!link) {
+      link = document.createElement('link');
+      link.rel = 'icon';
+      link.type = 'image/svg+xml';
+      document.head.appendChild(link);
+    }
+    link.href = buildStatusFaviconHref(faviconState);
+  }, [faviconState]);
 
   const checkSession = useCallback(() => {
     setSessionOffline(false);
@@ -310,9 +361,9 @@ export function App() {
   }, [authenticated, paletteOpen, shortcutsOpen]);
 
   const dismissToast = useCallback((id: number) => {
-    const t = toastTimersRef.current.get(id);
-    if (t) {
-      clearTimeout(t);
+    const tTimer = toastTimersRef.current.get(id);
+    if (tTimer) {
+      clearTimeout(tTimer);
       toastTimersRef.current.delete(id);
     }
     setToasts((prev) => prev.filter((item) => item.id !== id));
@@ -394,7 +445,7 @@ export function App() {
         const storedToken = getAuthToken();
         if (storedToken) {
           const { ticket } = await api.getWsTicket();
-          if (!ticket) throw new Error('No se pudo emitir el ticket WebSocket');
+          if (!ticket) throw new Error('Could not issue WebSocket ticket');
           protocols = ['culkibo.v1', `culkibo-ticket.${ticket}`];
         } else {
           protocols = ['culkibo.v1'];
@@ -419,6 +470,14 @@ export function App() {
               deployStream.emitLog(data);
             } else if (type === 'deploy_event') {
               deployStream.emitEvent(data);
+              if (data?.projectId && typeof data?.status === 'string') {
+                const nextFav: FaviconState = DEPLOYING_STATUSES.has(data.status)
+                  ? 'deploying'
+                  : data.status === 'fallido'
+                    ? 'error'
+                    : 'healthy';
+                setDeployStates((prev) => ({ ...prev, [data.projectId]: nextFav }));
+              }
             } else if (type === 'sync_applied') {
               liveEvents.emitSyncApplied(data);
             } else if (type === 'sync_rollback') {
@@ -426,7 +485,7 @@ export function App() {
             } else if (type === 'sync_conflict') {
               liveEvents.emitSyncConflict(data);
               if (data?.path) {
-                showToast(`Conflicto de Live Sync detectado en ${data.path}`, 'error');
+                showToast(`Live Sync conflict detected in ${data.path}`, 'error');
               }
             } else if (type === 'sync_client') {
               liveEvents.emitSyncClient(data);
@@ -442,18 +501,18 @@ export function App() {
               liveEvents.emitServiceProgress(data);
             } else if (type === 'service_installed') {
               liveEvents.emitServiceInstalled(data);
-              if (data?.name) showToast(`${data.name} instalado y en marcha`, 'success');
+              if (data?.name) showToast(`${data.name} installed and running`, 'success');
             } else if (type === 'service_failed') {
               liveEvents.emitServiceFailed(data);
-              if (data?.name) showToast(`Error instalando ${data.name}`, 'error');
+              if (data?.name) showToast(`Error installing ${data.name}`, 'error');
             } else if (type === 'traffic_change') {
-              showToast(`Tráfico actualizado: ${data.citadel}% Prod / ${data.forge}% Dev`);
+              showToast(`Traffic updated: ${data.citadel}% Prod / ${data.forge}% Dev`);
             } else if (type === 'ssl_progress') {
               if (data?.stage === 'installed') {
-                showToast(`Certificado SSL listo para ${data.domain}`, 'success');
+                showToast(`SSL certificate ready for ${data.domain}`, 'success');
               }
             } else if (type === 'github_deploy') {
-              showToast(`Push en ${data.branch} (${data.commit}) por ${data.author}: ${data.message}`, 'success');
+              showToast(`Push on ${data.branch} (${data.commit}) by ${data.author}: ${data.message}`, 'success');
               void fetchProjects();
             } else if (type === 'project_update' && data?.id) {
               setProjects((prev) => prev.map((p) => (p.id === data.id ? data : p)));
@@ -477,11 +536,11 @@ export function App() {
                 setAiPulseLabel(data.toolName);
                 if (aiPulseTimerRef.current) clearTimeout(aiPulseTimerRef.current);
                 aiPulseTimerRef.current = setTimeout(() => setAiPulseLabel(null), 6000);
-                showToast(`Agente IA ejecutó: ${data.toolName}`);
+                showToast(`AI Agent ran: ${data.toolName}`);
               }
             }
           } catch {
-            // ignorar tramas JSON malformadas
+            // ignore malformed JSON frames
           }
         };
 
@@ -491,7 +550,7 @@ export function App() {
           if (ev.code === 4001) {
             clearAuthToken();
             setAuthenticated(false);
-            showToast('Sesión cerrada: el token de acceso del servidor ha cambiado.', 'error');
+            showToast('Session closed: server access token rotated.', 'error');
             return;
           }
           const base = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
@@ -559,12 +618,12 @@ export function App() {
       window.localStorage.removeItem('culkibo_onboarding_dismissed_v1');
       window.localStorage.removeItem('culkibo_quickstart_dismissed');
     } catch {
-      // ignorar
+      // ignore
     }
-    setChecklistRestoreTick((t) => t + 1);
+    setChecklistRestoreTick((c) => c + 1);
     navigate('projects');
-    showToast('Guía de primeros pasos restaurada', 'info');
-  }, [navigate, showToast]);
+    showToast(locale === 'es' ? 'Guía de primeros pasos restaurada' : 'Quick start checklist restored', 'info');
+  }, [navigate, showToast, locale]);
 
   const openImport = useCallback((source: ImportSourceTab = 'wordpress') => {
     setActiveProjectId(null);
@@ -613,7 +672,7 @@ export function App() {
   if (!authChecked) {
     return (
       <div className="min-h-screen bg-slate-50 text-slate-500 flex items-center justify-center text-sm">
-        Comprobando acceso…
+        {t('app.checkingAuth')}
       </div>
     );
   }
@@ -622,16 +681,16 @@ export function App() {
     return (
       <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
         <div className="culkibo-surface w-full max-w-md rounded-2xl p-6 text-center space-y-4">
-          <h1 className="text-base font-semibold text-slate-900">No se pudo conectar con Culkibo</h1>
+          <h1 className="text-base font-semibold text-slate-900">{t('app.offlineTitle')}</h1>
           <p className="text-xs text-slate-500 leading-relaxed">
-            El servidor del plano de control no responde en este momento. Comprueba que el servicio esté activo y vuelve a intentarlo.
+            {t('app.offlineDesc')}
           </p>
           <button
             type="button"
             onClick={checkSession}
             className="culkibo-press px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium transition-colors cursor-pointer"
           >
-            Reintentar conexión
+            {t('app.retry')}
           </button>
         </div>
       </div>
@@ -672,7 +731,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => dismissToast(item.id)}
-                aria-label="Cerrar aviso"
+                aria-label={t('app.closeNotice')}
                 className="inline-flex items-center justify-center w-8 h-8 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer shrink-0"
               >
                 <X className="w-3.5 h-3.5" />
@@ -839,10 +898,10 @@ export function App() {
               type="button"
               onClick={() => setShortcutsOpen(true)}
               className="inline-flex items-center gap-1 text-slate-500 hover:text-slate-900 transition-colors cursor-pointer"
-              title="Ver atajos de teclado (?)"
+              title={t('app.shortcuts')}
             >
               <Keyboard className="w-3.5 h-3.5" />
-              <span>Atajos (?)</span>
+              <span>{t('app.shortcuts')}</span>
             </button>
           </div>
         </div>

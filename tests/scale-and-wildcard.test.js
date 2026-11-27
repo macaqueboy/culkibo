@@ -287,10 +287,10 @@ async function testScaleAndWildcard() {
     maintenanceMode: false
   });
   try {
-    // Verify 109 MCP 2.1 tools registered including meta-discovery, self-healing & Coolify/Bundle tools
+    // Verify 111 MCP 2.1 tools registered including meta-discovery, self-healing, Coolify/Bundle, SmartPack & EdgeTunnel tools
     const listedTools = await mcpServer.handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     const toolNames = (listedTools.result?.tools || []).map((t) => t.name);
-    assert.strictEqual(toolNames.length, 109, `Expected 109 MCP tools, got ${toolNames.length}`);
+    assert.strictEqual(toolNames.length, 111, `Expected 111 MCP tools, got ${toolNames.length}`);
     assert.ok(toolNames.includes('culkibo_link_database'));
     assert.ok(toolNames.includes('culkibo_toggle_maintenance'));
     assert.ok(toolNames.includes('culkibo_get_deploy_queue'));
