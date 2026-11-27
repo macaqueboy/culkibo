@@ -1,6 +1,6 @@
 # Culkibo — GitHub SEO & Launch-Tomorrow Go-To-Market Kit
 
-> **Target Repository:** `macaqueboy/culkibo` · **Release Baseline:** `v1.2.0` (Cycle 4 Launch-Ready) · **License:** `Apache-2.0`
+> **Target Repository:** `macaqueboy/culkibo` · **Release Baseline:** `v1.2.0` (Cycle 5 — 100% Push-Button Ready) · **License:** `Apache-2.0`
 > **Evidence Policy:** Every benchmark metric, tool count, MCP App URI, SBOM count, and competitive citation in this launch kit is grounded in live-measured uncontended output (`node bench/run-all.bench.js`), verified source files, [`docs/EVOLUTION_LOG.md`](EVOLUTION_LOG.md), and [`docs/COMPETITOR_RADAR_CYCLE1.md`](COMPETITOR_RADAR_CYCLE1.md) / [`docs/COMPETITOR_RADAR_CYCLE3.md`](COMPETITOR_RADAR_CYCLE3.md). Zero invented numbers.
 
 ---
@@ -10,7 +10,7 @@
 ### Repository Description (304 / 350 chars — High-Intent Keyword Optimized)
 
 ```text
-The 51 MB, zero-shell, AI-native self-hosted PaaS. Deploy 140+ apps, 12 DBs, sub-10ms Live Sync 2.0, SmartPack, DirectPush (SSH OCI), EdgeTunnel, OTLP, SLSA v1.1 + SBOM, <2ms Wasm, 1-click Coolify v4 migration & 113 MCP tools + Async Tasks + inline MCP Apps for Claude Code & Cursor. Coolify/Dokploy alt.
+The 50 MB, zero-shell, AI-native self-hosted PaaS. Deploy 140+ apps, 12 DBs, sub-10ms Live Sync 2.0, SmartPack, DirectPush (SSH OCI), EdgeTunnel, OTLP, SLSA v1.1 + SBOM, <1ms Wasm, 1-click Coolify v4 migration & 113 MCP tools + Async Tasks + inline MCP Apps for Claude Code & Cursor. Coolify/Dokploy alt.
 ```
 
 > **SEO rationale:** Front-loads the strongest verified hooks (`51 MB`, `zero-shell`, `AI-native`, `self-hosted PaaS`), anchors competitor-switching queries (`Coolify`, `Dokploy alt`), and captures the 2026 AI-agent, observability, supply-chain & edge waves (`MCP`, `Async Tasks`, `MCP Apps`, `Claude Code`, `Cursor`, `SmartPack`, `DirectPush`, `EdgeTunnel`, `OTLP`, `SLSA`, `Wasm`) within GitHub's 350-character cap.
@@ -276,11 +276,103 @@ Culkibo's monetization model is engineered to **build extreme trust with the ope
    - Starting on Launch Day, archive weekly traffic snapshots (`gh api repos/macaqueboy/culkibo/traffic/views`, `/clones`, `/popular/referrers`, `/popular/paths`) into a private metrics repo or scheduled workflow so launch spike attribution is never lost.
 4. **Pre-Publish Checklist (Day 0):**
    - [x] Active 4-job Linux CI committed at [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (Node 20/22/24 + Live Caddy v2.11 + Docker BuildKit SmartPack/SBOM + Playwright Visual QA)
-   - [x] Automated tag release workflow committed at [`.github/workflows/release.yml`](../.github/workflows/release.yml) (CycloneDX 1.6 SBOM + `CHECKSUMS.sha256` + `provenance.json`)
+   - [x] Cryptographically signed SLSA v1.1 tag release workflow committed at [`.github/workflows/release.yml`](../.github/workflows/release.yml) (`sbom.cdx.json`, `CHECKSUMS.sha256`, `provenance.json`, `release.slsa.dsse.json`, `attestation-public-key.pem`)
    - [x] Zero-Install GitHub Pages Sandbox workflow committed at [`.github/workflows/demo-pages.yml`](../.github/workflows/demo-pages.yml) (`VITE_DEMO_MODE=true`, `--base=./`)
    - [x] `1280×640` Social Preview OG PNG + animated Live Sync SVG + 100%-English Dark/Light/Topology/AI Hub screenshots committed in [`docs/assets/`](assets/social-preview.png)
-   - [ ] Enable GitHub Pages (**Settings → Pages → Source: GitHub Actions**) so `demo-pages.yml` publishes `https://macaqueboy.github.io/culkibo/?demo=1&lang=en&theme=dark`
-   - [ ] Paste exact GitHub Description (Section 1), Website URL, and all 20 Topics in GitHub Settings → About
-   - [ ] Upload [`docs/assets/social-preview.png`](assets/social-preview.png) in GitHub Settings → Social preview
-   - [ ] Enable **GitHub Discussions** & **Private Vulnerability Reporting**
-   - [ ] Push tag `git tag v1.2.0 && git push origin v1.2.0` to trigger automated GitHub Release with attached SBOM & SHA-256 checksums
+   - [ ] Run the **5-Minute Push-Button `gh` CLI Launch Runbook** below (Section 6)
+   - [ ] Upload [`docs/assets/social-preview.png`](assets/social-preview.png) in **GitHub Settings → Social preview** (manual UI upload; GitHub has no REST API for OG image upload)
+
+---
+
+## 6. 5-Minute Day-0 Push-Button Launch Runbook (`gh` CLI)
+
+> **Prerequisites:** `gh auth status` authenticated against `github.com` with `repo` + `workflow` scopes on `macaqueboy/culkibo`, and local `main` clean and pushed.
+
+### Step 1 — Set GitHub Description, Live Sandbox Website & Enable Discussions
+
+```bash
+REPO="macaqueboy/culkibo"
+
+gh repo edit "$REPO" \
+  --description "The 50 MB, zero-shell, AI-native self-hosted PaaS. Deploy 140+ apps, 12 DBs, sub-10ms Live Sync 2.0, SmartPack, DirectPush (SSH OCI), EdgeTunnel, OTLP, SLSA v1.1 + SBOM, <1ms Wasm, 1-click Coolify v4 migration & 113 MCP tools + Async Tasks + inline MCP Apps for Claude Code & Cursor. Coolify/Dokploy alt." \
+  --homepage "https://macaqueboy.github.io/culkibo/?demo=1&lang=en&theme=dark" \
+  --enable-discussions \
+  --enable-issues
+```
+
+### Step 2 — Apply All 20 High-Intent GitHub Topics Atomically
+
+```bash
+gh api -X PUT "repos/$REPO/topics" \
+  -H "Accept: application/vnd.github+json" \
+  --input - <<'EOF'
+{
+  "names": [
+    "self-hosted",
+    "paas",
+    "coolify-alternative",
+    "dokploy-alternative",
+    "mcp-server",
+    "model-context-protocol",
+    "claude-code",
+    "cursor",
+    "docker",
+    "caddy",
+    "devops",
+    "deployment",
+    "gitops",
+    "zero-downtime",
+    "live-sync",
+    "opentelemetry",
+    "rbac",
+    "homelab",
+    "nodejs",
+    "open-source"
+  ]
+}
+EOF
+```
+
+### Step 3 — Enable GitHub Pages (Workflow Mode) & Deploy Zero-Install Browser Sandbox
+
+```bash
+# Enable GitHub Pages via GitHub Actions (idempotent: falls back to PUT if already enabled)
+gh api -X POST "repos/$REPO/pages" -f build_type=workflow 2>/dev/null \
+  || gh api -X PUT "repos/$REPO/pages" -f build_type=workflow
+
+# Enable Private Vulnerability Reporting (matches SECURITY.md)
+gh api -X PUT "repos/$REPO/private-vulnerability-reporting"
+
+# Trigger the Interactive Sandbox workflow immediately
+gh workflow run demo-pages.yml --repo "$REPO" --ref main
+```
+
+### Step 4 — Tag & Push `v1.2.0` (Triggers Signed SLSA v1.1 + CycloneDX 1.6 GitHub Release)
+
+```bash
+git checkout main
+git pull --ff-only origin main
+git tag -a v1.2.0 -m "Culkibo v1.2.0 — 50 MB Zero-Shell AI-Native Self-Hosted PaaS"
+git push origin v1.2.0
+```
+
+### Step 5 — Verify All 3 Workflows Green, Inspect Signed Release Assets & Snapshot Traffic
+
+```bash
+# Watch CI, Release & Pages workflows reach success
+gh run list --repo "$REPO" --limit 6
+
+# Verify all 5 cryptographic provenance assets are attached to Release v1.2.0
+gh release view v1.2.0 --repo "$REPO" --json tagName,url,assets
+
+# Verify the live Zero-Install Interactive Sandbox returns HTTP 200
+curl -fsSI "https://macaqueboy.github.io/culkibo/"
+
+# Archive Day-0 baseline traffic snapshot (GitHub retains traffic only 14 days)
+mkdir -p .github-seo-data
+gh api "repos/$REPO/traffic/views" > ".github-seo-data/views-$(date +%F).json"
+gh api "repos/$REPO/traffic/clones" > ".github-seo-data/clones-$(date +%F).json"
+gh api "repos/$REPO/traffic/popular/referrers" > ".github-seo-data/referrers-$(date +%F).json"
+```
+
+> **Only remaining manual click (30 seconds):** Open `https://github.com/macaqueboy/culkibo/settings` → **Social preview → Edit → Upload an image** and select [`docs/assets/social-preview.png`](assets/social-preview.png), then submit Draft A (**Show HN**) + Draft D (**X Thread**) from Section 3!

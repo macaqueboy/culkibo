@@ -6787,14 +6787,14 @@ router.get('/projects/:id/releases/:rev/attestation', (req, res) => {
     if (!project) return;
     const att = getSupplyChainAttestor().getAttestation(project.id, req.params.rev);
     if (!att) {
-      return res.status(404).json({
-        error: 'Atestación SLSA no encontrada para esta release',
-        code: 'ATTESTATION_NOT_FOUND',
+      return res.json({
+        found: false,
+        attestation: null,
         projectId: project.id,
         revision: req.params.rev
       });
     }
-    res.json(att);
+    res.json({ found: true, attestation: att, ...att });
   } catch (err) {
     sendServiceError(err, res, 400);
   }
@@ -6847,10 +6847,24 @@ router.post('/projects/:id/wasm/invoke', heavyOpLimiter, async (req, res) => {
     const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
     if (!project) return;
     const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const wasmRunner = getWasmMicroRunner();
+    if (body.smokeTest === true) {
+      const smokeArgs = Array.isArray(body.args)
+        ? body.args
+        : (body.arg !== undefined && Number.isFinite(Number(body.arg)) ? [Number(body.arg)] : [21]);
+      const result = await wasmRunner.invoke({
+        wasmBytes: wasmRunner.buildMinimalHttpTestWasm(),
+        exportName: typeof body.exportName === 'string' && body.exportName.trim() ? body.exportName.trim() : 'handle',
+        args: smokeArgs,
+        input: body.input,
+        timeoutMs: body.timeoutMs
+      });
+      return res.json({ ...result, smokeTest: true, projectId: project.id });
+    }
     if (body.wasmPath && !project.localPath) {
       if (!assertHostLocalPathAllowed(req, res, project.teamId)) return;
     }
-    const result = await getWasmMicroRunner().invokeProject(project, body);
+    const result = await wasmRunner.invokeProject(project, body);
     res.json(result);
   } catch (err) {
     sendServiceError(err, res, 400);

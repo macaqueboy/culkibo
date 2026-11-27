@@ -701,7 +701,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                           )}
                         </div>
                         <div className="text-xs font-mono text-slate-500 mt-1 truncate">
-                          {isLocal ? '127.0.0.1 (plano de control)' : `${srv.user}@${srv.host}:${srv.port || 22}`}
+                          {isLocal ? `127.0.0.1 (${t('fleet.controlPlane')})` : `${srv.user}@${srv.host}:${srv.port || 22}`}
                         </div>
                       </div>
 
@@ -758,7 +758,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                           </span>
                         </div>
                         <div className="text-[11px] text-slate-500 font-mono">
-                          Carga: {metrics?.load1m != null ? metrics.load1m.toFixed(2) : '—'}
+                          {t('fleet.load')}: {metrics?.load1m != null ? metrics.load1m.toFixed(2) : '—'}
                         </div>
                       </div>
 
@@ -776,13 +776,13 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                           />
                         </div>
                         <div className="text-[10px] text-slate-400 font-mono">
-                          Libre: {formatMb(metrics?.memoryAvailableMb)} / {formatMb(metrics?.memoryTotalMb)}
+                          {t('fleet.free')}: {formatMb(metrics?.memoryAvailableMb)} / {formatMb(metrics?.memoryTotalMb)}
                         </div>
                       </div>
 
                       <div className="space-y-1">
                         <div className="flex items-center justify-between text-slate-500">
-                          <span className="inline-flex items-center gap-1"><HardDrive className="w-3 h-3" /> Disco</span>
+                          <span className="inline-flex items-center gap-1"><HardDrive className="w-3 h-3" /> {t('fleet.disk')}</span>
                           <span className="font-mono text-slate-900 font-medium">
                             {diskPct != null ? `${diskPct}%` : '—'}
                           </span>
@@ -794,7 +794,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                           />
                         </div>
                         <div className="text-[10px] text-slate-400 font-mono">
-                          Libre: {formatGb(metrics?.diskAvailableGb)} / {formatGb(metrics?.diskTotalGb)}
+                          {t('fleet.free')}: {formatGb(metrics?.diskAvailableGb)} / {formatGb(metrics?.diskTotalGb)}
                         </div>
                       </div>
                     </div>
@@ -835,7 +835,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                         >
                           <ShieldCheck className="w-3 h-3 text-slate-500 shrink-0" />
                           <span className="truncate max-w-[165px]">
-                            {srv.hostKeyFingerprint ? srv.hostKeyFingerprint : `${(srv.hostKeyPolicy || 'tofu').toUpperCase()} pendiente`}
+                            {srv.hostKeyFingerprint ? srv.hostKeyFingerprint : `${(srv.hostKeyPolicy || 'tofu').toUpperCase()} ${t('fleet.pending')}`}
                           </span>
                           {srv.hostKeyFingerprint && (
                             copiedKey === `fp-${srv.id}`
@@ -865,7 +865,9 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                     {/* Acciones */}
                     <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100 mt-auto">
                       <span className="text-[11px] text-slate-400 tabular-nums">
-                        {srv.projectsCount != null ? `${srv.projectsCount} ${srv.projectsCount === 1 ? 'proyecto' : 'proyectos'}` : (metrics?.os || 'Listo')}
+                        {srv.projectsCount != null
+                          ? `${srv.projectsCount} ${srv.projectsCount === 1 ? t('fleet.projectSingular') : t('fleet.projectPlural')}`
+                          : (metrics?.os || t('fleet.ready'))}
                       </span>
                       <div className="flex items-center gap-1.5 flex-wrap justify-end">
                         <button

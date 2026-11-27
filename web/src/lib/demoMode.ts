@@ -809,6 +809,63 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       ],
     });
   }
+  const attestMatch = pathname.match(/^\/api\/projects\/([^/]+)\/releases\/([^/]+)\/attest$/);
+  if (attestMatch && method === 'POST') {
+    const pid = decodeURIComponent(attestMatch[1]);
+    const rev = decodeURIComponent(attestMatch[2]);
+    const sha = '7a91e4c2b5d830f1a6e29c4b07d812fe5c3a90b1d4e6f7a8b9c0d1e2f3a4b5c6';
+    const statement = {
+      _type: 'https://in-toto.io/Statement/v1',
+      predicateType: 'https://slsa.dev/provenance/v1',
+      subject: [{ name: `${pid}@${rev}`, digest: { sha256: sha } }],
+      predicate: { buildDefinition: { buildType: 'https://culkibo.dev/smartpack/v1' } },
+    };
+    const envelope = {
+      payloadType: 'application/vnd.in-toto+json',
+      payload: btoa(JSON.stringify(statement)),
+      signatures: [{ keyid: 'ed25519-demo-key-01', sig: 'ZGVtb19lZDI1NTE5X2Rzc2Vfc2lnbmF0dXJl' }],
+    };
+    return jsonResponse({ projectId: pid, revision: rev, keyId: 'ed25519-demo-key-01', predicateType: 'https://slsa.dev/provenance/v1', subjectDigest: sha, statement, envelope, createdAt: nowIso() }, 201);
+  }
+  if (pathname === '/api/security/attestation/verify' && method === 'POST') {
+    return jsonResponse({
+      valid: true,
+      keyId: 'ed25519-demo-key-01',
+      predicateType: 'https://slsa.dev/provenance/v1',
+      subjectDigest: '7a91e4c2b5d830f1a6e29c4b07d812fe5c3a90b1d4e6f7a8b9c0d1e2f3a4b5c6',
+      reason: null,
+    });
+  }
+  const migPlanMatch = pathname.match(/^\/api\/projects\/([^/]+)\/migrations\/plan$/);
+  if (migPlanMatch && method === 'POST') {
+    const pid = decodeURIComponent(migPlanMatch[1]);
+    const cmd = String(body.command || 'npx prisma migrate deploy').trim();
+    const argv = cmd.split(/\s+/).filter(Boolean);
+    return jsonResponse({
+      command: cmd,
+      argv,
+      snapshotRequired: true,
+      lockKey: `migration-lease:${pid}`,
+      timeoutMs: 120000,
+      abortCutoverOnFailure: true,
+      shell: false,
+      dockerArgs: ['run', '--rm', '--label', 'culkibo.migration=1', `culkibo/${pid}:latest`, ...argv],
+    });
+  }
+  const wasmInvokeMatch = pathname.match(/^\/api\/projects\/([^/]+)\/wasm\/invoke$/);
+  if (wasmInvokeMatch && method === 'POST') {
+    const argVal = Number.isFinite(Number(body.arg)) ? Number(body.arg) : 200;
+    return jsonResponse({
+      ok: true,
+      status: 200,
+      headers: { 'x-culkibo-runtime': 'micro-wasm-worker', 'content-type': 'application/json' },
+      result: argVal * 2 + 1,
+      body: JSON.stringify({ ok: true, input: argVal, output: argVal * 2 + 1, sandbox: 'worker_threads' }),
+      execMs: 0.63,
+      memoryBytes: 65536,
+      engine: 'node-webassembly-isolated',
+    });
+  }
   if (pathname.match(/^\/api\/projects\/[^/]+\/sync\/status$/)) {
     return jsonResponse({
       projectId: pathname.split('/')[3],

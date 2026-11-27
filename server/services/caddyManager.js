@@ -644,8 +644,8 @@ class CaddyManager {
       return this.lastDetection;
     }
 
-    /** @type {{ available: boolean, adminUrl: string, version: string | null, reason: string | null }} */
-    let result = { available: false, adminUrl: effectiveAdminUrl, version: null, reason: null };
+    /** @type {{ available: boolean, adminUrl: string, version: string | null, code: string | null, reason: string | null, messageEn: string | null }} */
+    let result = { available: false, adminUrl: effectiveAdminUrl, version: null, code: null, reason: null, messageEn: null };
     try {
       const res = await this.adminRequest('GET', '/reverse_proxy/upstreams', {
         timeoutMs: 2000,
@@ -654,7 +654,7 @@ class CaddyManager {
         caddyAdminPort
       });
       if (res.ok) {
-        result = { available: true, adminUrl: effectiveAdminUrl, version: 'activo', reason: null };
+        result = { available: true, adminUrl: effectiveAdminUrl, version: 'activo', code: 'CADDY_ONLINE', reason: null, messageEn: null };
       } else {
         // Algunos Caddy recién arrancados sin server http responden 404 a /reverse_proxy/upstreams pero 200 a /config/
         const cfgRes = await this.adminRequest('GET', '/config/', {
@@ -664,13 +664,25 @@ class CaddyManager {
           caddyAdminPort
         });
         if (cfgRes.ok) {
-          result = { available: true, adminUrl: effectiveAdminUrl, version: 'activo', reason: null };
+          result = { available: true, adminUrl: effectiveAdminUrl, version: 'activo', code: 'CADDY_ONLINE', reason: null, messageEn: null };
         } else {
+          const isForbidden = cfgRes.status === 401 || cfgRes.status === 403;
+          result.code = isForbidden ? 'CADDY_ADMIN_FORBIDDEN' : 'CADDY_ADMIN_HTTP_ERROR';
           result.reason = `La API de administración respondió ${cfgRes.status}`;
+          result.messageEn = isForbidden
+            ? `Caddy Admin API denied access with HTTP ${cfgRes.status} at ${effectiveAdminUrl}`
+            : `Caddy Admin API returned HTTP ${cfgRes.status} at ${effectiveAdminUrl}`;
         }
       }
     } catch (err) {
+      /** @type {any} */
+      const e = err;
+      const isTimeout = Boolean(e && (e.name === 'AbortError' || e.code === 'ETIMEDOUT' || /timeout|aborted/i.test(String(e.message || ''))));
+      result.code = isTimeout ? 'CADDY_TIMEOUT' : 'CADDY_UNREACHABLE';
       result.reason = `No hay ninguna API de administración de Caddy en ${effectiveAdminUrl}`;
+      result.messageEn = isTimeout
+        ? `Caddy Admin API at ${effectiveAdminUrl} timed out`
+        : `No Caddy Admin API reachable at ${effectiveAdminUrl}`;
     }
 
     if (!isOverride) {

@@ -8,6 +8,7 @@ const { execFileSync } = require('child_process');
 
 const { parseCron, nextCronRun } = require('../server/services/cronParser');
 const Project = require('../server/models/Project');
+const { CaddyManager } = require('../server/services/caddyManager');
 const {
   EditionService,
   CORE_OSS_FEATURES,
@@ -398,6 +399,21 @@ function httpJson(port, method, reqPath, { token, cookie, body, headers = {} } =
 
     const logsExp = await httpJson(port, 'GET', '/api/observability/logs/export?format=ndjson', { token: ownerBoot.sessionToken });
     assert.strictEqual(logsExp.status, 200);
+
+    // 8b. Cycle-5 Playground Routes: Micro-Wasm smokeTest & empty SLSA attestation 200 { found: false }
+    const emptyAtt = await httpJson(port, 'GET', '/api/projects/proj_alpha_sec/releases/v0.0.0-none/attestation', { token: ownerBoot.sessionToken });
+    assert.strictEqual(emptyAtt.status, 200, 'Missing attestation should return clean 200 { found: false }: ' + emptyAtt.text);
+    assert.strictEqual(emptyAtt.json.found, false);
+    assert.strictEqual(emptyAtt.json.attestation, null);
+
+    const wasmSmoke = await httpJson(port, 'POST', '/api/projects/proj_alpha_sec/wasm/invoke', {
+      token: ownerBoot.sessionToken,
+      body: { smokeTest: true }
+    });
+    assert.strictEqual(wasmSmoke.status, 200, 'POST wasm/invoke { smokeTest: true } failed: ' + wasmSmoke.text);
+    assert.strictEqual(wasmSmoke.json.smokeTest, true);
+    assert.strictEqual(wasmSmoke.json.status, 200);
+    assert.strictEqual(typeof wasmSmoke.json.execMs, 'number');
     assert.ok(String(logsExp.headers['content-disposition'] || '').includes('attachment'));
     assert.ok(logsExp.text.includes('Alpha confidential startup log'));
     assert.ok(!logsExp.text.includes('Bravo startup log'), 'Scoped log export must never leak cross-team logs');
@@ -819,10 +835,98 @@ async function testEditionAndBola() {
   }
 
   // -------------------------------------------------------------------------
-  // 4. Real Express HTTP BOLA/IDOR Closure, Audit Actor, HttpOnly Cookies & Wave-2 Routes
+  // 4. Real Express HTTP BOLA/IDOR Closure, Audit Actor, HttpOnly Cookies & Wave-2/Cycle-5 Routes
   // -------------------------------------------------------------------------
   runIsolatedHttpBolaAndWave2Suite();
-  console.log('  ✓ 4. Real Express HTTP BOLA/IDOR (26 cross-team probes), HttpOnly cookies, audit actor, freeze/scanner & Wave-2 routes verified');
+  console.log('  ✓ 4. Real Express HTTP BOLA/IDOR (26 cross-team probes), HttpOnly cookies, audit actor, freeze/scanner, Wave-2 & Cycle-5 Wasm smokeTest verified');
+
+  // -------------------------------------------------------------------------
+  // 5. Cycle-5: Caddy Bilingual Diagnostics & Signed SLSA v1.1 Release Provenance CLI
+  // -------------------------------------------------------------------------
+  {
+    // 5a. caddyManager.detect() structured code & messageEn on offline / 403 Admin API
+    const caddyInst = new CaddyManager();
+    const detUnreach = await caddyInst.detect({ force: true, adminUrl: 'http://127.0.0.1:1' });
+    assert.strictEqual(detUnreach.available, false);
+    assert.strictEqual(detUnreach.code, 'CADDY_UNREACHABLE');
+    assert.ok(typeof detUnreach.messageEn === 'string' && detUnreach.messageEn.includes('Caddy Admin API'));
+    assert.ok(typeof detUnreach.reason === 'string' && detUnreach.reason.length > 0);
+
+    const srv403 = http.createServer((_req, res) => { res.writeHead(403); res.end('forbidden'); });
+    await new Promise((resolve) => srv403.listen(0, '127.0.0.1', () => resolve(undefined)));
+    try {
+      const addr403 = srv403.address();
+      const port403 = typeof addr403 === 'object' && addr403 ? addr403.port : 0;
+      const det403 = await caddyInst.detect({ force: true, adminUrl: `http://127.0.0.1:${port403}` });
+      assert.strictEqual(det403.available, false);
+      assert.strictEqual(det403.code, 'CADDY_ADMIN_FORBIDDEN');
+      assert.ok(typeof det403.messageEn === 'string' && det403.messageEn.includes('403'));
+    } finally {
+      await new Promise((resolve) => srv403.close(() => resolve(undefined)));
+    }
+
+    // 5b. scripts/release-provenance.js --sign --verify (Ed25519 DSSE + tamper rejection in os.tmpdir())
+    const provTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-rel-sign-'));
+    try {
+      const scriptPath = path.join(__dirname, '..', 'scripts', 'release-provenance.js');
+      const rawOut = execFileSync(process.execPath, [scriptPath, '--out-dir', provTmp, '--sign', '--verify', '--json'], {
+        cwd: path.resolve(__dirname, '..'),
+        encoding: 'utf8',
+        timeout: 20000
+      });
+      const parsed = JSON.parse(rawOut);
+      assert.strictEqual(parsed.ok, true);
+      assert.strictEqual(parsed.signed, true);
+      assert.ok(parsed.verification && parsed.verification.valid === true);
+      assert.ok(parsed.verification.slsa && parsed.verification.slsa.valid === true);
+      assert.ok(fs.existsSync(path.join(provTmp, 'release.slsa.dsse.json')));
+      assert.ok(fs.existsSync(path.join(provTmp, 'attestation-public-key.pem')));
+
+      // Tamper Ed25519 DSSE signature -> standalone --verify MUST fail (non-zero exit)
+      const dsseFile = path.join(provTmp, 'release.slsa.dsse.json');
+      const origDsse = fs.readFileSync(dsseFile, 'utf8');
+      const dsseObj = JSON.parse(origDsse);
+      const origSig = dsseObj.signatures[0].sig;
+      dsseObj.signatures[0].sig = (origSig.startsWith('A') ? 'B' : 'A') + origSig.slice(1);
+      fs.writeFileSync(dsseFile, JSON.stringify(dsseObj, null, 2), 'utf8');
+
+      let tamperFailed = false;
+      try {
+        execFileSync(process.execPath, [scriptPath, '--out-dir', provTmp, '--verify', '--json'], {
+          cwd: path.resolve(__dirname, '..'),
+          encoding: 'utf8',
+          timeout: 20000
+        });
+      } catch (e) {
+        tamperFailed = true;
+        const outJson = JSON.parse(String(e.stdout || '{}'));
+        assert.strictEqual(outJson.valid, false);
+        assert.strictEqual(outJson.slsa.valid, false);
+      }
+      assert.strictEqual(tamperFailed, true, 'Tampered release.slsa.dsse.json must fail --verify');
+
+      // Restore valid DSSE, tamper sbom.cdx.json -> signed subject digest check MUST fail
+      fs.writeFileSync(dsseFile, origDsse, 'utf8');
+      fs.appendFileSync(path.join(provTmp, 'sbom.cdx.json'), '\n ', 'utf8');
+      let sbomTamperFailed = false;
+      try {
+        execFileSync(process.execPath, [scriptPath, '--out-dir', provTmp, '--verify', '--json'], {
+          cwd: path.resolve(__dirname, '..'),
+          encoding: 'utf8',
+          timeout: 20000
+        });
+      } catch (e) {
+        sbomTamperFailed = true;
+        const outJson = JSON.parse(String(e.stdout || '{}'));
+        assert.strictEqual(outJson.valid, false);
+        assert.ok(outJson.slsa && outJson.slsa.subjectMismatches.length >= 1);
+      }
+      assert.strictEqual(sbomTamperFailed, true, 'Tampered sbom.cdx.json must fail SLSA subject digest verification');
+    } finally {
+      fs.rmSync(provTmp, { recursive: true, force: true });
+    }
+    console.log('  ✓ 5. Cycle-5: Caddy bilingual diagnostics (code + messageEn) & signed SLSA v1.1 release-provenance (--sign --verify + tamper proofs) verified');
+  }
 
   console.log('✅ All Edition, CronParser Anti-DoS, Project Secrets & BOLA/IDOR tests passed!\n');
 }

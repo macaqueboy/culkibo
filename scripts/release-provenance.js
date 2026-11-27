@@ -452,8 +452,219 @@ function atomicWriteTextSync(targetPath, content) {
 }
 
 /**
- * Genera y escribe `sbom.cdx.json`, `CHECKSUMS.sha256` y `provenance.json` en `outDir`.
- * @param {{ rootDir?: string, outDir?: string, timestamp?: string, files?: string[] }} [opts]
+ * Genera una atestación SLSA v1.1 firmada en formato DSSE Ed25519 sobre `CHECKSUMS.sha256` y `sbom.cdx.json`.
+ * Nunca escribe claves privadas en `data/` ni en `outDir` (usa `opts.privateKeyPem`, env o clave efímera Ed25519).
+ *
+ * @param {{
+ *   version: string,
+ *   checksumsSha256: string,
+ *   sbomSha256: string,
+ *   counts: Record<string, any>,
+ *   timestamp?: string,
+ *   privateKeyPem?: string | null,
+ *   publicKeyPem?: string | null,
+ *   builderId?: string | null
+ * }} params
+ */
+function signReleaseProvenance(params) {
+  const attestorMod = require('../server/services/supplyChainAttestor');
+  const { createStatementV1, dssePae, DSSE_PAYLOAD_TYPE } = attestorMod;
+
+  const envPriv = process.env.CULKIBO_ATTESTATION_PRIVATE_KEY_PEM || null;
+  const rawPriv = params.privateKeyPem || envPriv;
+  /** @type {string} */
+  let privateKeyPem;
+  /** @type {string} */
+  let publicKeyPem;
+
+  if (rawPriv && typeof rawPriv === 'string' && rawPriv.trim()) {
+    privateKeyPem = rawPriv.trim();
+    publicKeyPem = params.publicKeyPem
+      ? String(params.publicKeyPem).trim()
+      : String(crypto.createPublicKey(privateKeyPem).export({ type: 'spki', format: 'pem' }));
+  } else {
+    const pair = crypto.generateKeyPairSync('ed25519', {
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+    privateKeyPem = String(pair.privateKey);
+    publicKeyPem = String(pair.publicKey);
+  }
+
+  const keyId = `ed25519:${sha256Hex(publicKeyPem).slice(0, 16)}`;
+  const revision = `v${String(params.version || '1.2.0').replace(/^v/i, '')}`;
+  const statement = createStatementV1({
+    projectId: 'culkibo-release',
+    revision,
+    imageDigest: `sha256:${params.checksumsSha256}`,
+    builderId: params.builderId || 'https://culkibo.dev/builders/release-provenance@v1',
+    buildType: 'https://culkibo.dev/slsa/release-provenance/v1',
+    artifactName: 'CHECKSUMS.sha256',
+    startedOn: params.timestamp,
+    finishedOn: params.timestamp,
+    sbomSummary: {
+      bomFormat: 'CycloneDX',
+      specVersion: '1.6',
+      sha256: params.sbomSha256,
+      componentsCount: Number(params.counts?.sbomComponents) || 0,
+      rootRuntimeDeps: Number(params.counts?.rootDeps) || 0,
+      collectorRuntimeDeps: Number(params.counts?.collectorDeps) || 0,
+      checksumFiles: Number(params.counts?.checksumFiles) || 0
+    },
+    externalParameters: {
+      version: params.version,
+      artifacts: ['CHECKSUMS.sha256', 'sbom.cdx.json']
+    }
+  });
+
+  // Incluir ambos artefactos canónicos (`CHECKSUMS.sha256` y `sbom.cdx.json`) como subjects firmados
+  statement.subject = [
+    { name: 'CHECKSUMS.sha256', digest: { sha256: params.checksumsSha256 } },
+    { name: 'sbom.cdx.json', digest: { sha256: params.sbomSha256 } }
+  ];
+
+  const payloadBuf = Buffer.from(JSON.stringify(statement), 'utf8');
+  const pae = dssePae(DSSE_PAYLOAD_TYPE, payloadBuf);
+  const sigBuf = crypto.sign(null, pae, privateKeyPem);
+
+  const envelope = {
+    payloadType: DSSE_PAYLOAD_TYPE,
+    payload: payloadBuf.toString('base64'),
+    signatures: [
+      {
+        keyid: keyId,
+        sig: sigBuf.toString('base64')
+      }
+    ]
+  };
+
+  return {
+    slsaVersion: '1.1',
+    algorithm: 'Ed25519',
+    keyId,
+    publicKeyPem,
+    payloadSha256: sha256Hex(payloadBuf),
+    statement,
+    envelope
+  };
+}
+
+/**
+ * Verifica criptográficamente `release.slsa.dsse.json` con `attestation-public-key.pem` y comprueba
+ * que los digests `sha256` de los subjects coincidan exactamente con `CHECKSUMS.sha256` y `sbom.cdx.json` en disco.
+ *
+ * @param {string} outDir
+ * @param {{ publicKeyPem?: string | null }} [opts]
+ */
+function verifyReleaseAttestation(outDir, opts = {}) {
+  const dir = path.resolve(outDir);
+  const dssePath = path.join(dir, 'release.slsa.dsse.json');
+  const pubKeyPath = path.join(dir, 'attestation-public-key.pem');
+
+  if (!fs.existsSync(dssePath)) {
+    return { valid: false, present: false, reason: 'release.slsa.dsse.json no encontrado', dssePath };
+  }
+  const publicKeyPem = opts.publicKeyPem
+    ? String(opts.publicKeyPem)
+    : (fs.existsSync(pubKeyPath) ? fs.readFileSync(pubKeyPath, 'utf8') : null);
+  if (!publicKeyPem) {
+    return { valid: false, present: true, reason: 'attestation-public-key.pem no encontrado', dssePath };
+  }
+
+  /** @type {any} */
+  let envelope;
+  try {
+    envelope = JSON.parse(fs.readFileSync(dssePath, 'utf8'));
+  } catch (e) {
+    return { valid: false, present: true, reason: 'release.slsa.dsse.json contiene JSON inválido', dssePath };
+  }
+
+  const attestor = require('../server/services/supplyChainAttestor');
+  const sigCheck = attestor.verifyAttestation(envelope, publicKeyPem);
+  if (!sigCheck || !sigCheck.valid) {
+    return {
+      valid: false,
+      present: true,
+      reason: (sigCheck && sigCheck.reason) || 'Firma Ed25519 DSSE inválida',
+      dssePath,
+      verification: sigCheck
+    };
+  }
+
+  const subjects = Array.isArray(sigCheck.statement && sigCheck.statement.subject)
+    ? sigCheck.statement.subject
+    : [];
+  /** @type {Array<{ name: string, expected: string, actual: string | null }>} */
+  const subjectMismatches = [];
+  for (const subj of subjects) {
+    const name = String(subj && subj.name || '').trim();
+    const expected = String(subj && subj.digest && subj.digest.sha256 || '').toLowerCase();
+    if (!name || !expected || name.includes('..') || name.includes('/') || name.includes('\\')) continue;
+    const artifactPath = path.join(dir, name);
+    if (!fs.existsSync(artifactPath)) {
+      subjectMismatches.push({ name, expected, actual: null });
+      continue;
+    }
+    const actual = sha256Hex(fs.readFileSync(artifactPath));
+    if (actual !== expected) {
+      subjectMismatches.push({ name, expected, actual });
+    }
+  }
+
+  const valid = subjectMismatches.length === 0 && subjects.length > 0;
+  return {
+    valid,
+    present: true,
+    keyId: sigCheck.keyId || null,
+    algorithm: 'Ed25519',
+    predicateType: sigCheck.predicateType || null,
+    subjectsChecked: subjects.length,
+    subjectMismatches,
+    ...(valid ? {} : { reason: subjectMismatches.length > 0 ? 'Digest de artefacto no coincide con subject SLSA firmado' : 'Atestación sin subjects verificables' }),
+    dssePath
+  };
+}
+
+/**
+ * Verifica un bundle de release completo (o archivo `CHECKSUMS.sha256`):
+ *  - Comprueba `CHECKSUMS.sha256` contra `rootDir`.
+ *  - Si existe `release.slsa.dsse.json` (o `requireSignature: true`), verifica su firma Ed25519 DSSE y digests.
+ *
+ * @param {string} targetPath Directorio `dist-release` o ruta a `CHECKSUMS.sha256`
+ * @param {{ rootDir?: string, requireSignature?: boolean, publicKeyPem?: string | null }} [opts]
+ */
+function verifyReleaseBundle(targetPath, opts = {}) {
+  const resolved = path.resolve(targetPath);
+  const isDir = fs.existsSync(resolved) && fs.statSync(resolved).isDirectory();
+  const outDir = isDir ? resolved : path.dirname(resolved);
+  const checksumsPath = isDir ? path.join(outDir, 'CHECKSUMS.sha256') : resolved;
+
+  const checksums = verifyChecksums(checksumsPath, { rootDir: opts.rootDir });
+  const dssePath = path.join(outDir, 'release.slsa.dsse.json');
+  const hasDsse = fs.existsSync(dssePath);
+
+  /** @type {any} */
+  let slsa = null;
+  if (hasDsse || opts.requireSignature) {
+    slsa = verifyReleaseAttestation(outDir, { publicKeyPem: opts.publicKeyPem });
+  }
+
+  const valid = Boolean(checksums.valid && (!slsa || slsa.valid));
+  return {
+    valid,
+    checked: checksums.checked,
+    missing: checksums.missing,
+    mismatched: checksums.mismatched,
+    malformed: checksums.malformed,
+    checksums,
+    slsa
+  };
+}
+
+/**
+ * Genera y escribe `sbom.cdx.json`, `CHECKSUMS.sha256` y `provenance.json` en `outDir`
+ * (y opcionalmente `release.slsa.dsse.json` + `attestation-public-key.pem` con `sign: true`).
+ * @param {{ rootDir?: string, outDir?: string, timestamp?: string, files?: string[], sign?: boolean, privateKeyPem?: string | null, publicKeyPem?: string | null }} [opts]
  */
 function writeReleaseProvenance(opts = {}) {
   const rootDir = path.resolve(opts.rootDir || DEFAULT_ROOT_DIR);
@@ -479,6 +690,66 @@ function writeReleaseProvenance(opts = {}) {
     checksumFiles: checksums.count
   };
 
+  /** @type {any} */
+  const artifacts = {
+    sbom: { file: 'sbom.cdx.json', format: 'CycloneDX', specVersion: '1.6', sha256: sbomSha256 },
+    checksums: { file: 'CHECKSUMS.sha256', algorithm: 'sha256', filesCount: counts.checksumFiles, sha256: checksumsSha256 }
+  };
+
+  const sbomPath = path.join(outDir, 'sbom.cdx.json');
+  const checksumsPath = path.join(outDir, 'CHECKSUMS.sha256');
+  const provenancePath = path.join(outDir, 'provenance.json');
+
+  atomicWriteTextSync(sbomPath, sbomJson);
+  atomicWriteTextSync(checksumsPath, checksums.text);
+
+  /** @type {any} */
+  let slsaResult = null;
+  /** @type {Record<string, string>} */
+  const filesOut = {
+    sbom: sbomPath,
+    checksums: checksumsPath,
+    provenance: provenancePath
+  };
+  /** @type {Record<string, string>} */
+  const hashesOut = {
+    sbomSha256,
+    checksumsSha256
+  };
+
+  if (opts.sign) {
+    slsaResult = signReleaseProvenance({
+      version: sbom.metadata.component.version,
+      checksumsSha256,
+      sbomSha256,
+      counts,
+      timestamp,
+      privateKeyPem: opts.privateKeyPem,
+      publicKeyPem: opts.publicKeyPem
+    });
+    const dssePath = path.join(outDir, 'release.slsa.dsse.json');
+    const pubKeyPath = path.join(outDir, 'attestation-public-key.pem');
+    const dsseJson = JSON.stringify(slsaResult.envelope, null, 2) + '\n';
+    atomicWriteTextSync(dssePath, dsseJson);
+    atomicWriteTextSync(pubKeyPath, slsaResult.publicKeyPem.endsWith('\n') ? slsaResult.publicKeyPem : `${slsaResult.publicKeyPem}\n`);
+    filesOut.slsa = dssePath;
+    filesOut.publicKey = pubKeyPath;
+    hashesOut.slsaSha256 = sha256Hex(dsseJson);
+    artifacts.slsa = {
+      file: 'release.slsa.dsse.json',
+      format: 'DSSE+in-toto',
+      predicateType: 'https://slsa.dev/provenance/v1',
+      algorithm: 'Ed25519',
+      keyId: slsaResult.keyId,
+      sha256: hashesOut.slsaSha256
+    };
+    artifacts.publicKey = {
+      file: 'attestation-public-key.pem',
+      algorithm: 'Ed25519',
+      keyId: slsaResult.keyId
+    };
+  }
+
   const provenance = {
     schema: 'culkibo-release-provenance/v1',
     name: sbom.metadata.component.name,
@@ -496,50 +767,45 @@ function writeReleaseProvenance(opts = {}) {
       webRuntimeDeps: counts.webDeps,
       shellExecutionPolicy: 'shell:false'
     },
-    artifacts: {
-      sbom: { file: 'sbom.cdx.json', format: 'CycloneDX', specVersion: '1.6', sha256: sbomSha256 },
-      checksums: { file: 'CHECKSUMS.sha256', algorithm: 'sha256', filesCount: counts.checksumFiles, sha256: checksumsSha256 }
-    }
+    artifacts
   };
 
-  const sbomPath = path.join(outDir, 'sbom.cdx.json');
-  const checksumsPath = path.join(outDir, 'CHECKSUMS.sha256');
-  const provenancePath = path.join(outDir, 'provenance.json');
-
-  atomicWriteTextSync(sbomPath, sbomJson);
-  atomicWriteTextSync(checksumsPath, checksums.text);
   atomicWriteTextSync(provenancePath, JSON.stringify(provenance, null, 2) + '\n');
 
   return {
     ok: true,
     version: provenance.version,
     outDir,
-    files: {
-      sbom: sbomPath,
-      checksums: checksumsPath,
-      provenance: provenancePath
-    },
+    signed: Boolean(slsaResult),
+    files: filesOut,
     counts,
-    hashes: {
-      sbomSha256,
-      checksumsSha256
-    },
+    hashes: hashesOut,
     sbom,
-    provenance
+    provenance,
+    ...(slsaResult ? { slsa: { keyId: slsaResult.keyId, algorithm: slsaResult.algorithm, payloadSha256: slsaResult.payloadSha256, envelope: slsaResult.envelope } } : {})
   };
 }
 
 /** @param {string[]} argv */
 function parseCliArgs(argv) {
-  /** @type {{ outDir?: string, json: boolean, stdoutSbom: boolean, verify?: string }} */
-  const out = { json: false, stdoutSbom: false };
+  /** @type {{ outDir?: string, rootDir?: string, json: boolean, stdoutSbom: boolean, sign: boolean, verify?: string | boolean }} */
+  const out = { json: false, stdoutSbom: false, sign: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') out.json = true;
     else if (a === '--stdout-sbom') out.stdoutSbom = true;
+    else if (a === '--sign') out.sign = true;
     else if (a === '--out-dir' && argv[i + 1]) { out.outDir = argv[++i]; }
     else if (a.startsWith('--out-dir=')) { out.outDir = a.slice('--out-dir='.length); }
-    else if (a === '--verify' && argv[i + 1]) { out.verify = argv[++i]; }
+    else if (a === '--root-dir' && argv[i + 1]) { out.rootDir = argv[++i]; }
+    else if (a.startsWith('--root-dir=')) { out.rootDir = a.slice('--root-dir='.length); }
+    else if (a === '--verify') {
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) {
+        out.verify = argv[++i];
+      } else {
+        out.verify = true;
+      }
+    }
     else if (a.startsWith('--verify=')) { out.verify = a.slice('--verify='.length); }
   }
   return out;
@@ -547,31 +813,57 @@ function parseCliArgs(argv) {
 
 if (require.main === module) {
   const args = parseCliArgs(process.argv.slice(2));
-  if (args.verify) {
-    const res = verifyChecksums(args.verify);
-    if (args.json) console.log(JSON.stringify(res, null, 2));
-    else console.log(res.valid ? `OK: ${res.checked} files verified.` : `FAILED: missing=${res.missing.length} mismatched=${res.mismatched.length} malformed=${res.malformed.length}`);
-    process.exit(res.valid ? 0 : 1);
-  }
   if (args.stdoutSbom) {
-    console.log(JSON.stringify(generateCycloneDxSbom(), null, 2));
+    console.log(JSON.stringify(generateCycloneDxSbom({ rootDir: args.rootDir }), null, 2));
     process.exit(0);
   }
-  const result = writeReleaseProvenance({ outDir: args.outDir });
+  if (args.verify && !args.sign) {
+    const target = typeof args.verify === 'string'
+      ? args.verify
+      : (args.outDir || path.join(DEFAULT_ROOT_DIR, 'dist-release'));
+    const res = verifyReleaseBundle(target, { rootDir: args.rootDir });
+    if (args.json) console.log(JSON.stringify(res, null, 2));
+    else {
+      const slsaTag = res.slsa ? ` | SLSA Ed25519: ${res.slsa.valid ? 'VALID' : `INVALID (${res.slsa.reason || 'failed'})`}` : '';
+      console.log(res.valid
+        ? `OK: ${res.checked} files verified${slsaTag}.`
+        : `FAILED: missing=${res.missing.length} mismatched=${res.mismatched.length} malformed=${res.malformed.length}${slsaTag}`);
+    }
+    process.exit(res.valid ? 0 : 1);
+  }
+  const result = writeReleaseProvenance({ rootDir: args.rootDir, outDir: args.outDir, sign: args.sign });
+  /** @type {any} */
+  let verification = null;
+  if (args.verify) {
+    verification = verifyReleaseBundle(result.outDir, { rootDir: args.rootDir, requireSignature: args.sign });
+  }
   if (args.json) {
     console.log(JSON.stringify({
-      ok: result.ok,
+      ok: Boolean(result.ok && (!verification || verification.valid)),
       version: result.version,
       outDir: result.outDir,
+      signed: result.signed,
       files: result.files,
       counts: result.counts,
-      hashes: result.hashes
+      hashes: result.hashes,
+      ...(result.slsa ? { slsa: { keyId: result.slsa.keyId, algorithm: result.slsa.algorithm, payloadSha256: result.slsa.payloadSha256 } } : {}),
+      ...(verification ? { verification } : {})
     }, null, 2));
   } else {
     console.log(`Culkibo v${result.version} release provenance generated in ${result.outDir}`);
     console.log(`  - sbom.cdx.json   (${result.counts.sbomComponents} components, ROOT_DEPS=${result.counts.rootDeps}, COLLECTOR_DEPS=${result.counts.collectorDeps})`);
     console.log(`  - CHECKSUMS.sha256 (${result.counts.checksumFiles} files, sha256:${result.hashes.checksumsSha256.slice(0, 16)}...)`);
     console.log(`  - provenance.json`);
+    if (result.signed && result.slsa) {
+      console.log(`  - release.slsa.dsse.json (Ed25519 keyId=${result.slsa.keyId})`);
+      console.log(`  - attestation-public-key.pem`);
+    }
+    if (verification) {
+      console.log(`  - verify: ${verification.valid ? 'PASS' : 'FAILED'}`);
+    }
+  }
+  if (verification && !verification.valid) {
+    process.exit(1);
   }
 }
 
@@ -579,6 +871,9 @@ module.exports = {
   generateCycloneDxSbom,
   generateChecksums,
   verifyChecksums,
+  signReleaseProvenance,
+  verifyReleaseAttestation,
+  verifyReleaseBundle,
   writeReleaseProvenance,
   buildNpmPurl,
   parseIntegrityToCdxHashes

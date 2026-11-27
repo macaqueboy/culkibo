@@ -4131,6 +4131,65 @@ export const api = {
       'Could not flush OTLP spans'
     );
   },
+
+  // --- Cycle-5 Cockpit Helpers (SLSA v1.1 DSSE, Atomic DB Migrations, Micro-Wasm) ---
+
+  async attestProjectRelease(
+    projectId: string,
+    rev: string,
+    payload: { imageDigest?: string; commitSha?: string; builderId?: string } = {}
+  ): Promise<ReleaseAttestationResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/releases/${encodeURIComponent(rev)}/attest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not sign SLSA v1.1 release attestation'
+    );
+  },
+
+  async verifyReleaseAttestation(
+    envelope: Record<string, unknown>,
+    publicKeyPem?: string
+  ): Promise<AttestationVerifyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/attestation/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(publicKeyPem ? { envelope, publicKeyPem } : { envelope }),
+      }),
+      'Could not verify SLSA v1.1 attestation'
+    );
+  },
+
+  async planProjectMigration(
+    projectId: string,
+    command: string
+  ): Promise<MigrationPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/migrations/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command }),
+      }),
+      'Could not plan atomic DB migration'
+    );
+  },
+
+  async invokeProjectWasm(
+    projectId: string,
+    opts: { smokeTest?: boolean; wasmPath?: string; arg?: number; timeoutMs?: number } = { smokeTest: true }
+  ): Promise<WasmInvokeResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/wasm/invoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      }),
+      'Could not invoke Micro-Wasm handler'
+    );
+  },
 };
 
 // =====================================================================
@@ -4567,4 +4626,52 @@ export interface OtlpStatusResult {
   lastError?: string | null;
   headersRedacted?: Record<string, string>;
   hasAuthHeader?: boolean;
+}
+
+export interface ReleaseAttestationResult {
+  projectId: string;
+  revision: string;
+  keyId?: string;
+  predicateType?: string;
+  subjectDigest?: string;
+  envelope: Record<string, unknown>;
+  statement?: {
+    predicateType?: string;
+    subject?: Array<{ name?: string; digest?: { sha256?: string } }>;
+  };
+  createdAt?: string;
+}
+
+export interface AttestationVerifyResult {
+  valid: boolean;
+  keyId?: string;
+  predicateType?: string;
+  subjectDigest?: string;
+  statement?: {
+    predicateType?: string;
+    subject?: Array<{ name?: string; digest?: { sha256?: string } }>;
+  };
+  reason?: string | null;
+}
+
+export interface MigrationPlanResult {
+  command: string;
+  argv: string[];
+  snapshotRequired: boolean;
+  lockKey: string;
+  timeoutMs: number;
+  abortCutoverOnFailure: boolean;
+  dockerArgs?: string[];
+  shell?: boolean;
+}
+
+export interface WasmInvokeResult {
+  ok?: boolean;
+  status: number;
+  headers?: Record<string, string>;
+  body?: string;
+  result?: number | string;
+  execMs: number;
+  memoryBytes?: number;
+  engine?: string;
 }

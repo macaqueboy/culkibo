@@ -738,7 +738,16 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   className="text-slate-600 mt-0.5 max-w-2xl leading-relaxed"
                   style={isDark && (!ingress.available || !ingress.inSync) ? { color: '#fde68a' } : undefined}
                 >
-                  {ingress.message}
+                  {(() => {
+                    const ingAny = ingress as IngressStatus & { messageEn?: string; code?: string };
+                    if (locale === 'en') {
+                      if (ingAny.messageEn) return ingAny.messageEn;
+                      if (ingAny.code === 'CADDY_ADMIN_FORBIDDEN') return t('domains.caddyAdminForbiddenEn');
+                      if (!ingress.available) return t('domains.caddyOfflineEn');
+                      return ingress.inSync ? t('domains.caddySyncedEn') : t('domains.caddyDriftEn');
+                    }
+                    return ingress.message;
+                  })()}
                 </p>
                 {ingress.available && (
                   <p className="text-slate-500 mt-1 tabular-nums">

@@ -40,8 +40,19 @@ import {
   FileCode2,
   ChevronDown,
   ChevronUp,
+  ShieldCheck,
+  Terminal,
+  Cpu as CpuIcon,
 } from 'lucide-react';
-import { api, type Project, type SmartPackPlanResult } from '../lib/api';
+import {
+  api,
+  type Project,
+  type SmartPackPlanResult,
+  type ReleaseAttestationResult,
+  type AttestationVerifyResult,
+  type MigrationPlanResult,
+  type WasmInvokeResult,
+} from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -145,6 +156,23 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [smartPackShowIgnore, setSmartPackShowIgnore] = useState(false);
   const [smartPackShowDockerfile, setSmartPackShowDockerfile] = useState(false);
   const [smartPackCopied, setSmartPackCopied] = useState<'ignore' | 'dockerfile' | null>(null);
+
+  // Cycle-5 Cockpit Panels (SLSA v1.1 Provenance, Atomic DB Migrations, Micro-Wasm)
+  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | null>(null);
+  const [slsaAttest, setSlsaAttest] = useState<ReleaseAttestationResult | null>(null);
+  const [slsaVerify, setSlsaVerify] = useState<AttestationVerifyResult | null>(null);
+  const [slsaLoading, setSlsaLoading] = useState(false);
+  const [slsaError, setSlsaError] = useState<string | null>(null);
+  const [slsaCopied, setSlsaCopied] = useState(false);
+
+  const [migCommand, setMigCommand] = useState('npx prisma migrate deploy');
+  const [migPlan, setMigPlan] = useState<MigrationPlanResult | null>(null);
+  const [migLoading, setMigLoading] = useState(false);
+  const [migError, setMigError] = useState<string | null>(null);
+
+  const [wasmResult, setWasmResult] = useState<WasmInvokeResult | null>(null);
+  const [wasmLoading, setWasmLoading] = useState(false);
+  const [wasmError, setWasmError] = useState<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTabState] = useState<ProjectTabId>(() => normalizeProjectTab(initialTab));
@@ -574,6 +602,56 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
   };
 
+  const handleSignAndVerifySlsa = async () => {
+    setSlsaLoading(true);
+    setSlsaError(null);
+    try {
+      const rev = project.lastDeployedAt ? `rev-${Date.parse(project.lastDeployedAt).toString(36)}` : 'rev-current';
+      const att = await api.attestProjectRelease(project.id, rev, {
+        builderId: 'https://culkibo.dev/smartpack/v1',
+      });
+      setSlsaAttest(att);
+      const ver = await api.verifyReleaseAttestation(att.envelope);
+      setSlsaVerify(ver);
+    } catch (e: unknown) {
+      setSlsaError(e instanceof Error ? e.message : 'SLSA attestation unavailable');
+    } finally {
+      setSlsaLoading(false);
+    }
+  };
+
+  const handlePlanMigration = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!migCommand.trim()) return;
+    setMigLoading(true);
+    setMigError(null);
+    try {
+      const plan = await api.planProjectMigration(project.id, migCommand.trim());
+      setMigPlan(plan);
+    } catch (e: unknown) {
+      setMigError(e instanceof Error ? e.message : 'Migration plan error');
+    } finally {
+      setMigLoading(false);
+    }
+  };
+
+  const handleTestWasm = async () => {
+    setWasmLoading(true);
+    setWasmError(null);
+    try {
+      const res = await api.invokeProjectWasm(project.id, { smokeTest: true, arg: 200 });
+      setWasmResult(res);
+    } catch (e: unknown) {
+      setWasmError(e instanceof Error ? e.message : 'Micro-Wasm invocation error');
+    } finally {
+      setWasmLoading(false);
+    }
+  };
+
+  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm') => {
+    setActiveCockpit((prev) => (prev === panel ? null : panel));
+  };
+
   const tabGroups: Array<{
     group: string;
     items: Array<{ id: ProjectTabId; label: string; icon: React.ComponentType<{ className?: string }>; count?: number }>;
@@ -741,6 +819,45 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           >
             <Layers className="w-3.5 h-3.5" />
             <span>{t('pd.smartpackBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('slsa')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'slsa'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <ShieldCheck className="w-3.5 h-3.5" />
+            <span>{t('pd.slsaBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('migration')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'migration'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Database className="w-3.5 h-3.5" />
+            <span>{t('pd.migBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('wasm')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'wasm'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <CpuIcon className="w-3.5 h-3.5" />
+            <span>{t('pd.wasmBtn')}</span>
           </button>
 
           {project.localRunning ? (
@@ -1061,6 +1178,205 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               </div>
             );
           })()}
+        </section>
+      )}
+
+      {/* Cycle-5 Cockpit Drawer: SLSA v1.1 Provenance / Atomic DB Migration / Micro-Wasm */}
+      {activeCockpit === 'slsa' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-3.5 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.slsaTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.slsaDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={slsaLoading}
+                onClick={() => void handleSignAndVerifySlsa()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {slsaLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                <span>{slsaLoading ? t('pd.slsaRunning') : t('pd.slsaRun')}</span>
+              </button>
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close SLSA panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {slsaError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{slsaError}</div>}
+
+          {slsaAttest && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-semibold border ${
+                  slsaVerify?.valid
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-red-50 text-red-700 border-red-200'
+                }`}>
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>{slsaVerify?.valid ? t('pd.slsaValid') : t('pd.slsaInvalid')}</span>
+                </span>
+                <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
+                  {slsaVerify?.predicateType || slsaAttest.predicateType || 'https://slsa.dev/provenance/v1'}
+                </span>
+                {(slsaVerify?.subjectDigest || slsaAttest.subjectDigest || slsaAttest.statement?.subject?.[0]?.digest?.sha256) && (
+                  <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600 tabular-nums">
+                    sha256:{String(slsaVerify?.subjectDigest || slsaAttest.subjectDigest || slsaAttest.statement?.subject?.[0]?.digest?.sha256).slice(0, 16)}…
+                  </span>
+                )}
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-950 text-slate-100 border border-slate-800 flex items-center justify-between gap-2 flex-wrap">
+                <code className="font-mono text-[11px] text-emerald-300 inline-flex items-center gap-1.5 break-all">
+                  <Terminal className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                  culkibo verify --json
+                </code>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const ok = await copyToClipboard('culkibo verify --json');
+                    if (!ok) return;
+                    setSlsaCopied(true);
+                    window.setTimeout(() => setSlsaCopied(false), 1600);
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 text-[11px] font-medium cursor-pointer"
+                >
+                  {slsaCopied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                  <span>{t('pd.slsaCopyCli')}</span>
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      {activeCockpit === 'migration' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-3.5 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <Database className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.migTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.migDesc')}</p>
+              </div>
+            </div>
+            <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Migration panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer self-start">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <form onSubmit={(e) => void handlePlanMigration(e)} className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-end">
+            <label className="flex-1 block">
+              <span className="font-medium text-slate-700 block mb-1">{t('pd.migCmdLabel')}</span>
+              <input
+                type="text"
+                value={migCommand}
+                onChange={(e) => setMigCommand(e.target.value)}
+                placeholder="npx prisma migrate deploy"
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={migLoading || !migCommand.trim()}
+              className="culkibo-press inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50 shrink-0"
+            >
+              {migLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Database className="w-3.5 h-3.5" />}
+              <span>{migLoading ? t('pd.migRunning') : t('pd.migRun')}</span>
+            </button>
+          </form>
+
+          {migError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{migError}</div>}
+
+          {migPlan && (
+            <div className="space-y-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 tabular-nums">
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <span className="text-[10px] uppercase text-slate-400 font-semibold block">Lease Lock</span>
+                  <span className="font-mono font-semibold text-slate-900 truncate block mt-0.5">{migPlan.lockKey}</span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <span className="text-[10px] uppercase text-slate-400 font-semibold block">Pre-Snapshot</span>
+                  <span className="font-mono font-semibold text-emerald-700 block mt-0.5">{migPlan.snapshotRequired ? 'required (safe)' : 'optional'}</span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <span className="text-[10px] uppercase text-slate-400 font-semibold block">Cutover Guard</span>
+                  <span className="font-mono font-semibold text-slate-900 block mt-0.5">abortOnFail: {String(migPlan.abortCutoverOnFailure)}</span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  <span className="text-[10px] uppercase text-slate-400 font-semibold block">Timeout</span>
+                  <span className="font-mono font-semibold text-slate-900 block mt-0.5">{Math.round((migPlan.timeoutMs || 120000) / 1000)}s · shell:false</span>
+                </div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-950 text-emerald-300 font-mono text-[11px] border border-slate-800 break-all">
+                argv: {JSON.stringify(migPlan.argv)}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      {activeCockpit === 'wasm' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-3.5 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <CpuIcon className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.wasmTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.wasmDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={wasmLoading}
+                onClick={() => void handleTestWasm()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {wasmLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                <span>{wasmLoading ? t('pd.wasmRunning') : t('pd.wasmRun')}</span>
+              </button>
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Micro-Wasm panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {wasmError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{wasmError}</div>}
+
+          {wasmResult && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 tabular-nums">
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <span className="text-[10px] uppercase text-slate-400 font-semibold block">Execution Time</span>
+                <span className="font-mono text-base font-semibold text-emerald-700 block mt-0.5">
+                  {typeof wasmResult.execMs === 'number' ? `${wasmResult.execMs.toFixed(2)} ms` : '—'}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <span className="text-[10px] uppercase text-slate-400 font-semibold block">Linear Memory</span>
+                <span className="font-mono text-base font-semibold text-slate-900 block mt-0.5">
+                  {wasmResult.memoryBytes != null ? `${Math.round(wasmResult.memoryBytes / 1024)} KiB` : '64 KiB'}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <span className="text-[10px] uppercase text-slate-400 font-semibold block">Compute Output</span>
+                <span className="font-mono text-sm font-semibold text-slate-900 block mt-0.5 truncate" title={String(wasmResult.result ?? wasmResult.body ?? '')}>
+                  HTTP {wasmResult.status} · {wasmResult.result !== undefined ? `result=${wasmResult.result}` : (wasmResult.body || 'OK')}
+                </span>
+              </div>
+            </div>
+          )}
         </section>
       )}
 

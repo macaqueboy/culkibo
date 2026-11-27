@@ -381,3 +381,79 @@
    - Return structured English/bilingual `code` + locale-friendly messages for `caddyManager` offline diagnostics and localize remaining `FleetView.tsx` card sublabels (`Load:`, `Free:`, `Disk`) for 100.0% linguistic consistency under `?lang=en`.
 5. **External Real-Client MCP Compatibility Matrix & Community Launch Execution**
    - Smoke-test `culkibo agent-init` + `io.modelcontextprotocol/tasks` + `ui://culkibo/*` MCP Apps inside live Claude Code, Antigravity, Cursor, Windsurf, and Codex CLI binaries, and execute the staggered Day-0 Show HN / `r/selfhosted` / Product Hunt / X launch from `docs/GITHUB_SEO_LAUNCH_KIT.md`.
+
+---
+
+## Cycle #5 (`v1.2.0` Release Polish) — Signed SLSA v1.1 Releases, Interactive Project Cockpit, Bilingual Edge Diagnostics & Day-0 `gh` Launch Runbook
+
+- **Timestamp (UTC):** `2026-11-27T10:24:08Z` (`2026-11-27 11:24 CET`)
+- **Host / Runtime:** `Node.js v24.14.0` · `win32/x64` (8 vCPUs) · Docker Desktop & Caddy offline on host (automated in `.github/workflows/ci.yml`)
+- **Commit Baseline:** `171ac88` (`feat(cycle-4): OTLP/HTTP hex exporter, SLSA v1.1 Ed25519 DSSE, MCP 2026 Tasks+Elicitation (113 tools), Atomic DB Migrations, <1ms Micro-Wasm, 6 Wave-3 CVE guards & ?demo=1 Browser Sandbox`)
+- **Final Verification Verdict:** **100% GREEN ON FIRST PASS** (`39/39` suites in `35.62s` + live-server + WS stress + HTTP stress `p99 28.43ms` + telemetry collector + root/web `tsc` 0 errors + `oxlint` 0 warnings/0 errors across 40 files + `web:build` `827ms` + `scripts/release-provenance.js --sign --verify --json` 5 signed files `valid: true` + `shell-safety` + `bench/run-all.bench.js` **`132.4 ms` boot / `50 MB RSS` / `9,693 req/s` auth / `1.32 ms` Live Sync** + isolated `:3039` APIs + Sandbox & Standard EN Playwright QA with 0 console/page/HTTP errors & 0px overflow)
+
+---
+
+### 1. Exact Changes Landed by Worker
+
+| Worker | Scope & Key Deliverables |
+| :--- | :--- |
+| **`core-pioneer`** (`#183`) | Extended `server/services/caddyManager.js` `detect()` with structured bilingual diagnostics (`code`: `CADDY_ONLINE`, `CADDY_UNREACHABLE`, `CADDY_TIMEOUT`, `CADDY_ADMIN_FORBIDDEN`, `CADDY_ADMIN_HTTP_ERROR` + clean English `messageEn` alongside backwards-compatible `reason`); upgraded **`scripts/release-provenance.js`** with `--sign` & `--verify` emitting Ed25519-signed **`release.slsa.dsse.json`** (covering both `CHECKSUMS.sha256` & `sbom.cdx.json`) + **`attestation-public-key.pem`** with zero private keys written to `data/` or `outDir`; polished `POST /api/projects/:id/wasm/invoke` (`{ smokeTest: true }` 1-click playground) & `GET /api/projects/:id/releases/:rev/attestation` (`200 { found: false }`) in `server/routes/api.js`; expanded `tests/edition-and-bola.test.js` with Ed25519 & subject-digest tamper rejection tests. |
+| **`ux-designer`** (`#182`) | Wired 3 collapsible **Cycle-4 Pioneer Cockpit** panels alongside SmartPack Plan in `web/src/components/ProjectDetail.tsx` (+ `api.ts` & `demoMode.ts` mock handlers): **SLSA v1.1 Ed25519 Provenance** (`Sign & Verify SLSA`), **Atomic DB Migration Pre-Flight** (`Migration Plan`), and **Micro-Wasm `<1 ms` Edge Tester** (`Test Micro-Wasm`, live verified showing `0.63 ms` / `64 KiB` / `HTTP 200 · result=401`); completed 100.0% EN localization of `FleetView.tsx` (`Load:`, `Free:`, `Disk`, `control plane`) and `DomainManager.tsx` (clean English `messageEn` / `code` mapping on the dark-mode amber Caddy offline banner); `0` new deps, `0` oxlint warnings. |
+| **`seo-launch`** (`#181`) | Upgraded **`.github/workflows/release.yml`** to run `scripts/release-provenance.js --out-dir dist-release --sign --verify --json`, validate and attach all **5 signed provenance artifacts** (`sbom.cdx.json`, `CHECKSUMS.sha256`, `provenance.json`, `release.slsa.dsse.json`, `attestation-public-key.pem`) to every `v*` GitHub Release; synced `README.md` (`100/100` lint, `101/101` valid links) to `50 MB RSS`, `0.636 ms` Micro-Wasm, `-81.8%` core, and Project Cockpit controls; added copy-paste **5-Minute Day-0 `gh` CLI Launch Runbook** to `docs/GITHUB_SEO_LAUNCH_KIT.md`. |
+| **`qa-verifier`** (this log) | Independently verified all 39 suites, 5-artifact signed SLSA provenance, new record Cycle-5 benchmarks (`9,693 req/s` auth fast-path, `132.4 ms` boot, `50 MB RSS`, `0.562 ms` WASM smoke), isolated `:3039` APIs, and Sandbox + Standard EN Playwright screenshots. |
+
+---
+
+### 2. Independently Verified Quality Gates (Cycle #5 — `v1.2.0` Release Candidate)
+
+| Check | Command | Measured Result | Status |
+| :--- | :--- | :--- | :---: |
+| **Version, Deps & Workflows** | `package.json`, `.github/workflows/*` | `VERSION=1.2.0`, `ROOT_DEPS=6`, `COLLECTOR_DEPS=0`, `webDeps=3`; `ci.yml` + `release.yml` + `demo-pages.yml`; `data/` clean | PASS |
+| **Static, Lint & Build** | `typecheck`, `web tsc`, `oxlint`, `web:build` | `0` TS errors, **0 warnings / 0 errors** across 40 files (`555ms`), Vite build **`827 ms`** | PASS |
+| **Signed SLSA v1.1 Provenance** | `node scripts/release-provenance.js --out-dir <tmpdir> --sign --verify --json` | **`valid: true`**, `Ed25519`, 5 artifacts emitted (`sbom.cdx.json` 93 components, `CHECKSUMS.sha256` 68 files, `provenance.json`, `release.slsa.dsse.json` 2 signed subjects, `attestation-public-key.pem`) | PASS |
+| **Shell-Safety & 39 Suites** | `shell-safety.test.js` + `tests/run-all.js` | `0` unauthorized shell calls; **39 passed, 0 failed** in **`35.62s`** | PASS |
+| **Live Server / WS / HTTP Stress / Collector** | `live-server`, `websocket-stress`, `stress`, `collector.test.js` | ALL PASS (`v1.2.0`, `113` tools, `30/30` WS, `100/100` HTTP avg `19.07ms` / p99 **`28.43ms`**, collector `2/2`) | PASS |
+| **Isolated `:3039` APIs & Playwright QA** | Fresh `CULKIBO_DATA_DIR` + Sandbox (`/?demo=1&lang=en&theme=dark`) + Standard (`#/domains`, `#/fleet`) | `POST /wasm/invoke {smokeTest:true}` `200` (**`0.562 ms`**, `result: 43`); `GET /releases/rev-none/attestation` `200` (`{ found: false }`); Playwright **0 console/page/HTTP errors, 0px overflow**, Project Cockpit Micro-Wasm (`0.63 ms` / `64 KiB` / `HTTP 200 · result=401`), Fleet (`Load:`/`Free:`/`Disk`/`Local Server (Primary)` — 0 Spanish leaks), Domains EN Caddy banner (`Caddy reverse proxy is not reachable right now...` — 0 Spanish leaks); `PORT_3039_LISTENERS=0` | PASS |
+
+---
+
+### 3. Record Cycle #5 Live Benchmarks (`node bench/run-all.bench.js` — Unadjusted)
+
+| Metric | Cycle #1 | Cycle #4 | Cycle #5 (Final `v1.2.0`) | Cycle #1 → #5 Gain |
+| :--- | :--- | :--- | :--- | :--- |
+| **Cold Boot (`CULKIBO_SKIP_RECONCILE=1`)** | 462.9 ms | 200.9 ms | **132.4 ms** | **-71.4% (3.5x faster)** |
+| **Idle Daemon RAM (Node RSS)** | 56 MB RSS | 50 MB RSS | **50 MB RSS** (~68 MB +Caddy, **0% CPU**) | **-6 MB** (`<=60 MB` invariant) |
+| **Auth Fast-Path (`Bearer`+`br`, 500 req / 25w)** | 3,235 req/s | 6,513 req/s | **9,693 req/s** (`p50 2.31 ms` · `p99 3.91 ms`) | **+200% req/s** (`cp;dur=0.02`) |
+| **Health HTTP (`GET /api/health`, 500 req / 25w)** | 2,181 req/s | 5,431 req/s | **7,951 req/s** (`p50 2.68 ms` · `p99 8.49 ms`) | **+265% req/s** |
+| **Mixed Uncompressed / RBAC HTTP (500 req / 25w)** | 625 / 923 req/s | 1,633 / 1,918 req/s | **3,566 / 2,275 req/s** (`p50 6.06 / 10.34 ms`) | **+471% / +146% req/s** |
+| **Catalog Load (`GET /api/catalog`, 140 apps)** | warm 1.05 ms | warm 0.78 ms | **warm p50 0.68 ms** (`-73.4%` br) | Sub-millisecond zero-copy |
+| **Live Sync 2.0 (Path B + Rollback)** | 3.99 / 24.94 ms | 2.01 / 12.83 ms | **1.32 ms apply · 7.85 ms E2E · 1.91 ms rollback** | **Sub-8ms E2E**, Brotli `-96.1%` |
+| **WebSocket Fan-Out (40 clients)** | 552.4 ms | 85.6 ms | **51.9 ms** | **10.6x faster** |
+| **Micro-Wasm Edge Runtime (Live HTTP Smoke)** | — | 0.636 ms | **0.562 ms** (`{ smokeTest: true }`) | Sub-millisecond isolated Wasm |
+| **MCP `2026-07-28` & Supply-Chain Budget** | 109 tools · 33 suites | 113 tools · 39 suites | **113 tools · 3 Apps · Tasks (`-81.8%`) · 39 suites (`35.62s`) · `ROOT_DEPS=6`** | Signed SLSA v1.1 + CycloneDX 1.6 |
+
+---
+
+### 4. Honest Launch Readiness Score: **99.0 / 100** *(98.98%, +0.33 vs Cycle #4's 98.65% · +8.6 vs Cycle #1's 90.4% — Push-Button `v1.2.0` Global Launch Ready)*
+
+| # | Pillar | Weight | Cycle #4 | Cycle #5 | Weighted | Verified Gains & Honest Remaining Deductions |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| 1 | **Speed & Architecture** | 15% | 99.0 | **99.0 / 100** | `14.850` | **Verified:** `132.4 ms` boot, `50 MB RSS`, `9,693 req/s` authed fast-path, `1.32 ms` apply / `7.85 ms` E2E Live Sync, `0.562 ms` Wasm. **Gap (-1.0):** Live Linux Caddy v2.11 route swap awaits first GitHub Actions run. |
+| 2 | **Security & RBAC** | 15% | 99.0 | **99.5 / 100** | `14.925` | **Gains:** Cryptographically signed `release.slsa.dsse.json` + `attestation-public-key.pem` integrated into `release-provenance.js --sign --verify` & `release.yml`. **Gap (-0.5):** External third-party pentest before enterprise GA. |
+| 3 | **Coolify Migration** | 15% | 96.0 | **96.0 / 100** | `14.400` | **Gap (-4.0):** Live end-to-end migration battle-test against a real production Coolify v4 VPS with multi-GB PostgreSQL/Redis volumes & real DNS cutover. |
+| 4 | **AI / MCP Ecosystem** | 15% | 100.0 | **100.0 / 100** | `15.000` | **Verified:** 113 tools (`-81.8%` core), official MCP `2026-07-28` Async Tasks + Elicitation, 3 inline MCP Apps, 13 playbooks, external stdio E2E, `culkibo verify`/`demo`. |
+| 5 | **UI / UX Polish** | 10% | 99.0 | **99.5 / 100** | `9.950` | **Gains:** Interactive SLSA/Migration/Micro-Wasm Project Cockpit panels, 100.0% EN Fleet (`Load:`/`Free:`/`Disk`) & Domains (`messageEn` Caddy banner), `0` lint warnings/errors. **Gap (-0.5):** 4 minor legacy Spanish card headings inside `ProjectDetail.tsx` lower Overview section (`Recursos y entornos`, `Reparto de tráfico`, `Publicar a producción`, `Dominios`). |
+| 6 | **Catalog / DB / Edge Depth** | 10% | 98.0 | **99.0 / 100** | `9.900` | **Gains:** Cycle-4 capabilities wired end-to-end across API, Project Cockpit UI & Sandbox; bilingual `caddyManager` diagnostics. **Gap (-1.0):** Live Linux Docker BuildKit + Caddy HTTP/3 UDP 443 run pending first CI push. |
+| 7 | **Verification & QA** | 10% | 99.0 | **99.5 / 100** | `9.950` | **Gains:** **39/39** suites in `35.62s`, 5-artifact signed SLSA verify, `827 ms` build, 0-error Playwright verification. **Gap (-0.5):** First live green GitHub Actions run (`ci.yml` + `demo-pages.yml` + `release.yml`) pending push/tag. |
+| 8 | **README / GitHub SEO / Launch Kit** | 10% | 99.5 | **100.0 / 100** | `10.000` | **Gains:** `100/100` README lint, `101/101` valid links, `50 MB` / `<1 ms` Wasm precision sync, and copy-paste 5-minute Day-0 `gh` CLI Launch Runbook. |
+| | **TOTAL WEIGHTED SCORE** | **100%** | **98.65%** | **98.98%** | **98.98%** | **Verdict:** **99.0% — Execute the 5-Minute Day-0 `gh` CLI Launch Runbook (`docs/GITHUB_SEO_LAUNCH_KIT.md` §6) & publish `v1.2.0`!** |
+
+---
+
+### 5. Post-Launch Excellence Checklist (Day-0 Execution & Real-World Field Proof)
+
+1. **Execute Day-0 `gh` CLI Launch Runbook (`docs/GITHUB_SEO_LAUNCH_KIT.md` §6):** Set description/20 topics, enable GitHub Pages (`build_type=workflow`) + Discussions + PVR, dispatch `demo-pages.yml`, push `v1.2.0` tag to mint all 5 signed SLSA release artifacts, and embed live Linux Caddy v2.11 route-swap numbers from the first green `ci.yml` run.
+2. **Real Production Coolify v4 VPS Battle-Test:** Migrate a live Coolify v4 staging estate (multi-GB PostgreSQL/Redis volumes + Compose + Traefik + real DNS cutover) to move Coolify Migration from `96` → `100`.
+3. **Final 4-String EN Polish in `ProjectDetail.tsx` Overview Cards:** Localize `Recursos y entornos`, `Reparto de tráfico`, `Publicar a producción`, and `Dominios` under `?lang=en`.
+4. **Live External AI Client Compatibility Smoke:** Run `culkibo agent-init` + `io.modelcontextprotocol/tasks` + `ui://culkibo/*` inside live Claude Code, Antigravity, Cursor, Windsurf, and Codex CLI binaries.
+5. **Staggered Community Launch & Third-Party Security Review:** Publish Show HN, `r/selfhosted`, Product Hunt, and X thread (Tue–Thu 13:30–15:00 UTC) and schedule an independent external security audit ahead of enterprise GA.
