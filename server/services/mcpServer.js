@@ -33,7 +33,9 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'environmentManager',
   'gitopsManager',
   'uptimeMonitor',
-  'sleepAdvisor'
+  'sleepAdvisor',
+  'secretScanner',
+  'auditLogger'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -59,7 +61,7 @@ function lazySvc(name) {
 }
 
 const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars|passphrase|privatekey|private_key|sshkey|ssh_key|invitetoken|invite_token|tokenhash|token_hash|signingsecret|signing_secret|masterkey|master_key|confirmtoken|confirm_token)/i;
-const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck[stihp]_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck[stihpr]_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_database_credentials',
   'culkibo_github_connect',
@@ -101,6 +103,7 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_create_project',
     'culkibo_set_project_env',
     'culkibo_deploy_production',
+    'culkibo_ship_and_verify',
     'culkibo_list_deployments',
     'culkibo_rollback_deployment',
     'culkibo_get_container_logs',
@@ -113,6 +116,7 @@ const TOOL_PROFILES = Object.freeze({
   ]),
   deploy: new Set([
     'culkibo_search_tools',
+    'culkibo_export_agent_kit',
     'culkibo_rbac_whoami',
     'culkibo_list_projects',
     'culkibo_get_project',
@@ -121,6 +125,7 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_set_project_env',
     'culkibo_deploy_strategy',
     'culkibo_deploy_production',
+    'culkibo_ship_and_verify',
     'culkibo_list_deployments',
     'culkibo_rollback_deployment',
     'culkibo_cancel_deployment',
@@ -137,6 +142,7 @@ const TOOL_PROFILES = Object.freeze({
   ]),
   ops: new Set([
     'culkibo_search_tools',
+    'culkibo_export_agent_kit',
     'culkibo_rbac_whoami',
     'culkibo_list_projects',
     'culkibo_get_project',
@@ -164,6 +170,7 @@ const TOOL_PROFILES = Object.freeze({
   ]),
   security: new Set([
     'culkibo_search_tools',
+    'culkibo_export_agent_kit',
     'culkibo_rbac_whoami',
     'culkibo_team_list_members',
     'culkibo_team_invite_member',
@@ -198,12 +205,22 @@ const SEARCH_SYNONYMS = Object.freeze({
   incident: ['diagnose', 'remediate', 'uptime', 'status', 'rollback', 'logs', 'crash', 'oom'],
   heal: ['remediate', 'diagnose', 'doctor', 'fix', 'rollback', 'restart'],
   fix: ['remediate', 'doctor', 'diagnose', 'reconcile', 'rollback'],
-  deploy: ['production', 'release', 'build', 'rollback', 'canary', 'smoke', 'freeze', 'preview'],
-  rollback: ['revert', 'sync', 'deploy', 'remediate'],
+  deploy: ['production', 'release', 'build', 'rollback', 'canary', 'smoke', 'freeze', 'preview', 'ship'],
+  ship: ['deploy', 'verify', 'smoke', 'rollback', 'secret', 'production'],
+  verify: ['ship', 'smoke', 'diagnose', 'sync', 'health'],
+  secret: ['vault', 'env', 'ship', 'scan', 'redact'],
+  rollback: ['revert', 'sync', 'deploy', 'remediate', 'ship'],
   auth: ['rbac', 'token', 'team', 'basic', 'whoami', 'security'],
   ssh: ['fleet', 'server', 'remote', 'node', 'probe'],
   sleep: ['hibernate', 'scale', 'idle', 'wake', 'cost', 'ram'],
-  yaml: ['gitops', 'compose', 'manifest', 'plan', 'apply', 'export']
+  yaml: ['gitops', 'compose', 'manifest', 'plan', 'apply', 'export'],
+  agent: ['kit', 'mcp', 'claude', 'cursor', 'windsurf', 'antigravity', 'codex', 'vscode', 'config'],
+  claude: ['agent', 'kit', 'mcp', 'config', 'export'],
+  cursor: ['agent', 'kit', 'mcp', 'config', 'export'],
+  antigravity: ['agent', 'kit', 'mcp', 'config', 'export'],
+  windsurf: ['agent', 'kit', 'mcp', 'config', 'export'],
+  codex: ['agent', 'kit', 'mcp', 'config', 'export'],
+  kit: ['agent', 'export', 'mcp', 'config']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -340,7 +357,10 @@ const TOOL_POLICIES = Object.freeze({
   // MCP 2.1: Meta-Discovery & Autonomous Self-Healing Ops (+3 = 107)
   culkibo_search_tools: { minRole: 'viewer', scope: 'tools:read', projectScoped: false },
   culkibo_diagnose_incident: { minRole: 'viewer', scope: 'observability:read', projectScoped: true },
-  culkibo_auto_remediate: { minRole: 'developer', scope: 'deployments:write', projectScoped: true }
+  culkibo_auto_remediate: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
+  // MCP 2026 Pioneer: Autonomous Ship-and-Verify & 1-Click Agent Kit Generator (+2 = 109)
+  culkibo_ship_and_verify: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
+  culkibo_export_agent_kit: { minRole: 'viewer', scope: 'tools:read', projectScoped: false }
 });
 
 /**
@@ -733,6 +753,7 @@ const DEFAULT_ERROR_REMEDIATIONS = Object.freeze({
   CONFIRM_TOKEN_EXPIRED: 'El confirmToken caducó (5 min); genera uno nuevo con culkibo_auto_remediate y dryRun: true.',
   CONFIRM_TOKEN_REPLAYED: 'Cada confirmToken es de un solo uso; ejecuta dryRun: true para generar uno nuevo si necesitas repetir la acción.',
   CONFIRM_TOKEN_MISMATCH: 'El confirmToken está vinculado al llamante, acción, proyecto y parámetros exactos del dryRun; solicita uno nuevo para estos parámetros.',
+  SECRET_LEAK_DETECTED: 'Mueve los secretos detectados al Vault cifrado de Culkibo (${vault.KEY}) o a secretos de entorno antes de desplegar.',
   CANARY_NOT_ACTIVE: 'Inicia primero un despliegue canario con culkibo_canary_rollout (action: "start") o consulta su estado con action: "status".',
   FORBIDDEN_PATH: 'Usa un directorio dentro del workspace actual o de la carpeta projects/ de Culkibo.'
 });
@@ -2737,7 +2758,7 @@ class McpServer extends EventEmitter {
             profiles: { type: 'object' }
           }
         },
-        description: 'Busca semánticamente (ES/EN) entre las 107 herramientas autorizadas de Culkibo para descubrir sus esquemas bajo demanda sin saturar la ventana de contexto (ideal con ?profile=core).',
+        description: 'Busca semánticamente (ES/EN) entre las 109 herramientas autorizadas de Culkibo para descubrir sus esquemas bajo demanda sin saturar la ventana de contexto (ideal con ?profile=core).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2813,6 +2834,108 @@ class McpServer extends EventEmitter {
             verifyAfter: { type: 'boolean', description: 'Ejecutar verificación de salud/smoke checks tras aplicar el fix (default true)' }
           },
           required: ['action']
+        }
+      },
+
+      // --- MCP 2026 Pioneer: Autonomous Ship-and-Verify & 1-Click Agent Kit Generator (+2 -> 109) ---
+      {
+        name: 'culkibo_ship_and_verify',
+        title: 'Desplegar y verificar de forma autónoma (Ship & Verify)',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            phase: { type: 'string' },
+            executed: { type: 'boolean' },
+            dryRun: { type: 'boolean' },
+            verified: { type: 'boolean' },
+            wouldExecute: { type: 'boolean' },
+            projectId: { type: 'string' },
+            confirmToken: { type: 'string' },
+            confirmTokenExpiresAt: { type: 'string' },
+            secretScan: { type: 'object' },
+            rollbackReadiness: { type: 'object' },
+            deployment: { type: ['object', 'null'] },
+            smokeVerification: { type: ['object', 'null'] },
+            metricsSnapshot: { type: ['object', 'null'] },
+            rollbackExecuted: { type: 'boolean' },
+            rollbackResult: { type: ['object', 'null'] },
+            blockers: { type: 'array' },
+            warnings: { type: 'array' },
+            nextStep: { type: 'string' }
+          }
+        },
+        description: 'Despliegue autónomo en 2 fases: (1) dryRun: true ejecuta pre-flight secret scan, comprueba freeze/rollback readiness y emite confirmToken HMAC-SHA256 (5 min); (2) dryRun: false + confirmToken despliega, verifica smoke/métricas y hace auto-rollback si falla.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectId: { type: 'string', minLength: 1, description: 'ID del proyecto' },
+            confirmToken: { type: 'string', minLength: 16, maxLength: 512, description: 'Token HMAC de un solo uso emitido en dryRun: true' },
+            commit: { type: 'string', maxLength: 64, description: 'Commit SHA o rama opcional' },
+            gitSync: { type: 'boolean', description: 'Sincronizar Git antes de construir (default true)' },
+            serverId: { type: 'string', maxLength: 64, description: 'Nodo destino de flota SSH' },
+            secretScanMode: { type: 'string', enum: ['block', 'warn'], description: 'Política secret scan (default block; warn exige admin)' },
+            runSmokeTests: { type: 'boolean', description: 'Ejecutar smoke checks post-deploy (default true)' },
+            smokeChecks: {
+              type: 'array',
+              items: { type: 'object' },
+              maxItems: 10,
+              description: 'Smoke checks ad-hoc opcionales'
+            },
+            autoRollbackOnFailure: { type: 'boolean', description: 'Auto-rollback si fallan los smoke checks (default true)' },
+            overrideFreeze: { type: 'boolean', description: 'Omitir deploy freeze (solo admin/owner)' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_export_agent_kit',
+        title: 'Exportar kit de conexión MCP 1-clic para agentes IA',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            protocolVersion: { type: 'string' },
+            profile: { type: 'string' },
+            target: { type: 'string' },
+            serverUrl: { type: 'string' },
+            endpoint: { type: 'string' },
+            tokenPlaceholder: { type: 'string' },
+            containsPlaintextSecrets: { type: 'boolean' },
+            tokenSavings: { type: 'object' },
+            kits: { type: 'object' },
+            playbooks: { type: 'array' }
+          }
+        },
+        description: 'Genera configuraciones listas para copiar/escribir (drop-in) para Antigravity, Claude Code (.mcp.json + CLAUDE.md), Cursor (.cursor/mcp.json), Windsurf, OpenAI Codex CLI y VS Code Copilot usando ?profile=core por defecto (-82% tokens de contexto) y placeholders ${CULKIBO_TOKEN} sin incrustar jamás tokens maestros en claro.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            target: {
+              type: 'string',
+              enum: ['all', 'antigravity', 'claude-code', 'cursor', 'windsurf', 'codex', 'vscode'],
+              description: 'Agente IA objetivo (default all)'
+            },
+            profile: {
+              type: 'string',
+              enum: ['core', 'deploy', 'ops', 'security', 'all'],
+              description: 'Perfil de herramientas MCP (default core para ahorrar >80% de contexto)'
+            },
+            serverUrl: {
+              type: 'string',
+              maxLength: 256,
+              description: 'URL base del servidor Culkibo (opcional; autodetecta dominio del panel o localhost)'
+            },
+            projectId: {
+              type: 'string',
+              minLength: 1,
+              description: 'ID de proyecto opcional para personalizar el snippet CLAUDE.md'
+            },
+            includeOpsGuide: {
+              type: 'boolean',
+              description: 'Incluir guía operativa CLAUDE.md con playbooks y protocolo dryRun/confirmToken (default true)'
+            }
+          }
         }
       }
     ];
@@ -3063,16 +3186,30 @@ class McpServer extends EventEmitter {
   }
 
   /**
-   * Hash determinista de parámetros relevantes de `culkibo_auto_remediate`.
+   * Hash determinista de parámetros relevantes de `culkibo_auto_remediate` o `culkibo_ship_and_verify`.
    * @param {any} args
    */
   _remediationParamsHash(args) {
-    const canonical = JSON.stringify({
-      action: String(args.action || ''),
-      projectId: args.projectId ? String(args.projectId) : null,
-      doctorFixAction: args.doctorFixAction ? String(args.doctorFixAction) : null,
-      maintenanceEnabled: args.action === 'toggle_maintenance' ? (args.maintenanceEnabled !== false) : null
-    });
+    const action = String(args.action || '');
+    const canonical = action === 'ship_and_verify'
+      ? JSON.stringify({
+          action: 'ship_and_verify',
+          projectId: args.projectId ? String(args.projectId) : null,
+          commit: args.commit ? String(args.commit) : null,
+          gitSync: args.gitSync !== false,
+          serverId: args.serverId ? String(args.serverId) : null,
+          secretScanMode: args.secretScanMode === 'warn' ? 'warn' : 'block',
+          runSmokeTests: args.runSmokeTests !== false,
+          autoRollbackOnFailure: args.autoRollbackOnFailure !== false,
+          overrideFreeze: Boolean(args.overrideFreeze),
+          smokeChecksCount: Array.isArray(args.smokeChecks) ? args.smokeChecks.length : 0
+        })
+      : JSON.stringify({
+          action,
+          projectId: args.projectId ? String(args.projectId) : null,
+          doctorFixAction: args.doctorFixAction ? String(args.doctorFixAction) : null,
+          maintenanceEnabled: action === 'toggle_maintenance' ? (args.maintenanceEnabled !== false) : null
+        });
     return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 24);
   }
 
@@ -3795,6 +3932,543 @@ class McpServer extends EventEmitter {
   }
 
   /**
+   * Ejecuta escaneo pre-despliegue de fugas de secretos sobre la configuración de un proyecto
+   * sin exponer jamás valores en claro (solo previews enmascarados de `secretScanner`).
+   * @param {any} project
+   * @param {'block' | 'warn'} [mode]
+   */
+  _scanProjectSecrets(project, mode = 'block') {
+    const scanner = lazySvc('secretScanner');
+    const cleanMode = mode === 'warn' ? 'warn' : 'block';
+    if (!scanner || typeof scanner.scanDeploymentPayload !== 'function') {
+      return {
+        clean: true,
+        blocked: false,
+        mode: cleanMode,
+        scannerAvailable: false,
+        summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0 },
+        findings: []
+      };
+    }
+    const payload = {
+      envVars: project && typeof project.envVars === 'object' ? project.envVars : undefined,
+      buildArgs: project && typeof project.buildArgs === 'object' ? project.buildArgs : undefined,
+      composeYaml: typeof project?.composeYaml === 'string' ? project.composeYaml : undefined,
+      culkiboYaml: typeof project?.culkiboYaml === 'string' ? project.culkiboYaml : undefined,
+      dockerfile: typeof project?.dockerfile === 'string' ? project.dockerfile : undefined
+    };
+    const report = scanner.scanDeploymentPayload(payload, { mode: cleanMode, includeEntropy: true });
+    return {
+      scannerAvailable: true,
+      ...report
+    };
+  }
+
+  /**
+   * Ejecuta el flujo autónomo `culkibo_ship_and_verify` (Fase 2: requiere `confirmToken` de `dryRun: true`).
+   * Correlaciona escaneo pre-despliegue de secretos + despliegue + smoke/health verification + auto-rollback.
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   * @param {any} args
+   * @param {{ onProgress?: (msg: string) => void }} [context]
+   */
+  async executeShipAndVerify(principal, args, context = {}) {
+    const project = projectManager.getById(String(args.projectId || ''));
+    if (!project) throw projectNotFoundError(args.projectId);
+
+    const tokenArgs = { ...args, action: 'ship_and_verify' };
+    if (!args.confirmToken) {
+      throw new McpToolError(
+        'CONFIRMATION_REQUIRED',
+        `culkibo_ship_and_verify exige previsualización dryRun: true (con secret scan y rollback readiness) y un confirmToken HMAC-SHA256 de un solo uso antes de desplegar '${project.name}'.`,
+        {
+          retryable: true,
+          remediation: `Ejecuta primero culkibo_ship_and_verify con { projectId: "${project.id}", dryRun: true } para revisar el plan y obtener confirmToken, luego confirma con dryRun: false y confirmToken.`
+        }
+      );
+    }
+
+    this.verifyAndConsumeRemediationToken(String(args.confirmToken), principal, tokenArgs);
+
+    const freeze = evaluateProjectFreeze(project);
+    if (freeze.frozen && !args.overrideFreeze) {
+      throw new McpToolError('DEPLOY_FREEZE_ACTIVE', `Despliegue de '${project.name}' bloqueado por una ventana de deploy freeze activa.`, {
+        retryable: false,
+        remediation: 'Espera a que finalice la ventana con culkibo_deploy_freeze (action: "list") o repite el flujo con overrideFreeze: true (admin/owner).',
+        details: { projectId: project.id, freeze }
+      });
+    }
+
+    const secretScanMode = args.secretScanMode === 'warn' ? 'warn' : 'block';
+    const secretScan = this._scanProjectSecrets(project, secretScanMode);
+    if (secretScan.blocked) {
+      throw new McpToolError(
+        'SECRET_LEAK_DETECTED',
+        `Ship & Verify bloqueado: se detectaron ${secretScan.summary.critical + secretScan.summary.high} secreto(s) en claro en '${project.name}'.`,
+        {
+          retryable: false,
+          remediation: 'Sustituye los literales detectados por referencias ${vault.KEY} usando culkibo_set_project_env o el Vault cifrado y vuelve a ejecutar dryRun: true.',
+          details: { projectId: project.id, summary: secretScan.summary, findings: secretScan.findings.slice(0, 10) }
+        }
+      );
+    }
+
+    const onProg = typeof context.onProgress === 'function' ? context.onProgress : null;
+    if (onProg) onProg(`Ship & Verify [${project.name}]: pre-flight secret scan OK (${secretScan.summary.total} hallazgos). Iniciando despliegue…`);
+
+    const preStatus = await deployManager.status(project.id).catch(() => null);
+    const linkedDbs = Array.isArray(project.linkedDatabaseIds) ? project.linkedDatabaseIds : [];
+    const rollbackReadiness = {
+      canRollback: Boolean(preStatus?.current || preStatus?.previous),
+      currentReleaseId: preStatus?.current?.id || null,
+      previousReleaseId: preStatus?.previous?.id || null,
+      linkedDatabasesCount: linkedDbs.length
+    };
+
+    const stageListener = onProg
+      ? (ev) => {
+          if (ev && ev.projectId === project.id && ev.stage) {
+            onProg(`Ship & Verify [${project.name}]: fase «${ev.stage}»`);
+          }
+        }
+      : null;
+    if (stageListener) deployManager.on('stage', stageListener);
+
+    /** @type {any} */
+    let deployment = null;
+    try {
+      const targetProject = args.serverId ? { ...project, serverId: String(args.serverId) } : project;
+      deployment = await deployManager.deploy(targetProject, {
+        commit: args.commit || null,
+        gitSync: args.gitSync !== false,
+        overrideFreeze: Boolean(args.overrideFreeze),
+        serverId: args.serverId ? String(args.serverId) : undefined,
+        trigger: 'mcp_ship_and_verify'
+      });
+    } finally {
+      if (stageListener) deployManager.off('stage', stageListener);
+    }
+
+    const deploySucceeded = Boolean(
+      deployment &&
+      deployment.status !== 'error' &&
+      deployment.status !== 'failed' &&
+      deployment.status !== 'fallido' &&
+      deployment.status !== 'cancelado'
+    );
+
+    const warnings = [];
+    if (secretScan.summary.total > 0) {
+      warnings.push(`Escáner de secretos detectó ${secretScan.summary.total} aviso(s) en modo '${secretScanMode}'.`);
+    }
+
+    /** @type {any} */
+    let smokeVerification = null;
+    let verified = deploySucceeded;
+    let rollbackExecuted = false;
+    /** @type {any} */
+    let rollbackResult = null;
+
+    if (deploySucceeded && args.runSmokeTests !== false) {
+      if (onProg) onProg(`Ship & Verify [${project.name}]: ejecutando smoke checks y verificación de salud…`);
+      const configuredChecks = Array.isArray(project.smokeTests)
+        ? project.smokeTests
+        : (Array.isArray(project.smokeTests?.checks) ? project.smokeTests.checks : []);
+      const checks = Array.isArray(args.smokeChecks) && args.smokeChecks.length > 0
+        ? sanitizeSmokeChecks(args.smokeChecks)
+        : (configuredChecks.length > 0
+          ? configuredChecks
+          : [{ name: 'default-health', method: 'GET', path: project.healthPath || '/', expectedStatus: 200 }]);
+
+      if (typeof deployManager.runSmokeTests === 'function') {
+        try {
+          const postStatus = await deployManager.status(project.id).catch(() => null);
+          const port = deployment?.hostPort || postStatus?.current?.hostPort || project.citadelPort || 3000;
+          const upstream = `http://127.0.0.1:${port}`;
+          const smokeRes = await deployManager.runSmokeTests(upstream, checks, { target: 'citadel' });
+          const passed = smokeRes?.passed !== false && smokeRes?.ok !== false;
+          smokeVerification = { upstream, checksCount: checks.length, passed, ...smokeRes };
+          if (!passed) {
+            verified = false;
+            warnings.push('Los smoke checks post-despliegue fallaron.');
+            if (args.autoRollbackOnFailure !== false && rollbackReadiness.canRollback) {
+              if (onProg) onProg(`Ship & Verify [${project.name}]: smoke checks fallaron — ejecutando auto-rollback…`);
+              try {
+                rollbackResult = await deployManager.rollback(project.id);
+                rollbackExecuted = true;
+              } catch (rbErr) {
+                rollbackResult = { ok: false, error: rbErr.message };
+                warnings.push(`Auto-rollback falló: ${rbErr.message}`);
+              }
+            }
+          }
+        } catch (smokeErr) {
+          smokeVerification = { passed: false, error: smokeErr.message };
+          verified = false;
+          warnings.push(`Error ejecutando smoke checks: ${smokeErr.message}`);
+          if (args.autoRollbackOnFailure !== false && rollbackReadiness.canRollback) {
+            try {
+              rollbackResult = await deployManager.rollback(project.id);
+              rollbackExecuted = true;
+            } catch (rbErr) {
+              rollbackResult = { ok: false, error: rbErr.message };
+              warnings.push(`Auto-rollback falló: ${rbErr.message}`);
+            }
+          }
+        }
+      } else {
+        smokeVerification = { skipped: true, reason: 'runSmokeTests no disponible en deployManager' };
+      }
+    }
+
+    /** @type {any} */
+    let metricsSnapshot = null;
+    try {
+      const [runtimeStats, obs] = await Promise.all([
+        typeof deployManager.getRuntimeStats === 'function'
+          ? deployManager.getRuntimeStats(project.id).catch(() => null)
+          : Promise.resolve(null),
+        Promise.resolve().then(() => metricsCollector.getSnapshot(false)).catch(() => null)
+      ]);
+      metricsSnapshot = {
+        runtime: runtimeStats,
+        hostMemory: obs?.memory || null,
+        capturedAt: new Date().toISOString()
+      };
+    } catch (e) {
+      metricsSnapshot = null;
+    }
+
+    const phase = !deploySucceeded
+      ? 'failed'
+      : verified
+        ? 'shipped_verified'
+        : rollbackExecuted
+          ? 'shipped_rolled_back'
+          : 'failed';
+
+    return {
+      phase,
+      executed: true,
+      dryRun: false,
+      verified,
+      wouldExecute: true,
+      projectId: project.id,
+      secretScan,
+      rollbackReadiness,
+      deployment,
+      smokeVerification,
+      metricsSnapshot,
+      rollbackExecuted,
+      rollbackResult,
+      blockers: [],
+      warnings,
+      nextStep: verified
+        ? `Release verificada en producción para '${project.name}'. Supervisa logs con culkibo_get_container_logs o monitores con culkibo_uptime_list_monitors.`
+        : rollbackExecuted
+          ? `Se ejecutó auto-rollback tras fallo de smoke checks. Diagnostica la causa con culkibo_diagnose_incident({ projectId: "${project.id}" }).`
+          : `Despliegue no verificado. Inspecciona logs con culkibo_get_deployment_logs({ projectId: "${project.id}" }) o culkibo_diagnose_incident.`
+    };
+  }
+
+  /**
+   * Genera el kit de conexión 1-clic multi-agente (Antigravity, Claude Code, Cursor, Windsurf,
+   * OpenAI Codex CLI, VS Code Copilot) por defecto con `?profile=core` y placeholders `${CULKIBO_TOKEN}`
+   * (JAMÁS incrusta tokens maestros en claro).
+   * @param {{
+   *   target?: string,
+   *   profile?: string,
+   *   serverUrl?: string,
+   *   projectId?: string | null,
+   *   projectName?: string | null,
+   *   includeOpsGuide?: boolean
+   * }} [opts]
+   */
+  buildAgentKit(opts = {}) {
+    const validTargets = ['all', 'antigravity', 'claude-code', 'cursor', 'windsurf', 'codex', 'vscode'];
+    const rawTarget = String(opts.target || 'all').trim().toLowerCase();
+    const targetAliases = {
+      claude: 'claude-code',
+      'claude_code': 'claude-code',
+      'codex-cli': 'codex',
+      'openai-codex': 'codex',
+      copilot: 'vscode',
+      'vscode-copilot': 'vscode'
+    };
+    const normalizedTarget = targetAliases[rawTarget] || rawTarget;
+    if (!validTargets.includes(normalizedTarget)) {
+      throw new McpToolError('INVALID_ARGUMENT', `Agente objetivo no soportado: '${opts.target}'.`, {
+        retryable: true,
+        remediation: `Usa uno de los objetivos soportados: ${validTargets.join(', ')}.`
+      });
+    }
+
+    const profile = this.normalizeProfile(opts.profile !== undefined ? opts.profile : 'core');
+    const defaultUrl = ingressManager.panelDomain
+      ? `https://${ingressManager.panelDomain}`
+      : `http://127.0.0.1:${process.env.PORT || 3030}`;
+    const serverUrl = String(opts.serverUrl || defaultUrl).trim().replace(/\/+$/, '').replace(/\/api\/mcp(?:\?.*)?$/i, '');
+    const endpoint = profile !== 'all' ? `${serverUrl}/api/mcp?profile=${profile}` : `${serverUrl}/api/mcp`;
+    const tokenPlaceholder = '${CULKIBO_TOKEN}';
+    const includeOpsGuide = opts.includeOpsGuide !== false;
+
+    // Medición exacta en tiempo real del ahorro de contexto respecto al catálogo completo
+    const allTools = this.getToolsDefinition();
+    const profileTools = this.getToolsForPrincipal(null, { profile });
+    const allBytes = Buffer.byteLength(JSON.stringify(allTools), 'utf8');
+    const profileBytes = Buffer.byteLength(JSON.stringify(profileTools), 'utf8');
+    const savedPct = allBytes > 0 ? Number(((1 - profileBytes / allBytes) * 100).toFixed(1)) : 0;
+    const tokenSavings = {
+      profile,
+      profileToolsCount: profileTools.length,
+      allToolsCount: allTools.length,
+      profileBytes,
+      allBytes,
+      estimatedTokens: Math.round(profileBytes / 4),
+      fullEstimatedTokens: Math.round(allBytes / 4),
+      savedPct
+    };
+
+    const projectHint = opts.projectId
+      ? `\n- Proyecto por defecto: \`${String(opts.projectId)}\`${opts.projectName ? ` (${String(opts.projectName)})` : ''}`
+      : '';
+
+    const claudeMdSnippet = [
+      '<!-- culkibo-mcp-ops:start -->',
+      '## Culkibo AI-Native PaaS Operations (MCP 2026)',
+      '',
+      `- Endpoint MCP: \`${endpoint}\` (perfil \`${profile}\`: **${profileTools.length}/${allTools.length}** herramientas, **-${savedPct}%** tokens de contexto).`,
+      '- Autenticación segura: exporta `CULKIBO_TOKEN` en tu entorno local; **nunca** pegues tokens maestros en repositorios Git.' + projectHint,
+      '',
+      '### Reglas de operación autónoma',
+      '1. **Meta-Discovery bajo demanda**: con `?profile=core` arrancas con las herramientas esenciales. Si necesitas bases de datos, flota SSH, GitOps, Canary o DNS-01, llama a `culkibo_search_tools({ query: "..." })` para cargar solo esos esquemas.',
+      '2. **Protocolo de seguridad 2 fases (`dryRun` → `confirmToken`)**:',
+      '   - Para desplegar con red de seguridad completa usa `culkibo_ship_and_verify({ projectId, dryRun: true })` (escaneo de secretos + freeze + rollback readiness) → revisa el plan → confirma con `dryRun: false` y el `confirmToken` de un solo uso.',
+      '   - Para incidentes ejecuta `culkibo_diagnose_incident` y aplica fixes mediante `culkibo_auto_remediate` (`dryRun: true` → `confirmToken` → `dryRun: false`).',
+      '3. **Higiene de secretos**: referencia secretos en `culkibo.yaml` y `.env` siempre como `${vault.KEY}` y verifica con el escáner pre-despliegue.',
+      '4. **Playbooks nativos (`prompts/list`)**: `deploy_safely`, `migrate_from_coolify`, `debug_production_crash`, `zero_downtime_db_upgrade`, `security_audit_stack`, `setup_wildcard_tls_and_tunnel`, `optimize_ram_and_costs`, `disaster_recovery_drill`.',
+      '<!-- culkibo-mcp-ops:end -->',
+      ''
+    ].join('\n');
+
+    const antigravityConfig = {
+      mcpServers: {
+        culkibo: {
+          serverUrl: endpoint,
+          headers: {
+            Authorization: `Bearer ${tokenPlaceholder}`
+          }
+        }
+      }
+    };
+
+    const claudeCodeMcpJson = {
+      mcpServers: {
+        culkibo: {
+          type: 'http',
+          url: endpoint,
+          headers: {
+            Authorization: `Bearer ${tokenPlaceholder}`
+          }
+        }
+      }
+    };
+
+    const cursorMcpJson = {
+      mcpServers: {
+        culkibo: {
+          url: endpoint,
+          headers: {
+            Authorization: `Bearer ${tokenPlaceholder}`
+          }
+        }
+      }
+    };
+
+    const windsurfMcpJson = {
+      mcpServers: {
+        culkibo: {
+          serverUrl: endpoint,
+          headers: {
+            Authorization: `Bearer ${tokenPlaceholder}`
+          }
+        }
+      }
+    };
+
+    const codexToml = [
+      '# Culkibo MCP 2026 — OpenAI Codex CLI',
+      `# Profile: ${profile} (${profileTools.length}/${allTools.length} tools, -${savedPct}% context tokens)`,
+      '# Set CULKIBO_TOKEN in your shell environment; never commit plaintext tokens.',
+      '[mcp_servers.culkibo]',
+      `url = "${endpoint}"`,
+      'bearer_token_env_var = "CULKIBO_TOKEN"',
+      '',
+      '# Optional stdio bridge (works with CULKIBO_API_URL + CULKIBO_MCP_PROFILE):',
+      '# [mcp_servers.culkibo]',
+      '# command = "culkibo"',
+      '# args = ["mcp"]',
+      `# env = { CULKIBO_API_URL = "${serverUrl}", CULKIBO_MCP_PROFILE = "${profile}", CULKIBO_TOKEN = "${tokenPlaceholder}" }`,
+      ''
+    ].join('\n');
+
+    const vscodeMcpJson = {
+      servers: {
+        culkibo: {
+          type: 'http',
+          url: endpoint,
+          headers: {
+            Authorization: `Bearer ${tokenPlaceholder}`
+          }
+        }
+      }
+    };
+
+    /** @type {Record<string, any>} */
+    const allKits = {
+      antigravity: {
+        id: 'antigravity',
+        name: 'Antigravity',
+        transport: `Streamable HTTP (${PROTOCOL_VERSION})`,
+        primaryFile: '.antigravity/mcp.json',
+        globalPath: '~/.gemini/antigravity/mcp_config.json',
+        cliCommand: `culkibo agent-init antigravity --profile ${profile} --url "${serverUrl}"`,
+        config: antigravityConfig,
+        files: [
+          {
+            path: '.antigravity/mcp.json',
+            format: 'json',
+            mergeKey: 'mcpServers',
+            content: JSON.stringify(antigravityConfig, null, 2) + '\n'
+          }
+        ],
+        notes: 'Exporta CULKIBO_TOKEN en tu entorno antes de abrir Antigravity; el endpoint usa Streamable HTTP nativo sin handshake.'
+      },
+      'claude-code': {
+        id: 'claude-code',
+        name: 'Claude Code',
+        transport: `Streamable HTTP (${PROTOCOL_VERSION})`,
+        primaryFile: '.mcp.json',
+        globalPath: '~/.claude.json',
+        cliCommand: `claude mcp add --transport http culkibo "${endpoint}" --header "Authorization: Bearer \${CULKIBO_TOKEN}"`,
+        config: claudeCodeMcpJson,
+        claudeMdSnippet,
+        files: [
+          {
+            path: '.mcp.json',
+            format: 'json',
+            mergeKey: 'mcpServers',
+            content: JSON.stringify(claudeCodeMcpJson, null, 2) + '\n'
+          },
+          ...(includeOpsGuide ? [{
+            path: 'CLAUDE.md',
+            format: 'markdown',
+            markerStart: '<!-- culkibo-mcp-ops:start -->',
+            markerEnd: '<!-- culkibo-mcp-ops:end -->',
+            content: claudeMdSnippet
+          }] : [])
+        ],
+        notes: 'Genera .mcp.json listo para equipo + guía operativa CLAUDE.md con los 8 playbooks y protocolo dryRun/confirmToken.'
+      },
+      cursor: {
+        id: 'cursor',
+        name: 'Cursor',
+        transport: `Streamable HTTP (${PROTOCOL_VERSION})`,
+        primaryFile: '.cursor/mcp.json',
+        globalPath: '~/.cursor/mcp.json',
+        cliCommand: `culkibo agent-init cursor --profile ${profile} --url "${serverUrl}"`,
+        config: cursorMcpJson,
+        files: [
+          {
+            path: '.cursor/mcp.json',
+            format: 'json',
+            mergeKey: 'mcpServers',
+            content: JSON.stringify(cursorMcpJson, null, 2) + '\n'
+          }
+        ],
+        notes: 'Coloca .cursor/mcp.json en la raíz del proyecto y define CULKIBO_TOKEN en tu shell.'
+      },
+      windsurf: {
+        id: 'windsurf',
+        name: 'Windsurf',
+        transport: `Streamable HTTP (${PROTOCOL_VERSION})`,
+        primaryFile: '.windsurf/mcp_config.json',
+        globalPath: '~/.codeium/windsurf/mcp_config.json',
+        cliCommand: `culkibo agent-init windsurf --profile ${profile} --url "${serverUrl}"`,
+        config: windsurfMcpJson,
+        files: [
+          {
+            path: '.windsurf/mcp_config.json',
+            format: 'json',
+            mergeKey: 'mcpServers',
+            content: JSON.stringify(windsurfMcpJson, null, 2) + '\n'
+          }
+        ],
+        notes: 'Compatible con Windsurf Cascade usando serverUrl y cabecera Authorization con ${CULKIBO_TOKEN}.'
+      },
+      codex: {
+        id: 'codex',
+        name: 'OpenAI Codex CLI',
+        transport: `Streamable HTTP (${PROTOCOL_VERSION}) + TOML`,
+        primaryFile: '.codex/config.toml',
+        globalPath: '~/.codex/config.toml',
+        cliCommand: `codex mcp add culkibo --url "${endpoint}" --bearer-token-env-var CULKIBO_TOKEN`,
+        config: codexToml,
+        files: [
+          {
+            path: '.codex/config.toml',
+            format: 'toml',
+            sectionHeader: '[mcp_servers.culkibo]',
+            content: codexToml
+          }
+        ],
+        notes: 'Usa bearer_token_env_var = "CULKIBO_TOKEN" para leer el token desde la variable de entorno sin guardarlo en disco.'
+      },
+      vscode: {
+        id: 'vscode',
+        name: 'VS Code Copilot',
+        transport: `Streamable HTTP (${PROTOCOL_VERSION})`,
+        primaryFile: '.vscode/mcp.json',
+        globalPath: '.vscode/mcp.json',
+        cliCommand: `culkibo agent-init vscode --profile ${profile} --url "${serverUrl}"`,
+        config: vscodeMcpJson,
+        files: [
+          {
+            path: '.vscode/mcp.json',
+            format: 'json',
+            mergeKey: 'servers',
+            content: JSON.stringify(vscodeMcpJson, null, 2) + '\n'
+          }
+        ],
+        notes: 'Compatible con GitHub Copilot Agent Mode en VS Code (sustituye ${CULKIBO_TOKEN} por ${env:CULKIBO_TOKEN} si tu versión de VS Code exige prefijo env:).'
+      }
+    };
+
+    const kits = normalizedTarget === 'all'
+      ? allKits
+      : { [normalizedTarget]: allKits[normalizedTarget] };
+
+    const playbooks = this.listPrompts().slice(0, 8).map((p) => ({
+      name: p.name,
+      title: p.title || p.name,
+      description: p.description,
+      arguments: p.arguments || []
+    }));
+
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      profile,
+      target: normalizedTarget,
+      serverUrl,
+      endpoint,
+      tokenPlaceholder,
+      containsPlaintextSecrets: false,
+      tokenSavings,
+      kits,
+      playbooks
+    };
+  }
+
+  /**
    * Resuelve referencias directas e indirectas a proyectos para aplicar ACL anti-IDOR.
    * @param {string} toolName
    * @param {any} args
@@ -3964,10 +4638,17 @@ class McpServer extends EventEmitter {
       if (effRank < minEffectiveProjectRank) minEffectiveProjectRank = effRank;
     }
 
-    if ((toolName === 'culkibo_deploy_production' || toolName === 'culkibo_env_promote') && args.overrideFreeze === true && minEffectiveProjectRank < ROLE_RANK.admin) {
+    if ((toolName === 'culkibo_deploy_production' || toolName === 'culkibo_env_promote' || toolName === 'culkibo_ship_and_verify') && args.overrideFreeze === true && minEffectiveProjectRank < ROLE_RANK.admin) {
       throw new McpToolError('FORBIDDEN', 'Solo admin u owner pueden omitir una ventana de deploy freeze.', {
         retryable: false,
         remediation: 'Espera a que termine la ventana con culkibo_deploy_freeze (action: "list") o pide override a un admin/owner.'
+      });
+    }
+
+    if (toolName === 'culkibo_ship_and_verify' && args.secretScanMode === 'warn' && minEffectiveProjectRank < ROLE_RANK.admin) {
+      throw new McpToolError('FORBIDDEN', 'Solo admin u owner pueden degradar secretScanMode a "warn" en culkibo_ship_and_verify.', {
+        retryable: false,
+        remediation: 'Usa secretScanMode: "block" (por defecto) y mueve los secretos detectados al Vault cifrado (${vault.KEY}).'
       });
     }
 
@@ -4320,6 +5001,121 @@ class McpServer extends EventEmitter {
           preview,
           postVerification: null,
           nextStep: `Resuelve los bloqueos (${blockers.join(', ')}) antes de ejecutar culkibo_auto_remediate.`
+        };
+      }
+
+      case 'culkibo_ship_and_verify': {
+        if (!project) throw projectNotFoundError(args.projectId);
+        const freeze = evaluateProjectFreeze(project);
+        const targetServer = args.serverId || project.serverId || 'local';
+        const secretScanMode = args.secretScanMode === 'warn' ? 'warn' : 'block';
+        const secretScan = this._scanProjectSecrets(project, secretScanMode);
+        const depStatus = await deployManager.status(project.id).catch(() => null);
+        const domains = domainManager.listDomains().filter((d) => d.projectId === project.id).map((d) => d.hostname);
+        const linkedDbs = Array.isArray(project.linkedDatabaseIds) ? project.linkedDatabaseIds : [];
+        const configuredChecks = Array.isArray(project.smokeTests)
+          ? project.smokeTests
+          : (Array.isArray(project.smokeTests?.checks) ? project.smokeTests.checks : []);
+        const plannedSmokeChecks = Array.isArray(args.smokeChecks) && args.smokeChecks.length > 0
+          ? sanitizeSmokeChecks(args.smokeChecks)
+          : (configuredChecks.length > 0
+            ? configuredChecks
+            : [{ name: 'default-health', method: 'GET', path: project.healthPath || '/', expectedStatus: 200 }]);
+
+        const rollbackReadiness = {
+          canRollback: Boolean(depStatus?.current || depStatus?.previous),
+          currentReleaseId: depStatus?.current?.id || null,
+          previousReleaseId: depStatus?.previous?.id || null,
+          linkedDatabasesCount: linkedDbs.length,
+          autoRollbackOnFailure: args.autoRollbackOnFailure !== false
+        };
+
+        Object.assign(target, {
+          projectId: project.id,
+          projectName: project.name,
+          serverId: targetServer,
+          commit: args.commit || null,
+          secretScanMode
+        });
+        effects.push(`Ejecutará pre-flight secret scan (${secretScanMode}), desplegará '${project.name}' en '${targetServer}', correrá ${plannedSmokeChecks.length} smoke check(s) y capturará métricas post-despliegue.`);
+        if (rollbackReadiness.canRollback && args.autoRollbackOnFailure !== false) {
+          effects.push(`Rollback automático listo hacia release '${rollbackReadiness.currentReleaseId || rollbackReadiness.previousReleaseId}' si los smoke checks fallan.`);
+        }
+        if (secretScan.blocked) {
+          blockers.push('SECRET_LEAK_DETECTED');
+          warnings.push(`Secret scanner detectó ${secretScan.summary.critical} hallazgo(s) críticos y ${secretScan.summary.high} altos. Mueve los secretos a \${vault.KEY}.`);
+        } else if (secretScan.summary.total > 0) {
+          warnings.push(`Secret scanner reportó ${secretScan.summary.total} aviso(s) no bloqueantes.`);
+        }
+        if (freeze.frozen && !args.overrideFreeze) {
+          blockers.push('DEPLOY_FREEZE_ACTIVE');
+          warnings.push(`Ventana de deploy freeze activa${freeze.activeWindow?.reason ? `: ${freeze.activeWindow.reason}` : ''}.`);
+        }
+        if (!rollbackReadiness.canRollback) {
+          warnings.push('No existe release previa activa: es el primer despliegue (no habrá rollback automático disponible hasta completar el primero).');
+        }
+        if (project.maintenanceMode) {
+          warnings.push('El proyecto está en modo mantenimiento (HTTP 503).');
+        }
+
+        preview.freeze = freeze;
+        preview.domains = domains;
+        preview.plannedSmokeChecks = plannedSmokeChecks;
+        riskLevel = 'high';
+        reversible = rollbackReadiness.canRollback;
+
+        if (blockers.length === 0) {
+          const minted = this.mintRemediationToken(principal, { ...args, action: 'ship_and_verify' });
+          return {
+            phase: 'dry_run_plan',
+            dryRun: true,
+            executed: false,
+            verified: false,
+            tool: toolName,
+            projectId: project.id,
+            wouldExecute: true,
+            riskLevel,
+            reversible,
+            target,
+            effects,
+            blockers,
+            warnings,
+            preview,
+            secretScan,
+            rollbackReadiness,
+            deployment: null,
+            smokeVerification: null,
+            metricsSnapshot: null,
+            rollbackExecuted: false,
+            rollbackResult: null,
+            confirmToken: minted.confirmToken,
+            confirmTokenExpiresAt: minted.confirmTokenExpiresAt,
+            nextStep: `Plan verificado (0 secretos bloqueantes). Confirma y ejecuta culkibo_ship_and_verify con los mismos parámetros, dryRun: false y confirmToken: "${minted.confirmToken}" antes de ${minted.confirmTokenExpiresAt}.`
+          };
+        }
+        return {
+          phase: 'dry_run_plan',
+          dryRun: true,
+          executed: false,
+          verified: false,
+          tool: toolName,
+          projectId: project.id,
+          wouldExecute: false,
+          riskLevel,
+          reversible,
+          target,
+          effects,
+          blockers,
+          warnings,
+          preview,
+          secretScan,
+          rollbackReadiness,
+          deployment: null,
+          smokeVerification: null,
+          metricsSnapshot: null,
+          rollbackExecuted: false,
+          rollbackResult: null,
+          nextStep: `Resuelve los bloqueos (${blockers.join(', ')}) antes de confirmar culkibo_ship_and_verify.`
         };
       }
 
@@ -6310,6 +7106,26 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        // --- MCP 2026 Pioneer: Ship-and-Verify & Agent Kit Generator (2) ---
+        case 'culkibo_ship_and_verify': {
+          res = await this.executeShipAndVerify(principal, args, context);
+          break;
+        }
+
+        case 'culkibo_export_agent_kit': {
+          const targetProject = args.projectId ? projectManager.getById(String(args.projectId)) : null;
+          if (args.projectId && !targetProject) throw projectNotFoundError(args.projectId);
+          res = this.buildAgentKit({
+            target: args.target || 'all',
+            profile: args.profile || 'core',
+            serverUrl: args.serverUrl || undefined,
+            projectId: targetProject ? targetProject.id : null,
+            projectName: targetProject ? targetProject.name : null,
+            includeOpsGuide: args.includeOpsGuide !== false
+          });
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -6540,10 +7356,104 @@ class McpServer extends EventEmitter {
     };
   }
 
-  listPrompts() {
+  /**
+   * Sanea un argumento de prompt (longitud acotada, sin caracteres de control ni secretos).
+   * @param {any} raw
+   * @param {string} fallback
+   */
+  _sanitizePromptArg(raw, fallback) {
+    if (raw === undefined || raw === null) return fallback;
+    const cleaned = String(raw).replace(/[\r\n\t\0\x1b]+/g, ' ').trim().slice(0, 120);
+    if (!cleaned) return fallback;
+    if (SENSITIVE_VALUE_RE.test(cleaned)) return '[REDACTED]';
+    return cleaned;
+  }
+
+  /**
+   * Lista los prompts interactivos MCP (8 playbooks de ingeniería MCP 2026 + 5 prompts heredados).
+   * @param {any} [authOrPrincipal]
+   */
+  listPrompts(authOrPrincipal = null) {
+    const principal = normalizePrincipal(authOrPrincipal);
+    if (principal.role === 'none') return [];
     return [
+      // --- 8 Battle-Tested Interactive Engineering Playbooks (MCP 2026) ---
+      {
+        name: 'deploy_safely',
+        title: 'Deploy Safely (Pre-Flight Secret Scan → Ship → Smoke → Metrics)',
+        description: 'Playbook completo de despliegue seguro: escaneo pre-despliegue de secretos, verificación de freeze/rollback readiness, despliegue con culkibo_ship_and_verify, smoke checks y validación de métricas.',
+        arguments: [
+          { name: 'projectId', description: 'ID del proyecto a desplegar con red de seguridad', required: true },
+          { name: 'targetEnv', description: 'Entorno objetivo opcional (p. ej. production, staging)', required: false },
+          { name: 'canary', description: 'Usar despliegue canario progresivo ("true" | "false")', required: false }
+        ]
+      },
+      {
+        name: 'migrate_from_coolify',
+        title: 'Migrate from Coolify (Scan → Magic Vars & Traefik → Plan → Verify)',
+        description: 'Migración asistida sin pérdida desde Coolify: inventario read-only, traducción de variables mágicas (SERVICE_FQDN_*/SERVICE_PASSWORD_*) y etiquetas Traefik a Caddy, plan de migración y verificación.',
+        arguments: [
+          { name: 'coolifyUrl', description: 'URL base de la instancia Coolify de origen', required: true },
+          { name: 'targetServerId', description: 'ID del nodo destino en la flota (default local)', required: false }
+        ]
+      },
+      {
+        name: 'debug_production_crash',
+        title: 'Debug Production Crash (Correlate OOM/Logs/Restarts → Safe Remediate)',
+        description: 'Diagnóstico autónomo de caídas en producción con culkibo_diagnose_incident, correlación de OOMKilled/logs/restarts/uptime y remediación segura en 2 fases (dryRun + confirmToken).',
+        arguments: [
+          { name: 'projectId', description: 'ID del proyecto afectado (opcional para diagnóstico global)', required: false },
+          { name: 'hostname', description: 'Dominio afectado opcional para sondear DNS/TLS/Caddy', required: false }
+        ]
+      },
+      {
+        name: 'zero_downtime_db_upgrade',
+        title: 'Zero-Downtime DB Upgrade (Backup + Verify + DR Drill → Clone/Pooler → Cutover)',
+        description: 'Actualización de motor de base de datos sin cortes: backup cifrado + verificación + ensayo DR no destructivo, clonado/pooler en paralelo y conmutación con plan de vuelta atrás.',
+        arguments: [
+          { name: 'databaseId', description: 'ID de la base de datos gestionada a actualizar', required: true },
+          { name: 'targetVersion', description: 'Versión o imagen objetivo (p. ej. postgres:17)', required: false }
+        ]
+      },
+      {
+        name: 'security_audit_stack',
+        title: 'Security Audit Stack (Audit Chain + Secret Scan + RBAC/2FA/OIDC + TLS)',
+        description: 'Auditoría integral de seguridad: integridad de cadena SHA-256 de auditoría, escaneo de secretos en proyectos, postura RBAC/2FA/OIDC/tokens, exposición de BDs y caducidad TLS.',
+        arguments: [
+          { name: 'scope', description: 'Alcance opcional ("instance" o projectId concreto)', required: false }
+        ]
+      },
+      {
+        name: 'setup_wildcard_tls_and_tunnel',
+        title: 'Setup Wildcard TLS & Zero-Open-Ports Tunnel (Multi-DNS-01 / Cloudflare CGNAT)',
+        description: 'Configura certificados comodín *.dominio.com por ACME DNS-01 multi-dominio en Caddy o acceso sin puertos abiertos tras CGNAT con Cloudflare Tunnel y verificación TLS real.',
+        arguments: [
+          { name: 'rootDomain', description: 'Dominio raíz para wildcard/túnel (p. ej. miempresa.com)', required: true },
+          { name: 'mode', description: 'Modo deseado: "dns01", "tunnel" o "hybrid"', required: false }
+        ]
+      },
+      {
+        name: 'optimize_ram_and_costs',
+        title: 'Optimize RAM & VPS Costs (Sleep Advisor + Cost Advisor + Right-Sizing)',
+        description: 'Reduce consumo de RAM y factura VPS combinando culkibo_cost_advisor, políticas Smart Sleep para servicios inactivos, ajuste de límites de contenedores y poda segura de BuildKit.',
+        arguments: [
+          { name: 'monthlyServerCostEur', description: 'Coste mensual actual del VPS en EUR para estimar ahorro real', required: false }
+        ]
+      },
+      {
+        name: 'disaster_recovery_drill',
+        title: 'Disaster Recovery Drill (AES-256-GCM Verify + Non-Destructive Restore)',
+        description: 'Simulacro no destructivo de recuperación ante desastres: verifica backups cifrados AES-256-GCM y checksums SHA-256, ejecuta dryRun de restauración y valida RTO/RPO sin tocar producción.',
+        arguments: [
+          { name: 'databaseId', description: 'ID de base de datos objetivo para el simulacro DR (opcional)', required: false },
+          { name: 'projectId', description: 'ID de proyecto opcional para verificar respaldo integral', required: false }
+        ]
+      },
+
+      // --- 5 Prompts heredados (compatibilidad 100% con clientes previos) ---
       {
         name: 'debug-failed-deploy',
+        title: 'Debug Failed Deploy (Legacy)',
         description: 'Guía paso a paso para diagnosticar un despliegue fallido, leer sus logs, comprobar Docker/disco y proponer un fix seguro.',
         arguments: [
           { name: 'projectId', description: 'ID del proyecto que falló al desplegar', required: true }
@@ -6551,6 +7461,7 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'zero-downtime-release',
+        title: 'Zero-Downtime Release (Legacy)',
         description: 'Checklist operativo para lanzar una nueva versión en producción sin cortes y con plan de rollback instantáneo.',
         arguments: [
           { name: 'projectId', description: 'ID del proyecto a liberar en Citadel', required: true }
@@ -6558,11 +7469,13 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'audit-security-tls',
+        title: 'Audit Security & TLS (Legacy)',
         description: 'Audita la postura de seguridad del servidor: TLS/HTTPS, Basic Auth, exposición de BDs, Doctor del sistema y alertas.',
         arguments: []
       },
       {
         name: 'culkibo_multi_server_rollout',
+        title: 'Multi-Server Progressive Rollout',
         description: 'Orquesta un despliegue progresivo multi-servidor verificando flota SSH, ventanas de freeze, previsualización dryRun, canary y smoke tests con auto-rollback.',
         arguments: [
           { name: 'projectId', description: 'ID del proyecto a desplegar en la flota', required: true },
@@ -6572,6 +7485,7 @@ class McpServer extends EventEmitter {
       },
       {
         name: 'culkibo_incident_triage',
+        title: 'Production Incident Triage',
         description: 'Triaje sistemático de incidentes en producción usando uptime, pods, flota, diagnóstico de dominio, logs, cost advisor y conflictos de LiveSync.',
         arguments: [
           { name: 'projectId', description: 'ID del proyecto afectado (opcional)', required: false },
@@ -6581,8 +7495,211 @@ class McpServer extends EventEmitter {
     ];
   }
 
-  getPrompt(name, args = {}) {
-    const pid = args && args.projectId ? String(args.projectId) : '<projectId>';
+  /**
+   * Devuelve el guion paso a paso de un prompt/playbook MCP con argumentos saneados.
+   * @param {string} name
+   * @param {Record<string, any>} [args]
+   * @param {{ auth?: any }} [context]
+   */
+  getPrompt(name, args = {}, context = {}) {
+    const principal = normalizePrincipal(context && context.auth ? context.auth : null);
+    if (principal.role === 'none') {
+      throw new McpToolError('FORBIDDEN', 'Acceso denegado a prompts/get para credencial no autenticada o revocada.', {
+        retryable: false,
+        remediation: 'Autentícate con un token válido antes de consultar playbooks MCP.'
+      });
+    }
+    const safeArgs = args && typeof args === 'object' ? args : {};
+    const pid = this._sanitizePromptArg(safeArgs.projectId, '<projectId>');
+
+    if (name === 'deploy_safely') {
+      const envName = this._sanitizePromptArg(safeArgs.targetEnv, 'production');
+      const useCanary = String(safeArgs.canary || '').toLowerCase() === 'true';
+      return {
+        description: 'Playbook de despliegue seguro: secret scan pre-despliegue → ship → smoke check → verificación de métricas',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **deploy_safely** para el proyecto \`${pid}\` (entorno \`${envName}\`${useCanary ? ', modo canary progresivo' : ''}):`,
+                '1) **Inspección previa**: llama a `culkibo_get_project`, `culkibo_deploy_strategy` y `culkibo_deploy_freeze` (`action: "list"`) para confirmar configuración, estrategia y ausencia de ventanas de congelación.',
+                '2) **Pre-flight Secret Scan y Plan (Fase 1)**: llama a `culkibo_ship_and_verify` con `{ projectId: "' + pid + '", dryRun: true, secretScanMode: "block" }`. Verifica que `secretScan.blocked === false` (0 secretos hardcoded; si hay fugas, muévelas a `${vault.KEY}`), comprueba `rollbackReadiness` y revisa el `confirmToken` HMAC-SHA256 emitido.',
+                '3) **Resguardo de BDs**: si el proyecto tiene bases de datos vinculadas (`culkibo_list_databases`), crea copia previa con `culkibo_database_backup`.',
+                useCanary
+                  ? '4) **Rollout progresivo + Smoke Guard**: tras confirmación explícita del usuario, lanza `culkibo_canary_rollout` (`action: "start"`, `steps: [10, 50, 100]`, `autoRollbackOnSmokeFail: true`) validando cada paso con `culkibo_smoke_test_run`.'
+                  : '4) **Despliegue y verificación autónoma (Fase 2)**: tras confirmación explícita del usuario, llama a `culkibo_ship_and_verify` con `dryRun: false`, el `confirmToken` recibido, `runSmokeTests: true` y `autoRollbackOnFailure: true`.',
+                '5) **Validación final**: revisa `smokeVerification`, `metricsSnapshot`, `culkibo_get_container_logs` y `culkibo_get_observability`. Resume estado de la release, latencia smoke y comando de rollback listo (`culkibo_rollback_deployment`).'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
+    if (name === 'migrate_from_coolify') {
+      const coolifyUrl = this._sanitizePromptArg(safeArgs.coolifyUrl, 'https://coolify.tu-dominio.com');
+      const targetServerId = this._sanitizePromptArg(safeArgs.targetServerId, 'local');
+      return {
+        description: 'Migración paso a paso desde Coolify con traducción de variables mágicas y Traefik → Caddy',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **migrate_from_coolify** desde \`${coolifyUrl}\` hacia el nodo \`${targetServerId}\`:`,
+                '1) **Inventario en solo lectura**: solicita al usuario el API token de Coolify (nunca lo guardes en archivos ni logs) y ejecuta `culkibo_migrate_coolify` con `{ coolifyUrl: "' + coolifyUrl + '", mode: "preview" }` para listar aplicaciones, bases de datos y servicios Compose.',
+                '2) **Revisión de traducción mágica y Traefik**: analiza el preview verificando cómo se traducen variables mágicas (`SERVICE_FQDN_*`, `SERVICE_URL_*`, `SERVICE_PASSWORD_*`, `SERVICE_USER_*`) y reglas Traefik (`traefik.http.routers.*`, middlewares, strip-prefix, Basic Auth) hacia rutas nativas Caddy + `${vault.KEY}`.',
+                '3) **Capacidad y plan de corte**: sondea el nodo destino con `culkibo_fleet_probe_server` (`serverId: "' + targetServerId + '"`) y `culkibo_cost_advisor`; presenta al usuario el plan exacto (qué apps, BDs y servicios importar) para aprobación.',
+                '4) **Importación selectiva**: ejecuta `culkibo_migrate_coolify` con `mode: "import"` sobre los recursos aprobados, vincula bases de datos con `culkibo_link_database` y verifica que no existan secretos en claro en `culkibo_gitops_export`.',
+                '5) **Verificación post-migración**: reconcilia Caddy con `culkibo_reconcile_ingress`, comprueba DNS/TLS real con `culkibo_diagnose_domain` y ejecuta `culkibo_smoke_test_run` sobre cada app antes de cambiar DNS definitivo.'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
+    if (name === 'debug_production_crash') {
+      const hostHint = safeArgs.hostname ? ` y dominio \`${this._sanitizePromptArg(safeArgs.hostname, '')}\`` : '';
+      return {
+        description: 'Diagnóstico autónomo de crash en producción: correlación OOM/logs/restarts y remediación segura',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **debug_production_crash** para \`${pid}\`${hostHint}:`,
+                '1) **Diagnóstico correlacionado**: ejecuta `culkibo_diagnose_incident` (con `projectId`, `hostname` si aplica, `logLines: 150`, `includeDoctor: true`) para correlacionar `OOMKilled`, `RestartCount`, estado de healthcheck, último despliegue, logs redactados, monitores de uptime, presión de RAM/Smart Sleep, System Doctor, flota SSH y conflictos LiveSync.',
+                '2) **Aislamiento de causa raíz**: si aparece `CONTAINER_OOM_KILLED`, `CONTAINER_CRASH_LOOP` o `RECENT_DEPLOY_FAILED`, inspecciona los logs exactos con `culkibo_get_container_logs` y `culkibo_get_deployment_logs`, y evalúa presión de memoria con `culkibo_cost_advisor`.',
+                '3) **Plan de remediación seguro (Fase 1)**: selecciona la acción recomendada (`rollback_release`, `restart_service`, `wake_service`, `toggle_maintenance`, `reconcile_ingress` o `doctor_fix`) y llama a `culkibo_auto_remediate` con `dryRun: true` para inspeccionar el radio de impacto y obtener el `confirmToken` HMAC-SHA256.',
+                '4) **Aplicación y verificación (Fase 2)**: explica la causa raíz con evidencia al usuario, pide confirmación explícita, aplica `culkibo_auto_remediate` con `dryRun: false`, `confirmToken` y `verifyAfter: true`, y confirma estabilidad con `culkibo_uptime_list_monitors` y `culkibo_get_observability`.'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
+    if (name === 'zero_downtime_db_upgrade') {
+      const dbId = this._sanitizePromptArg(safeArgs.databaseId, '<databaseId>');
+      const targetVer = this._sanitizePromptArg(safeArgs.targetVersion, '<targetVersion>');
+      return {
+        description: 'Actualización de base de datos sin cortes: backup + verificación + DR drill → clon/pooler → cutover',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **zero_downtime_db_upgrade** para la base de datos \`${dbId}\` hacia \`${targetVer}\`:`,
+                '1) **Inspección de línea base**: llama a `culkibo_list_databases`, `culkibo_database_inspect` (`databaseId: "' + dbId + '"`) y `culkibo_list_projects` para mapear versión actual, tamaño, tablas críticas y proyectos vinculados.',
+                '2) **Backup cifrado + Verificación**: ejecuta `culkibo_database_backup` (`databaseId: "' + dbId + '"`) y confirma con `culkibo_database_list_backups` que existe un archivo reciente con checksum SHA-256 y cifrado AES-256-GCM.',
+                '3) **Ensayo DR + Clonado en paralelo**: crea una instancia clon/staging con la versión objetivo (`culkibo_create_database`) y valida la restauración y compatibilidad de esquema/pooler antes de tocar producción (usa `culkibo_database_restore` con `dryRun: true` para planificar).',
+                '4) **Cutover controlado**: previsualiza el reenlace con `culkibo_link_database` (`dryRun: true`); si se requiere ventana breve de consistencia de escritura, coordina `culkibo_toggle_maintenance` (`dryRun: true`), conmuta el enlace a la nueva BD, redespliega con `culkibo_ship_and_verify` (`dryRun: true` → `dryRun: false`) y valida con `culkibo_smoke_test_run` + `culkibo_database_inspect`.',
+                '5) **Período de garantía**: mantén la instancia anterior detenida pero intacta (sin `deleteVolume: true`) hasta confirmar 24–72 h sin regresiones.'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
+    if (name === 'security_audit_stack') {
+      const scope = this._sanitizePromptArg(safeArgs.scope, 'instance');
+      return {
+        description: 'Auditoría integral de seguridad: cadena hash de auditoría, secretos, RBAC/2FA/OIDC y TLS',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **security_audit_stack** (alcance: \`${scope}\`):`,
+                '1) **Salud y endurecimiento base**: llama a `culkibo_system_doctor` y lee `culkibo://doctor` para detectar fallos de permisos, Docker, Caddy, disco o configuración insegura.',
+                '2) **Postura RBAC, Equipos, 2FA/OIDC y Tokens**: llama a `culkibo_rbac_whoami`, `culkibo_team_list_members` y `culkibo_rbac_list_tokens`. Verifica principio de mínimo privilegio (tokens acotados por `projectIds` y scopes específicos, sin tokens caducados/huérfanos, revisión de 2FA/OIDC para cuentas admin/owner).',
+                '3) **Integridad de auditoría encadenada y Escaneo de Secretos**: verifica la integridad criptográfica SHA-256 de la cadena de auditoría (`GET /api/audit/verify`), revisa `culkibo_list_projects` y ejecuta `culkibo_ship_and_verify` con `dryRun: true` (modo `block`) por proyecto para detectar credenciales hardcoded o claves de alta entropía; valida también que `culkibo_gitops_export` use `${vault.KEY}` y cero secretos en claro.',
+                '4) **TLS, Borde y Exposición de Datos**: llama a `culkibo_ingress_status` (`probe: true`), `culkibo_manage_wildcard_dns01` (`action: "list"`) y `culkibo_list_databases` para detectar certificados próximos a caducar (<14 días), dominios sin protección o bases de datos expuestas innecesariamente en `0.0.0.0`.',
+                '5) **Informe priorizado**: entrega una tabla de hallazgos P0 (crítico) a P3 (mejora) indicando la herramienta MCP exacta (`dryRun: true`) para remediar cada punto.'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
+    if (name === 'setup_wildcard_tls_and_tunnel') {
+      const rootDomain = this._sanitizePromptArg(safeArgs.rootDomain, 'example.com');
+      const mode = this._sanitizePromptArg(safeArgs.mode, 'dns01');
+      return {
+        description: 'Configuración de TLS Wildcard Multi-DNS-01 o Cloudflare Tunnel CGNAT sin puertos abiertos',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **setup_wildcard_tls_and_tunnel** para \`${rootDomain}\` (modo: \`${mode}\`):`,
+                '1) **Diagnóstico de capacidades**: llama a `culkibo_ingress_status`, `culkibo_get_remote_access` y `culkibo_system_doctor` para comprobar si Caddy tiene plugin DNS-01 disponible, si el servidor tiene IP pública o está detrás de CGNAT, y el estado de Cloudflare.',
+                '2) **Opción A — Wildcard Multi-DNS-01 (`*.' + rootDomain + '`)**: revisa políticas actuales con `culkibo_manage_wildcard_dns01` (`action: "list"`), previsualiza con `culkibo_manage_wildcard_dns01` (`action: "add"`, `domain: "' + rootDomain + '"`, `includeApex: true`, `dryRun: true`) asegurándote de referenciar el token por variable de entorno (`CF_API_TOKEN`) y nunca en claro.',
+                '3) **Opción B — CGNAT / Zero-Open-Ports (Cloudflare Tunnel)**: verifica túneles activos en `culkibo_get_remote_access`, registra los hostnames con `culkibo_manage_domain` (`cloudflareProxied: true`, `dryRun: true` → aplicar) sin abrir puertos 80/443 en el firewall del host.',
+                '4) **Reconciliación y sonda TLS real**: ejecuta `culkibo_reconcile_ingress` (tras confirmación) y verifica DNS + cadena X.509 real con `culkibo_diagnose_domain` y `culkibo_inspect_ingress` sobre `' + rootDomain + '` y un subdominio de prueba (`app.' + rootDomain + '`).'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
+    if (name === 'optimize_ram_and_costs') {
+      const costHint = safeArgs.monthlyServerCostEur
+        ? ` (coste VPS actual: ${this._sanitizePromptArg(safeArgs.monthlyServerCostEur, '20')} EUR/mes)`
+        : '';
+      return {
+        description: 'Optimización de RAM y costes VPS con Cost Advisor, Smart Sleep y ajuste de límites',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **optimize_ram_and_costs**${costHint}:`,
+                '1) **Telemetría y análisis económico**: ejecuta `culkibo_cost_advisor`' + (safeArgs.monthlyServerCostEur ? ` con \`monthlyServerCostEur: ${Number(safeArgs.monthlyServerCostEur) || 20}\`` : '') + ' junto a `culkibo_get_observability` para cuantificar RAM libre, RAM recuperable (`reclaimableRamMb`) y ahorro mensual estimado.',
+                '2) **Inventario de servicios inactivos y límites**: llama a `culkibo_sleep_status`, `culkibo_docker_containers` y `culkibo_list_databases` para identificar previews/staging ociosos, contenedores sobredimensionados y caché BuildKit acumulada.',
+                '3) **Simulación sin riesgo**: para cada candidato seguro (evitando servicios críticos con tráfico continuo), previsualiza Smart Sleep con `culkibo_sleep_manage` (`action: "configure"`, `idleMinutes: 30`, `dryRun: true`) y limpieza de caché con `culkibo_prune_build_cache` (`dryRun: true`).',
+                '4) **Plan de right-sizing**: presenta al usuario el ahorro total proyectado en MB y EUR/mes, los límites `memoryMb`/CPU recomendados por contenedor y solicita aprobación antes de aplicar cada cambio.'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
+    if (name === 'disaster_recovery_drill') {
+      const dbId = this._sanitizePromptArg(safeArgs.databaseId, '<databaseId>');
+      return {
+        description: 'Simulacro no destructivo de Disaster Recovery: verificación AES-256-GCM y restore drill',
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: [
+                `Ejecuta el playbook **disaster_recovery_drill** (BD: \`${dbId}\`, proyecto: \`${pid}\`):`,
+                '1) **Auditoría de backups existentes**: llama a `culkibo_list_backups`, `culkibo_list_databases` y `culkibo_database_list_backups` para comprobar frecuencia programada (`schedule`), retención, disponibilidad local/S3, cifrado AES-256-GCM y checksum SHA-256.',
+                '2) **Snapshot de verificación**: genera un backup fresco con `culkibo_database_backup` (y opcionalmente un snapshot de configuración redactado con `culkibo_export_instance_snapshot`, `includeSecrets: false`).',
+                '3) **Simulacro de restauración NO destructivo**: ejecuta primero `culkibo_database_restore` con `dryRun: true` y `createSafetySnapshot: true` para verificar referencias y validar que producción no se sobrescribe sin snapshot de seguridad; para ensayo real completo, aprovisiona una BD temporal aislada (`culkibo_create_database`), restaura en ella y verifica tablas/latencia con `culkibo_database_inspect`.',
+                '4) **Informe RTO/RPO y limpieza**: documenta tiempos de backup/restore (RTO real), antigüedad del último respaldo (RPO real), integridad verificada y elimina la BD temporal de ensayo con `culkibo_delete_database` (`dryRun: true` → confirmar).'
+              ].join('\n')
+            }
+          }
+        ]
+      };
+    }
+
     if (name === 'debug-failed-deploy') {
       return {
         description: 'Diagnóstico sistemático de despliegue fallido en Culkibo',
@@ -6626,8 +7743,8 @@ class McpServer extends EventEmitter {
       };
     }
     if (name === 'culkibo_multi_server_rollout') {
-      const targetServers = args && args.targetServers ? String(args.targetServers) : 'los nodos configurados en la flota';
-      const canarySteps = args && args.canarySteps ? String(args.canarySteps) : '10, 50, 100';
+      const targetServers = this._sanitizePromptArg(safeArgs.targetServers, 'los nodos configurados en la flota');
+      const canarySteps = this._sanitizePromptArg(safeArgs.canarySteps, '10, 50, 100');
       return {
         description: 'Despliegue progresivo multi-servidor con canary, smoke tests y dryRun',
         messages: [
@@ -6642,7 +7759,7 @@ class McpServer extends EventEmitter {
       };
     }
     if (name === 'culkibo_incident_triage') {
-      const hostHint = args && args.hostname ? ` y dominio ${String(args.hostname)}` : '';
+      const hostHint = safeArgs.hostname ? ` y dominio ${this._sanitizePromptArg(safeArgs.hostname, '')}` : '';
       return {
         description: 'Triaje sistemático de incidentes en producción con diagnóstico correlacionado y remediación segura',
         messages: [
@@ -6723,7 +7840,11 @@ class McpServer extends EventEmitter {
         id: safeId,
         result: {
           protocolVersion: LEGACY_PROTOCOL_VERSION,
-          capabilities: { tools: {}, resources: {}, prompts: {} },
+          capabilities: {
+            tools: { listChanged: false },
+            resources: { listChanged: false },
+            prompts: { listChanged: false }
+          },
           serverInfo: SERVER_INFO,
           instructions: `Este endpoint habla la revisión ${LEGACY_PROTOCOL_VERSION}, deprecada. Culkibo ya sirve la revisión ${PROTOCOL_VERSION} en POST /api/mcp (Streamable HTTP, sin handshake).`
         }
@@ -6782,12 +7903,12 @@ class McpServer extends EventEmitter {
     }
 
     if (method === 'prompts/list') {
-      return { jsonrpc: '2.0', id, result: { prompts: this.listPrompts() } };
+      return { jsonrpc: '2.0', id, result: { prompts: this.listPrompts(context.auth) } };
     }
 
     if (method === 'prompts/get') {
       try {
-        return { jsonrpc: '2.0', id, result: this.getPrompt(params?.name, params?.arguments || {}) };
+        return { jsonrpc: '2.0', id, result: this.getPrompt(params?.name, params?.arguments || {}, { auth: context.auth }) };
       } catch (err) {
         return { jsonrpc: '2.0', id, error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message } };
       }
@@ -6825,10 +7946,10 @@ class McpServer extends EventEmitter {
           prompts: { listChanged: false }
         },
         instructions: [
-          'Culkibo es un orquestador cloud autohospedado (MCP 2.1: 107 herramientas anotadas, 7 recursos y 5 prompts). Gestiona proyectos, pods (The Forge y The Citadel), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, diagnóstico autónomo de incidentes y remediación segura.',
-          'Para reducir el consumo de contexto en >=80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all, usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
-          'Para incidentes en producción llama primero a culkibo_diagnose_incident y aplica fixes seguros en dos fases con culkibo_auto_remediate (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false).',
-          'Las herramientas destructivas y de despliegue soportan dryRun: true para previsualizar el radio de impacto (DryRunPlan) sin mutar estado ni disparar webhooks; confírmalas siempre con la persona usuaria antes de aplicarlas.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026: 109 herramientas anotadas, 7 recursos y 13 prompts incluyendo 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
+          'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',
+          'Usa prompts/list para acceder a los 8 playbooks interactivos (deploy_safely, migrate_from_coolify, debug_production_crash, zero_downtime_db_upgrade, security_audit_stack, setup_wildcard_tls_and_tunnel, optimize_ram_and_costs, disaster_recovery_drill) y culkibo_export_agent_kit para generar configs drop-in sin secretos en claro.',
           'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation: úsalo para decidir si reintentar o corregir los argumentos.'
         ].join(' '),
         ttlMs: 300000,
@@ -6932,12 +8053,16 @@ class McpServer extends EventEmitter {
     }
 
     if (method === 'prompts/list') {
-      return ok({ prompts: this.listPrompts(), ttlMs: 60000, cacheScope: 'public' });
+      return ok({
+        prompts: this.listPrompts(principal),
+        ttlMs: principal.isSuperAdmin ? 60000 : 0,
+        cacheScope: principal.isSuperAdmin ? 'public' : 'private'
+      });
     }
 
     if (method === 'prompts/get') {
       try {
-        return ok(this.getPrompt(params?.name, params?.arguments || {}));
+        return ok(this.getPrompt(params?.name, params?.arguments || {}, { auth: context.auth }));
       } catch (err) {
         return {
           jsonrpc: '2.0',
@@ -6958,18 +8083,20 @@ class McpServer extends EventEmitter {
     };
   }
 
-  getClientConfigs(serverUrl = 'http://localhost:3030', { includeAuthPlaceholder = false, profile = 'all' } = {}) {
+  getClientConfigs(serverUrl = 'http://localhost:3030', { includeAuthPlaceholder = false, profile = 'core' } = {}) {
     const cleanUrl = String(serverUrl || 'http://localhost:3030').replace(/\/+$/, '');
     const cliEntry = path.resolve(__dirname, '..', '..', 'bin', 'culkibo.js');
     const isRemote = !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(cleanUrl);
     const needAuth = includeAuthPlaceholder || isRemote;
-    const remoteHeaders = needAuth ? { Authorization: 'Bearer TU_CULKIBO_TOKEN' } : undefined;
-    const safeProfile = VALID_TOOL_PROFILES.includes(/** @type {any} */ (String(profile || 'all').toLowerCase()))
-      ? String(profile || 'all').toLowerCase()
-      : 'all';
+    const tokenPlaceholder = '${CULKIBO_TOKEN}';
+    const remoteHeaders = needAuth ? { Authorization: `Bearer ${tokenPlaceholder}` } : undefined;
+    const safeProfile = VALID_TOOL_PROFILES.includes(/** @type {any} */ (String(profile || 'core').toLowerCase()))
+      ? String(profile || 'core').toLowerCase()
+      : 'core';
     const mcpEndpoint = safeProfile !== 'all'
       ? `${cleanUrl}/api/mcp?profile=${safeProfile}`
       : `${cleanUrl}/api/mcp`;
+    const kit = this.buildAgentKit({ target: 'all', profile: safeProfile, serverUrl: cleanUrl, includeOpsGuide: true });
 
     return {
       claudeDesktop: {
@@ -6980,12 +8107,13 @@ class McpServer extends EventEmitter {
             env: {
               CULKIBO_API_URL: cleanUrl,
               ...(safeProfile !== 'all' ? { CULKIBO_MCP_PROFILE: safeProfile } : {}),
-              ...(needAuth ? { CULKIBO_TOKEN: 'TU_CULKIBO_TOKEN' } : {})
+              ...(needAuth ? { CULKIBO_TOKEN: tokenPlaceholder } : {})
             }
           }
         }
       },
       // Clientes con transporte HTTP: el endpoint moderno, un solo POST.
+      antigravity: kit.kits.antigravity.config,
       cursorOrWindsurf: {
         mcpServers: {
           culkibo: {
@@ -6994,6 +8122,7 @@ class McpServer extends EventEmitter {
           }
         }
       },
+      windsurf: kit.kits.windsurf.config,
       vscodeCopilot: {
         servers: {
           culkibo: {
@@ -7003,9 +8132,16 @@ class McpServer extends EventEmitter {
           }
         }
       },
+      claudeCodeMcpJson: kit.kits['claude-code'].config,
+      claudeMdSnippet: kit.kits['claude-code'].claudeMdSnippet,
+      codexCli: {
+        toml: kit.kits.codex.config,
+        command: kit.kits.codex.cliCommand
+      },
       claudeCodeCli: needAuth
-        ? `claude mcp add --transport http culkibo "${mcpEndpoint}" --header "Authorization: Bearer TU_CULKIBO_TOKEN"`
+        ? `claude mcp add --transport http culkibo "${mcpEndpoint}" --header "Authorization: Bearer ${tokenPlaceholder}"`
         : `claude mcp add --transport http culkibo "${mcpEndpoint}"`,
+      agentKit: kit,
       // Solo para clientes que aún no hablan 2026-07-28. Ver README.
       legacySse: {
         deprecated: true,
@@ -7024,6 +8160,8 @@ class McpServer extends EventEmitter {
         endpoint: mcpEndpoint,
         profile: safeProfile,
         profiles: VALID_TOOL_PROFILES,
+        tokenPlaceholder,
+        tokenSavings: kit.tokenSavings,
         legacyEndpoint: `${cleanUrl}/api/mcp/sse`,
         wsUrl: `${cleanUrl.replace(/^http/, 'ws')}/ws/sync`
       }

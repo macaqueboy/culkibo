@@ -24,6 +24,7 @@ const WebSocket = require('ws');
 
 const pkg = require('../package.json');
 const mcpServer = require('../server/services/mcpServer');
+const { resolveToken } = require('../server/middleware/auth');
 
 const CADDY_IDLE_RSS_ESTIMATE_MB = 18;
 
@@ -157,17 +158,36 @@ async function run({ silent = false, concurrency = 500, workers = 25, wsClients 
     // conexiones TCP keep-alive persistentes (sin alterar ni restar latencia).
     const endpoints = ['/api/health', '/api/projects', '/api/catalog', '/api/pods'];
     const agent = new http.Agent({ keepAlive: true, maxSockets: workers });
-    const httpGet = (ep) => new Promise((resolve) => {
+    const httpGet = (ep, extraHeaders = {}) => new Promise((resolve) => {
       const t0 = process.hrtime.bigint();
-      const req = http.request({ host: '127.0.0.1', port, path: ep, method: 'GET', agent }, (res) => {
-        res.on('data', () => {});
+      const req = http.request({ host: '127.0.0.1', port, path: ep, method: 'GET', agent, headers: extraHeaders }, (res) => {
+        let bytes = 0;
+        res.on('data', (chunk) => { bytes += chunk.length; });
         res.on('end', () => {
-          resolve({ ok: (res.statusCode || 500) < 400, ms: Number(process.hrtime.bigint() - t0) / 1e6 });
+          resolve({
+            ok: (res.statusCode || 500) < 400,
+            status: res.statusCode || 0,
+            bytes,
+            encoding: res.headers['content-encoding'] || null,
+            serverTiming: res.headers['server-timing'] || null,
+            ms: Number(process.hrtime.bigint() - t0) / 1e6
+          });
         });
       });
-      req.on('error', () => resolve({ ok: false, ms: Number(process.hrtime.bigint() - t0) / 1e6 }));
+      req.on('error', () => resolve({ ok: false, status: 0, bytes: 0, encoding: null, serverTiming: null, ms: Number(process.hrtime.bigint() - t0) / 1e6 }));
       req.end();
     });
+
+    // Medición honesta de carga del catálogo (frío en 1ª petición -> caliente comprimido Brotli)
+    const catalogColdRaw = await httpGet('/api/catalog');
+    const catalogColdBr = await httpGet('/api/catalog', { 'Accept-Encoding': 'br, gzip' });
+    /** @type {number[]} */
+    const catalogWarmSamples = [];
+    for (let i = 0; i < 40; i++) {
+      const r = await httpGet('/api/catalog', { 'Accept-Encoding': 'br, gzip' });
+      if (r.ok) catalogWarmSamples.push(r.ms);
+    }
+    catalogWarmSamples.sort((a, b) => a - b);
 
     // Calentamiento (1 ronda por endpoint para JIT y sockets keep-alive).
     for (const ep of endpoints) await httpGet(ep);
@@ -176,6 +196,8 @@ async function run({ silent = false, concurrency = 500, workers = 25, wsClients 
     const reqLatencies = [];
     let reqFailures = 0;
     let nextIdx = 0;
+    /** @type {string | null} */
+    let observedServerTiming = null;
 
     const batchStart = process.hrtime.bigint();
     await Promise.all(Array.from({ length: Math.min(workers, concurrency) }, async () => {
@@ -183,13 +205,58 @@ async function run({ silent = false, concurrency = 500, workers = 25, wsClients 
         const idx = nextIdx++;
         if (idx >= concurrency) break;
         const res = await httpGet(endpoints[idx % endpoints.length]);
+        if (!observedServerTiming && res.serverTiming) observedServerTiming = String(res.serverTiming);
         if (!res.ok) reqFailures++;
         else reqLatencies.push(res.ms);
       }
     }));
     const batchMs = Number(process.hrtime.bigint() - batchStart) / 1e6;
-    agent.destroy();
     const sortedReq = [...reqLatencies].sort((a, b) => a - b);
+
+    // Concurrencia pura sobre /api/health (mide techo real de latencia del plano de control)
+    /** @type {number[]} */
+    const healthLatencies = [];
+    let healthFailures = 0;
+    let healthIdx = 0;
+    const healthStart = process.hrtime.bigint();
+    await Promise.all(Array.from({ length: Math.min(workers, concurrency) }, async () => {
+      while (true) {
+        const idx = healthIdx++;
+        if (idx >= concurrency) break;
+        const res = await httpGet('/api/health');
+        if (!res.ok) healthFailures++;
+        else healthLatencies.push(res.ms);
+      }
+    }));
+    const healthTotalMs = Number(process.hrtime.bigint() - healthStart) / 1e6;
+    healthLatencies.sort((a, b) => a - b);
+
+    // Concurrencia autenticada real (Bearer token + Accept-Encoding: br, gzip) sobre rutas calientes
+    const masterToken = resolveToken();
+    const authHeaders = {
+      Authorization: `Bearer ${masterToken}`,
+      'Accept-Encoding': 'br, gzip'
+    };
+    const authedEndpoints = ['/api/health', '/api/projects', '/api/catalog', '/api/system/status'];
+    for (const ep of authedEndpoints) await httpGet(ep, authHeaders);
+
+    /** @type {number[]} */
+    const authedLatencies = [];
+    let authedFailures = 0;
+    let authedIdx = 0;
+    const authedStart = process.hrtime.bigint();
+    await Promise.all(Array.from({ length: Math.min(workers, concurrency) }, async () => {
+      while (true) {
+        const idx = authedIdx++;
+        if (idx >= concurrency) break;
+        const res = await httpGet(authedEndpoints[idx % authedEndpoints.length], authHeaders);
+        if (!res.ok) authedFailures++;
+        else authedLatencies.push(res.ms);
+      }
+    }));
+    const authedTotalMs = Number(process.hrtime.bigint() - authedStart) / 1e6;
+    authedLatencies.sort((a, b) => a - b);
+    agent.destroy();
 
     // Fan-out WebSocket simultáneo
     const sockets = [];
@@ -233,6 +300,39 @@ async function run({ silent = false, concurrency = 500, workers = 25, wsClients 
         p95Ms: percentile(sortedReq, 95),
         p99Ms: percentile(sortedReq, 99)
       },
+      healthHttp: {
+        requests: concurrency,
+        workers,
+        failures: healthFailures,
+        totalMs: Number(healthTotalMs.toFixed(1)),
+        rps: Math.round((concurrency / healthTotalMs) * 1000),
+        p50Ms: percentile(healthLatencies, 50),
+        p95Ms: percentile(healthLatencies, 95),
+        p99Ms: percentile(healthLatencies, 99)
+      },
+      authenticatedFastPathHttp: {
+        requests: concurrency,
+        workers,
+        failures: authedFailures,
+        totalMs: Number(authedTotalMs.toFixed(1)),
+        rps: Math.round((concurrency / authedTotalMs) * 1000),
+        p50Ms: percentile(authedLatencies, 50),
+        p95Ms: percentile(authedLatencies, 95),
+        p99Ms: percentile(authedLatencies, 99),
+        encoding: 'br/gzip'
+      },
+      catalogLoad: {
+        coldRawMs: Number(catalogColdRaw.ms.toFixed(2)),
+        coldBrotliMs: Number(catalogColdBr.ms.toFixed(2)),
+        warmP50Ms: percentile(catalogWarmSamples, 50),
+        warmP95Ms: percentile(catalogWarmSamples, 95),
+        rawBytes: catalogColdRaw.bytes,
+        brotliBytes: catalogColdBr.bytes,
+        brotliSavedPct: catalogColdRaw.bytes > 0
+          ? Number((((catalogColdRaw.bytes - catalogColdBr.bytes) / catalogColdRaw.bytes) * 100).toFixed(1))
+          : 0
+      },
+      serverTimingHeader: observedServerTiming,
       websocketFanout: {
         clients: wsClients,
         delivered: initialStateReceived,
@@ -261,6 +361,10 @@ async function run({ silent = false, concurrency = 500, workers = 25, wsClients 
       console.log('    Kamal 2 (CLI/SSH-only)     0 MB panel (+15–25 MB kamal-proxy)');
       console.log(`  CPU en reposo                ${summary.idleCpuPercent ?? 0} %`);
       console.log(`  Concurrencia HTTP (${concurrency})      p50 ${summary.httpConcurrency.p50Ms} ms · p95 ${summary.httpConcurrency.p95Ms} ms · p99 ${summary.httpConcurrency.p99Ms} ms · ${summary.httpConcurrency.rps} req/s · ${summary.httpConcurrency.failures} fallos`);
+      console.log(`  Salud /api/health (${concurrency})      p50 ${summary.healthHttp.p50Ms} ms · p95 ${summary.healthHttp.p95Ms} ms · p99 ${summary.healthHttp.p99Ms} ms · ${summary.healthHttp.rps} req/s`);
+      console.log(`  Auth Bearer+Brotli (${concurrency})     p50 ${summary.authenticatedFastPathHttp.p50Ms} ms · p95 ${summary.authenticatedFastPathHttp.p95Ms} ms · p99 ${summary.authenticatedFastPathHttp.p99Ms} ms · ${summary.authenticatedFastPathHttp.rps} req/s`);
+      console.log(`  Catálogo /api/catalog        frío ${summary.catalogLoad.coldRawMs} ms · warm p50 ${summary.catalogLoad.warmP50Ms} ms (${summary.catalogLoad.rawBytes} B → ${summary.catalogLoad.brotliBytes} B br, -${summary.catalogLoad.brotliSavedPct}%)`);
+      console.log(`  Cabecera Server-Timing       ${summary.serverTimingHeader || 'n/d'}`);
       console.log(`  WebSocket fan-out (${wsClients})       ${summary.websocketFanout.delivered}/${wsClients} clientes listos en ${summary.websocketFanout.totalMs} ms`);
       console.log(`  Dependencias de runtime      ${summary.footprint.runtimeDependencies}`);
       console.log(`  Superficie MCP 2026-07-28    ${summary.footprint.mcpToolsTotal} herramientas (${summary.footprint.mcpToolsMutating} de escritura)\n`);

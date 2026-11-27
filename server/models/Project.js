@@ -3,8 +3,73 @@ const crypto = require('crypto');
 const PROJECT_ID_RE = /^[a-zA-Z0-9_-]{1,80}$/;
 const SERVER_ID_RE = /^[a-z0-9_-]{1,64}$/;
 const TEAM_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const FORBIDDEN_MAP_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const SMOKE_HEADER_BLOCKLIST = /^(host|connection|content-length|transfer-encoding|keep-alive|te|trailer|upgrade)$/i;
 const DAY_NAME_TO_INDEX = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
+/**
+ * Normaliza un mapa clave-valor de variables de entorno o secretos de build
+ * descartando claves peligrosas (prototype pollution o nombres no-POSIX).
+ * @param {any} raw
+ * @param {number} [maxEntries]
+ * @param {number} [maxValueLen]
+ * @returns {Record<string, string>}
+ */
+function normalizeKeyValueMap(raw, maxEntries = 100, maxValueLen = 16384) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  let count = 0;
+  for (const [rawKey, rawVal] of Object.entries(raw)) {
+    if (count >= maxEntries) break;
+    const key = String(rawKey || '').trim();
+    if (!key || FORBIDDEN_MAP_KEYS.has(key) || !ENV_KEY_RE.test(key)) continue;
+    if (rawVal === undefined || rawVal === null) continue;
+    if (typeof rawVal === 'string') {
+      out[key] = rawVal.slice(0, maxValueLen);
+      count++;
+    } else if (typeof rawVal === 'number' || typeof rawVal === 'boolean') {
+      out[key] = String(rawVal);
+      count++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Normaliza un entero acotado opcional; devuelve `fallback` si está ausente.
+ * @param {any} raw
+ * @param {number} min
+ * @param {number} max
+ * @param {number | null} [fallback]
+ * @returns {number | null}
+ */
+function normalizeBoundedInt(raw, min, max, fallback = null) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const rounded = Math.round(n);
+  if (rounded < min) return min;
+  if (rounded > max) return max;
+  return rounded;
+}
+
+/**
+ * Sustituye todos los valores de un objeto de secretos por `'[REDACTED]'` sin mutarlo.
+ * @param {Record<string, any> | null | undefined} map
+ * @returns {Record<string, string>}
+ */
+function maskSecretMap(map) {
+  /** @type {Record<string, string>} */
+  const masked = {};
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return masked;
+  for (const key of Object.keys(map)) {
+    if (FORBIDDEN_MAP_KEYS.has(key)) continue;
+    masked[key] = '[REDACTED]';
+  }
+  return masked;
+}
 
 /**
  * Normaliza una entrada individual de smoke test post-despliegue.
@@ -322,9 +387,13 @@ class Project {
     // Todos se vuelven a validar en deployManager antes de tocar un argv.
     this.containerPort = data.containerPort || null;
     this.healthPath = data.healthPath || '/';
+    this.healthStartPeriodSec = normalizeBoundedInt(data.healthStartPeriodSec, 0, 300, null);
+    this.healthRetries = normalizeBoundedInt(data.healthRetries, 1, 10, null);
+    this.healthyThreshold = normalizeBoundedInt(data.healthyThreshold, 1, 5, null);
     this.memoryMb = data.memoryMb || null;
     this.cpus = data.cpus || null;
     this.buildArgs = data.buildArgs || {};
+    this.buildSecrets = normalizeKeyValueMap(data.buildSecrets);
     // Hooks pre/post despliegue ejecutados sin shell (argv puro dentro del contenedor).
     this.preDeployCommand = data.preDeployCommand || '';
     this.postDeployCommand = data.postDeployCommand || '';
@@ -340,16 +409,29 @@ class Project {
     // y vistas previas HTTPS automáticas por Pull Request / rama.
     this.maintenanceMode = Boolean(data.maintenanceMode);
     this.autoRollback = data.autoRollback !== undefined ? Boolean(data.autoRollback) : true;
-    this.previewDeployments = data.previewDeployments && typeof data.previewDeployments === 'object'
+    this.previewDeployments = data.previewDeployments && typeof data.previewDeployments === 'object' && !Array.isArray(data.previewDeployments)
       ? {
           enabled: Boolean(data.previewDeployments.enabled),
           baseDomain: String(data.previewDeployments.baseDomain || '').trim().toLowerCase(),
           maxPreviews: Math.min(20, Math.max(1, Number(data.previewDeployments.maxPreviews) || 5)),
           allowForks: Boolean(data.previewDeployments.allowForks),
           ttlHours: Math.min(720, Math.max(1, Number(data.previewDeployments.ttlHours) || 168)),
-          memoryMb: Math.min(4096, Math.max(64, Number(data.previewDeployments.memoryMb) || 512))
+          memoryMb: Math.min(4096, Math.max(64, Number(data.previewDeployments.memoryMb) || 512)),
+          envVars: normalizeKeyValueMap(data.previewDeployments.envVars),
+          buildSecrets: normalizeKeyValueMap(data.previewDeployments.buildSecrets),
+          healthTimeoutMs: normalizeBoundedInt(data.previewDeployments.healthTimeoutMs, 5000, 300000, null)
         }
-      : { enabled: false, baseDomain: '', maxPreviews: 5, allowForks: false, ttlHours: 168, memoryMb: 512 };
+      : {
+          enabled: false,
+          baseDomain: '',
+          maxPreviews: 5,
+          allowForks: false,
+          ttlHours: 168,
+          memoryMb: 512,
+          envVars: {},
+          buildSecrets: {},
+          healthTimeoutMs: null
+        };
     // Enrutamiento multi-servidor (Fleet SSH), aislamiento multi-equipo (RBAC)
     // y guardias de despliegue (Smoke Tests, Canary Auto-Guard, Freeze Windows).
     const rawServerId = data.serverId !== undefined && data.serverId !== null ? String(data.serverId).trim() : '';
@@ -360,6 +442,64 @@ class Project {
     this.canary = normalizeCanary(data.canary);
     this.freezeWindows = normalizeFreezeWindows(data.freezeWindows);
   }
+
+  /**
+   * Devuelve una copia segura del proyecto para serialización sin privilegios (`viewer` o sin `secrets:read`).
+   * Jamás muta la instancia original en memoria ni expone `buildSecrets` ni `previewDeployments.buildSecrets`.
+   * @param {{ includeSecrets?: boolean, maskBuildSecrets?: boolean }} [opts]
+   */
+  toSafeJSON(opts = {}) {
+    return Project.redactForUnprivileged(this, opts);
+  }
+
+  /**
+   * Clona y redacta secretos de un objeto `Project` (incluidos `buildSecrets` y
+   * `previewDeployments.{buildSecrets,envVars}`) para respuestas sin privilegios.
+   * @param {any} proj
+   * @param {{ includeSecrets?: boolean, maskBuildSecrets?: boolean }} [opts]
+   */
+  static redactForUnprivileged(proj, opts = {}) {
+    if (!proj || typeof proj !== 'object') return proj;
+    const includeSecrets = opts.includeSecrets === true;
+    const maskBuildOnly = opts.maskBuildSecrets === true;
+    const copy = { ...proj };
+
+    if (!includeSecrets || maskBuildOnly) {
+      if (copy.buildSecrets && typeof copy.buildSecrets === 'object' && !Array.isArray(copy.buildSecrets)) {
+        copy.buildSecrets = maskSecretMap(copy.buildSecrets);
+      }
+      if (copy.previewDeployments && typeof copy.previewDeployments === 'object' && !Array.isArray(copy.previewDeployments)) {
+        const pd = { ...copy.previewDeployments };
+        if (pd.buildSecrets && typeof pd.buildSecrets === 'object' && !Array.isArray(pd.buildSecrets)) {
+          pd.buildSecrets = maskSecretMap(pd.buildSecrets);
+        }
+        if (!includeSecrets && pd.envVars && typeof pd.envVars === 'object' && !Array.isArray(pd.envVars)) {
+          pd.envVars = maskSecretMap(pd.envVars);
+        }
+        copy.previewDeployments = pd;
+      }
+    }
+
+    if (!includeSecrets) {
+      if (copy.envVars && typeof copy.envVars === 'object' && !Array.isArray(copy.envVars)) {
+        copy.envVars = maskSecretMap(copy.envVars);
+      }
+      if (copy.buildArgs && typeof copy.buildArgs === 'object' && !Array.isArray(copy.buildArgs)) {
+        copy.buildArgs = maskSecretMap(copy.buildArgs);
+      }
+      if (copy.webhookSecret) copy.webhookSecret = '[REDACTED]';
+      if (copy.deployHookToken) copy.deployHookToken = '[REDACTED]';
+      if (copy.secrets && typeof copy.secrets === 'object' && !Array.isArray(copy.secrets)) {
+        copy.secrets = maskSecretMap(copy.secrets);
+      }
+      copy._secretsRedacted = true;
+    }
+
+    return copy;
+  }
 }
+
+Project.maskSecretMap = maskSecretMap;
+Project.normalizeKeyValueMap = normalizeKeyValueMap;
 
 module.exports = Project;

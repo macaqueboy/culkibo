@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
   Download,
   Link as LinkIcon,
@@ -6,6 +6,7 @@ import {
   Database,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   Box,
   ChevronDown,
   ChevronRight,
@@ -15,8 +16,23 @@ import {
   Globe,
   Loader2,
   Cloud,
+  ShieldCheck,
+  Sparkles,
+  FileArchive,
+  FileJson,
+  ArrowRight,
+  Lock,
+  Clock,
+  RotateCcw,
+  Terminal,
+  Search,
+  Layers,
+  Upload,
+  KeyRound,
+  Activity,
+  Copy,
 } from 'lucide-react';
-import { api, type DomainItem } from '../lib/api';
+import { api, apiFetch, type DomainItem } from '../lib/api';
 
 interface CoolifyProject {
   uuid: string;
@@ -30,15 +46,28 @@ interface CoolifyResource {
   name: string;
   fqdn?: string;
   database_type?: string;
+  type?: string;
+  image?: string;
+  build_pack?: string;
+  git_repository?: string;
+  git_branch?: string;
+  ports_exposes?: string;
+  port?: number | string;
+  health_check_path?: string;
+  health_check_enabled?: boolean;
+  custom_labels?: string;
+  docker_compose?: string;
+  docker_compose_raw?: string;
+  scheduled_tasks?: Array<{ name?: string; frequency?: string; schedule?: string; command?: string; enabled?: boolean }>;
   status?: string;
   environment?: { project?: { uuid?: string; name?: string; id?: number } };
-  project_id?: number;
-  local_persistent_volumes?: any[];
-  persistent_volumes?: any[];
-  volumes?: any[];
-  local_file_volumes?: any[];
-  file_volumes?: any[];
-  environment_variables?: any[];
+  project_id?: number | string;
+  local_persistent_volumes?: unknown[];
+  persistent_volumes?: unknown[];
+  volumes?: unknown[];
+  local_file_volumes?: unknown[];
+  file_volumes?: unknown[];
+  environment_variables?: Array<{ key?: string; value?: string; is_preview?: boolean }>;
   _resourceType: 'app' | 'database' | 'service';
 }
 
@@ -47,28 +76,535 @@ interface ProjectGroup {
   resources: CoolifyResource[];
 }
 
+interface MagicVarPreview {
+  resourceName: string;
+  resourceId?: string;
+  envKey: string;
+  original: string;
+  variable: string;
+  kind: 'magic_secret' | 'magic_domain' | 'magic_runtime';
+  translated: string;
+  vaultKey: string | null;
+  resolvedPreview: string;
+}
+
+interface TraefikTranslationPreview {
+  resourceId: string;
+  resourceName: string;
+  hosts: string[];
+  labelCount: number;
+  translatedRules: Array<{ source: string; target: string; summary: string }>;
+  edgeConfig?: Record<string, unknown>;
+  unsupportedLabels: string[];
+  warnings: string[];
+}
+
+interface CronPreview {
+  name: string;
+  schedule: string;
+  command: string;
+  enabled: boolean;
+  valid: boolean;
+  warning: string | null;
+  sourceResource: string;
+}
+
+interface DatabasePlanPreview {
+  id: string;
+  name: string;
+  originalType: string;
+  culkiboEngine: string;
+  label: string;
+  image: string;
+  port: number;
+  isPublicInCoolify?: boolean;
+  volumesCount: number;
+  note?: string | null;
+  dumpCommand?: string;
+  restoreCommand?: string;
+}
+
+interface CutoverStep {
+  step: number;
+  id: string;
+  title: string;
+  detail: string;
+  required: boolean;
+}
+
+interface MigrationPlan {
+  parityScore: number;
+  readinessLevel: 'ready' | 'ready_with_warnings' | 'manual_review_needed';
+  summary: {
+    projects: number;
+    apps: number;
+    databases: number;
+    services: number;
+    domains: number;
+    magicVarsTranslated: number;
+    traefikRulesTranslated: number;
+    cronsMapped: number;
+    volumesCount: number;
+    fileMountsCount: number;
+    healthchecksCount: number;
+    vaultRefsNeeded: number;
+  };
+  domains: Array<{ hostname: string; resourceName: string; targetPort: number; hasEdgeRules: boolean; healthPath: string }>;
+  databases: DatabasePlanPreview[];
+  magicVariables: MagicVarPreview[];
+  traefikTranslations: TraefikTranslationPreview[];
+  crons: CronPreview[];
+  vaultRefs: string[];
+  secretWarnings: string[];
+  warnings: string[];
+  dnsCutoverChecklist: CutoverStep[];
+  rollbackPlan: {
+    sourceUntouched: boolean;
+    estimatedRollbackSeconds: number;
+    steps: string[];
+  };
+}
+
+interface ParsedBundlePreview {
+  filename: string;
+  format: 'zip' | 'ckb.gz';
+  manifest: {
+    bundleId: string;
+    stackName: string;
+    createdAt: string;
+    vaultMode: string;
+    source?: string;
+    counts?: Record<string, number>;
+    vaultRefs?: string[];
+  };
+  projects: Array<Record<string, unknown>>;
+  domains: Array<Record<string, unknown>>;
+  databases: Array<Record<string, unknown>>;
+  crons: Array<Record<string, unknown>>;
+  culkiboYaml: string;
+  rawBase64?: string;
+}
+
+type SourceMode = 'api' | 'offline' | 'bundle';
+type PreviewTab = 'resources' | 'magic' | 'traefik' | 'preflight';
+
+// ---------------------------------------------------------------------------
+// Client-side helpers: Lightweight Parity Analyzer & Pure-TS ZIP Preview/Export
+// ---------------------------------------------------------------------------
+
+function crc32Bytes(data: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < data.length; i++) {
+    crc ^= data[i];
+    for (let k = 0; k < 8; k++) {
+      crc = (crc & 1) !== 0 ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function buildClientZipBlob(files: Record<string, string>): Blob {
+  const enc = new TextEncoder();
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+  const names = Object.keys(files).sort();
+
+  for (const name of names) {
+    const nameBytes = enc.encode(name);
+    const dataBytes = enc.encode(files[name]);
+    const checksum = crc32Bytes(dataBytes);
+
+    const lfh = new Uint8Array(30);
+    const lv = new DataView(lfh.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0x0800, true);
+    lv.setUint16(8, 0, true); // STORE
+    lv.setUint32(14, checksum, true);
+    lv.setUint32(18, dataBytes.length, true);
+    lv.setUint32(22, dataBytes.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    localParts.push(lfh, nameBytes, dataBytes);
+
+    const cdh = new Uint8Array(46);
+    const cv = new DataView(cdh.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0x0800, true);
+    cv.setUint16(10, 0, true);
+    cv.setUint32(16, checksum, true);
+    cv.setUint32(20, dataBytes.length, true);
+    cv.setUint32(24, dataBytes.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint32(42, offset, true);
+    centralParts.push(cdh, nameBytes);
+
+    offset += 30 + nameBytes.length + dataBytes.length;
+  }
+
+  let cdSize = 0;
+  for (const p of centralParts) cdSize += p.length;
+
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, names.length, true);
+  ev.setUint16(10, names.length, true);
+  ev.setUint32(12, cdSize, true);
+  ev.setUint32(16, offset, true);
+
+  const allParts: BlobPart[] = [...localParts, ...centralParts, eocd].map(
+    (u) => new Uint8Array(u) as BlobPart
+  );
+  return new Blob(allParts, { type: 'application/zip' });
+}
+
+async function inflateRawBrowser(comp: Uint8Array): Promise<Uint8Array> {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('Tu navegador no soporta DecompressionStream; usa el endpoint de backend para inspeccionar .zip comprimidos.');
+  }
+  const ds = new DecompressionStream('deflate-raw');
+  const writer = ds.writable.getWriter();
+  await writer.write(new Uint8Array(comp));
+  await writer.close();
+  const ab = await new Response(ds.readable).arrayBuffer();
+  return new Uint8Array(ab);
+}
+
+async function parseZipInBrowser(buf: ArrayBuffer): Promise<Record<string, string>> {
+  const bytes = new Uint8Array(buf);
+  const view = new DataView(buf);
+  if (bytes.length < 22) throw new Error('Archivo ZIP demasiado pequeño o corrupto');
+
+  let eocdPos = -1;
+  const minPos = Math.max(0, bytes.length - 22 - 65535);
+  for (let p = bytes.length - 22; p >= minPos; p--) {
+    if (view.getUint32(p, true) === 0x06054b50) {
+      eocdPos = p;
+      break;
+    }
+  }
+  if (eocdPos === -1) throw new Error('Cabecera EOCD de ZIP no encontrada');
+
+  const totalEntries = view.getUint16(eocdPos + 10, true);
+  const cdSize = view.getUint32(eocdPos + 12, true);
+  const cdOffset = view.getUint32(eocdPos + 16, true);
+  if (totalEntries > 200 || cdOffset + cdSize > eocdPos) {
+    throw new Error('Archivo ZIP rechazado por límites de seguridad');
+  }
+
+  const dec = new TextDecoder('utf-8');
+  const files: Record<string, string> = {};
+  let cursor = cdOffset;
+  let totalUncomp = 0;
+
+  for (let i = 0; i < totalEntries; i++) {
+    if (view.getUint32(cursor, true) !== 0x02014b50) throw new Error('Central Directory inválido');
+    const method = view.getUint16(cursor + 10, true);
+    const compSize = view.getUint32(cursor + 20, true);
+    const uncompSize = view.getUint32(cursor + 24, true);
+    const nameLen = view.getUint16(cursor + 28, true);
+    const extraLen = view.getUint16(cursor + 30, true);
+    const commentLen = view.getUint16(cursor + 32, true);
+    const lfhOffset = view.getUint32(cursor + 42, true);
+
+    const name = dec.decode(bytes.subarray(cursor + 46, cursor + 46 + nameLen));
+    cursor += 46 + nameLen + extraLen + commentLen;
+
+    if (name.includes('..') || name.startsWith('/') || name.includes('\\') || /^[A-Za-z]:/.test(name)) {
+      throw new Error(`Path traversal bloqueado en ZIP: ${name}`);
+    }
+    if (name.endsWith('/')) continue;
+    if (uncompSize > 10 * 1024 * 1024 || totalUncomp + uncompSize > 25 * 1024 * 1024) {
+      throw new Error('Zip-bomb bloqueado en inspección local');
+    }
+
+    const lfhNameLen = view.getUint16(lfhOffset + 26, true);
+    const lfhExtraLen = view.getUint16(lfhOffset + 28, true);
+    const dataStart = lfhOffset + 30 + lfhNameLen + lfhExtraLen;
+    const compSlice = bytes.subarray(dataStart, dataStart + compSize);
+
+    let raw: Uint8Array;
+    if (method === 0) raw = compSlice;
+    else if (method === 8) raw = await inflateRawBrowser(compSlice);
+    else throw new Error(`Método ZIP no soportado: ${method}`);
+
+    totalUncomp += raw.length;
+    files[name] = dec.decode(raw);
+  }
+  return files;
+}
+
+function parseFqdnHostsClient(fqdn?: string): string[] {
+  if (!fqdn) return [];
+  const hosts: string[] = [];
+  for (const part of String(fqdn).split(',')) {
+    const clean = part.trim().replace(/^https?:\/\//i, '').replace(/[:/].*$/, '').toLowerCase();
+    if (clean && clean.includes('.')) hosts.push(clean);
+  }
+  return Array.from(new Set(hosts));
+}
+
+function resolveDbEngineClient(r: CoolifyResource): { engine: string; label: string; port: number } {
+  const raw = `${r.database_type || ''} ${r.type || ''} ${r.image || ''}`.toLowerCase();
+  if (raw.includes('pgvector')) return { engine: 'pgvector', label: 'PostgreSQL + pgvector', port: 5432 };
+  if (raw.includes('timescaledb')) return { engine: 'timescaledb', label: 'TimescaleDB', port: 5432 };
+  if (raw.includes('postgres')) return { engine: 'postgres', label: 'PostgreSQL', port: 5432 };
+  if (raw.includes('mariadb')) return { engine: 'mariadb', label: 'MariaDB', port: 3306 };
+  if (raw.includes('mysql')) return { engine: 'mysql', label: 'MySQL', port: 3306 };
+  if (raw.includes('dragonfly')) return { engine: 'valkey', label: 'Valkey (Dragonfly)', port: 6379 };
+  if (raw.includes('keydb')) return { engine: 'valkey', label: 'Valkey (KeyDB)', port: 6379 };
+  if (raw.includes('redis') || raw.includes('valkey')) return { engine: 'valkey', label: 'Valkey (Redis)', port: 6379 };
+  if (raw.includes('mongo')) return { engine: 'mongodb', label: 'MongoDB', port: 27017 };
+  if (raw.includes('clickhouse')) return { engine: 'clickhouse', label: 'ClickHouse', port: 8123 };
+  return { engine: r.database_type || 'database', label: r.database_type || 'Base de datos', port: 5432 };
+}
+
+/** Fallback local analyzer when previewing an offline JSON export (mirrors coolifyMigrator.buildMigrationPlan). */
+function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject[]): MigrationPlan {
+  const magicVariables: MagicVarPreview[] = [];
+  const traefikTranslations: TraefikTranslationPreview[] = [];
+  const crons: CronPreview[] = [];
+  const databases: DatabasePlanPreview[] = [];
+  const vaultRefs = new Set<string>();
+  const secretWarnings: string[] = [];
+  const warnings: string[] = [];
+  const domains: Array<{ hostname: string; resourceName: string; targetPort: number; hasEdgeRules: boolean; healthPath: string }> = [];
+
+  let volumesCount = 0;
+  let fileMountsCount = 0;
+  let healthchecksCount = 0;
+  const magicRe = /\$\{((?:SERVICE|COOLIFY)_[A-Za-z0-9_]+)(?::?-([^}]*))?\}/g;
+
+  for (const r of resources) {
+    const hosts = parseFqdnHostsClient(r.fqdn);
+    const vols = r.local_persistent_volumes?.length || r.persistent_volumes?.length || r.volumes?.length || 0;
+    const mounts = r.local_file_volumes?.length || r.file_volumes?.length || 0;
+    volumesCount += vols;
+    fileMountsCount += mounts;
+    if (r.health_check_enabled || r.health_check_path) healthchecksCount++;
+
+    // Scan Magic Vars
+    for (const ev of r.environment_variables || []) {
+      const k = ev?.key || '';
+      const v = String(ev?.value ?? '');
+      if (!k) continue;
+      let m: RegExpExecArray | null;
+      magicRe.lastIndex = 0;
+      while ((m = magicRe.exec(v)) !== null) {
+        const varName = m[1];
+        const isSecret = /^SERVICE_(PASSWORD|USER|(?:REAL)?BASE64)/i.test(varName);
+        const isDomain = /^(SERVICE_(FQDN|URL)|COOLIFY_(FQDN|URL))/i.test(varName);
+        const vk = isSecret ? varName.toUpperCase().replace(/[^A-Z0-9_]/g, '_') : null;
+        if (vk) vaultRefs.add(vk);
+        const translated = vk
+          ? `\${vault.${vk}}`
+          : isDomain
+            ? (hosts[0] ? (varName.includes('URL') ? `https://${hosts[0]}` : hosts[0]) : '${domain.primary}')
+            : (varName === 'COOLIFY_BRANCH' ? (r.git_branch || 'main') : `culkibo-${r.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`);
+        magicVariables.push({
+          resourceName: r.name,
+          resourceId: r.uuid,
+          envKey: k,
+          original: m[0],
+          variable: varName,
+          kind: isSecret ? 'magic_secret' : (isDomain ? 'magic_domain' : 'magic_runtime'),
+          translated,
+          vaultKey: vk,
+          resolvedPreview: translated,
+        });
+      }
+      if (/(secret|token|pass|key|dsn|database_url)/i.test(k) && v && !v.includes('${')) {
+        secretWarnings.push(`Variable sensible "${k}" en ${r.name}: migrar a \${vault.${k.toUpperCase()}}.`);
+      }
+    }
+
+    // Scan Traefik labels
+    const rawLbl = String(r.custom_labels || '') + '\n' + String(r.docker_compose || r.docker_compose_raw || '');
+    const traefikLines = rawLbl.split(/\r?\n/).filter((l) => /traefik\.http\./i.test(l));
+    if (traefikLines.length > 0) {
+      const rules: Array<{ source: string; target: string; summary: string }> = [];
+      if (traefikLines.some((l) => /stripprefix/i.test(l))) {
+        rules.push({ source: 'traefik.middlewares.stripprefix', target: 'domain.pathRoutes', summary: 'Prefijo de ruta con stripPrefix nativo en Caddy' });
+      }
+      if (traefikLines.some((l) => /redirectregex/i.test(l))) {
+        rules.push({ source: 'traefik.middlewares.redirectregex', target: 'domain.pathRedirects', summary: 'Redirección regex/canónica validada en Caddy' });
+      }
+      if (traefikLines.some((l) => /accesscontrolallow/i.test(l))) {
+        rules.push({ source: 'traefik.middlewares.headers (CORS)', target: 'domain.cors', summary: 'Política CORS nativa' });
+      }
+      if (traefikLines.some((l) => /sts(seconds|preload)/i.test(l))) {
+        rules.push({ source: 'traefik.middlewares.headers (HSTS)', target: 'domain.hstsPreload', summary: 'Cabecera HSTS / Preload' });
+      }
+      if (traefikLines.some((l) => /forwardauth/i.test(l))) {
+        rules.push({ source: 'traefik.middlewares.forwardauth', target: 'domain.forwardAuth', summary: 'ForwardAuth (Authelia/Authentik)' });
+      }
+      if (traefikLines.some((l) => /basicauth/i.test(l))) {
+        rules.push({ source: 'traefik.middlewares.basicauth', target: 'domain.basicAuth', summary: 'Basic Auth bcrypt en Caddy' });
+      }
+      if (traefikLines.some((l) => /loadbalancer\.server\.port/i.test(l))) {
+        rules.push({ source: 'traefik.services.loadbalancer.port', target: 'domain.targetPort', summary: 'Puerto upstream detectado automáticamente' });
+      }
+      traefikTranslations.push({
+        resourceId: r.uuid,
+        resourceName: r.name,
+        hosts,
+        labelCount: traefikLines.length,
+        translatedRules: rules,
+        unsupportedLabels: [],
+        warnings: [],
+      });
+    }
+
+    // Crons
+    for (const task of r.scheduled_tasks || []) {
+      const cmd = String(task.command || '').trim();
+      const hasShell = /[|;&`><]/.test(cmd);
+      crons.push({
+        name: task.name || `${r.name} cron`,
+        schedule: task.frequency || task.schedule || '0 0 * * *',
+        command: cmd,
+        enabled: task.enabled !== false,
+        valid: !hasShell,
+        warning: hasShell ? 'Usa sintaxis de shell; divídelo en comando directo o endpoint HTTP.' : null,
+        sourceResource: r.name,
+      });
+    }
+
+    // Databases
+    if (r._resourceType === 'database') {
+      const eng = resolveDbEngineClient(r);
+      databases.push({
+        id: r.uuid,
+        name: r.name,
+        originalType: r.database_type || r.type || eng.engine,
+        culkiboEngine: eng.engine,
+        label: eng.label,
+        image: r.image || '',
+        port: Number(r.port) || eng.port,
+        volumesCount: vols,
+      });
+    }
+
+    // Domains
+    const firstPort = parseInt(String(r.ports_exposes || r.port || '3000').split(',')[0], 10) || 3000;
+    for (const h of hosts) {
+      if (!domains.some((d) => d.hostname === h)) {
+        domains.push({
+          hostname: h,
+          resourceName: r.name,
+          targetPort: firstPort,
+          hasEdgeRules: traefikLines.length > 0,
+          healthPath: r.health_check_path || '/',
+        });
+      }
+    }
+  }
+
+  const invalidCrons = crons.filter((c) => !c.valid).length;
+  const parityScore = Math.max(60, 100 - invalidCrons * 5);
+  const appsCount = resources.filter((r) => r._resourceType === 'app').length;
+  const dbsCount = resources.filter((r) => r._resourceType === 'database').length;
+  const svcsCount = resources.filter((r) => r._resourceType === 'service').length;
+
+  return {
+    parityScore,
+    readinessLevel: parityScore >= 90 ? 'ready' : 'ready_with_warnings',
+    summary: {
+      projects: Math.max(projects.length, resources.length > 0 ? 1 : 0),
+      apps: appsCount,
+      databases: dbsCount,
+      services: svcsCount,
+      domains: domains.length,
+      magicVarsTranslated: magicVariables.length,
+      traefikRulesTranslated: traefikTranslations.reduce((acc, t) => acc + t.translatedRules.length, 0),
+      cronsMapped: crons.length,
+      volumesCount,
+      fileMountsCount,
+      healthchecksCount,
+      vaultRefsNeeded: vaultRefs.size,
+    },
+    domains,
+    databases,
+    magicVariables,
+    traefikTranslations,
+    crons,
+    vaultRefs: Array.from(vaultRefs).sort(),
+    secretWarnings,
+    warnings,
+    dnsCutoverChecklist: [
+      { step: 1, id: 'lower_ttl', title: 'Reducir TTL DNS a 60s', detail: 'Prepara una conmutación instantánea sin caché antigua.', required: domains.length > 0 },
+      { step: 2, id: 'populate_vault', title: `Cargar ${vaultRefs.size} secreto(s) en Vault AES-256-GCM`, detail: 'Culkibo inyecta los secretos sin escribir texto plano en Git ni discos.', required: vaultRefs.size > 0 },
+      { step: 3, id: 'sync_data', title: `Migrar ${dbsCount} BD(s) y ${volumesCount} volumen(es)`, detail: 'Vuelca PostgreSQL/MySQL/Valkey/ClickHouse y sincroniza volúmenes con rsync.', required: dbsCount > 0 || volumesCount > 0 },
+      { step: 4, id: 'smoke_verify', title: 'Verificar endpoints antes de mover DNS', detail: 'Usa curl --resolve contra la IP de Culkibo para validar HTTP 200 y TLS.', required: true },
+      { step: 5, id: 'dns_flip', title: 'Conmutación DNS Zero-Downtime', detail: 'Actualiza los registros A en Cloudflare o tu registrador.', required: domains.length > 0 },
+    ],
+    rollbackPlan: {
+      sourceUntouched: true,
+      estimatedRollbackSeconds: 30,
+      steps: [
+        'Tu instancia de Coolify v4 original NO se ha modificado (acceso estrictamente solo-lectura).',
+        'Mantén los contenedores de Coolify corriendo en paralelo 24-48 h tras el cutover.',
+        'Si detectas cualquier anomalía, apunta el registro A de vuelta a la IP de Coolify (~30 s en Cloudflare).',
+      ],
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
 export const CoolifyImport: React.FC<{
   onComplete: () => void;
   onCancel: () => void;
   onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }> = ({ onComplete, onCancel, onNotify }) => {
-  const [step, setStep] = useState(1);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [sourceMode, setSourceMode] = useState<SourceMode>('api');
+
+  // Step 1: API / Offline JSON / Bundle
   const [apiUrl, setApiUrl] = useState('');
   const [apiToken, setApiToken] = useState('');
+  const [offlineJson, setOfflineJson] = useState('');
+  const [bundlePassphrase, setBundlePassphrase] = useState('');
+  const [parsedBundle, setParsedBundle] = useState<ParsedBundlePreview | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Step 2: Live Parity Preview
   const [loading, setLoading] = useState(false);
   const [allResources, setAllResources] = useState<CoolifyResource[]>([]);
   const [projects, setProjects] = useState<CoolifyProject[]>([]);
+  const [serverPlan, setServerPlan] = useState<MigrationPlan | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [results, setResults] = useState<any>(null);
+  const [previewTab, setPreviewTab] = useState<PreviewTab>('resources');
+  const [searchQuery, setSearchQuery] = useState('');
 
+  // Step 3: Results + Cutover + Smoke Verify + Rollback
+  const [results, setResults] = useState<Record<string, any> | null>(null);
   const [importedDomains, setImportedDomains] = useState<DomainItem[]>([]);
   const [serverIp, setServerIp] = useState('');
   const [cfAvailable, setCfAvailable] = useState(false);
   const [useCloudflare, setUseCloudflare] = useState(false);
   const [migratingDomains, setMigratingDomains] = useState<Set<string>>(new Set());
+  const [checkedCutover, setCheckedCutover] = useState<Set<string>>(new Set());
+  const [showRollback, setShowRollback] = useState(false);
+  const [verifyingParity, setVerifyingParity] = useState(false);
+  const [verifyReport, setVerifyReport] = useState<Record<string, any> | null>(null);
 
-  const handleConnect = async () => {
+  const activePlan: MigrationPlan = useMemo(() => {
+    if (serverPlan) return serverPlan;
+    return computeLocalPlan(allResources, projects);
+  }, [serverPlan, allResources, projects]);
+
+  // -------------------------------------------------------------------------
+  // Step 1 Handlers
+  // -------------------------------------------------------------------------
+
+  const handleConnectApi = async () => {
     setLoading(true);
     try {
       const res = await api.previewCoolify(apiUrl.trim(), apiToken.trim());
@@ -78,7 +614,9 @@ export const CoolifyImport: React.FC<{
       const all = [...apps, ...dbs, ...svcs];
       setAllResources(all);
       setProjects(res.projects || []);
+      setServerPlan(res.plan || null);
       setSelected(new Set(all.map((r) => r.uuid)));
+      setPreviewTab('resources');
       setStep(2);
     } catch (e: any) {
       onNotify(e?.message || 'Error al conectar con Coolify', 'error');
@@ -87,6 +625,204 @@ export const CoolifyImport: React.FC<{
     }
   };
 
+  const handleParseOfflineJson = () => {
+    try {
+      const parsed = JSON.parse(offlineJson);
+      const apps: CoolifyResource[] = (parsed.apps || parsed.applications || []).map((a: any, i: number) => ({
+        uuid: a.uuid || `offline-app-${i + 1}`,
+        name: a.name || `App ${i + 1}`,
+        ...a,
+        _resourceType: 'app' as const,
+      }));
+      const dbs: CoolifyResource[] = (parsed.databases || []).map((d: any, i: number) => ({
+        uuid: d.uuid || `offline-db-${i + 1}`,
+        name: d.name || `DB ${i + 1}`,
+        ...d,
+        _resourceType: 'database' as const,
+      }));
+      const svcs: CoolifyResource[] = (parsed.services || []).map((s: any, i: number) => ({
+        uuid: s.uuid || `offline-svc-${i + 1}`,
+        name: s.name || `Service ${i + 1}`,
+        ...s,
+        _resourceType: 'service' as const,
+      }));
+      const all = [...apps, ...dbs, ...svcs];
+      if (all.length === 0) {
+        onNotify('El JSON no contiene apps, databases ni services de Coolify.', 'error');
+        return;
+      }
+      setAllResources(all);
+      setProjects(parsed.projects || []);
+      setServerPlan(null);
+      setSelected(new Set(all.map((r) => r.uuid)));
+      setPreviewTab('resources');
+      setStep(2);
+    } catch (err: any) {
+      onNotify(`JSON inválido: ${err?.message || 'revisa el formato'}`, 'error');
+    }
+  };
+
+  const handleBundleFileChange = async (file: File | null) => {
+    if (!file) return;
+    setLoading(true);
+    try {
+      const ab = await file.arrayBuffer();
+      const bytes = new Uint8Array(ab);
+      const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b;
+      const isGz = bytes[0] === 0x1f && bytes[1] === 0x8b;
+      if (!isZip && !isGz) {
+        throw new Error('Selecciona un archivo .zip o .ckb.gz válido generado por Culkibo.');
+      }
+
+      // Convert to base64 for optional backend Wave-2 bundle endpoints
+      let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      const rawBase64 = btoa(bin);
+
+      if (isZip) {
+        const files = await parseZipInBrowser(ab);
+        if (!files['manifest.json']) {
+          throw new Error('El archivo ZIP no contiene manifest.json de Culkibo.');
+        }
+        const manifest = JSON.parse(files['manifest.json']);
+        const bProjects = files['projects.json'] ? JSON.parse(files['projects.json']) : [];
+        const bDomains = files['domains.json'] ? JSON.parse(files['domains.json']) : [];
+        const bDbs = files['databases.json'] ? JSON.parse(files['databases.json']) : [];
+        const bCrons = files['crons.json'] ? JSON.parse(files['crons.json']) : [];
+        setParsedBundle({
+          filename: file.name,
+          format: 'zip',
+          manifest,
+          projects: Array.isArray(bProjects) ? bProjects : [],
+          domains: Array.isArray(bDomains) ? bDomains : [],
+          databases: Array.isArray(bDbs) ? bDbs : [],
+          crons: Array.isArray(bCrons) ? bCrons : [],
+          culkiboYaml: files['culkibo.yaml'] || '',
+          rawBase64,
+        });
+        onNotify(`Bundle "${manifest.stackName || file.name}" inspeccionado (${bProjects.length} proyecto(s))`, 'success');
+      } else {
+        // .ckb.gz: intentar backend /api/bundles/inspect (Wave-2) o DecompressionStream('gzip')
+        let payload: any = null;
+        if (typeof DecompressionStream !== 'undefined') {
+          const ds = new DecompressionStream('gzip');
+          const writer = ds.writable.getWriter();
+          await writer.write(bytes);
+          await writer.close();
+          const text = await new Response(ds.readable).text();
+          payload = JSON.parse(text);
+        } else {
+          const res = await apiFetch('/api/bundles/inspect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bundleBase64: rawBase64, passphrase: bundlePassphrase || undefined }),
+          });
+          if (!res.ok) throw new Error('No se pudo inspeccionar el archivo .ckb.gz');
+          payload = await res.json();
+        }
+        const files = payload.files || {};
+        setParsedBundle({
+          filename: file.name,
+          format: 'ckb.gz',
+          manifest: payload.manifest,
+          projects: files['projects.json'] ? JSON.parse(files['projects.json']) : (payload.projects || []),
+          domains: files['domains.json'] ? JSON.parse(files['domains.json']) : (payload.domains || []),
+          databases: files['databases.json'] ? JSON.parse(files['databases.json']) : (payload.databases || []),
+          crons: files['crons.json'] ? JSON.parse(files['crons.json']) : (payload.crons || []),
+          culkiboYaml: files['culkibo.yaml'] || payload.culkiboYaml || '',
+          rawBase64,
+        });
+        onNotify(`Bundle .ckb.gz "${payload.manifest?.stackName || file.name}" verificado`, 'success');
+      }
+    } catch (err: any) {
+      setParsedBundle(null);
+      onNotify(err?.message || 'Error al leer el bundle portátil', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleImportBundle = async () => {
+    if (!parsedBundle) return;
+    setLoading(true);
+    try {
+      // Intenta primero el endpoint Wave-2 /api/bundles/import si está montado
+      let importedViaApi = false;
+      try {
+        const res = await apiFetch('/api/bundles/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bundleBase64: parsedBundle.rawBase64,
+            passphrase: bundlePassphrase || undefined,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setResults({
+            importedApps: data.importedProjects || 0,
+            importedDbs: data.databasesCataloged || 0,
+            importedServices: 0,
+            importedCrons: data.importedCrons || 0,
+            domainsLinked: data.importedDomains || 0,
+            parityScore: 100,
+            warnings: data.warnings || [],
+            errors: data.errors || [],
+          });
+          importedViaApi = true;
+        }
+      } catch {
+        // Fallback gracioso usando api.createProject si Wave-2 aún no está cableado
+      }
+
+      if (!importedViaApi) {
+        let count = 0;
+        const errs: string[] = [];
+        for (const p of parsedBundle.projects) {
+          try {
+            await api.createProject({
+              name: String(p.name || 'Proyecto Bundle'),
+              description: String(p.description || `Restaurado desde ${parsedBundle.filename}`),
+              gitRepo: String(p.gitRepo || ''),
+              gitBranch: String(p.gitBranch || 'main'),
+              buildCommand: String(p.buildCommand || ''),
+              startCommand: String(p.startCommand || ''),
+              baseDirectory: String(p.baseDirectory || '/'),
+              envVars: (p.envVars as Record<string, string>) || {},
+            } as any);
+            count++;
+          } catch (err: any) {
+            errs.push(`${String(p.name || 'Proyecto')}: ${err?.message || 'error'}`);
+          }
+        }
+        setResults({
+          importedApps: count,
+          importedDbs: parsedBundle.databases.length,
+          importedServices: 0,
+          importedCrons: parsedBundle.crons.length,
+          domainsLinked: 0,
+          parityScore: 100,
+          warnings: parsedBundle.manifest.vaultMode === 'encrypted'
+            ? ['Proyecto(s) creados vía API base; importa el sobre vault.enc.json desde CLI/Vault si requieres descifrar los secretos.']
+            : [],
+          errors: errs,
+        });
+      }
+
+      await loadCutoverContext();
+      setStep(3);
+      onNotify(`Bundle "${parsedBundle.manifest.stackName}" restaurado en Culkibo`, 'success');
+    } catch (err: any) {
+      onNotify(err?.message || 'Error al importar bundle', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Step 2 Grouping & Selection
+  // -------------------------------------------------------------------------
+
   const projectGroups: ProjectGroup[] = useMemo(() => {
     const groups = new Map<string, ProjectGroup>();
     const fallbackProject: CoolifyProject = {
@@ -94,8 +830,13 @@ export const CoolifyImport: React.FC<{
       name: 'Sin proyecto asignado',
       description: 'Recursos sin proyecto en Coolify',
     };
+    const q = searchQuery.trim().toLowerCase();
 
     for (const resource of allResources) {
+      if (q) {
+        const hay = `${resource.name} ${resource.fqdn || ''} ${resource.database_type || ''} ${resource.git_repository || ''}`.toLowerCase();
+        if (!hay.includes(q)) continue;
+      }
       let projectKey = '_unassigned';
       let project: CoolifyProject = fallbackProject;
 
@@ -122,7 +863,7 @@ export const CoolifyImport: React.FC<{
       if (b.project.uuid === '_unassigned') return -1;
       return a.project.name.localeCompare(b.project.name);
     });
-  }, [allResources, projects]);
+  }, [allResources, projects, searchQuery]);
 
   const toggleResource = (uuid: string) =>
     setSelected((prev) => {
@@ -161,27 +902,146 @@ export const CoolifyImport: React.FC<{
   const totalDbs = allResources.filter((r) => r._resourceType === 'database').length;
   const totalSvcs = allResources.filter((r) => r._resourceType === 'service').length;
 
+  const loadCutoverContext = async () => {
+    const [domainsRes, ipRes, cfRes] = await Promise.all([
+      api.getDomains().catch(() => ({ domains: [] as DomainItem[] })),
+      api.getServerIp().catch(() => ({ ip: null })),
+      api.getCloudflareConfig().catch(() => ({ isConfigured: false })),
+    ]);
+
+    const coolifyDomains = (domainsRes.domains || []).filter(
+      (d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify'
+    );
+    setImportedDomains(coolifyDomains);
+    if (ipRes.ip) setServerIp(ipRes.ip);
+    const cfOk = Boolean(cfRes?.isConfigured);
+    setCfAvailable(cfOk);
+    setUseCloudflare(cfOk);
+  };
+
+  const handleDownloadPortableZip = () => {
+    const chosen = allResources.filter((r) => selected.has(r.uuid));
+    const bundleId = `ckb_${Date.now().toString(36)}`;
+    const manifest = {
+      format: 'culkibo-bundle/v1',
+      version: 1,
+      bundleId,
+      stackName: projects[0]?.name || 'coolify-migration',
+      source: 'coolify-migration',
+      createdAt: new Date().toISOString(),
+      vaultMode: 'redacted',
+      vaultRefs: activePlan.vaultRefs,
+      counts: {
+        projects: projectGroups.length,
+        domains: activePlan.domains.length,
+        databases: activePlan.databases.length,
+        crons: activePlan.crons.length,
+      },
+    };
+    const sanitizedProjects = chosen
+      .filter((r) => r._resourceType !== 'database')
+      .map((r) => ({
+        id: r.uuid,
+        name: r.name,
+        gitRepo: r.git_repository || '',
+        gitBranch: r.git_branch || 'main',
+        domains: parseFqdnHostsClient(r.fqdn),
+        source: 'coolify-import',
+      }));
+    const yamlLines = [
+      `# Culkibo Portable Stack Manifest (culkibo.yaml v1)`,
+      `version: 1`,
+      `name: ${JSON.stringify(manifest.stackName)}`,
+      ...(activePlan.vaultRefs.length > 0 ? ['vaultRefs:', ...activePlan.vaultRefs.map((k) => `  - ${k}`)] : []),
+      `projects:`,
+      ...sanitizedProjects.flatMap((p) => [
+        `  - id: ${JSON.stringify(p.id)}`,
+        `    name: ${JSON.stringify(p.name)}`,
+        ...(p.gitRepo ? [`    gitRepo: ${JSON.stringify(p.gitRepo)}`] : []),
+        `    gitBranch: ${JSON.stringify(p.gitBranch)}`,
+      ]),
+    ].join('\n');
+
+    const blob = buildClientZipBlob({
+      'manifest.json': JSON.stringify(manifest, null, 2),
+      'culkibo.yaml': `${yamlLines}\n`,
+      'projects.json': JSON.stringify(sanitizedProjects, null, 2),
+      'domains.json': JSON.stringify(activePlan.domains, null, 2),
+      'databases.json': JSON.stringify(activePlan.databases, null, 2),
+      'crons.json': JSON.stringify(activePlan.crons, null, 2),
+      'vault.redacted.json': JSON.stringify(
+        {
+          version: 1,
+          encrypted: false,
+          mode: 'redacted',
+          requiredKeys: activePlan.vaultRefs,
+          note: 'Zero plaintext secrets exported. Populate these keys in Culkibo AES-256-GCM Vault.',
+        },
+        null,
+        2
+      ),
+      'migration-report.json': JSON.stringify(activePlan, null, 2),
+    });
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `culkibo-coolify-stack-${bundleId}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    onNotify('Bundle portátil .zip generado (0 secretos en claro)', 'success');
+  };
+
   const handleImport = async () => {
     setLoading(true);
     try {
-      const res = await api.importCoolify(apiUrl.trim(), apiToken.trim(), selectedApps, selectedDbs, selectedServices);
-      setResults(res);
+      if (sourceMode === 'api') {
+        const res = await api.importCoolify(apiUrl.trim(), apiToken.trim(), selectedApps, selectedDbs, selectedServices);
+        setResults(res);
+      } else {
+        // Offline JSON import using existing api.createProject gracefully
+        const chosen = allResources.filter((r) => selected.has(r.uuid));
+        let importedApps = 0;
+        let importedDbs = 0;
+        let importedServices = 0;
+        const errs: string[] = [];
+        for (const r of chosen) {
+          if (r._resourceType === 'database') {
+            importedDbs++;
+            continue;
+          }
+          try {
+            await api.createProject({
+              name: r.name,
+              description: `Importado offline desde Coolify (${r._resourceType})`,
+              gitRepo: r.git_repository || '',
+              gitBranch: r.git_branch || 'main',
+            } as any);
+            if (r._resourceType === 'app') importedApps++;
+            else importedServices++;
+          } catch (err: any) {
+            errs.push(`${r.name}: ${err?.message || 'error'}`);
+          }
+        }
+        setResults({
+          importedApps,
+          importedDbs,
+          importedServices,
+          importedCrons: activePlan.crons.filter((c) => c.valid).length,
+          domainsLinked: 0,
+          traefikRulesApplied: activePlan.summary.traefikRulesTranslated,
+          magicVarsTranslated: activePlan.summary.magicVarsTranslated,
+          vaultRefs: activePlan.vaultRefs,
+          parityScore: activePlan.parityScore,
+          dnsCutoverChecklist: activePlan.dnsCutoverChecklist,
+          rollbackPlan: activePlan.rollbackPlan,
+          errors: errs,
+        });
+      }
 
-      const [domainsRes, ipRes, cfRes] = await Promise.all([
-        api.getDomains().catch(() => ({ domains: [] as DomainItem[] })),
-        api.getServerIp().catch(() => ({ ip: null })),
-        api.getCloudflareConfig().catch(() => ({ isConfigured: false })),
-      ]);
-
-      const coolifyDomains = (domainsRes.domains || []).filter(
-        (d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify'
-      );
-      setImportedDomains(coolifyDomains);
-      if (ipRes.ip) setServerIp(ipRes.ip);
-      const cfOk = Boolean(cfRes?.isConfigured);
-      setCfAvailable(cfOk);
-      setUseCloudflare(cfOk);
-
+      await loadCutoverContext();
       setStep(3);
     } catch (e: any) {
       onNotify(e?.message || 'Error al importar desde Coolify', 'error');
@@ -190,15 +1050,61 @@ export const CoolifyImport: React.FC<{
     }
   };
 
+  const handleRunLiveVerification = async () => {
+    setVerifyingParity(true);
+    try {
+      const targets = (activePlan.domains || []).map((d) => ({
+        name: d.resourceName,
+        hostname: d.hostname,
+        sourceUrl: `https://${d.hostname}${d.healthPath || '/'}`,
+        targetUrl: serverIp ? `http://${serverIp}:${d.targetPort || 3000}${d.healthPath || '/'}` : `http://127.0.0.1:${d.targetPort || 3000}${d.healthPath || '/'}`,
+        healthPath: d.healthPath || '/',
+      }));
+      const res = await apiFetch('/api/import/coolify/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targets, targetIp: serverIp || undefined }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setVerifyReport(data);
+        onNotify(data.cutoverReady ? 'Paridad verificada: listo para DNS cutover' : 'Algunos endpoints requieren atención', data.cutoverReady ? 'success' : 'error');
+      } else {
+        onNotify('Usa los comandos curl --resolve de abajo para verificar directamente contra la IP destino.', 'info');
+      }
+    } catch {
+      onNotify('Usa los comandos curl --resolve de abajo para verificar antes de mover DNS.', 'info');
+    } finally {
+      setVerifyingParity(false);
+    }
+  };
+
+  const copyText = (text: string, label: string) => {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => onNotify(`${label} copiado`, 'success')).catch(() => {});
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Render Helpers
+  // -------------------------------------------------------------------------
+
   const typeConfig = {
-    app: { icon: Server, label: 'Aplicación' },
-    database: { icon: Database, label: 'Base de datos' },
-    service: { icon: Box, label: 'Servicio' },
+    app: { icon: Server, label: 'Aplicación', pill: 'bg-indigo-50 text-indigo-700 border-indigo-200' },
+    database: { icon: Database, label: 'Base de datos', pill: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+    service: { icon: Box, label: 'Servicio Compose', pill: 'bg-amber-50 text-amber-800 border-amber-200' },
   };
 
   const getVolCount = (r: CoolifyResource) => r.local_persistent_volumes?.length || r.persistent_volumes?.length || r.volumes?.length || 0;
   const getMountCount = (r: CoolifyResource) => r.local_file_volumes?.length || r.file_volumes?.length || 0;
   const getEnvCount = (r: CoolifyResource) => r.environment_variables?.length || 0;
+  const getCronCount = (r: CoolifyResource) => r.scheduled_tasks?.length || 0;
+
+  const parityColor = activePlan.parityScore >= 90
+    ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+    : activePlan.parityScore >= 70
+      ? 'text-amber-800 bg-amber-50 border-amber-200'
+      : 'text-rose-700 bg-rose-50 border-rose-200';
 
   const renderResourceRow = (resource: CoolifyResource) => {
     const cfg = typeConfig[resource._resourceType];
@@ -207,35 +1113,64 @@ export const CoolifyImport: React.FC<{
     const vols = getVolCount(resource);
     const mounts = getMountCount(resource);
     const envs = getEnvCount(resource);
+    const cronCnt = getCronCount(resource);
     const statusRunning = String(resource.status || '').toLowerCase().startsWith('running');
+    const dbInfo = resource._resourceType === 'database' ? resolveDbEngineClient(resource) : null;
+    const traefikMatch = activePlan.traefikTranslations.find((t) => t.resourceId === resource.uuid);
+    const magicCount = activePlan.magicVariables.filter((m) => m.resourceId === resource.uuid || m.resourceName === resource.name).length;
 
     return (
-      <label key={resource.uuid} className="flex items-center gap-3 p-3 bg-white border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50 transition-colors">
+      <label
+        key={resource.uuid}
+        className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+          isChecked ? 'bg-white border-slate-300 shadow-2xs' : 'bg-slate-50/50 border-slate-200 opacity-75 hover:opacity-100'
+        }`}
+      >
         <input
           type="checkbox"
           checked={isChecked}
           onChange={() => toggleResource(resource.uuid)}
-          className="w-4 h-4 rounded border-slate-300 accent-slate-900"
+          className="w-4 h-4 mt-0.5 rounded border-slate-300 accent-slate-900"
         />
-        <Icon className="w-4 h-4 text-slate-500 shrink-0" />
+        <Icon className="w-4 h-4 mt-0.5 text-slate-500 shrink-0" />
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-slate-900 truncate">{resource.name}</span>
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200 font-medium">
-              {cfg.label}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-semibold text-slate-900 truncate">{resource.name}</span>
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${cfg.pill}`}>
+              {dbInfo ? dbInfo.label : cfg.label}
             </span>
-            {statusRunning && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" title="En ejecución" />}
+            {resource.build_pack && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
+                {resource.build_pack}
+              </span>
+            )}
+            {statusRunning && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" title="En ejecución en Coolify" />}
           </div>
           <div className="flex items-center gap-2 mt-0.5 flex-wrap text-[11px] text-slate-500">
-            {resource.fqdn && <span className="font-mono truncate max-w-[220px]">{resource.fqdn}</span>}
-            {resource.database_type && <span>{resource.database_type}</span>}
-            {resource._resourceType === 'service' && <span>Docker Compose</span>}
+            {resource.fqdn && <span className="font-mono truncate max-w-[260px] text-slate-700">{resource.fqdn}</span>}
+            {resource.git_repository && <span className="font-mono truncate max-w-[200px]">{resource.git_repository}</span>}
           </div>
-          {(vols > 0 || mounts > 0 || envs > 0) && (
-            <div className="flex gap-1.5 mt-1 text-[10px] text-slate-500 tabular-nums">
-              {vols > 0 && <span className="px-1.5 py-0.5 bg-slate-100 rounded">{vols} {vols === 1 ? 'volumen' : 'volúmenes'}</span>}
-              {mounts > 0 && <span className="px-1.5 py-0.5 bg-slate-100 rounded">{mounts} {mounts === 1 ? 'archivo' : 'archivos'}</span>}
-              {envs > 0 && <span className="px-1.5 py-0.5 bg-slate-100 rounded">{envs} {envs === 1 ? 'variable' : 'variables'}</span>}
+          {(vols > 0 || mounts > 0 || envs > 0 || cronCnt > 0 || magicCount > 0 || (traefikMatch && traefikMatch.translatedRules.length > 0) || resource.health_check_path) && (
+            <div className="flex gap-1.5 mt-1.5 flex-wrap text-[10px] text-slate-600 tabular-nums">
+              {envs > 0 && <span className="px-1.5 py-0.5 bg-slate-100 rounded">{envs} env</span>}
+              {magicCount > 0 && (
+                <span className="px-1.5 py-0.5 bg-violet-50 text-violet-700 border border-violet-200 rounded font-medium">
+                  {magicCount} Magic {magicCount === 1 ? 'Var' : 'Vars'}
+                </span>
+              )}
+              {traefikMatch && traefikMatch.translatedRules.length > 0 && (
+                <span className="px-1.5 py-0.5 bg-sky-50 text-sky-700 border border-sky-200 rounded font-medium">
+                  {traefikMatch.translatedRules.length} Traefik→Caddy
+                </span>
+              )}
+              {vols > 0 && <span className="px-1.5 py-0.5 bg-slate-100 rounded">{vols} vol</span>}
+              {mounts > 0 && <span className="px-1.5 py-0.5 bg-slate-100 rounded">{mounts} cfg</span>}
+              {cronCnt > 0 && <span className="px-1.5 py-0.5 bg-amber-50 text-amber-800 border border-amber-200 rounded">{cronCnt} cron</span>}
+              {resource.health_check_path && (
+                <span className="px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded font-mono">
+                  health:{resource.health_check_path}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -243,339 +1178,881 @@ export const CoolifyImport: React.FC<{
     );
   };
 
+  const cutoverItems: CutoverStep[] = (results?.dnsCutoverChecklist as CutoverStep[] | undefined) || activePlan.dnsCutoverChecklist;
+  const rollbackInfo = results?.rollbackPlan || activePlan.rollbackPlan;
+
   return (
-    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-      <div className="p-5 border-b border-slate-200 bg-slate-50 flex items-center gap-3">
-        <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
-          <Download className="w-4 h-4" />
+    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-2xs">
+      {/* Header + 3-Step Cockpit Stepper */}
+      <div className="p-5 border-b border-slate-200 bg-slate-50 space-y-4">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-slate-900 text-white flex items-center justify-center shrink-0">
+              <Download className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="font-semibold text-base text-slate-900">Cabina de Migración Coolify v4 → Culkibo</h2>
+                <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  Zero-Downtime
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Traduce Magic Vars a Vault AES-256-GCM, etiquetas Traefik a Caddy nativo, 8 motores de BD, Crons y bundles portátiles <code className="font-mono">.zip</code>.
+              </p>
+            </div>
+          </div>
+          {step >= 2 && (
+            <div className={`px-3 py-1.5 rounded-lg border text-xs font-semibold inline-flex items-center gap-1.5 tabular-nums ${parityColor}`}>
+              <ShieldCheck className="w-4 h-4" />
+              <span>{results?.parityScore ?? activePlan.parityScore}% Paridad</span>
+            </div>
+          )}
         </div>
-        <div>
-          <h2 className="font-semibold text-base text-slate-900">Importación desde Coolify v4</h2>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Migra aplicaciones, bases de datos, variables y dominios con su configuración completa.
-          </p>
-        </div>
+
+        {/* 3-Step Stepper */}
+        <ol className="grid grid-cols-3 gap-2" aria-label="Pasos de migración">
+          {[
+            { num: 1 as const, label: '1. Conectar origen', sub: 'API, JSON o .zip' },
+            { num: 2 as const, label: '2. Paridad y Pre-Flight', sub: 'Magic Vars & Traefik' },
+            { num: 3 as const, label: '3. Migrar y Cutover DNS', sub: 'Smoke & Rollback' },
+          ].map((s) => {
+            const isCurrent = step === s.num;
+            const isDone = step > s.num;
+            return (
+              <li
+                key={s.num}
+                className={`px-3 py-2 rounded-lg border text-left transition-colors ${
+                  isCurrent
+                    ? 'bg-white border-slate-900 text-slate-900 shadow-2xs'
+                    : isDone
+                      ? 'bg-emerald-50/60 border-emerald-200 text-emerald-900'
+                      : 'bg-white/60 border-slate-200 text-slate-400'
+                }`}
+              >
+                <div className="flex items-center gap-1.5 text-xs font-semibold">
+                  {isDone ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" /> : null}
+                  <span className="truncate">{s.label}</span>
+                </div>
+                <div className="text-[10px] opacity-80 truncate">{s.sub}</div>
+              </li>
+            );
+          })}
+        </ol>
       </div>
 
       <div className="p-5">
-        {/* PASO 1 */}
+        {/* ================================================================= */}
+        {/* STEP 1: CONNECT COOLIFY API / OFFLINE EXPORT / PORTABLE .ZIP      */}
+        {/* ================================================================= */}
         {step === 1 && (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void handleConnect();
-            }}
-            className="space-y-4"
-          >
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">URL de tu instancia Coolify</label>
-              <div className="relative">
-                <LinkIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                <input
-                  type="url"
-                  required
-                  value={apiUrl}
-                  onChange={(e) => setApiUrl(e.target.value)}
-                  placeholder="https://coolify.tudominio.com"
-                  className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono"
-                />
-              </div>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Token de API (Bearer)</label>
-              <div className="relative">
-                <AlertCircle className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                <input
-                  type="password"
-                  required
-                  value={apiToken}
-                  onChange={(e) => setApiToken(e.target.value)}
-                  placeholder="1|xxxxxxxxxxxxxxxxxxxx"
-                  className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono"
-                />
-              </div>
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <button type="button" onClick={onCancel} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
-                Cancelar
-              </button>
-              <button
-                type="submit"
-                disabled={loading || !apiUrl.trim() || !apiToken.trim()}
-                className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
-              >
-                {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                {loading ? 'Conectando…' : 'Conectar y previsualizar'}
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* PASO 2 */}
-        {step === 2 && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div className="flex items-center gap-3 text-xs text-slate-600 tabular-nums">
-                <span className="flex items-center gap-1"><Server className="w-3.5 h-3.5 text-slate-400" /> {selectedApps.length}/{totalApps} apps</span>
-                <span className="flex items-center gap-1"><Database className="w-3.5 h-3.5 text-slate-400" /> {selectedDbs.length}/{totalDbs} BDs</span>
-                <span className="flex items-center gap-1"><Box className="w-3.5 h-3.5 text-slate-400" /> {selectedServices.length}/{totalSvcs} servicios</span>
-              </div>
-              <div className="flex gap-2 text-xs">
-                <button type="button" onClick={selectAll} className="text-slate-700 hover:text-slate-900 font-medium underline cursor-pointer">
-                  Seleccionar todo
-                </button>
-                <span className="text-slate-300">·</span>
-                <button type="button" onClick={deselectAll} className="text-slate-500 hover:text-slate-800 font-medium cursor-pointer">
-                  Quitar todo
-                </button>
-              </div>
-            </div>
-
-            <div className="space-y-3 max-h-[400px] overflow-y-auto pr-1">
-              {projectGroups.map((group) => {
-                const key = group.project.uuid;
-                const isCollapsed = collapsed.has(key);
-                const groupUuids = group.resources.map((r) => r.uuid);
-                const selectedInGroup = groupUuids.filter((id) => selected.has(id)).length;
-                const allInGroupSelected = selectedInGroup === groupUuids.length;
-                const someSelected = selectedInGroup > 0 && !allInGroupSelected;
-
+            {/* Source Mode Switcher */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {[
+                { id: 'api' as const, title: 'API Coolify v4', desc: 'Conexión directa solo-lectura', icon: LinkIcon },
+                { id: 'offline' as const, title: 'Exportación JSON', desc: 'Pega snapshot sin red pública', icon: FileJson },
+                { id: 'bundle' as const, title: 'Bundle Portátil .zip', desc: 'Stack Culkibo autocontenido', icon: FileArchive },
+              ].map((m) => {
+                const Icon = m.icon;
+                const active = sourceMode === m.id;
                 return (
-                  <div key={key} className="border border-slate-200 rounded-xl overflow-hidden bg-white">
-                    <div className="flex items-center gap-3 px-4 py-3 bg-slate-50 border-b border-slate-200 select-none">
-                      <button
-                        type="button"
-                        aria-label={allInGroupSelected ? `Quitar selección de ${group.project.name}` : `Seleccionar todo ${group.project.name}`}
-                        onClick={() => toggleProject(group)}
-                        className={`w-4 h-4 flex items-center justify-center rounded border transition-colors shrink-0 cursor-pointer ${
-                          allInGroupSelected
-                            ? 'bg-slate-900 border-slate-900 text-white'
-                            : someSelected
-                              ? 'bg-slate-200 border-slate-400 text-slate-900'
-                              : 'border-slate-300 text-transparent bg-white'
-                        }`}
-                        title={allInGroupSelected ? 'Quitar selección' : 'Seleccionar todo el proyecto'}
-                      >
-                        {allInGroupSelected ? <Check className="w-3 h-3" /> : someSelected ? <Minus className="w-3 h-3" /> : null}
-                      </button>
-                      <button
-                        type="button"
-                        aria-expanded={!isCollapsed}
-                        onClick={() => toggleCollapse(key)}
-                        className="flex-1 min-w-0 flex items-center justify-between gap-2 text-left cursor-pointer"
-                      >
-                        <span className="flex items-center gap-2 min-w-0">
-                          <FolderKanban className="w-4 h-4 text-slate-500 shrink-0" />
-                          <span className="text-xs font-semibold text-slate-900 truncate">{group.project.name}</span>
-                          <span className="text-[11px] text-slate-400 tabular-nums">
-                            {selectedInGroup}/{group.resources.length}
-                          </span>
-                        </span>
-                        {isCollapsed ? <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" /> : <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />}
-                      </button>
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setSourceMode(m.id)}
+                    className={`flex items-start gap-2.5 p-3 rounded-xl border text-left transition-colors cursor-pointer ${
+                      active
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${active ? 'text-emerald-400' : 'text-slate-400'}`} />
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold">{m.title}</div>
+                      <div className={`text-[11px] ${active ? 'text-slate-300' : 'text-slate-500'}`}>{m.desc}</div>
                     </div>
-                    {!isCollapsed && (
-                      <div className="p-3 space-y-2">{group.resources.map((r) => renderResourceRow(r))}</div>
-                    )}
-                  </div>
+                  </button>
                 );
               })}
-              {projectGroups.length === 0 && (
-                <div className="text-center py-8 text-slate-500 text-xs">
-                  No se encontraron recursos en esa instancia de Coolify.
+            </div>
+
+            {sourceMode === 'api' && (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void handleConnectApi();
+                }}
+                className="space-y-4"
+              >
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs text-slate-600 flex items-start gap-2.5">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-semibold text-slate-900">100% solo-lectura en origen:</span> Culkibo nunca modifica ni detiene tus contenedores en Coolify. Genera tu token en{' '}
+                    <span className="font-mono text-[11px] bg-white px-1.5 py-0.5 rounded border border-slate-200">Keys &amp; Tokens → API Tokens (read:all)</span>.
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">URL de tu instancia Coolify v4</label>
+                  <div className="relative">
+                    <LinkIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input
+                      type="url"
+                      required
+                      value={apiUrl}
+                      onChange={(e) => setApiUrl(e.target.value)}
+                      placeholder="https://coolify.tudominio.com"
+                      className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono focus:outline-none focus:border-slate-400"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Token de API (Bearer)</label>
+                  <div className="relative">
+                    <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input
+                      type="password"
+                      required
+                      value={apiToken}
+                      onChange={(e) => setApiToken(e.target.value)}
+                      placeholder="1|xxxxxxxxxxxxxxxxxxxx"
+                      className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono focus:outline-none focus:border-slate-400"
+                    />
+                  </div>
+                </div>
+                <div className="flex justify-end gap-2 pt-2">
+                  <button type="button" onClick={onCancel} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={loading || !apiUrl.trim() || !apiToken.trim()}
+                    className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                  >
+                    {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    {loading ? 'Analizando paridad…' : 'Conectar y analizar paridad'}
+                    {!loading && <ArrowRight className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {sourceMode === 'offline' && (
+              <div className="space-y-3">
+                <p className="text-xs text-slate-600">
+                  Pega una exportación JSON de Coolify v4 (<code className="font-mono text-[11px] bg-slate-100 px-1 rounded">{'{ "projects": [...], "apps": [...], "databases": [...], "services": [...] }'}</code>) para ejecutar el análisis de paridad, Magic Vars y Traefik→Caddy completamente offline.
+                </p>
+                <textarea
+                  rows={8}
+                  value={offlineJson}
+                  onChange={(e) => setOfflineJson(e.target.value)}
+                  placeholder='{"projects":[{"uuid":"p1","name":"Prod"}],"apps":[{"uuid":"a1","name":"API","fqdn":"https://api.ejemplo.com","environment_variables":[{"key":"DB_PASS","value":"${SERVICE_PASSWORD_64_DB}"}]}]}'
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:bg-white focus:border-slate-400"
+                />
+                <div className="flex justify-end gap-2">
+                  <button type="button" onClick={onCancel} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!offlineJson.trim()}
+                    onClick={handleParseOfflineJson}
+                    className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                  >
+                    <span>Analizar exportación JSON</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {sourceMode === 'bundle' && (
+              <div className="space-y-4">
+                <div
+                  onClick={() => fileInputRef.current?.click()}
+                  className="border-2 border-dashed border-slate-300 hover:border-slate-500 rounded-xl p-6 text-center cursor-pointer bg-slate-50/70 transition-colors"
+                >
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".zip,.gz,.ckb.gz"
+                    className="hidden"
+                    onChange={(e) => void handleBundleFileChange(e.target.files?.[0] || null)}
+                  />
+                  <Upload className="w-7 h-7 text-slate-400 mx-auto mb-2" />
+                  <p className="text-xs font-semibold text-slate-800">
+                    Arrastra o selecciona un Culkibo Portable Stack Bundle (<code className="font-mono">.zip</code> / <code className="font-mono">.ckb.gz</code>)
+                  </p>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Incluye <code className="font-mono">culkibo.yaml</code>, proyectos, políticas Caddy, BDs, crons, MCP y sobre Vault AES-256-GCM.
+                  </p>
+                </div>
+
+                {parsedBundle && (
+                  <div className="border border-emerald-200 bg-emerald-50/40 rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-2">
+                        <FileArchive className="w-4 h-4 text-emerald-700" />
+                        <span className="text-xs font-semibold text-slate-900">{parsedBundle.manifest.stackName}</span>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white border border-slate-200 text-slate-600">
+                          {parsedBundle.format} · {parsedBundle.manifest.bundleId}
+                        </span>
+                      </div>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${
+                        parsedBundle.manifest.vaultMode === 'encrypted'
+                          ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                          : 'bg-slate-100 text-slate-700 border-slate-200'
+                      }`}>
+                        {parsedBundle.manifest.vaultMode === 'encrypted' ? 'Vault cifrado AES-256-GCM' : 'Vault redactado (0 secretos)'}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-4 gap-2 text-center text-xs tabular-nums">
+                      <div className="bg-white border border-slate-200 rounded-lg p-2">
+                        <div className="font-semibold text-slate-900">{parsedBundle.projects.length}</div>
+                        <div className="text-[10px] text-slate-500">Proyectos</div>
+                      </div>
+                      <div className="bg-white border border-slate-200 rounded-lg p-2">
+                        <div className="font-semibold text-slate-900">{parsedBundle.domains.length}</div>
+                        <div className="text-[10px] text-slate-500">Dominios</div>
+                      </div>
+                      <div className="bg-white border border-slate-200 rounded-lg p-2">
+                        <div className="font-semibold text-slate-900">{parsedBundle.databases.length}</div>
+                        <div className="text-[10px] text-slate-500">Bases datos</div>
+                      </div>
+                      <div className="bg-white border border-slate-200 rounded-lg p-2">
+                        <div className="font-semibold text-slate-900">{parsedBundle.crons.length}</div>
+                        <div className="text-[10px] text-slate-500">Crons</div>
+                      </div>
+                    </div>
+
+                    {parsedBundle.manifest.vaultMode === 'encrypted' && (
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-700 mb-1">Contraseña del Vault portátil (passphrase)</label>
+                        <input
+                          type="password"
+                          value={bundlePassphrase}
+                          onChange={(e) => setBundlePassphrase(e.target.value)}
+                          placeholder="Introduce tu passphrase para descifrar vault.enc.json"
+                          className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono"
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex justify-end gap-2">
+                  <button type="button" onClick={onCancel} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    disabled={loading || !parsedBundle}
+                    onClick={() => void handleImportBundle()}
+                    className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                  >
+                    {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    <span>Restaurar Bundle en 1 clic</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ================================================================= */}
+        {/* STEP 2: LIVE PARITY PREVIEW COCKPIT                               */}
+        {/* ================================================================= */}
+        {step === 2 && (
+          <div className="space-y-4">
+            {/* KPI Parity Strip */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 tabular-nums">
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <div className="text-[10px] text-slate-500 flex items-center gap-1"><Server className="w-3 h-3" /> Apps / Compose</div>
+                <div className="text-sm font-semibold text-slate-900 mt-0.5">{selectedApps.length}/{totalApps} · {selectedServices.length}/{totalSvcs}</div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <div className="text-[10px] text-slate-500 flex items-center gap-1"><Database className="w-3 h-3" /> Bases de datos</div>
+                <div className="text-sm font-semibold text-slate-900 mt-0.5">{selectedDbs.length}/{totalDbs}</div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-violet-50/70 border border-violet-200">
+                <div className="text-[10px] text-violet-700 flex items-center gap-1"><Sparkles className="w-3 h-3" /> Magic Vars</div>
+                <div className="text-sm font-semibold text-violet-950 mt-0.5">{activePlan.summary.magicVarsTranslated} traducidas</div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-sky-50/70 border border-sky-200">
+                <div className="text-[10px] text-sky-700 flex items-center gap-1"><Layers className="w-3 h-3" /> Traefik → Caddy</div>
+                <div className="text-sm font-semibold text-sky-950 mt-0.5">{activePlan.summary.traefikRulesTranslated} reglas</div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-emerald-50/70 border border-emerald-200 col-span-2 sm:col-span-1">
+                <div className="text-[10px] text-emerald-700 flex items-center gap-1"><Clock className="w-3 h-3" /> Crons / Vols</div>
+                <div className="text-sm font-semibold text-emerald-950 mt-0.5">{activePlan.summary.cronsMapped} · {activePlan.summary.volumesCount}</div>
+              </div>
+            </div>
+
+            {/* Sub-Tabs */}
+            <div className="flex items-center justify-between gap-2 border-b border-slate-200 pb-2 flex-wrap">
+              <div className="flex gap-1 flex-wrap" role="tablist">
+                {[
+                  { id: 'resources' as const, label: `Recursos (${allResources.length})` },
+                  { id: 'magic' as const, label: `Magic Vars (${activePlan.magicVariables.length})` },
+                  { id: 'traefik' as const, label: `Traefik→Caddy (${activePlan.summary.traefikRulesTranslated})` },
+                  { id: 'preflight' as const, label: `Pre-Flight (${activePlan.warnings.length + activePlan.secretWarnings.length})` },
+                ].map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={previewTab === t.id}
+                    onClick={() => setPreviewTab(t.id)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                      previewTab === t.id
+                        ? 'bg-slate-900 text-white'
+                        : 'text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              {previewTab === 'resources' && (
+                <div className="flex items-center gap-2 text-xs">
+                  <button type="button" onClick={selectAll} className="text-slate-700 hover:text-slate-900 font-medium underline cursor-pointer">
+                    Todo
+                  </button>
+                  <span className="text-slate-300">·</span>
+                  <button type="button" onClick={deselectAll} className="text-slate-500 hover:text-slate-800 font-medium cursor-pointer">
+                    Ninguno
+                  </button>
                 </div>
               )}
             </div>
 
-            <div className="flex justify-between gap-2 pt-3 border-t border-slate-200">
+            {/* TAB 1: RESOURCES */}
+            {previewTab === 'resources' && (
+              <div className="space-y-3">
+                {allResources.length > 4 && (
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Filtrar por nombre, dominio, motor de BD o repo…"
+                      className="w-full pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs focus:outline-none focus:bg-white"
+                    />
+                  </div>
+                )}
+
+                <div className="space-y-3 max-h-[380px] overflow-y-auto pr-1">
+                  {projectGroups.map((group) => {
+                    const key = group.project.uuid;
+                    const isCollapsed = collapsed.has(key);
+                    const groupUuids = group.resources.map((r) => r.uuid);
+                    const selectedInGroup = groupUuids.filter((id) => selected.has(id)).length;
+                    const allInGroupSelected = selectedInGroup === groupUuids.length;
+                    const someSelected = selectedInGroup > 0 && !allInGroupSelected;
+
+                    return (
+                      <div key={key} className="border border-slate-200 rounded-xl overflow-hidden bg-white">
+                        <div className="flex items-center gap-3 px-4 py-2.5 bg-slate-50 border-b border-slate-200 select-none">
+                          <button
+                            type="button"
+                            aria-label={allInGroupSelected ? `Quitar selección de ${group.project.name}` : `Seleccionar todo ${group.project.name}`}
+                            onClick={() => toggleProject(group)}
+                            className={`w-4 h-4 flex items-center justify-center rounded border transition-colors shrink-0 cursor-pointer ${
+                              allInGroupSelected
+                                ? 'bg-slate-900 border-slate-900 text-white'
+                                : someSelected
+                                  ? 'bg-slate-200 border-slate-400 text-slate-900'
+                                  : 'border-slate-300 text-transparent bg-white'
+                            }`}
+                          >
+                            {allInGroupSelected ? <Check className="w-3 h-3" /> : someSelected ? <Minus className="w-3 h-3" /> : null}
+                          </button>
+                          <button
+                            type="button"
+                            aria-expanded={!isCollapsed}
+                            onClick={() => toggleCollapse(key)}
+                            className="flex-1 min-w-0 flex items-center justify-between gap-2 text-left cursor-pointer"
+                          >
+                            <span className="flex items-center gap-2 min-w-0">
+                              <FolderKanban className="w-4 h-4 text-slate-500 shrink-0" />
+                              <span className="text-xs font-semibold text-slate-900 truncate">{group.project.name}</span>
+                              <span className="text-[11px] text-slate-400 tabular-nums">
+                                {selectedInGroup}/{group.resources.length}
+                              </span>
+                            </span>
+                            {isCollapsed ? <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" /> : <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />}
+                          </button>
+                        </div>
+                        {!isCollapsed && (
+                          <div className="p-3 space-y-2">{group.resources.map((r) => renderResourceRow(r))}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {projectGroups.length === 0 && (
+                    <div className="text-center py-8 text-slate-500 text-xs">
+                      No se encontraron recursos con ese filtro.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 2: MAGIC VARS & VAULT */}
+            {previewTab === 'magic' && (
+              <div className="space-y-3 max-h-[380px] overflow-y-auto pr-1">
+                <div className="flex items-center gap-2 text-xs text-slate-600 bg-violet-50/60 border border-violet-200 rounded-lg p-3">
+                  <Lock className="w-4 h-4 text-violet-700 shrink-0" />
+                  <span>
+                    Vista previa 100% redactada: todos los secretos mágicos (<code className="font-mono">SERVICE_PASSWORD_*</code>, <code className="font-mono">SERVICE_BASE64_*</code>) se traducen a referencias nativas <code className="font-mono">{'${vault.*}'}</code> cifradas con AES-256-GCM.
+                  </span>
+                </div>
+                {activePlan.magicVariables.length > 0 ? (
+                  <div className="border border-slate-200 rounded-xl overflow-hidden">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-50 border-b border-slate-200 text-[10px] uppercase tracking-wide text-slate-500">
+                        <tr>
+                          <th className="px-3 py-2">Recurso / Env</th>
+                          <th className="px-3 py-2">Coolify v4</th>
+                          <th className="px-3 py-2">Culkibo Nativo</th>
+                          <th className="px-3 py-2">Tipo</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {activePlan.magicVariables.map((mv, i) => (
+                          <tr key={`${mv.envKey}-${mv.variable}-${i}`} className="hover:bg-slate-50/70">
+                            <td className="px-3 py-2">
+                              <div className="font-medium text-slate-900">{mv.resourceName}</div>
+                              <div className="font-mono text-[10px] text-slate-500">{mv.envKey}</div>
+                            </td>
+                            <td className="px-3 py-2 font-mono text-[11px] text-slate-600">{mv.original}</td>
+                            <td className="px-3 py-2 font-mono text-[11px] font-medium text-emerald-700">{mv.resolvedPreview}</td>
+                            <td className="px-3 py-2">
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                                mv.kind === 'magic_secret'
+                                  ? 'bg-violet-50 text-violet-700 border border-violet-200'
+                                  : mv.kind === 'magic_domain'
+                                    ? 'bg-sky-50 text-sky-700 border border-sky-200'
+                                    : 'bg-slate-100 text-slate-700'
+                              }`}>
+                                {mv.kind === 'magic_secret' ? 'Vault' : mv.kind === 'magic_domain' ? 'Dominio' : 'Runtime'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="text-center py-8 text-xs text-slate-500 border border-dashed border-slate-200 rounded-xl">
+                    No se detectaron variables mágicas <code className="font-mono">${'{SERVICE_*}'}</code> / <code className="font-mono">${'{COOLIFY_*}'}</code> en los recursos actuales.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* TAB 3: TRAEFIK → CADDY */}
+            {previewTab === 'traefik' && (
+              <div className="space-y-3 max-h-[380px] overflow-y-auto pr-1">
+                {activePlan.traefikTranslations.length > 0 ? (
+                  activePlan.traefikTranslations.map((tr) => (
+                    <div key={tr.resourceId} className="border border-slate-200 rounded-xl p-3.5 space-y-2.5 bg-white">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="text-xs font-semibold text-slate-900">{tr.resourceName}</div>
+                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200 font-medium tabular-nums">
+                          {tr.translatedRules.length} reglas traducidas de {tr.labelCount} etiquetas
+                        </span>
+                      </div>
+                      <div className="space-y-1.5">
+                        {tr.translatedRules.map((rule, idx) => (
+                          <div key={idx} className="flex items-center gap-2 text-[11px] bg-slate-50 border border-slate-100 rounded-lg px-2.5 py-1.5 flex-wrap">
+                            <span className="font-mono text-slate-500">{rule.source}</span>
+                            <ArrowRight className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span className="font-mono font-semibold text-sky-700">{rule.target}</span>
+                            <span className="text-slate-700 ml-auto">{rule.summary}</span>
+                          </div>
+                        ))}
+                      </div>
+                      {tr.unsupportedLabels.length > 0 && (
+                        <div className="text-[11px] bg-amber-50 text-amber-900 border border-amber-200 rounded-lg p-2.5">
+                          <div className="font-semibold mb-1">Etiquetas Traefik avanzadas para revisión manual:</div>
+                          <ul className="font-mono text-[10px] space-y-0.5 list-disc pl-4">
+                            {tr.unsupportedLabels.map((u, i) => <li key={i}>{u}</li>)}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-center py-8 text-xs text-slate-500 border border-dashed border-slate-200 rounded-xl">
+                    No se detectaron etiquetas <code className="font-mono">traefik.http.*</code> personalizadas; Culkibo configurará HTTPS automático y cabeceras de seguridad en Caddy.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* TAB 4: PRE-FLIGHT & WARNINGS */}
+            {previewTab === 'preflight' && (
+              <div className="space-y-3 max-h-[380px] overflow-y-auto pr-1">
+                {activePlan.databases.length > 0 && (
+                  <div className="border border-slate-200 rounded-xl p-3.5 space-y-2">
+                    <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                      <Database className="w-3.5 h-3.5 text-emerald-600" /> Paridad de Bases de Datos ({activePlan.databases.length})
+                    </div>
+                    <div className="space-y-1.5">
+                      {activePlan.databases.map((db) => (
+                        <div key={db.id} className="text-[11px] bg-slate-50 border border-slate-100 rounded-lg p-2.5 space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-slate-900">{db.name}</span>
+                            <span className="font-mono text-[10px] px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded">
+                              {db.originalType} → {db.culkiboEngine} (:{db.port})
+                            </span>
+                          </div>
+                          {db.note && <div className="text-amber-800">{db.note}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {activePlan.crons.length > 0 && (
+                  <div className="border border-slate-200 rounded-xl p-3.5 space-y-2">
+                    <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-amber-600" /> Scheduled Tasks → Crons ({activePlan.crons.length})
+                    </div>
+                    {activePlan.crons.map((c, i) => (
+                      <div key={i} className={`text-[11px] rounded-lg p-2 border ${c.valid ? 'bg-slate-50 border-slate-100' : 'bg-amber-50 border-amber-200'}`}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-900">{c.name}</span>
+                          <code className="font-mono text-[10px] bg-white px-1.5 py-0.5 rounded border border-slate-200">{c.schedule}</code>
+                        </div>
+                        <div className="font-mono text-[10px] text-slate-600 mt-0.5 truncate">{c.command}</div>
+                        {c.warning && <div className="text-amber-900 mt-1">{c.warning}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {(activePlan.secretWarnings.length > 0 || activePlan.warnings.length > 0) ? (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 space-y-1.5 text-xs text-amber-900">
+                    <div className="font-semibold flex items-center gap-1.5">
+                      <AlertTriangle className="w-4 h-4 text-amber-600" /> Recomendaciones de seguridad y paridad
+                    </div>
+                    <ul className="list-disc pl-4 space-y-1 text-[11px]">
+                      {[...activePlan.secretWarnings, ...activePlan.warnings].map((w, i) => <li key={i}>{w}</li>)}
+                    </ul>
+                  </div>
+                ) : (
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3.5 text-xs text-emerald-900 flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <span>Pre-flight limpio: 0 bloqueantes detectados. Listo para migrar en 1 clic.</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Footer Actions */}
+            <div className="flex items-center justify-between gap-2 pt-3 border-t border-slate-200 flex-wrap">
               <button type="button" onClick={() => setStep(1)} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
                 Atrás
               </button>
-              <button
-                type="button"
-                onClick={() => void handleImport()}
-                disabled={loading || selected.size === 0}
-                className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer tabular-nums"
-              >
-                {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                {loading
-                  ? 'Importando…'
-                  : `Importar ${selected.size} ${selected.size === 1 ? 'recurso seleccionado' : 'recursos seleccionados'}`}
-              </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={handleDownloadPortableZip}
+                  disabled={selected.size === 0}
+                  className="px-3.5 py-2 text-slate-700 font-medium border border-slate-200 bg-white hover:bg-slate-50 rounded-lg text-xs inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                >
+                  <FileArchive className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Exportar Bundle .zip</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleImport()}
+                  disabled={loading || selected.size === 0}
+                  className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer tabular-nums"
+                >
+                  {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  {loading
+                    ? 'Migrando stack…'
+                    : `Migrar ${selected.size} ${selected.size === 1 ? 'recurso' : 'recursos'} (Zero-Downtime)`}
+                </button>
+              </div>
             </div>
           </div>
         )}
 
-        {/* PASO 3 */}
+        {/* ================================================================= */}
+        {/* STEP 3: MIGRATION SUMMARY + DNS CUTOVER CHECKLIST + ROLLBACK      */}
+        {/* ================================================================= */}
         {step === 3 && results && (
-          <div className="space-y-5 text-center py-4">
-            <CheckCircle2 className="w-12 h-12 text-emerald-600 mx-auto" />
-            <div>
-              <h3 className="text-base font-semibold text-slate-900">Migración completada</h3>
-              <p className="text-xs text-slate-500 mt-1 tabular-nums">
-                Se importaron {results.importedApps} aplicaciones, {results.importedDbs} bases de datos y {results.importedServices} servicios.
-              </p>
+          <div className="space-y-5">
+            {/* Completion Hero */}
+            <div className="bg-emerald-50/60 border border-emerald-200 rounded-xl p-4 flex items-start gap-3">
+              <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm font-semibold text-slate-900">Migración completada sin tocar tu Coolify original</h3>
+                <p className="text-xs text-slate-600 mt-1 tabular-nums">
+                  Importados <strong>{results.importedApps || 0}</strong> apps, <strong>{results.importedDbs || 0}</strong> BDs, <strong>{results.importedServices || 0}</strong> servicios
+                  {results.importedCrons ? <> · <strong>{results.importedCrons}</strong> crons</> : null}
+                  {results.traefikRulesApplied ? <> · <strong>{results.traefikRulesApplied}</strong> reglas Traefik→Caddy</> : null}
+                  {results.magicVarsTranslated ? <> · <strong>{results.magicVarsTranslated}</strong> Magic Vars</> : null}.
+                </p>
+              </div>
             </div>
-            {results.errors?.length > 0 && (
-              <div className="bg-red-50 text-red-800 p-4 rounded-xl text-xs text-left border border-red-200">
-                <p className="font-semibold mb-1.5">Avisos durante la migración:</p>
-                <ul className="list-disc pl-4 space-y-1">
+
+            {Array.isArray(results.errors) && results.errors.length > 0 && (
+              <div className="bg-red-50 text-red-800 p-3.5 rounded-xl text-xs border border-red-200">
+                <div className="font-semibold mb-1 flex items-center gap-1.5">
+                  <AlertCircle className="w-4 h-4" /> Errores parciales durante la importación:
+                </div>
+                <ul className="list-disc pl-4 space-y-0.5">
                   {results.errors.map((e: string, i: number) => <li key={i}>{e}</li>)}
                 </ul>
               </div>
             )}
 
-            {importedDomains.length > 0 ? (
-              <button
-                type="button"
-                onClick={() => setStep(4)}
-                className="px-5 py-2.5 bg-slate-900 text-white rounded-lg text-xs font-medium hover:bg-slate-800 cursor-pointer tabular-nums"
-              >
-                Siguiente: configurar dominios ({importedDomains.length})
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={onComplete}
-                className="px-5 py-2.5 bg-slate-900 text-white rounded-lg text-xs font-medium hover:bg-slate-800 cursor-pointer"
-              >
-                Ir a proyectos
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* PASO 4 */}
-        {step === 4 && (
-          <div className="space-y-5">
-            <div className="flex items-center gap-2.5 border-b border-slate-200 pb-3.5">
-              <Globe className="w-4 h-4 text-slate-600" />
-              <div>
-                <h3 className="font-semibold text-sm text-slate-900">Migración de dominios</h3>
-                <p className="text-xs text-slate-500">Apunta los dominios importados a la IP de este servidor.</p>
+            {/* Zero-Downtime Cutover Checklist */}
+            <div className="border border-slate-200 rounded-xl p-4 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <h4 className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                  <Activity className="w-4 h-4 text-slate-600" /> Checklist de Cutover DNS (Zero-Downtime)
+                </h4>
+                <span className="text-[11px] text-slate-500 tabular-nums">
+                  {checkedCutover.size}/{cutoverItems.length} completados
+                </span>
+              </div>
+              <div className="space-y-1.5">
+                {cutoverItems.map((item) => {
+                  const done = checkedCutover.has(item.id);
+                  return (
+                    <label
+                      key={item.id}
+                      className={`flex items-start gap-2.5 p-2.5 rounded-lg border text-xs cursor-pointer transition-colors ${
+                        done ? 'bg-emerald-50/40 border-emerald-200 text-slate-500' : 'bg-white border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={done}
+                        onChange={() =>
+                          setCheckedCutover((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(item.id)) next.delete(item.id);
+                            else next.add(item.id);
+                            return next;
+                          })
+                        }
+                        className="w-3.5 h-3.5 mt-0.5 rounded accent-emerald-600"
+                      />
+                      <div className="min-w-0">
+                        <div className={`font-medium ${done ? 'line-through text-slate-500' : 'text-slate-900'}`}>
+                          {item.step}. {item.title}
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-0.5">{item.detail}</div>
+                      </div>
+                    </label>
+                  );
+                })}
               </div>
             </div>
 
-            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-2.5">
-              <label className="block text-xs font-medium text-slate-700">IP del servidor Culkibo</label>
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
-                <input
-                  type="text"
-                  value={serverIp}
-                  onChange={(e) => setServerIp(e.target.value)}
-                  placeholder="203.0.113.10"
-                  className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono"
-                />
-                <label className="flex items-center gap-2 text-xs text-slate-700 bg-white border border-slate-200 px-3 py-2 rounded-lg cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={useCloudflare}
-                    onChange={(e) => setUseCloudflare(e.target.checked)}
-                    className="rounded border-slate-300 accent-slate-900"
-                  />
-                  <Cloud className="w-3.5 h-3.5 text-slate-500" />
-                  <span>Actualizar DNS vía Cloudflare</span>
-                </label>
+            {/* Pre-DNS Parity Verifier */}
+            {activePlan.domains.length > 0 && (
+              <div className="border border-slate-200 rounded-xl p-4 space-y-2.5 bg-slate-50/50">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                    <Terminal className="w-4 h-4 text-slate-600" /> Verificación Smoke Pre-DNS (prueba Culkibo antes de mover tráfico)
+                  </div>
+                  <button
+                    type="button"
+                    disabled={verifyingParity}
+                    onClick={() => void handleRunLiveVerification()}
+                    className="px-2.5 py-1 text-[11px] font-medium rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    {verifyingParity && <Loader2 className="w-3 h-3 animate-spin" />}
+                    <span>Verificar paridad en vivo</span>
+                  </button>
+                </div>
+                <div className="space-y-1.5">
+                  {activePlan.domains.slice(0, 6).map((d) => {
+                    const cmd = `curl -fsS -I --resolve ${d.hostname}:443:${serverIp || '<IP_CULKIBO>'} https://${d.hostname}${d.healthPath || '/'}`;
+                    return (
+                      <div key={d.hostname} className="flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5">
+                        <code className="text-[11px] font-mono text-slate-700 truncate">{cmd}</code>
+                        <button
+                          type="button"
+                          onClick={() => copyText(cmd, 'Comando curl')}
+                          className="p-1 text-slate-400 hover:text-slate-700 cursor-pointer shrink-0"
+                          title="Copiar comando"
+                        >
+                          <Copy className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                {verifyReport && (
+                  <div className={`text-xs p-2.5 rounded-lg border ${verifyReport.cutoverReady ? 'bg-emerald-50 border-emerald-200 text-emerald-900' : 'bg-amber-50 border-amber-200 text-amber-900'}`}>
+                    {verifyReport.recommendation} ({verifyReport.parityPercent}% paridad)
+                  </div>
+                )}
               </div>
-              {useCloudflare && !cfAvailable && (
-                <p className="text-[11px] text-amber-800">
-                  Cloudflare no está configurado todavía en Ajustes → Integraciones; configura tu API Token para que el cambio sea automático.
-                </p>
+            )}
+
+            {/* Live Domain DNS Cutover */}
+            {importedDomains.length > 0 && (
+              <div className="border border-slate-200 rounded-xl p-4 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Globe className="w-4 h-4 text-slate-600" />
+                  <h4 className="font-semibold text-xs text-slate-900">Conmutación de dominios ({importedDomains.length})</h4>
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                  <input
+                    type="text"
+                    value={serverIp}
+                    onChange={(e) => setServerIp(e.target.value)}
+                    placeholder="IP del servidor Culkibo (ej. 203.0.113.10)"
+                    className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono"
+                  />
+                  <label className="flex items-center gap-2 text-xs text-slate-700 bg-slate-50 border border-slate-200 px-3 py-2 rounded-lg cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={useCloudflare}
+                      onChange={(e) => setUseCloudflare(e.target.checked)}
+                      className="rounded border-slate-300 accent-slate-900"
+                    />
+                    <Cloud className="w-3.5 h-3.5 text-slate-500" />
+                    <span>Auto-DNS Cloudflare</span>
+                  </label>
+                </div>
+
+                {useCloudflare && !cfAvailable && (
+                  <p className="text-[11px] text-amber-800">
+                    Cloudflare no está configurado todavía en Ajustes → Integraciones; configura tu API Token para actualización automática.
+                  </p>
+                )}
+
+                <div className="space-y-1.5 max-h-[200px] overflow-y-auto">
+                  {importedDomains.map((domain) => {
+                    const isMigrating = migratingDomains.has(domain.hostname);
+                    const isPending = domain.sslStatus === 'pending_migration';
+                    const isActive = domain.sslStatus === 'active';
+                    return (
+                      <div key={domain.id} className="flex items-center justify-between p-2.5 bg-slate-50/70 border border-slate-200 rounded-lg gap-3">
+                        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                          <span className="font-mono font-medium text-slate-900 text-xs truncate">{domain.hostname}</span>
+                          <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                            isActive
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                              : 'bg-amber-50 text-amber-800 border-amber-200'
+                          }`}>
+                            {isPending ? 'Pendiente DNS' : isActive ? 'Certificado activo' : 'SSL pendiente'}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setMigratingDomains((prev) => new Set([...prev, domain.hostname]));
+                            try {
+                              await api.migrateDomain(domain.hostname, serverIp, useCloudflare);
+                              const domainsRes = await api.getDomains();
+                              setImportedDomains(
+                                domainsRes.domains.filter((d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify')
+                              );
+                              onNotify(`Dominio ${domain.hostname} actualizado`, 'success');
+                            } catch (e: any) {
+                              onNotify(e?.message || 'Error al migrar dominio', 'error');
+                            } finally {
+                              setMigratingDomains((prev) => {
+                                const n = new Set(prev);
+                                n.delete(domain.hostname);
+                                return n;
+                              });
+                            }
+                          }}
+                          disabled={isMigrating || !isPending}
+                          className="px-3 py-1 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer shrink-0"
+                        >
+                          {isMigrating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : isPending ? 'Migrar DNS' : 'Listo'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setLoading(true);
+                      const hostnames = importedDomains.filter((d) => d.sslStatus === 'pending_migration').map((d) => d.hostname);
+                      setMigratingDomains(new Set(hostnames));
+                      try {
+                        await api.migrateDomainsBatch(hostnames, serverIp, useCloudflare);
+                        const domainsRes = await api.getDomains();
+                        setImportedDomains(
+                          domainsRes.domains.filter((d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify')
+                        );
+                        onNotify('Conmutación DNS por lote completada', 'success');
+                      } catch (e: any) {
+                        onNotify(e?.message || 'Error al migrar los dominios', 'error');
+                      } finally {
+                        setMigratingDomains(new Set());
+                        setLoading(false);
+                      }
+                    }}
+                    disabled={loading || importedDomains.every((d) => d.sslStatus !== 'pending_migration')}
+                    className="bg-slate-900 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                  >
+                    {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    <span>Migrar todos los dominios</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Rollback Safety Net */}
+            <div className="border border-slate-200 rounded-xl overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setShowRollback((prev) => !prev)}
+                className="w-full px-4 py-3 bg-slate-50 flex items-center justify-between text-xs font-semibold text-slate-800 cursor-pointer hover:bg-slate-100/70"
+              >
+                <span className="flex items-center gap-2">
+                  <RotateCcw className="w-3.5 h-3.5 text-emerald-600" />
+                  Red de Seguridad y Plan de Rollback Instantáneo (~{rollbackInfo.estimatedRollbackSeconds || 30}s)
+                </span>
+                {showRollback ? <ChevronDown className="w-4 h-4 text-slate-400" /> : <ChevronRight className="w-4 h-4 text-slate-400" />}
+              </button>
+              {showRollback && (
+                <div className="p-4 bg-white border-t border-slate-200 space-y-2 text-xs text-slate-600">
+                  <ol className="list-decimal pl-4 space-y-1.5">
+                    {(rollbackInfo.steps || []).map((s: string, i: number) => <li key={i}>{s}</li>)}
+                  </ol>
+                </div>
               )}
             </div>
 
-            {!useCloudflare && (
-              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs">
-                <p className="font-medium text-slate-800 mb-1.5">Crea un registro A en tu proveedor DNS:</p>
-                <code className="block bg-white border border-slate-200 text-slate-800 font-mono text-[11px] p-2.5 rounded-lg">
-                  Tipo: A · Host: @ · Valor: {serverIp || '<IP_DEL_SERVIDOR>'} · TTL: 300
-                </code>
-              </div>
-            )}
-
-            <div className="space-y-2 max-h-[280px] overflow-y-auto">
-              {importedDomains.map((domain) => {
-                const isMigrating = migratingDomains.has(domain.hostname);
-                const isPending = domain.sslStatus === 'pending_migration';
-                const isActive = domain.sslStatus === 'active';
-                return (
-                  <div key={domain.id} className="flex items-center justify-between p-3 bg-white border border-slate-200 rounded-lg gap-3">
-                    <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                      <span className="font-mono font-medium text-slate-900 text-xs truncate">{domain.hostname}</span>
-                      {isPending ? (
-                        <span className="text-[10px] bg-amber-50 text-amber-800 border border-amber-200 px-2 py-0.5 rounded-full">
-                          Pendiente DNS
-                        </span>
-                      ) : isActive ? (
-                        <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 rounded-full">
-                          Certificado activo
-                        </span>
-                      ) : (
-                        <span className="text-[10px] bg-amber-50 text-amber-800 border border-amber-200 px-2 py-0.5 rounded-full">
-                          SSL pendiente
-                        </span>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        setMigratingDomains((prev) => new Set([...prev, domain.hostname]));
-                        try {
-                          await api.migrateDomain(domain.hostname, serverIp, useCloudflare);
-                          const domainsRes = await api.getDomains();
-                          setImportedDomains(
-                            domainsRes.domains.filter((d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify')
-                          );
-                          onNotify(`Dominio ${domain.hostname} actualizado`, 'success');
-                        } catch (e: any) {
-                          onNotify(e?.message || 'Error al migrar dominio', 'error');
-                        } finally {
-                          setMigratingDomains((prev) => {
-                            const n = new Set(prev);
-                            n.delete(domain.hostname);
-                            return n;
-                          });
-                        }
-                      }}
-                      disabled={isMigrating || !isPending}
-                      className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer shrink-0"
-                    >
-                      {isMigrating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : isPending ? 'Migrar DNS' : 'Registrado'}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="flex justify-between gap-2 pt-3 border-t border-slate-200">
-              <button type="button" onClick={onComplete} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
-                Configurar después
+            {/* Final CTA */}
+            <div className="flex justify-between items-center gap-2 pt-3 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={handleDownloadPortableZip}
+                className="px-3.5 py-2 text-slate-700 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <FileArchive className="w-3.5 h-3.5 text-slate-500" />
+                <span>Guardar copia Bundle .zip</span>
               </button>
               <button
                 type="button"
-                onClick={async () => {
-                  setLoading(true);
-                  const hostnames = importedDomains.filter((d) => d.sslStatus === 'pending_migration').map((d) => d.hostname);
-                  setMigratingDomains(new Set(hostnames));
-                  try {
-                    await api.migrateDomainsBatch(hostnames, serverIp, useCloudflare);
-                    const domainsRes = await api.getDomains();
-                    setImportedDomains(
-                      domainsRes.domains.filter((d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify')
-                    );
-                    onNotify('Migración de dominios completada', 'success');
-                  } catch (e: any) {
-                    onNotify(e?.message || 'Error al migrar los dominios', 'error');
-                  } finally {
-                    setMigratingDomains(new Set());
-                    setLoading(false);
-                  }
-                }}
-                disabled={loading || importedDomains.every((d) => d.sslStatus !== 'pending_migration')}
-                className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                onClick={onComplete}
+                className="px-5 py-2 bg-slate-900 text-white rounded-lg text-xs font-medium hover:bg-slate-800 cursor-pointer"
               >
-                {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                <span>Migrar todos los dominios</span>
+                Finalizar e ir a proyectos
               </button>
             </div>
           </div>

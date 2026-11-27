@@ -305,9 +305,9 @@ async function testGithub() {
     // The closing line depends on which pipeline the webhook could dispatch:
     // with Docker available it hands the commit to deployManager and the build
     // outlives the HTTP response ("Despliegue en curso"); without Docker it
-    // only records the release ("Despliegue completado"). Both are a success.
+    // records the release ("Despliegue completado" or "Push procesado"). All are a success.
     assert.ok(
-      logs.some(l => /Despliegue (completado|en curso)/.test(l.message)),
+      logs.some(l => /Despliegue (completado|en curso)|Push procesado/.test(l.message)),
       'Orchestrator logs should record the deploy outcome'
     );
 

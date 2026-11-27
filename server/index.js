@@ -308,8 +308,9 @@ let wsConnectionsTotal = 0;
 let wsBroadcastsTotal = 0;
 const MAX_SSE_CLIENTS = 50;
 
-// Revocar todas las sesiones WS, Live Sync y SSE al rotar el token maestro
+// Revocar todas las sesiones WS, Live Sync, SSE y caché fast-auth al rotar el token maestro
 onTokenRotated(() => {
+  invalidateFastAuthCaches();
   for (const ws of Array.from(clients)) {
     try { ws.close(4001, 'Token rotated'); } catch (e) {}
   }
@@ -324,16 +325,27 @@ onTokenRotated(() => {
 
 if (typeof onPrincipalRevoked === 'function') {
   onPrincipalRevoked((ev) => {
+    invalidateFastAuthCaches();
     if (!ev) return;
-    const matches = (ws) => {
-      const p = /** @type {any} */ (ws)._authPrincipal;
-      if (!p || p.isSuperAdmin) return false;
+    const matches = (target) => {
+      const p = /** @type {any} */ (target)._authPrincipal;
+      if (!p) return false;
+      if (ev.masterToken) return p.kind === 'master';
+      if (p.isSuperAdmin) return false;
+      // Revocación acotada por sessionId: jamás desconectar api_token (p.sessionId === null)
+      if (ev.sessionId) {
+        return Boolean(p.sessionId && p.sessionId === ev.sessionId);
+      }
+      // Revocación acotada por tokenId: jamás desconectar sesiones de navegador (p.tokenId === null)
+      if (ev.tokenId) {
+        return Boolean(p.tokenId && p.tokenId === ev.tokenId);
+      }
       if (ev.userId && p.userId === ev.userId) {
-        if (ev.sessionId && p.sessionId && p.sessionId !== ev.sessionId) return false;
-        if (ev.tokenId && p.tokenId && p.tokenId !== ev.tokenId) return false;
         return true;
       }
-      if (ev.tokenId && p.tokenId === ev.tokenId) return true;
+      if (ev.teamId && !ev.userId && p.teamId === ev.teamId) {
+        return true;
+      }
       return false;
     };
     for (const pool of [clients, syncClients]) {
@@ -341,6 +353,12 @@ if (typeof onPrincipalRevoked === 'function') {
         if (matches(ws)) {
           try { ws.close(4001, 'Session revoked'); } catch (e) {}
         }
+      }
+    }
+    for (const res of Array.from(activeSseResponses)) {
+      if (matches(res)) {
+        activeSseResponses.delete(res);
+        try { res.end(); } catch (e) {}
       }
     }
   });
@@ -476,6 +494,15 @@ function scopeWsEventForPrincipal(principal, type, data) {
   }
   if (type === 'log') {
     if (!tm.authorizeAction(principal, 'logs:read').allowed) return { send: false };
+    if (data && data.teamId && principal.teamId && data.teamId !== principal.teamId) return { send: false };
+    const pid = data && data.projectId;
+    if (pid && pid !== 'global') {
+      const proj = projectManager.getById(pid);
+      if (!tm.authorizeProject(principal, pid, 'projects:read', proj).allowed) return { send: false };
+    } else if (Array.isArray(principal.projectIds)) {
+      return { send: false };
+    }
+    return { send: true, data };
   }
   return { send: true, data };
 }
@@ -607,45 +634,6 @@ function resolveAllowedSyncTargetDir(rawDir, req) {
     throw err;
   }
   return canonical;
-}
-
-/**
- * Decodifica una trama binaria rápida de Commit Frame (`/ws/sync`):
- * `[1B magic 0x01][4B uint32BE metaLen][JSON meta][buffers concatenados]`
- * @param {Buffer} buf
- */
-function decodeBinarySyncFrame(buf) {
-  if (buf.length < 5 || buf[0] !== 0x01) {
-    throw new Error('Trama binaria de sincronización inválida');
-  }
-  const metaLen = buf.readUInt32BE(1);
-  const headerEnd = 5 + metaLen;
-  if (headerEnd > buf.length) {
-    throw new Error('Cabecera de trama binaria truncada');
-  }
-  const meta = JSON.parse(buf.subarray(5, headerEnd).toString('utf8'));
-  let offset = headerEnd;
-  const files = (meta.files || []).map((f) => {
-    if (f.op === 'delete') return { path: f.path, op: 'delete' };
-    const byteLen = Number(f.byteLength || 0);
-    if (!Number.isInteger(byteLen) || byteLen < 0 || offset + byteLen > buf.length) {
-      throw new Error(`Longitud binaria inválida para ${f.path}`);
-    }
-    const rawSlice = buf.subarray(offset, offset + byteLen);
-    // Desacoplar del slab ArrayBuffer del frame WS si el slab padre supera 2x el fichero
-    // (evita que un fichero de 4 KB retenga 16 MB de RAM en fileCache o patchHistory).
-    const contentBuf = (byteLen > 0 && rawSlice.buffer.byteLength > byteLen * 2)
-      ? Buffer.from(rawSlice)
-      : rawSlice;
-    offset += byteLen;
-    return {
-      path: f.path,
-      op: 'upsert',
-      buffer: contentBuf,
-      sha256: f.sha256
-    };
-  });
-  return { ...meta, type: 'frame', files };
 }
 
 function safeWsSend(ws, obj) {
@@ -880,12 +868,17 @@ function ensureWsServers() {
           return;
         }
 
-        if (msg.type === 'start_chunked_upload' || msg.type === 'append_chunk' || msg.type === 'commit_chunked_upload' || msg.type === 'abort_chunked_upload') {
+        if (typeof msg.type === 'string' && msg.type.startsWith('chunk_')) {
           const pid = String(msg.projectId || boundProjectId || '');
-          if (!pid) throw new Error(msg.type + ' requiere projectId');
+          if (!pid) throw new Error(`${msg.type} requiere projectId`);
           assertSyncAccess(pid, 'projects:write');
-          const result = liveSyncEngine.handleChunkMessage(pid, msg, { clientId, clientName: boundClientName });
-          safeWsSend(ws, { type: msg.type + '_ack', ...result });
+          const safeDir = resolveDirCached(msg.targetDir);
+          const result = liveSyncEngine.handleChunkMessage(pid, msg, {
+            targetDir: safeDir || undefined,
+            clientId,
+            clientName: boundClientName
+          });
+          safeWsSend(ws, result);
           return;
         }
 
@@ -959,8 +952,137 @@ function ensureWsServers() {
 }
 
 // ---------------------------------------------------------------------------
-// Fast-Path HTTP (O(1) sin capas de Express ni regex de rutas)
+// Fast-Path HTTP (O(1) tabla precompilada + caché LRU de auth por HMAC + zero-copy)
 // ---------------------------------------------------------------------------
+// Clave HMAC efímera por proceso: la caché LRU nunca almacena tokens en claro en RAM
+// y se invalida al instante en `onTokenRotated`, `onPrincipalRevoked` y mutaciones auth/teams.
+const FAST_AUTH_HMAC_KEY = crypto.randomBytes(32);
+const FAST_AUTH_CACHE_MAX = 256;
+const FAST_AUTH_TOKEN_TTL_MS = 5000;
+const FAST_LOOPBACK_POLICY_TTL_MS = 500;
+const STRUCTURED_LOGS_QUERY_RE = /(?:^|&)(?:regex|since|until|attr)=/i;
+
+/** @type {Map<string, { decision: any, expiresAt: number }>} */
+const fastAuthCache = new Map();
+/** @type {Map<string, { decision: any, expiresAt: number }>} */
+const loopbackPolicyCache = new Map();
+/** @type {{ at: number, dataDir: string, envTok: string, data: any } | null} */
+let cachedAuthStatus = null;
+
+function invalidateFastAuthCaches() {
+  fastAuthCache.clear();
+  loopbackPolicyCache.clear();
+  cachedAuthStatus = null;
+  systemStatusCache = null;
+}
+
+function getAuthStatusCached() {
+  const now = Date.now();
+  const dataDir = process.env.CULKIBO_DATA_DIR || '';
+  const envTok = process.env.CULKIBO_TOKEN || '';
+  if (
+    cachedAuthStatus &&
+    (now - cachedAuthStatus.at) < 1000 &&
+    cachedAuthStatus.dataDir === dataDir &&
+    cachedAuthStatus.envTok === envTok
+  ) {
+    return cachedAuthStatus.data;
+  }
+  const data = authStatus();
+  cachedAuthStatus = { at: now, dataDir, envTok, data };
+  return data;
+}
+
+/**
+ * Verificación de autenticación acelerada para el fast-path HTTP (cero relajación de seguridad):
+ * - Siempre comprueba `Origin` antes de consultar la caché.
+ * - Indexa tokens por HMAC-SHA256 efímero + IP efectiva + env (`CULKIBO_TOKEN`, `CULKIBO_DATA_DIR`).
+ * - Solo cachea decisiones positivas (`ok: true`) con TTL corto e invalidación inmediata en revocación/rotación.
+ * - En loopback sin credencial, evita `fs.existsSync(data/teams.json)` por petición durante 500 ms.
+ * @param {any} req
+ */
+function authorizeRequestFast(req) {
+  const headers = req.headers || {};
+  const origin = headers.origin;
+  if (origin && !isOriginAllowed(origin, req)) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'Origen no permitido',
+      detail: `El origen ${origin} no está autorizado a hablar con este daemon. Añádelo a CULKIBO_ALLOWED_ORIGINS si es tuyo.`
+    };
+  }
+
+  // Extraer token explícito sin parsear cookies si viene cabecera Bearer / X-Culkibo-Token
+  /** @type {string | null} */
+  let rawToken = null;
+  const authHeader = headers.authorization;
+  if (authHeader && authHeader.length > 7 && (authHeader.startsWith('Bearer ') || authHeader.startsWith('bearer ') || authHeader.slice(0, 7).toLowerCase() === 'bearer ')) {
+    rawToken = authHeader.slice(7).trim();
+  } else if (headers['x-culkibo-token']) {
+    rawToken = String(headers['x-culkibo-token']).trim();
+  }
+
+  const now = Date.now();
+  const dataDirEnv = process.env.CULKIBO_DATA_DIR || '';
+
+  if (rawToken) {
+    const ip = clientIp(req);
+    const tokHmac = crypto.createHmac('sha256', FAST_AUTH_HMAC_KEY).update(rawToken, 'utf8').digest('base64');
+    const cacheKey = `${tokHmac}|${ip}|${process.env.CULKIBO_TOKEN || ''}|${dataDirEnv}`;
+    const hit = fastAuthCache.get(cacheKey);
+    if (hit) {
+      if (hit.expiresAt > now) {
+        // Refrescar posición LRU
+        fastAuthCache.delete(cacheKey);
+        fastAuthCache.set(cacheKey, hit);
+        return hit.decision;
+      }
+      fastAuthCache.delete(cacheKey);
+    }
+    const decision = authorizeRequest(req, { allowWsSubprotocol: false });
+    if (decision.ok && (decision.method === 'token' || decision.method === 'session' || decision.method === 'api_token')) {
+      if (fastAuthCache.size >= FAST_AUTH_CACHE_MAX) {
+        const oldest = fastAuthCache.keys().next().value;
+        if (oldest !== undefined) fastAuthCache.delete(oldest);
+      }
+      fastAuthCache.set(cacheKey, { decision, expiresAt: now + FAST_AUTH_TOKEN_TTL_MS });
+    }
+    return decision;
+  }
+
+  // Camino rápido loopback sin credenciales ni cookies ni enforceOnLoopback cargado
+  if (
+    !headers.cookie &&
+    !headers['x-forwarded-for'] &&
+    !headers.forwarded &&
+    process.env.CULKIBO_REQUIRE_TOKEN !== '1' &&
+    !(loadedServices.teamManager && typeof loadedServices.teamManager.isEnforceOnLoopback === 'function' && loadedServices.teamManager.isEnforceOnLoopback())
+  ) {
+    const peer = req.socket?.remoteAddress || '';
+    if (peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1') {
+      const host = headers.host || '';
+      const lbKey = `${dataDirEnv}|${origin || ''}|${host}|${peer}`;
+      const lbHit = loopbackPolicyCache.get(lbKey);
+      if (lbHit) {
+        if (lbHit.expiresAt > now) return lbHit.decision;
+        loopbackPolicyCache.delete(lbKey);
+      }
+      const decision = authorizeRequest(req, { allowWsSubprotocol: false });
+      if (decision.ok && (decision.method === 'loopback' || decision.method === 'loopback_origin')) {
+        if (loopbackPolicyCache.size >= 64) {
+          const oldest = loopbackPolicyCache.keys().next().value;
+          if (oldest !== undefined) loopbackPolicyCache.delete(oldest);
+        }
+        loopbackPolicyCache.set(lbKey, { decision, expiresAt: now + FAST_LOOPBACK_POLICY_TTL_MS });
+      }
+      return decision;
+    }
+  }
+
+  return authorizeRequest(req, { allowWsSubprotocol: false });
+}
+
 /** @type {{ at: number, buf: Buffer } | null} */
 let healthBufCache = null;
 function getHealthBuffer() {
@@ -980,7 +1102,7 @@ function getSystemStatusBuffer() {
   const payload = {
     name: 'Culkibo',
     status: 'operational',
-    version: '1.1.0',
+    version: '1.0.0',
     platform: process.platform,
     arch: process.arch,
     nodeVersion: process.version,
@@ -988,7 +1110,7 @@ function getSystemStatusBuffer() {
     memoryUsageMb: proc.memoryMb,
     heapUsedMb: proc.heapUsedMb,
     cpuPercent: proc.cpuPercent,
-    auth: authStatus(),
+    auth: getAuthStatusCached(),
     capabilities: {
       liveSyncBinary: true,
       merkleVerify: true,
@@ -1018,6 +1140,7 @@ const ASK_FORBIDDEN_LOCAL_BUF = Buffer.from('acceso restringido al plano de dato
 const ASK_MISSING_DOMAIN_BUF = Buffer.from('falta el parámetro domain', 'utf8');
 const ASK_INVALID_DOMAIN_BUF = Buffer.from('parámetro domain inválido', 'utf8');
 const MANAGEMENT_HOSTS_FAST = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '']);
+const API_COMPRESS_MIN_BYTES = 512;
 
 /** @type {typeof import('zlib') | null} */
 let _zlib = null;
@@ -1027,12 +1150,27 @@ function getZlib() {
 }
 
 /** Caché WeakMap por Buffer fuente: auto-GC cuando el Buffer rota, cero fugas de RAM. */
-/** @type {WeakMap<Buffer, { etag: string, br?: Buffer, zstd?: Buffer, gzip?: Buffer }>} */
+/** @type {WeakMap<Buffer, { etag?: string, br?: Buffer, zstd?: Buffer, gzip?: Buffer }>} */
 const compressedApiCache = new WeakMap();
 
-/** Comprueba si `Accept-Encoding` acepta `coding` con q > 0 (RFC 9110). */
+/** Comprueba si `Accept-Encoding` acepta `coding` con q > 0 (RFC 9110), con fast-path sin asignaciones. */
 function acceptsEncoding(aeHeader, coding) {
   if (!aeHeader || typeof aeHeader !== 'string') return false;
+  if (aeHeader === coding) return true;
+  // Fast-path sin `;` (sin pesos q): comprueba token exacto sin split ni regex
+  if (aeHeader.indexOf(';') === -1) {
+    const lower = aeHeader.toLowerCase();
+    let idx = lower.indexOf(coding);
+    while (idx !== -1) {
+      const before = idx === 0 ? ',' : lower[idx - 1];
+      const after = idx + coding.length === lower.length ? ',' : lower[idx + coding.length];
+      if ((before === ',' || before === ' ' || before === '\t') && (after === ',' || after === ' ' || after === '\t')) {
+        return true;
+      }
+      idx = lower.indexOf(coding, idx + 1);
+    }
+    return false;
+  }
   const parts = aeHeader.toLowerCase().split(',');
   for (let i = 0; i < parts.length; i++) {
     const seg = parts[i].trim();
@@ -1055,6 +1193,7 @@ function etagMatches(inmHeader, etag) {
   if (!inmHeader || !etag) return false;
   const raw = String(inmHeader).trim();
   if (raw === '*') return true;
+  if (raw === etag) return true;
   const cleanTarget = etag.replace(/^W\//i, '').trim();
   const candidates = raw.split(',');
   for (let i = 0; i < candidates.length; i++) {
@@ -1067,6 +1206,8 @@ function etagMatches(inmHeader, etag) {
 function pickApiEncoding(req) {
   const ae = req.headers['accept-encoding'];
   if (!ae || typeof ae !== 'string') return null;
+  if (ae === 'br' || ae === 'gzip, deflate, br' || ae === 'gzip, deflate, br, zstd') return 'br';
+  if (ae === 'gzip' || ae === 'gzip, deflate') return 'gzip';
   if (acceptsEncoding(ae, 'br')) return 'br';
   if (acceptsEncoding(ae, 'zstd')) {
     const z = getZlib();
@@ -1076,14 +1217,28 @@ function pickApiEncoding(req) {
   return null;
 }
 
-function getCompressedEntry(buf, encoding) {
+function getOrCreateCacheSlot(buf) {
   let entry = compressedApiCache.get(buf);
   if (!entry) {
-    const etag = `"${crypto.createHash('sha1').update(buf).digest('base64url').slice(0, 16)}"`;
-    entry = { etag };
+    entry = {};
     compressedApiCache.set(buf, entry);
   }
-  if (!encoding || buf.length < 1024) return { etag: entry.etag, body: buf, encoding: null };
+  return entry;
+}
+
+function getBufferEtag(buf) {
+  const entry = getOrCreateCacheSlot(buf);
+  if (!entry.etag) {
+    entry.etag = `"${crypto.createHash('sha1').update(buf).digest('base64url').slice(0, 16)}"`;
+  }
+  return entry.etag;
+}
+
+function getCompressedEntry(buf, encoding) {
+  if (!encoding || buf.length < API_COMPRESS_MIN_BYTES) {
+    return { body: buf, encoding: null };
+  }
+  const entry = getOrCreateCacheSlot(buf);
   if (encoding === 'br') {
     if (!entry.br) {
       const z = getZlib();
@@ -1095,7 +1250,7 @@ function getCompressedEntry(buf, encoding) {
       });
       entry.br = c.length < buf.length ? c : buf;
     }
-    return { etag: entry.etag, body: entry.br, encoding: entry.br === buf ? null : 'br' };
+    return { body: entry.br, encoding: entry.br === buf ? null : 'br' };
   }
   if (encoding === 'zstd') {
     if (!entry.zstd) {
@@ -1107,7 +1262,7 @@ function getCompressedEntry(buf, encoding) {
         entry.zstd = buf;
       }
     }
-    return { etag: entry.etag, body: entry.zstd, encoding: entry.zstd === buf ? null : 'zstd' };
+    return { body: entry.zstd, encoding: entry.zstd === buf ? null : 'zstd' };
   }
   if (encoding === 'gzip') {
     if (!entry.gzip) {
@@ -1115,9 +1270,9 @@ function getCompressedEntry(buf, encoding) {
       const c = z.gzipSync(buf, { level: 6 });
       entry.gzip = c.length < buf.length ? c : buf;
     }
-    return { etag: entry.etag, body: entry.gzip, encoding: entry.gzip === buf ? null : 'gzip' };
+    return { body: entry.gzip, encoding: entry.gzip === buf ? null : 'gzip' };
   }
-  return { etag: entry.etag, body: buf, encoding: null };
+  return { body: buf, encoding: null };
 }
 
 /**
@@ -1131,8 +1286,8 @@ function getCompressedEntry(buf, encoding) {
  * @param {{ cacheControl?: string, etag?: string | null, compress?: boolean, csp?: boolean, closeConnection?: boolean }} [opts]
  */
 function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, t0Ms, opts = {}) {
-  const allowCompress = Boolean(opts.compress) && statusCode === 200 && buf.length >= 1024;
-  const wantEtag = Boolean(opts.etag) || allowCompress;
+  const allowCompress = Boolean(opts.compress) && statusCode === 200 && buf.length >= API_COMPRESS_MIN_BYTES;
+  const sendEtag = statusCode === 200 && Boolean(opts.cacheControl && opts.cacheControl !== 'no-store');
 
   let body = buf;
   /** @type {string | null} */
@@ -1171,20 +1326,23 @@ function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, 
     headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
   }
 
-  // Comprobar 304 ANTES de comprimir (ahorra CPU en hits de caché)
-  if (wantEtag && statusCode === 200) {
-    if (!etag) etag = getCompressedEntry(buf, null).etag;
-    if (opts.cacheControl && opts.cacheControl !== 'no-store') {
-      headers['ETag'] = etag;
-      if (etagMatches(req.headers['if-none-match'], etag)) {
-        res.writeHead(304, headers);
-        res.end();
-        metricsCollector.recordFastPath(req.method, canonicalRoute, 304, performance.now() - t0Ms);
-        return;
-      }
+  // Comprobar 304 ANTES de comprimir (ahorra CPU y evita SHA-1 innecesarios en rutas no-store)
+  if (sendEtag) {
+    if (!etag) etag = getBufferEtag(buf);
+    headers['ETag'] = etag;
+    if (etagMatches(req.headers['if-none-match'], etag)) {
+      const dur304 = Math.max(0, performance.now() - t0Ms);
+      headers['Server-Timing'] = `cp;dur=${dur304.toFixed(2)}`;
+      res.writeHead(304, headers);
+      res.end();
+      metricsCollector.recordFastPath(req.method, canonicalRoute, 304, dur304);
+      return;
     }
-    if (allowCompress) {
-      const enc = pickApiEncoding(req);
+  }
+
+  if (allowCompress) {
+    const enc = pickApiEncoding(req);
+    if (enc) {
       const comp = getCompressedEntry(buf, enc);
       body = comp.body;
       contentEncoding = comp.encoding;
@@ -1194,10 +1352,12 @@ function sendFastBuffer(req, res, statusCode, contentType, buf, canonicalRoute, 
   headers['Content-Type'] = contentType;
   headers['Content-Length'] = body.length;
   if (contentEncoding) headers['Content-Encoding'] = contentEncoding;
+  const durMs = Math.max(0, performance.now() - t0Ms);
+  headers['Server-Timing'] = `cp;dur=${durMs.toFixed(2)}`;
 
   res.writeHead(statusCode, headers);
   res.end(req.method === 'HEAD' ? undefined : body);
-  metricsCollector.recordFastPath(req.method, canonicalRoute, statusCode, performance.now() - t0Ms);
+  metricsCollector.recordFastPath(req.method, canonicalRoute, statusCode, durMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,9 +1504,11 @@ function tryServeStaticFastPath(req, res, pathname) {
   } else {
     headers['ETag'] = asset.etag;
     if (etagMatches(req.headers['if-none-match'], asset.etag)) {
+      const dur304 = Math.max(0, performance.now() - t0);
+      headers['Server-Timing'] = `cp;dur=${dur304.toFixed(2)}`;
       res.writeHead(304, headers);
       res.end();
-      metricsCollector.recordFastPath(req.method, '/static', 304, performance.now() - t0);
+      metricsCollector.recordFastPath(req.method, '/static', 304, dur304);
       return true;
     }
   }
@@ -1356,10 +1518,12 @@ function tryServeStaticFastPath(req, res, pathname) {
   headers['Content-Type'] = asset.mime;
   headers['Content-Length'] = body.length;
   if (encoding) headers['Content-Encoding'] = encoding;
+  const durMs = Math.max(0, performance.now() - t0);
+  headers['Server-Timing'] = `cp;dur=${durMs.toFixed(2)}`;
 
   res.writeHead(200, headers);
   res.end(req.method === 'HEAD' ? undefined : body);
-  metricsCollector.recordFastPath(req.method, '/static', 200, performance.now() - t0);
+  metricsCollector.recordFastPath(req.method, '/static', 200, durMs);
   return true;
 }
 
@@ -1526,11 +1690,11 @@ function tryHandleFastPath(req, res) {
       return true;
     }
 
-    const decision = authorizeRequest(req, { allowWsSubprotocol: false });
+    const decision = authorizeRequestFast(req);
     if (!decision.ok) {
       if (decision.status === 403) metricsCollector.recordSecurityEvent('originRejected403');
       const creds = extractCredentials(req, { allowWsSubprotocol: false });
-      if (decision.status === 401 && (creds.token || creds.ticket)) {
+      if (decision.status === 401 && (creds.token || creds.ticket || creds.cookieToken)) {
         recordAuthFailure(req);
         metricsCollector.recordSecurityEvent('authFailures');
       }
@@ -1617,30 +1781,34 @@ function tryHandleFastPath(req, res) {
   }
 
   if (method !== 'GET' && method !== 'HEAD') return false;
+  return tryHandleFastPathGet(req, res, pathname, queryStr);
+}
 
-  // Fast-path estático para el panel web pre-comprimido (cero carga de Express al abrir el dashboard)
-  if (!pathname.startsWith('/api') && pathname !== '/health' && pathname !== '/metrics' && pathname !== '/ws' && pathname !== '/ws/sync') {
-    if (tryServeStaticFastPath(req, res, pathname)) return true;
-    return false;
-  }
-
-  if (pathname === '/health' || pathname === '/api/health') {
+// Tabla precompilada O(1) de rutas públicas y autenticadas del fast-path HTTP
+/** @type {Map<string, (req: any, res: any, pathname: string, queryStr: string) => boolean>} */
+const FAST_PUBLIC_GET_ROUTES = new Map([
+  ['/health', (req, res, pathname) => {
     const t0 = performance.now();
     containerOrchestrator.recordRequest();
     sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', getHealthBuffer(), pathname, t0);
     return true;
-  }
-
-  // Fast-path público: sesión del panel (/api/auth/session)
-  if (pathname === '/api/auth/session') {
+  }],
+  ['/api/health', (req, res, pathname) => {
+    const t0 = performance.now();
+    containerOrchestrator.recordRequest();
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', getHealthBuffer(), pathname, t0);
+    return true;
+  }],
+  ['/api/auth/session', (req, res, pathname) => {
     const t0 = performance.now();
     containerOrchestrator.recordRequest();
     if (req.headers.origin && !isOriginAllowed(req.headers.origin, req)) {
+      metricsCollector.recordSecurityEvent('originRejected403');
       sendFastAuthError(req, res, { status: 403, error: 'Origen no permitido' }, pathname, t0);
       return true;
     }
-    const decision = authorizeRequest(req);
-    const st = authStatus();
+    const decision = authorizeRequestFast(req);
+    const st = getAuthStatusCached();
     const body = Buffer.from(JSON.stringify({
       authenticated: decision.ok,
       method: decision.method || null,
@@ -1650,10 +1818,8 @@ function tryHandleFastPath(req, res) {
     }), 'utf8');
     sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', body, pathname, t0);
     return true;
-  }
-
-  // Fast-path público local: autorización On-Demand TLS de Caddy (/api/ingress/ask)
-  if (pathname === '/api/ingress/ask') {
+  }],
+  ['/api/ingress/ask', (req, res, pathname, queryStr) => {
     const t0 = performance.now();
     containerOrchestrator.recordRequest();
     const askRl = fastAskLimiter.check(req);
@@ -1699,65 +1865,142 @@ function tryHandleFastPath(req, res) {
     }
     sendFastBuffer(req, res, 200, 'text/plain; charset=utf-8', ASK_OK_BUF, pathname, t0);
     return true;
+  }]
+]);
+
+/** @type {Map<string, (req: any, res: any, pathname: string, queryStr: string, fresh: boolean, t0: number) => boolean>} */
+const FAST_AUTHED_GET_ROUTES = new Map([
+  ['/metrics', (req, res, pathname, _q, fresh, t0) => {
+    sendFastBuffer(req, res, 200, 'text/plain; version=0.0.4; charset=utf-8', metricsCollector.getPrometheusBuffer(fresh), pathname, t0, { compress: true });
+    return true;
+  }],
+  ['/api/metrics', (req, res, pathname, _q, fresh, t0) => {
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', metricsCollector.getSnapshotBuffer(fresh), pathname, t0, { compress: true });
+    return true;
+  }],
+  ['/api/observability/snapshot', (req, res, pathname, _q, fresh, t0) => {
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', metricsCollector.getSnapshotBuffer(fresh), pathname, t0, { compress: true });
+    return true;
+  }],
+  ['/api/pods', (req, res, pathname, _q, _fresh, t0) => {
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', containerOrchestrator.getPodsSerialized(), pathname, t0, { compress: true });
+    return true;
+  }],
+  ['/api/projects', (req, res, pathname, _q, _fresh, t0) => {
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', projectManager.getAllSerialized(), pathname, t0, {
+      cacheControl: 'private, no-cache',
+      etag: projectManager.getAllEtag(),
+      compress: true
+    });
+    return true;
+  }],
+  ['/api/catalog', (req, res, pathname, _q, _fresh, t0) => {
+    const cm = getService('catalogManager');
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', cm.getCatalogSerialized(), pathname, t0, {
+      cacheControl: 'private, no-cache',
+      compress: true
+    });
+    return true;
+  }],
+  ['/api/domains', (req, res, pathname, _q, _fresh, t0) => {
+    const dm = getService('domainManager');
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', dm.getAllWrappedSerialized(), pathname, t0, {
+      cacheControl: 'private, no-cache',
+      etag: typeof dm.getWrappedEtag === 'function' ? dm.getWrappedEtag() : null,
+      compress: true
+    });
+    return true;
+  }],
+  ['/api/logs', (req, res, pathname, queryStr, _fresh, t0) => {
+    const params = queryStr ? new URLSearchParams(queryStr) : null;
+    const logs = containerOrchestrator.getLogs({
+      pod: params?.get('pod') || null,
+      level: params?.get('level') || null,
+      limit: params?.get('limit') ? parseInt(String(params.get('limit')), 10) : 100,
+      search: params?.get('search') || '',
+      projectId: params?.get('projectId') || null
+    });
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', Buffer.from(JSON.stringify({ logs }), 'utf8'), pathname, t0, { compress: true });
+    return true;
+  }],
+  ['/api/system/status', (req, res, pathname, _q, _fresh, t0) => {
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', getSystemStatusBuffer(), pathname, t0, { compress: true });
+    return true;
+  }],
+  ['/api/sync/summary', (req, res, pathname, _q, _fresh, t0) => {
+    const buf = loadedServices.liveSyncEngine
+      ? Buffer.from(JSON.stringify(loadedServices.liveSyncEngine.getGlobalSummary()), 'utf8')
+      : EMPTY_SYNC_SUMMARY_BUF;
+    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', buf, pathname, t0, { compress: true });
+    return true;
+  }]
+]);
+
+function tryHandleFastPathGet(req, res, pathname, queryStr) {
+  // Fast-path estático para el panel web pre-comprimido (cero carga de Express al abrir el dashboard)
+  if (!pathname.startsWith('/api') && pathname !== '/health' && pathname !== '/metrics' && pathname !== '/ws' && pathname !== '/ws/sync') {
+    if (tryServeStaticFastPath(req, res, pathname)) return true;
+    return false;
   }
 
-  // Comprobar si es GET /api/projects/:id (un solo segmento, distinto de 'active')
+  // O(1) rutas públicas precompiladas (`/health`, `/api/health`, `/api/auth/session`, `/api/ingress/ask`)
+  const publicHandler = FAST_PUBLIC_GET_ROUTES.get(pathname);
+  if (publicHandler) {
+    return publicHandler(req, res, pathname, queryStr);
+  }
+
+  // O(1) rutas autenticadas precompiladas + `GET /api/projects/:id`
+  const authedHandler = FAST_AUTHED_GET_ROUTES.get(pathname) || null;
   /** @type {string | null} */
   let projectByIdMatch = null;
-  if (pathname.startsWith('/api/projects/') && pathname.indexOf('/', 14) === -1) {
-    const seg = pathname.slice(14);
-    if (seg && seg !== 'active') {
-      try { projectByIdMatch = decodeURIComponent(seg); } catch (e) { projectByIdMatch = seg; }
+  if (!authedHandler) {
+    if (pathname.startsWith('/api/projects/') && pathname.indexOf('/', 14) === -1) {
+      const seg = pathname.slice(14);
+      if (seg && seg !== 'active') {
+        try { projectByIdMatch = decodeURIComponent(seg); } catch (e) { projectByIdMatch = seg; }
+      }
+    }
+    if (!projectByIdMatch) return false;
+  }
+
+  // Filtros avanzados o consultas estructuradas de logs pasan a Express (regex/since/until/attr, search, category)
+  if (queryStr) {
+    if (pathname === '/api/projects' || pathname === '/api/catalog' || pathname === '/api/domains') {
+      return false;
+    }
+    if (pathname === '/api/logs' && STRUCTURED_LOGS_QUERY_RE.test(queryStr)) {
+      return false;
     }
   }
 
-  if (
-    !projectByIdMatch &&
-    pathname !== '/metrics' &&
-    pathname !== '/api/metrics' &&
-    pathname !== '/api/observability/snapshot' &&
-    pathname !== '/api/pods' &&
-    pathname !== '/api/projects' &&
-    pathname !== '/api/catalog' &&
-    pathname !== '/api/domains' &&
-    pathname !== '/api/logs' &&
-    pathname !== '/api/system/status' &&
-    pathname !== '/api/sync/summary'
-  ) {
-    return false;
-  }
-
-  // `/api/projects?search=...` o `/api/catalog?category=...` pasan a Express si hay filtros de consulta
-  if (queryStr && (pathname === '/api/projects' || pathname === '/api/catalog' || pathname === '/api/domains')) {
-    return false;
-  }
-
   const t0 = performance.now();
+  const canonicalRoute = projectByIdMatch ? '/api/projects/:id' : pathname;
   containerOrchestrator.recordRequest();
 
   const bf = checkAuthBruteForce(req);
   if (bf.blocked) {
+    metricsCollector.recordSecurityEvent('authBlocked429');
     res.setHeader('Retry-After', String(bf.retryAfterSec));
-    sendFastAuthError(req, res, { status: 429, error: 'Demasiados intentos de autenticación fallidos.' }, projectByIdMatch ? '/api/projects/:id' : pathname, t0);
+    sendFastAuthError(req, res, { status: 429, error: 'Demasiados intentos de autenticación fallidos.' }, canonicalRoute, t0);
     return true;
   }
 
-  const decision = authorizeRequest(req, { allowWsSubprotocol: false });
+  const decision = authorizeRequestFast(req);
   if (!decision.ok) {
+    if (decision.status === 403) metricsCollector.recordSecurityEvent('originRejected403');
     const creds = extractCredentials(req, { allowWsSubprotocol: false });
-    if (decision.status === 401 && (creds.token || creds.ticket)) {
+    if (decision.status === 401 && (creds.token || creds.ticket || creds.cookieToken)) {
       recordAuthFailure(req);
+      metricsCollector.recordSecurityEvent('authFailures');
     }
-    sendFastAuthError(req, res, decision, projectByIdMatch ? '/api/projects/:id' : pathname, t0);
+    sendFastAuthError(req, res, decision, canonicalRoute, t0);
     return true;
   }
 
-  // Aislamiento multi-tenant: todo principal no-superadmin pasa por Express RBAC + filtrado por equipo/ACL
+  // Aislamiento multi-tenant estricto: todo principal no-superadmin pasa por Express RBAC + filtrado por equipo/ACL
   if (decision.principal && !decision.principal.isSuperAdmin) {
     return false;
   }
-
-  const fresh = queryStr.includes('fresh=1');
 
   if (projectByIdMatch) {
     const entry = projectManager.getByIdSerializedEntry(projectByIdMatch);
@@ -1773,68 +2016,8 @@ function tryHandleFastPath(req, res) {
     return true;
   }
 
-  if (pathname === '/metrics') {
-    sendFastBuffer(req, res, 200, 'text/plain; version=0.0.4; charset=utf-8', metricsCollector.getPrometheusBuffer(fresh), pathname, t0, { compress: true });
-    return true;
-  }
-  if (pathname === '/api/metrics' || pathname === '/api/observability/snapshot') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', metricsCollector.getSnapshotBuffer(fresh), pathname, t0, { compress: true });
-    return true;
-  }
-  if (pathname === '/api/pods') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', containerOrchestrator.getPodsSerialized(), pathname, t0, { compress: true });
-    return true;
-  }
-  if (pathname === '/api/projects') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', projectManager.getAllSerialized(), pathname, t0, {
-      cacheControl: 'private, no-cache',
-      etag: projectManager.getAllEtag(),
-      compress: true
-    });
-    return true;
-  }
-  if (pathname === '/api/catalog') {
-    const cm = getService('catalogManager');
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', cm.getCatalogSerialized(), pathname, t0, {
-      cacheControl: 'private, no-cache',
-      compress: true
-    });
-    return true;
-  }
-  if (pathname === '/api/domains') {
-    const dm = getService('domainManager');
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', dm.getAllWrappedSerialized(), pathname, t0, {
-      cacheControl: 'private, no-cache',
-      etag: typeof dm.getWrappedEtag === 'function' ? dm.getWrappedEtag() : null,
-      compress: true
-    });
-    return true;
-  }
-  if (pathname === '/api/logs') {
-    const params = queryStr ? new URLSearchParams(queryStr) : null;
-    const logs = containerOrchestrator.getLogs({
-      pod: params?.get('pod') || null,
-      level: params?.get('level') || null,
-      limit: params?.get('limit') ? parseInt(String(params.get('limit')), 10) : 100,
-      search: params?.get('search') || '',
-      projectId: params?.get('projectId') || null
-    });
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', Buffer.from(JSON.stringify({ logs }), 'utf8'), pathname, t0, { compress: true });
-    return true;
-  }
-  if (pathname === '/api/system/status') {
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', getSystemStatusBuffer(), pathname, t0, { compress: true });
-    return true;
-  }
-  if (pathname === '/api/sync/summary') {
-    const buf = loadedServices.liveSyncEngine
-      ? Buffer.from(JSON.stringify(loadedServices.liveSyncEngine.getGlobalSummary()), 'utf8')
-      : EMPTY_SYNC_SUMMARY_BUF;
-    sendFastBuffer(req, res, 200, 'application/json; charset=utf-8', buf, pathname, t0, { compress: true });
-    return true;
-  }
-
-  return false;
+  const fresh = Boolean(queryStr) && queryStr.includes('fresh=1');
+  return authedHandler ? authedHandler(req, res, pathname, queryStr, fresh, t0) : false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,6 +2250,8 @@ function getApp() {
     if (typeof res.setTimeout === 'function') res.setTimeout(0);
     const mcpServer = getService('mcpServer');
     const mcpStreamableHttp = getService('mcpStreamableHttp');
+    const ssePrincipal = (/** @type {any} */ (req).auth && /** @type {any} */ (req).auth.principal) || null;
+    /** @type {any} */ (res)._authPrincipal = ssePrincipal;
     activeSseClients++;
     activeSseResponses.add(res);
     mcpStreamableHttp.markLegacyTransport(res, 'GET /api/mcp/sse');
@@ -2081,6 +2266,12 @@ function getApp() {
     /** @type {ReturnType<typeof setInterval> | null} */
     let keepalive = null;
     const onMcp = (entry) => {
+      if (ssePrincipal && !ssePrincipal.isSuperAdmin) {
+        const scoped = scopeWsEventForPrincipal(ssePrincipal, 'mcp_call', entry);
+        if (!scoped.send) return;
+        safeWrite(`event: mcp_event\ndata: ${JSON.stringify(scoped.data)}\n\n`);
+        return;
+      }
       safeWrite(`event: mcp_event\ndata: ${JSON.stringify(entry)}\n\n`);
     };
     const cleanup = () => {
@@ -2257,6 +2448,12 @@ const server = http.createServer(
       res.end('{"error":"Servidor cerrándose ordenadamente"}');
       return;
     }
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const u = req.url || '';
+      if (u.startsWith('/api/auth/') || u.startsWith('/api/teams')) {
+        invalidateFastAuthCaches();
+      }
+    }
     if (tryHandleFastPath(req, res)) return;
     getApp()(req, res);
   }
@@ -2394,9 +2591,16 @@ function trackTimer(t) {
 /**
  * @param {number} port
  * @param {string} host
- * @param {{ reconcileIngress?: boolean }} [options]
+ * @param {{ reconcileIngress?: boolean, startWatchdogs?: boolean }} [options]
  */
-function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = process.env.CULKIBO_SKIP_RECONCILE !== '1' } = {}) {
+function startServer(port = PORT, host = '127.0.0.1', {
+  reconcileIngress = process.env.CULKIBO_SKIP_RECONCILE !== '1',
+  startWatchdogs
+} = {}) {
+  const isTestOrBenchArgv = /[\\/](?:tests|bench)[\\/]/.test((process.argv || []).join(' ').toLowerCase());
+  const enableWatchdogs = startWatchdogs !== undefined
+    ? Boolean(startWatchdogs)
+    : (process.env.NODE_ENV !== 'test' && reconcileIngress !== false && !isTestOrBenchArgv);
   shuttingDown = false;
   shutdownPromise = null;
   return new Promise((resolve, reject) => {
@@ -2422,11 +2626,7 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
       }
       console.log(`========================================================\n`);
 
-      // Tareas post-arranque no bloqueantes (no penalizan el tiempo al primer byte)
-      trackTimer(setTimeout(() => {
-        try { ensureWsServers(); } catch (e) {}
-      }, 100));
-
+      // Tareas post-arranque no bloqueantes (WS y servicios pesados se cargan estrictamente bajo demanda)
       setImmediate(() => {
         sweepStaleTmpFiles();
 
@@ -2513,10 +2713,6 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
           telemetryService.start();
         } catch (e) {}
 
-          // Boot observability v1.1
-          try { const mh = getService('metricsHistory'); if (typeof mh.start === 'function') mh.start(); } catch (e) {}
-          try { const ae = getService('alertEngine'); if (typeof ae.start === 'function') ae.start(); } catch (e) {}
-
         // Limpieza periódica no intrusiva de sesiones Live Sync inactivas (cada 5 min)
         trackTimer(setInterval(() => {
           if (loadedServices.liveSyncEngine && typeof loadedServices.liveSyncEngine.evictIdleSessions === 'function') {
@@ -2524,8 +2720,10 @@ function startServer(port = PORT, host = '127.0.0.1', { reconcileIngress = proce
           }
         }, 5 * 60 * 1000));
 
-        // Watchdogs silenciosos de producción, disco, temporales y TLS (no activos en NODE_ENV=test)
-        if (process.env.NODE_ENV !== 'test') {
+        // Watchdogs silenciosos de producción, observabilidad v1.1, disco, temporales y TLS (no activos en tests/bench)
+        if (enableWatchdogs) {
+          try { const mh = getService('metricsHistory'); if (typeof mh.start === 'function') mh.start(); } catch (e) {}
+          try { const ae = getService('alertEngine'); if (typeof ae.start === 'function') ae.start(); } catch (e) {}
           const runProdWatchdog = async () => {
             lastWatchdogAt = new Date().toISOString();
             try {
@@ -2619,8 +2817,18 @@ function shutdown(signal = 'SIGTERM') {
     try { if (loadedServices.previewManager) loadedServices.previewManager.stopReaper(); } catch (e) {}
     try { if (loadedServices.uptimeMonitor) loadedServices.uptimeMonitor.shutdown(); } catch (e) {}
     try { if (loadedServices.sleepAdvisor) loadedServices.sleepAdvisor.shutdown(); } catch (e) {}
-    try { if (loadedServices.metricsHistory) loadedServices.metricsHistory.stop(); } catch (e) {}
-    try { if (loadedServices.alertEngine) loadedServices.alertEngine.stop(); } catch (e) {}
+    try {
+      if (loadedServices.metricsHistory) {
+        if (typeof loadedServices.metricsHistory.shutdown === 'function') loadedServices.metricsHistory.shutdown();
+        else if (typeof loadedServices.metricsHistory.stop === 'function') loadedServices.metricsHistory.stop();
+      }
+    } catch (e) {}
+    try {
+      if (loadedServices.alertEngine) {
+        if (typeof loadedServices.alertEngine.shutdown === 'function') loadedServices.alertEngine.shutdown();
+        else if (typeof loadedServices.alertEngine.stop === 'function') loadedServices.alertEngine.stop();
+      }
+    } catch (e) {}
     try { if (loadedServices.serverFleetManager) await loadedServices.serverFleetManager.shutdown(); } catch (e) {}
 
     // 2. Dejar de aceptar nuevas conexiones y cerrar WS/SSE activos (sin cortar peticiones HTTP en vuelo)

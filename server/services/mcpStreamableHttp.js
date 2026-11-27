@@ -42,7 +42,8 @@ const NAME_BEARING_SET = new Set(NAME_BEARING_METHODS);
 const VALID_PROFILE_SET = new Set(VALID_TOOL_PROFILES || ['all', 'core', 'deploy', 'ops', 'security']);
 
 /**
- * Extrae y valida el query param `?profile=core|deploy|ops|security|all` de la petición HTTP.
+ * Extrae y valida el query param `?profile=core|deploy|ops|security|all` (o cabecera
+ * `X-Culkibo-Mcp-Profile` como fallback) de la petición HTTP.
  * @param {any} req
  * @returns {{ ok: true, profile: string, explicit: boolean } | { ok: false, raw: string }}
  */
@@ -55,6 +56,11 @@ function resolveRequestProfile(req) {
       if (all.length > 1) return { ok: false, raw: all.join(',') };
       if (all.length === 1) raw = all[0];
     } catch (e) {}
+  }
+  if (raw === undefined && req && req.headers && req.headers['x-culkibo-mcp-profile'] !== undefined) {
+    const hdr = req.headers['x-culkibo-mcp-profile'];
+    if (Array.isArray(hdr)) return { ok: false, raw: hdr.join(',') };
+    raw = hdr;
   }
   if (raw === undefined || raw === null || String(raw).trim() === '') {
     return { ok: true, profile: 'all', explicit: false };
@@ -346,10 +352,11 @@ async function respondJson(req, res, body, profile = 'all') {
     });
     if (profile && profile !== 'all') {
       res.setHeader('X-Culkibo-Mcp-Profile', profile);
+      res.setHeader('Vary', 'Authorization, Accept, X-Culkibo-Mcp-Profile');
     }
     if (envelope?.result?.cacheScope === 'private') {
       res.setHeader('Cache-Control', 'private, no-store');
-      res.setHeader('Vary', 'Authorization, Accept');
+      res.setHeader('Vary', 'Authorization, Accept, X-Culkibo-Mcp-Profile');
     }
     res.status(200).json(envelope);
   } catch (err) {

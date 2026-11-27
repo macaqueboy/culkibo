@@ -1,145 +1,154 @@
 # Guía Definitiva de Migración: Coolify v4 → Culkibo (Zero Downtime)
 
-> **Culkibo v1.0.0** es el orquestador de aplicaciones y contenedores para la era de la IA. Diseñado para desarrollar con agentes de IA: control nativo mediante MCP (Model Context Protocol), gestión de dominios y túneles Cloudflare, y ejecución local de proyectos sin reconstruir contenedores.
+> **Culkibo v1.1.0** es el orquestador de aplicaciones y contenedores para la era de la IA: 0 dependencias de shell, Vault cifrado AES-256-GCM, ingress atómico en Caddy (<10 ms), control nativo por MCP y **bundles portátiles `.zip` autocontenidos**.
 
 ---
 
-## 1. Resumen de Paridad de Recursos
+## 1. Matriz Completa de Paridad (Coolify v4 → Culkibo)
 
-Culkibo preserva la estructura de proyectos de Coolify garantizando fidelidad total:
+Culkibo ejecuta una migración **100% solo-lectura** sobre tu instancia Coolify v4 (nunca detiene ni modifica contenedores de origen) y calcula un **Parity Score determinista (0–100%)** antes de tocar un solo recurso:
 
-| Recurso | Coolify v4 | Culkibo v1.0.0 | Fidelidad |
+| Recurso | Coolify v4 | Culkibo v1.1.0 | Fidelidad |
 | :--- | :--- | :--- | :---: |
-| **Proyectos y Entornos** | Projects / Environments | Proyectos jerárquicos multi-recurso | 100% |
-| **Aplicaciones Web** | Node, Python, Vite, Dockerfile, Compose | Entornos Desarrollo (Hot) & Producción (Citadel) | 100% |
-| **Bases de Datos** | PostgreSQL, MySQL, Redis, MongoDB | Recursos gestionados con credenciales y volúmenes | 100% |
-| **Volúmenes Persistentes** | `local_persistent_volumes` | Mapeo persistente en `/data/volumes` | 100% |
-| **Montajes de Archivos** | `local_file_volumes` | Archivos de configuración inyectados | 100% |
-| **Variables de Entorno** | Envs (Globales y de build) | Editor Dual (Visual y `.env` Raw) | 100% |
-| **Dominios & SSL** | FQDN con Traefik | Ingress de ultra-baja latencia con Cloudflare DNS-01 | 100% |
+| **Proyectos y Entornos** | Projects / Environments | Proyectos jerárquicos + entornos aislados | 100% |
+| **Aplicaciones** | Git, Nixpacks, Dockerfile, Docker Image, Compose | Build/Deploy nativo con `memoryMb`, `cpus`, hooks pre/post | 100% |
+| **Servicios Multi-Contenedor** | Docker Compose Stacks (`services` + sub-apps) | Parser Compose + sub-dominios + traductor Magic Vars | 100% |
+| **Bases de Datos (8 motores)** | PostgreSQL (pgvector/Timescale), MySQL, MariaDB, MongoDB, Redis, KeyDB, Dragonfly, ClickHouse | Motores gestionados (`postgres`, `pgvector`, `timescaledb`, `mysql`, `mariadb`, `mongodb`, `valkey`, `clickhouse`) aislados en red privada | 100% |
+| **Magic Variables** | `${SERVICE_FQDN_*}`, `${SERVICE_PASSWORD_64_*}`, `${COOLIFY_*}` | Traducción automática a dominios y `${vault.*}` (AES-256-GCM) | 100% |
+| **Etiquetas Traefik** | `traefik.http.routers.*`, `stripprefix`, `redirectregex`, `headers`, `forwardauth`, `basicauth`, `ipallowlist`, `ratelimit` | Traducción automática a reglas nativas de **Caddy Edge** (`pathRoutes`, `pathRedirects`, `cors`, `hstsPreload`, `forwardAuth`, `basicAuth`, `targetPort`) | 100% |
+| **Scheduled Tasks** | Tareas programadas (`daily`, `hourly`, cron) | `cronManager` nativo (validado con `cronParser` + zero-shell `safeCommand`) | 100% |
+| **Variables Compartidas & Preview** | Shared Envs, Build Envs, Preview Envs | Entornos separados + vista previa estrictamente redactada | 100% |
+| **Volúmenes y File Mounts** | `local_persistent_volumes` / `local_file_volumes` | Volúmenes persistentes y montajes de archivos preservados | 100% |
+| **Healthchecks** | `health_check_path` / `method` / `timeout` | Conversión automática a **Smoke Tests** post-despliegue | 100% |
 
 ---
 
-## 2. Preparación Pre-Migración
+## 2. Traducción Automática de Coolify v4 Magic Variables
 
-### Obtener el API Token en Coolify v4
-1. Entra a tu panel de Coolify (ej. `http://tu-vps:8000` o `https://app.tudominio.com`).
-2. Ve a **Keys & Tokens** > **API Tokens**.
-3. Haz clic en **+ Add New Token**, ponle de nombre `Culkibo-Migrator` y marca permisos de lectura completa (`read:all` o `admin`).
-4. Copia el token generado (ej. `1|abc123xyz...`).
+El motor `coolifyMigrator.translateMagicVariables()` escanea tanto `environment_variables` como bloques `docker_compose` (decodificando Base64 si Coolify lo entrega codificado):
 
----
+| Variable Mágica en Coolify v4 | Traducción en Culkibo | Notas de Seguridad |
+| :--- | :--- | :--- |
+| `${SERVICE_FQDN_<APP>}` / `${SERVICE_FQDN_<APP>_<PORT>}` | Hostname real resuelto (ej. `api.ejemplo.com`) o `${domain.<app>}` | Soporta sufijos de puerto `_3000`, `_8080` |
+| `${SERVICE_URL_<APP>}` / `${SERVICE_URL_<APP>_<PORT>}` | URL completa con esquema (`https://api.ejemplo.com`) | Preserva esquema del FQDN original |
+| `${SERVICE_PASSWORD_<NAME>}` | `${vault.SERVICE_PASSWORD_<NAME>}` | Secretos jamás en texto plano en dry-run |
+| `${SERVICE_PASSWORD_64_<NAME>}` | `${vault.SERVICE_PASSWORD_64_<NAME>}` | Longitud 64 caracteres marcada en metadatos |
+| `${SERVICE_USER_<NAME>}` | `${vault.SERVICE_USER_<NAME>}` | Almacenado en Vault AES-256-GCM |
+| `${SERVICE_BASE64_<NAME>}` / `_64_` / `_128_` / `REALBASE64` | `${vault.SERVICE_BASE64_<NAME>}` | Auto-generable en destino si no se porta |
+| `${COOLIFY_FQDN}` | Lista CSV de hostnames de la app | Sin esquema |
+| `${COOLIFY_URL}` | URL principal (`https://<host>`) | Lista para callbacks OAuth / webhooks |
+| `${COOLIFY_BRANCH}` | Rama Git configurada (`main`, etc.) | Inyectada en runtime y build |
+| `${COOLIFY_CONTAINER_NAME}` | Slug de contenedor normalizado (`culkibo-<app>`) | Seguro para redes internas |
 
-## 3. Procedimiento de Migración Paso a Paso
-
-### Paso 1: Asistente Automático de Importación en Culkibo
-
-1. Abre el panel de Culkibo en `http://localhost:3030` (o la IP de tu nuevo VPS).
-2. Haz clic en el botón superior derecho **"Importar desde Coolify"**.
-3. Introduce la **URL de tu Coolify** y el **Token de API**.
-4. Culkibo consultará los endpoints de Coolify:
-   - `/api/v1/projects`
-   - `/api/v1/applications`
-   - `/api/v1/databases`
-   - `/api/v1/services`
-5. Verás un resumen detallado con todos tus proyectos, el número de aplicaciones, bases de datos, variables de entorno y volúmenes persistentes.
-6. Pulsa **"Iniciar Importación Inteligente"**. En pocos segundos todos tus proyectos estarán registrados en Culkibo.
+> **Privacidad en Dry-Run:** `planMigration()` y `previewMigration()` redactan toda credencial y variable sensible como `[REDACTED:sha256:...]`. Nunca se filtran secretos en logs ni en la interfaz previa.
 
 ---
 
-### Paso 2: Migración de Datos de Bases de Datos
+## 3. Traductor Traefik → Caddy Edge Nativo
 
-Para una migración sin interrupción, recomendamos volcar los datos mientras la aplicación antigua sigue sirviendo lecturas, o programar una ventana de conmutación de 1 minuto:
+`coolifyMigrator.parseTraefikLabels()` decodifica `custom_labels` (texto plano o Base64) y etiquetas `labels:` de Docker Compose, aplicando las mismas guardias de seguridad de `caddyManager` / `domainManager`:
 
-#### PostgreSQL (ej. GaleiaDB, AuraCV DB)
-```bash
-# 1. En el VPS de origen (Coolify):
-docker exec -t <id_contenedor_postgres> pg_dump -U postgres -d <nombre_bd> -F c -b -v -f /tmp/backup_postgres.dump
-
-# 2. Copiar hacia el VPS nuevo:
-scp /tmp/backup_postgres.dump root@<nuevo_vps>:/var/backups/
-
-# 3. Restaurar en Culkibo:
-pg_restore -h localhost -p 5432 -U postgres -d <nombre_bd> -v /var/backups/backup_postgres.dump
-```
-
-#### MySQL / MariaDB
-```bash
-# 1. En el VPS de origen (Coolify):
-docker exec <id_contenedor_mysql> mysqldump -u root -p<password> --single-transaction --quick <nombre_bd> > /tmp/backup_mysql.sql
-
-# 2. Restaurar en Culkibo:
-mysql -h localhost -P 3306 -u root -p<password> <nombre_bd> < /tmp/backup_mysql.sql
-```
-
-#### Redis
-```bash
-# Guardar estado a disco:
-docker exec <id_contenedor_redis> redis-cli BGSAVE
-# Copiar el archivo dump.rdb montado en el volumen persistente hacia el nuevo host.
-```
-
-#### MongoDB
-```bash
-docker exec <id_contenedor_mongo> mongodump --db <nombre_bd> --archive=/tmp/mongo_backup.archive --gzip
-mongorestore --archive=/tmp/mongo_backup.archive --gzip --db <nombre_bd>
-```
+| Etiqueta Traefik v2/v3 | Campo Nativo en Culkibo (`domainManager`) | Validación de Seguridad |
+| :--- | :--- | :--- |
+| `traefik.http.routers.<r>.rule=Host(...) && PathPrefix(...)` | `hostname` + `pathRoutes[]` | RFC 1123 + bloqueo path traversal `..` |
+| `traefik.http.services.<s>.loadbalancer.server.port` | `targetPort` (y `protocol: 'h2c'` si `scheme=h2c`) | Puerto entero 1..65535 |
+| `traefik.http.middlewares.<m>.stripprefix.prefixes` | `pathRoutes[].stripPrefix` | Normalizado por router/prefix |
+| `traefik.http.middlewares.<m>.redirectregex.*` | `canonicalRedirect` (`www_to_apex`/`apex_to_www`) o `pathRedirects[]` | **Guardia anti-ReDoS** (`validateSafeRedirectRegex`) |
+| `traefik.http.middlewares.<m>.headers.accesscontrol*` | `cors` (`allowedOrigins`, `allowedMethods`, `allowedHeaders`, `allowCredentials`, `maxAge`) | Bloquea CORS inseguro `*` + `allowCredentials: true` |
+| `traefik.http.middlewares.<m>.headers.sts*` | `hstsPreload` + `hstsMaxAge` | Acotado `0..63072000` s |
+| `traefik.http.middlewares.<m>.headers.custom*headers.*` | `customHeaders.response` / `customHeaders.request` | Bloquea CRLF y cabeceras hop-by-hop |
+| `traefik.http.middlewares.<m>.forwardauth.*` | `forwardAuth` (`upstream`, `uri`, `copyHeaders`) | **Guardia SSRF** (bloquea IMDS/metadatos cloud) |
+| `traefik.http.middlewares.<m>.basicauth.users` | `basicAuth` (desescapa `$$` → `$`) | Preserva bcrypt `$2a$`/`$2b$`/`$2y$`; avisa en hashes APR1/SHA1 |
+| `traefik.http.middlewares.<m>.ipallowlist.sourcerange` | `ipAllowlist[]` | Validación estricta IPv4/IPv6 CIDR |
+| `traefik.http.middlewares.<m>.ratelimit.average` | `rateLimit` (`requests`, `windowSeconds`) | Acotado para Caddy |
+| `traefik.http.middlewares.<m>.buffering.maxrequestbodybytes` | `maxBodySizeMb` | Conversión automática a MB |
 
 ---
 
-### Paso 3: Migración de Volúmenes Persistentes (Archivos y Medios)
+## 4. Culkibo Portable Stack Bundle (`.zip` / `.ckb.gz`)
 
-Para copiar carpetas de medios (como los 6 volúmenes de MediaMate o Shorty):
+Con `server/services/bundleArchiver.js` (0 dependencias externas, escritor/lector PKZIP 2.0 en JS puro con CRC32 + `zlib`), puedes empaquetar, respaldar o mover un stack completo entre servidores en un único archivo `.zip` o `.ckb.gz`:
 
+### Estructura del Bundle `.zip`
+```text
+mi-stack-ckb_xxx.zip
+├── manifest.json           # Versión, bundleId, conteos y modo de Vault
+├── checksums.json          # Integridad SHA-256 de todos los archivos
+├── culkibo.yaml            # Manifiesto declarativo GitOps v1 (0 secretos en claro)
+├── projects.json           # Proyectos sanitizados con referencias ${vault.*}
+├── domains.json            # Dominios y políticas Caddy Edge (CORS, HSTS, ForwardAuth)
+├── databases.json          # Topologías de bases de datos (sin contraseñas)
+├── crons.json              # Tareas programadas
+├── mcp-agent-config.json   # Config drop-in para Antigravity, Claude Code y Cursor
+├── vault.enc.json          # Sobre cifrado AES-256-GCM + scrypt (si se indicó passphrase)
+│   (o vault.redacted.json) # Huellas y claves requeridas sin secretos en claro
+└── README-RESTORE.md       # Guía de restauración en 1 clic
+```
+
+### Defensas Integradas en `bundleArchiver.js`
+- **Anti Path-Traversal & Symlinks**: rechaza `..`, rutas absolutas (`/etc/...`), unidades Windows (`C:\...`), bytes NUL y entradas symlink Unix (`0o120000`).
+- **Anti Zip-Bomb / Gzip-Bomb**: valida número de entradas (máx. 200), tamaño por archivo (máx. 10 MB), tamaño total (máx. 50 MB), ratio de expansión (máx. 100:1) y `maxOutputLength` nativo en `zlib.inflateRawSync` / `zlib.gunzipSync`.
+- **Anti-Polyglot & Integridad**: exige coincidencia exacta entre Local File Header y Central Directory, CRC32 por archivo y SHA-256 global (`checksums.json`).
+
+---
+
+## 5. Procedimiento de Migración Zero-Downtime (3 Pasos)
+
+### Paso 1: Obtener Token API en Coolify v4 (o Exportación Offline / `.zip`)
+1. En Coolify v4 ve a **Keys & Tokens → API Tokens → + Add New Token**.
+2. Otorga permisos `read:all` y copia el token (`1|...`).
+3. Abre Culkibo → **Importar → Coolify v4**, pega tu URL + Token (o selecciona **Exportación JSON** / **Bundle Portátil .zip**).
+
+### Paso 2: Revisar la Cabina de Paridad (Pre-Flight)
+1. Comprueba el **Parity Score (%)** y las 4 pestañas de inspección:
+   - **Recursos**: selecciona proyectos, apps, bases de datos y stacks Compose.
+   - **Magic Vars**: verifica las referencias `${vault.*}` y dominios traducidos.
+   - **Traefik → Caddy**: revisa `pathRoutes`, `CORS`, `HSTS`, `forwardAuth`, `basicAuth` y puertos.
+   - **Pre-Flight**: revisa avisos de secretos, puertos públicos de BDs o crons con sintaxis de shell.
+2. Opcional: haz clic en **Exportar Bundle .zip** para guardar una copia portable antes de importar.
+3. Pulsa **Migrar recursos (Zero-Downtime)**.
+
+### Paso 3: Volcado de Datos, Verificación Pre-DNS y Cutover
+
+#### Volcado de Bases de Datos (8 Motores)
 ```bash
-# Sincronización recursiva con preservación de permisos y timestamps
+# PostgreSQL / pgvector / TimescaleDB
+docker exec -t <coolify_pg> pg_dump -U postgres -d <db> -F c -b -f /tmp/backup.dump
+pg_restore -h 127.0.0.1 -p 5432 -U postgres -d <db> --no-owner --no-privileges /tmp/backup.dump
+
+# MySQL / MariaDB
+docker exec <coolify_mysql> mysqldump -u root -p --single-transaction --quick --set-gtid-purged=OFF <db> > backup.sql
+mysql -h 127.0.0.1 -P 3306 -u root -p <db> < backup.sql
+
+# Redis / KeyDB / Dragonfly → Valkey
+docker exec <coolify_kv> redis-cli BGSAVE
+# Copiar dump.rdb al volumen de Valkey en Culkibo
+
+# MongoDB
+docker exec <coolify_mongo> mongodump --archive=/tmp/mongo.archive --gzip
+mongorestore --archive=/tmp/mongo.archive --gzip
+
+# ClickHouse
+docker exec <coolify_ch> clickhouse-client --query="BACKUP DATABASE default TO Disk('backups', 'migration.zip')"
+```
+
+#### Sincronización de Volúmenes Persistentes
+```bash
 rsync -avzP /var/lib/docker/volumes/<volumen_coolify>/_data/ root@<nuevo_vps>:/var/lib/culkibo/volumes/<volumen_culkibo>/
 ```
 
----
-
-### Paso 4: Conmutación de Tráfico DNS con Zero Downtime
-
-Si utilizas Cloudflare (Nube Naranja ☁️ activada):
-1. La IP del registro `A` o `CNAME` en Cloudflare se actualiza a la nueva IP del servidor Culkibo.
-2. Como el proxy de Cloudflare absorbe la caché de borde, los usuarios finales no experimentan caídas ni esperas de propagación DNS (cambio instantáneo).
-3. El Ingress de Culkibo detecta automáticamente la cabecera `Host` y enruta al Entorno de Producción (:8080) con SSL activo.
-
----
-
-## 4. Verificación y Health Check
-
-Una vez finalizada la migración, ejecuta el diagnóstico completo en la terminal:
-
-```powershell
-culkibo doctor
+#### Verificación Pre-Cutover (`verifyMigratedStack`)
+Antes de modificar tus registros DNS, verifica tus endpoints contra la IP del servidor Culkibo:
+```bash
+curl -fsS -I --resolve api.tudominio.com:443:<IP_CULKIBO> https://api.tudominio.com/health
 ```
-
-Deberías ver:
-```
-🩺 DIAGNÓSTICO INTEGRAL DE CULKIBO
-==================================================
-  ✓ Node.js: v24.x (Cumple requisito mínimo >= v18)
-  ✓ Motor Docker: Activo — Modo Nativo
-  ✓ Directorio ./data: Permisos de lectura/escritura correctos
-  ✓ Directorio ./projects: Permisos de lectura/escritura correctos
-  ✓ Directorio ./data/backups: Permisos de lectura/escritura correctos
-  ✓ Cloudflare API: Token configurado correctamente
-  • Puerto 3030 (Panel/API): En uso (demonio activo)
-==================================================
-✨ Diagnóstico finalizado con éxito.
-```
-
-Comprueba los proyectos y dominios enrutados:
-```powershell
-culkibo pod list
-culkibo domain list
-```
+Comprueba HTTP 200, cabeceras CORS/HSTS y latencia. Luego haz clic en **Migrar todos los dominios** (Cloudflare actualiza el registro `A` en <30 s con caída cero).
 
 ---
 
-## 5. Plan de Contingencia / Rollback
+## 6. Red de Seguridad / Rollback Instantáneo
 
-Si necesitas revertir el cambio temporalmente:
-1. En Cloudflare, vuelve a cambiar la IP del registro DNS a la IP del VPS anterior donde corre Coolify.
-2. Coolify seguirá teniendo sus contenedores intactos, ya que la migración es de solo-lectura y no altera el VPS de origen.
+Si necesitas revertir tras el cutover:
+1. Tu servidor Coolify original **nunca fue alterado** y sus contenedores siguen intactos.
+2. En Cloudflare (o tu DNS), cambia de vuelta el registro `A` a la IP del VPS de Coolify (~30 segundos con proxy naranja activo).
+3. Mantén Coolify en espera 24–48 h antes de apagar el VPS antiguo.

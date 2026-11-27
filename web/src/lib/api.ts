@@ -406,6 +406,9 @@ export interface ServiceInstallation {
   notes: string[];
   createdAt: string;
   updatedAt: string;
+  catalogImage?: string;
+  updateAvailable?: boolean;
+  extraPorts?: Record<string, number>;
 }
 
 export interface ServiceSecrets {
@@ -545,14 +548,25 @@ export interface PreviewDeploymentItem {
 
 export interface AuditLogEvent {
   id?: string;
+  seq?: number;
   at?: string;
   timestamp?: string;
   source: string;
   action: string;
   target?: string | null;
-  actor?: string | null;
+  path?: string | null;
+  method?: string | null;
+  actor?: string | {
+    userId?: string | null;
+    email?: string | null;
+    role?: string | null;
+    teamId?: string | null;
+    kind?: string | null;
+  } | null;
   ip?: string | null;
-  status?: string | null;
+  status?: number | string | null;
+  prevHash?: string | null;
+  entryHash?: string | null;
   meta?: Record<string, unknown>;
 }
 
@@ -2465,7 +2479,7 @@ export const api = {
     return jsonOrThrow(await apiFetch(`${API_BASE}/catalog/installations`), 'No se pudieron cargar los servicios instalados');
   },
 
-  async installService(body: { templateId: string; name?: string; domain?: string | null }): Promise<ServiceInstallation> {
+  async installService(body: { templateId: string; name?: string; domain?: string | null; env?: Record<string, string>; tz?: string }): Promise<ServiceInstallation> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/catalog/install`, {
         method: 'POST',
@@ -3879,6 +3893,99 @@ export const api = {
       'No se pudo cargar la topología del sistema'
     );
   },
+
+  // --- Edge Multi-DNS-01 & HTTP/3 (QUIC) v1.1 ---
+
+  async getDnsProviders(): Promise<{ providers: DnsProviderInfo[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/dns-providers`),
+      'No se pudieron cargar los proveedores DNS-01'
+    );
+    return Array.isArray(data) ? { providers: data } : { providers: data?.providers || [] };
+  },
+
+  async getHttp3Status(): Promise<Http3ProbeResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ingress/http3`),
+      'No se pudo comprobar el estado de HTTP/3 (QUIC)'
+    );
+  },
+
+  // --- Enterprise Security v1.1 (TOTP 2FA, OIDC SSO, Hash-Chained Audit, Secret Scanner) ---
+
+  async setup2FA(): Promise<TotpSetupResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/2fa/setup`, { method: 'POST' }),
+      'No se pudo iniciar la configuración de 2FA (TOTP)'
+    );
+  },
+
+  async verify2FA(code: string): Promise<TotpVerifyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/2fa/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      }),
+      'Código TOTP inválido o caducado'
+    );
+  },
+
+  async disable2FA(payload: { code: string; password?: string }): Promise<{ disabled?: boolean; alreadyDisabled?: boolean }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/2fa/disable`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo desactivar la autenticación en dos pasos'
+    );
+  },
+
+  async getOidcProviders(): Promise<{ providers: OidcProviderSummary[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/auth/oidc/providers`),
+      'No se pudieron cargar los proveedores OIDC SSO'
+    );
+    return Array.isArray(data) ? { providers: data } : { providers: data?.providers || [] };
+  },
+
+  async getSecurityAuditLog(opts: { limit?: number; since?: string; action?: string } = {}): Promise<{ entries: AuditLogEvent[] }> {
+    const qs = new URLSearchParams();
+    if (opts.limit) qs.set('limit', String(opts.limit));
+    if (opts.since) qs.set('since', opts.since);
+    if (opts.action) qs.set('action', opts.action);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/audit-log${suffix}`),
+      'No se pudo leer el registro de auditoría cifrado'
+    );
+    return Array.isArray(data) ? { entries: data } : { entries: data?.entries || data?.events || [] };
+  },
+
+  async verifyAuditLogIntegrity(): Promise<AuditChainVerification> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/audit-log/verify`, { method: 'POST' }),
+      'No se pudo verificar la cadena criptográfica de auditoría'
+    );
+  },
+
+  async scanSecrets(payload: {
+    text?: string;
+    envVars?: Record<string, string>;
+    composeYaml?: string;
+    culkiboYaml?: string;
+    dockerfile?: string;
+  }): Promise<SecretScanReport> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/scan-secrets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'No se pudo ejecutar el escáner de secretos'
+    );
+  },
 };
 
 // =====================================================================
@@ -4029,4 +4136,115 @@ export interface TopologyGraph {
   nodes: TopologyNode[];
   edges: TopologyEdge[];
   generatedAt: string;
+}
+
+// --- Edge Multi-DNS-01 & HTTP/3 v1.1 ---
+
+export interface DnsProviderField {
+  name: string;
+  label?: string;
+  envVar?: string;
+  secret?: boolean;
+  required?: boolean;
+}
+
+export interface DnsProviderInfo {
+  id: string;
+  label: string;
+  caddyModule: string;
+  xcaddyModule: string;
+  fields: DnsProviderField[];
+}
+
+export interface Http3ProbeResult {
+  supported: boolean;
+  configured: boolean;
+  protocols: string[];
+  automaticHttpsDisabled: boolean;
+  udp443Published: boolean | null;
+  listen: string[];
+  reason: string | null;
+}
+
+// --- Security v1.1 (TOTP 2FA, OIDC SSO, Hash-Chained Audit, Secret Scanner) ---
+
+export interface TotpSetupResult {
+  secretBase32?: string;
+  secret?: string;
+  otpauthUri?: string;
+  otpauthUrl?: string;
+  qrUrl?: string;
+  issuer?: string;
+  accountName?: string;
+  digits?: number;
+  period?: number;
+  algorithm?: string;
+}
+
+export interface TotpVerifyResult {
+  enabled?: boolean;
+  verified?: boolean;
+  valid?: boolean;
+  enabledAt?: string | null;
+  recoveryCodes?: string[];
+  recoveryCodesRemaining?: number;
+}
+
+export interface OidcProviderSummary {
+  id: string;
+  type: string;
+  protocol: string;
+  name: string;
+  enabled: boolean;
+  issuerUrl?: string | null;
+  clientId?: string;
+  hasClientSecret?: boolean;
+  redirectUri?: string;
+  scopes?: string[];
+  autoProvision?: boolean;
+  defaultRole?: string;
+  teamId?: string;
+  allowedDomains?: string[];
+  enforceLocal2fa?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface AuditChainVerification {
+  valid: boolean;
+  checkedCount: number;
+  filesChecked: string[];
+  anchored: boolean;
+  firstSeq: number | null;
+  lastSeq: number | null;
+  headHash: string | null;
+  brokenAtSeq: number | null;
+  brokenAtLine: number | null;
+  brokenFile: string | null;
+  reason: string | null;
+}
+
+export interface SecretScanFinding {
+  ruleId: string;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  source: string;
+  key: string | null;
+  line: number | null;
+  preview: string;
+  remediation: string;
+}
+
+export interface SecretScanReport {
+  clean: boolean;
+  blocked: boolean;
+  mode: string;
+  summary: {
+    total: number;
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+  };
+  findings: SecretScanFinding[];
 }

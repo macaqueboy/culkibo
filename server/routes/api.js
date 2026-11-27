@@ -38,14 +38,19 @@ const {
   createWsTicket,
   rotateToken,
   onTokenRotated,
+  onPrincipalRevoked,
   isPrivateProxyPeer,
   canBootstrapRequest,
   clientIp,
   checkAuthBruteForce,
   recordAuthFailure,
   getBruteForceStats,
-  requireRouteRbac
+  requireRouteRbac,
+  formatSessionCookie,
+  formatClearSessionCookie,
+  isHttpsRequest
 } = require('../middleware/auth');
+const Project = require('../models/Project');
 
 // Carga perezosa de los módulos v2 (0 impacto en RAM al arrancar en 1 solo VPS)
 /** @type {Record<string, any>} */
@@ -61,6 +66,213 @@ function getAlertEngine() { return _lazyV2.ae || (_lazyV2.ae = require('../servi
 function getTopologyService() { return _lazyV2.topo || (_lazyV2.topo = require('../services/topologyService')); }
 function getOidcService() { return _lazyV2.oidc || (_lazyV2.oidc = require('../services/oidcService')); }
 function getSecretScanner() { return _lazyV2.scanner || (_lazyV2.scanner = require('../services/secretScanner')); }
+function getEditionService() { return _lazyV2.edition || (_lazyV2.edition = require('../services/editionService')); }
+function getBundleArchiver() { return _lazyV2.bundle || (_lazyV2.bundle = require('../services/bundleArchiver')); }
+
+/**
+ * Adjunta una cookie de sesión `HttpOnly; SameSite=Strict` (o `Lax` en OIDC redirect)
+ * manteniendo 100% compatibilidad con clientes Bearer / X-Culkibo-Token.
+ * @param {any} req
+ * @param {any} res
+ * @param {string | null | undefined} sessionToken
+ * @param {{ maxAgeSec?: number, sameSite?: 'Strict' | 'Lax' }} [opts]
+ */
+function attachSessionCookie(req, res, sessionToken, opts = {}) {
+  if (typeof sessionToken === 'string' && sessionToken.startsWith('cks_')) {
+    res.append('Set-Cookie', formatSessionCookie(sessionToken, req, opts));
+  }
+}
+
+/**
+ * Emite una cookie marcadora `HttpOnly; SameSite=Strict` en `/auth/verify` cuando
+ * se verifica el token maestro (sin escribir jamás el token maestro en claro en la cookie).
+ * @param {any} req
+ * @param {any} res
+ */
+function attachVerifiedAuthCookie(req, res) {
+  const secure = isHttpsRequest(req);
+  const name = secure ? '__Host-culkibo_auth' : 'culkibo_auth';
+  const attrs = [
+    `${name}=verified`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Strict',
+    'Max-Age=86400'
+  ];
+  if (secure) attrs.push('Secure');
+  res.append('Set-Cookie', attrs.join('; '));
+}
+
+/**
+ * Borra las cookies de sesión/verificación al cerrar sesión.
+ * @param {any} req
+ * @param {any} res
+ */
+function clearSessionCookies(req, res) {
+  for (const cookie of formatClearSessionCookie(req)) {
+    res.append('Set-Cookie', cookie);
+  }
+  res.append('Set-Cookie', 'culkibo_auth=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
+  if (isHttpsRequest(req)) {
+    res.append('Set-Cookie', '__Host-culkibo_auth=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0');
+  }
+}
+
+/**
+ * Construye el descriptor de actor sanitizado para `auditLogger.record(...)`.
+ * @param {any} req
+ */
+function getAuditActor(req) {
+  const authCtx = req && req.auth ? req.auth : null;
+  const principal = authCtx && authCtx.principal ? authCtx.principal : null;
+  if (!principal) return { actor: null, authMethod: null };
+  return {
+    authMethod: authCtx.method || null,
+    actor: {
+      userId: principal.userId || null,
+      email: principal.email || null,
+      role: principal.role || null,
+      teamId: principal.teamId || null,
+      tokenId: principal.tokenId || null,
+      kind: principal.kind || null
+    }
+  };
+}
+
+/**
+ * Redacta secretos del proyecto (incluyendo `buildSecrets` y `previewDeployments.buildSecrets`)
+ * cuando el llamador no tiene `secrets:read` sobre el proyecto.
+ * @param {any} req
+ * @param {any} proj
+ */
+function redactProjectOutput(req, proj) {
+  if (!proj || typeof proj !== 'object') return proj;
+  const principal = getPrincipal(req);
+  if (principal.isSuperAdmin) return proj;
+  const tm = getTeamManager();
+  const redacted = tm.redactProjectForPrincipal(principal, proj);
+  if (redacted && redacted._secretsRedacted) {
+    return Project.redactForUnprivileged(redacted, { includeSecrets: false });
+  }
+  return redacted;
+}
+
+/**
+ * Devuelve la lista de IDs de proyectos visibles para un principal no-superadmin (o `null` para superadmin).
+ * @param {any} req
+ * @returns {string[] | null}
+ */
+function getAllowedProjectIds(req) {
+  const principal = getPrincipal(req);
+  if (principal.isSuperAdmin) return null;
+  return getTeamManager()
+    .filterProjects(principal, projectManager.getAll(), { redact: false })
+    .map((p) => p.id);
+}
+
+/**
+ * Impide que un no-owner establezca o modifique `localPath` del host (Coolify CVE-2026-34153).
+ * @param {any} req
+ * @param {any} res
+ * @param {string} [teamId]
+ * @returns {boolean}
+ */
+function assertHostLocalPathAllowed(req, res, teamId) {
+  const principal = getPrincipal(req);
+  if (principal.isSuperAdmin) return true;
+  const check = getTeamManager().doesPrincipalSatisfyRole(principal, 'owner', teamId || principal.teamId);
+  if (!check || !check.allowed) {
+    res.status(403).json({
+      error: 'Solo un owner puede configurar rutas locales del host (localPath)',
+      code: 'LOCAL_PATH_OWNER_REQUIRED'
+    });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Evita sobrescribir secretos reales en `buildSecrets` con el marcador literal `'[REDACTED]'`.
+ * @param {Record<string, string> | null | undefined} existingMap
+ * @param {Record<string, any> | null | undefined} incomingMap
+ */
+function mergeRedactedSecretMap(existingMap, incomingMap) {
+  if (!incomingMap || typeof incomingMap !== 'object' || Array.isArray(incomingMap)) return incomingMap;
+  const prev = existingMap && typeof existingMap === 'object' ? existingMap : {};
+  /** @type {Record<string, any>} */
+  const next = { ...incomingMap };
+  for (const [k, v] of Object.entries(next)) {
+    if (v === '[REDACTED]' && Object.prototype.hasOwnProperty.call(prev, k)) {
+      next[k] = prev[k];
+    }
+  }
+  return next;
+}
+
+/**
+ * Verifica autorización multi-tenant + ACL por proyecto sobre un dominio.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} domainId
+ * @param {string} [perm]
+ * @returns {any | null}
+ */
+function assertDomainAccess(req, res, domainId, perm = 'domains:write') {
+  const principal = getPrincipal(req);
+  const domain = domainManager.getById(domainId);
+  if (!domain) {
+    res.status(404).json({ error: 'Dominio no encontrado' });
+    return null;
+  }
+  if (!principal.isSuperAdmin) {
+    if (domain.projectId) {
+      const proj = assertProjectAccess(req, res, domain.projectId, perm);
+      if (!proj) return null;
+    } else if (denyProjectScopedToken(req, res, 'dominios globales sin proyecto')) {
+      return null;
+    } else if (principal.teamId && principal.teamId !== 'team_default') {
+      res.status(404).json({ error: 'Dominio no encontrado' });
+      return null;
+    }
+  }
+  return domain;
+}
+
+/**
+ * Verifica autorización multi-tenant + ACL por proyecto sobre una base de datos gestionada.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} dbId
+ * @param {string} [perm]
+ * @returns {any | null}
+ */
+function assertDatabaseAccess(req, res, dbId, perm = 'databases:read') {
+  const principal = getPrincipal(req);
+  /** @type {any} */
+  let db = null;
+  try {
+    db = databaseManager.get(dbId);
+  } catch (e) {
+    res.status(404).json({ error: e.message || 'Base de datos no encontrada' });
+    return null;
+  }
+  if (!db) {
+    res.status(404).json({ error: 'Base de datos no encontrada' });
+    return null;
+  }
+  if (!principal.isSuperAdmin) {
+    if (db.projectId) {
+      const proj = assertProjectAccess(req, res, db.projectId, perm);
+      if (!proj) return null;
+    } else if (denyProjectScopedToken(req, res, 'bases de datos sin proyecto')) {
+      return null;
+    } else if (principal.teamId && principal.teamId !== 'team_default') {
+      res.status(404).json({ error: 'Base de datos no encontrada' });
+      return null;
+    }
+  }
+  return db;
+}
 
 /** @param {any} req */
 function getPrincipal(req) {
@@ -221,12 +433,15 @@ router.use((req, res, next) => {
   const t0 = Date.now();
   res.once('finish', () => {
     try {
+      const { actor, authMethod } = getAuditActor(req);
       auditLogger.record({
         source: 'http',
         action: `${req.method} ${req.path}`,
         method: req.method,
         path: req.path,
         ip: clientIp(req),
+        authMethod,
+        actor,
         status: res.statusCode,
         durationMs: Date.now() - t0
       });
@@ -248,8 +463,8 @@ const RBAC_PUBLIC_PATHS = new Set([
   '/webhooks/gitlab',
   '/webhooks/gitea',
   '/webhooks/bitbucket',
-  '/auth/2fa/setup',
   '/auth/2fa/verify',
+  '/auth/oidc/start',
   '/auth/oidc/authorize',
   '/auth/oidc/callback',
   '/auth/oidc/providers'
@@ -328,8 +543,8 @@ router.get('/projects', (req, res) => {
     const principal = getPrincipal(req);
     if (!principal.isSuperAdmin) {
       const tm = getTeamManager();
-      const visible = tm.filterProjects(principal, projectManager.getAll())
-        .map((p) => tm.redactProjectForPrincipal(principal, p));
+      const visible = tm.filterProjects(principal, projectManager.getAll(), { redact: false })
+        .map((p) => redactProjectOutput(req, p));
       res.setHeader('Cache-Control', 'private, no-store');
       return res.json(visible);
     }
@@ -342,10 +557,14 @@ router.get('/projects', (req, res) => {
 
 router.post('/projects', async (req, res) => {
   try {
+    if (denyProjectScopedToken(req, res, 'crear proyectos')) return;
     const principal = getPrincipal(req);
     const body = req.body && typeof req.body === 'object' ? { ...req.body } : {};
     if (!principal.isSuperAdmin) {
       body.teamId = principal.teamId || 'team_default';
+      if (body.localPath !== undefined && body.localPath !== null && String(body.localPath).trim() !== '') {
+        if (!assertHostLocalPathAllowed(req, res, body.teamId)) return;
+      }
     }
     const project = projectManager.create(body);
     // Automatically pre-clone and prepare dependencies in the background
@@ -356,7 +575,7 @@ router.post('/projects', async (req, res) => {
     }
     // `projectManager.create()` ya programa un volcado atómico agrupado (15 ms);
     // no bloqueamos la respuesta HTTP en I/O de disco igual que PUT /projects/:id.
-    res.status(201).json(project);
+    res.status(201).json(redactProjectOutput(req, project));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -366,13 +585,10 @@ router.get('/projects/:id', (req, res) => {
   try {
     const principal = getPrincipal(req);
     if (!principal.isSuperAdmin) {
-      const proj = projectManager.getById(req.params.id);
-      if (!proj) return res.status(404).json({ error: 'Proyecto no encontrado' });
-      const tm = getTeamManager();
-      const authz = tm.authorizeProject(principal, proj.id, 'projects:read', proj);
-      if (!authz.allowed) return res.status(authz.status || 404).json({ error: authz.status === 403 ? 'Sin permiso' : 'Proyecto no encontrado' });
+      const proj = assertProjectAccess(req, res, req.params.id, 'projects:read');
+      if (!proj) return;
       res.setHeader('Cache-Control', 'private, no-store');
-      return res.json(tm.redactProjectForPrincipal(principal, proj));
+      return res.json(redactProjectOutput(req, proj));
     }
     const serialized = projectManager.getByIdSerialized(req.params.id);
     if (!serialized) return res.status(404).json({ error: 'Proyecto no encontrado' });
@@ -385,17 +601,27 @@ router.get('/projects/:id', (req, res) => {
 
 router.put('/projects/:id', (req, res) => {
   try {
-    const existing = projectManager.getById(req.params.id);
-    if (!existing) {
-      return res.status(404).json({ error: 'Proyecto no encontrado' });
-    }
+    const existing = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!existing) return;
     const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? { ...req.body } : {};
     if (!principal.isSuperAdmin) {
-      const authz = getTeamManager().authorizeProject(principal, existing.id, 'projects:write', existing);
-      if (!authz.allowed) return res.status(authz.status || 403).json({ error: authz.reason || 'Sin permiso para editar este proyecto' });
+      delete body.teamId;
+      if (body.localPath !== undefined && String(body.localPath || '').trim() !== String(existing.localPath || '').trim()) {
+        if (String(body.localPath || '').trim() !== '' && !assertHostLocalPathAllowed(req, res, existing.teamId)) return;
+      }
     }
-    const project = projectManager.update(req.params.id, req.body);
-    res.json(project);
+    if (body.buildSecrets && typeof body.buildSecrets === 'object') {
+      body.buildSecrets = mergeRedactedSecretMap(existing.buildSecrets, body.buildSecrets);
+    }
+    if (body.previewDeployments && typeof body.previewDeployments === 'object' && body.previewDeployments.buildSecrets) {
+      body.previewDeployments = {
+        ...body.previewDeployments,
+        buildSecrets: mergeRedactedSecretMap(existing.previewDeployments && existing.previewDeployments.buildSecrets, body.previewDeployments.buildSecrets)
+      };
+    }
+    const project = projectManager.update(req.params.id, body);
+    res.json(redactProjectOutput(req, project));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -404,13 +630,8 @@ router.put('/projects/:id', (req, res) => {
 router.delete('/projects/:id', async (req, res) => {
   try {
     const projectId = req.params.id;
-    const existing = projectManager.getById(projectId);
-    if (!existing) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    const principal = getPrincipal(req);
-    if (!principal.isSuperAdmin) {
-      const authz = getTeamManager().authorizeProject(principal, existing.id, 'projects:delete', existing);
-      if (!authz.allowed) return res.status(authz.status || 403).json({ error: authz.reason || 'Sin permiso para eliminar este proyecto' });
-    }
+    const existing = assertProjectAccess(req, res, projectId, 'projects:delete');
+    if (!existing) return;
 
     try { await localRunner.stop(projectId, existing.localPort); } catch (e) {}
     try { liveSyncEngine.resetSession(projectId); } catch (e) {}
@@ -451,9 +672,11 @@ router.delete('/projects/:id', async (req, res) => {
 
 router.post('/projects/:id/activate', async (req, res) => {
   try {
-    const project = projectManager.activate(req.params.id);
-    await projectManager.flushToDisk(req.params.id);
-    res.json(project);
+    const existing = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!existing) return;
+    const project = projectManager.activate(existing.id);
+    await projectManager.flushToDisk(existing.id);
+    res.json(redactProjectOutput(req, project));
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -461,8 +684,8 @@ router.post('/projects/:id/activate', async (req, res) => {
 
 router.post('/projects/:id/hibernate', async (req, res) => {
   try {
-    let project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
 
     try {
       await localRunner.stop(project.id, project.localPort);
@@ -481,11 +704,11 @@ router.post('/projects/:id/hibernate', async (req, res) => {
       }
     } catch(e) {}
 
-    const updated = projectManager.hibernate(req.params.id);
-    await projectManager.flushToDisk(req.params.id);
+    const updated = projectManager.hibernate(project.id);
+    await projectManager.flushToDisk(project.id);
     // P1-1: syncProject conserva la ruta de producción en Caddy si sigue viva y la retira si no
-    const ingress = await ingressManager.syncProject(req.params.id);
-    res.json({ ...updated, ingress });
+    const ingress = await ingressManager.syncProject(project.id);
+    res.json({ ...redactProjectOutput(req, updated), ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -493,8 +716,8 @@ router.post('/projects/:id/hibernate', async (req, res) => {
 
 router.post('/projects/:id/start-local', async (req, res) => {
   try {
-    let project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    let project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
 
     if (!project.localPort) {
       project.localPort = await localRunner.getAvailablePort(project.forgePort || 3001);
@@ -516,12 +739,12 @@ router.post('/projects/:id/start-local', async (req, res) => {
 
     project.status = 'active';
     project.localRunning = true;
-    project = projectManager.update(req.params.id, project);
+    project = projectManager.update(project.id, project);
 
     const ingress = await ingressManager.syncProject(project.id);
 
-    await projectManager.flushToDisk(req.params.id);
-    res.json({ ...project, ingress });
+    await projectManager.flushToDisk(project.id);
+    res.json({ ...redactProjectOutput(req, project), ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -529,8 +752,8 @@ router.post('/projects/:id/start-local', async (req, res) => {
 
 const handleStopProject = async (req, res) => {
   try {
-    let project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
 
     try {
       await localRunner.stop(project.id, project.localPort);
@@ -550,11 +773,11 @@ const handleStopProject = async (req, res) => {
       }
     } catch(e) {}
 
-    const updated = projectManager.stop(req.params.id);
-    await projectManager.flushToDisk(req.params.id);
+    const updated = projectManager.stop(project.id);
+    await projectManager.flushToDisk(project.id);
     // P1-1: syncProject evita borrar la ruta de producción en Caddy al detener solo el servidor local
-    const ingress = await ingressManager.syncProject(req.params.id);
-    res.json({ ...updated, ingress });
+    const ingress = await ingressManager.syncProject(project.id);
+    res.json({ ...redactProjectOutput(req, updated), ingress });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -574,8 +797,8 @@ router.post('/projects/:id/stop-local', handleStopProject);
  */
 router.get('/projects/:id/deploy/strategy', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
 
     const rootDir = (project.localPath && fs.existsSync(project.localPath))
       ? project.localPath
@@ -613,31 +836,114 @@ router.get('/projects/:id/deploy/strategy', async (req, res) => {
  */
 router.post('/projects/:id/deploy', heavyOpLimiter, async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
+    const principal = getPrincipal(req);
     if (deployManager.locks.has(project.id)) {
       return res.status(409).json({ error: 'Ya hay un despliegue en curso para este proyecto' });
     }
 
     const deploymentId = `dep_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    const options = { deploymentId };
-    if (req.body && typeof req.body === 'object') {
-      for (const key of ['healthTimeoutMs', 'drainTimeoutMs', 'healthIntervalMs', 'buildTimeoutMs', 'keepReleases']) {
-        const value = Number(req.body[key]);
-        if (Number.isFinite(value) && value > 0) options[key] = value;
+    /** @type {Record<string, any>} */
+    const options = {
+      deploymentId,
+      trigger: 'manual',
+      actor: principal.email || principal.kind || 'operator',
+      actorIp: clientIp(req),
+      auditSource: 'http'
+    };
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    for (const key of ['healthTimeoutMs', 'drainTimeoutMs', 'healthIntervalMs', 'buildTimeoutMs', 'keepReleases', 'healthStartPeriodSec', 'healthRetries', 'healthyThreshold']) {
+      if (body[key] !== undefined && body[key] !== null && body[key] !== '') {
+        const value = Number(body[key]);
+        if (Number.isFinite(value) && value >= 0) options[key] = value;
       }
-      if (req.body.memoryMb != null) {
-        const mem = Math.round(Number(req.body.memoryMb));
-        if (Number.isFinite(mem) && mem >= 32 && mem <= 65536) options.memoryMb = mem;
-      }
-      if (typeof req.body.version === 'string') options.version = req.body.version;
-      if (typeof req.body.commit === 'string' && /^[0-9a-f]{7,40}$/i.test(req.body.commit.trim())) {
-        options.commit = req.body.commit.trim();
-      }
-      if (req.body.gitSync === false) options.gitSync = false;
-      if (req.body.skipHooks === true) options.skipHooks = true;
     }
-    options.trigger = 'manual';
+    if (body.memoryMb != null) {
+      const mem = Math.round(Number(body.memoryMb));
+      if (Number.isFinite(mem) && mem >= 32 && mem <= 65536) options.memoryMb = mem;
+    }
+    if (typeof body.version === 'string') options.version = body.version;
+    if (typeof body.commit === 'string' && /^[0-9a-f]{7,40}$/i.test(body.commit.trim())) {
+      options.commit = body.commit.trim();
+    }
+    if (body.gitSync === false) options.gitSync = false;
+    if (body.skipHooks === true) options.skipHooks = true;
+    if (body.buildSecrets && typeof body.buildSecrets === 'object' && !Array.isArray(body.buildSecrets)) {
+      options.buildSecrets = Project.normalizeKeyValueMap(body.buildSecrets);
+    }
+
+    // Ventana de congelación: comprobar ANTES de devolver 202 y exigir rol admin/owner para overrideFreeze
+    if (body.overrideFreeze) {
+      if (!principal.isSuperAdmin) {
+        const adminCheck = getTeamManager().doesPrincipalSatisfyRole(principal, 'admin', project.teamId || principal.teamId);
+        if (!adminCheck.allowed) {
+          return res.status(403).json({
+            error: 'Solo un administrador u owner puede anular una ventana de congelación (overrideFreeze)',
+            code: 'FREEZE_OVERRIDE_FORBIDDEN'
+          });
+        }
+      }
+      options.overrideFreeze = true;
+      if (typeof body.overrideReason === 'string' && body.overrideReason.trim()) {
+        options.overrideReason = body.overrideReason.trim().slice(0, 300);
+      }
+    }
+    const freezeCheck = deployManager.evaluateFreezeStatus(project, { trigger: 'manual' });
+    if (freezeCheck.frozen && !options.overrideFreeze) {
+      const { actor, authMethod } = getAuditActor(req);
+      try {
+        auditLogger.record({
+          source: 'http',
+          action: 'deploy.freeze_blocked',
+          method: 'POST',
+          path: req.path,
+          resourceId: project.id,
+          ip: clientIp(req),
+          authMethod,
+          actor,
+          status: 423,
+          detail: { projectName: project.name || project.id, reason: freezeCheck.reason, window: freezeCheck.window }
+        });
+      } catch (e) {}
+      return res.status(423).json({
+        error: `Despliegue bloqueado por ventana de congelación: ${freezeCheck.reason || 'ventana activa'}`,
+        code: 'DEPLOY_FROZEN',
+        freezeWindow: freezeCheck.window || null
+      });
+    }
+
+    // Escáner pre-despliegue de fugas de secretos (modo `warn` por defecto; `block` si se activa)
+    /** @type {any} */
+    let secretScanReport = null;
+    if (body.skipSecretScan !== true) {
+      const scanMode = (body.secretScanMode === 'block' || process.env.CULKIBO_BLOCK_SECRET_LEAKS === '1')
+        ? 'block'
+        : 'warn';
+      secretScanReport = getSecretScanner().scanDeploymentPayload(
+        {
+          envVars: project.envVars || {},
+          buildArgs: project.buildArgs || {}
+        },
+        { mode: scanMode }
+      );
+      if (secretScanReport.blocked) {
+        return res.status(422).json({
+          error: `Despliegue bloqueado: se detectaron ${secretScanReport.summary.critical + secretScanReport.summary.high} secreto(s) en claro. Mueve las credenciales a \${vault.KEY} antes de desplegar.`,
+          code: 'SECRET_LEAK_DETECTED',
+          secretScan: secretScanReport
+        });
+      }
+      if (!secretScanReport.clean) {
+        containerOrchestrator.addLog(
+          'WARN',
+          'citadel',
+          `[SecretScanner] ${secretScanReport.summary.total} posible(s) secreto(s) en claro en ${project.name} (${secretScanReport.findings.map((f) => f.ruleId).slice(0, 4).join(', ')}). Considera usar \${vault.KEY}.`,
+          new Date(),
+          project.id
+        );
+      }
+    }
 
     const started = deployManager.deploy(project, options);
     started.catch(() => {});
@@ -646,17 +952,28 @@ router.post('/projects/:id/deploy', heavyOpLimiter, async (req, res) => {
       accepted: true,
       deploymentId,
       message: 'Despliegue iniciado. Sigue el progreso en los logs en vivo.',
-      projectId: project.id
+      projectId: project.id,
+      ...(options.overrideFreeze ? { freezeOverridden: true } : {}),
+      ...(secretScanReport && !secretScanReport.clean
+        ? {
+            secretScanWarnings: {
+              total: secretScanReport.summary.total,
+              critical: secretScanReport.summary.critical,
+              high: secretScanReport.summary.high,
+              findings: secretScanReport.findings
+            }
+          }
+        : {})
     });
   } catch (err) {
-    res.status(409).json({ error: err.message });
+    res.status(err.status || 409).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
   }
 });
 
 router.post('/projects/:id/deploy/cancel', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
     const result = deployManager.cancelDeploy(project.id, {
       reason: (req.body && req.body.reason) || 'Cancelado desde el panel'
     });
@@ -671,6 +988,7 @@ router.post('/projects/:id/deploy/cancel', (req, res) => {
 
 router.get('/projects/:id/deployments', (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'projects:read')) return;
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const history = deployManager.listDeployments(req.params.id, limit)
       .map(({ logLines, ...rest }) => ({ ...rest, logLineCount: (logLines || []).length }));
@@ -682,6 +1000,7 @@ router.get('/projects/:id/deployments', (req, res) => {
 
 router.get('/projects/:id/deployments/:deployId', (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'projects:read')) return;
     const deployment = deployManager.getDeployment(req.params.id, req.params.deployId);
     if (!deployment) return res.status(404).json({ error: 'Despliegue no encontrado' });
     res.json(deployment);
@@ -692,6 +1011,7 @@ router.get('/projects/:id/deployments/:deployId', (req, res) => {
 
 router.get('/projects/:id/deploy/status', async (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'projects:read')) return;
     res.json(await deployManager.status(req.params.id));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -700,6 +1020,7 @@ router.get('/projects/:id/deploy/status', async (req, res) => {
 
 router.post('/projects/:id/rollback', heavyOpLimiter, async (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'deployments:write')) return;
     const opts = {};
     if (req.body && typeof req.body.deploymentId === 'string' && req.body.deploymentId.trim()) {
       opts.deploymentId = req.body.deploymentId.trim();
@@ -715,8 +1036,8 @@ router.post('/projects/:id/rollback', heavyOpLimiter, async (req, res) => {
 // --- LOGS, STATS Y EXEC SEGURO DEL CONTENEDOR DE PRODUCCIÓN ---
 router.get('/projects/:id/runtime/logs', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
     const result = await deployManager.getRuntimeLogs(project.id, {
       tail: req.query.tail,
       since: req.query.since || null,
@@ -731,8 +1052,9 @@ router.get('/projects/:id/runtime/logs', async (req, res) => {
 });
 
 router.get('/projects/:id/runtime/logs/stream', (req, res) => {
-  const project = projectManager.getById(req.params.id);
-  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+  if (!project) return;
+  const principal = getPrincipal(req);
   try {
     if (typeof req.setTimeout === 'function') req.setTimeout(0);
     if (typeof res.setTimeout === 'function') res.setTimeout(0);
@@ -744,6 +1066,8 @@ router.get('/projects/:id/runtime/logs/stream', (req, res) => {
     let stream = null;
     /** @type {(() => void) | null} */
     let unsubRotate = null;
+    /** @type {(() => void) | null} */
+    let unsubRevoke = null;
     let closed = false;
 
     const safeWrite = (chunk) => {
@@ -763,6 +1087,7 @@ router.get('/projects/:id/runtime/logs/stream', (req, res) => {
       if (ka) { clearInterval(ka); ka = null; }
       if (maxLife) { clearTimeout(maxLife); maxLife = null; }
       if (unsubRotate) { try { unsubRotate(); } catch (e) {} unsubRotate = null; }
+      if (unsubRevoke) { try { unsubRevoke(); } catch (e) {} unsubRevoke = null; }
       if (stream) { try { stream.close(); } catch (e) {} }
       if (!res.writableEnded && !res.destroyed) {
         try { res.end(); } catch (e) {}
@@ -793,6 +1118,14 @@ router.get('/projects/:id/runtime/logs/stream', (req, res) => {
     maxLife = setTimeout(() => { stopAll(); }, 30 * 60 * 1000);
     if (maxLife.unref) maxLife.unref();
     unsubRotate = onTokenRotated(() => stopAll());
+    unsubRevoke = onPrincipalRevoked((evt) => {
+      if (!evt) return;
+      if (evt.masterToken) return stopAll();
+      if (principal.isSuperAdmin) return;
+      if (evt.tokenId && principal.kind === 'api_token' && evt.tokenId === principal.tokenId) return stopAll();
+      if (evt.sessionId && principal.kind === 'session' && evt.sessionId === principal.sessionId) return stopAll();
+      if (evt.userId && !evt.sessionId && !evt.tokenId && evt.userId === principal.userId) return stopAll();
+    });
     req.on('close', stopAll);
     res.on('close', stopAll);
     res.on('error', stopAll);
@@ -803,8 +1136,8 @@ router.get('/projects/:id/runtime/logs/stream', (req, res) => {
 
 router.get('/projects/:id/runtime/stats', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
     const result = await deployManager.getRuntimeStats(project.id);
     if (!result.ok && result.status) return res.status(result.status).json(result);
     res.json(result);
@@ -815,8 +1148,8 @@ router.get('/projects/:id/runtime/stats', async (req, res) => {
 
 router.post('/projects/:id/runtime/exec', execLimiter, async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'runtime:exec');
+    if (!project) return;
     const { command, workdir, timeoutMs } = req.body || {};
     const result = await deployManager.execInContainer(project.id, { command, workdir, timeoutMs });
     res.json(result);
@@ -827,15 +1160,15 @@ router.post('/projects/:id/runtime/exec', execLimiter, async (req, res) => {
 
 // --- TAREAS PROGRAMADAS CRON POR PROYECTO ---
 router.get('/projects/:id/crons', (req, res) => {
-  const project = projectManager.getById(req.params.id);
-  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+  if (!project) return;
   res.json({ jobs: cronManager.list(project.id) });
 });
 
 router.post('/projects/:id/crons', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'crons:write');
+    if (!project) return;
     const job = cronManager.create(project.id, req.body || {});
     res.status(201).json(job);
   } catch (err) {
@@ -845,8 +1178,10 @@ router.post('/projects/:id/crons', (req, res) => {
 
 router.put('/projects/:id/crons/:jobId', (req, res) => {
   try {
+    const project = assertProjectAccess(req, res, req.params.id, 'crons:write');
+    if (!project) return;
     const existing = cronManager.getById(req.params.jobId);
-    if (!existing || existing.projectId !== req.params.id) {
+    if (!existing || existing.projectId !== project.id) {
       return res.status(404).json({ error: 'Tarea cron no encontrada' });
     }
     const updated = cronManager.update(req.params.jobId, req.body || {});
@@ -857,8 +1192,10 @@ router.put('/projects/:id/crons/:jobId', (req, res) => {
 });
 
 router.delete('/projects/:id/crons/:jobId', (req, res) => {
+  const project = assertProjectAccess(req, res, req.params.id, 'crons:write');
+  if (!project) return;
   const existing = cronManager.getById(req.params.jobId);
-  if (!existing || existing.projectId !== req.params.id) {
+  if (!existing || existing.projectId !== project.id) {
     return res.status(404).json({ error: 'Tarea cron no encontrada' });
   }
   cronManager.remove(req.params.jobId);
@@ -867,8 +1204,10 @@ router.delete('/projects/:id/crons/:jobId', (req, res) => {
 
 router.post('/projects/:id/crons/:jobId/run', heavyOpLimiter, async (req, res) => {
   try {
+    const project = assertProjectAccess(req, res, req.params.id, 'crons:write');
+    if (!project) return;
     const existing = cronManager.getById(req.params.jobId);
-    if (!existing || existing.projectId !== req.params.id) {
+    if (!existing || existing.projectId !== project.id) {
       return res.status(404).json({ error: 'Tarea cron no encontrada' });
     }
     const run = await cronManager.runNow(req.params.jobId, { trigger: 'manual' });
@@ -879,8 +1218,10 @@ router.post('/projects/:id/crons/:jobId/run', heavyOpLimiter, async (req, res) =
 });
 
 router.get('/projects/:id/crons/:jobId/runs', (req, res) => {
+  const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+  if (!project) return;
   const existing = cronManager.getById(req.params.jobId);
-  if (!existing || existing.projectId !== req.params.id) {
+  if (!existing || existing.projectId !== project.id) {
     return res.status(404).json({ error: 'Tarea cron no encontrada' });
   }
   res.json({ runs: cronManager.getRuns(req.params.jobId) });
@@ -888,19 +1229,20 @@ router.get('/projects/:id/crons/:jobId/runs', (req, res) => {
 
 // --- VISTAS PREVIAS (PREVIEW DEPLOYMENTS POR RAMA / PR) ---
 router.get('/projects/:id/previews', (req, res) => {
-  const project = projectManager.getById(req.params.id);
-  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+  if (!project) return;
+  const safeProj = redactProjectOutput(req, project);
   res.json({
-    config: project.previewDeployments,
+    config: safeProj.previewDeployments,
     previews: previewManager.list(project.id)
   });
 });
 
 router.post('/projects/:id/previews', heavyOpLimiter, async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    const { branch, prNumber, commit, title } = req.body || {};
+    const project = assertProjectAccess(req, res, req.params.id, 'previews:write');
+    if (!project) return;
+    const { branch, prNumber, commit, title, supersede, buildSecrets } = req.body || {};
     if (!branch && !prNumber) {
       return res.status(400).json({ error: 'Indica una rama (branch) o un número de PR (prNumber)' });
     }
@@ -908,7 +1250,11 @@ router.post('/projects/:id/previews', heavyOpLimiter, async (req, res) => {
       branch: branch || project.gitBranch || 'main',
       prNumber: prNumber ?? null,
       commit: commit || null,
-      title: title || null
+      title: title || null,
+      ...(supersede !== undefined ? { supersede: Boolean(supersede) } : {}),
+      ...(buildSecrets && typeof buildSecrets === 'object' && !Array.isArray(buildSecrets)
+        ? { buildSecrets: Project.normalizeKeyValueMap(buildSecrets) }
+        : {})
     });
     res.status(201).json(preview);
   } catch (err) {
@@ -918,8 +1264,8 @@ router.post('/projects/:id/previews', heavyOpLimiter, async (req, res) => {
 
 router.delete('/projects/:id/previews/:key', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'previews:write');
+    if (!project) return;
     const result = await previewManager.destroyPreview(project.id, req.params.key);
     res.json(result);
   } catch (err) {
@@ -929,6 +1275,7 @@ router.delete('/projects/:id/previews/:key', async (req, res) => {
 
 router.get('/projects/:id/previews/:key/logs', async (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'projects:read')) return;
     const result = await previewManager.getLogs(req.params.id, req.params.key, req.query.tail);
     res.json(result);
   } catch (err) {
@@ -938,6 +1285,7 @@ router.get('/projects/:id/previews/:key/logs', async (req, res) => {
 
 router.post('/projects/:id/deploy/stop', async (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'deployments:write')) return;
     res.json(await deployManager.stopProduction(req.params.id));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -951,6 +1299,7 @@ router.post('/projects/:id/deploy/stop', async (req, res) => {
  */
 router.post('/projects/:id/deploy/start', async (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'deployments:write')) return;
     res.json(await deployManager.startProduction(req.params.id));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -963,9 +1312,15 @@ router.post('/projects/:id/deploy/start', async (req, res) => {
  */
 router.post('/deploy/prune-cache', async (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'podar la caché global de BuildKit')) return;
     const keepStorageGb = Number((req.body && req.body.keepStorageGb) ?? 10);
     const untilHours = /** @type {number | null} */ (req.body && req.body.untilHours != null ? Number(req.body.untilHours) : null);
-    res.json(await deployManager.pruneBuildCache({ keepStorageGb, untilHours }));
+    const force = Boolean(req.body && req.body.force);
+    const result = await deployManager.pruneBuildCache({ keepStorageGb, untilHours, force });
+    if (result && result.busy === true) {
+      return res.status(409).json(result);
+    }
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1083,6 +1438,192 @@ router.post('/import/coolify/migrate-domains-batch', async (req, res) => {
     res.json({ success: true, results });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/import/coolify/plan', heavyOpLimiter, async (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'planificar migración desde Coolify')) return;
+    const body = req.body || {};
+    const selectedApps = body.apps !== undefined ? body.apps : body.selectedApps;
+    const selectedDbs = body.dbs !== undefined ? body.dbs : body.selectedDbs;
+    const selectedServices = body.services !== undefined ? body.services : body.selectedServices;
+
+    // Modo offline snapshot (JSON exportado de Coolify sin conexión en vivo)
+    if (body.snapshot && typeof body.snapshot === 'object') {
+      const plan = coolifyMigrator.buildMigrationPlan(body.snapshot, {
+        selectedApps: selectedApps !== undefined ? selectedApps : null,
+        selectedDbs: selectedDbs !== undefined ? selectedDbs : null,
+        selectedServices: selectedServices !== undefined ? selectedServices : null
+      });
+      return res.json(plan);
+    }
+
+    const { apiUrl, apiToken } = body;
+    if (!apiUrl || !apiToken) {
+      return res.status(400).json({ error: 'Indica apiUrl y apiToken de Coolify, o envía un objeto snapshot offline' });
+    }
+    const plan = await coolifyMigrator.planMigration(apiUrl, apiToken, {
+      apps: selectedApps !== undefined ? selectedApps : null,
+      dbs: selectedDbs !== undefined ? selectedDbs : null,
+      services: selectedServices !== undefined ? selectedServices : null
+    });
+    res.json(plan);
+  } catch (err) {
+    const status = err && (err.status === 401 || err.status === 403)
+      ? err.status
+      : (/SSRF|inválida|malformada|protocolo|metadatos|privada|obligatori/i.test(String(err.message || '')) ? 400 : 500);
+    res.status(status).json({ error: err.message });
+  }
+});
+
+router.post('/import/coolify/verify', heavyOpLimiter, async (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'verificar paridad de migración Coolify')) return;
+    const { targets, plan, domains, targetIp, dryRun, timeoutMs } = req.body || {};
+    const targetsOrPlan = Array.isArray(targets)
+      ? targets
+      : (plan && typeof plan === 'object' ? plan : (Array.isArray(domains) ? { domains } : null));
+    if (!targetsOrPlan) {
+      return res.status(400).json({ error: 'Proporciona targets (array) o plan/domains para verificar paridad' });
+    }
+    const targetCount = Array.isArray(targetsOrPlan)
+      ? targetsOrPlan.length
+      : (Array.isArray(targetsOrPlan.domains) ? targetsOrPlan.domains.length : 0);
+    if (targetCount > 50) {
+      return res.status(400).json({ error: 'Máximo 50 objetivos por verificación de paridad' });
+    }
+    const report = await coolifyMigrator.verifyMigratedStack(targetsOrPlan, {
+      targetIp: targetIp ? String(targetIp) : undefined,
+      dryRun: Boolean(dryRun),
+      timeoutMs: timeoutMs != null ? Number(timeoutMs) : undefined
+    });
+    res.json(report);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- PORTABLE STACK BUNDLES (.zip / .ckb.gz, zero-dep, AES-256-GCM Vault) ---
+const MAX_BUNDLE_BASE64_CHARS = 35 * 1024 * 1024;
+
+router.post('/bundles/export', heavyOpLimiter, (req, res) => {
+  try {
+    const body = req.body || {};
+    const format = body.format === 'ckb.gz' ? 'ckb.gz' : 'zip';
+    if (body.format && body.format !== 'zip' && body.format !== 'ckb.gz') {
+      return res.status(400).json({ error: 'Formato de bundle inválido (usa "zip" o "ckb.gz")' });
+    }
+    const principal = getPrincipal(req);
+    const requestedIds = Array.isArray(body.projectIds) ? body.projectIds.map((id) => String(id)) : null;
+
+    /** @type {any[]} */
+    let exportProjects;
+    if (principal.isSuperAdmin) {
+      const allProjects = projectManager.getAll();
+      exportProjects = requestedIds ? allProjects.filter((p) => requestedIds.includes(p.id)) : allProjects;
+    } else {
+      if (requestedIds) {
+        for (const pid of requestedIds) {
+          if (!assertProjectAccess(req, res, pid, 'projects:read')) return;
+        }
+      }
+      const visible = getTeamManager().filterProjects(principal, projectManager.getAll(), { redact: false });
+      exportProjects = requestedIds ? visible.filter((p) => requestedIds.includes(p.id)) : visible;
+    }
+
+    const exportedIdSet = new Set(exportProjects.map((p) => p.id).filter(Boolean));
+    const allDomains = domainManager.listDomains();
+    const exportDomains = (principal.isSuperAdmin && !requestedIds)
+      ? allDomains
+      : allDomains.filter((d) => d.projectId && exportedIdSet.has(d.projectId));
+
+    const allCrons = cronManager.list();
+    const exportCrons = (principal.isSuperAdmin && !requestedIds)
+      ? allCrons
+      : allCrons.filter((c) => c.projectId && exportedIdSet.has(c.projectId));
+
+    const allDbs = databaseManager.list();
+    const exportDbs = (principal.isSuperAdmin && !requestedIds)
+      ? allDbs
+      : allDbs.filter((db) => db.projectId && exportedIdSet.has(db.projectId));
+
+    const panelUrl = `${req.protocol || 'http'}://${req.get('host') || 'localhost:3030'}`;
+    const bundle = getBundleArchiver().exportStackBundle({
+      stackName: body.stackName ? String(body.stackName) : 'culkibo-stack',
+      format,
+      passphrase: body.passphrase ? String(body.passphrase) : null,
+      panelUrl,
+      projects: exportProjects,
+      domains: exportDomains,
+      crons: exportCrons,
+      databases: exportDbs
+    });
+
+    res.setHeader('Cache-Control', 'private, no-store');
+    if (req.query.download === '1' || body.download === true) {
+      const safeName = String(bundle.filename || `culkibo-stack.${format}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+      res.setHeader('Content-Type', format === 'ckb.gz' ? 'application/gzip' : 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+      res.setHeader('X-Culkibo-Bundle-Sha256', bundle.sha256);
+      return res.send(bundle.buffer);
+    }
+
+    res.json({
+      ok: true,
+      format: bundle.format,
+      bundleId: bundle.bundleId,
+      filename: bundle.filename,
+      byteLength: bundle.byteLength,
+      sha256: bundle.sha256,
+      manifest: bundle.manifest,
+      stats: bundle.stats,
+      bundleBase64: bundle.buffer.toString('base64')
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/bundles/inspect', heavyOpLimiter, (req, res) => {
+  try {
+    const { bundleBase64, passphrase } = req.body || {};
+    if (typeof bundleBase64 !== 'string' || !bundleBase64.trim()) {
+      return res.status(400).json({ error: 'Proporciona bundleBase64 para inspeccionar el bundle' });
+    }
+    if (bundleBase64.length > MAX_BUNDLE_BASE64_CHARS) {
+      return res.status(413).json({ error: 'El bundle supera el tamaño máximo permitido (25 MB)' });
+    }
+    const buf = Buffer.from(bundleBase64.trim(), 'base64');
+    const report = getBundleArchiver().inspectStackBundle(buf, {
+      passphrase: passphrase ? String(passphrase) : null
+    });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(report);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/bundles/import', heavyOpLimiter, async (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'importar un stack bundle portátil')) return;
+    const { bundleBase64, passphrase, dryRun, selectedProjectIds } = req.body || {};
+    if (typeof bundleBase64 !== 'string' || !bundleBase64.trim()) {
+      return res.status(400).json({ error: 'Proporciona bundleBase64 para importar el bundle' });
+    }
+    if (bundleBase64.length > MAX_BUNDLE_BASE64_CHARS) {
+      return res.status(413).json({ error: 'El bundle supera el tamaño máximo permitido (25 MB)' });
+    }
+    const buf = Buffer.from(bundleBase64.trim(), 'base64');
+    const result = await getBundleArchiver().importStackBundle(buf, {
+      passphrase: passphrase ? String(passphrase) : null,
+      dryRun: Boolean(dryRun),
+      selectedProjectIds: Array.isArray(selectedProjectIds) ? selectedProjectIds.map((id) => String(id)) : null
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
   }
 });
 
@@ -1312,6 +1853,89 @@ router.get('/system/audit', (req, res) => {
   }
 });
 
+router.get('/system/audit/verify', (req, res) => {
+  try {
+    const includeRotated = req.query.includeRotated !== '0' && req.query.includeRotated !== 'false';
+    res.json(auditLogger.verifyIntegrity({ includeRotated }));
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+// --- OPEN-CORE EDITION & OFFLINE ED25519 LICENSE VERIFIER ---
+router.get('/system/edition', (req, res) => {
+  try {
+    const includeCatalog = req.query.includeCatalog === '1' || req.query.includeCatalog === 'true';
+    res.json(getEditionService().getStatus({ includeCatalog }));
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/system/edition/activate', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'activar o modificar la licencia de la instancia')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor, authMethod } = getAuditActor(req);
+    if (body.deactivate === true || body.licenseKey === null) {
+      const result = getEditionService().deactivateLicense();
+      auditLogger.record({
+        source: 'http',
+        action: 'edition.license_deactivated',
+        method: 'POST',
+        path: '/api/system/edition/activate',
+        ip: clientIp(req),
+        authMethod,
+        actor,
+        status: 200
+      });
+      return res.json(result);
+    }
+    const licenseKey = typeof body.licenseKey === 'string'
+      ? body.licenseKey
+      : (typeof body.license === 'string' ? body.license : '');
+    const result = getEditionService().activateLicense(licenseKey);
+    auditLogger.record({
+      source: 'http',
+      action: 'edition.license_activated',
+      method: 'POST',
+      path: '/api/system/edition/activate',
+      ip: clientIp(req),
+      authMethod,
+      actor,
+      status: 200,
+      detail: {
+        edition: result.edition,
+        licenseId: result.license && result.license.licenseId ? result.license.licenseId : null
+      }
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/system/edition/license', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'desactivar la licencia de la instancia')) return;
+    const result = getEditionService().deactivateLicense();
+    const { actor, authMethod } = getAuditActor(req);
+    auditLogger.record({
+      source: 'http',
+      action: 'edition.license_deactivated',
+      method: 'DELETE',
+      path: '/api/system/edition/license',
+      ip: clientIp(req),
+      authMethod,
+      actor,
+      status: 200
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 let _healthSummaryCache = { at: 0, data: /** @type {any} */ (null) };
 router.get('/system/health-summary', (req, res) => {
   try {
@@ -1491,6 +2115,18 @@ router.post('/pods/deploy', async (req, res) => {
 // --- DOMAINS ---
 router.get('/domains', (req, res) => {
   try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin) {
+      const allowedSet = new Set(getAllowedProjectIds(req) || []);
+      const allowGlobal = !Array.isArray(principal.projectIds) && (!principal.teamId || principal.teamId === 'team_default');
+      const filtered = domainManager.listDomains().filter((d) => {
+        if (!d) return false;
+        if (d.projectId) return allowedSet.has(d.projectId);
+        return allowGlobal;
+      });
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.json({ domains: filtered });
+    }
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.send(domainManager.getAllWrappedSerialized());
   } catch (err) {
@@ -1514,7 +2150,18 @@ function syncProjectDomainsList(projectId, hostname, action) {
 
 router.post('/domains', async (req, res) => {
   try {
+    const principal = getPrincipal(req);
     const body = { ...(req.body || {}) };
+    if (!principal.isSuperAdmin) {
+      if (body.projectId) {
+        const proj = assertProjectAccess(req, res, String(body.projectId), 'domains:write');
+        if (!proj) return;
+      } else if (denyProjectScopedToken(req, res, 'dominios globales sin proyecto')) {
+        return;
+      } else if (principal.teamId && principal.teamId !== 'team_default') {
+        return res.status(403).json({ error: 'Indica un projectId de tu equipo al crear un dominio', code: 'PROJECT_ID_REQUIRED' });
+      }
+    }
     if (body.autoCreateDns && (!body.serverIp || body.serverIp === '127.0.0.1')) {
       const detected = await detectPublicIp();
       if (detected) body.serverIp = detected;
@@ -1532,12 +2179,14 @@ router.post('/domains', async (req, res) => {
 
 router.delete('/domains/:id', async (req, res) => {
   try {
-    const removed = await domainManager.deleteDomain(req.params.id);
+    const existing = assertDomainAccess(req, res, req.params.id, 'domains:write');
+    if (!existing) return;
+    const removed = await domainManager.deleteDomain(existing.id);
     if (removed.projectId) {
       syncProjectDomainsList(removed.projectId, removed.hostname, 'remove');
     }
     if (typeof catalogManager.syncDomainRemoved === 'function') {
-      catalogManager.syncDomainRemoved(req.params.id);
+      catalogManager.syncDomainRemoved(existing.id);
     }
     const ingress = await ingressManager.reconcile();
     res.json({ success: true, removed, ingress });
@@ -1548,11 +2197,13 @@ router.delete('/domains/:id', async (req, res) => {
 
 router.patch('/domains/:id', async (req, res) => {
   try {
-    const prev = domainManager.getById(req.params.id);
-    if (!prev) {
-      return res.status(404).json({ error: 'Dominio no encontrado' });
+    const prev = assertDomainAccess(req, res, req.params.id, 'domains:write');
+    if (!prev) return;
+    if (req.body && req.body.projectId && String(req.body.projectId) !== String(prev.projectId || '')) {
+      const nextProj = assertProjectAccess(req, res, String(req.body.projectId), 'domains:write');
+      if (!nextProj) return;
     }
-    const updated = await domainManager.updateDomain(req.params.id, req.body);
+    const updated = await domainManager.updateDomain(prev.id, req.body);
     if (prev.projectId && (prev.projectId !== updated.projectId || prev.hostname !== updated.hostname)) {
       syncProjectDomainsList(prev.projectId, prev.hostname, 'remove');
     }
@@ -1569,7 +2220,9 @@ router.patch('/domains/:id', async (req, res) => {
 
 router.post('/domains/:id/toggle-proxy', async (req, res) => {
   try {
-    const updated = await domainManager.toggleProxy(req.params.id);
+    const existing = assertDomainAccess(req, res, req.params.id, 'domains:write');
+    if (!existing) return;
+    const updated = await domainManager.toggleProxy(existing.id);
     res.json(updated);
   } catch (err) {
     res.status(404).json({ error: err.message });
@@ -1578,8 +2231,10 @@ router.post('/domains/:id/toggle-proxy', async (req, res) => {
 
 router.post('/domains/:id/diagnose', async (req, res) => {
   try {
+    const existing = assertDomainAccess(req, res, req.params.id, 'domains:read');
+    if (!existing) return;
     const expectedIp = (req.body && req.body.serverIp) || await detectPublicIp();
-    const report = await ingressManager.diagnoseDomain(req.params.id, { expectedIp });
+    const report = await ingressManager.diagnoseDomain(existing.id, { expectedIp });
     res.json(report);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1588,8 +2243,8 @@ router.post('/domains/:id/diagnose', async (req, res) => {
 
 router.post('/projects/:id/domains', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'domains:write');
+    if (!project) return;
 
     const hostname = String(req.body.hostname || '').trim().toLowerCase();
     if (!hostname) return res.status(400).json({ error: 'El nombre de dominio es obligatorio' });
@@ -1632,7 +2287,7 @@ router.post('/projects/:id/domains', async (req, res) => {
     const ingress = domain.canonicalRedirect && domain.canonicalRedirect !== 'none'
       ? await ingressManager.reconcile()
       : await ingressManager.syncProject(project.id);
-    res.status(201).json({ domain, project: updatedProject, ingress });
+    res.status(201).json({ domain, project: redactProjectOutput(req, updatedProject), ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -1640,11 +2295,13 @@ router.post('/projects/:id/domains', async (req, res) => {
 
 router.delete('/projects/:id/domains/:domainId', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'domains:write');
+    if (!project) return;
 
     const domain = domainManager.getById(req.params.domainId);
-    if (!domain) return res.status(404).json({ error: 'Dominio no encontrado' });
+    if (!domain || (domain.projectId && domain.projectId !== project.id)) {
+      return res.status(404).json({ error: 'Dominio no encontrado' });
+    }
 
     const keep = req.query.keepDomain === '1';
     if (keep) {
@@ -1657,7 +2314,7 @@ router.delete('/projects/:id/domains/:domainId', async (req, res) => {
     const updatedProject = projectManager.update(project.id, { domains });
 
     const ingress = await ingressManager.reconcile();
-    res.json({ success: true, hostname: domain.hostname, kept: keep, project: updatedProject, ingress });
+    res.json({ success: true, hostname: domain.hostname, kept: keep, project: redactProjectOutput(req, updatedProject), ingress });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -1941,6 +2598,65 @@ router.post('/cloudflare/tunnels', async (req, res) => {
   }
 });
 
+router.get('/cloudflare/tunnels/status', async (_req, res) => {
+  try {
+    res.json(await ingressManager.getTunnelStatus());
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/cloudflare/tunnels/config', (req, res) => {
+  try {
+    res.json(ingressManager.configureCloudflareTunnel(req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/cloudflare/tunnels/sync', heavyOpLimiter, async (req, res) => {
+  try {
+    res.json(await ingressManager.syncTunnelIngress(req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/cloudflare/tunnels/connector/status', async (req, res) => {
+  try {
+    res.json(await cloudflareService.getCloudflaredStatus(req.query));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/cloudflare/tunnels/connector/logs', async (req, res) => {
+  try {
+    res.json(await cloudflareService.getCloudflaredLogs(req.query));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/cloudflare/tunnels/connector/start', heavyOpLimiter, async (req, res) => {
+  try {
+    const { tunnelToken, containerName } = req.body || {};
+    const result = await cloudflareService.startCloudflaredDocker({ tunnelToken, containerName });
+    if (!result.started) return res.status(502).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/cloudflare/tunnels/connector/stop', async (req, res) => {
+  try {
+    res.json(await cloudflareService.stopCloudflaredDocker(req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 router.get('/cloudflare/tunnels/:tunnelId/token', async (req, res) => {
   try {
     const result = await cloudflareService.getTunnelToken(req.params.tunnelId);
@@ -1961,16 +2677,45 @@ router.get('/cloudflare/tunnels/:tunnelId/config', async (req, res) => {
 
 router.post('/cloudflare/tunnels/:tunnelId/route', async (req, res) => {
   try {
-    const { hostname, serviceUrl, zoneId } = req.body || {};
+    const { hostname, serviceUrl, zoneId, path: routePath, originRequest } = req.body || {};
     const result = await cloudflareService.routeHostnameToTunnel({
       tunnelId: req.params.tunnelId,
       zoneId: zoneId || null,
       hostname,
-      serviceUrl
+      serviceUrl,
+      path: routePath || null,
+      originRequest: originRequest || null
     });
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/cloudflare/tunnels/:tunnelId/route', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = await cloudflareService.unrouteHostnameFromTunnel({
+      tunnelId: req.params.tunnelId,
+      zoneId: body.zoneId || (req.query.zoneId ? String(req.query.zoneId) : null),
+      hostname: body.hostname || (req.query.hostname ? String(req.query.hostname) : ''),
+      path: body.path || (req.query.path ? String(req.query.path) : null),
+      removeDns: body.removeDns !== false
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/cloudflare/tunnels/:tunnelId/all-to-caddy', async (req, res) => {
+  try {
+    res.json(await cloudflareService.configureAllResourcesTunnel({
+      tunnelId: req.params.tunnelId,
+      ...(req.body || {})
+    }));
+  } catch (err) {
+    sendServiceError(err, res, 400);
   }
 });
 
@@ -1983,33 +2728,67 @@ router.delete('/cloudflare/tunnels/:tunnelId', async (req, res) => {
   }
 });
 
-router.post('/cloudflare/tunnels/connector/start', heavyOpLimiter, async (req, res) => {
-  try {
-    const { tunnelToken, containerName } = req.body || {};
-    const result = await cloudflareService.startCloudflaredDocker({ tunnelToken, containerName });
-    if (!result.started) return res.status(502).json(result);
-    res.json(result);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
 // --- LOGS ---
+/** @param {any} req @param {any} res */
+function handleLogsExport(req, res) {
+  try {
+    const principal = getPrincipal(req);
+    const requestedProjectId = req.query.projectId ? String(req.query.projectId) : null;
+    if (requestedProjectId && requestedProjectId !== 'global' && !principal.isSuperAdmin) {
+      if (!assertProjectAccess(req, res, requestedProjectId, 'projects:read')) return;
+    }
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const exported = containerOrchestrator.exportLogs({
+      pod: req.query.pod ? String(req.query.pod) : null,
+      level: req.query.level ? String(req.query.level) : null,
+      limit: req.query.limit ? parseInt(String(req.query.limit), 10) : 2000,
+      search: req.query.search ? String(req.query.search) : (req.query.q ? String(req.query.q) : ''),
+      regex: req.query.regex ? String(req.query.regex) : false,
+      since: req.query.since ? String(req.query.since) : null,
+      until: req.query.until ? String(req.query.until) : null,
+      attr: req.query.attr ? String(req.query.attr) : null,
+      projectId: requestedProjectId,
+      projectIds: allowedProjectIds,
+      format: /** @type {'log' | 'ndjson' | 'json'} */ (req.query.format ? String(req.query.format).toLowerCase() : 'log')
+    });
+    res.setHeader('Content-Type', exported.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${exported.filename}"`);
+    res.setHeader('X-Culkibo-Logs-Count', String(exported.count));
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(exported.content);
+  } catch (err) {
+    sendServiceError(err, res, err && err.status === 400 ? 400 : 500);
+  }
+}
+
 router.get('/logs', (req, res) => {
   try {
-    const { pod, level, limit, search, projectId } = req.query;
+    const principal = getPrincipal(req);
+    const { pod, level, limit, search, q, regex, since, until, attr, projectId } = req.query;
+    const requestedProjectId = projectId ? String(projectId) : null;
+    if (requestedProjectId && requestedProjectId !== 'global' && !principal.isSuperAdmin) {
+      if (!assertProjectAccess(req, res, requestedProjectId, 'projects:read')) return;
+    }
+    const allowedProjectIds = getAllowedProjectIds(req);
     const logs = containerOrchestrator.getLogs({
-      pod,
-      level,
-      limit: limit ? parseInt(limit, 10) : 100,
-      search,
-      projectId
+      pod: pod ? String(pod) : null,
+      level: level ? String(level) : null,
+      limit: limit ? parseInt(String(limit), 10) : 100,
+      search: search ? String(search) : (q ? String(q) : ''),
+      regex: regex ? String(regex) : false,
+      since: since ? String(since) : null,
+      until: until ? String(until) : null,
+      attr: attr ? String(attr) : null,
+      projectId: requestedProjectId,
+      projectIds: allowedProjectIds
     });
     res.json({ logs });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServiceError(err, res, err && err.status === 400 ? 400 : 500);
   }
 });
+
+router.get('/logs/export', handleLogsExport);
 
 // --- MCP ---
 // Endpoint MCP de la revisión 2026-07-28 (Streamable HTTP). Cuelga de /api, así
@@ -2024,12 +2803,17 @@ router.get('/mcp/tools', (req, res) => {
   try {
     const authCtx = /** @type {any} */ (req).auth || null;
     const principal = mcpServer.normalizePrincipal(authCtx);
+    const profile = mcpServer.normalizeProfile(req.query.profile ? String(req.query.profile) : 'all');
     if (!principal.isSuperAdmin) {
       res.setHeader('Cache-Control', 'private, no-store');
     }
+    res.setHeader('X-Culkibo-Mcp-Profile', profile);
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.send(mcpServer.getToolsSerialized(authCtx));
+    res.send(mcpServer.getToolsSerialized(authCtx, { profile }));
   } catch (err) {
+    if (err && err.code === 'INVALID_ARGUMENT') {
+      return res.status(400).json({ error: err.message, code: err.code, remediation: err.remediation || null });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -2043,8 +2827,24 @@ router.post('/mcp/message', async (req, res) => {
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       return res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
     }
+    let profile = 'all';
+    if (req.query.profile !== undefined) {
+      try {
+        profile = mcpServer.normalizeProfile(String(req.query.profile));
+      } catch (pErr) {
+        return res.status(400).json({
+          jsonrpc: '2.0',
+          id: body.id ?? null,
+          error: { code: -32602, message: pErr.message }
+        });
+      }
+    }
+    res.setHeader('X-Culkibo-Mcp-Profile', profile);
     const isNotification = body.id === undefined && typeof body.method === 'string';
-    const response = await mcpServer.handleJsonRpc(body, { auth: /** @type {any} */ (req).auth || null });
+    const response = await mcpServer.handleJsonRpc(body, {
+      auth: /** @type {any} */ (req).auth || null,
+      profile
+    });
     if (isNotification || response === null) {
       return res.status(202).end();
     }
@@ -2068,8 +2868,13 @@ router.get('/mcp/config', (req, res) => {
     const protocol = req.protocol;
     const host = req.get('host');
     const serverUrl = `${protocol}://${host}`;
-    res.json(mcpServer.getClientConfigs(serverUrl));
+    const profile = mcpServer.normalizeProfile(req.query.profile ? String(req.query.profile) : 'all');
+    res.setHeader('X-Culkibo-Mcp-Profile', profile);
+    res.json(mcpServer.getClientConfigs(serverUrl, { profile }));
   } catch (err) {
+    if (err && err.code === 'INVALID_ARGUMENT') {
+      return res.status(400).json({ error: err.message, code: err.code, remediation: err.remediation || null });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -2164,9 +2969,10 @@ router.get('/docker/containers/:id/logs', async (req, res) => {
 // --- DATABASE & PROJECT BACKUP/RESTORE ---
 router.post('/backup/export/:projectId', async (req, res) => {
   try {
-    const result = await dbBackupManager.exportProject(req.params.projectId, {
-      includeSecrets: Boolean(req.body && req.body.includeSecrets)
-    });
+    const includeSecrets = Boolean(req.body && req.body.includeSecrets);
+    const project = assertProjectAccess(req, res, req.params.projectId, includeSecrets ? 'secrets:read' : 'projects:read');
+    if (!project) return;
+    const result = await dbBackupManager.exportProject(project.id, { includeSecrets });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2175,6 +2981,7 @@ router.post('/backup/export/:projectId', async (req, res) => {
 
 router.post('/backup/restore', async (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'restaurar backups desde disco')) return;
     const { backupFilePath } = req.body;
     if (!backupFilePath) return res.status(400).json({ error: 'Ruta de archivo de backup requerida' });
     const result = await dbBackupManager.restoreProject(backupFilePath);
@@ -2186,6 +2993,7 @@ router.post('/backup/restore', async (req, res) => {
 
 router.post('/backup/instance/export', heavyOpLimiter, async (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'exportar instantánea de instancia')) return;
     req.setTimeout(0);
     res.setTimeout(0);
     const { includeSecrets = false, passphrase = '', uploadToS3 = false } = req.body || {};
@@ -2202,6 +3010,7 @@ router.post('/backup/instance/export', heavyOpLimiter, async (req, res) => {
 
 router.post('/backup/instance/import', heavyOpLimiter, async (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'importar instantánea de instancia')) return;
     req.setTimeout(0);
     res.setTimeout(0);
     const { snapshot = null, fileName = null, passphrase = '', dryRun = false, mode = 'merge' } = req.body || {};
@@ -2220,6 +3029,7 @@ router.post('/backup/instance/import', heavyOpLimiter, async (req, res) => {
 
 router.get('/backup/download/:fileName', (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'descargar archivos de backup')) return;
     req.setTimeout(0);
     res.setTimeout(0);
     const filePath = dbBackupManager.resolveDownloadPath(req.params.fileName);
@@ -2239,6 +3049,7 @@ router.get('/backup/download/:fileName', (req, res) => {
 
 router.get('/backup/list', async (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'listar backups globales')) return;
     const backups = await dbBackupManager.listBackups();
     res.json({ backups });
   } catch (err) {
@@ -2258,7 +3069,7 @@ router.post('/backup/dump-command', async (req, res) => {
 
 // --- BASES DE DATOS GESTIONADAS ---
 //
-// Orden importante: las rutas literales (/engines, /status, /storage) van antes
+// Orden importante: las rutas literales (/engines, /status, /storage, /backup-*) van antes
 // que /:id, porque Express resuelve por orden de registro y `:id` capturaría
 // "engines" como identificador.
 
@@ -2280,6 +3091,7 @@ router.get('/databases/status', async (req, res) => {
 
 router.get('/databases/storage', (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'configuración S3 global')) return;
     res.json(databaseManager.getS3Config());
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2288,6 +3100,7 @@ router.get('/databases/storage', (req, res) => {
 
 router.put('/databases/storage', (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'configuración S3 global')) return;
     res.json(databaseManager.setS3Config(req.body));
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -2296,6 +3109,7 @@ router.put('/databases/storage', (req, res) => {
 
 router.post('/databases/storage/test', async (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'probar almacenamiento S3 global')) return;
     res.json(await databaseManager.testS3());
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -2304,6 +3118,7 @@ router.post('/databases/storage/test', async (req, res) => {
 
 router.get('/databases/storage/objects', async (req, res) => {
   try {
+    if (denyInstanceGlobalForTenant(req, res, 'listar objetos S3 globales')) return;
     const prefix = req.query.prefix !== undefined ? String(req.query.prefix) : null;
     const maxKeys = Math.min(500, Math.max(1, parseInt(String(req.query.maxKeys || '200'), 10) || 200));
     res.json(await databaseManager.listRemoteObjects({ prefix, maxKeys }));
@@ -2312,9 +3127,76 @@ router.get('/databases/storage/objects', async (req, res) => {
   }
 });
 
+router.get('/databases/backup-health', (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'salud global de copias de seguridad')) return;
+    res.json(databaseManager.checkBackupHealth({ notify: false }));
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.get('/databases/backup-encryption', (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'configuración de cifrado de copias')) return;
+    res.json(databaseManager.getBackupEncryptionConfig());
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/databases/backup-encryption', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'configuración de cifrado de copias')) return;
+    res.json(databaseManager.setBackupEncryption(req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/backup-encryption/rotate', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'rotar clave de cifrado de copias')) return;
+    res.json(databaseManager.rotateBackupEncryptionKey(req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.put('/databases/s3/lifecycle', certAndAdminLimiter, async (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'reglas de ciclo de vida S3')) return;
+    const s3Client = databaseManager.s3ClientFor();
+    if (!s3Client) {
+      return res.status(400).json({ error: 'Configura primero el almacenamiento S3 para gestionar reglas de ciclo de vida' });
+    }
+    const rules = (req.body && req.body.rules) || [];
+    res.json(await s3Client.putBucketLifecycle(rules));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 router.get('/databases', (req, res) => {
   try {
-    res.json({ databases: databaseManager.list({ projectId: req.query.projectId }) });
+    const principal = getPrincipal(req);
+    const filterProjectId = req.query.projectId ? String(req.query.projectId) : undefined;
+    if (!principal.isSuperAdmin) {
+      if (filterProjectId) {
+        if (!assertProjectAccess(req, res, filterProjectId, 'databases:read')) return;
+        return res.json({ databases: databaseManager.list({ projectId: filterProjectId }) });
+      }
+      const allowedSet = new Set(getAllowedProjectIds(req) || []);
+      const allowGlobal = !Array.isArray(principal.projectIds) && (!principal.teamId || principal.teamId === 'team_default');
+      const visible = databaseManager.list().filter((d) => {
+        if (!d) return false;
+        if (d.projectId) return allowedSet.has(d.projectId);
+        return allowGlobal;
+      });
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.json({ databases: visible });
+    }
+    res.json({ databases: databaseManager.list({ projectId: filterProjectId }) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2324,7 +3206,18 @@ router.get('/databases', (req, res) => {
 // aquí hay que pedirla en /credentials.
 router.post('/databases', async (req, res) => {
   try {
-    res.status(201).json(await databaseManager.provision(req.body));
+    const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (!principal.isSuperAdmin) {
+      if (body.projectId) {
+        if (!assertProjectAccess(req, res, String(body.projectId), 'databases:write')) return;
+      } else if (denyProjectScopedToken(req, res, 'bases de datos globales sin proyecto')) {
+        return;
+      } else if (principal.teamId && principal.teamId !== 'team_default') {
+        return res.status(403).json({ error: 'Indica un projectId de tu equipo al aprovisionar una base de datos', code: 'PROJECT_ID_REQUIRED' });
+      }
+    }
+    res.status(201).json(await databaseManager.provision(body));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2332,7 +3225,9 @@ router.post('/databases', async (req, res) => {
 
 router.get('/databases/:id', (req, res) => {
   try {
-    res.json(databaseManager.get(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:read');
+    if (!db) return;
+    res.json(db);
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -2340,8 +3235,10 @@ router.get('/databases/:id', (req, res) => {
 
 router.delete('/databases/:id', async (req, res) => {
   try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:admin');
+    if (!db) return;
     // Borrar el volumen es destructivo e irreversible: nunca por defecto.
-    const result = await databaseManager.remove(req.params.id, {
+    const result = await databaseManager.remove(db.id, {
       deleteVolume: req.query.deleteVolume === 'true',
       deleteBackups: req.query.deleteBackups === 'true'
     });
@@ -2358,7 +3255,10 @@ router.delete('/databases/:id', async (req, res) => {
  */
 router.get('/databases/:id/credentials', (req, res) => {
   try {
-    res.json(databaseManager.getCredentials(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'secrets:read');
+    if (!db) return;
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(databaseManager.getCredentials(db.id));
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -2366,7 +3266,9 @@ router.get('/databases/:id/credentials', (req, res) => {
 
 router.get('/databases/:id/health', async (req, res) => {
   try {
-    res.json(await databaseManager.refreshHealth(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:read');
+    if (!db) return;
+    res.json(await databaseManager.refreshHealth(db.id));
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -2374,7 +3276,9 @@ router.get('/databases/:id/health', async (req, res) => {
 
 router.post('/databases/:id/start', async (req, res) => {
   try {
-    res.json(await databaseManager.start(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.start(db.id));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2382,7 +3286,9 @@ router.post('/databases/:id/start', async (req, res) => {
 
 router.post('/databases/:id/stop', async (req, res) => {
   try {
-    res.json(await databaseManager.stop(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.stop(db.id));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2390,7 +3296,9 @@ router.post('/databases/:id/stop', async (req, res) => {
 
 router.post('/databases/:id/restart', async (req, res) => {
   try {
-    res.json(await databaseManager.restart(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.restart(db.id));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2403,7 +3311,9 @@ router.post('/databases/:id/restart', async (req, res) => {
  */
 router.post('/databases/:id/exposure', async (req, res) => {
   try {
-    res.json(await databaseManager.setExposure(req.params.id, req.body || {}));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.setExposure(db.id, req.body || {}));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2411,7 +3321,9 @@ router.post('/databases/:id/exposure', async (req, res) => {
 
 router.get('/databases/:id/backups', (req, res) => {
   try {
-    res.json({ backups: databaseManager.listBackups(req.params.id) });
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:read');
+    if (!db) return;
+    res.json({ backups: databaseManager.listBackups(db.id) });
   } catch (err) {
     res.status(404).json({ error: err.message });
   }
@@ -2419,9 +3331,11 @@ router.get('/databases/:id/backups', (req, res) => {
 
 router.post('/databases/:id/backups', heavyOpLimiter, async (req, res) => {
   try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
     req.setTimeout(0);
     res.setTimeout(0);
-    res.json(await databaseManager.runBackup(req.params.id, { trigger: 'manual' }));
+    res.json(await databaseManager.runBackup(db.id, { trigger: 'manual' }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2429,7 +3343,9 @@ router.post('/databases/:id/backups', heavyOpLimiter, async (req, res) => {
 
 router.post('/databases/:id/inspect', async (req, res) => {
   try {
-    res.json(await databaseManager.inspectDatabase(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:read');
+    if (!db) return;
+    res.json(await databaseManager.inspectDatabase(db.id));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2437,7 +3353,9 @@ router.post('/databases/:id/inspect', async (req, res) => {
 
 router.post('/databases/:id/recover', heavyOpLimiter, async (req, res) => {
   try {
-    res.json(await databaseManager.recoverContainer(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.recoverContainer(db.id));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2445,9 +3363,11 @@ router.post('/databases/:id/recover', heavyOpLimiter, async (req, res) => {
 
 router.get('/databases/:id/backups/:backupId/download', async (req, res) => {
   try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'secrets:read');
+    if (!db) return;
     req.setTimeout(0);
     res.setTimeout(0);
-    const { filePath, fileName, sizeBytes } = await databaseManager.getBackupFilePath(req.params.id, req.params.backupId);
+    const { filePath, fileName, sizeBytes } = await databaseManager.getBackupFilePath(db.id, req.params.backupId);
     const safeName = path.basename(fileName).replace(/["\r\n]/g, '_');
     res.setHeader('Content-Type', 'application/gzip');
     res.setHeader('Content-Length', String(sizeBytes));
@@ -2461,16 +3381,30 @@ router.get('/databases/:id/backups/:backupId/download', async (req, res) => {
   }
 });
 
+router.post('/databases/:id/backups/:backupId/verify', heavyOpLimiter, async (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.verifyBackup(db.id, req.params.backupId, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 router.delete('/databases/:id/backups/:backupId', async (req, res) => {
   try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:admin');
+    if (!db) return;
     const deleteRemote = req.query.deleteRemote === 'true' || req.query.deleteRemote === '1';
-    res.json(await databaseManager.deleteBackup(req.params.id, req.params.backupId, { deleteRemote }));
+    res.json(await databaseManager.deleteBackup(db.id, req.params.backupId, { deleteRemote }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
 router.post('/databases/:id/backups/upload', heavyOpLimiter, async (req, res) => {
+  const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+  if (!db) return;
   req.setTimeout(0);
   res.setTimeout(0);
   const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
@@ -2513,7 +3447,7 @@ router.post('/databases/:id/backups/upload', heavyOpLimiter, async (req, res) =>
       });
     });
 
-    const entry = await databaseManager.registerUploadedBackup(req.params.id, {
+    const entry = await databaseManager.registerUploadedBackup(db.id, {
       fileName,
       tempPath,
       sha256: hash.digest('hex'),
@@ -2521,7 +3455,7 @@ router.post('/databases/:id/backups/upload', heavyOpLimiter, async (req, res) =>
     });
 
     if (req.query.restore === '1' || req.query.restore === 'true') {
-      const restored = await databaseManager.restore(req.params.id, {
+      const restored = await databaseManager.restore(db.id, {
         backupId: entry.id,
         createSafetySnapshot: req.query.safety !== '0'
       });
@@ -2536,13 +3470,15 @@ router.post('/databases/:id/backups/upload', heavyOpLimiter, async (req, res) =>
 
 router.post('/databases/:id/restore', heavyOpLimiter, async (req, res) => {
   try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
     req.setTimeout(0);
     res.setTimeout(0);
     const { backupId, remoteKey, createSafetySnapshot } = req.body || {};
     if (!backupId && !remoteKey) {
       return res.status(400).json({ error: 'Indique backupId o remoteKey' });
     }
-    res.json(await databaseManager.restore(req.params.id, {
+    res.json(await databaseManager.restore(db.id, {
       backupId,
       remoteKey,
       createSafetySnapshot: createSafetySnapshot !== false
@@ -2552,10 +3488,69 @@ router.post('/databases/:id/restore', heavyOpLimiter, async (req, res) => {
   }
 });
 
+router.post('/databases/:id/tuning', async (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.setTuning(db.id, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/:id/pooler', async (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.configurePooler(db.id, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/:id/clone', heavyOpLimiter, async (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && String(body.projectId) !== String(db.projectId || '')) {
+      if (!assertProjectAccess(req, res, String(body.projectId), 'databases:write')) return;
+    }
+    res.status(201).json(await databaseManager.cloneDatabase(db.id, body));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/:id/drill', heavyOpLimiter, async (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.runRestoreDrill(db.id, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/databases/:id/history', (req, res) => {
+  try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:read');
+    if (!db) return;
+    res.json({
+      restores: databaseManager.listRestoreHistory(db.id),
+      verifications: databaseManager.listVerificationHistory(db.id)
+    });
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
 router.put('/databases/:id/schedule', (req, res) => {
   try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
     const { enabled, cron } = req.body || {};
-    res.json(databaseManager.setSchedule(req.params.id, { enabled, cron }));
+    res.json(databaseManager.setSchedule(db.id, { enabled, cron }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2563,8 +3558,10 @@ router.put('/databases/:id/schedule', (req, res) => {
 
 router.put('/databases/:id/retention', (req, res) => {
   try {
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
     const { hourly, daily, weekly } = req.body || {};
-    res.json(databaseManager.setRetention(req.params.id, { hourly, daily, weekly }));
+    res.json(databaseManager.setRetention(db.id, { hourly, daily, weekly }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2572,7 +3569,9 @@ router.put('/databases/:id/retention', (req, res) => {
 
 router.post('/databases/:id/retention/apply', async (req, res) => {
   try {
-    res.json(await databaseManager.applyRetention(req.params.id));
+    const db = assertDatabaseAccess(req, res, req.params.id, 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.applyRetention(db.id));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -2989,6 +3988,7 @@ router.post('/webhooks/github', async (req, res) => {
         prNumber: pr.number,
         branch: pr.head?.ref || '',
         commitSha: pr.head?.sha || null,
+        deliveryId: req.headers['x-github-delivery'] || null,
         isFork
       });
       return res.status(out.status).json(out.body);
@@ -3072,6 +4072,7 @@ router.post('/webhooks/deploy/:projectId', heavyOpLimiter, async (req, res) => {
 
 router.post('/projects/:id/deploy-hook/rotate', async (req, res) => {
   try {
+    if (!getPrincipal(req).isSuperAdmin && !assertProjectAccess(req, res, req.params.id, 'projects:write')) return;
     const result = await webhookService.rotateDeployHookToken(req.params.id);
     res.json(result);
   } catch (err) {
@@ -3082,8 +4083,8 @@ router.post('/projects/:id/deploy-hook/rotate', async (req, res) => {
 // UX P0-7: prueba autenticada de webhook desde el panel sin exponer el secreto HMAC en el navegador
 router.post('/projects/:id/webhook/test', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
     const branch = project.gitBranch || 'main';
     const shortSha = crypto.randomBytes(4).toString('hex').slice(0, 7);
     const now = new Date().toISOString();
@@ -3123,6 +4124,14 @@ router.get('/catalog', (req, res) => {
   }
 });
 
+router.get('/catalog/drift', (_req, res) => {
+  try {
+    res.json(catalogManager.checkImageDrift());
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
 router.get('/catalog/installations', (req, res) => {
   try {
     res.json({ installations: catalogManager.list() });
@@ -3136,6 +4145,40 @@ router.get('/catalog/installations/:id', (req, res) => {
     res.json(catalogManager.get(req.params.id));
   } catch (err) {
     res.status(404).json({ error: err.message });
+  }
+});
+
+router.get('/catalog/installations/:id/drift', (req, res) => {
+  try {
+    res.json(catalogManager.checkImageDrift(req.params.id));
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+router.get('/catalog/installations/:id/backups', (req, res) => {
+  try {
+    res.json({ backups: catalogManager.listVolumeBackups(req.params.id) });
+  } catch (err) {
+    sendServiceError(err, res, 404);
+  }
+});
+
+router.post('/catalog/installations/:id/backups', heavyOpLimiter, async (req, res) => {
+  try {
+    const label = req.body && req.body.label ? String(req.body.label) : null;
+    res.status(201).json(await catalogManager.backupVolumes(req.params.id, /** @type {any} */ ({ label })));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/catalog/installations/:id/backups/:backupId/restore', heavyOpLimiter, async (req, res) => {
+  try {
+    const volumeKey = req.body && req.body.volumeKey ? String(req.body.volumeKey) : null;
+    res.json(await catalogManager.restoreVolume(req.params.id, req.params.backupId, /** @type {any} */ ({ volumeKey })));
+  } catch (err) {
+    sendServiceError(err, res, 400);
   }
 });
 
@@ -3198,7 +4241,9 @@ router.post('/catalog/installations/:id/update', heavyOpLimiter, async (req, res
     res.setTimeout(0);
     const image = req.body && req.body.image;
     if (!image) return res.status(400).json({ error: 'Indica la nueva imagen fijada (p. ej. imagen:1.2.3)' });
-    res.json(await catalogManager.updateImage(req.params.id, image));
+    res.json(await catalogManager.updateImage(req.params.id, image, {
+      allowRepoChange: Boolean(req.body && req.body.allowRepoChange)
+    }));
   } catch (err) {
     res.status(err.status || 400).json({ error: err.message });
   }
@@ -3275,12 +4320,23 @@ router.post('/auth/verify', (req, res) => {
     res.setHeader('Retry-After', String(bf.retryAfterSec));
     return res.status(429).json({ valid: false, error: 'Demasiados intentos de autenticación fallidos.' });
   }
-  const token = (req.body && req.body.token) || '';
+  const token = String((req.body && req.body.token) || '').trim();
+  if (token.startsWith('cks_')) {
+    const verified = getTeamManager().verifySessionToken(token);
+    if (verified && verified.ok) {
+      attachSessionCookie(req, res, token);
+      return res.json({ valid: true, method: 'session' });
+    }
+    recordAuthFailure(req);
+    metricsCollector.recordSecurityEvent('authFailures');
+    return res.status(401).json({ valid: false, error: 'Token inválido' });
+  }
   if (!tokenMatches(token)) {
     recordAuthFailure(req);
     metricsCollector.recordSecurityEvent('authFailures');
     return res.status(401).json({ valid: false, error: 'Token inválido' });
   }
+  attachVerifiedAuthCookie(req, res);
   res.json({ valid: true });
 });
 
@@ -3295,12 +4351,15 @@ router.post('/auth/ws-ticket', (req, res) => {
 router.post('/auth/rotate', (req, res) => {
   try {
     const rotated = rotateToken();
+    const { actor, authMethod } = getAuditActor(req);
     auditLogger.record({
       source: 'auth',
       action: 'auth.token_rotated',
       method: 'POST',
       path: '/api/auth/rotate',
       ip: clientIp(req),
+      authMethod,
+      actor,
       status: 200
     });
     res.json(rotated);
@@ -3315,15 +4374,15 @@ router.get('/sync/summary', (req, res) => {
 });
 
 router.get('/projects/:id/sync/status', (req, res) => {
-  const project = projectManager.getById(req.params.id);
-  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+  if (!project) return;
   res.json(liveSyncEngine.getStatus(project.id));
 });
 
 router.post('/projects/:id/sync/frame', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'sync:write');
+    if (!project) return;
     const result = liveSyncEngine.applyCommitFrame(project.id, req.body || {});
     res.json(result);
   } catch (err) {
@@ -3334,8 +4393,8 @@ router.post('/projects/:id/sync/frame', (req, res) => {
 
 router.post('/projects/:id/sync/verify', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
     const result = liveSyncEngine.verifySync(project.id, req.body || {});
     res.json(result);
   } catch (err) {
@@ -3345,8 +4404,8 @@ router.post('/projects/:id/sync/verify', (req, res) => {
 
 router.post('/projects/:id/sync/rollback', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'sync:write');
+    if (!project) return;
     const steps = Number(req.body && req.body.steps) || 1;
     res.json(liveSyncEngine.rollback(project.id, steps));
   } catch (err) {
@@ -3356,8 +4415,8 @@ router.post('/projects/:id/sync/rollback', (req, res) => {
 
 router.get('/projects/:id/sync/frames/:seq/diff', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
     const diff = liveSyncEngine.getFrameDiff(project.id, Number(req.params.seq));
     if (!diff) return res.status(404).json({ error: 'Commit Frame no encontrado en el historial activo de memoria' });
     res.json(diff);
@@ -3368,8 +4427,8 @@ router.get('/projects/:id/sync/frames/:seq/diff', (req, res) => {
 
 router.post('/projects/:id/sync/token', (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'sync:write');
+    if (!project) return;
     const ticket = createWsTicket(req);
     const trustFwd = isPrivateProxyPeer(req.socket?.remoteAddress || '');
     const fwdProto = trustFwd ? String(req.headers['x-forwarded-proto'] || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean).pop() : '';
@@ -3398,8 +4457,8 @@ router.post('/projects/:id/sync/token', (req, res) => {
  */
 router.post('/projects/:id/sync/promote', heavyOpLimiter, async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
     const targetDir = liveSyncEngine.resolveTargetDir(project.id);
     const verification = liveSyncEngine.verifySync(project.id);
     const isAsync = req.query.async === '1' || req.query.async === 'true' || Boolean(req.body && req.body.async);
@@ -3431,17 +4490,19 @@ router.post('/projects/:id/sync/promote', heavyOpLimiter, async (req, res) => {
   }
 });
 
-// --- WILDCARD TLS NATIVO PERSISTIDO (MÚLTIPLES DOMINIOS COMODÍN) VÍA CADDY + CLOUDFLARE DNS-01 ---
+// --- WILDCARD TLS NATIVO PERSISTIDO (MÚLTIPLES DOMINIOS COMODÍN) VÍA CADDY + DNS-01 MULTI-PROVEEDOR ---
 router.get('/ingress/wildcard-dns01', (_req, res) => {
   res.json({ policies: ingressManager.listWildcardPolicies() });
 });
 
 router.post('/ingress/wildcard-dns01', async (req, res) => {
   try {
-    const { domain, tokenEnv, includeApex } = req.body || {};
+    const { domain, provider, tokenEnv, credentialsEnv, includeApex } = req.body || {};
     if (!domain) return res.status(400).json({ error: 'Indica el dominio raíz (p. ej. midominio.com)' });
     const result = await ingressManager.addWildcardPolicy(domain, {
-      tokenEnv: tokenEnv || 'CF_API_TOKEN',
+      provider: provider ? String(provider) : 'cloudflare',
+      tokenEnv: tokenEnv || (provider && provider !== 'cloudflare' ? null : 'CF_API_TOKEN'),
+      credentialsEnv: credentialsEnv && typeof credentialsEnv === 'object' ? credentialsEnv : null,
       includeApex: includeApex !== false
     });
     res.json(result);
@@ -3466,15 +4527,16 @@ router.get('/deploy/queue', (_req, res) => {
 
 router.post('/projects/:id/databases/:dbId/link', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    const db = databaseManager.get(req.params.dbId);
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const db = assertDatabaseAccess(req, res, req.params.dbId, 'databases:read');
+    if (!db) return;
     const nextIds = Array.from(new Set([...(Array.isArray(project.linkedDatabaseIds) ? project.linkedDatabaseIds : []), db.id]));
     const updated = projectManager.update(project.id, { linkedDatabaseIds: nextIds });
     await projectManager.flushToDisk();
     res.json({
       success: true,
-      project: updated,
+      project: redactProjectOutput(req, updated),
       database: db,
       note: 'Base de datos vinculada: al redesplegar se adjuntará su red Docker aislada y se inyectará la URL de conexión sin guardar contraseñas en disco.'
     });
@@ -3485,12 +4547,12 @@ router.post('/projects/:id/databases/:dbId/link', async (req, res) => {
 
 router.delete('/projects/:id/databases/:dbId/link', async (req, res) => {
   try {
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
     const nextIds = (Array.isArray(project.linkedDatabaseIds) ? project.linkedDatabaseIds : []).filter((x) => x !== req.params.dbId);
     const updated = projectManager.update(project.id, { linkedDatabaseIds: nextIds });
     await projectManager.flushToDisk();
-    res.json({ success: true, project: updated });
+    res.json({ success: true, project: redactProjectOutput(req, updated) });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -3514,12 +4576,15 @@ router.put('/telemetry/config', (req, res) => {
       return res.status(400).json({ error: 'Debes enviar un booleano `enabled`' });
     }
     const status = telemetryService.setEnabled(enabled);
+    const { actor, authMethod } = getAuditActor(req);
     auditLogger.record({
       source: 'http',
       action: enabled ? 'telemetry.enable' : 'telemetry.disable',
       method: 'PUT',
       path: '/api/telemetry/config',
       ip: clientIp(req),
+      authMethod,
+      actor,
       status: 200
     });
     res.json(status);
@@ -3539,12 +4604,15 @@ router.get('/telemetry/preview', (_req, res) => {
 router.post('/telemetry/reset-id', (req, res) => {
   try {
     const status = telemetryService.resetInstanceId();
+    const { actor, authMethod } = getAuditActor(req);
     auditLogger.record({
       source: 'http',
       action: 'telemetry.reset_id',
       method: 'POST',
       path: '/api/telemetry/reset-id',
       ip: clientIp(req),
+      authMethod,
+      actor,
       status: 200
     });
     res.json(status);
@@ -3611,6 +4679,17 @@ router.post('/servers', certAndAdminLimiter, async (req, res) => {
   }
 });
 
+router.post('/servers/select', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+    if (!principal.isSuperAdmin) body.teamId = principal.teamId;
+    res.json(getFleetManager().selectBestServer(body));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 router.get('/servers/:id', (req, res) => {
   try {
     const principal = getPrincipal(req);
@@ -3623,6 +4702,96 @@ router.get('/servers/:id', (req, res) => {
     res.json({ server });
   } catch (err) {
     sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/servers/:id/maintenance', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(fleet.setServerMaintenance(req.params.id, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/servers/:id/bootstrap', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(fleet.generateBootstrapScript(req.params.id, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/servers/:id/caddy/sync', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(await fleet.syncRemoteCaddy(req.params.id, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/servers/:id/containers/:containerId/logs', async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(await fleet.remoteContainerLogs(req.params.id, req.params.containerId, req.query || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/servers/:id/containers/:containerId/stats', async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(await fleet.remoteContainerStats(req.params.id, req.params.containerId));
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/servers/:id/containers/:containerId/exec', execLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(await fleet.remoteContainerExec(req.params.id, req.params.containerId, req.body || {}));
+  } catch (err) {
+    sendServiceError(err, res, 400);
   }
 });
 
@@ -3751,6 +4920,7 @@ router.post('/auth/bootstrap', sensitiveAuthLimiter, (req, res) => {
       ip: clientIp(req),
       ua: req.headers['user-agent'] || ''
     });
+    attachSessionCookie(req, res, result.sessionToken);
     res.status(201).json(result);
   } catch (err) {
     sendServiceError(err, res, 400);
@@ -3774,6 +4944,9 @@ router.post('/auth/login', authVerifyLimiter, (req, res) => {
       ip: clientIp(req),
       ua: req.headers['user-agent'] || ''
     });
+    if (result && result.sessionToken) {
+      attachSessionCookie(req, res, result.sessionToken);
+    }
     res.json(result);
   } catch (err) {
     recordAuthFailure(req);
@@ -3799,6 +4972,9 @@ router.post('/auth/invites/accept', authVerifyLimiter, (req, res) => {
       ip: clientIp(req),
       ua: req.headers['user-agent'] || ''
     });
+    if (result && result.sessionToken) {
+      attachSessionCookie(req, res, result.sessionToken);
+    }
     res.status(201).json(result);
   } catch (err) {
     recordAuthFailure(req);
@@ -3813,6 +4989,7 @@ router.post('/auth/logout', (req, res) => {
     if (principal.kind === 'session' && principal.userId && principal.sessionId) {
       getTeamManager().logoutSession(principal.userId, principal.sessionId);
     }
+    clearSessionCookies(req, res);
     res.json({ success: true });
   } catch (err) {
     sendServiceError(err, res, 400);
@@ -3825,6 +5002,7 @@ router.post('/auth/logout-all', (req, res) => {
     if (principal.userId) {
       getTeamManager().logoutAll(principal.userId);
     }
+    clearSessionCookies(req, res);
     res.json({ success: true });
   } catch (err) {
     sendServiceError(err, res, 400);
@@ -3971,21 +5149,23 @@ router.delete('/teams/:teamId/invites/:inviteId', certAndAdminLimiter, (req, res
   }
 });
 
+router.put('/teams/:teamId/security-policy', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const result = getTeamManager().setTeamSecurityPolicy(principal, req.params.teamId, req.body || {});
+    res.json({ success: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 router.get('/projects/:id/acl', (req, res) => {
   try {
     const principal = getPrincipal(req);
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
-    const tm = getTeamManager();
-    const authz = tm.authorizeProject(principal, project.id, 'projects:read', project);
-    if (!authz.allowed) return res.status(authz.status || 403).json({ error: authz.reason || 'Sin acceso' });
-    tm._ensureLoaded();
-    const acl = (tm.state && tm.state.projectAcls && tm.state.projectAcls[project.id]) || null;
-    res.json({
-      projectId: project.id,
-      teamId: (acl && acl.teamId) || project.teamId || 'team_default',
-      overrides: (acl && acl.overrides) || {}
-    });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const acl = getTeamManager().getProjectAcl(principal, project.id, project.teamId || 'team_default');
+    res.json(acl);
   } catch (err) {
     sendServiceError(err, res, 400);
   }
@@ -3994,10 +5174,14 @@ router.get('/projects/:id/acl', (req, res) => {
 router.put('/projects/:id/acl', certAndAdminLimiter, (req, res) => {
   try {
     const principal = getPrincipal(req);
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:acl');
+    if (!project) return;
     const body = req.body || {};
-    const result = getTeamManager().setProjectAcl(principal, project.id, body.userId, body.role, project.teamId || 'team_default');
+    const result = getTeamManager().setProjectAcl(principal, project.id, {
+      userId: body.userId,
+      role: body.role,
+      teamId: project.teamId || 'team_default'
+    });
     res.json({ success: true, ...result });
   } catch (err) {
     sendServiceError(err, res, 400);
@@ -4007,8 +5191,8 @@ router.put('/projects/:id/acl', certAndAdminLimiter, (req, res) => {
 router.delete('/projects/:id/acl/:userId', certAndAdminLimiter, (req, res) => {
   try {
     const principal = getPrincipal(req);
-    const project = projectManager.getById(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:acl');
+    if (!project) return;
     const result = getTeamManager().removeProjectAcl(principal, project.id, req.params.userId, project.teamId || 'team_default');
     res.json({ success: true, removed: true, ...result });
   } catch (err) {
@@ -4484,9 +5668,67 @@ router.delete('/uptime/pages/:slug', (req, res) => {
   }
 });
 
+router.post('/uptime/pages/:slug/incidents', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'incidentes de páginas de estado')) return;
+    const principal = getPrincipal(req);
+    const um = getUptimeMonitor();
+    const cleanSlug = String(req.params.slug || '').trim().toLowerCase();
+    if (!principal.isSuperAdmin) {
+      const existingPage = um.listStatusPages().find((p) => p.slug === cleanSlug);
+      if (existingPage && Array.isArray(existingPage.monitorIds)) {
+        for (const mid of existingPage.monitorIds) {
+          const m = um.getMonitor(String(mid));
+          if (m && !canAccessMonitor(principal, m, 'uptime:write')) {
+            return res.status(403).json({ error: 'No tienes permisos sobre esta página de estado', code: 'PROJECT_FORBIDDEN' });
+          }
+        }
+      }
+    }
+    const incident = um.publishStatusIncident(req.params.slug, req.body || {});
+    res.status(201).json({ success: true, incident });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/uptime/pages/:slug/incidents/:id/resolve', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'resolver incidentes de páginas de estado')) return;
+    const principal = getPrincipal(req);
+    const um = getUptimeMonitor();
+    const cleanSlug = String(req.params.slug || '').trim().toLowerCase();
+    if (!principal.isSuperAdmin) {
+      const existingPage = um.listStatusPages().find((p) => p.slug === cleanSlug);
+      if (existingPage && Array.isArray(existingPage.monitorIds)) {
+        for (const mid of existingPage.monitorIds) {
+          const m = um.getMonitor(String(mid));
+          if (m && !canAccessMonitor(principal, m, 'uptime:write')) {
+            return res.status(403).json({ error: 'No tienes permisos sobre esta página de estado', code: 'PROJECT_FORBIDDEN' });
+          }
+        }
+      }
+    }
+    const incident = um.resolveStatusIncident(req.params.slug, req.params.id, req.body || {});
+    res.json({ success: true, incident });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 // ===========================================================================
 // SCALE-TO-ZERO AUTO-SLEEP & VPS COST/RAM ADVISOR
 // ===========================================================================
+router.get('/sleep', (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const policies = getSleepAdvisor().listPolicies({ projectIds: allowedProjectIds || undefined });
+    res.json({ policies });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
 router.get('/sleep/:projectId', (req, res) => {
   try {
     const project = assertProjectAccess(req, res, req.params.projectId, 'projects:read');
@@ -4679,174 +5921,424 @@ router.post('/projects/:id/canary/abort', certAndAdminLimiter, async (req, res) 
 
 // ===== v1.1 ENDPOINTS =====
 
+/** Mapea alias de condición del frontend (`gt`/`lt`/`gte`/`lte`/`eq`) al operador nativo de `alertEngine`. */
+function normalizeAlertRulePayload(raw) {
+  const body = raw && typeof raw === 'object' ? { ...raw } : {};
+  const condMap = { gt: '>', gte: '>=', lt: '<', lte: '<=', eq: '==' };
+  if (!body.operator && typeof body.condition === 'string') {
+    const mapped = condMap[body.condition.trim().toLowerCase()];
+    body.operator = mapped || body.condition;
+  }
+  if (body.cooldownMs === undefined && body.cooldownSec !== undefined) {
+    body.cooldownMs = Math.round(Number(body.cooldownSec) * 1000);
+  }
+  return body;
+}
+
 // --- OBSERVABILITY v1.1 ---
 router.get('/observability/history', (req, res) => {
   try {
-    const data = getMetricsHistory().query({ range: req.query.range || '1h', projectId: req.query.projectId || null });
+    const data = getMetricsHistory().query({
+      range: req.query.range ? String(req.query.range) : '1h'
+    });
     res.json(data);
   } catch (err) { sendServiceError(err, res); }
 });
-router.get('/observability/alerts', (req, res) => {
-  try { res.json({ alerts: getAlertEngine().listAlerts({ status: req.query.status || 'all' }) }); }
-  catch (err) { sendServiceError(err, res); }
-});
-router.post('/observability/alerts', (req, res) => {
-  try { res.status(201).json(getAlertEngine().createRule(req.body)); }
-  catch (err) { sendServiceError(err, res); }
-});
-router.put('/observability/alerts/:id', (req, res) => {
-  try { res.json(getAlertEngine().updateRule(req.params.id, req.body)); }
-  catch (err) { sendServiceError(err, res); }
-});
-router.delete('/observability/alerts/:id', (req, res) => {
-  try { getAlertEngine().deleteRule(req.params.id); res.json({ success: true }); }
-  catch (err) { sendServiceError(err, res); }
-});
-router.post('/observability/alerts/:id/acknowledge', (req, res) => {
-  try { getAlertEngine().acknowledge(req.params.id); res.json({ success: true }); }
-  catch (err) { sendServiceError(err, res); }
-});
-router.get('/observability/topology', (req, res) => {
-  try { res.json(getTopologyService().getTopology()); }
-  catch (err) { sendServiceError(err, res); }
-});
-router.get('/observability/logs/search', (req, res) => {
+
+router.get('/observability/metrics/history', (req, res) => {
   try {
-    const co = require('../services/containerOrchestrator');
-    res.json(co.getLogs({ search: req.query.q || '', level: req.query.level || null, projectId: req.query.projectId || null, since: req.query.since || null, limit: Math.min(Number(req.query.limit) || 100, 1000) }));
+    const data = getMetricsHistory().query({
+      range: req.query.range ? String(req.query.range) : '24h'
+    });
+    res.json(data);
   } catch (err) { sendServiceError(err, res); }
 });
 
-// --- EDGE / INGRESS v1.1 ---
-router.get('/ingress/dns-providers', (req, res) => {
-  try { res.json({ providers: caddyManager.listDnsProviders() }); }
+router.get('/alerts/rules', (_req, res) => {
+  try { res.json({ rules: getAlertEngine().listRules() }); }
+  catch (err) { sendServiceError(err, res, 500); }
+});
+router.post('/alerts/rules', (req, res) => {
+  try { res.status(201).json({ rule: getAlertEngine().createRule(normalizeAlertRulePayload(req.body)) }); }
   catch (err) { sendServiceError(err, res); }
 });
-router.get('/ingress/http3', async (req, res) => {
-  try { res.json(await caddyManager.probeHttp3()); }
+router.put('/alerts/rules/:id', (req, res) => {
+  try { res.json({ rule: getAlertEngine().updateRule(req.params.id, normalizeAlertRulePayload(req.body)) }); }
   catch (err) { sendServiceError(err, res); }
 });
-router.get('/cloudflare/tunnels/connector/status', async (req, res) => {
-  try { res.json(await cloudflareService.getCloudflaredStatus(req.query)); }
+router.delete('/alerts/rules/:id', (req, res) => {
+  try { res.json(getAlertEngine().deleteRule(req.params.id)); }
   catch (err) { sendServiceError(err, res); }
 });
-router.get('/cloudflare/tunnels/connector/logs', async (req, res) => {
-  try { res.json(await cloudflareService.getCloudflaredLogs(req.query)); }
+router.post('/alerts/rules/:id/silence', (req, res) => {
+  try {
+    const mins = req.body && req.body.durationMinutes !== undefined ? Number(req.body.durationMinutes) : 60;
+    res.json({ rule: getAlertEngine().silenceRule(req.params.id, mins) });
+  } catch (err) { sendServiceError(err, res); }
+});
+router.get('/alerts/active', (req, res) => {
+  try {
+    const projectIds = getAllowedProjectIds(req);
+    const alerts = getAlertEngine().getActiveAlerts({ projectIds });
+    res.json({ alerts, summary: getAlertEngine().getSummary({ projectIds }) });
+  } catch (err) { sendServiceError(err, res, 500); }
+});
+router.post('/alerts/active/:id/ack', (req, res) => {
+  try { res.json({ success: true, alert: getAlertEngine().acknowledgeAlert(req.params.id) }); }
   catch (err) { sendServiceError(err, res); }
 });
-router.post('/cloudflare/tunnels/connector/stop', async (req, res) => {
-  try { res.json(await cloudflareService.stopCloudflaredDocker(req.body || {})); }
+router.get('/alerts/history', (req, res) => {
+  try {
+    const projectIds = getAllowedProjectIds(req);
+    const history = getAlertEngine().getHistory({
+      limit: req.query.limit ? parseInt(String(req.query.limit), 10) : 50,
+      ruleId: req.query.ruleId ? String(req.query.ruleId) : null,
+      status: req.query.status ? String(req.query.status) : null,
+      projectIds
+    });
+    res.json({ alerts: history, history });
+  } catch (err) { sendServiceError(err, res, 500); }
+});
+router.post('/alerts/evaluate', async (_req, res) => {
+  try { res.json(await getAlertEngine().evaluateLive()); }
+  catch (err) { sendServiceError(err, res, 500); }
+});
+
+// Aliases `/observability/alerts/*` usados por `web/src/lib/api.ts`
+router.get('/observability/alerts/rules', (_req, res) => {
+  try { res.json({ rules: getAlertEngine().listRules() }); }
+  catch (err) { sendServiceError(err, res, 500); }
+});
+router.post('/observability/alerts/rules', (req, res) => {
+  try { res.status(201).json({ rule: getAlertEngine().createRule(normalizeAlertRulePayload(req.body)) }); }
   catch (err) { sendServiceError(err, res); }
 });
-router.post('/cloudflare/tunnels/:tunnelId/all-to-caddy', async (req, res) => {
-  try { res.json(await cloudflareService.configureAllResourcesTunnel({ tunnelId: req.params.tunnelId, ...req.body })); }
+router.put('/observability/alerts/rules/:id', (req, res) => {
+  try { res.json({ rule: getAlertEngine().updateRule(req.params.id, normalizeAlertRulePayload(req.body)) }); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.delete('/observability/alerts/rules/:id', (req, res) => {
+  try { res.json(getAlertEngine().deleteRule(req.params.id)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.get('/observability/alerts/history', (req, res) => {
+  try {
+    const projectIds = getAllowedProjectIds(req);
+    const history = getAlertEngine().getHistory({
+      limit: req.query.limit ? parseInt(String(req.query.limit), 10) : 50,
+      ruleId: req.query.ruleId ? String(req.query.ruleId) : null,
+      status: req.query.status ? String(req.query.status) : null,
+      projectIds
+    });
+    res.json({ alerts: history, history });
+  } catch (err) { sendServiceError(err, res, 500); }
+});
+router.get('/observability/alerts', (req, res) => {
+  try {
+    const projectIds = getAllowedProjectIds(req);
+    res.json({ alerts: getAlertEngine().getActiveAlerts({ projectIds }), rules: getAlertEngine().listRules() });
+  } catch (err) { sendServiceError(err, res, 500); }
+});
+router.post('/observability/alerts', (req, res) => {
+  try { res.status(201).json(getAlertEngine().createRule(normalizeAlertRulePayload(req.body))); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.put('/observability/alerts/:id', (req, res) => {
+  try { res.json(getAlertEngine().updateRule(req.params.id, normalizeAlertRulePayload(req.body))); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.delete('/observability/alerts/:id', (req, res) => {
+  try { res.json(getAlertEngine().deleteRule(req.params.id)); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/observability/alerts/:id/acknowledge', (req, res) => {
+  try { res.json({ success: true, alert: getAlertEngine().acknowledgeAlert(req.params.id) }); }
   catch (err) { sendServiceError(err, res); }
 });
 
-// --- SECURITY v1.1 ---
-router.post('/auth/2fa/setup', sensitiveAuthLimiter, (req, res) => {
-  try { res.json(getTeamManager().setup2FA((getPrincipal(req).userId || getPrincipal(req).tokenId))); }
+/** @param {any} req @param {any} res */
+function handleTopologyRequest(req, res) {
+  try {
+    const principal = getPrincipal(req);
+    const allowedProjectIds = getAllowedProjectIds(req);
+    res.json(getTopologyService().buildTopology({
+      isSuperAdmin: Boolean(principal.isSuperAdmin),
+      allowedProjectIds
+    }));
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+}
+router.get('/topology', handleTopologyRequest);
+router.get('/observability/topology', handleTopologyRequest);
+
+router.get('/observability/logs/search', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const requestedProjectId = req.query.projectId ? String(req.query.projectId) : null;
+    if (requestedProjectId && requestedProjectId !== 'global' && !principal.isSuperAdmin) {
+      if (!assertProjectAccess(req, res, requestedProjectId, 'projects:read')) return;
+    }
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const logs = containerOrchestrator.getLogs({
+      pod: req.query.pod ? String(req.query.pod) : null,
+      search: req.query.q ? String(req.query.q) : (req.query.search ? String(req.query.search) : ''),
+      regex: req.query.regex ? String(req.query.regex) : false,
+      level: req.query.level ? String(req.query.level) : null,
+      projectId: requestedProjectId,
+      projectIds: allowedProjectIds,
+      since: req.query.since ? String(req.query.since) : null,
+      until: req.query.until ? String(req.query.until) : null,
+      attr: req.query.attr ? String(req.query.attr) : null,
+      limit: Math.min(Number(req.query.limit) || 100, 1000)
+    });
+    res.json({ logs });
+  } catch (err) { sendServiceError(err, res, err && err.status === 400 ? 400 : 500); }
+});
+
+router.get('/observability/logs/export', handleLogsExport);
+
+// --- EDGE / INGRESS v1.1 ---
+router.get('/ingress/dns-providers', (_req, res) => {
+  try { res.json({ providers: caddyManager.listDnsProviders() }); }
   catch (err) { sendServiceError(err, res); }
 });
-router.post('/auth/2fa/verify', sensitiveAuthLimiter, (req, res) => {
-  try { res.json(getTeamManager().verify2FA((getPrincipal(req).userId || getPrincipal(req).tokenId), req.body.code)); }
+router.get('/ingress/http3', async (_req, res) => {
+  try { res.json(await caddyManager.probeHttp3()); }
+  catch (err) { sendServiceError(err, res); }
+});
+
+// --- SECURITY v1.1 (TOTP 2FA RFC 6238, OIDC PKCE+JWKS, Audit Verify & Secret Scanner) ---
+router.get('/auth/2fa/status', (req, res) => {
+  try { res.json(getTeamManager().getTotpStatus(getPrincipal(req))); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/auth/2fa/setup', sensitiveAuthLimiter, (req, res) => {
+  try { res.json(getTeamManager().setupTotp(getPrincipal(req), req.body || {})); }
+  catch (err) { sendServiceError(err, res); }
+});
+router.post('/auth/2fa/enable', sensitiveAuthLimiter, (req, res) => {
+  try { res.json(getTeamManager().enableTotp(getPrincipal(req), req.body || {})); }
   catch (err) { sendServiceError(err, res); }
 });
 router.post('/auth/2fa/disable', sensitiveAuthLimiter, (req, res) => {
-  try { res.json(getTeamManager().disable2FA((getPrincipal(req).userId || getPrincipal(req).tokenId), req.body.code)); }
+  try { res.json(getTeamManager().disableTotp(getPrincipal(req), req.body || {})); }
   catch (err) { sendServiceError(err, res); }
 });
-router.get('/auth/oidc/providers', (req, res) => {
-  try { res.json({ providers: getOidcService().listProviders() }); }
+router.post('/auth/2fa/recovery-codes', sensitiveAuthLimiter, (req, res) => {
+  try { res.json(getTeamManager().regenerateRecoveryCodes(getPrincipal(req), req.body || {})); }
   catch (err) { sendServiceError(err, res); }
 });
-router.get('/auth/oidc/authorize', (req, res) => {
-  try { const r = getOidcService().getAuthorizationUrl(req.query.provider); res.json(r); }
+router.post('/auth/2fa/verify', sensitiveAuthLimiter, (req, res) => {
+  const bf = checkAuthBruteForce(req);
+  if (bf.blocked) {
+    res.setHeader('Retry-After', String(bf.retryAfterSec));
+    return res.status(429).json({ error: 'Demasiados intentos de autenticación fallidos.', code: 'AUTH_RATE_LIMITED' });
+  }
+  try {
+    const result = getTeamManager().verifyMfaLogin({
+      ...(req.body || {}),
+      ip: clientIp(req),
+      ua: req.headers['user-agent'] || ''
+    });
+    if (result && result.sessionToken) {
+      attachSessionCookie(req, res, result.sessionToken);
+    }
+    res.json(result);
+  } catch (err) {
+    recordAuthFailure(req);
+    metricsCollector.recordSecurityEvent('authFailures');
+    sendServiceError(err, res, 401);
+  }
+});
+
+router.get('/auth/oidc/providers', (_req, res) => {
+  try { res.json({ providers: getOidcService().listPublicProviders() }); }
   catch (err) { sendServiceError(err, res); }
 });
-router.post('/auth/oidc/callback', async (req, res) => {
-  try { res.json(await getOidcService().handleCallback(req.body)); }
-  catch (err) { sendServiceError(err, res); }
+router.get('/auth/oidc/config', (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'configuración OIDC')) return;
+    res.json({ providers: getOidcService().listProviders() });
+  } catch (err) { sendServiceError(err, res); }
 });
+router.post('/auth/oidc/config', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'configuración OIDC')) return;
+    res.status(201).json({ provider: getOidcService().configureProvider(req.body || {}) });
+  } catch (err) { sendServiceError(err, res); }
+});
+router.delete('/auth/oidc/config/:id', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'eliminar proveedor OIDC')) return;
+    res.json(getOidcService().deleteProvider(req.params.id));
+  } catch (err) { sendServiceError(err, res); }
+});
+router.post('/auth/oidc/start', authVerifyLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const providerId = String(body.providerId || body.provider || '').trim();
+    const out = await getOidcService().createAuthorizationUrl(providerId, {
+      redirectUri: body.redirectUri ? String(body.redirectUri) : undefined,
+      teamId: body.teamId ? String(body.teamId) : undefined,
+      ip: clientIp(req)
+    });
+    res.json(out);
+  } catch (err) { sendServiceError(err, res); }
+});
+router.get('/auth/oidc/authorize', authVerifyLimiter, async (req, res) => {
+  try {
+    const providerId = String(req.query.providerId || req.query.provider || '').trim();
+    const out = await getOidcService().createAuthorizationUrl(providerId, {
+      redirectUri: req.query.redirectUri ? String(req.query.redirectUri) : undefined,
+      teamId: req.query.teamId ? String(req.query.teamId) : undefined,
+      ip: clientIp(req)
+    });
+    res.json(out);
+  } catch (err) { sendServiceError(err, res); }
+});
+/** @param {any} req @param {any} res */
+async function handleOidcCallback(req, res) {
+  try {
+    const src = req.method === 'GET' ? (req.query || {}) : (req.body || {});
+    const identity = await getOidcService().handleCallback({
+      state: String(src.state || ''),
+      code: String(src.code || ''),
+      ip: clientIp(req)
+    });
+    const loginResult = getTeamManager().loginWithOidc(identity, {
+      teamId: identity.teamId,
+      autoProvision: identity.autoProvision,
+      defaultRole: identity.defaultRole,
+      ip: clientIp(req),
+      ua: req.headers['user-agent'] || ''
+    });
+    if (loginResult && loginResult.sessionToken) {
+      attachSessionCookie(req, res, loginResult.sessionToken, {
+        sameSite: req.method === 'GET' ? 'Lax' : 'Strict'
+      });
+    }
+    res.json(loginResult);
+  } catch (err) {
+    recordAuthFailure(req);
+    metricsCollector.recordSecurityEvent('authFailures');
+    sendServiceError(err, res, 401);
+  }
+}
+router.get('/auth/oidc/callback', authVerifyLimiter, handleOidcCallback);
+router.post('/auth/oidc/callback', authVerifyLimiter, handleOidcCallback);
+
 router.get('/security/audit-log', (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json({ entries: auditLogger.query({ limit: Math.min(Number(req.query.limit) || 100, 1000), since: req.query.since || null, action: req.query.action || null }) });
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'audit:read')) {
+      return res.status(403).json({ error: 'Solo administradores', code: 'FORBIDDEN' });
+    }
+    res.json({
+      entries: auditLogger.query({
+        limit: Math.min(Number(req.query.limit) || 100, 1000),
+        source: req.query.source ? String(req.query.source) : '',
+        action: req.query.action ? String(req.query.action) : ''
+      })
+    });
   } catch (err) { sendServiceError(err, res); }
 });
 router.post('/security/audit-log/verify', (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(auditLogger.verifyIntegrity());
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'audit:read')) {
+      return res.status(403).json({ error: 'Solo administradores', code: 'FORBIDDEN' });
+    }
+    const includeRotated = !(req.body && req.body.includeRotated === false);
+    res.json(auditLogger.verifyIntegrity({ includeRotated }));
   } catch (err) { sendServiceError(err, res); }
 });
-router.post('/security/scan-secrets', async (req, res) => {
+router.post('/security/scan-secrets', (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(await getSecretScanner().scan(req.body));
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const mode = body.mode === 'block' ? 'block' : 'warn';
+    res.json(getSecretScanner().scanDeploymentPayload(body, { mode }));
   } catch (err) { sendServiceError(err, res); }
 });
 
 // --- GITOPS v1.1 ---
-router.get('/gitops/schema.json', (req, res) => {
+router.get('/gitops/schema.json', (_req, res) => {
   try { res.json(getGitOpsManager().getJsonSchema()); }
   catch (err) { sendServiceError(err, res); }
 });
 
-// --- DATABASE v1.1 ---
-router.post('/databases/:id/pooler', async (req, res) => {
-  try { res.json(await databaseManager.configurePooler(req.params.id, req.body)); }
-  catch (err) { sendServiceError(err, res); }
-});
-router.post('/databases/:id/clone', async (req, res) => {
+// --- BACKUP DR ALIASES v1.1 ---
+router.post('/backup/verify', heavyOpLimiter, async (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(await databaseManager.cloneDatabase(req.params.id, req.body));
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (!body.databaseId || !body.backupId) {
+      return res.status(400).json({ error: 'Indica databaseId y backupId para verificar la copia' });
+    }
+    const db = assertDatabaseAccess(req, res, String(body.databaseId), 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.verifyBackup(db.id, String(body.backupId), body));
   } catch (err) { sendServiceError(err, res); }
 });
-router.post('/backup/verify', async (req, res) => {
+router.post('/backup/restore-drill', heavyOpLimiter, async (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(await dbBackupManager.verifyBackup(req.body));
-  } catch (err) { sendServiceError(err, res); }
-});
-router.post('/backup/restore-drill', async (req, res) => {
-  try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(await dbBackupManager.runRestoreDrill(req.body));
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (!body.databaseId) {
+      return res.status(400).json({ error: 'Indica databaseId para ejecutar el simulacro de restauración' });
+    }
+    const db = assertDatabaseAccess(req, res, String(body.databaseId), 'databases:write');
+    if (!db) return;
+    res.json(await databaseManager.runRestoreDrill(db.id, body));
   } catch (err) { sendServiceError(err, res); }
 });
 
-// --- FLEET v1.1 ---
-router.post('/fleet/servers/:id/maintenance', async (req, res) => {
+// --- FLEET ALIASES v1.1 ---
+router.post('/fleet/servers/:id/maintenance', certAndAdminLimiter, (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(await getFleetManager().setMaintenanceMode(req.params.id, req.body));
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(fleet.setServerMaintenance(req.params.id, req.body || {}));
   } catch (err) { sendServiceError(err, res); }
 });
-router.post('/fleet/servers/:id/drain', async (req, res) => {
+router.post('/fleet/servers/:id/drain', certAndAdminLimiter, (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(await getFleetManager().drainNode(req.params.id, req.body));
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const existing = fleet.getServer(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    res.json(fleet.setServerMaintenance(req.params.id, { ...(req.body || {}), state: 'draining' }));
   } catch (err) { sendServiceError(err, res); }
 });
 router.get('/fleet/bootstrap', (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.setHeader('Content-Type', 'text/x-shellscript');
-    res.send(getFleetManager().generateBootstrapScript(req.query));
-  } catch (err) { sendServiceError(err, res); }
-});
-router.post('/fleet/servers/:id/containers', async (req, res) => {
-  try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(await getFleetManager().remoteContainerOp(req.params.id, req.body));
+    const principal = getPrincipal(req);
+    const fleet = getFleetManager();
+    const serverId = String(req.query.serverId || req.query.id || '').trim();
+    if (!serverId) return res.status(400).json({ error: 'Indica el parámetro serverId' });
+    const existing = fleet.getServer(serverId);
+    if (!existing) return res.status(404).json({ error: 'Servidor no encontrado' });
+    if (!principal.isSuperAdmin && existing.teamId && existing.teamId !== principal.teamId) {
+      return res.status(404).json({ error: 'Servidor no encontrado' });
+    }
+    const generated = fleet.generateBootstrapScript(serverId, req.query || {});
+    if (req.query.format === 'json') return res.json(generated);
+    res.setHeader('Content-Type', 'text/x-shellscript; charset=utf-8');
+    res.send(generated.script || '');
   } catch (err) { sendServiceError(err, res); }
 });
 router.post('/fleet/placement', (req, res) => {
   try {
-    if (!getPrincipal(req).isSuperAdmin) return res.status(403).json({ error: 'Solo administradores' });
-    res.json(getFleetManager().computePlacement(req.body));
+    const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+    if (!principal.isSuperAdmin) body.teamId = principal.teamId;
+    res.json(getFleetManager().selectBestServer(body));
   } catch (err) { sendServiceError(err, res); }
 });
 

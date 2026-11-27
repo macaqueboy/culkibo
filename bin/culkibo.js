@@ -3,6 +3,8 @@
 const { Command } = require('commander');
 const readline = require('readline');
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const net = require('net');
 const { spawn } = require('child_process');
@@ -1205,11 +1207,58 @@ telemetryCmd
     console.log(`\x1b[32m✅ Nuevo instanceId generado:\x1b[0m ${st.instanceId}`);
   });
 
+/**
+ * Realiza un POST HTTP/HTTPS sin pool keep-alive (`agent: false`, `Connection: close`)
+ * para el puente MCP stdio remoto, evitando carreras de teardown de sockets/libuv en Windows.
+ * @param {string} urlStr
+ * @param {Record<string, string>} headers
+ * @param {string} bodyStr
+ * @returns {Promise<{ status: number, contentType: string, bodyText: string }>}
+ */
+function postMcpRemote(urlStr, headers, bodyStr) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(urlStr);
+    const transport = parsed.protocol === 'https:' ? https : http;
+    const payload = Buffer.from(bodyStr, 'utf8');
+    const req = transport.request({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: `${parsed.pathname}${parsed.search}`,
+      method: 'POST',
+      agent: false,
+      headers: {
+        ...headers,
+        'Content-Length': String(payload.length),
+        'Connection': 'close'
+      }
+    }, (res) => {
+      /** @type {Buffer[]} */
+      const chunks = [];
+      res.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      res.on('end', () => {
+        resolve({
+          status: res.statusCode || 0,
+          contentType: String(res.headers['content-type'] || '').toLowerCase(),
+          bodyText: Buffer.concat(chunks).toString('utf8')
+        });
+      });
+      res.on('error', reject);
+    });
+    req.setTimeout(60000, () => {
+      req.destroy(new Error(`Timeout (60s) conectando con ${urlStr}`));
+    });
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
 // Transporte stdio MCP (con puente HTTP automático hacia VPS remoto cuando CULKIBO_API_URL está definido)
 program
   .command('mcp')
-  .description('Ejecuta el servidor MCP sobre entrada/salida estándar (stdio local o puente remoto HTTP)')
-  .action(() => {
+  .description('Ejecuta el servidor MCP sobre entrada/salida estándar (stdio local o puente remoto HTTP, soporta CULKIBO_MCP_PROFILE)')
+  .option('-p, --profile <profile>', 'Perfil de herramientas MCP (core|deploy|ops|security|all; default env CULKIBO_MCP_PROFILE o all)')
+  .action((options) => {
     const toStderr = (...args) => {
       try { process.stderr.write(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') + '\n'); } catch (e) {}
     };
@@ -1219,24 +1268,31 @@ program
 
     const remoteApiUrl = (process.env.CULKIBO_API_URL || '').trim().replace(/\/+$/, '');
     const remoteToken = (process.env.CULKIBO_TOKEN || '').trim();
+    const mcpProfile = String((options && options.profile) || process.env.CULKIBO_MCP_PROFILE || 'all').trim().toLowerCase() || 'all';
     const mcpServer = remoteApiUrl ? null : svc.mcpServer;
 
     const rl = readline.createInterface({
       input: process.stdin,
-      output: process.stdout,
       terminal: false
     });
 
     let inFlight = 0;
     let stdinClosed = false;
+    let exiting = false;
     const maybeExit = () => {
-      if (!stdinClosed || inFlight > 0) return;
+      if (!stdinClosed || inFlight > 0 || exiting) return;
+      exiting = true;
+      try { rl.close(); } catch (e) {}
       if (remoteApiUrl) {
-        process.exit(0);
+        // Sin agent keep-alive ni process.exit() brusco: el bucle de eventos drena limpio en 0 ms (cero carreras libuv en Windows)
+        process.exitCode = process.exitCode || 0;
         return;
       }
       Promise.resolve(svc.projectManager.flushToDisk()).catch(() => {}).finally(() => {
-        process.exit(0);
+        process.exitCode = process.exitCode || 0;
+        // Fallback unref'd solo si algún servicio local mantiene un handle abierto tras drenar
+        const fallback = setTimeout(() => process.exit(0), 150);
+        if (fallback.unref) fallback.unref();
       });
     };
 
@@ -1262,8 +1318,16 @@ program
             || null;
           const isModern = metaVer === '2026-07-28' || request.method === 'server/discover';
           const nameVal = request.method === 'resources/read' ? request.params?.uri : request.params?.name;
-          const baseOrigin = remoteApiUrl.replace(/\/api\/mcp(?:\/message)?$/, '');
-          const endpoint = isModern ? `${baseOrigin}/api/mcp` : `${baseOrigin}/api/mcp/message`;
+          const baseOrigin = remoteApiUrl.replace(/\/api\/mcp(?:\/message)?(?:\?.*)?$/, '');
+          const profileQuery = mcpProfile && mcpProfile !== 'all'
+            ? `?profile=${encodeURIComponent(mcpProfile)}`
+            : '';
+          const endpoint = isModern
+            ? `${baseOrigin}/api/mcp${profileQuery}`
+            : `${baseOrigin}/api/mcp/message`;
+          const outboundRequest = (!isModern && request.method === 'tools/list' && mcpProfile && mcpProfile !== 'all' && !(request.params && request.params.profile))
+            ? { ...request, params: { ...(request.params || {}), profile: mcpProfile } }
+            : request;
           const headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
@@ -1274,13 +1338,9 @@ program
             } : {}),
             ...(remoteToken ? { 'Authorization': `Bearer ${remoteToken}` } : {})
           };
-          const res = await fetch(endpoint, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(request)
-          });
-          const ct = String(res.headers.get('content-type') || '').toLowerCase();
-          const bodyText = await res.text();
+          const res = await postMcpRemote(endpoint, headers, JSON.stringify(outboundRequest));
+          const ct = res.contentType;
+          const bodyText = res.bodyText;
           if (ct.includes('text/event-stream')) {
             // Extraer último evento `data: {...}` JSON-RPC del stream SSE
             const dataLines = bodyText.split(/\r?\n/).filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).filter(Boolean);
@@ -1307,8 +1367,8 @@ program
           || request.params?._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28'
           || request._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28';
         const response = useModern && typeof mcpServer.handleModernRpc === 'function'
-          ? await mcpServer.handleModernRpc(request, { transport: 'stdio' })
-          : await mcpServer.handleJsonRpc(request);
+          ? await mcpServer.handleModernRpc(request, { transport: 'stdio', profile: mcpProfile })
+          : await mcpServer.handleJsonRpc(request, { transport: 'stdio', profile: mcpProfile });
         if (response !== null) writeStdLine(response);
       } catch (err) {
         writeStdLine({
@@ -1326,6 +1386,207 @@ program
       stdinClosed = true;
       maybeExit();
     });
+  });
+
+/**
+ * Escribe de forma segura e idempotente los archivos drop-in del kit de agente MCP
+ * (fusionando `mcpServers`/`servers` en JSON existentes y delimitando bloques en CLAUDE.md/TOML),
+ * verificando siempre que JAMÁS se incrusten tokens reales en disco.
+ * @param {any} kitResult
+ * @param {string} targetDir
+ * @param {{ dryRun?: boolean, force?: boolean }} [opts]
+ */
+function writeAgentKitFiles(kitResult, targetDir, opts = {}) {
+  const dir = path.resolve(targetDir || process.cwd());
+  const dryRun = Boolean(opts.dryRun);
+  const force = Boolean(opts.force);
+  const activeEnvToken = String(process.env.CULKIBO_TOKEN || '').trim();
+
+  /** @type {Array<{ path: string, target: string, format: string, action: string, fullPath: string, reason?: string }>} */
+  const results = [];
+  /** @type {string[]} */
+  const written = [];
+  /** @type {string[]} */
+  const skipped = [];
+
+  for (const kit of Object.values(kitResult.kits || {})) {
+    for (const file of (kit.files || [])) {
+      const relPath = String(file.path);
+      const fullPath = path.resolve(dir, relPath);
+      const relCheck = path.relative(dir, fullPath);
+      if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
+        throw new Error(`Ruta de destino fuera del directorio de trabajo: ${relPath}`);
+      }
+      const rawContent = String(file.content || '');
+      if (activeEnvToken.length >= 8 && rawContent.includes(activeEnvToken)) {
+        throw new Error('Bloqueo de seguridad: el archivo generado contiene un token real en claro.');
+      }
+
+      const exists = fs.existsSync(fullPath);
+      let finalContent = rawContent;
+      let action = exists ? 'update' : 'create';
+      /** @type {string | undefined} */
+      let skipReason;
+
+      if (exists && file.format === 'json' && file.mergeKey) {
+        try {
+          const existingObj = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+          const incomingObj = JSON.parse(rawContent);
+          const mergeKey = String(file.mergeKey);
+          const existingBucket = existingObj && typeof existingObj[mergeKey] === 'object' ? existingObj[mergeKey] : {};
+          if (existingBucket && Object.prototype.hasOwnProperty.call(existingBucket, 'culkibo') && !force) {
+            action = 'skip';
+            skipReason = 'culkibo ya existe en el archivo (usa --force para sobrescribir)';
+          } else {
+            const merged = {
+              ...(existingObj && typeof existingObj === 'object' ? existingObj : {}),
+              [mergeKey]: {
+                ...existingBucket,
+                ...(incomingObj[mergeKey] || {})
+              }
+            };
+            finalContent = JSON.stringify(merged, null, 2) + '\n';
+            action = existingBucket && Object.prototype.hasOwnProperty.call(existingBucket, 'culkibo') ? 'overwrite' : 'merge';
+          }
+        } catch (e) {
+          if (!force) {
+            action = 'skip';
+            skipReason = 'JSON existente no parseable (usa --force para sobrescribir)';
+          } else {
+            action = 'overwrite';
+          }
+        }
+      } else if (exists && file.format === 'markdown' && file.markerStart && file.markerEnd) {
+        const existingText = fs.readFileSync(fullPath, 'utf8');
+        const startIdx = existingText.indexOf(file.markerStart);
+        const endIdx = existingText.indexOf(file.markerEnd);
+        if (startIdx >= 0 && endIdx > startIdx) {
+          if (!force) {
+            action = 'skip';
+            skipReason = 'bloque culkibo-mcp-ops ya presente (usa --force para actualizar)';
+          } else {
+            const before = existingText.slice(0, startIdx);
+            const after = existingText.slice(endIdx + file.markerEnd.length).replace(/^\r?\n/, '');
+            finalContent = `${before}${rawContent}${after}`;
+            action = 'overwrite';
+          }
+        } else {
+          const sep = existingText.endsWith('\n') ? '\n' : '\n\n';
+          finalContent = `${existingText}${sep}${rawContent}`;
+          action = 'append';
+        }
+      } else if (exists && file.format === 'toml' && file.sectionHeader) {
+        const existingText = fs.readFileSync(fullPath, 'utf8');
+        if (existingText.includes(file.sectionHeader)) {
+          if (!force) {
+            action = 'skip';
+            skipReason = `${file.sectionHeader} ya presente (usa --force para sobrescribir)`;
+          } else {
+            const sectionRe = /(?:# Culkibo MCP 2026[^\n]*\n(?:#[^\n]*\n)*)?\[mcp_servers\.culkibo\][\s\S]*?(?=\n\[|$)/;
+            finalContent = existingText.replace(sectionRe, rawContent.trimEnd()) + '\n';
+            action = 'overwrite';
+          }
+        } else {
+          const sep = existingText.endsWith('\n') ? '\n' : '\n\n';
+          finalContent = `${existingText}${sep}${rawContent}`;
+          action = 'append';
+        }
+      } else if (exists && !force) {
+        action = 'skip';
+        skipReason = 'archivo ya existente (usa --force para sobrescribir)';
+      }
+
+      if (action === 'skip') {
+        skipped.push(relPath);
+      } else {
+        if (!dryRun) {
+          fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+          fs.writeFileSync(fullPath, finalContent, 'utf8');
+        }
+        written.push(relPath);
+      }
+
+      results.push({
+        path: relPath,
+        target: kit.id,
+        format: file.format,
+        action,
+        fullPath,
+        ...(skipReason ? { reason: skipReason } : {})
+      });
+    }
+  }
+
+  return { directory: dir, dryRun, results, written, skipped };
+}
+
+// culkibo agent-init [target]: generador 1-clic de kits MCP drop-in (Antigravity, Claude Code, Cursor, Windsurf, Codex CLI, VS Code)
+program
+  .command('agent-init [target]')
+  .description('Genera configuraciones MCP 1-clic (antigravity, claude-code, cursor, windsurf, codex, vscode, all) con ?profile=core y ${CULKIBO_TOKEN}')
+  .option('-d, --dir <dir>', 'Directorio destino del workspace', process.cwd())
+  .option('-p, --profile <profile>', 'Perfil MCP de herramientas (core|deploy|ops|security|all)', 'core')
+  .option('--url <serverUrl>', 'URL del servidor Culkibo (por defecto --api-url, CULKIBO_API_URL o http://127.0.0.1:3030)')
+  .option('--project <projectId>', 'ID de proyecto opcional para personalizar CLAUDE.md')
+  .option('--no-ops-guide', 'Omitir el bloque operativo CLAUDE.md al inicializar Claude Code')
+  .option('--dry-run', 'Previsualizar los archivos a generar sin escribir en disco')
+  .option('--force', 'Sobrescribir entradas culkibo existentes')
+  .option('--json', 'Salida JSON estructurada')
+  .action((target = 'all', options) => {
+    try {
+      const targetDir = path.resolve(options.dir || process.cwd());
+      if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
+        throw new Error(`El directorio destino no existe: ${targetDir}`);
+      }
+      const remote = getRemoteConfig(options);
+      const serverUrl = String(options.url || remote.apiUrl || `http://127.0.0.1:${process.env.PORT || 3030}`).trim();
+      const kit = svc.mcpServer.buildAgentKit({
+        target: String(target || 'all'),
+        profile: String(options.profile || 'core'),
+        serverUrl,
+        projectId: options.project ? String(options.project) : null,
+        includeOpsGuide: options.opsGuide !== false
+      });
+
+      const writeRes = writeAgentKitFiles(kit, targetDir, {
+        dryRun: Boolean(options.dryRun),
+        force: Boolean(options.force)
+      });
+
+      const payload = {
+        ok: true,
+        target: kit.target,
+        profile: kit.profile,
+        endpoint: kit.endpoint,
+        tokenPlaceholder: kit.tokenPlaceholder,
+        containsPlaintextSecrets: false,
+        tokenSavings: kit.tokenSavings,
+        dryRun: writeRes.dryRun,
+        directory: writeRes.directory,
+        written: writeRes.written,
+        skipped: writeRes.skipped,
+        files: writeRes.results,
+        kits: kit.kits
+      };
+
+      if (isJsonMode(options)) {
+        return printJson(payload);
+      }
+
+      console.log(`\n\x1b[32m🤖 Culkibo Agent Kit (${kit.target}) — perfil "${kit.profile}"\x1b[0m`);
+      console.log(`   Endpoint:    ${kit.endpoint}`);
+      console.log(`   Contexto:    ${kit.tokenSavings.profileToolsCount}/${kit.tokenSavings.allToolsCount} herramientas (~${(kit.tokenSavings.estimatedTokens / 1000).toFixed(1)}k tok, -${kit.tokenSavings.savedPct}%)`);
+      console.log(`   Token:       placeholder ${kit.tokenPlaceholder} (0 secretos en claro)`);
+      for (const r of writeRes.results) {
+        const verb = r.action === 'skip'
+          ? `\x1b[33momitido\x1b[0m (${r.reason})`
+          : (writeRes.dryRun ? `\x1b[36m[dry-run] ${r.action}\x1b[0m` : `\x1b[32m${r.action}\x1b[0m`);
+        console.log(`   · ${r.path} → ${verb}`);
+      }
+      console.log(`\n   Siguiente paso: export CULKIBO_TOKEN="<tu_token_rbac>" y abre tu agente IA.\n`);
+    } catch (err) {
+      failCli(err, options);
+    }
   });
 
 // ===========================================================================
@@ -2060,5 +2321,6 @@ module.exports = {
   detectLocalStack,
   generateStarterManifest,
   parseEnvAssignments,
-  remoteApiRequest
+  remoteApiRequest,
+  writeAgentKitFiles
 };

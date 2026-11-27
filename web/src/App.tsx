@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
-import { Keyboard, X } from 'lucide-react';
-import { Header, type AppView } from './components/Header';
+import { Keyboard, X, CheckCircle2, AlertCircle, Info } from 'lucide-react';
+import { Header, type AppView, type DaemonHeaderStats } from './components/Header';
 import { ProjectList } from './components/ProjectList';
 import { AuthGate } from './components/AuthGate';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -79,7 +79,24 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 const ViewFallback = () => (
-  <div className="py-16 text-center text-sm text-slate-500">Cargando vista…</div>
+  <div className="space-y-5 animate-pulse" aria-busy="true" aria-label="Cargando vista">
+    <div className="flex items-center justify-between gap-4">
+      <div className="space-y-2">
+        <div className="h-6 w-40 rounded-lg bg-slate-200/80" />
+        <div className="h-3.5 w-64 rounded bg-slate-200/60" />
+      </div>
+      <div className="h-9 w-32 rounded-lg bg-slate-200/70" />
+    </div>
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      {[1, 2, 3].map((i) => (
+        <div key={i} className="h-40 rounded-2xl bg-white border border-slate-200/80 p-4 space-y-3">
+          <div className="h-4 w-28 rounded bg-slate-200/70" />
+          <div className="h-3 w-full rounded bg-slate-100" />
+          <div className="h-3 w-2/3 rounded bg-slate-100" />
+        </div>
+      ))}
+    </div>
+  </div>
 );
 
 export function App() {
@@ -110,6 +127,7 @@ export function App() {
   const [checklistRestoreTick, setChecklistRestoreTick] = useState(0);
 
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [daemonStats, setDaemonStats] = useState<DaemonHeaderStats | null>(null);
   const [toasts, setToasts] = useState<Array<{ id: number; msg: string; kind: ToastKind }>>([]);
   const [aiPulseLabel, setAiPulseLabel] = useState<string | null>(null);
   const [activeSyncCount, setActiveSyncCount] = useState<number>(0);
@@ -159,6 +177,40 @@ export function App() {
       setUnauthorizedHandler(null);
     };
   }, []);
+
+  // Telemetría ligera del daemon (RAM RSS + RTT real) sin polling agresivo
+  useEffect(() => {
+    if (!authenticated) return;
+    let active = true;
+    const sampleDaemon = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
+      api.getSystemStatus()
+        .then((sys) => {
+          if (!active || !sys) return;
+          const latencyMs = typeof performance !== 'undefined' && t0 > 0
+            ? Math.max(1, Math.round(performance.now() - t0))
+            : null;
+          setDaemonStats({
+            memoryMb: typeof sys.memoryUsageMb === 'number' ? sys.memoryUsageMb : null,
+            latencyMs,
+            version: typeof sys.version === 'string' ? sys.version : null,
+            nodeVersion: typeof sys.nodeVersion === 'string' ? sys.nodeVersion : null,
+            uptimeSeconds: typeof sys.uptimeSeconds === 'number' ? sys.uptimeSeconds : null,
+          });
+        })
+        .catch(() => {
+          // silencioso
+        });
+    };
+
+    sampleDaemon();
+    const timer = window.setInterval(sampleDaemon, 30000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [authenticated]);
 
   // Sincroniza cambios de hash (atrás/adelante del navegador)
   useEffect(() => {
@@ -284,7 +336,7 @@ export function App() {
     try {
       const data = await api.getProjects();
       setProjects(data);
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error(e);
     } finally {
       setProjectsLoaded(true);
@@ -569,7 +621,7 @@ export function App() {
   if (sessionOffline) {
     return (
       <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
-        <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl shadow-sm p-6 text-center space-y-4">
+        <div className="culkibo-surface w-full max-w-md rounded-2xl p-6 text-center space-y-4">
           <h1 className="text-base font-semibold text-slate-900">No se pudo conectar con Culkibo</h1>
           <p className="text-xs text-slate-500 leading-relaxed">
             El servidor del plano de control no responde en este momento. Comprueba que el servicio esté activo y vuelve a intentarlo.
@@ -577,7 +629,7 @@ export function App() {
           <button
             type="button"
             onClick={checkSession}
-            className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium transition-colors cursor-pointer"
+            className="culkibo-press px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium transition-colors cursor-pointer"
           >
             Reintentar conexión
           </button>
@@ -595,31 +647,33 @@ export function App() {
       {toasts.length > 0 && (
         <div
           aria-live="polite"
-          className="fixed bottom-5 right-5 z-50 flex flex-col gap-2 items-end pointer-events-none"
+          className="fixed bottom-4 right-4 left-4 sm:left-auto sm:bottom-5 sm:right-5 z-50 flex flex-col gap-2 items-end pointer-events-none"
         >
           {toasts.map((item) => (
             <div
               key={item.id}
               role={item.kind === 'error' ? 'alert' : 'status'}
-              className={`culkibo-modal-enter pointer-events-auto max-w-sm flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg bg-white border text-xs font-medium shadow-lg ${
+              className={`culkibo-toast-enter pointer-events-auto w-full sm:w-auto sm:max-w-sm flex items-center gap-2.5 pl-3.5 pr-2 py-2.5 rounded-xl bg-white border text-xs font-medium shadow-lg ${
                 item.kind === 'error'
-                  ? 'border-red-200 text-red-800'
+                  ? 'border-red-200 text-red-900'
                   : item.kind === 'success'
-                    ? 'border-emerald-200 text-emerald-900'
+                    ? 'border-emerald-200 text-emerald-950'
                     : 'border-slate-200 text-slate-900'
               }`}
             >
-              <span
-                className={`w-2 h-2 rounded-full shrink-0 ${
-                  item.kind === 'error' ? 'bg-red-500' : item.kind === 'success' ? 'bg-emerald-500' : 'bg-slate-900'
-                }`}
-              />
-              <span className="leading-snug">{item.msg}</span>
+              {item.kind === 'error' ? (
+                <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+              ) : item.kind === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              ) : (
+                <Info className="w-4 h-4 text-slate-600 shrink-0" />
+              )}
+              <span className="leading-snug flex-1 min-w-0">{item.msg}</span>
               <button
                 type="button"
                 onClick={() => dismissToast(item.id)}
                 aria-label="Cerrar aviso"
-                className="ml-1 p-0.5 text-slate-400 hover:text-slate-700 rounded cursor-pointer shrink-0"
+                className="inline-flex items-center justify-center w-8 h-8 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer shrink-0"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -639,9 +693,10 @@ export function App() {
         onOpenPalette={() => setPaletteOpen(true)}
         aiPulseLabel={aiPulseLabel}
         activeSyncCount={activeSyncCount}
+        daemonStats={daemonStats}
       />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-7">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-3.5 sm:px-6 lg:px-8 py-6 sm:py-7">
         <ErrorBoundary key={`${activeView}:${activeProjectId || ''}`}>
           <Suspense fallback={<ViewFallback />}>
             {activeView === 'projects' && !activeProjectId && (
@@ -655,6 +710,7 @@ export function App() {
                 onOpenCatalog={() => openCatalog('catalogo')}
                 onOpenDomains={() => handleQuickAction('domain')}
                 onOpenAi={() => navigate('ai')}
+                onOpenSecurity={() => navigate('settings', 'security')}
                 onNotify={showToast}
                 externalCreateTrigger={createProjectTrigger}
                 checklistRestoreTick={checklistRestoreTick}
@@ -756,19 +812,24 @@ export function App() {
         onQuickImport={(src) => openImport(src || 'wordpress')}
         onOpenShortcuts={() => setShortcutsOpen(true)}
         onRestoreChecklist={restoreQuickstartChecklist}
+        onNotify={showToast}
       />
 
       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
 
-      <footer className="border-t border-slate-200 py-4 bg-white mt-auto">
+      <footer className="border-t border-slate-200/90 py-4 bg-white mt-auto">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-2">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold text-slate-800">Culkibo v1.0.0</span>
-            <span>·</span>
+          <div className="flex items-center gap-2 flex-wrap justify-center sm:justify-start">
+            <span className="font-semibold text-slate-800">
+              Culkibo v{daemonStats?.version || '1.1.0'}
+            </span>
+            <span className="text-slate-300">·</span>
             <span>Apache-2.0</span>
+            <span className="text-slate-300">·</span>
+            <span>Zero-Shell Engine</span>
           </div>
-          <div className="flex items-center gap-3 text-slate-400">
-            <span>Caddy</span>
+          <div className="flex items-center gap-3 text-slate-400 flex-wrap justify-center">
+            <span>Caddy HTTP/3</span>
             <span>·</span>
             <span>Live Sync</span>
             <span>·</span>

@@ -30,6 +30,7 @@ const { testCoreBoost } = require('./core-boost.test');
 const testAdversarialFuzz = require('./adversarial-fuzz.test');
 const testCliDx = require('./cli-dx.test');
 const testObservabilityAlerts = require('./observability-alerts.test');
+const testEditionAndBola = require('./edition-and-bola.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -85,6 +86,7 @@ async function runAll() {
     { name: 'Adversarial Fuzz & Crash Recovery', fn: testAdversarialFuzz },
     { name: 'CLI DX (init, up, logs, env, exec, releases, rollback)', fn: testCliDx },
     { name: 'Observability Alerts, Metrics History & Topology', fn: testObservabilityAlerts },
+    { name: 'Edition Ed25519 Verifier, CronParser Anti-DoS, Project Secrets & BOLA/IDOR Closure', fn: testEditionAndBola },
   ];
 
   for (const suite of suites) {

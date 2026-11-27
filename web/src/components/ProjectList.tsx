@@ -18,8 +18,17 @@ import {
   Square,
   Loader2,
   PauseCircle,
+  Rocket,
+  Terminal,
+  Cpu,
+  Database,
+  Copy,
+  Check,
+  Bot,
+  Sparkles,
 } from 'lucide-react';
 import { api, type Project } from '../lib/api';
+import { copyToClipboard } from '../lib/clipboard';
 import { CreateProjectModal } from './CreateProjectModal';
 import { OnboardingChecklist } from './OnboardingChecklist';
 
@@ -30,6 +39,7 @@ interface ProjectListProps {
   onOpenCatalog?: () => void;
   onOpenDomains?: () => void;
   onOpenAi?: () => void;
+  onOpenSecurity?: () => void;
   projects?: Project[];
   projectsLoading?: boolean;
   onRefreshProjects?: () => void;
@@ -46,6 +56,7 @@ function getHonestStatus(p: Project): {
   label: string;
   pillClass: string;
   dotClass: string;
+  isLive?: boolean;
   isMaintenance?: boolean;
 } {
   if (p.maintenanceMode) {
@@ -61,16 +72,17 @@ function getHonestStatus(p: Project): {
       label: 'En producción',
       pillClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
       dotClass: 'bg-emerald-500',
+      isLive: true,
     };
   }
   if (p.localRunning) {
     return {
-      label: p.localPort ? `En local :${p.localPort}` : 'En local',
+      label: p.localPort ? `Local :${p.localPort}` : 'En local',
       pillClass: 'bg-amber-50 text-amber-800 border-amber-200',
       dotClass: 'bg-amber-500',
     };
   }
-  if (p.status === 'hibernated') {
+  if (p.status === 'hibernated' || p.status === 'sleeping') {
     return {
       label: 'Hibernado',
       pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
@@ -85,7 +97,7 @@ function getHonestStatus(p: Project): {
     };
   }
   return {
-    label: 'Sin iniciar',
+    label: 'Listo',
     pillClass: 'bg-slate-100 text-slate-600 border-slate-200',
     dotClass: 'bg-slate-400',
   };
@@ -94,14 +106,20 @@ function getHonestStatus(p: Project): {
 interface ProjectMetadata {
   cleanGit: string | null;
   monogram: string;
+  branch: string | null;
+  totalDbs: number;
+  ramLabel: string | null;
+  cpuLabel: string | null;
+  shortCommit: string | null;
+  lastDeployShort: string | null;
   summaryTag: string;
 }
 
 function getProjectMetadata(p: Project): ProjectMetadata {
   let rawGit = p.gitRepo || '';
   if (!rawGit && p.resources && Array.isArray(p.resources)) {
-    const resWithGit = p.resources.find((r: any) => r.gitRepo);
-    if (resWithGit) rawGit = resWithGit.gitRepo;
+    const resWithGit = p.resources.find((r: { gitRepo?: string }) => Boolean(r?.gitRepo));
+    if (resWithGit?.gitRepo) rawGit = resWithGit.gitRepo;
   }
 
   const cleanGit = rawGit
@@ -120,18 +138,40 @@ function getProjectMetadata(p: Project): ProjectMetadata {
     : (words[0] || 'PR').slice(0, 2).toUpperCase();
 
   const linkedDbs = Array.isArray(p.linkedDatabaseIds) ? p.linkedDatabaseIds.length : 0;
-  const embeddedDbs = (p.resources || []).filter((r: any) => r.type === 'database').length;
+  const embeddedDbs = (p.resources || []).filter((r: { type?: string }) => r?.type === 'database').length;
   const totalDbs = linkedDbs + embeddedDbs;
+
+  const ramLabel = typeof p.memoryMb === 'number' && p.memoryMb > 0
+    ? p.memoryMb >= 1024
+      ? `${(p.memoryMb / 1024).toFixed(p.memoryMb % 1024 === 0 ? 0 : 1)} GB`
+      : `${p.memoryMb} MB`
+    : null;
+  const cpuLabel = p.cpus !== undefined && p.cpus !== null && String(p.cpus).trim() !== ''
+    ? `${p.cpus} vCPU`
+    : null;
+  const shortCommit = p.lastCommit?.sha ? p.lastCommit.sha.slice(0, 7) : null;
+  const lastDeployShort = p.lastDeployedAt
+    ? new Date(p.lastDeployedAt).toLocaleDateString('es-ES', { day: '2-digit', month: 'short' })
+    : null;
 
   const parts: string[] = [];
   if (p.gitBranch) parts.push(p.gitBranch);
+  if (ramLabel) parts.push(ramLabel);
   if (totalDbs > 0) parts.push(`${totalDbs} BD`);
-  if (p.lastDeployedAt) {
-    parts.push(`Desplegado ${new Date(p.lastDeployedAt).toLocaleDateString('es-ES', { day: '2-digit', month: 'short' })}`);
-  }
+  if (lastDeployShort) parts.push(`Desplegado ${lastDeployShort}`);
   const summaryTag = parts.join(' · ') || 'Sin desplegar todavía';
 
-  return { cleanGit, monogram, summaryTag };
+  return {
+    cleanGit,
+    monogram,
+    branch: p.gitBranch || null,
+    totalDbs,
+    ramLabel,
+    cpuLabel,
+    shortCommit,
+    lastDeployShort,
+    summaryTag,
+  };
 }
 
 export const ProjectList: React.FC<ProjectListProps> = ({
@@ -141,6 +181,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   onOpenCatalog,
   onOpenDomains,
   onOpenAi,
+  onOpenSecurity,
   projects: parentProjects,
   projectsLoading,
   onRefreshProjects,
@@ -152,6 +193,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   const [loading, setLoading] = useState<boolean>(() => !Array.isArray(parentProjects));
   const [startingLocalId, setStartingLocalId] = useState<string | null>(null);
   const [stoppingLocalId, setStoppingLocalId] = useState<string | null>(null);
+  const [deployingId, setDeployingId] = useState<string | null>(null);
+  const [copiedDomainId, setCopiedDomainId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const deferredSearch = useDeferredValue(search);
   const [filter, setFilter] = useState<'all' | 'active' | 'hibernated' | 'local'>('all');
@@ -224,18 +267,21 @@ export const ProjectList: React.FC<ProjectListProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const previewHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+
   const handleStartLocal = async (id: string) => {
     try {
       setStartingLocalId(id);
-      const res: any = await api.startLocal(id);
+      const res = await api.startLocal(id);
       fetchProjects();
-      const port = res?.localPort || res?.port;
+      const port = res?.localPort;
       onNotify?.(
         port ? `Iniciado en http://${previewHost}:${port}` : 'Proyecto iniciado en local',
         'success'
       );
-    } catch (err: any) {
-      onNotify?.(err?.message || 'Error al iniciar en local', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Error al iniciar en local';
+      onNotify?.(msg, 'error');
       fetchProjects();
     } finally {
       setStartingLocalId(null);
@@ -248,12 +294,35 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       await api.stopProject(id);
       fetchProjects();
       onNotify?.('Proyecto detenido y puerto liberado', 'info');
-    } catch (err: any) {
-      onNotify?.(err?.message || 'Error al detener el proyecto', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Error al detener el proyecto';
+      onNotify?.(msg, 'error');
       fetchProjects();
     } finally {
       setStoppingLocalId(null);
     }
+  };
+
+  const handleQuickDeploy = async (p: Project) => {
+    try {
+      setDeployingId(p.id);
+      await api.startDeploy(p.id);
+      onNotify?.(`Despliegue iniciado para ${p.name}`, 'success');
+      onSelectProject(p.id, 'deploy');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'No se pudo iniciar el despliegue';
+      onNotify?.(msg, 'error');
+    } finally {
+      setDeployingId(null);
+    }
+  };
+
+  const handleCopyDomain = async (id: string, domain: string) => {
+    const ok = await copyToClipboard(`https://${domain}`);
+    if (!ok) return;
+    setCopiedDomainId(id);
+    window.setTimeout(() => setCopiedDomainId(null), 1600);
+    onNotify?.(`URL copiada: https://${domain}`, 'success');
   };
 
   const projects = localProjects;
@@ -306,20 +375,19 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       });
   }, [projects, metadataMap, filter, deferredSearch, sortBy]);
 
-  const previewHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
   const isLoading = loading || Boolean(projectsLoading);
 
   return (
     <div className="space-y-5">
       {/* Cabecera limpia sobre el lienzo */}
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
-        <div>
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Proyectos</h1>
           <p className="text-sm text-slate-500 mt-1 tabular-nums">
             {isLoading && projects.length === 0
               ? 'Cargando espacio de trabajo…'
               : stats.total === 0
-                ? 'Despliega aplicaciones, migra WordPress y publica con HTTPS automático.'
+                ? 'Despliega desde Git, migra Coolify en 1 clic o instala 140+ apps con HTTPS automático.'
                 : `${stats.total} ${stats.total === 1 ? 'proyecto' : 'proyectos'} · ${stats.active} ${stats.active === 1 ? 'activo' : 'activos'} · ${stats.totalDomains} ${stats.totalDomains === 1 ? 'dominio' : 'dominios'}${stats.local > 0 ? ` · ${stats.local} en local` : ''}`}
           </p>
         </div>
@@ -328,7 +396,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
           <button
             type="button"
             onClick={onImportCoolify}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 transition-colors cursor-pointer"
+            className="culkibo-press inline-flex items-center gap-1.5 min-h-[44px] sm:min-h-[36px] px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 shadow-2xs cursor-pointer"
           >
             <Download className="w-3.5 h-3.5 text-slate-500" />
             <span>Importar o migrar</span>
@@ -337,7 +405,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
           <button
             type="button"
             onClick={() => setShowCreateModal(true)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 transition-colors cursor-pointer"
+            className="culkibo-press inline-flex items-center gap-1.5 min-h-[44px] sm:min-h-[36px] px-3.5 py-2 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 shadow-xs cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
             <span>Nuevo proyecto</span>
@@ -345,7 +413,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         </div>
       </div>
 
-      {/* Rail compacto de puesta en marcha */}
+      {/* Guía de puesta en marcha inteligente (<2 min) */}
       <OnboardingChecklist
         projectsCount={stats.total}
         domainsCount={stats.totalDomains}
@@ -355,11 +423,12 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         onOpenCatalog={onOpenCatalog || onImportCoolify}
         onOpenDomains={onOpenDomains || (() => {})}
         onOpenAi={onOpenAi || (() => {})}
+        onOpenSecurity={onOpenSecurity}
         onNotify={onNotify}
         restoreTick={checklistRestoreTick}
       />
 
-      {/* Barra de búsqueda y filtros directa sobre el lienzo (solo cuando hay proyectos) */}
+      {/* Barra de búsqueda y filtros (solo cuando hay proyectos) */}
       {projects.length > 0 && (
         <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-2.5">
           <div className="relative flex-1 max-w-md">
@@ -370,26 +439,26 @@ export const ProjectList: React.FC<ProjectListProps> = ({
               placeholder="Buscar proyecto, repositorio o dominio…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-full pl-9 pr-10 py-1.5 bg-white border border-slate-200 rounded-lg text-sm text-slate-900 placeholder:text-slate-400"
+              className="w-full min-h-[44px] sm:min-h-[36px] pl-9 pr-10 py-1.5 bg-white border border-slate-200 rounded-lg text-sm text-slate-900 placeholder:text-slate-400"
             />
             {search ? (
               <button
                 type="button"
                 onClick={() => setSearch('')}
                 aria-label="Limpiar búsqueda"
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
             ) : (
-              <kbd className="hidden sm:inline-flex items-center absolute right-2.5 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-mono text-slate-400 bg-slate-50 border border-slate-200 rounded">
+              <kbd className="culkibo-kbd hidden sm:inline-flex items-center absolute right-2.5 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-medium text-slate-400 bg-slate-50 border border-slate-200 rounded">
                 /
               </kbd>
             )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2 justify-between lg:justify-end">
-            <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs overflow-x-auto">
+            <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200/90 text-xs overflow-x-auto no-scrollbar max-w-full">
               {([
                 { id: 'all', label: `Todos (${stats.total})` },
                 { id: 'active', label: `Activos (${stats.active})` },
@@ -400,7 +469,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                   key={pill.id}
                   type="button"
                   onClick={() => setFilter(pill.id)}
-                  className={`px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap tabular-nums ${
+                  className={`px-2.5 py-1.5 sm:py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap tabular-nums ${
                     filter === pill.id
                       ? 'bg-white text-slate-900 shadow-2xs'
                       : 'text-slate-600 hover:text-slate-900'
@@ -411,51 +480,66 @@ export const ProjectList: React.FC<ProjectListProps> = ({
               ))}
             </div>
 
-            <select
-              aria-label="Ordenar proyectos"
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value as any)}
-              className="bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium rounded-lg px-2.5 py-1.5 cursor-pointer"
-            >
-              <option value="recent">Más recientes</option>
-              <option value="name">Nombre (A–Z)</option>
-              <option value="domains">Más dominios</option>
-              <option value="status">Estado</option>
-            </select>
+            <div className="flex items-center gap-2">
+              <select
+                aria-label="Ordenar proyectos"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as 'recent' | 'name' | 'domains' | 'status')}
+                className="bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium rounded-lg px-2.5 py-1.5 min-h-[36px] cursor-pointer"
+              >
+                <option value="recent">Más recientes</option>
+                <option value="name">Nombre (A–Z)</option>
+                <option value="domains">Más dominios</option>
+                <option value="status">Estado</option>
+              </select>
 
-            <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200">
-              <button
-                type="button"
-                onClick={() => setView('grid')}
-                aria-label="Vista en cuadrícula"
-                title="Vista en cuadrícula"
-                className={`p-1.5 rounded-md transition-colors cursor-pointer ${
-                  view === 'grid' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-400 hover:text-slate-700'
-                }`}
-              >
-                <LayoutGrid className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setView('table')}
-                aria-label="Vista en tabla"
-                title="Vista en tabla"
-                className={`p-1.5 rounded-md transition-colors cursor-pointer ${
-                  view === 'table' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-400 hover:text-slate-700'
-                }`}
-              >
-                <List className="w-3.5 h-3.5" />
-              </button>
+              <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200/90">
+                <button
+                  type="button"
+                  onClick={() => setView('grid')}
+                  aria-label="Vista en cuadrícula"
+                  title="Vista en cuadrícula"
+                  className={`p-1.5 rounded-md transition-colors cursor-pointer ${
+                    view === 'grid' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-400 hover:text-slate-700'
+                  }`}
+                >
+                  <LayoutGrid className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setView('table')}
+                  aria-label="Vista en tabla"
+                  title="Vista en tabla"
+                  className={`p-1.5 rounded-md transition-colors cursor-pointer ${
+                    view === 'table' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-400 hover:text-slate-700'
+                  }`}
+                >
+                  <List className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Listado */}
+      {/* Listado de proyectos */}
       {isLoading && projects.length === 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="bg-white border border-slate-200 rounded-xl p-5 h-[180px] animate-pulse" />
+            <div
+              key={i}
+              className="bg-white border border-slate-200 rounded-2xl p-5 h-[204px] animate-pulse space-y-4"
+            >
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-200/80" />
+                <div className="space-y-2 flex-1">
+                  <div className="h-3.5 w-28 rounded bg-slate-200/80" />
+                  <div className="h-3 w-40 rounded bg-slate-100" />
+                </div>
+              </div>
+              <div className="h-7 w-44 rounded-lg bg-slate-100" />
+              <div className="h-3 w-36 rounded bg-slate-100" />
+            </div>
           ))}
         </div>
       ) : filtered.length > 0 && view === 'grid' ? (
@@ -463,16 +547,17 @@ export const ProjectList: React.FC<ProjectListProps> = ({
           {filtered.map((p) => {
             const meta = metadataMap.get(p.id) || getProjectMetadata(p);
             const isStartingThisLocal = startingLocalId === p.id;
+            const isDeployingThis = deployingId === p.id;
             const statusMeta = getHonestStatus(p);
 
             return (
               <article
                 key={p.id}
-                className="group bg-white border border-slate-200 hover:border-slate-300 rounded-xl p-4 shadow-2xs hover:shadow-xs transition-all flex flex-col justify-between gap-4"
+                className="culkibo-card group rounded-2xl p-4 flex flex-col justify-between gap-4 min-w-0"
               >
-                {/* Señal 1: Identidad + Estado */}
-                <div className="space-y-3">
-                  <div className="flex items-start justify-between gap-3">
+                {/* Bloque superior: Identidad + Estado + Dominio + Telemetría */}
+                <div className="space-y-3 min-w-0">
+                  <div className="flex items-start justify-between gap-2.5">
                     <button
                       type="button"
                       onClick={() => onSelectProject(p.id)}
@@ -480,7 +565,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                     >
                       <span
                         aria-hidden="true"
-                        className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 bg-slate-900 text-white text-xs font-semibold tracking-tight font-mono"
+                        className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 bg-slate-900 text-white text-xs font-semibold tracking-tight font-mono shadow-2xs"
                       >
                         {meta.monogram}
                       </span>
@@ -492,12 +577,16 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                           {meta.cleanGit ? (
                             <>
                               <GitBranch className="w-3 h-3 text-slate-400 shrink-0" />
-                              <span className="truncate max-w-[170px]" title={meta.cleanGit}>{meta.cleanGit}</span>
+                              <span className="truncate max-w-[165px]" title={meta.cleanGit}>
+                                {meta.cleanGit}
+                              </span>
                             </>
                           ) : p.localPath ? (
-                            <span className="truncate max-w-[170px]" title={p.localPath}>{p.localPath}</span>
+                            <span className="truncate max-w-[165px]" title={p.localPath}>
+                              {p.localPath}
+                            </span>
                           ) : (
-                            <span className="font-sans text-slate-400">Carpeta local / sin Git</span>
+                            <span className="font-sans text-slate-400">Proyecto local</span>
                           )}
                         </span>
                       </span>
@@ -509,119 +598,206 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                       {statusMeta.isMaintenance ? (
                         <PauseCircle className="w-3 h-3 text-amber-600" />
                       ) : (
-                        <span className={`w-1.5 h-1.5 rounded-full ${statusMeta.dotClass}`} />
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full ${statusMeta.dotClass} ${
+                            statusMeta.isLive ? 'culkibo-dot-live' : ''
+                          }`}
+                        />
                       )}
                       {statusMeta.label}
                     </span>
                   </div>
 
-                  {/* Señal 2: Dominio conectado */}
-                  <div className="min-h-[26px] flex items-center justify-between gap-2">
+                  {/* Dominio HTTPS conectado + copia en 1 clic */}
+                  <div className="min-h-[30px] flex items-center justify-between gap-2 min-w-0">
                     {p.domains && p.domains.length > 0 ? (
-                      <div className="flex items-center gap-1.5 min-w-0">
+                      <div className="flex items-center gap-1 min-w-0 max-w-full">
                         <a
                           href={`https://${p.domains[0]}`}
                           target="_blank"
                           rel="noreferrer"
-                          className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-mono text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 transition-colors max-w-[220px] truncate"
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200/90 transition-colors max-w-[215px] truncate"
                           title={`Abrir https://${p.domains[0]}`}
                         >
                           <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
                           <span className="truncate">{p.domains[0]}</span>
                           <ExternalLink className="w-2.5 h-2.5 text-slate-400 shrink-0" />
                         </a>
+                        <button
+                          type="button"
+                          onClick={() => void handleCopyDomain(p.id, p.domains[0])}
+                          aria-label={`Copiar https://${p.domains[0]}`}
+                          title="Copiar URL HTTPS"
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer shrink-0"
+                        >
+                          {copiedDomainId === p.id ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-600" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
                         {p.domains.length > 1 && (
-                          <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                          <span className="text-[11px] font-mono text-slate-400 tabular-nums shrink-0">
                             +{p.domains.length - 1}
                           </span>
                         )}
                       </div>
+                    ) : p.localRunning && p.localPort ? (
+                      <a
+                        href={`http://${previewHost}:${p.localPort}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200 transition-colors tabular-nums"
+                      >
+                        <Zap className="w-3 h-3 text-amber-600 shrink-0" />
+                        <span>http://{previewHost}:{p.localPort}</span>
+                        <ExternalLink className="w-2.5 h-2.5 text-amber-600/80 shrink-0" />
+                      </a>
                     ) : (
-                      <span className="inline-flex items-center gap-1.5 text-xs text-slate-400">
+                      <button
+                        type="button"
+                        onClick={() => onSelectProject(p.id, 'domains')}
+                        className="inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
+                      >
                         <Globe className="w-3.5 h-3.5 text-slate-300" />
-                        {p.localRunning ? 'Solo vista previa local' : 'Sin dominio conectado'}
-                      </span>
+                        <span>Conectar dominio HTTPS</span>
+                      </button>
                     )}
                   </div>
 
-                  {/* Señal 3: Resumen único de rama / BD / último deploy */}
-                  <p className="text-xs text-slate-500 truncate tabular-nums">
-                    {meta.summaryTag}
-                  </p>
+                  {/* Badges reales de telemetría/runtime (cero datos inventados) */}
+                  <div className="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-500 tabular-nums">
+                    {meta.branch && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200/80 font-mono text-slate-600">
+                        <GitBranch className="w-2.5 h-2.5 text-slate-400" />
+                        {meta.branch}
+                      </span>
+                    )}
+                    {(meta.ramLabel || meta.cpuLabel) && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200/80 font-mono text-slate-600">
+                        <Cpu className="w-2.5 h-2.5 text-slate-400" />
+                        {[meta.ramLabel, meta.cpuLabel].filter(Boolean).join(' · ')}
+                      </span>
+                    )}
+                    {meta.totalDbs > 0 && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200/80 font-mono text-slate-600">
+                        <Database className="w-2.5 h-2.5 text-slate-400" />
+                        {meta.totalDbs} BD
+                      </span>
+                    )}
+                    {meta.shortCommit && (
+                      <span className="px-1.5 py-0.5 rounded-md bg-slate-50 border border-slate-200/80 font-mono text-slate-500">
+                        #{meta.shortCommit}
+                      </span>
+                    )}
+                    {meta.lastDeployShort ? (
+                      <span className="text-slate-400 ml-auto">{meta.lastDeployShort}</span>
+                    ) : (
+                      !meta.branch && !meta.ramLabel && meta.totalDbs === 0 && (
+                        <span className="text-slate-400">Sin desplegar todavía</span>
+                      )
+                    )}
+                  </div>
                 </div>
 
-                {/* Señal 4: Barra de acción limpia sin botones anidados */}
-                <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
-                  {p.localRunning ? (
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {p.localPort && (
-                        <a
-                          href={`http://${previewHost}:${p.localPort}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          title={`Abrir vista previa local en http://${previewHost}:${p.localPort}`}
-                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors font-mono tabular-nums"
-                        >
-                          <Zap className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                          <span>Abrir :{p.localPort}</span>
-                          <ExternalLink className="w-3 h-3 text-amber-600/80 shrink-0" />
-                        </a>
-                      )}
+                {/* Barra de acciones 1-clic (Deploy / Local + Logs + Sync + Gestionar) */}
+                <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-1.5">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    {p.localRunning ? (
                       <button
                         type="button"
                         onClick={() => void handleStopLocal(p.id)}
                         disabled={stoppingLocalId === p.id}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg cursor-pointer disabled:opacity-50"
+                        className="culkibo-press inline-flex items-center gap-1.5 min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg cursor-pointer disabled:opacity-50"
                       >
                         <Square className="w-3 h-3 fill-red-600 text-red-600" />
                         <span>{stoppingLocalId === p.id ? 'Parando…' : 'Detener'}</span>
                       </button>
-                    </div>
-                  ) : (
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void handleQuickDeploy(p)}
+                        disabled={isDeployingThis}
+                        title="Desplegar a producción (zero-downtime)"
+                        className="culkibo-press inline-flex items-center gap-1.5 min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg cursor-pointer disabled:opacity-50"
+                      >
+                        {isDeployingThis ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Rocket className="w-3.5 h-3.5" />
+                        )}
+                        <span>{isDeployingThis ? 'Desplegando…' : 'Desplegar'}</span>
+                      </button>
+                    )}
+
+                    {!p.localRunning && (
+                      <button
+                        type="button"
+                        onClick={() => void handleStartLocal(p.id)}
+                        disabled={isStartingThisLocal}
+                        aria-label={`Iniciar vista previa local de ${p.name}`}
+                        title="Iniciar vista previa local"
+                        className="culkibo-press inline-flex items-center justify-center w-9 h-9 rounded-lg text-slate-600 bg-slate-50 hover:bg-slate-100 border border-slate-200/80 cursor-pointer disabled:opacity-50"
+                      >
+                        {isStartingThisLocal ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Play className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-0.5 shrink-0">
                     <button
                       type="button"
-                      onClick={() => void handleStartLocal(p.id)}
-                      disabled={isStartingThisLocal}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg cursor-pointer disabled:opacity-50"
+                      onClick={() => onSelectProject(p.id, 'deploy')}
+                      aria-label={`Ver logs de ${p.name}`}
+                      title="Logs y despliegues"
+                      className="inline-flex items-center justify-center w-9 h-9 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors cursor-pointer"
                     >
-                      {isStartingThisLocal ? (
-                        <Loader2 className="w-3.5 h-3.5 text-slate-600 animate-spin" />
-                      ) : (
-                        <Play className="w-3.5 h-3.5 text-slate-600" />
-                      )}
-                      <span>{isStartingThisLocal ? 'Iniciando…' : 'Iniciar local'}</span>
+                      <Terminal className="w-3.5 h-3.5" />
                     </button>
-                  )}
-
-                  <button
-                    type="button"
-                    onClick={() => onSelectProject(p.id)}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors cursor-pointer"
-                  >
-                    <span>Gestionar</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => onSelectProject(p.id, 'live')}
+                      aria-label={`Abrir Live Sync de ${p.name}`}
+                      title="Live Sync <10ms"
+                      className="inline-flex items-center justify-center w-9 h-9 rounded-lg text-slate-500 hover:text-amber-600 hover:bg-amber-50 transition-colors cursor-pointer"
+                    >
+                      <Zap className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onSelectProject(p.id)}
+                      className="inline-flex items-center gap-1 min-h-[36px] px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors cursor-pointer"
+                    >
+                      <span>Abrir</span>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
               </article>
             );
           })}
         </div>
       ) : filtered.length > 0 ? (
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="culkibo-surface rounded-2xl overflow-hidden">
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-slate-200">
               <thead className="bg-slate-50/80">
                 <tr>
                   <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Proyecto</th>
                   <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Estado</th>
-                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Resumen</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Runtime</th>
                   <th className="px-5 py-3 text-left text-xs font-medium text-slate-500">Dominio</th>
-                  <th className="px-5 py-3 text-right text-xs font-medium text-slate-500">Acción</th>
+                  <th className="px-5 py-3 text-right text-xs font-medium text-slate-500">Acciones</th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-slate-100">
                 {filtered.map((p) => {
                   const meta = metadataMap.get(p.id) || getProjectMetadata(p);
+                  const s = getHonestStatus(p);
                   return (
                     <tr
                       key={p.id}
@@ -633,7 +809,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                           onSelectProject(p.id);
                         }
                       }}
-                      className="hover:bg-slate-50 focus:bg-slate-50 transition-colors cursor-pointer group outline-none"
+                      className="hover:bg-slate-50/90 focus:bg-slate-50 transition-colors cursor-pointer group outline-none"
                     >
                       <td className="px-5 py-3.5 whitespace-nowrap">
                         <div className="flex items-center gap-3">
@@ -649,22 +825,19 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         </div>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap">
-                        {(() => {
-                          const s = getHonestStatus(p);
-                          return (
-                            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium border tabular-nums ${s.pillClass}`}>
-                              <span className={`w-1.5 h-1.5 rounded-full ${s.dotClass}`} />
-                              {s.label}
-                            </span>
-                          );
-                        })()}
+                        <span
+                          className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium border tabular-nums ${s.pillClass}`}
+                        >
+                          <span className={`w-1.5 h-1.5 rounded-full ${s.dotClass} ${s.isLive ? 'culkibo-dot-live' : ''}`} />
+                          {s.label}
+                        </span>
                       </td>
-                      <td className="px-5 py-3.5 whitespace-nowrap text-xs text-slate-600 tabular-nums">
+                      <td className="px-5 py-3.5 whitespace-nowrap text-xs text-slate-600 tabular-nums font-mono">
                         {meta.summaryTag}
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap">
                         {p.domains && p.domains.length > 0 ? (
-                          <span className="font-mono text-xs text-slate-700 bg-slate-50 border border-slate-200 px-2 py-0.5 rounded inline-flex items-center gap-1">
+                          <span className="font-mono text-xs text-slate-700 bg-slate-50 border border-slate-200 px-2 py-0.5 rounded-md inline-flex items-center gap-1">
                             <Lock className="w-2.5 h-2.5 text-emerald-600" />
                             {p.domains[0]}
                           </span>
@@ -673,10 +846,40 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         )}
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap text-right">
-                        <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-500 group-hover:text-slate-900">
-                          <span>Gestionar</span>
-                          <ArrowRight className="w-3.5 h-3.5" />
-                        </span>
+                        <div
+                          className="inline-flex items-center gap-1"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => void handleQuickDeploy(p)}
+                            disabled={deployingId === p.id}
+                            title="Desplegar"
+                            className="p-1.5 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 cursor-pointer disabled:opacity-50"
+                          >
+                            {deployingId === p.id ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Rocket className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onSelectProject(p.id, 'live')}
+                            title="Live Sync"
+                            className="p-1.5 rounded-lg text-slate-500 hover:text-amber-600 hover:bg-amber-50 cursor-pointer"
+                          >
+                            <Zap className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onSelectProject(p.id)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 cursor-pointer"
+                          >
+                            <span>Abrir</span>
+                            <ArrowRight className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -687,68 +890,150 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         </div>
       ) : null}
 
-      {/* Estado vacío calmado y enfocado */}
+      {/* Estado vacío hero con 3 caminos cristalinos */}
       {!isLoading && filtered.length === 0 && (
-        <div className="bg-white border border-slate-200 rounded-xl p-10 text-center max-w-xl mx-auto">
-          {projects.length === 0 ? (
-            <div className="space-y-4">
-              <div className="w-11 h-11 rounded-xl bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center mx-auto">
-                <Boxes className="w-5 h-5" />
+        projects.length === 0 ? (
+          <section className="culkibo-surface rounded-2xl p-6 sm:p-8 space-y-6">
+            <div className="max-w-xl mx-auto text-center space-y-2">
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200/80 text-[11px] font-medium text-slate-700">
+                <Sparkles className="w-3 h-3 text-amber-500" />
+                <span>Zero-Shell · &lt;60 MB RAM · HTTPS Automático</span>
               </div>
-              <div>
-                <h3 className="text-base font-semibold text-slate-900">Empieza con tu primer proyecto</h3>
-                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">
-                  Conecta un repositorio Git, migra una web WordPress en minutos o importa stacks desde Coolify, Vercel, Railway o Docker Compose.
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => setShowCreateModal(true)}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Crear proyecto</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={onOpenWordPress || onImportCoolify}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 cursor-pointer"
-                >
-                  <Globe className="w-3.5 h-3.5 text-slate-500" />
-                  <span>Migrar WordPress</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={onImportCoolify}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 cursor-pointer"
-                >
-                  <Download className="w-3.5 h-3.5 text-slate-500" />
-                  <span>Importar plataforma</span>
-                </button>
-              </div>
+              <h2 className="text-xl sm:text-2xl font-semibold text-slate-900 tracking-tight">
+                Elige cómo empezar en 30 segundos
+              </h2>
+              <p className="text-sm text-slate-500 leading-relaxed">
+                Migra tu infraestructura actual sin dolor, despliega un repositorio Git con Live Sync o instala un stack del catálogo curado.
+              </p>
             </div>
-          ) : (
-            <div className="space-y-3">
-              <div className="w-10 h-10 rounded-lg bg-slate-100 text-slate-400 flex items-center justify-center mx-auto">
-                <Search className="w-5 h-5" />
-              </div>
-              <h3 className="text-sm font-semibold text-slate-900">
-                {search.trim()
-                  ? `No hay proyectos que coincidan con «${search.trim()}»`
-                  : 'No hay proyectos en este filtro'}
-              </h3>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {/* Camino 1: Importar desde Coolify */}
               <button
                 type="button"
-                onClick={() => { setSearch(''); setFilter('all'); }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
+                onClick={onImportCoolify}
+                className="culkibo-card culkibo-stagger-1 culkibo-press text-left rounded-2xl p-5 flex flex-col justify-between gap-4 cursor-pointer group"
               >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Restablecer filtros</span>
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="w-10 h-10 rounded-xl bg-amber-50 border border-amber-200/80 text-amber-700 flex items-center justify-center">
+                      <Download className="w-5 h-5" />
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200/80 text-[11px] font-medium">
+                      1-Clic
+                    </span>
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-900">Importar desde Coolify</h3>
+                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                      Trae tus apps, bases de datos y variables mágicas con traducción automática de Traefik a Caddy.
+                    </p>
+                  </div>
+                </div>
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 group-hover:translate-x-0.5 transition-transform">
+                  <span>Abrir migrador Coolify</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </span>
+              </button>
+
+              {/* Camino 2: Desplegar repositorio Git */}
+              <button
+                type="button"
+                onClick={() => setShowCreateModal(true)}
+                className="culkibo-card culkibo-stagger-2 culkibo-press text-left rounded-2xl p-5 flex flex-col justify-between gap-4 cursor-pointer group border-slate-900/20"
+              >
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="w-10 h-10 rounded-xl bg-slate-900 text-white flex items-center justify-center">
+                      <GitBranch className="w-5 h-5" />
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200 text-[11px] font-medium">
+                      Live Sync &lt;10ms
+                    </span>
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-900">Desplegar repositorio Git</h3>
+                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                      Conecta GitHub, GitLab o una carpeta local. Detección automática de stack, build BuildKit y SSL nativo.
+                    </p>
+                  </div>
+                </div>
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 group-hover:translate-x-0.5 transition-transform">
+                  <span>Crear nuevo proyecto</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </span>
+              </button>
+
+              {/* Camino 3: Catálogo 1-Clic 140+ Apps */}
+              <button
+                type="button"
+                onClick={onOpenCatalog || onImportCoolify}
+                className="culkibo-card culkibo-stagger-3 culkibo-press text-left rounded-2xl p-5 flex flex-col justify-between gap-4 cursor-pointer group"
+              >
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="w-10 h-10 rounded-xl bg-emerald-50 border border-emerald-200/80 text-emerald-700 flex items-center justify-center">
+                      <Boxes className="w-5 h-5" />
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200/80 text-[11px] font-medium tabular-nums">
+                      140+ Apps
+                    </span>
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-900">Catálogo 1-Clic (140+ Apps)</h3>
+                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                      WordPress, n8n, Langfuse, Dify, Authentik, Ghost, PostgreSQL… imágenes pineadas sin <code className="font-mono">docker.sock</code>.
+                    </p>
+                  </div>
+                </div>
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 group-hover:translate-x-0.5 transition-transform">
+                  <span>Explorar catálogo</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </span>
               </button>
             </div>
-          )}
-        </div>
+
+            <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-center gap-x-5 gap-y-2 text-xs text-slate-500">
+              <button
+                type="button"
+                onClick={onOpenWordPress || onImportCoolify}
+                className="inline-flex items-center gap-1.5 hover:text-slate-900 transition-colors cursor-pointer"
+              >
+                <Globe className="w-3.5 h-3.5 text-slate-400" />
+                <span>Migrar WordPress sin cortes</span>
+              </button>
+              {onOpenAi && (
+                <button
+                  type="button"
+                  onClick={onOpenAi}
+                  className="inline-flex items-center gap-1.5 hover:text-slate-900 transition-colors cursor-pointer"
+                >
+                  <Bot className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Conectar Claude Code / Antigravity MCP</span>
+                </button>
+              )}
+            </div>
+          </section>
+        ) : (
+          <div className="culkibo-surface rounded-2xl p-10 text-center max-w-lg mx-auto space-y-3">
+            <div className="w-10 h-10 rounded-xl bg-slate-100 text-slate-400 flex items-center justify-center mx-auto">
+              <Search className="w-5 h-5" />
+            </div>
+            <h3 className="text-sm font-semibold text-slate-900">
+              {search.trim()
+                ? `No hay proyectos que coincidan con «${search.trim()}»`
+                : 'No hay proyectos en este filtro'}
+            </h3>
+            <button
+              type="button"
+              onClick={() => { setSearch(''); setFilter('all'); }}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Restablecer filtros</span>
+            </button>
+          </div>
+        )
       )}
 
       <CreateProjectModal

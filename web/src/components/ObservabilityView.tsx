@@ -370,6 +370,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [alertHistory, setAlertHistory] = useState<AlertRecord[]>([]);
   const [alertsSupported, setAlertsSupported] = useState(true);
   const [alertBusy, setAlertBusy] = useState<string | null>(null);
+  const [alertsNowMs, setAlertsNowMs] = useState<number>(() => Date.now());
   const [showNewRule, setShowNewRule] = useState(false);
   const [newRule, setNewRule] = useState({
     name: '',
@@ -462,6 +463,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
         const d = await histRes.json();
         setAlertHistory(Array.isArray(d.history) ? d.history : []);
       }
+      setAlertsNowMs(Date.now());
     } catch {
       setAlertsSupported(false);
     }
@@ -572,20 +574,98 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   }, [buildFallbackTopology]);
 
   useEffect(() => {
-    void loadSnapshot(true);
-    void loadDoctor(false);
-    void loadAlerts();
-  }, [loadSnapshot, loadDoctor, loadAlerts]);
+    let active = true;
+    api.getObservabilitySnapshot(true)
+      .then((snap) => {
+        if (!active) return;
+        setSnapshot(snap);
+        setError(null);
+      })
+      .catch((e: any) => {
+        if (active) setError(e?.message || 'No se pudieron cargar las métricas');
+      })
+      .finally(() => {
+        if (!active) return;
+        setLoading(false);
+        setRefreshing(false);
+      });
+
+    api.getSystemDoctor()
+      .then((report) => {
+        if (active) setDoctor(report);
+      })
+      .catch((e: any) => {
+        if (active) onNotify(e?.message || 'No se pudo ejecutar el diagnóstico del sistema', 'error');
+      });
+
+    Promise.all([
+      apiFetch('/api/alerts/rules'),
+      apiFetch('/api/alerts/active'),
+      apiFetch('/api/alerts/history?limit=40'),
+    ])
+      .then(async ([rulesRes, activeRes, histRes]) => {
+        if (!active) return;
+        if (rulesRes.status === 404) {
+          setAlertsSupported(false);
+          return;
+        }
+        setAlertsSupported(true);
+        if (rulesRes.ok) {
+          const d = await rulesRes.json();
+          if (active) setAlertRules(Array.isArray(d.rules) ? d.rules : []);
+        }
+        if (activeRes.ok) {
+          const d = await activeRes.json();
+          if (active) setActiveAlerts(Array.isArray(d.alerts) ? d.alerts : []);
+        }
+        if (histRes.ok) {
+          const d = await histRes.json();
+          if (active) setAlertHistory(Array.isArray(d.history) ? d.history : []);
+        }
+        if (active) setAlertsNowMs(Date.now());
+      })
+      .catch(() => {
+        if (active) setAlertsSupported(false);
+      });
+
+    return () => { active = false; };
+  }, [onNotify]);
 
   useEffect(() => {
-    void loadRangeHistory(range);
-  }, [range, loadRangeHistory]);
+    if (range === 'live') return;
+    let active = true;
+    apiFetch(`/api/observability/history?range=${encodeURIComponent(range)}`)
+      .then(async (res) => {
+        if (!active) return;
+        if (!res.ok) {
+          setRangePoints([]);
+          return;
+        }
+        const data = await res.json();
+        if (!active) return;
+        setRangePoints(Array.isArray(data.points) ? data.points : []);
+        setDeployMarkers(Array.isArray(data.markers) ? data.markers : []);
+      })
+      .catch(() => {
+        if (active) setRangePoints([]);
+      });
+    return () => { active = false; };
+  }, [range]);
 
   useEffect(() => {
-    if (activeTab === 'topology' && !topology) {
-      void loadTopology();
-    }
-  }, [activeTab, topology, loadTopology]);
+    if (activeTab !== 'topology' || topology) return;
+    let active = true;
+    apiFetch('/api/topology')
+      .then(async (res) => {
+        if (res.ok) return res.json();
+        return buildFallbackTopology();
+      })
+      .catch(() => buildFallbackTopology())
+      .then((data) => {
+        if (active) setTopology(data);
+      });
+    return () => { active = false; };
+  }, [activeTab, topology, buildFallbackTopology]);
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -1339,7 +1419,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
             ) : (
               <div className="divide-y divide-slate-100">
                 {alertRules.map((r) => {
-                  const silenced = Boolean(r.silencedUntil && Date.parse(r.silencedUntil) > Date.now());
+                  const silenced = Boolean(r.silencedUntil && Date.parse(r.silencedUntil) > alertsNowMs);
                   return (
                     <div key={r.id} className="px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
                       <div className="min-w-0">

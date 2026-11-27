@@ -78,6 +78,9 @@ class MetricsCollector {
     this.latScratch = new Float64Array(RING_SIZE);
     this.latCursor = 0;
     this.latCount = 0;
+    this._latCachedCursor = -1;
+    /** @type {any} */
+    this._latCachedPercentiles = null;
 
     // Prometheus histogram buckets (seconds): 12 finite + 1 +Inf
     this.histBuckets = new Uint32Array(PROM_BUCKETS_SEC.length + 1);
@@ -105,9 +108,12 @@ class MetricsCollector {
     this.rpsCounts = new Uint32Array(60);
     this.rpsEpochSec = new Uint32Array(60);
 
-    // Bounded per-route breakdown
+    // Bounded per-route breakdown + cached sorted view
     /** @type {Map<string, { count: number, errors: number, totalMs: number, maxMs: number }>} */
     this.routes = new Map();
+    this._topRoutesCachedReqTotal = -1;
+    /** @type {Array<{ route: string, count: number, errors: number, avgMs: number, maxMs: number }>} */
+    this._topRoutesCache = [];
 
     // Event loop delay & utilization
     this.eld = monitorEventLoopDelay({ resolution: ELD_RESOLUTION_MS });
@@ -118,13 +124,17 @@ class MetricsCollector {
       : null;
     this.lastEluRatio = 0;
 
-    // Process & host CPU/mem cache (250 ms)
+    // Process & host CPU/mem/disk tiered caches (process 250 ms, host mem/cpu 1 s, disk 5 s)
     this.lastCpuSample = null;
     this._lastHostCpuTotals = readHostCpuTotals();
     /** @type {number | null} */
     this._lastHostCpuPct = null;
     /** @type {{ at: number, data: any } | null} */
     this._procCache = null;
+    /** @type {{ at: number, hostMem: any, loadAvg: number[] } | null} */
+    this._hostSysCache = null;
+    /** @type {{ at: number, disk: any } | null} */
+    this._diskCache = null;
 
     // Snapshot / Prometheus serialization caches (250 ms)
     /** @type {{ at: number, data: any } | null} */
@@ -134,9 +144,14 @@ class MetricsCollector {
     /** @type {{ at: number, buf: Buffer } | null} */
     this._promBufCache = null;
 
-    // History ring (max 60 samples, 1 per 5s)
+    // O(1) circular history ring (max 60 samples, 1 per 5s, 0 array.shift())
     /** @type {Array<{ ts: number, rps: number, p50Ms: number, p95Ms: number, rssMb: number, heapMb: number, elLagMs: number, cpuPercent: number, hostCpuPct?: number, hostRamPct?: number, diskUsedPct?: number | null, errorRatePct?: number }>} */
-    this.history = [];
+    this._historyRing = new Array(HISTORY_CAP);
+    this._historyHead = 0;
+    this._historyCount = 0;
+    /** @type {Array<any> | null} */
+    this._historyViewCache = null;
+    this._historySeeded = false;
     this._lastHistoryAt = 0;
 
     // External lazy getters (injected by server/index.js — never force require)
@@ -149,8 +164,44 @@ class MetricsCollector {
     this.caddySwapScratch = new Float64Array(64);
     this.caddySwapCursor = 0;
     this.caddySwapCount = 0;
+    this._caddyCachedCursor = -1;
+    /** @type {any} */
+    this._caddyCachedPercentiles = null;
     this.caddySwapsTotal = 0;
     this.caddyNoopSkips = 0;
+  }
+
+  /** O(1) append into fixed-size circular history ring (avoids O(N) Array.prototype.shift). */
+  _pushHistoryPoint(point) {
+    this._historyRing[this._historyHead] = point;
+    this._historyHead = (this._historyHead + 1) % HISTORY_CAP;
+    if (this._historyCount < HISTORY_CAP) this._historyCount++;
+    this._historyViewCache = null;
+  }
+
+  /** Chronological view of the O(1) circular history ring (cached until next append). */
+  get history() {
+    if (this._historyViewCache) return this._historyViewCache;
+    const count = this._historyCount;
+    const out = new Array(count);
+    const start = count < HISTORY_CAP ? 0 : this._historyHead;
+    for (let i = 0; i < count; i++) {
+      out[i] = this._historyRing[(start + i) % HISTORY_CAP];
+    }
+    this._historyViewCache = out;
+    return out;
+  }
+
+  set history(items) {
+    this._historyHead = 0;
+    this._historyCount = 0;
+    this._historyViewCache = null;
+    if (Array.isArray(items)) {
+      const slice = items.length > HISTORY_CAP ? items.slice(-HISTORY_CAP) : items;
+      for (let i = 0; i < slice.length; i++) {
+        this._pushHistoryPoint(slice[i]);
+      }
+    }
   }
 
   /** @param {() => any} fn */
@@ -329,13 +380,29 @@ class MetricsCollector {
       this.lastEluRatio = Number((delta.utilization || 0).toFixed(4));
     }
 
-    const hostMem = readHostMemoryStats();
-    const disk = readDiskStats();
-    const hostCpuNow = readHostCpuTotals();
-    const hostCpuDelta = computeHostCpuDelta(this._lastHostCpuTotals, hostCpuNow);
-    if (hostCpuDelta !== null && (hostCpuNow.total - this._lastHostCpuTotals.total) >= 10) {
-      this._lastHostCpuPct = hostCpuDelta;
-      this._lastHostCpuTotals = hostCpuNow;
+    let hostMem;
+    let loadAvg;
+    if (!force && this._hostSysCache && (now - this._hostSysCache.at) < 1000) {
+      hostMem = this._hostSysCache.hostMem;
+      loadAvg = this._hostSysCache.loadAvg;
+    } else {
+      hostMem = readHostMemoryStats();
+      loadAvg = os.loadavg().map((n) => Number(n.toFixed(2)));
+      const hostCpuNow = readHostCpuTotals();
+      const hostCpuDelta = computeHostCpuDelta(this._lastHostCpuTotals, hostCpuNow);
+      if (hostCpuDelta !== null && (hostCpuNow.total - this._lastHostCpuTotals.total) >= 10) {
+        this._lastHostCpuPct = hostCpuDelta;
+        this._lastHostCpuTotals = hostCpuNow;
+      }
+      this._hostSysCache = { at: now, hostMem, loadAvg };
+    }
+
+    let disk;
+    if (!force && this._diskCache && (now - this._diskCache.at) < 5000) {
+      disk = this._diskCache.disk;
+    } else {
+      disk = readDiskStats();
+      this._diskCache = { at: now, disk };
     }
 
     const totalMemMb = hostMem.totalMb || HOST_TOTAL_MEM_MB;
@@ -370,7 +437,7 @@ class MetricsCollector {
       diskFreeGb: disk.freeGb,
       diskTotalGb: disk.totalGb,
       hostCpus: HOST_CPUS,
-      loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
+      loadAvg,
       measured: true
     };
     this._procCache = { at: now, data };
@@ -406,7 +473,12 @@ class MetricsCollector {
 
     const proc = this.sampleProcess(fresh);
     const el = this.sampleEventLoop();
-    const lat = this._computePercentiles(this.latRing, this.latCount, this.latScratch);
+    let lat = this._latCachedPercentiles;
+    if (!lat || this._latCachedCursor !== this.latCursor) {
+      lat = this._computePercentiles(this.latRing, this.latCount, this.latScratch);
+      this._latCachedCursor = this.latCursor;
+      this._latCachedPercentiles = lat;
+    }
     const rps = this._computeRps();
     const ws = this._wsGetter();
     const liveSync = this._liveSyncGetter() || {
@@ -422,18 +494,27 @@ class MetricsCollector {
     };
 
     const caddyBase = this._caddyGetter() || { available: null, version: null, managedRoutes: null };
-    const caddyLatency = this._computePercentiles(this.caddySwapRing, this.caddySwapCount, this.caddySwapScratch);
+    let caddyLatency = this._caddyCachedPercentiles;
+    if (!caddyLatency || this._caddyCachedCursor !== this.caddySwapCursor) {
+      caddyLatency = this._computePercentiles(this.caddySwapRing, this.caddySwapCount, this.caddySwapScratch);
+      this._caddyCachedCursor = this.caddySwapCursor;
+      this._caddyCachedPercentiles = caddyLatency;
+    }
 
-    const topRoutes = Array.from(this.routes.entries())
-      .map(([route, s]) => ({
-        route,
-        count: s.count,
-        errors: s.errors,
-        avgMs: s.count > 0 ? Number((s.totalMs / s.count).toFixed(2)) : 0,
-        maxMs: Number(s.maxMs.toFixed(2))
-      }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 12);
+    if (this._topRoutesCachedReqTotal !== this.requestsTotal) {
+      this._topRoutesCache = Array.from(this.routes.entries())
+        .map(([route, s]) => ({
+          route,
+          count: s.count,
+          errors: s.errors,
+          avgMs: s.count > 0 ? Number((s.totalMs / s.count).toFixed(2)) : 0,
+          maxMs: Number(s.maxMs.toFixed(2))
+        }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 12);
+      this._topRoutesCachedReqTotal = this.requestsTotal;
+    }
+    const topRoutes = this._topRoutesCache;
 
     const errorRatePct = this.requestsTotal > 0
       ? Number((((this.status4xx + this.status5xx) / this.requestsTotal) * 100).toFixed(2))
@@ -443,12 +524,13 @@ class MetricsCollector {
       : 0;
 
     // Sembrar historial en memoria con puntos persistidos recientes si el daemon acaba de arrancar
-    if (this.history.length === 0 && metricsHistory && typeof metricsHistory.query === 'function') {
+    if (!this._historySeeded && this._historyCount === 0 && metricsHistory && typeof metricsHistory.query === 'function') {
+      this._historySeeded = true;
       try {
         const persisted = metricsHistory.query({ range: '1h', includeMarkers: false });
         if (persisted && Array.isArray(persisted.points) && persisted.points.length > 0) {
           for (const p of persisted.points.slice(-HISTORY_CAP)) {
-            this.history.push({
+            this._pushHistoryPoint({
               ts: p.ts,
               rps: p.rps,
               p50Ms: p.p50Ms,
@@ -467,10 +549,10 @@ class MetricsCollector {
       } catch (e) {}
     }
 
-    // Muestreo histórico (máx 1 punto cada 5 s)
-    if (now - this._lastHistoryAt >= 5000 || this.history.length === 0) {
+    // Muestreo histórico O(1) en anillo circular (máx 1 punto cada 5 s, sin array.shift())
+    if (now - this._lastHistoryAt >= 5000 || this._historyCount === 0) {
       this._lastHistoryAt = now;
-      this.history.push({
+      this._pushHistoryPoint({
         ts: now,
         rps: rps.rps10s,
         p50Ms: lat.p50 ?? 0,
@@ -484,9 +566,6 @@ class MetricsCollector {
         diskUsedPct: proc.diskUsedPct ?? null,
         errorRatePct
       });
-      if (this.history.length > HISTORY_CAP) {
-        this.history.shift();
-      }
     }
 
     const snapshot = {

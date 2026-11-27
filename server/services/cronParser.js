@@ -16,6 +16,26 @@ const CRON_ALIASES = Object.freeze({
   '@monthly': '0 0 1 * *'
 });
 
+/** Número máximo posible de días por mes (incluyendo 29 de febrero en año bisiesto). */
+const MAX_DAYS_BY_MONTH = Object.freeze({
+  1: 31,
+  2: 29,
+  3: 31,
+  4: 30,
+  5: 31,
+  6: 30,
+  7: 31,
+  8: 31,
+  9: 30,
+  10: 31,
+  11: 30,
+  12: 31
+});
+
+/** Horizonte máximo de búsqueda (8 años cubre saltos de año bisiesto incluso cruzando un siglo no bisiesto). */
+const MAX_HORIZON_MS = 8 * 366 * 24 * 60 * 60 * 1000;
+const MAX_LOOP_ITERATIONS = 50000;
+
 /**
  * @param {string} expr
  * @param {number} min
@@ -119,19 +139,48 @@ function parseCron(raw) {
 }
 
 /**
+ * Comprueba en O(1) si la combinación `(mes, día-del-mes)` es imposible cuando
+ * el día de la semana es `*` (semántica AND estricta, p. ej. `0 0 30 2 *` o `0 0 31 4 *`).
+ * Cuando ambos `dom` y `dow` son restringidos, cron usa semántica OR y el día de la semana
+ * puede coincidir igualmente.
+ * @param {{ month: Set<number>, dom: Set<number>, dowWildcard: boolean }} parsed
+ * @returns {boolean}
+ */
+function hasPossibleCalendarDay(parsed) {
+  if (!parsed.dowWildcard) return true;
+  for (const mon of parsed.month) {
+    const maxDay = MAX_DAYS_BY_MONTH[/** @type {keyof typeof MAX_DAYS_BY_MONTH} */ (mon)] || 31;
+    for (const day of parsed.dom) {
+      if (day <= maxDay) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Calcula la siguiente ejecución a partir de `fromDate` (estrictamente posterior).
+ * Acotado tanto por horizonte temporal (`MAX_HORIZON_MS`) como por iteraciones
+ * máximas para eliminar cualquier riesgo de DoS síncrono en fechas imposibles.
  * @param {string} expression
  * @param {Date} [fromDate]
  * @returns {Date}
  */
 function nextCronRun(expression, fromDate = new Date()) {
   const parsed = parseCron(expression);
-  const cursor = new Date(fromDate.getTime());
+  if (!(fromDate instanceof Date) || !Number.isFinite(fromDate.getTime())) {
+    throw new Error('Fecha base inválida para cálculo de cron');
+  }
+  if (!hasPossibleCalendarDay(parsed)) {
+    throw new Error(`No se encontró una próxima ejecución válida para cron "${expression}"`);
+  }
+
+  const baseMs = fromDate.getTime();
+  const maxTimeMs = baseMs + MAX_HORIZON_MS;
+  const cursor = new Date(baseMs);
   cursor.setSeconds(0, 0);
   cursor.setMinutes(cursor.getMinutes() + 1);
 
-  const maxIter = 525960 * 2; // hasta 2 años de búsqueda minuto a minuto (con saltos por mes/día/hora)
-  for (let i = 0; i < maxIter; i++) {
+  for (let i = 0; i < MAX_LOOP_ITERATIONS && cursor.getTime() <= maxTimeMs; i++) {
     const mon = cursor.getMonth() + 1;
     if (!parsed.month.has(mon)) {
       cursor.setMonth(cursor.getMonth() + 1, 1);

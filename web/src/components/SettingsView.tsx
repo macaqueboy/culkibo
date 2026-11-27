@@ -34,6 +34,12 @@ import {
   ArrowRightLeft,
   Rocket,
   Plus,
+  KeyRound,
+  Fingerprint,
+  ScanSearch,
+  ShieldAlert,
+  Radio,
+  Link2,
 } from 'lucide-react';
 import {
   api,
@@ -52,6 +58,13 @@ import {
   type Project,
   type ProjectEnvironmentItem,
   type EnvironmentDiffResult,
+  type RbacIdentity,
+  type TotpSetupResult,
+  type OidcProviderSummary,
+  type AuditChainVerification,
+  type SecretScanReport,
+  type DnsProviderInfo,
+  type Http3ProbeResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -59,7 +72,7 @@ import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
 
-type SettingsTab = 'remote' | 'team' | 'gitops' | 'integrations' | 'backups' | 'notifications' | 'system';
+type SettingsTab = 'remote' | 'team' | 'security' | 'gitops' | 'integrations' | 'backups' | 'notifications' | 'system';
 
 function formatSafeDate(raw?: string | null): string {
   if (!raw) return '—';
@@ -68,12 +81,19 @@ function formatSafeDate(raw?: string | null): string {
   return d.toLocaleString('es-ES');
 }
 
+function formatAuditActor(actor?: AuditLogEvent['actor']): string | null {
+  if (!actor) return null;
+  if (typeof actor === 'string') return actor;
+  return actor.email || actor.userId || actor.kind || null;
+}
+
 function normalizeSettingsTab(raw?: string | null): SettingsTab {
   if (!raw) return 'remote';
   const k = raw.toLowerCase();
   if (
     k === 'remote' ||
     k === 'team' ||
+    k === 'security' ||
     k === 'gitops' ||
     k === 'integrations' ||
     k === 'backups' ||
@@ -193,6 +213,35 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [envDiffTo, setEnvDiffTo] = useState('production');
   const [envDiffResult, setEnvDiffResult] = useState<EnvironmentDiffResult | null>(null);
   const [envBusy, setEnvBusy] = useState(false);
+
+  // Seguridad v1.1 (TOTP 2FA, OIDC SSO, Cadena SHA-256, Secret Scanner) & Edge v1.1 (HTTP/3, Multi-DNS-01)
+  const [identity, setIdentity] = useState<RbacIdentity | null>(null);
+  const [totpSetup, setTotpSetup] = useState<TotpSetupResult | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [totpEnabled, setTotpEnabled] = useState(false);
+  const [totpRecoveryCodes, setTotpRecoveryCodes] = useState<string[]>([]);
+  const [totpDisableOpen, setTotpDisableOpen] = useState(false);
+  const [totpDisableCode, setTotpDisableCode] = useState('');
+  const [totpDisablePassword, setTotpDisablePassword] = useState('');
+  const [totpBusy, setTotpBusy] = useState<'setup' | 'verify' | 'disable' | null>(null);
+  const [totpNotice, setTotpNotice] = useState<{ kind: 'info' | 'ok' | 'err'; text: string } | null>(null);
+
+  const [oidcProviders, setOidcProviders] = useState<OidcProviderSummary[]>([]);
+  const [oidcUnavailable, setOidcUnavailable] = useState(false);
+
+  const [auditVerification, setAuditVerification] = useState<AuditChainVerification | null>(null);
+  const [auditVerifyBusy, setAuditVerifyBusy] = useState(false);
+  const [auditVerifyError, setAuditVerifyError] = useState<string | null>(null);
+  const [securityAuditEntries, setSecurityAuditEntries] = useState<AuditLogEvent[]>([]);
+
+  const [scanInput, setScanInput] = useState('');
+  const [scanBusy, setScanBusy] = useState(false);
+  const [scanReport, setScanReport] = useState<SecretScanReport | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+
+  const [http3Status, setHttp3Status] = useState<Http3ProbeResult | null>(null);
+  const [dnsProviders, setDnsProviders] = useState<DnsProviderInfo[]>([]);
+  const [copiedSecKey, setCopiedSecKey] = useState<string | null>(null);
 
   const loadAll = async () => {
     const [sys, gh, cf, ntf, doc, ing, s3, tel] = await Promise.all([
@@ -403,6 +452,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       api.getTelemetryStatus()
         .then((res) => { if (active) setTelemetryStatus(res); })
         .catch(() => {});
+      api.getHttp3Status()
+        .then((res) => { if (active) setHttp3Status(res); })
+        .catch(() => { if (active) setHttp3Status(null); });
+      api.getDnsProviders()
+        .then((res) => { if (active) setDnsProviders(res.providers || []); })
+        .catch(() => { if (active) setDnsProviders([]); });
+    } else if (tab === 'security') {
+      api.getRbacMe()
+        .then((me) => { if (active) setIdentity(me); })
+        .catch(() => {});
+      api.getOidcProviders()
+        .then((res) => {
+          if (!active) return;
+          setOidcProviders(res.providers || []);
+          setOidcUnavailable(false);
+        })
+        .catch(() => {
+          if (active) setOidcUnavailable(true);
+        });
+      api.getSecurityAuditLog({ limit: 25 })
+        .then((res) => { if (active) setSecurityAuditEntries(res.entries || []); })
+        .catch(() => {
+          api.getSystemAudit({ limit: 25 })
+            .then((res) => { if (active) setSecurityAuditEntries(res.events || []); })
+            .catch(() => {});
+        });
     } else if (tab === 'notifications') {
       api.getNotificationsHistory(20)
         .then((res) => { if (active) setNotifHistory(res.notifications || []); })
@@ -836,6 +911,152 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  // --- Handlers de Seguridad v1.1 ---
+
+  const copySecurityValue = async (text: string, key: string, label: string) => {
+    const ok = await copyToClipboard(text);
+    if (!ok) return;
+    setCopiedSecKey(key);
+    window.setTimeout(() => setCopiedSecKey(null), 1800);
+    onNotify?.(`${label} copiado al portapapeles`, 'success');
+  };
+
+  const handleSetup2FA = async () => {
+    setTotpBusy('setup');
+    setTotpNotice(null);
+    setTotpRecoveryCodes([]);
+    try {
+      const res = await api.setup2FA();
+      setTotpSetup(res);
+      setTotpNotice({
+        kind: 'info',
+        text: 'Añade la clave Base32 o la URI otpauth:// en tu app autenticadora (1Password, Bitwarden, Authy o Google Authenticator) y verifica el código de 6 dígitos.',
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'No se pudo iniciar la configuración 2FA';
+      setTotpNotice({
+        kind: 'err',
+        text: msg.includes('not a function') || msg.includes('404')
+          ? 'La configuración TOTP requiere sesión de usuario RBAC (Equipo y RBAC) y el endpoint /api/auth/2fa/setup activo.'
+          : msg,
+      });
+    } finally {
+      setTotpBusy(null);
+    }
+  };
+
+  const handleVerify2FA = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanCode = totpCode.replace(/\s+/g, '');
+    if (cleanCode.length < 6) return;
+    setTotpBusy('verify');
+    setTotpNotice(null);
+    try {
+      const res = await api.verify2FA(cleanCode);
+      setTotpEnabled(true);
+      setTotpSetup(null);
+      setTotpCode('');
+      if (Array.isArray(res.recoveryCodes) && res.recoveryCodes.length > 0) {
+        setTotpRecoveryCodes(res.recoveryCodes);
+      }
+      setTotpNotice({
+        kind: 'ok',
+        text: 'Autenticación en dos pasos (TOTP 2FA) verificada y activa.',
+      });
+      onNotify?.('2FA (TOTP) activado correctamente', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Código TOTP inválido';
+      setTotpNotice({ kind: 'err', text: msg });
+    } finally {
+      setTotpBusy(null);
+    }
+  };
+
+  const handleDisable2FA = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanCode = totpDisableCode.replace(/\s+/g, '');
+    if (!cleanCode) return;
+    setTotpBusy('disable');
+    setTotpNotice(null);
+    try {
+      await api.disable2FA({
+        code: cleanCode,
+        password: totpDisablePassword.trim() || undefined,
+      });
+      setTotpEnabled(false);
+      setTotpDisableOpen(false);
+      setTotpDisableCode('');
+      setTotpDisablePassword('');
+      setTotpRecoveryCodes([]);
+      setTotpNotice({ kind: 'info', text: '2FA desactivado para tu cuenta.' });
+      onNotify?.('Autenticación en dos pasos desactivada', 'info');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'No se pudo desactivar 2FA';
+      setTotpNotice({ kind: 'err', text: msg });
+    } finally {
+      setTotpBusy(null);
+    }
+  };
+
+  const handleVerifyAuditChain = async () => {
+    setAuditVerifyBusy(true);
+    setAuditVerifyError(null);
+    try {
+      const res = await api.verifyAuditLogIntegrity();
+      setAuditVerification(res);
+      if (res.valid) {
+        onNotify?.(`Cadena SHA-256 verificada (${res.checkedCount} entradas íntegras)`, 'success');
+      } else {
+        onNotify?.(`Alteración detectada en auditoría (${res.reason || 'hash inválido'})`, 'error');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'No se pudo verificar la cadena de auditoría';
+      setAuditVerifyError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setAuditVerifyBusy(false);
+    }
+  };
+
+  const handleRunSecretScan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!scanInput.trim()) return;
+    setScanBusy(true);
+    setScanError(null);
+    try {
+      const report = await api.scanSecrets({ text: scanInput });
+      setScanReport(report);
+      if (report.clean) {
+        onNotify?.('Escaneo limpio: cero fugas de secretos detectadas', 'success');
+      } else {
+        onNotify?.(`Escáner detectó ${report.summary.total} posible(s) fuga(s) de secretos`, 'error');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'No se pudo ejecutar el escáner de secretos';
+      setScanError(
+        msg.includes('not a function') || msg.includes('404')
+          ? 'El endpoint /api/security/scan-secrets no está disponible en esta compilación del servidor.'
+          : msg
+      );
+    } finally {
+      setScanBusy(false);
+    }
+  };
+
+  const handleLoadSafeScannerSample = () => {
+    setScanInput(
+      [
+        '# Ejemplo sintético de prueba (valores ficticios de demostración)',
+        'NODE_ENV=production',
+        'DATABASE_URL=postgres://demo:EjemploClaveInsegura99@db.local:5432/app',
+        'API_KEY=${vault.PROD_API_KEY}',
+        'DEMO_AWS_ID=AKIAIOSFODNN7EXAMPLE',
+      ].join('\n')
+    );
+    setScanReport(null);
+    setScanError(null);
+  };
+
   const hasCfToken = Boolean(cfConfig?.hasApiToken || cfConfig?.hasToken);
 
   return (
@@ -843,16 +1064,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       <div>
         <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Ajustes</h1>
         <p className="text-sm text-slate-500 mt-1">
-          Acceso remoto, integraciones externas, alertas y mantenimiento del servidor.
+          Acceso remoto, seguridad enterprise (2FA/OIDC/Auditoría), integraciones, backups y sistema.
         </p>
       </div>
 
       {/* Pestañas */}
-      <div className="flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-lg text-xs overflow-x-auto no-scrollbar">
+      <div className="flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-xl text-xs overflow-x-auto no-scrollbar">
         {([
           { id: 'remote', label: 'Acceso remoto', icon: Globe },
           { id: 'team', label: 'Equipo y RBAC', icon: Users },
-          { id: 'gitops', label: 'GitOps (culkibo.yaml)', icon: FileCode2 },
+          { id: 'security', label: 'Seguridad', icon: ShieldCheck },
+          { id: 'gitops', label: 'GitOps', icon: FileCode2 },
           { id: 'integrations', label: 'Integraciones', icon: Plug },
           { id: 'backups', label: 'Backups y DR', icon: HardDrive },
           { id: 'notifications', label: 'Notificaciones', icon: Bell },
@@ -864,8 +1086,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               key={t.id}
               type="button"
               onClick={() => setTab(t.id)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                tab === t.id ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+              className={`culkibo-press inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 rounded-lg font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                tab === t.id ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
               <Icon className="w-3.5 h-3.5" />
@@ -878,6 +1100,540 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       {tab === 'remote' && <RemoteAccessPanel onNotify={onNotify} />}
 
       {tab === 'team' && <TeamAccessPanel onNotify={onNotify} />}
+
+      {tab === 'security' && (
+        <div className="space-y-5 text-xs">
+          {/* 1. TOTP 2FA (RFC 6238) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Fingerprint className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">Autenticación en dos pasos (TOTP 2FA)</h2>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[11px] font-medium border ${
+                        totpEnabled
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-slate-100 text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      {totpEnabled ? 'Activo (RFC 6238)' : 'Pendiente de configurar'}
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5 leading-relaxed">
+                    Protege el plano de control con códigos TOTP de 6 dígitos y códigos de recuperación de un solo uso cifrados con AES-256-GCM.
+                  </p>
+                  {identity && (
+                    <div className="mt-1.5 text-[11px] text-slate-400 font-mono">
+                      Sesión actual: {identity.email || identity.name || 'Administrador local'} ({identity.role})
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                {!totpSetup && (
+                  <button
+                    type="button"
+                    disabled={totpBusy !== null}
+                    onClick={() => void handleSetup2FA()}
+                    className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    {totpBusy === 'setup' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+                    <span>{totpEnabled ? 'Reconfigurar 2FA' : 'Configurar 2FA'}</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setTotpDisableOpen((v) => !v)}
+                  className="culkibo-press px-3 py-2 rounded-lg bg-white hover:bg-red-50 border border-slate-200 hover:border-red-200 text-slate-700 hover:text-red-700 font-medium cursor-pointer"
+                >
+                  {totpDisableOpen ? 'Cancelar' : 'Desactivar 2FA'}
+                </button>
+              </div>
+            </div>
+
+            {totpNotice && (
+              <div
+                className={`p-3 rounded-xl border flex items-start gap-2 ${
+                  totpNotice.kind === 'ok'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                    : totpNotice.kind === 'err'
+                      ? 'bg-red-50 border-red-200 text-red-800'
+                      : 'bg-slate-50 border-slate-200 text-slate-700'
+                }`}
+              >
+                {totpNotice.kind === 'ok' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                )}
+                <span className="leading-relaxed">{totpNotice.text}</span>
+              </div>
+            )}
+
+            {totpSetup && (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="p-3 rounded-lg bg-white border border-slate-200 space-y-1.5">
+                    <div className="text-[11px] font-medium text-slate-500">Clave secreta Base32 (manual)</div>
+                    <div className="flex items-center justify-between gap-2">
+                      <code className="font-mono text-xs font-semibold text-slate-900 tracking-wider break-all">
+                        {totpSetup.secretBase32 || totpSetup.secret || '—'}
+                      </code>
+                      {(totpSetup.secretBase32 || totpSetup.secret) && (
+                        <button
+                          type="button"
+                          onClick={() => void copySecurityValue(totpSetup.secretBase32 || totpSetup.secret || '', 'totp_secret', 'Clave Base32')}
+                          className="p-1.5 rounded-md border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-600 cursor-pointer shrink-0"
+                          aria-label="Copiar clave Base32"
+                        >
+                          {copiedSecKey === 'totp_secret' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="p-3 rounded-lg bg-white border border-slate-200 space-y-1.5">
+                    <div className="text-[11px] font-medium text-slate-500">URI otpauth:// (gestores de contraseñas)</div>
+                    <div className="flex items-center justify-between gap-2">
+                      <code className="font-mono text-[11px] text-slate-700 truncate">
+                        {totpSetup.otpauthUri || totpSetup.otpauthUrl || '—'}
+                      </code>
+                      {(totpSetup.otpauthUri || totpSetup.otpauthUrl) && (
+                        <button
+                          type="button"
+                          onClick={() => void copySecurityValue(totpSetup.otpauthUri || totpSetup.otpauthUrl || '', 'totp_uri', 'URI otpauth://')}
+                          className="p-1.5 rounded-md border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-600 cursor-pointer shrink-0"
+                          aria-label="Copiar URI otpauth"
+                        >
+                          {copiedSecKey === 'totp_uri' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <form onSubmit={handleVerify2FA} className="flex flex-col sm:flex-row items-stretch sm:items-end gap-2.5">
+                  <label className="flex-1 max-w-xs">
+                    <span className="block font-medium text-slate-700 mb-1">Código TOTP de 6 dígitos</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      maxLength={8}
+                      required
+                      value={totpCode}
+                      onChange={(e) => setTotpCode(e.target.value.replace(/[^0-9]/g, ''))}
+                      placeholder="123456"
+                      className="w-full px-3 py-2 rounded-lg bg-white border border-slate-200 font-mono text-sm tracking-[0.25em] text-slate-900 tabular-nums"
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={totpBusy !== null || totpCode.length < 6}
+                    className="culkibo-press px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    {totpBusy === 'verify' ? 'Verificando…' : 'Verificar y activar 2FA'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTotpSetup(null)}
+                    className="px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                </form>
+              </div>
+            )}
+
+            {totpRecoveryCodes.length > 0 && (
+              <div className="p-4 rounded-xl bg-amber-50/70 border border-amber-200 space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="font-semibold text-amber-950">Códigos de recuperación (se muestran una sola vez)</span>
+                  <button
+                    type="button"
+                    onClick={() => void copySecurityValue(totpRecoveryCodes.join('\n'), 'recovery_codes', 'Códigos de recuperación')}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white border border-amber-300 text-amber-900 font-medium cursor-pointer"
+                  >
+                    {copiedSecKey === 'recovery_codes' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                    <span>Copiar todos</span>
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 font-mono text-[11px] tabular-nums">
+                  {totpRecoveryCodes.map((c) => (
+                    <div key={c} className="px-2 py-1.5 rounded-md bg-white border border-amber-200 text-center text-slate-900">
+                      {c}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {totpDisableOpen && (
+              <form onSubmit={handleDisable2FA} className="p-4 rounded-xl bg-red-50/50 border border-red-200/80 grid grid-cols-1 sm:grid-cols-3 gap-2.5 items-end">
+                <label className="block">
+                  <span className="font-medium text-slate-700">Código TOTP o recuperación</span>
+                  <input
+                    type="text"
+                    required
+                    value={totpDisableCode}
+                    onChange={(e) => setTotpDisableCode(e.target.value)}
+                    placeholder="123456"
+                    className="mt-1 w-full px-3 py-2 rounded-lg bg-white border border-slate-200 font-mono text-slate-900"
+                  />
+                </label>
+                <label className="block">
+                  <span className="font-medium text-slate-700">Contraseña (si aplica)</span>
+                  <input
+                    type="password"
+                    value={totpDisablePassword}
+                    onChange={(e) => setTotpDisablePassword(e.target.value)}
+                    placeholder="Contraseña actual"
+                    className="mt-1 w-full px-3 py-2 rounded-lg bg-white border border-slate-200 font-mono text-slate-900"
+                  />
+                </label>
+                <button
+                  type="submit"
+                  disabled={totpBusy !== null || !totpDisableCode.trim()}
+                  className="culkibo-press px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {totpBusy === 'disable' ? 'Desactivando…' : 'Confirmar desactivación'}
+                </button>
+              </form>
+            )}
+          </div>
+
+          {/* 2. Proveedores SSO (OIDC / OAuth2 PKCE + JWKS) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Link2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">Proveedores SSO (OIDC / OAuth2 PKCE)</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-[11px] font-medium text-slate-600 tabular-nums">
+                      {oidcProviders.length} {oidcProviders.length === 1 ? 'proveedor' : 'proveedores'}
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">
+                    Verificación criptográfica JWKS nativa (RS256/ES256/EdDSA), PKCE S256 obligatorio y protección contra confusión de algoritmos.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {oidcUnavailable ? (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-500">
+                El listado de proveedores OIDC no respondió en esta instancia. Configura tus proveedores en <code className="font-mono text-slate-700">data/oidc.json</code> o mediante la API administrativa.
+              </div>
+            ) : oidcProviders.length === 0 ? (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+                <div className="text-slate-600">
+                  Aún no hay proveedores SSO configurados. Culkibo incluye soporte nativo sin dependencias para:
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {['GitHub OAuth2 PKCE', 'Google OIDC', 'Authentik', 'Keycloak', 'OpenID Connect genérico'].map((p) => (
+                    <span
+                      key={p}
+                      className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[11px] font-medium text-slate-700"
+                    >
+                      {p}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="border border-slate-200 rounded-xl divide-y divide-slate-100 overflow-hidden">
+                {oidcProviders.map((prov) => (
+                  <div key={prov.id} className="px-4 py-3 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${prov.enabled ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                        <span className="font-semibold text-slate-900">{prov.name}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] uppercase text-slate-600">
+                          {prov.protocol}
+                        </span>
+                        {prov.defaultRole && (
+                          <span className="px-1.5 py-0.5 rounded bg-slate-50 border border-slate-200 text-[10px] text-slate-600">
+                            rol: {prov.defaultRole}
+                          </span>
+                        )}
+                        {prov.enforceLocal2fa && (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-[10px] text-emerald-700">
+                            2FA local
+                          </span>
+                        )}
+                      </div>
+                      {prov.issuerUrl && (
+                        <div className="font-mono text-[11px] text-slate-400 truncate">{prov.issuerUrl}</div>
+                      )}
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[11px] font-medium border shrink-0 self-start sm:self-center ${
+                        prov.enabled
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-slate-100 text-slate-500 border-slate-200'
+                      }`}
+                    >
+                      {prov.enabled ? 'Activo' : 'Desactivado'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 3. Cadena de Auditoría Inmutable (SHA-256 Hash-Chained) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Registro de auditoría encadenado (SHA-256)</h2>
+                  <p className="text-slate-500 mt-0.5">
+                    Cada mutación enlaza su huella criptográfica con la entrada anterior (<code className="font-mono">prevHash → entryHash</code>) para detectar cualquier alteración o borrado.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={auditVerifyBusy}
+                onClick={() => void handleVerifyAuditChain()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50 shrink-0"
+              >
+                {auditVerifyBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                <span>{auditVerifyBusy ? 'Verificando…' : 'Verificar cadena a prueba de manipulaciones'}</span>
+              </button>
+            </div>
+
+            {auditVerifyError && (
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>{auditVerifyError}</span>
+              </div>
+            )}
+
+            {auditVerification && (
+              <div
+                className={`p-4 rounded-xl border space-y-3 ${
+                  auditVerification.valid
+                    ? 'bg-emerald-50/70 border-emerald-200'
+                    : 'bg-red-50/80 border-red-200'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2 font-semibold">
+                    {auditVerification.valid ? (
+                      <>
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        <span className="text-emerald-950">Cadena criptográfica íntegra · 0 manipulaciones</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldAlert className="w-4 h-4 text-red-600" />
+                        <span className="text-red-900">
+                          Integridad comprometida: {auditVerification.reason || 'Discontinuidad en la cadena'}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                  {auditVerification.headHash && (
+                    <button
+                      type="button"
+                      onClick={() => void copySecurityValue(auditVerification.headHash || '', 'head_hash', 'Head SHA-256')}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-white border border-slate-200 font-mono text-[10px] text-slate-700 cursor-pointer"
+                      title="Copiar hash de cabecera"
+                    >
+                      <span>head:{auditVerification.headHash.slice(0, 12)}…</span>
+                      {copiedSecKey === 'head_hash' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3 text-slate-400" />}
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] tabular-nums">
+                  <div className="p-2.5 rounded-lg bg-white/90 border border-slate-200/80">
+                    <span className="text-slate-500 block">Entradas verificadas</span>
+                    <span className="font-mono font-semibold text-slate-900 text-xs">{auditVerification.checkedCount}</span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-white/90 border border-slate-200/80">
+                    <span className="text-slate-500 block">Secuencia</span>
+                    <span className="font-mono font-semibold text-slate-900 text-xs">
+                      {auditVerification.firstSeq !== null ? `#${auditVerification.firstSeq} → #${auditVerification.lastSeq}` : '—'}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-white/90 border border-slate-200/80">
+                    <span className="text-slate-500 block">Fuentes comprobadas</span>
+                    <span className="font-mono font-semibold text-slate-900 text-xs">
+                      {auditVerification.filesChecked.length || 1}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-white/90 border border-slate-200/80">
+                    <span className="text-slate-500 block">Ancla de rotación</span>
+                    <span className="font-mono font-semibold text-slate-900 text-xs">
+                      {auditVerification.anchored ? 'Anclada' : 'Desde génesis'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {securityAuditEntries.length > 0 && (
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 font-medium text-slate-700 flex items-center justify-between">
+                  <span className="tabular-nums">Últimos eventos encadenados ({securityAuditEntries.length})</span>
+                  <span className="font-mono text-[10px] text-slate-400">SHA-256 append-only</span>
+                </div>
+                <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto">
+                  {securityAuditEntries.map((ev, i) => {
+                    const actorStr = formatAuditActor(ev.actor);
+                    return (
+                      <div key={ev.id || `${ev.timestamp || ev.at || 'sec'}-${i}`} className="px-4 py-2.5 flex items-center justify-between gap-3">
+                        <div className="min-w-0 flex items-center gap-2 flex-wrap">
+                          {typeof ev.seq === 'number' && (
+                            <span className="font-mono text-[10px] text-slate-400 tabular-nums">#{ev.seq}</span>
+                          )}
+                          <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
+                            {ev.source}
+                          </span>
+                          <span className="font-medium text-slate-900">{ev.action}</span>
+                          {actorStr && <span className="text-slate-500 font-mono text-[11px] truncate">{actorStr}</span>}
+                          {ev.entryHash && (
+                            <span className="font-mono text-[10px] text-slate-400 hidden md:inline">
+                              {ev.entryHash.slice(0, 8)}
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-[11px] text-slate-400 tabular-nums shrink-0">
+                          {formatSafeDate(ev.timestamp || ev.at)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 4. Escáner Pre-Despliegue de Secretos */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ScanSearch className="w-4 h-4" />
+                </div>
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Escáner de fugas de secretos (Pre-Despliegue)</h2>
+                  <p className="text-slate-500 mt-0.5">
+                    Detecta claves AWS, Stripe, GitHub, OpenAI/Anthropic, PEM, JWT, URIs de BD y alta entropía Shannon antes de publicar. Los resultados siempre se enmascaran.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleLoadSafeScannerSample}
+                className="culkibo-press px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer shrink-0"
+              >
+                Cargar muestra de prueba
+              </button>
+            </div>
+
+            <form onSubmit={handleRunSecretScan} className="space-y-3">
+              <textarea
+                rows={5}
+                value={scanInput}
+                onChange={(e) => setScanInput(e.target.value)}
+                placeholder={'Pega aquí un archivo .env, docker-compose.yml, culkibo.yaml o Dockerfile para comprobar fugas…\nReferencias seguras como ${vault.MI_CLAVE} son ignoradas automáticamente.'}
+                spellCheck={false}
+                className="w-full p-3.5 bg-slate-50 focus:bg-white border border-slate-200 rounded-xl font-mono text-[11px] leading-relaxed text-slate-900"
+              />
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={scanBusy || !scanInput.trim()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {scanBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                  <span>{scanBusy ? 'Escaneando…' : 'Escanear fugas de secretos'}</span>
+                </button>
+              </div>
+            </form>
+
+            {scanError && (
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>{scanError}</span>
+              </div>
+            )}
+
+            {scanReport && (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="font-semibold text-slate-900 flex items-center gap-1.5">
+                    {scanReport.clean ? (
+                      <>
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        <span>Limpio · sin secretos expuestos</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldAlert className="w-4 h-4 text-red-600" />
+                        <span className="tabular-nums">{scanReport.summary.total} hallazgo(s) detectado(s)</span>
+                      </>
+                    )}
+                  </span>
+                  <div className="flex items-center gap-1.5 font-mono text-[11px] tabular-nums">
+                    <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700">
+                      Críticos: {scanReport.summary.critical}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
+                      Altos: {scanReport.summary.high}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-700">
+                      Medios: {scanReport.summary.medium}
+                    </span>
+                  </div>
+                </div>
+
+                {scanReport.findings.length > 0 && (
+                  <div className="space-y-2 max-h-60 overflow-y-auto">
+                    {scanReport.findings.map((f, idx) => (
+                      <div key={`${f.ruleId}-${f.line ?? idx}-${idx}`} className="p-3 rounded-lg bg-white border border-slate-200 space-y-1">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-mono uppercase font-semibold border ${
+                                f.severity === 'critical'
+                                  ? 'bg-red-50 text-red-700 border-red-200'
+                                  : f.severity === 'high'
+                                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                    : 'bg-slate-100 text-slate-700 border-slate-200'
+                              }`}
+                            >
+                              {f.severity}
+                            </span>
+                            <span className="font-semibold text-slate-900">{f.title}</span>
+                          </div>
+                          <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                            {f.line ? `Línea ${f.line}` : f.source} · {f.preview}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-500">{f.remediation}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {tab === 'gitops' && (
         <div className="space-y-5">
@@ -1437,7 +2193,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             {githubStatus?.connected && githubStatus.user ? (
               <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 flex items-center justify-between gap-4 flex-wrap">
                 <div className="flex items-center gap-3">
-                  <img src={githubStatus.user.avatar_url} alt={githubStatus.user.login} className="w-9 h-9 rounded-full border border-slate-200" />
+                  <img src={githubStatus.user.avatar_url} alt={githubStatus.user.login} className="w-9 h-9 rounded-full culkibo-img-outline" />
                   <div>
                     <div className="text-xs font-semibold text-slate-900">{githubStatus.user.name || githubStatus.user.login}</div>
                     <a href={githubStatus.user.html_url} target="_blank" rel="noreferrer" className="text-xs text-slate-600 hover:underline inline-flex items-center gap-1">
@@ -2104,6 +2860,58 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 )}
               </div>
             </div>
+
+            {/* Edge HTTP/3 (QUIC) & Multi-DNS-01 Wildcard Status */}
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Radio className="w-4 h-4 text-slate-600 shrink-0" />
+                  <span className="font-semibold text-slate-900">Edge HTTP/3 (QUIC) y Multi-DNS-01 Wildcard</span>
+                </div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {(http3Status?.protocols?.length ? http3Status.protocols : ['h1', 'h2']).map((proto) => (
+                    <span
+                      key={proto}
+                      className={`px-2 py-0.5 rounded-md font-mono text-[10px] uppercase font-semibold border ${
+                        proto === 'h3'
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-white text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      {proto === 'h3' ? 'HTTP/3 QUIC' : proto.toUpperCase()}
+                    </span>
+                  ))}
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[11px] font-medium border ${
+                      http3Status?.configured
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-white text-slate-600 border-slate-200'
+                    }`}
+                  >
+                    {http3Status === null
+                      ? 'Sondeando…'
+                      : http3Status.configured
+                        ? (http3Status.udp443Published === false ? 'H3 listo (falta UDP :443)' : 'HTTP/3 activo')
+                        : 'Solo HTTP/1.1 + HTTP/2'}
+                  </span>
+                </div>
+              </div>
+              {dnsProviders.length > 0 && (
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[11px] text-slate-500 mr-1 tabular-nums">
+                    Proveedores DNS-01 ({dnsProviders.length}):
+                  </span>
+                  {dnsProviders.map((prov) => (
+                    <span
+                      key={prov.id}
+                      className="px-2 py-0.5 rounded-md bg-white border border-slate-200 text-[11px] font-medium text-slate-700"
+                    >
+                      {prov.label}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="bg-white rounded-xl border border-slate-200 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -2261,20 +3069,44 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           {/* Registro de auditoría del servidor */}
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-            <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+            <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
                 <FileText className="w-3.5 h-3.5 text-slate-500" />
                 <span>Registro de auditoría de seguridad</span>
+                {auditVerification && (
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-medium border tabular-nums ${
+                      auditVerification.valid
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-red-50 text-red-700 border-red-200'
+                    }`}
+                  >
+                    {auditVerification.valid
+                      ? `SHA-256 íntegro (${auditVerification.checkedCount})`
+                      : 'Cadena alterada'}
+                  </span>
+                )}
               </div>
-              <button
-                type="button"
-                onClick={() => void loadAudit()}
-                disabled={auditLoading}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer"
-              >
-                <RefreshCw className={`w-3 h-3 ${auditLoading ? 'animate-spin' : ''}`} />
-                <span>Actualizar</span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void handleVerifyAuditChain()}
+                  disabled={auditVerifyBusy}
+                  className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-800 cursor-pointer disabled:opacity-50"
+                >
+                  {auditVerifyBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <ShieldCheck className="w-3 h-3 text-emerald-600" />}
+                  <span>Verificar cadena SHA-256</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void loadAudit()}
+                  disabled={auditLoading}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3 h-3 ${auditLoading ? 'animate-spin' : ''}`} />
+                  <span>Actualizar</span>
+                </button>
+              </div>
             </div>
             {auditEvents.length === 0 ? (
               <div className="p-6 text-center text-xs text-slate-500">

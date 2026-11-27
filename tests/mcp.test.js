@@ -14,7 +14,8 @@ async function testMcp() {
   assert.strictEqual(initRes.jsonrpc, '2.0');
   assert.strictEqual(initRes.id, 1);
   assert.strictEqual(initRes.result.serverInfo.name, 'culkibo-mcp-orchestrator');
-  console.log('  ✓ MCP JSON-RPC initialize handshake passed');
+  assert.strictEqual(initRes.result.capabilities.prompts.listChanged, false, 'initialize debe anunciar prompts: { listChanged: false }');
+  console.log('  ✓ MCP JSON-RPC initialize handshake passed (incl. prompts capability)');
 
   // 2. tools/list
   const toolsRes = await mcpServer.handleJsonRpc({
@@ -136,11 +137,14 @@ async function testMcp() {
   // 11. Transporte Streamable HTTP (2026-07-28)
   await testStreamableHttpTransport();
 
-  // 12. MCP 2.0/2.1: 107 herramientas, 7 recursos, 5 prompts, dryRun universal, RBAC y anti-IDOR
+  // 12. MCP 2.0/2.1/2026: 109 herramientas, 7 recursos, 13 prompts (8 playbooks), dryRun universal, RBAC y anti-IDOR
   await testMcpV2Capabilities();
 
   // 13. MCP 2.1: perfiles (-80% contexto), meta-discovery, validación estricta, 4 handlers reparados, 5 anti-IDOR, self-healing ops
   await testMcpV21Superpowers();
+
+  // 14. MCP 2026 Pioneer: 8 playbooks interactivos, culkibo_ship_and_verify (secret scan + confirmToken + smoke + auto-rollback) y culkibo_export_agent_kit
+  await testMcp2026PioneerUpgrades();
 
   console.log('✅ All MCP tests passed!\n');
 }
@@ -152,9 +156,9 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 107, 'El catálogo MCP 2.1 debe tener exactamente 107 herramientas anotadas');
+  assert.strictEqual(tools.length, 109, 'El catálogo MCP 2026 debe tener exactamente 109 herramientas anotadas');
   const uniqueNames = new Set(tools.map(t => t.name));
-  assert.strictEqual(uniqueNames.size, 107, 'No puede haber nombres de herramientas duplicados');
+  assert.strictEqual(uniqueNames.size, 109, 'No puede haber nombres de herramientas duplicados');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -177,11 +181,11 @@ async function testToolAnnotations() {
   const destCount = tools.filter(t => t.annotations.destructiveHint === true).length;
   const dryRunCount = tools.filter(t => Boolean(t.inputSchema?.properties?.dryRun)).length;
   const outputSchemaCount = tools.filter(t => Boolean(t.outputSchema)).length;
-  assert.strictEqual(roCount, 48, `Se esperaban 48 herramientas RO, hay ${roCount}`);
-  assert.strictEqual(mutCount, 59, `Se esperaban 59 herramientas mutadoras, hay ${mutCount}`);
-  assert.strictEqual(destCount, 33, `Se esperaban 33 herramientas destructivas, hay ${destCount}`);
-  assert.strictEqual(dryRunCount, 35, `Se esperaban 35 herramientas con dryRun, hay ${dryRunCount}`);
-  assert.ok(outputSchemaCount >= 60, `Se esperaban >=60 herramientas con outputSchema, hay ${outputSchemaCount}`);
+  assert.strictEqual(roCount, 49, `Se esperaban 49 herramientas RO, hay ${roCount}`);
+  assert.strictEqual(mutCount, 60, `Se esperaban 60 herramientas mutadoras, hay ${mutCount}`);
+  assert.strictEqual(destCount, 34, `Se esperaban 34 herramientas destructivas, hay ${destCount}`);
+  assert.strictEqual(dryRunCount, 36, `Se esperaban 36 herramientas con dryRun, hay ${dryRunCount}`);
+  assert.ok(outputSchemaCount >= 62, `Se esperaban >=62 herramientas con outputSchema, hay ${outputSchemaCount}`);
 
   const byName = Object.fromEntries(tools.map(t => [t.name, t]));
   const mustMutate = [
@@ -392,7 +396,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 107);
+    assert.strictEqual(list.result.tools.length, 109);
 
     // 7b. ?profile=core reduce el tamaño/tokens de tools/list en >=80% y mantiene callable herramientas descubiertas.
     const coreListRes = await fetch(`${endpoint}?profile=core`, {
@@ -644,8 +648,12 @@ async function testMcpV2Capabilities() {
   assert.ok(envRes.contents[0].text.includes('"projects"'));
 
   const prompts = mcpServer.listPrompts();
-  assert.strictEqual(prompts.length, 5, `Se esperaban 5 prompts MCP, hay ${prompts.length}`);
-  for (const name of ['debug-failed-deploy', 'zero-downtime-release', 'audit-security-tls', 'culkibo_multi_server_rollout', 'culkibo_incident_triage']) {
+  assert.strictEqual(prompts.length, 13, `Se esperaban 13 prompts MCP (8 playbooks + 5 heredados), hay ${prompts.length}`);
+  for (const name of [
+    'deploy_safely', 'migrate_from_coolify', 'debug_production_crash', 'zero_downtime_db_upgrade',
+    'security_audit_stack', 'setup_wildcard_tls_and_tunnel', 'optimize_ram_and_costs', 'disaster_recovery_drill',
+    'debug-failed-deploy', 'zero-downtime-release', 'audit-security-tls', 'culkibo_multi_server_rollout', 'culkibo_incident_triage'
+  ]) {
     assert.ok(prompts.some(p => p.name === name), `Falta prompt ${name}`);
   }
   const rolloutPrompt = mcpServer.getPrompt('culkibo_multi_server_rollout', { projectId: 'proj_demo', targetServers: 'srv_eu' });
@@ -653,7 +661,7 @@ async function testMcpV2Capabilities() {
   const triagePrompt = mcpServer.getPrompt('culkibo_incident_triage', { projectId: 'proj_demo', hostname: 'app.demo.test' });
   assert.ok(triagePrompt.messages[0].content.text.includes('culkibo_diagnose_incident'));
   assert.ok(triagePrompt.messages[0].content.text.includes('culkibo_auto_remediate'));
-  console.log('  ✓ MCP 2.0/2.1: 7 recursos y 5 prompts verificados');
+  console.log('  ✓ MCP 2.0/2026: 7 recursos y 13 prompts (8 playbooks + 5 heredados) verificados');
 
   // 2. Bugfixes y redacción ampliada
   const catTool = mcpServer.getToolByName('culkibo_list_catalog_templates');
@@ -717,7 +725,7 @@ async function testMcpV2Capabilities() {
       principal: { userId: 'usr_viewer_1', role: 'viewer', teamId: 'team_default', projectIds: [projA.id], scopes: ['*'] }
     };
     const viewerTools = mcpServer.getToolsForPrincipal(viewerAuth);
-    assert.ok(viewerTools.length > 0 && viewerTools.length < 107);
+    assert.ok(viewerTools.length > 0 && viewerTools.length < 109);
     assert.ok(viewerTools.every(t => t.annotations.readOnlyHint === true), 'viewer solo puede ver herramientas readOnly');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_database_credentials'), 'viewer NO puede ver culkibo_database_credentials');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_rbac_list_tokens'), 'viewer NO puede ver culkibo_rbac_list_tokens');
@@ -725,7 +733,7 @@ async function testMcpV2Capabilities() {
     // Serialized tools cache isolation
     const pubBuf = mcpServer.getToolsSerialized();
     const privBuf = mcpServer.getToolsSerialized(viewerAuth);
-    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 107);
+    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 109);
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).cacheScope, 'private');
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).count, viewerTools.length);
 
@@ -791,7 +799,7 @@ async function testMcpV2Capabilities() {
     const whoamiSuper = await mcpServer.executeTool('culkibo_rbac_whoami', {});
     assert.strictEqual(whoamiSuper.isError, false);
     assert.strictEqual(whoamiSuper.structuredContent.isSuperAdmin, true);
-    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 107);
+    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 109);
 
     const whoamiViewer = await mcpServer.executeTool('culkibo_rbac_whoami', {}, { auth: viewerAuth });
     assert.strictEqual(whoamiViewer.isError, false);
@@ -1021,7 +1029,7 @@ async function testMcpV21Superpowers() {
   let match;
   const caseRe = /case\s+'(culkibo_[a-z0-9_]+)'\s*:/g;
   while ((match = caseRe.exec(switchBlock))) caseNames.add(match[1]);
-  assert.strictEqual(caseNames.size, 107, `Todos los 107 tools deben tener handler en switch (hay ${caseNames.size})`);
+  assert.strictEqual(caseNames.size, 109, `Todos los 109 tools deben tener handler en switch (hay ${caseNames.size})`);
   for (const t of tools) {
     assert.ok(caseNames.has(t.name), `Falta case para ${t.name}`);
   }
@@ -1084,7 +1092,7 @@ async function testMcpV21Superpowers() {
     const subset = mcpServer.getToolsForPrincipal(null, { profile: prof });
     assert.ok(subset.length > 0, `El perfil ${prof} debe devolver herramientas`);
   }
-  console.log('  ✓ Auditoría automatizada de 107 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
+  console.log('  ✓ Auditoría automatizada de 109 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
 
   // 2. culkibo_search_tools (meta-discovery + aislamiento RBAC)
   const searchSuper = await mcpServer.executeTool('culkibo_search_tools', { query: 'postgres backup', limit: 5 });
@@ -1413,6 +1421,294 @@ async function testMcpV21Superpowers() {
     projectManager.delete(projA.id);
     projectManager.delete(projB.id);
     await projectManager.flushToDisk();
+  }
+}
+
+/**
+ * MCP 2026 Pioneer:
+ *  - 8 playbooks interactivos (prompts/list + prompts/get + sanitización + fail-closed RBAC)
+ *  - culkibo_ship_and_verify (pre-flight secret scan, confirmToken HMAC-SHA256, smoke check, auto-rollback, anti-IDOR)
+ *  - culkibo_export_agent_kit (6 agentes drop-in, ?profile=core, ${CULKIBO_TOKEN} sin fugas de secretos)
+ *  - X-Culkibo-Mcp-Profile header fallback en Streamable HTTP
+ */
+async function testMcp2026PioneerUpgrades() {
+  const express = require('express');
+  const projectManager = require('../server/services/projectManager');
+  const deployManager = require('../server/services/deployManager');
+  const mcpStreamableHttp = require('../server/services/mcpStreamableHttp');
+  const V = mcpServer.protocol.PROTOCOL_VERSION;
+
+  // 1. Verificar los 8 battle-tested playbooks vía handleModernRpc y handleJsonRpc + redacción de secretos en args
+  const expectedPlaybooks = [
+    ['deploy_safely', { projectId: 'proj_ship_1', targetEnv: 'production' }, 'culkibo_ship_and_verify'],
+    ['migrate_from_coolify', { coolifyUrl: 'https://coolify.acme.dev' }, 'SERVICE_FQDN_'],
+    ['debug_production_crash', { projectId: 'proj_crash_1', hostname: 'api.acme.dev' }, 'culkibo_diagnose_incident'],
+    ['zero_downtime_db_upgrade', { databaseId: 'db_pg_main', targetVersion: 'postgres:17' }, 'culkibo_database_backup'],
+    ['security_audit_stack', { scope: 'instance' }, '/api/audit/verify'],
+    ['setup_wildcard_tls_and_tunnel', { rootDomain: 'acme.dev', mode: 'dns01' }, 'culkibo_manage_wildcard_dns01'],
+    ['optimize_ram_and_costs', { monthlyServerCostEur: '25' }, 'culkibo_cost_advisor'],
+    ['disaster_recovery_drill', { databaseId: 'db_pg_main', projectId: 'proj_dr_1' }, 'AES-256-GCM']
+  ];
+
+  const listModern = await mcpServer.handleModernRpc({
+    jsonrpc: '2.0',
+    id: 'pb-list-1',
+    method: 'prompts/list',
+    params: { _meta: { 'io.modelcontextprotocol/protocolVersion': V, 'io.modelcontextprotocol/clientCapabilities': {} } }
+  });
+  assert.strictEqual(listModern.result.prompts.length, 13);
+
+  for (const [pbName, pbArgs, expectedNeedle] of expectedPlaybooks) {
+    assert.ok(listModern.result.prompts.some((p) => p.name === pbName), `prompts/list debe incluir ${pbName}`);
+    const got = await mcpServer.handleModernRpc({
+      jsonrpc: '2.0',
+      id: `pb-get-${pbName}`,
+      method: 'prompts/get',
+      params: {
+        name: pbName,
+        arguments: pbArgs,
+        _meta: { 'io.modelcontextprotocol/protocolVersion': V, 'io.modelcontextprotocol/clientCapabilities': {} }
+      }
+    });
+    assert.ok(got.result && Array.isArray(got.result.messages) && got.result.messages.length >= 1, `prompts/get falló para ${pbName}`);
+    const text = got.result.messages[0].content.text;
+    assert.ok(text.includes(expectedNeedle), `Playbook ${pbName} debe mencionar '${expectedNeedle}'`);
+  }
+
+  // Redacción de secretos si alguien pasa un secreto en los args de un prompt
+  const secretArgPrompt = mcpServer.getPrompt('deploy_safely', { projectId: 'sk_live_never_echo_secret_12345678' });
+  assert.ok(!secretArgPrompt.messages[0].content.text.includes('sk_live_never_echo_secret_12345678'), 'prompts/get NUNCA debe reflejar secretos');
+  assert.ok(secretArgPrompt.messages[0].content.text.includes('[REDACTED]'));
+
+  // Credencial revocada ({ ok: false }) falla cerrado en prompts/list y prompts/get
+  const deniedAuth = { ok: false };
+  assert.strictEqual(mcpServer.listPrompts(deniedAuth).length, 0);
+  assert.throws(() => mcpServer.getPrompt('deploy_safely', {}, { auth: deniedAuth }), /Acceso denegado/);
+  console.log('  ✓ MCP 2026: 8 playbooks interactivos verificados (prompts/list, prompts/get, redacción y RBAC fail-closed)');
+
+  // 2. culkibo_export_agent_kit (6 agentes drop-in, ?profile=core, cero secretos en claro)
+  const prevEnvToken = process.env.CULKIBO_TOKEN;
+  process.env.CULKIBO_TOKEN = 'ck_master_super_secret_never_embed_999';
+  try {
+    const viewerAuth = {
+      ok: true,
+      method: 'api_token',
+      principal: { userId: 'usr_kit_viewer', role: 'viewer', teamId: 'team_default', projectIds: null, scopes: ['*'] }
+    };
+    const kitRes = await mcpServer.executeTool('culkibo_export_agent_kit', {
+      target: 'all',
+      serverUrl: 'https://panel.acme.dev'
+    }, { auth: viewerAuth });
+    assert.strictEqual(kitRes.isError, false);
+    const kit = kitRes.structuredContent;
+    assert.strictEqual(kit.profile, 'core', 'culkibo_export_agent_kit debe usar profile=core por defecto');
+    assert.strictEqual(kit.endpoint, 'https://panel.acme.dev/api/mcp?profile=core');
+    assert.strictEqual(kit.tokenPlaceholder, '${CULKIBO_TOKEN}');
+    assert.strictEqual(kit.containsPlaintextSecrets, false);
+    assert.ok(kit.tokenSavings.savedPct >= 80, `El perfil core debe ahorrar >=80% (logró ${kit.tokenSavings.savedPct}%)`);
+    for (const targetKey of ['antigravity', 'claude-code', 'cursor', 'windsurf', 'codex', 'vscode']) {
+      assert.ok(kit.kits[targetKey], `Falta kit para ${targetKey}`);
+      assert.ok(Array.isArray(kit.kits[targetKey].files) && kit.kits[targetKey].files.length >= 1);
+    }
+    assert.ok(kit.kits['claude-code'].files.some((f) => f.path === '.mcp.json'));
+    assert.ok(kit.kits['claude-code'].files.some((f) => f.path === 'CLAUDE.md'));
+    assert.ok(kit.kits.cursor.files.some((f) => f.path === '.cursor/mcp.json'));
+    assert.ok(kit.kits.codex.files.some((f) => f.path === '.codex/config.toml' && f.content.includes('bearer_token_env_var = "CULKIBO_TOKEN"')));
+    const serializedKit = JSON.stringify(kit);
+    assert.ok(!serializedKit.includes('ck_master_super_secret_never_embed_999'), 'Agent kit JAMÁS puede incrustar CULKIBO_TOKEN real');
+    assert.ok(serializedKit.includes('${CULKIBO_TOKEN}'), 'Agent kit debe usar placeholder ${CULKIBO_TOKEN}');
+    console.log(`  ✓ culkibo_export_agent_kit verificado (6 agentes, ?profile=core -${kit.tokenSavings.savedPct}%, 0 secretos en claro)`);
+  } finally {
+    if (prevEnvToken === undefined) delete process.env.CULKIBO_TOKEN;
+    else process.env.CULKIBO_TOKEN = prevEnvToken;
+  }
+
+  // 3. culkibo_ship_and_verify (pre-flight secret scan + 2-phase confirmToken + smoke verify + auto-rollback + RBAC)
+  const leakyProj = projectManager.create({
+    name: 'Ship Leaky App',
+    description: 'Has hardcoded secret',
+    envVars: {
+      NODE_ENV: 'production',
+      STRIPE_SECRET_KEY: 'sk_live_hardcoded_leak_1234567890abcdef'
+    },
+    teamId: 'team_default'
+  });
+  const cleanProj = projectManager.create({
+    name: 'Ship Clean App',
+    description: 'Vault-clean app',
+    envVars: {
+      NODE_ENV: 'production',
+      STRIPE_SECRET_KEY: '${vault.STRIPE_SECRET_KEY}'
+    },
+    smokeTests: { enabled: true, failPolicy: 'rollback', checks: [{ path: '/health', expectedStatus: 200 }] },
+    teamId: 'team_default'
+  });
+
+  const devScopedClean = {
+    ok: true,
+    method: 'api_token',
+    principal: { userId: 'usr_ship_dev', role: 'developer', teamId: 'team_default', projectIds: [cleanProj.id], scopes: ['*'] }
+  };
+
+  const origDeploy = deployManager.deploy;
+  const origStatus = deployManager.status;
+  const origSmoke = deployManager.runSmokeTests;
+  const origRollback = deployManager.rollback;
+  const origStats = deployManager.getRuntimeStats;
+  try {
+    // 3a. Anti-IDOR: developer acotado a cleanProj NO puede usar ship_and_verify sobre leakyProj ni con dryRun
+    const idorShip = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: leakyProj.id,
+      dryRun: true
+    }, { auth: devScopedClean });
+    assert.strictEqual(idorShip.isError, true);
+    assert.strictEqual(JSON.parse(idorShip.content[0].text).code, 'FORBIDDEN');
+
+    // 3b. Developer NO puede degradar secretScanMode a 'warn'
+    const warnBlocked = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: cleanProj.id,
+      secretScanMode: 'warn',
+      dryRun: true
+    }, { auth: devScopedClean });
+    assert.strictEqual(warnBlocked.isError, true);
+    assert.strictEqual(JSON.parse(warnBlocked.content[0].text).code, 'FORBIDDEN');
+
+    // 3c. Proyecto con secreto hardcoded -> dryRun: true bloquea con SECRET_LEAK_DETECTED y NO emite confirmToken ni filtra el secreto
+    deployManager.status = async () => ({ current: { id: 'dep_prev_1', hostPort: 20101 }, previous: null });
+    const dryLeaky = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: leakyProj.id,
+      dryRun: true
+    });
+    assert.strictEqual(dryLeaky.isError, false);
+    assert.strictEqual(dryLeaky.structuredContent.wouldExecute, false);
+    assert.strictEqual(dryLeaky.structuredContent.secretScan.blocked, true);
+    assert.ok(dryLeaky.structuredContent.blockers.includes('SECRET_LEAK_DETECTED'));
+    assert.strictEqual(dryLeaky.structuredContent.confirmToken, undefined, 'No debe emitir confirmToken cuando hay fugas bloqueantes');
+    assert.ok(!JSON.stringify(dryLeaky).includes('sk_live_hardcoded_leak_1234567890abcdef'), 'El reporte de secret scan jamás expone el secreto en claro');
+
+    // 3d. dryRun: false sin confirmToken -> CONFIRMATION_REQUIRED
+    const noShipTok = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: cleanProj.id,
+      dryRun: false
+    }, { auth: devScopedClean });
+    assert.strictEqual(noShipTok.isError, true);
+    assert.strictEqual(JSON.parse(noShipTok.content[0].text).code, 'CONFIRMATION_REQUIRED');
+
+    // 3e. Proyecto limpio -> Fase 1 dryRun: true emite confirmToken ckr_ (redactado del auditLog)
+    const dryClean = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: cleanProj.id,
+      dryRun: true
+    }, { auth: devScopedClean });
+    assert.strictEqual(dryClean.isError, false);
+    assert.strictEqual(dryClean.structuredContent.wouldExecute, true);
+    assert.strictEqual(dryClean.structuredContent.secretScan.clean, true);
+    assert.strictEqual(dryClean.structuredContent.rollbackReadiness.canRollback, true);
+    const shipToken = dryClean.structuredContent.confirmToken;
+    assert.ok(typeof shipToken === 'string' && shipToken.startsWith('ckr_'));
+    const latestShipAudit = mcpServer.getAuditLog(1)[0];
+    assert.ok(!JSON.stringify(latestShipAudit).includes(shipToken), 'confirmToken de ship_and_verify jamás debe aparecer en auditLog');
+
+    // 3f. Cross-tool confusion: el token de ship_and_verify NO funciona en culkibo_auto_remediate
+    const crossTool = await mcpServer.executeTool('culkibo_auto_remediate', {
+      action: 'restart_service',
+      projectId: cleanProj.id,
+      confirmToken: shipToken
+    }, { auth: devScopedClean });
+    assert.strictEqual(crossTool.isError, true);
+    assert.strictEqual(JSON.parse(crossTool.content[0].text).code, 'CONFIRM_TOKEN_MISMATCH');
+
+    // 3g. Fase 2 exitosa: deploy + smoke tests OK + metricsSnapshot
+    let rollbackCalls = 0;
+    deployManager.deploy = async (proj) => ({ id: 'dep_ship_ok', projectId: proj.id, status: 'activo', hostPort: 20102 });
+    deployManager.runSmokeTests = async () => ({ passed: true, ok: true, results: [{ path: '/health', status: 200, ok: true, latencyMs: 11 }] });
+    deployManager.rollback = async (pid) => { rollbackCalls++; return { id: 'dep_prev_1', projectId: pid, status: 'activo' }; };
+    deployManager.getRuntimeStats = async () => ({ ok: true, running: true, status: 'running', health: 'healthy' });
+
+    const shippedOk = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: cleanProj.id,
+      dryRun: false,
+      confirmToken: shipToken
+    }, { auth: devScopedClean });
+    assert.strictEqual(shippedOk.isError, false);
+    assert.strictEqual(shippedOk.structuredContent.phase, 'shipped_verified');
+    assert.strictEqual(shippedOk.structuredContent.verified, true);
+    assert.strictEqual(shippedOk.structuredContent.rollbackExecuted, false);
+    assert.strictEqual(shippedOk.structuredContent.smokeVerification.passed, true);
+    assert.ok(shippedOk.structuredContent.metricsSnapshot);
+    assert.strictEqual(rollbackCalls, 0);
+
+    // Replay del mismo token -> CONFIRM_TOKEN_REPLAYED
+    const replayShip = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: cleanProj.id,
+      dryRun: false,
+      confirmToken: shipToken
+    }, { auth: devScopedClean });
+    assert.strictEqual(replayShip.isError, true);
+    assert.strictEqual(JSON.parse(replayShip.content[0].text).code, 'CONFIRM_TOKEN_REPLAYED');
+
+    // 3h. Auto-rollback cuando fallan los smoke checks post-despliegue
+    const dryClean2 = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: cleanProj.id,
+      dryRun: true
+    }, { auth: devScopedClean });
+    const shipToken2 = dryClean2.structuredContent.confirmToken;
+    deployManager.runSmokeTests = async () => ({ passed: false, ok: false, results: [{ path: '/health', status: 503, ok: false }] });
+
+    const shippedRb = await mcpServer.executeTool('culkibo_ship_and_verify', {
+      projectId: cleanProj.id,
+      dryRun: false,
+      confirmToken: shipToken2
+    }, { auth: devScopedClean });
+    assert.strictEqual(shippedRb.isError, false);
+    assert.strictEqual(shippedRb.structuredContent.phase, 'shipped_rolled_back');
+    assert.strictEqual(shippedRb.structuredContent.verified, false);
+    assert.strictEqual(shippedRb.structuredContent.rollbackExecuted, true);
+    assert.strictEqual(rollbackCalls, 1);
+    console.log('  ✓ culkibo_ship_and_verify verificado (secret scan block, confirmToken HMAC/replay/cross-tool, smoke verify, auto-rollback, anti-IDOR)');
+  } finally {
+    deployManager.deploy = origDeploy;
+    deployManager.status = origStatus;
+    deployManager.runSmokeTests = origSmoke;
+    deployManager.rollback = origRollback;
+    deployManager.getRuntimeStats = origStats;
+    projectManager.delete(leakyProj.id);
+    projectManager.delete(cleanProj.id);
+    await projectManager.flushToDisk();
+  }
+
+  // 4. X-Culkibo-Mcp-Profile header fallback en Streamable HTTP
+  const app = express();
+  app.use(express.json());
+  app.post('/api/mcp', mcpStreamableHttp.handlePost);
+  const srv = await new Promise((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  try {
+    const hdrRes = await fetch(`http://127.0.0.1:${srv.address().port}/api/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'MCP-Protocol-Version': V,
+        'Mcp-Method': 'tools/list',
+        'X-Culkibo-Mcp-Profile': 'core'
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'hdr-prof-1',
+        method: 'tools/list',
+        params: { _meta: { 'io.modelcontextprotocol/protocolVersion': V, 'io.modelcontextprotocol/clientCapabilities': {} } }
+      })
+    });
+    assert.strictEqual(hdrRes.status, 200);
+    assert.strictEqual(hdrRes.headers.get('x-culkibo-mcp-profile'), 'core');
+    assert.ok(String(hdrRes.headers.get('vary') || '').includes('X-Culkibo-Mcp-Profile'));
+    const hdrBody = await hdrRes.json();
+    assert.strictEqual(hdrBody.result.profile, 'core');
+    assert.ok(hdrBody.result.tools.some((t) => t.name === 'culkibo_ship_and_verify'));
+    console.log('  ✓ Streamable HTTP X-Culkibo-Mcp-Profile header fallback y Vary verificados');
+  } finally {
+    await new Promise((resolve) => srv.close(resolve));
   }
 }
 

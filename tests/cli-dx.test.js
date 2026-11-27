@@ -314,7 +314,144 @@ async function testCliDx() {
     assert.strictEqual(typeof cliMod.detectLocalStack, 'function');
     assert.strictEqual(typeof cliMod.generateStarterManifest, 'function');
     assert.strictEqual(typeof cliMod.parseEnvAssignments, 'function');
+    assert.strictEqual(typeof cliMod.writeAgentKitFiles, 'function');
     assert.deepStrictEqual(cliMod.parseEnvAssignments(['A=1', 'B=hello=world']), { A: '1', B: 'hello=world' });
+
+    // 6. culkibo agent-init [target]: drop-in configs con ?profile=core y ${CULKIBO_TOKEN} (0 secretos en claro)
+    const agentWorkspace = path.join(tmpRoot, 'agent-ws');
+    fs.mkdirSync(agentWorkspace, { recursive: true });
+    // Pre-poblar .cursor/mcp.json con otro servidor para verificar merge no destructivo
+    fs.mkdirSync(path.join(agentWorkspace, '.cursor'), { recursive: true });
+    fs.writeFileSync(
+      path.join(agentWorkspace, '.cursor', 'mcp.json'),
+      JSON.stringify({ mcpServers: { existingTool: { url: 'http://127.0.0.1:9999/mcp' } } }, null, 2),
+      'utf8'
+    );
+
+    const envWithSecretToken = {
+      ...isolatedEnv,
+      CULKIBO_TOKEN: 'ck_real_master_secret_must_never_leak_777'
+    };
+
+    // 6a. --dry-run no escribe archivos
+    const kitDry = await runCli(['agent-init', 'all', '-d', agentWorkspace, '--url', 'https://paas.acme.dev', '--dry-run', '--json'], { env: envWithSecretToken });
+    assert.strictEqual(kitDry.status, 0, kitDry.stderr + kitDry.stdout);
+    const kitDryJson = JSON.parse(kitDry.stdout);
+    assert.strictEqual(kitDryJson.ok, true);
+    assert.strictEqual(kitDryJson.dryRun, true);
+    assert.strictEqual(kitDryJson.profile, 'core');
+    assert.strictEqual(kitDryJson.containsPlaintextSecrets, false);
+    assert.ok(kitDryJson.tokenSavings.savedPct >= 80, `Se esperaba ahorro >=80%, llegó ${kitDryJson.tokenSavings.savedPct}%`);
+    assert.strictEqual(fs.existsSync(path.join(agentWorkspace, '.mcp.json')), false, '--dry-run no debe escribir archivos');
+
+    // 6b. Escritura real para todos los agentes (antigravity, claude-code, cursor, windsurf, codex, vscode)
+    const kitWrite = await runCli(['agent-init', 'all', '-d', agentWorkspace, '--url', 'https://paas.acme.dev', '--json'], { env: envWithSecretToken });
+    assert.strictEqual(kitWrite.status, 0, kitWrite.stderr + kitWrite.stdout);
+    const kitWriteJson = JSON.parse(kitWrite.stdout);
+    assert.strictEqual(kitWriteJson.ok, true);
+    assert.ok(!kitWrite.stdout.includes('ck_real_master_secret_must_never_leak_777'), 'agent-init JAMÁS debe imprimir CULKIBO_TOKEN real');
+
+    const expectedAgentFiles = [
+      '.antigravity/mcp.json',
+      '.mcp.json',
+      'CLAUDE.md',
+      '.cursor/mcp.json',
+      '.windsurf/mcp_config.json',
+      '.codex/config.toml',
+      '.vscode/mcp.json'
+    ];
+    for (const rel of expectedAgentFiles) {
+      const full = path.join(agentWorkspace, rel);
+      assert.strictEqual(fs.existsSync(full), true, `agent-init debe crear ${rel}`);
+      const content = fs.readFileSync(full, 'utf8');
+      assert.ok(!content.includes('ck_real_master_secret_must_never_leak_777'), `${rel} JAMÁS puede contener el token real`);
+      assert.ok(content.includes('profile=core'), `${rel} debe usar ?profile=core por defecto`);
+    }
+    const mergedCursor = JSON.parse(fs.readFileSync(path.join(agentWorkspace, '.cursor', 'mcp.json'), 'utf8'));
+    assert.ok(mergedCursor.mcpServers.existingTool, 'agent-init debe preservar servidores MCP existentes al fusionar JSON');
+    assert.strictEqual(mergedCursor.mcpServers.culkibo.headers.Authorization, 'Bearer ${CULKIBO_TOKEN}');
+    const codexToml = fs.readFileSync(path.join(agentWorkspace, '.codex', 'config.toml'), 'utf8');
+    assert.ok(codexToml.includes('bearer_token_env_var = "CULKIBO_TOKEN"'));
+    const claudeMd = fs.readFileSync(path.join(agentWorkspace, 'CLAUDE.md'), 'utf8');
+    assert.ok(claudeMd.includes('culkibo_ship_and_verify') && claudeMd.includes('deploy_safely'));
+
+    // Re-ejecutar sin --force omite entradas existentes sin sobrescribir
+    const kitSkip = await runCli(['agent-init', 'cursor', '-d', agentWorkspace, '--url', 'https://paas.acme.dev', '--json'], { env: envWithSecretToken });
+    assert.strictEqual(kitSkip.status, 0, kitSkip.stderr);
+    const kitSkipJson = JSON.parse(kitSkip.stdout);
+    assert.ok(kitSkipJson.skipped.includes('.cursor/mcp.json'));
+    console.log(`  ✓ culkibo agent-init verificado (6 agentes, merge seguro, -${kitWriteJson.tokenSavings.savedPct}% tokens, 0 secretos en claro)`);
+
+    // 7. CULKIBO_MCP_PROFILE sobre puente stdio local y remoto HTTP
+    const stdioLocalInput = [
+      JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+      JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+      JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'prompts/list', params: {} }),
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/list',
+        params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} } }
+      })
+    ].join('\n') + '\n';
+
+    const stdioLocalCore = await runCli(['mcp'], {
+      env: { ...isolatedEnv, CULKIBO_MCP_PROFILE: 'core' },
+      input: stdioLocalInput
+    });
+    assert.strictEqual(stdioLocalCore.status, 0, `culkibo mcp local falló: ${stdioLocalCore.stderr}`);
+    const localResponses = stdioLocalCore.stdout.trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    assert.strictEqual(localResponses.length, 4);
+    assert.strictEqual(localResponses[0].result.capabilities.prompts.listChanged, false);
+    const coreStdioTools = localResponses[1].result.tools;
+    assert.ok(coreStdioTools.length > 0 && coreStdioTools.length <= 20, `CULKIBO_MCP_PROFILE=core debe filtrar tools/list (devolvió ${coreStdioTools.length})`);
+    assert.ok(coreStdioTools.some((t) => t.name === 'culkibo_ship_and_verify'));
+    assert.ok(coreStdioTools.some((t) => t.name === 'culkibo_search_tools'));
+    assert.ok(localResponses[2].result.prompts.some((p) => p.name === 'deploy_safely'));
+    assert.strictEqual(localResponses[3].result.profile, 'core');
+    assert.strictEqual(localResponses[3].result.tools.length, coreStdioTools.length);
+
+    // Puente stdio remoto hacia HTTP mock verificando ?profile=core y legacy profile forwarding
+    /** @type {Array<{ url: string, body: any }>} */
+    const mcpBridgeReqs = [];
+    const mcpMockServer = http.createServer((req, res) => {
+      let bodyStr = '';
+      req.on('data', (c) => { bodyStr += c; });
+      req.on('end', () => {
+        const parsed = bodyStr ? JSON.parse(bodyStr) : {};
+        mcpBridgeReqs.push({ url: req.url || '', body: parsed });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: { tools: [{ name: 'culkibo_search_tools' }], profile: 'core' } }));
+      });
+    });
+    await new Promise((resolve) => mcpMockServer.listen(0, '127.0.0.1', resolve));
+    try {
+      const mcpMockAddr = /** @type {import('net').AddressInfo} */ (mcpMockServer.address());
+      const remoteStdioInput = [
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 10,
+          method: 'tools/list',
+          params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} } }
+        }),
+        JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/list', params: {} })
+      ].join('\n') + '\n';
+      const stdioRemoteCore = await runCli(['mcp'], {
+        env: {
+          ...isolatedEnv,
+          CULKIBO_API_URL: `http://127.0.0.1:${mcpMockAddr.port}`,
+          CULKIBO_TOKEN: 'ck_bridge_tok',
+          CULKIBO_MCP_PROFILE: 'core'
+        },
+        input: remoteStdioInput
+      });
+      assert.strictEqual(stdioRemoteCore.status, 0, stdioRemoteCore.stderr);
+      assert.ok(mcpBridgeReqs.some((r) => r.url === '/api/mcp?profile=core'), 'Puente stdio moderno debe añadir ?profile=core a /api/mcp');
+      assert.ok(mcpBridgeReqs.some((r) => r.url === '/api/mcp/message' && r.body?.params?.profile === 'core'), 'Puente stdio legacy debe reenviar params.profile=core');
+    } finally {
+      await new Promise((r) => mcpMockServer.close(() => r(undefined)));
+    }
+    console.log('  ✓ CULKIBO_MCP_PROFILE=core verificado en puente stdio local (2024-11-05 y 2026-07-28) y remoto HTTP');
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {
