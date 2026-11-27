@@ -68,6 +68,10 @@ import {
   type WorkerAutoscalerEvaluation,
   type OomForensicsResult,
   type ImageBloatAuditResult,
+  type EgressAuditResult,
+  type MultiArchVerifyResult,
+  type MultiArchPlanResult,
+  type ChaosGameDayResult,
 } from '../lib/api';
 import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
@@ -255,8 +259,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13 OOM Forensics & Image Layer Bloat Auditor state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image'>('oom');
+  // Cycle-13..14 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch & Chaos GameDay state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -266,6 +270,16 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [imageAuditResult, setImageAuditResult] = useState<ImageBloatAuditResult | null>(null);
   const [imageAuditBusy, setImageAuditBusy] = useState(false);
   const [imageAuditError, setImageAuditError] = useState<string | null>(null);
+  const [egressResult, setEgressResult] = useState<EgressAuditResult | null>(null);
+  const [egressBusy, setEgressBusy] = useState(false);
+  const [egressError, setEgressError] = useState<string | null>(null);
+  const [multiArchVerify, setMultiArchVerify] = useState<MultiArchVerifyResult | null>(null);
+  const [multiArchPlan, setMultiArchPlan] = useState<MultiArchPlanResult | null>(null);
+  const [multiArchBusy, setMultiArchBusy] = useState<'verify' | 'plan' | null>(null);
+  const [multiArchError, setMultiArchError] = useState<string | null>(null);
+  const [chaosResult, setChaosResult] = useState<ChaosGameDayResult | null>(null);
+  const [chaosBusy, setChaosBusy] = useState<'prod' | 'abort' | 'healthy' | null>(null);
+  const [chaosError, setChaosError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1182,6 +1196,119 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setImageAuditBusy(false);
+    }
+  };
+
+  const handleAuditEgressFirewall = async () => {
+    setEgressBusy(true);
+    setEgressError(null);
+    try {
+      const res = await api.auditProjectEgress(project.id, {
+        backend: 'nftables',
+        observedSockets: [
+          { ip: '169.254.169.254', host: '169.254.169.254', port: 80, proto: 'tcp' },
+          { ip: '10.0.0.15', host: '10.0.0.15', port: 5432, proto: 'tcp' },
+        ],
+        firewallRules: [],
+      });
+      setEgressResult(res);
+      const vCount = Array.isArray(res.violations) ? res.violations.length : 0;
+      onNotify(
+        res.compliant
+          ? `Egress Firewall compliant (riskScore ${res.riskScore}/100 · SSH/80/443 preserved)`
+          : `Egress Auditor flagged ${vCount} violation(s) (riskScore ${res.riskScore}/100 · nftables fix generated)`,
+        res.compliant ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Egress firewall audit failed';
+      setEgressError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setEgressBusy(false);
+    }
+  };
+
+  const handleVerifyMultiArch = async () => {
+    setMultiArchBusy('verify');
+    setMultiArchError(null);
+    try {
+      const res = await api.verifyMultiArchManifest({
+        imageArch: 'arm64',
+        hostArch: 'amd64',
+        manifestPlatforms: ['linux/arm64'],
+        strictOciRegistry: true,
+        includeAttestations: true,
+      });
+      setMultiArchVerify(res);
+      onNotify(
+        res.compatible
+          ? 'OCI Manifest compatible with host architecture'
+          : `Pre-Deploy Guard: ${res.code || 'EXEC_FORMAT_MISMATCH'} (arm64 image on amd64 host blocked!)`,
+        res.compatible ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Multi-arch verification failed';
+      setMultiArchError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setMultiArchBusy(null);
+    }
+  };
+
+  const handlePlanMultiArchMatrix = async () => {
+    setMultiArchBusy('plan');
+    setMultiArchError(null);
+    try {
+      const res = await api.planMultiArchBuild({
+        targetPlatforms: ['linux/amd64', 'linux/arm64'],
+        builders: [
+          { id: 'hetzner-x86-fsn1', name: 'hetzner-x86-fsn1', arch: 'amd64', host: '91.107.194.22' },
+          { id: 'ampere-arm-hel1', name: 'ampere-arm-hel1', arch: 'arm64', host: '95.217.44.18' },
+        ],
+        preferNativeOverQemu: true,
+        imageTag: `culkibo/${project.name}:latest`,
+      });
+      setMultiArchPlan(res);
+      onNotify(
+        res.usesQemu
+          ? 'Multi-arch build matrix planned (QEMU fallback required)'
+          : 'Native Fleet Build Matrix planned (amd64 + arm64 · 0 QEMU emulation!)',
+        'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Multi-arch planning failed';
+      setMultiArchError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setMultiArchBusy(null);
+    }
+  };
+
+  const handleRunChaosGameDay = async (mode: 'prod' | 'abort' | 'healthy') => {
+    setChaosBusy(mode);
+    setChaosError(null);
+    try {
+      const payload =
+        mode === 'prod'
+          ? { environment: 'production', explicitProdConfirm: false, faultType: 'latency_jitter', latencyMs: 300, dryRun: true }
+          : mode === 'abort'
+            ? { environment: 'staging', faultType: 'http_5xx', faultRatePct: 28, maxErrorAbortPct: 15, recoverySec: 45, sloP95Ms: 400, dryRun: true }
+            : { environment: 'staging', faultType: 'latency_jitter', latencyMs: 180, jitterMs: 25, faultRatePct: 0.4, maxErrorAbortPct: 15, recoverySec: 8, sloP95Ms: 400, dryRun: true };
+      const res = await api.simulateProjectChaos(project.id, payload);
+      setChaosResult(res);
+      if (res.blocked || res.code === 'PROD_CHAOS_CONFIRM_REQUIRED') {
+        onNotify('Production Chaos Safety Lock engaged: PROD_CHAOS_CONFIRM_REQUIRED', 'error');
+      } else if (res.aborted || res.status === 'AUTO_ABORTED') {
+        onNotify('Staging GameDay AUTO_ABORTED: error rate breached safety threshold!', 'error');
+      } else {
+        onNotify(`Healthy GameDay PASS: Resilience Score ${res.resilienceScore ?? 94}/100 (Grade ${res.grade || 'A'})`, 'success');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Chaos GameDay simulation failed';
+      setChaosError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setChaosBusy(null);
     }
   };
 
@@ -2849,25 +2976,25 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               </div>
             </div>
             <div className="flex items-center gap-1.5 flex-wrap shrink-0">
-              <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[11px] font-medium">
-                <button
-                  type="button"
-                  onClick={() => setForensicsTab('oom')}
-                  className={`px-2.5 py-1 rounded-md cursor-pointer ${
-                    forensicsTab === 'oom' ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {t('pd.forensicsTabOom')}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setForensicsTab('image')}
-                  className={`px-2.5 py-1 rounded-md cursor-pointer ${
-                    forensicsTab === 'image' ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {t('pd.forensicsTabImage')}
-                </button>
+              <div className="inline-flex flex-wrap items-center gap-0.5 bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[11px] font-medium">
+                {([
+                  { id: 'oom' as const, label: t('pd.forensicsTabOom') },
+                  { id: 'image' as const, label: t('pd.forensicsTabImage') },
+                  { id: 'egress' as const, label: t('pd.forensicsTabEgress') },
+                  { id: 'multiarch' as const, label: t('pd.forensicsTabMultiArch') },
+                  { id: 'chaos' as const, label: t('pd.forensicsTabChaos') },
+                ]).map((tabItem) => (
+                  <button
+                    key={tabItem.id}
+                    type="button"
+                    onClick={() => setForensicsTab(tabItem.id)}
+                    className={`px-2.5 py-1 rounded-md cursor-pointer ${
+                      forensicsTab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {tabItem.label}
+                  </button>
+                ))}
               </div>
               <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Forensics panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
                 <X className="w-4 h-4" />
@@ -2875,7 +3002,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
             </div>
           </div>
 
-          {forensicsTab === 'oom' ? (
+          {forensicsTab === 'oom' && (
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-2">
                 <button
@@ -2952,7 +3079,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 );
               })()}
             </div>
-          ) : (
+          )}
+
+          {forensicsTab === 'image' && (
             <div className="space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-1.5 flex-wrap">
@@ -3040,6 +3169,213 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                           <li key={idx}>{typeof tip === 'string' ? tip : (tip.message || tip.recommendation || tip.action || 'Use multi-stage alpine build')}</li>
                         ))}
                       </ul>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'egress' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={egressBusy}
+                  onClick={() => void handleAuditEgressFirewall()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {egressBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                  <span>{t('pd.egressAuditBtn')}</span>
+                </button>
+              </div>
+              {egressError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{egressError}</div>}
+              {egressResult && (() => {
+                const viols = Array.isArray(egressResult.violations) ? egressResult.violations : [];
+                const missing = Array.isArray(egressResult.missingChains) ? egressResult.missingChains : [];
+                const rules = Array.isArray(egressResult.suggestedRules) ? egressResult.suggestedRules : [];
+                return (
+                  <div className="space-y-2.5 tabular-nums">
+                    <div className="flex flex-wrap items-center gap-2 font-mono">
+                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-semibold border ${
+                        egressResult.compliant
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-red-50 text-red-700 border-red-200'
+                      }`}>
+                        riskScore: {egressResult.riskScore}/100
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                        antiLockoutSafe: {egressResult.antiLockoutSafe !== false ? 'SSH/80/443' : 'CHECK'}
+                      </span>
+                      {missing.map((ch) => (
+                        <span key={ch} className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                          missing: {ch}
+                        </span>
+                      ))}
+                    </div>
+                    {viols.length > 0 && (
+                      <div className="p-2.5 rounded-xl bg-red-50 border border-red-200 text-red-700 font-mono text-[11px] space-y-1">
+                        {viols.map((v, idx) => (
+                          <div key={idx}>
+                            • {typeof v === 'string' ? v : `[${v.code || 'EGRESS'}] ${v.target ? `${v.target} — ` : ''}${v.message || 'Blocked outbound socket'}`}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {rules.length > 0 && (
+                      <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 font-mono text-[10px] leading-relaxed overflow-x-auto max-h-44 border border-slate-800">
+                        {rules.join('\n')}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'multiarch' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={multiArchBusy !== null}
+                  onClick={() => void handleVerifyMultiArch()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {multiArchBusy === 'verify' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.multiArchCheckBtn')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={multiArchBusy !== null}
+                  onClick={() => void handlePlanMultiArchMatrix()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {multiArchBusy === 'plan' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Layers className="w-3.5 h-3.5" />}
+                  <span>{t('pd.multiArchPlanBtn')}</span>
+                </button>
+              </div>
+              {multiArchError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{multiArchError}</div>}
+              {multiArchVerify && (
+                <div className={`p-3 rounded-xl border space-y-1.5 font-mono text-[11px] ${
+                  multiArchVerify.compatible
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                    : 'bg-red-50 border-red-200 text-red-700'
+                }`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      {multiArchVerify.code || (multiArchVerify.compatible ? 'ARCH_COMPATIBLE' : 'EXEC_FORMAT_MISMATCH')}
+                    </span>
+                    {Array.isArray(multiArchVerify.warnings) && multiArchVerify.warnings.map((w, i) => (
+                      <span key={i} className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px]">{w}</span>
+                    ))}
+                  </div>
+                  {multiArchVerify.remediation && (
+                    <div>
+                      {Array.isArray(multiArchVerify.remediation) ? multiArchVerify.remediation.join(' · ') : multiArchVerify.remediation}
+                    </div>
+                  )}
+                </div>
+              )}
+              {multiArchPlan && (() => {
+                const assigns = Array.isArray(multiArchPlan.assignments) ? multiArchPlan.assignments : [];
+                const argv = Array.isArray(multiArchPlan.buildxArgv) ? multiArchPlan.buildxArgv : [];
+                return (
+                  <div className="space-y-2 tabular-nums">
+                    <div className="flex flex-wrap items-center gap-2 font-mono">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
+                        multiArchPlan.usesQemu
+                          ? 'bg-amber-50 text-amber-800 border-amber-200'
+                          : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      }`}>
+                        {multiArchPlan.usesQemu ? 'QEMU Fallback Active' : '100% Native Fleet Routing (0 QEMU)'}
+                      </span>
+                      {assigns.map((a, idx) => (
+                        <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                          {a.platform} → {a.builder}
+                        </span>
+                      ))}
+                    </div>
+                    {argv.length > 0 && (
+                      <pre className="p-3 rounded-xl bg-slate-950 text-emerald-300 font-mono text-[10px] leading-relaxed overflow-x-auto border border-slate-800">
+                        {argv.join(' ')}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'chaos' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={chaosBusy !== null}
+                  onClick={() => void handleRunChaosGameDay('prod')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {chaosBusy === 'prod' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.chaosTestProdLock')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={chaosBusy !== null}
+                  onClick={() => void handleRunChaosGameDay('abort')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 hover:bg-slate-100 text-amber-800 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {chaosBusy === 'abort' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                  <span>{t('pd.chaosTestAbort')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={chaosBusy !== null}
+                  onClick={() => void handleRunChaosGameDay('healthy')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {chaosBusy === 'healthy' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.chaosTestHealthy')}</span>
+                </button>
+              </div>
+              {chaosError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{chaosError}</div>}
+              {chaosResult && (() => {
+                const isBlocked = Boolean(chaosResult.blocked || chaosResult.code === 'PROD_CHAOS_CONFIRM_REQUIRED');
+                const isAborted = Boolean(chaosResult.aborted || chaosResult.status === 'AUTO_ABORTED');
+                return (
+                  <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums font-mono text-[11px] ${
+                    isBlocked
+                      ? 'bg-red-50 border-red-200 text-red-700'
+                      : isAborted
+                        ? 'bg-amber-50 border-amber-200 text-amber-800'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {isBlocked
+                          ? (chaosResult.code || 'PROD_CHAOS_CONFIRM_REQUIRED')
+                          : isAborted
+                            ? 'AUTO_ABORTED'
+                            : `RESILIENCE ${chaosResult.resilienceScore ?? 94}/100 · GRADE ${chaosResult.grade || 'A'}`}
+                      </span>
+                      {chaosResult.environment && (
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                          env: {chaosResult.environment}
+                        </span>
+                      )}
+                      {chaosResult.faultType && (
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                          fault: {chaosResult.faultType}
+                        </span>
+                      )}
+                    </div>
+                    {chaosResult.message && <div>{chaosResult.message}</div>}
+                    {chaosResult.breakdown && (
+                      <div className="flex flex-wrap gap-2 text-[10px]">
+                        <span>errorScore: {chaosResult.breakdown.errorScore ?? 100}</span>
+                        <span>· latencyScore: {chaosResult.breakdown.latencyScore ?? 92}</span>
+                        <span>· recoveryScore: {chaosResult.breakdown.recoveryScore ?? 95}</span>
+                      </div>
                     )}
                   </div>
                 );

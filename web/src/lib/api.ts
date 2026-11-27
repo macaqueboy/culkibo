@@ -5488,6 +5488,152 @@ export const api = {
       'Could not evaluate on-call escalations'
     );
   },
+
+  // --- Cycle-14: Egress Firewall, DB Replica Failover, Pre-Deploy Secret Gate, Multi-Arch Planner, Chaos GameDay ---
+
+  async scanPreDeploySecrets(payload: {
+    files?: Array<{ path: string; content: string }>;
+    diffText?: string;
+    envMap?: Record<string, string>;
+    mode?: 'enforce' | 'warn';
+    allowlistFingerprints?: string[];
+  }): Promise<PreDeploySecretScanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/predeploy-secret-scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Pre-deploy secret gate scan failed'
+    );
+  },
+
+  async getDatabaseReplicas(dbId: string): Promise<ReplicaTopologyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${encodeURIComponent(dbId)}/replicas`),
+      'Could not load database replica topology'
+    );
+  },
+
+  async saveDatabaseReplicas(
+    dbId: string,
+    payload: { primary: ReplicaNodeRecord; replicas: ReplicaNodeRecord[] }
+  ): Promise<ReplicaTopologyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${encodeURIComponent(dbId)}/replicas`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not save database replica topology'
+    );
+  },
+
+  async promoteDatabaseReplica(
+    dbId: string,
+    payload: {
+      targetReplicaId?: string;
+      maxAcceptableLagBytes?: number;
+      requireOldPrimaryFenced?: boolean;
+      dryRun?: boolean;
+    } = {}
+  ): Promise<ReplicaPromoteResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${encodeURIComponent(dbId)}/replicas/promote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Replica promotion planner failed'
+    );
+  },
+
+  async auditProjectEgress(
+    projectId: string,
+    payload: {
+      observedSockets?: Array<{ host?: string; ip?: string; port?: number; proto?: string }>;
+      firewallRules?: string[];
+      backend?: 'nftables' | 'iptables';
+    } = {}
+  ): Promise<EgressAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/egress-audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Egress firewall audit failed'
+    );
+  },
+
+  async verifyMultiArchManifest(payload: {
+    imageArch?: string;
+    imageOs?: string;
+    manifestPlatforms?: string[];
+    hostArch: string;
+    strictOciRegistry?: boolean;
+    includeAttestations?: boolean;
+  }): Promise<MultiArchVerifyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/build/multiarch/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Multi-arch manifest verification failed'
+    );
+  },
+
+  async planMultiArchBuild(payload: {
+    targetPlatforms?: string[];
+    builders?: Array<{ id?: string; name?: string; arch: string; host?: string }>;
+    preferNativeOverQemu?: boolean;
+    imageTag?: string;
+  }): Promise<MultiArchPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/build/multiarch/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Multi-arch matrix planning failed'
+    );
+  },
+
+  async listProjectChaosGameDays(projectId: string): Promise<{ ok?: boolean; gamedays: ChaosGameDayResult[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/chaos/gamedays`),
+      'Could not load Chaos GameDay history'
+    );
+  },
+
+  async simulateProjectChaos(
+    projectId: string,
+    payload: {
+      environment?: string;
+      explicitProdConfirm?: boolean;
+      faultType?: string;
+      latencyMs?: number;
+      jitterMs?: number;
+      faultRatePct?: number;
+      maxErrorAbortPct?: number;
+      recoverySec?: number;
+      sloP95Ms?: number;
+      allowedErrorRatePct?: number;
+      dryRun?: boolean;
+    }
+  ): Promise<ChaosGameDayResult> {
+    const res = await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/chaos/simulate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun: true, ...payload }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.code === 'PROD_CHAOS_CONFIRM_REQUIRED' || data?.blocked === true) {
+      return data as ChaosGameDayResult;
+    }
+    throw new Error(data?.error || data?.message || 'Chaos GameDay simulation failed');
+  },
 };
 
 // =====================================================================
@@ -7195,4 +7341,121 @@ export interface OncallIngestResult {
   suppressed?: boolean;
   flapping?: boolean;
   reason?: string;
+}
+
+// --- Cycle-14 Resilience, Fencing & Secret-Gate Types ---
+
+export type PreDeploySecretFinding = string | {
+  location?: string;
+  line?: number;
+  ruleId?: string;
+  severity?: string;
+  entropy?: number;
+  redactedPreview?: string;
+  fingerprintSha256?: string;
+  message?: string;
+};
+
+export interface PreDeploySecretScanResult {
+  ok?: boolean;
+  allowed: boolean;
+  mode?: string;
+  scannedItems?: number;
+  blockedCount: number;
+  findings?: PreDeploySecretFinding[];
+}
+
+export interface ReplicaNodeRecord {
+  id: string;
+  host: string;
+  port?: number;
+  region?: string;
+  lagMs?: number;
+  lagBytes?: number;
+  healthy?: boolean;
+  fenced?: boolean;
+  role?: string;
+}
+
+export interface ReplicaTopologyResult {
+  ok?: boolean;
+  dbId?: string;
+  primary?: ReplicaNodeRecord | null;
+  replicas?: ReplicaNodeRecord[];
+  topology?: {
+    primary?: ReplicaNodeRecord | null;
+    replicas?: ReplicaNodeRecord[];
+  };
+  readWriteSplit?: {
+    writeTarget?: ReplicaNodeRecord | string | null;
+    readTargets?: Array<ReplicaNodeRecord | string>;
+    excludedLagging?: Array<ReplicaNodeRecord | string>;
+    fallbackToPrimary?: boolean;
+  };
+}
+
+export interface ReplicaPromoteResult {
+  ok?: boolean;
+  dbId?: string;
+  allowed: boolean;
+  blockers?: Array<string | { code?: string; message?: string }>;
+  steps?: Array<string | { step?: number; phase?: string; action?: string; title?: string; description?: string }>;
+  promotedNode?: ReplicaNodeRecord | string | null;
+  timelineNext?: number;
+  dryRun?: boolean;
+}
+
+export interface EgressAuditResult {
+  ok?: boolean;
+  projectId?: string;
+  backend?: string;
+  compliant: boolean;
+  riskScore: number;
+  violations?: Array<string | { code?: string; severity?: string; target?: string; message?: string }>;
+  missingChains?: string[];
+  antiLockoutSafe?: boolean;
+  suggestedRules?: string[];
+  auditedAt?: string;
+}
+
+export interface MultiArchVerifyResult {
+  ok?: boolean;
+  compatible: boolean;
+  code?: string;
+  warnings?: string[];
+  remediation?: string | string[];
+}
+
+export interface MultiArchPlanResult {
+  ok?: boolean;
+  imageTag?: string;
+  assignments?: Array<{ platform: string; builder: string; native?: boolean; mode?: string }>;
+  usesQemu?: boolean;
+  qemuWarning?: string | null;
+  buildxArgv?: string[];
+  manifestCreateArgv?: string[];
+}
+
+export interface ChaosGameDayResult {
+  ok?: boolean;
+  id?: string;
+  projectId?: string;
+  environment?: string;
+  faultType?: string;
+  blocked?: boolean;
+  code?: string;
+  message?: string;
+  status?: string;
+  aborted?: boolean;
+  resilienceScore?: number;
+  grade?: string;
+  breakdown?: {
+    errorScore?: number;
+    latencyScore?: number;
+    recoveryScore?: number;
+  };
+  observedErrorRatePct?: number;
+  p95LatencyMs?: number;
+  recoverySec?: number;
+  dryRun?: boolean;
 }

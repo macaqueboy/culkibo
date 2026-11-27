@@ -86,6 +86,7 @@ import {
   type LicenseAuditResult,
   type SeccompProfileResult,
   type RuncAuditResult,
+  type PreDeploySecretScanResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -336,6 +337,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [runcAudit, setRuncAudit] = useState<RuncAuditResult | null>(null);
   const [seccompBusy, setSeccompBusy] = useState<'gen' | 'runc' | null>(null);
   const [seccompError, setSeccompError] = useState<string | null>(null);
+
+  // Cycle-14: Pre-Deploy Shannon-Entropy & Pattern Secret Gate (12 Rules)
+  const [gateInput, setGateInput] = useState(
+    'RELEASE_ID=550e8400-e29b-41d4-a716-446655440000\nGIT_COMMIT_SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nPUBLIC_APP_URL=https://app.acme-demo.dev'
+  );
+  const [gateResult, setGateResult] = useState<PreDeploySecretScanResult | null>(null);
+  const [gateBusy, setGateBusy] = useState(false);
+  const [gateError, setGateError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -1558,6 +1567,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setSeccompBusy(null);
+    }
+  };
+
+  const handleRunPreDeployGate = async (overrideDiff?: string) => {
+    const diffText = (overrideDiff ?? gateInput).trim();
+    if (!diffText) return;
+    if (overrideDiff !== undefined) setGateInput(overrideDiff);
+    setGateBusy(true);
+    setGateError(null);
+    try {
+      const res = await api.scanPreDeploySecrets({ diffText, mode: 'enforce' });
+      setGateResult(res);
+      onNotify?.(
+        res.allowed
+          ? `Pre-Deploy Secret Gate ALLOWED (0 leaks across ${res.scannedItems ?? 1} item(s))`
+          : `Pre-Deploy Secret Gate BLOCKED (${res.blockedCount} high-entropy / secret finding(s) redacted)`,
+        res.allowed ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Pre-deploy secret gate scan failed';
+      setGateError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setGateBusy(false);
     }
   };
 
@@ -3371,6 +3404,133 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </pre>
               </div>
             )}
+          </div>
+
+          {/* 15. Cycle-14: Pre-Deploy Shannon-Entropy & Pattern Secret Gate (12 Rules) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ScanSearch className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.gateTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Zero Raw Echo · SHA-256 Fingerprints
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.gateDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  disabled={gateBusy}
+                  onClick={() => {
+                    const fakePayKey = ['sk', 'live', '99887766554433221100aabb'].join('_');
+                    const fakeGh = ['ghp', 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'].join('_');
+                    const leakyDiff = [
+                      '+DATABASE_URL=postgresql://admin:Sup3rS3cretP@ss99!@db.internal:5432/prod',
+                      `+PAYMENT_API_KEY=${fakePayKey}`,
+                      `+GITHUB_TOKEN=${fakeGh}`,
+                    ].join('\n');
+                    void handleRunPreDeployGate(leakyDiff);
+                  }}
+                  className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                  <span>{t('sec.gateTestLeaky')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={gateBusy}
+                  onClick={() =>
+                    void handleRunPreDeployGate(
+                      'RELEASE_UUID=550e8400-e29b-41d4-a716-446655440000\nARTIFACT_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nDEMO_PLACEHOLDER=your_api_key'
+                    )
+                  }
+                  className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 hover:bg-slate-100 text-emerald-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>{t('sec.gateTestBenign')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={gateBusy || !gateInput.trim()}
+                  onClick={() => void handleRunPreDeployGate()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {gateBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                  <span>{gateBusy ? t('sec.gateScanning') : t('sec.gateScanBtn')}</span>
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              rows={3}
+              value={gateInput}
+              onChange={(e) => setGateInput(e.target.value)}
+              aria-label="Pre-deploy diff or .env payload to scan"
+              spellCheck={false}
+              className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white font-mono text-[11px] text-slate-900 leading-relaxed"
+            />
+
+            {gateError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{gateError}</div>}
+
+            {gateResult && (() => {
+              const findings = Array.isArray(gateResult.findings) ? gateResult.findings : [];
+              return (
+                <div className="space-y-2.5 tabular-nums">
+                  <div className="flex flex-wrap items-center gap-2 font-mono">
+                    <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-semibold border ${
+                      gateResult.allowed
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-red-50 text-red-700 border-red-200'
+                    }`}>
+                      {gateResult.allowed ? 'ALLOWED · 0 SECRETS' : `BLOCKED · ${gateResult.blockedCount} FINDING(S)`}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-[10px] text-slate-700">
+                      mode: {gateResult.mode || 'enforce'}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-[10px] text-slate-700">
+                      scanned: {gateResult.scannedItems ?? 1} item(s)
+                    </span>
+                  </div>
+                  {findings.length > 0 && (
+                    <div className="divide-y divide-red-200 border border-red-200 rounded-xl overflow-hidden bg-red-50">
+                      {findings.slice(0, 6).map((f, idx) => (
+                        <div key={idx} className="px-3.5 py-2.5 font-mono text-[11px] text-red-700 space-y-1">
+                          {typeof f === 'string' ? (
+                            <div>• {f}</div>
+                          ) : (
+                            <>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                                  {f.ruleId || 'HIGH_ENTROPY'}
+                                </span>
+                                {f.entropy != null && (
+                                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                                    entropy: {Number(f.entropy).toFixed(2)} bits
+                                  </span>
+                                )}
+                                {f.line != null && <span className="text-[10px]">line {f.line}</span>}
+                                {f.fingerprintSha256 && (
+                                  <span className="text-[10px] ml-auto">sha256:{String(f.fingerprintSha256).slice(0, 12)}</span>
+                                )}
+                              </div>
+                              {f.redactedPreview && (
+                                <div className="text-[10px] truncate">{f.redactedPreview}</div>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

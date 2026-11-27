@@ -2977,6 +2977,142 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #13 CVEs (15a-15e): coolify#7019/#5328 image bloat/secrets, coolify#5655/dokploy#1475 cron leases, post-Snaplet/Neosync PII masker, Portainer OOM forensics, uptime-kuma#3255 on-call dedup/flapping/escalation');
 
+  // -------------------------------------------------------------------------
+  // 16. Cycle #14 Resilience, Fencing & Secret-Gate Regressions (docs/COMPETITOR_RADAR_CYCLE13.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const { EgressFirewallService } = require('../server/services/egressFirewallService');
+    const { ChaosGameDayService } = require('../server/services/chaosGameDayService');
+    const replicaFailover = require('../server/services/replicaFailoverService');
+    const { scanPreDeployPayload } = require('../server/services/preDeploySecretGate');
+    const { verifyManifestCompatibility, planBuildMatrix } = require('../server/services/multiArchPlannerService');
+
+    const c14Tmp = makeTempDir('culkibo-c14-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c14Tmp;
+    try {
+      // 16a. coolify#12336 / dokploy#2486 / Docker 29 nftables: metadata & private LAN egress + DOCKER-USER + antiLockoutSafe
+      const eg = new EgressFirewallService({ dataDir: c14Tmp });
+      eg.saveEgressPolicy('proj_16a', { mode: 'allowlist', allowedCidrs: ['1.1.1.1/32'], blockMetadata: true, blockPrivateLan: true });
+      const egRes = eg.auditFirewallAndEgress({
+        projectId: 'proj_16a',
+        backend: 'nftables',
+        observedSockets: ['169.254.169.254:80', '192.168.1.50:22', '8.8.8.8:53'],
+        firewallRules: []
+      });
+      assert.strictEqual(egRes.compliant, false);
+      assert.strictEqual(egRes.antiLockoutSafe, true, 'Generated rules MUST preserve SSH/HTTP/HTTPS');
+      assert.ok(egRes.missingChains.includes('DOCKER-USER'));
+      const egRuleIds = egRes.violations.map((v) => v.ruleId);
+      assert.ok(egRuleIds.includes('CLOUD_METADATA_EGRESS'));
+      assert.ok(egRuleIds.includes('UNAUTHORIZED_PRIVATE_LAN_EGRESS'));
+      assert.ok(egRuleIds.includes('UNALLOWLISTED_EGRESS'));
+
+      // 16b. cloudnative-pg#8701/#7407 & patroni#3474: lagging standby & unfenced primary blocks + read pool lag filter
+      replicaFailover.saveTopology('db_16b', {
+        primary: { id: 'p1', host: '10.0.0.1', port: 5432, timeline: 1, fenced: false },
+        replicas: [
+          { id: 'r_lag', host: '10.0.0.2', port: 5432, lagBytes: 4 * 1024 * 1024, lagMs: 2500, healthy: true },
+          { id: 'r_sync', host: '10.0.0.3', port: 5432, lagBytes: 512, lagMs: 25, healthy: true }
+        ]
+      });
+      const split16b = replicaFailover.evaluateReadWriteSplit('db_16b', { maxReadLagMs: 500 });
+      assert.strictEqual(split16b.readTargets.length, 1);
+      assert.strictEqual(split16b.readTargets[0].id, 'r_sync');
+      assert.strictEqual(split16b.excludedLagging.length, 1);
+
+      const block16b = replicaFailover.planReplicaPromotion('db_16b', { targetReplicaId: 'r_lag', dryRun: true });
+      assert.strictEqual(block16b.allowed, false);
+      assert.ok(block16b.blockers.some((b) => b.code === 'REPLICA_LAG_TOO_HIGH'));
+      assert.ok(block16b.blockers.some((b) => b.code === 'OLD_PRIMARY_NOT_FENCED'));
+
+      replicaFailover.saveTopology('db_16b', {
+        primary: { id: 'p1', host: '10.0.0.1', port: 5432, timeline: 1, fenced: true },
+        replicas: [{ id: 'r_sync', host: '10.0.0.3', port: 5432, lagBytes: 512, lagMs: 25, healthy: true }]
+      });
+      const ok16b = replicaFailover.planReplicaPromotion('db_16b', { targetReplicaId: 'r_sync', dryRun: true });
+      assert.strictEqual(ok16b.allowed, true);
+      assert.deepStrictEqual(ok16b.steps.map((s) => s.phase), ['drain', 'fence', 'promote', 're-route']);
+
+      // 16c. Gitleaks/TruffleHog Shift-Left: dynamic high-entropy & PEM secrets blocked with 0 raw echo; UUID/SHA/pragma allowed
+      const dynSecret = ['sk', 'live', 'c14RegHighEntropy9z8y7x6w5v'].join('_');
+      const dynPem = '-----BEGIN ' + 'PRIVATE KEY-----';
+      const scanFail = scanPreDeployPayload({
+        mode: 'enforce',
+        diffText: `+API_SECRET=${dynSecret}\n+PEM=${dynPem}`
+      });
+      assert.strictEqual(scanFail.allowed, false);
+      assert.ok(scanFail.blockedCount >= 2);
+      const scanFailJson = JSON.stringify(scanFail);
+      assert.ok(!scanFailJson.includes(dynSecret), 'Secret gate MUST NEVER echo raw secret');
+      assert.ok(!scanFailJson.includes(dynPem), 'Secret gate MUST NEVER echo raw PEM header');
+
+      const scanPass = scanPreDeployPayload({
+        mode: 'enforce',
+        files: [{
+          path: '.env.example',
+          content: [
+            'REQ_ID=550e8400-e29b-41d4-a716-446655440000',
+            'GIT_COMMIT=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+            `TEST_ALLOW=${dynSecret} # culkibo:allow-secret`
+          ].join('\n')
+        }]
+      });
+      assert.strictEqual(scanPass.allowed, true);
+      assert.strictEqual(scanPass.blockedCount, 0);
+
+      // 16d. arm64/amd64 exec format error & native fleet builder matrix routing
+      const badArch = verifyManifestCompatibility({ imageArch: 'arm64', hostArch: 'amd64' });
+      assert.strictEqual(badArch.compatible, false);
+      assert.strictEqual(badArch.code, 'EXEC_FORMAT_MISMATCH');
+      const okArch = verifyManifestCompatibility({ manifestPlatforms: ['linux/amd64', 'linux/arm64'], hostArch: 'x86_64' });
+      assert.strictEqual(okArch.compatible, true);
+      const matPlan = planBuildMatrix({
+        targetPlatforms: ['linux/amd64', 'linux/arm64'],
+        builders: [
+          { name: 'b-amd64', arch: 'amd64', online: true },
+          { name: 'b-arm64', arch: 'arm64', online: true }
+        ],
+        imageTag: 'culkibo/demo:1.0'
+      });
+      assert.strictEqual(matPlan.usesQemu, false);
+      assert.ok(matPlan.assignments.every((a) => a.strategy === 'native'));
+
+      // 16e. Toxiproxy/Chaos Mesh GameDay: prod lock, auto-abort & healthy recovery >=85
+      const cg = new ChaosGameDayService({ dataDir: c14Tmp });
+      const prodLock = cg.runGameDaySimulation({ projectId: 'proj_16e', environment: 'production', explicitProdConfirm: false });
+      assert.strictEqual(prodLock.blocked, true);
+      assert.strictEqual(prodLock.code, 'PROD_CHAOS_CONFIRM_REQUIRED');
+
+      const abortRun = cg.runGameDaySimulation({
+        projectId: 'proj_16e',
+        environment: 'staging',
+        faultType: 'http_5xx',
+        faultRatePct: 25,
+        maxErrorAbortPct: 10
+      });
+      assert.strictEqual(abortRun.status, 'AUTO_ABORTED');
+      assert.strictEqual(abortRun.aborted, true);
+
+      const healthyRun = cg.runGameDaySimulation({
+        projectId: 'proj_16e',
+        environment: 'staging',
+        faultType: 'latency_jitter',
+        latencyMs: 60,
+        jitterMs: 10,
+        faultRatePct: 5,
+        recoverySec: 8
+      });
+      assert.strictEqual(healthyRun.status, 'COMPLETED');
+      assert.ok(healthyRun.resilienceScore >= 85, `Healthy GameDay must score >=85 (got ${healthyRun.resilienceScore})`);
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c14Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #14 CVEs (16a-16e): coolify#12336/nftables egress, cloudnative-pg#8701/#7407 replica fencing, Gitleaks Shannon-entropy secret gate, arm64/amd64 multi-arch, Chaos GameDay prod lock+auto-abort');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

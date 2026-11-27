@@ -116,6 +116,11 @@ function getCronLeaseService() { return _lazyV2.cronlease || (_lazyV2.cronlease 
 function getPiiMaskerService() { return _lazyV2.piimask || (_lazyV2.piimask = require('../services/piiMaskerService')); }
 function getOomForensicsService() { return _lazyV2.oomforensics || (_lazyV2.oomforensics = require('../services/oomForensicsService')); }
 function getOncallEscalationService() { return _lazyV2.oncall || (_lazyV2.oncall = require('../services/oncallEscalationService')); }
+function getEgressFirewallService() { return _lazyV2.egress || (_lazyV2.egress = require('../services/egressFirewallService')); }
+function getReplicaFailoverService() { return _lazyV2.replicas || (_lazyV2.replicas = require('../services/replicaFailoverService')); }
+function getPreDeploySecretGate() { return _lazyV2.secretgate || (_lazyV2.secretgate = require('../services/preDeploySecretGate')); }
+function getMultiArchPlannerService() { return _lazyV2.multiarch || (_lazyV2.multiarch = require('../services/multiArchPlannerService')); }
+function getChaosGameDayService() { return _lazyV2.chaos || (_lazyV2.chaos = require('../services/chaosGameDayService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -9004,6 +9009,177 @@ router.post('/oncall/evaluate', async (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const nowMs = body.nowMs !== undefined && Number.isFinite(Number(body.nowMs)) ? Number(body.nowMs) : Date.now();
     const out = await getOncallEscalationService().evaluateEscalations(nowMs);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #14 RESILIENCE, FENCING & SECRET-GATE LAZY ROUTES (65 Suites & 155 MCP Tools — 0 boot RAM impact) ---
+
+// 1. Container Egress & Firewall (`DOCKER-USER`/`nftables`) Drift Auditor (`coolify#12336`, `dokploy#2486`)
+router.get('/projects/:id/egress-policy', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const policy = await getEgressFirewallService().getEgressPolicy(req.params.id);
+    res.json({ ok: true, projectId: req.params.id, ...policy, policy });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/projects/:id/egress-policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden modificar la política de egress', code: 'FORBIDDEN' });
+    }
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const policy = await getEgressFirewallService().saveEgressPolicy(req.params.id, req.body || {});
+    res.json({ ok: true, projectId: req.params.id, ...policy, policy });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/egress-audit', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getEgressFirewallService().auditFirewallAndEgress({
+      ...body,
+      projectId: req.params.id
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Blue/Green DB Read-Replica Promotion & Split-Brain Fencing (`cloudnative-pg#8701`/`#7407`, `patroni#3474`)
+router.get('/databases/:id/replicas', async (req, res) => {
+  try {
+    const db = (typeof databaseManager.list === 'function' ? databaseManager.list().find((d) => d && d.id === req.params.id) : null) || null;
+    if (db && db.projectId && !assertTenantProjectAccess403(req, res, db.projectId, 'projects:read')) return;
+    const svc = getReplicaFailoverService();
+    const topology = await svc.getTopology(req.params.id);
+    const maxReadLagMs = req.query.maxReadLagMs !== undefined && Number.isFinite(Number(req.query.maxReadLagMs))
+      ? Number(req.query.maxReadLagMs)
+      : 500;
+    let readWriteSplit = null;
+    try {
+      readWriteSplit = await svc.evaluateReadWriteSplit(req.params.id, { maxReadLagMs });
+    } catch (e) {}
+    res.json({ ok: true, dbId: req.params.id, topology, readWriteSplit });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/databases/:id/replicas', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden gestionar topologías de réplicas', code: 'FORBIDDEN' });
+    }
+    const db = (typeof databaseManager.list === 'function' ? databaseManager.list().find((d) => d && d.id === req.params.id) : null) || null;
+    if (db && db.projectId) {
+      if (!assertTenantProjectAccess403(req, res, db.projectId, 'projects:write')) return;
+    } else if (denyInstanceGlobalForTenant(req, res, 'gestionar topologías de réplicas globales')) {
+      return;
+    }
+    const topology = await getReplicaFailoverService().saveTopology(req.params.id, req.body || {});
+    res.json({ ok: true, dbId: req.params.id, topology });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/:id/replicas/promote', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden promover réplicas de base de datos', code: 'FORBIDDEN' });
+    }
+    const db = (typeof databaseManager.list === 'function' ? databaseManager.list().find((d) => d && d.id === req.params.id) : null) || null;
+    if (db && db.projectId) {
+      if (!assertTenantProjectAccess403(req, res, db.projectId, 'projects:write')) return;
+    } else if (denyInstanceGlobalForTenant(req, res, 'promover réplicas de bases de datos globales')) {
+      return;
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getReplicaFailoverService().planReplicaPromotion(req.params.id, {
+      ...body,
+      dryRun: body.dryRun !== undefined ? Boolean(body.dryRun) : true
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Pre-Deploy Shannon-Entropy & Pattern Secret Gate (Gitleaks / TruffleHog Shift-Left — 0 raw echoes)
+router.post('/security/predeploy-secret-scan', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getPreDeploySecretGate().scanPreDeployPayload({
+      files: Array.isArray(body.files) ? body.files : [],
+      diffText: typeof body.diffText === 'string' ? body.diffText : '',
+      envMap: body.envMap && typeof body.envMap === 'object' ? body.envMap : {},
+      mode: typeof body.mode === 'string' ? body.mode : 'enforce',
+      allowlistFingerprints: Array.isArray(body.allowlistFingerprints) ? body.allowlistFingerprints : []
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Multi-Arch (`amd64`/`arm64`) OCI Manifest & Matrix Planner
+router.post('/build/multiarch/verify', async (req, res) => {
+  try {
+    const out = await getMultiArchPlannerService().verifyManifestCompatibility(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/build/multiarch/plan', async (req, res) => {
+  try {
+    const out = await getMultiArchPlannerService().planBuildMatrix(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Chaos Fault-Injection GameDay Simulator & Resilience Scorecard (Toxiproxy / Chaos Mesh DNA)
+router.get('/projects/:id/chaos/gamedays', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const raw = await getChaosGameDayService().listGameDays(req.params.id);
+    const gamedays = Array.isArray(raw)
+      ? raw
+      : (Array.isArray(raw && raw.gamedays) ? raw.gamedays : (Array.isArray(raw && raw.runs) ? raw.runs : []));
+    res.json({ ok: true, projectId: req.params.id, count: gamedays.length, gamedays });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/projects/:id/chaos/simulate', heavyOpLimiter, async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getChaosGameDayService().runGameDaySimulation({
+      ...body,
+      projectId: req.params.id,
+      dryRun: body.dryRun !== undefined ? Boolean(body.dryRun) : true
+    });
+    if (out && (out.blocked === true || out.code === 'PROD_CHAOS_CONFIRM_REQUIRED')) {
+      return res.status(400).json(out);
+    }
     res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);

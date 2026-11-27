@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 150);
+    assert.strictEqual(demoJson.datasets.mcpTools, 155);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -944,7 +944,45 @@ async function testCliDx() {
     const piiSqlJson = JSON.parse(piiSqlCli.stdout);
     assert.strictEqual(piiSqlJson.zeroPiiLeaked, true);
     assert.ok(!piiSqlCli.stdout.includes('bob.jones@prod-users.io'));
-    console.log(`  ✓ Pioneer CLI Cycle-13 verificado (culkibo audit-image leaky=1/slim=0, culkibo mask-pii JSON+SQL zero-PII, culkibo demo 150 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-13 verificado (culkibo audit-image leaky=1/slim=0, culkibo mask-pii JSON+SQL zero-PII)`);
+
+    // 18. Pioneer Cycle-14 CLI: `culkibo secret-scan` (enforce exit 1 vs benign/warn exit 0) & `culkibo multiarch-check` (mismatch exit 1 vs multi-arch exit 0)
+    const fakeGateSecret = ['sk', 'live', 'c14clisecretgate1234567890'].join('_');
+    const scanBlockCli = await runCli(['secret-scan', '--diff', `+STRIPE_KEY=${fakeGateSecret}\n`, '--mode', 'enforce', '--json'], { env: isolatedEnv });
+    assert.strictEqual(scanBlockCli.status, 1, 'culkibo secret-scan enforce debe salir con código 1 ante secreto real');
+    const scanBlockJson = JSON.parse(scanBlockCli.stdout);
+    assert.strictEqual(scanBlockJson.ok, false);
+    assert.strictEqual(scanBlockJson.allowed, false);
+    assert.ok(scanBlockJson.blockedCount >= 1);
+    assert.ok(!scanBlockCli.stdout.includes(fakeGateSecret), 'culkibo secret-scan jamás debe imprimir secretos en claro');
+
+    const scanWarnCli = await runCli(['secret-scan', '--diff', `+STRIPE_KEY=${fakeGateSecret}\n`, '--mode', 'warn', '--json'], { env: isolatedEnv });
+    assert.strictEqual(scanWarnCli.status, 0, `culkibo secret-scan --mode warn falló: ${scanWarnCli.stderr}`);
+    assert.strictEqual(JSON.parse(scanWarnCli.stdout).allowed, true);
+
+    const benignEnvFile = path.join(tmpRoot, 'benign.env');
+    fs.writeFileSync(
+      benignEnvFile,
+      'APP_UUID=550e8400-e29b-41d4-a716-446655440000\nGIT_COMMIT=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n',
+      'utf8'
+    );
+    const scanOkCli = await runCli(['secret-scan', benignEnvFile, '--mode', 'enforce', '--json'], { env: isolatedEnv });
+    assert.strictEqual(scanOkCli.status, 0, `culkibo secret-scan archivo benigno falló: ${scanOkCli.stderr}`);
+    assert.strictEqual(JSON.parse(scanOkCli.stdout).allowed, true);
+
+    const maMismatchCli = await runCli(['multiarch-check', '--image-arch', 'arm64', '--host-arch', 'amd64', '--json'], { env: isolatedEnv });
+    assert.strictEqual(maMismatchCli.status, 1, 'culkibo multiarch-check debe salir con código 1 en EXEC_FORMAT_MISMATCH');
+    const maMismatchJson = JSON.parse(maMismatchCli.stdout);
+    assert.strictEqual(maMismatchJson.ok, false);
+    assert.strictEqual(maMismatchJson.compatible, false);
+    assert.strictEqual(maMismatchJson.code, 'EXEC_FORMAT_MISMATCH');
+
+    const maOkCli = await runCli(['multiarch-check', '--platforms', 'linux/amd64,linux/arm64', '--host-arch', 'arm64', '--json'], { env: isolatedEnv });
+    assert.strictEqual(maOkCli.status, 0, `culkibo multiarch-check multi-arch falló: ${maOkCli.stderr}`);
+    const maOkJson = JSON.parse(maOkCli.stdout);
+    assert.strictEqual(maOkJson.ok, true);
+    assert.strictEqual(maOkJson.compatible, true);
+    console.log(`  ✓ Pioneer CLI Cycle-14 verificado (culkibo secret-scan block=1/benign=0/warn=0, culkibo multiarch-check mismatch=1/ok=0, culkibo demo 155 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

@@ -4121,6 +4121,29 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, isRead ? 'uptime:read' : 'uptime:write');
     }
 
+    // Cycle-14: Egress/nftables Drift Auditor, Blue/Green DB Read-Replica Fencing, Pre-Deploy Secret Gate, Multi-Arch OCI Planner & Chaos GameDay
+    if (/^\/api\/projects\/[^/]+\/egress-policy$/.test(p)) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'team:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/egress-audit$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (/^\/api\/databases\/[^/]+\/replicas$/.test(p)) {
+      return this.authorizeAction(principal, isRead ? 'databases:read' : 'team:write');
+    }
+    if (/^\/api\/databases\/[^/]+\/replicas\/promote$/.test(p)) {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/security/predeploy-secret-scan' || p === '/api/build/multiarch/verify' || p === '/api/build/multiarch/plan') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/chaos\/gamedays$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (/^\/api\/projects\/[^/]+\/chaos\/simulate$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

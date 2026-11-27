@@ -60,7 +60,9 @@ const svc = {
   get sqlMigrationLinter() { return require('../server/services/sqlMigrationLinter'); },
   get licenseAuditorService() { return require('../server/services/licenseAuditorService'); },
   get imageBloatAuditor() { return require('../server/services/imageBloatAuditor'); },
-  get piiMaskerService() { return require('../server/services/piiMaskerService'); }
+  get piiMaskerService() { return require('../server/services/piiMaskerService'); },
+  get preDeploySecretGate() { return require('../server/services/preDeploySecretGate'); },
+  get multiArchPlannerService() { return require('../server/services/multiArchPlannerService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2883,15 +2885,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 150,
+            mcpTools: 155,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '150 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
-            'Image Layer Bloat/Secret Auditor, Cron Fencing Leases, PR-Preview PII Masker, OOM Forensics & On-Call Router'
+            '155 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
+            'Egress/nftables Drift Auditor, DB Replica Fencing, Shannon-Entropy Secret Gate, Multi-Arch Planner & Chaos GameDay'
           ]
         };
       };
@@ -3947,6 +3949,118 @@ program
       if (result.pgAnonDdl) console.log(`\n-- pg_anonymizer DDL:\n${result.pgAnonDdl}`);
       console.log('');
       if (!safe) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-14 CLI: secret-scan (Entropy Gate) & multiarch-check (OCI Arch)
+// ===========================================================================
+
+program
+  .command('secret-scan [targetFile]')
+  .description('Pre-Deploy Shannon-Entropy & Pattern Secret Gate (12 reglas Gitleaks/TruffleHog): sale con código 1 si se detectan secretos en modo enforce')
+  .option('--diff <text>', 'Texto git diff o snippet inline a escanear')
+  .option('-m, --mode <mode>', 'Modo de evaluación: enforce | warn', 'enforce')
+  .option('--json', 'Salida JSON estructurada')
+  .action((targetFile, options) => {
+    try {
+      const mode = String(options.mode || 'enforce').toLowerCase();
+      if (!['enforce', 'warn'].includes(mode)) {
+        throw new Error(`Modo inválido "${options.mode}". Usa: enforce | warn`);
+      }
+      /** @type {{ files: Array<{ path: string, content: string }>, diffText: string, mode: 'enforce' | 'warn' }} */
+      const scanInput = {
+        files: [],
+        diffText: '',
+        mode: /** @type {'enforce' | 'warn'} */ (mode)
+      };
+      /** @type {string | null} */
+      let sourceFile = null;
+
+      if (typeof options.diff === 'string' && options.diff.length > 0) {
+        scanInput.diffText = options.diff;
+      } else if (targetFile) {
+        sourceFile = path.resolve(String(targetFile));
+        if (!fs.existsSync(sourceFile)) {
+          throw new Error(`Archivo objetivo no encontrado: ${sourceFile}`);
+        }
+        scanInput.files.push({
+          path: path.basename(sourceFile),
+          content: fs.readFileSync(sourceFile, 'utf8')
+        });
+      } else {
+        throw new Error('Proporciona un archivo <targetFile> o el flag --diff "<texto>".');
+      }
+
+      const gateSvc = svc.preDeploySecretGate;
+      const result = gateSvc.scanPreDeployPayload(scanInput);
+      const allowed = Boolean(result && result.allowed);
+      const payload = {
+        ...result,
+        ok: allowed,
+        ...(sourceFile ? { file: sourceFile } : {})
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!allowed) process.exitCode = 1;
+        return;
+      }
+
+      const badge = allowed ? '\x1b[32mALLOWED ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n🔐 Culkibo Pre-Deploy Shannon-Entropy Secret Gate (${mode}) — [${badge}]`);
+      console.log(`   Escaneados:  ${result.scannedItems ?? 0} · Bloqueados: ${result.blockedCount ?? 0}`);
+      if (Array.isArray(result.findings) && result.findings.length > 0) {
+        for (const f of result.findings) {
+          console.log(`     • [${f.ruleId}] ${f.location}:${f.line} (entropy=${f.entropy}, preview=${f.redactedPreview})`);
+        }
+      }
+      console.log('');
+      if (!allowed) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('multiarch-check')
+  .description('Multi-Arch (amd64/arm64) OCI Manifest Compatibility Checker: sale con código 1 en EXEC_FORMAT_MISMATCH')
+  .option('--image-arch <arch>', 'Arquitectura single-arch de la imagen (amd64 | arm64 | x86_64 | aarch64)')
+  .option('--platforms <csv>', 'Lista CSV de plataformas del manifest OCI (ej. linux/amd64,linux/arm64)')
+  .option('--host-arch <arch>', 'Arquitectura del host destino (default: arquitectura actual)')
+  .option('--strict-oci', 'Verificar compatibilidad con registros OCI estrictos + atestaciones')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const maSvc = svc.multiArchPlannerService;
+      const manifestPlatforms = typeof options.platforms === 'string' && options.platforms.trim()
+        ? options.platforms.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
+      const hostArch = String(options.hostArch || (process.arch === 'arm64' ? 'arm64' : 'amd64'));
+      const result = maSvc.verifyManifestCompatibility({
+        ...(options.imageArch ? { imageArch: String(options.imageArch) } : {}),
+        manifestPlatforms,
+        hostArch,
+        strictOciRegistry: Boolean(options.strictOci)
+      });
+      const compatible = Boolean(result && result.compatible);
+      const payload = {
+        ...result,
+        ok: compatible
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!compatible) process.exitCode = 1;
+        return;
+      }
+
+      const badge = compatible ? '\x1b[32mCOMPATIBLE ✅\x1b[0m' : '\x1b[31mMISMATCH ❌\x1b[0m';
+      console.log(`\n🏗️  Culkibo Multi-Arch OCI Manifest Check (host=${hostArch}) — [${badge}]`);
+      console.log(`   Código:      ${result.code || (compatible ? 'COMPATIBLE' : 'EXEC_FORMAT_MISMATCH')}`);
+      if (result.remediation) console.log(`   Solución:    ${result.remediation}`);
+      console.log('');
+      if (!compatible) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
     }

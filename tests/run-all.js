@@ -60,6 +60,9 @@ const testCycle12HttpE2E = require('./cycle12-http-e2e.test');
 const testCronLeaseAndOncall = require('./cron-lease-and-oncall.test');
 const testImagePiiOom = require('./image-pii-oom.test');
 const testCycle13HttpE2E = require('./cycle13-http-e2e.test');
+const testEgressAndChaos = require('./egress-and-chaos.test');
+const testReplicaSecretMultiarch = require('./replica-secret-multiarch.test');
+const testCycle14HttpE2E = require('./cycle14-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -145,6 +148,9 @@ async function runAll() {
     { name: 'Distributed Cron Fencing-Token Lease Guard & On-Call Escalation Router / Flapping Damper', fn: testCronLeaseAndOncall },
     { name: 'Container Image Bloat/Secret Auditor, Deterministic PR-Preview PII Masker & 8-Class OOM Forensics Classifier', fn: testImagePiiOom },
     { name: 'Cycle #13 150-MCP Milestone Live Isolated HTTP E2E (All 5 API Families + RBAC/ACL + Zero-PII/Dedup Guards)', fn: testCycle13HttpE2E },
+    { name: 'Container Egress/nftables Drift Auditor & Chaos Fault-Injection GameDay Simulator / Resilience Scorecard', fn: testEgressAndChaos },
+    { name: 'Blue/Green DB Read-Replica Fencing, Pre-Deploy Shannon-Entropy Secret Gate & Multi-Arch OCI Matrix Planner', fn: testReplicaSecretMultiarch },
+    { name: 'Cycle #14 Resilience, Fencing & Secret-Gate Live Isolated HTTP E2E (All 5 API Families + Prod Lock + RBAC/ACL)', fn: testCycle14HttpE2E },
   ];
 
   for (const suite of suites) {

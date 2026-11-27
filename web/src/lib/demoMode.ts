@@ -119,6 +119,8 @@ interface DemoState {
   cronLeases: Record<string, any[]>;
   oncallPolicies: any[];
   oncallIncidents: any[];
+  replicaTopologies: Record<string, any>;
+  chaosGameDays: Record<string, any[]>;
 }
 
 function createInitialDemoState(): DemoState {
@@ -1000,6 +1002,17 @@ function createInitialDemoState(): DemoState {
         updatedAtMs: Date.now() - 30000,
       },
     ],
+    replicaTopologies: {
+      db_pg_main: {
+        dbId: 'db_pg_main',
+        primary: { id: 'pg-primary-fsn1', host: '10.88.0.10', port: 5432, region: 'eu-central', healthy: true, fenced: false, role: 'primary' },
+        replicas: [
+          { id: 'rep-eu-west', host: '10.88.0.11', port: 5432, region: 'eu-west', lagMs: 18, lagBytes: 65536, healthy: true, role: 'replica' },
+          { id: 'rep-us-east', host: '10.88.0.12', port: 5432, region: 'us-east', lagMs: 1850, lagBytes: 6710886, healthy: true, role: 'replica' },
+        ],
+      },
+    },
+    chaosGameDays: {},
   };
 }
 
@@ -3664,6 +3677,276 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ ok: true, escalated: [], incidents: s.oncallIncidents });
   }
 
+  // --- Cycle-14: Pre-Deploy Secret Gate, DB Replica Failover, Egress Firewall, Multi-Arch Planner, Chaos GameDay ---
+  if (pathname === '/api/security/predeploy-secret-scan' && method === 'POST') {
+    const mode = String(body.mode || 'enforce');
+    const diffText = String(body.diffText || '');
+    const lines = diffText.split(/\r?\n/);
+    const payPrefix = ['sk', 'live', ''].join('_');
+    const ghPrefix = ['ghp', ''].join('_');
+    const findings: Array<{ location: string; line: number; ruleId: string; severity: string; entropy: number; redactedPreview: string; fingerprintSha256: string }> = [];
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const shaRe = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
+    const shannon = (str: string) => {
+      const freq: Record<string, number> = {};
+      for (const ch of str) freq[ch] = (freq[ch] || 0) + 1;
+      let ent = 0;
+      for (const c of Object.values(freq)) {
+        const p = c / str.length;
+        ent -= p * Math.log2(p);
+      }
+      return Number(ent.toFixed(2));
+    };
+    lines.forEach((rawLine, idx) => {
+      if (/culkibo:allow-secret/i.test(rawLine)) return;
+      const clean = rawLine.replace(/^[+-]/, '').trim();
+      if (!clean) return;
+      const eq = clean.indexOf('=');
+      const val = eq >= 0 ? clean.slice(eq + 1).trim().replace(/^["']|["']$/g, '') : clean;
+      if (!val || uuidRe.test(val) || shaRe.test(val) || /^(?:changeme|example|your_api_key|https?:\/\/)/i.test(val)) return;
+      const mkFp = (seedStr: string) => {
+        let h = 2166136261;
+        for (let i = 0; i < seedStr.length; i++) {
+          h ^= seedStr.charCodeAt(i);
+          h = Math.imul(h, 16777619);
+        }
+        return (h >>> 0).toString(16).padStart(8, '0') + 'e4a1b9c2d3f05678';
+      };
+      if (val.includes(payPrefix)) {
+        findings.push({ location: 'diffText', line: idx + 1, ruleId: 'STRIPE_PAYMENT_KEY', severity: 'critical', entropy: shannon(val), redactedPreview: `${clean.slice(0, eq + 1)}[REDACTED_PAYMENT_KEY]`, fingerprintSha256: mkFp(val) });
+      } else if (val.includes(ghPrefix)) {
+        findings.push({ location: 'diffText', line: idx + 1, ruleId: 'GITHUB_PAT_TOKEN', severity: 'critical', entropy: shannon(val), redactedPreview: `${clean.slice(0, eq + 1)}[REDACTED_GITHUB_TOKEN]`, fingerprintSha256: mkFp(val) });
+      } else if (/^postgres(?:ql)?:\/\/[^:]+:[^@]+@/i.test(val)) {
+        findings.push({ location: 'diffText', line: idx + 1, ruleId: 'DB_URI_PASSWORD', severity: 'critical', entropy: shannon(val), redactedPreview: `${clean.slice(0, eq + 1)}postgresql://admin:[REDACTED]@db.internal:5432/prod`, fingerprintSha256: mkFp(val) });
+      } else if (val.length >= 20 && shannon(val) >= 4.2) {
+        findings.push({ location: 'diffText', line: idx + 1, ruleId: 'HIGH_ENTROPY_SECRET', severity: 'high', entropy: shannon(val), redactedPreview: `${clean.slice(0, eq + 1)}[REDACTED_HIGH_ENTROPY]`, fingerprintSha256: mkFp(val) });
+      }
+    });
+    return jsonResponse({
+      ok: true,
+      allowed: mode === 'warn' ? true : findings.length === 0,
+      mode,
+      scannedItems: lines.filter(Boolean).length,
+      blockedCount: findings.length,
+      findings,
+    });
+  }
+
+  const repTopoMatch = pathname.match(/^\/api\/databases\/([^/]+)\/replicas$/);
+  if (repTopoMatch) {
+    const dbId = decodeURIComponent(repTopoMatch[1]);
+    const topo = s.replicaTopologies[dbId] || s.replicaTopologies.db_pg_main;
+    if (method === 'GET') {
+      const readTargets = (topo.replicas || []).filter((r: any) => r.healthy !== false && (r.lagMs ?? 0) <= 500);
+      const excludedLagging = (topo.replicas || []).filter((r: any) => r.healthy === false || (r.lagMs ?? 0) > 500);
+      return jsonResponse({
+        ok: true,
+        dbId,
+        primary: topo.primary,
+        replicas: topo.replicas,
+        topology: topo,
+        readWriteSplit: {
+          writeTarget: topo.primary,
+          readTargets,
+          excludedLagging,
+          fallbackToPrimary: readTargets.length === 0,
+        },
+      });
+    }
+    if (method === 'PUT') {
+      s.replicaTopologies[dbId] = { dbId, primary: body.primary || topo.primary, replicas: Array.isArray(body.replicas) ? body.replicas : topo.replicas };
+      return jsonResponse({ ok: true, dbId, ...s.replicaTopologies[dbId] });
+    }
+  }
+
+  const repPromoteMatch = pathname.match(/^\/api\/databases\/([^/]+)\/replicas\/promote$/);
+  if (repPromoteMatch && method === 'POST') {
+    const dbId = decodeURIComponent(repPromoteMatch[1]);
+    const topo = s.replicaTopologies[dbId] || s.replicaTopologies.db_pg_main;
+    const targetId = String(body.targetReplicaId || topo.replicas[0]?.id || 'rep-eu-west');
+    const maxLag = Number(body.maxAcceptableLagBytes ?? 1048576);
+    const requireFenced = body.requireOldPrimaryFenced !== false;
+    const target = (topo.replicas || []).find((r: any) => r.id === targetId) || topo.replicas[0];
+    const blockers: Array<{ code: string; message: string }> = [];
+    if (requireFenced && !topo.primary?.fenced) {
+      blockers.push({ code: 'OLD_PRIMARY_NOT_FENCED', message: `Old primary ${topo.primary?.id} is not fenced — split-brain risk blocked.` });
+    }
+    if (target && Number(target.lagBytes || 0) > maxLag) {
+      blockers.push({ code: 'REPLICA_LAG_TOO_HIGH', message: `Replica ${target.id} lag (${Math.round(target.lagBytes / 1024)} KB) exceeds ${Math.round(maxLag / 1024)} KB ceiling.` });
+    }
+    const allowed = blockers.length === 0;
+    return jsonResponse({
+      ok: true,
+      dbId,
+      allowed,
+      blockers,
+      promotedNode: allowed ? target : null,
+      timelineNext: 3,
+      dryRun: body.dryRun !== false,
+      steps: allowed
+        ? [
+            { step: 1, phase: 'drain', title: `Drain active PgBouncer write connections on ${topo.primary?.id}` },
+            { step: 2, phase: 'fence', title: `Fence old primary ${topo.primary?.id} (read-only + network STONITH)` },
+            { step: 3, phase: 'promote', title: `Promote ${target?.id} to primary (WAL timeline #3)` },
+            { step: 4, phase: 're-route', title: `Atomic Caddy/PgBouncer pool switch to ${target?.host}:5432` },
+          ]
+        : [],
+    });
+  }
+
+  const egressAuditMatch = pathname.match(/^\/api\/projects\/([^/]+)\/egress-(policy|audit)$/);
+  if (egressAuditMatch) {
+    const pid = decodeURIComponent(egressAuditMatch[1]);
+    const kind = egressAuditMatch[2];
+    if (kind === 'policy') {
+      return jsonResponse({
+        ok: true,
+        projectId: pid,
+        mode: 'allowlist',
+        allowedCidrs: [],
+        allowedDomains: ['api.stripe.com'],
+        blockMetadata: true,
+        blockPrivateLan: true,
+        preserveAdminPorts: [22, 80, 443],
+      });
+    }
+    const sockets = Array.isArray(body.observedSockets) ? body.observedSockets : [];
+    const violations: Array<{ code: string; severity: string; target: string; message: string }> = [];
+    for (const sock of sockets) {
+      const target = String(sock?.ip || sock?.host || '');
+      if (target === '169.254.169.254' || target.includes('metadata')) {
+        violations.push({ code: 'CLOUD_METADATA_EGRESS', severity: 'critical', target, message: 'Container attempted outbound access to cloud IMDS metadata endpoint (169.254.169.254).' });
+      } else if (/^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(target)) {
+        violations.push({ code: 'PRIVATE_LAN_EGRESS', severity: 'high', target, message: `Unauthorized private RFC1918 LAN socket to ${target}:${sock?.port || 0}.` });
+      }
+    }
+    const missingChains = Array.isArray(body.firewallRules) && body.firewallRules.length > 0 ? [] : ['DOCKER-USER', 'inet culkibo_egress forward'];
+    const riskScore = Math.min(100, violations.length * 32 + missingChains.length * 14);
+    return jsonResponse({
+      ok: true,
+      projectId: pid,
+      backend: body.backend || 'nftables',
+      compliant: violations.length === 0 && missingChains.length === 0,
+      riskScore,
+      violations,
+      missingChains,
+      antiLockoutSafe: true,
+      suggestedRules: [
+        'table inet culkibo_egress {',
+        '  chain forward {',
+        '    type filter hook forward priority -10; policy accept;',
+        '    tcp dport { 22, 80, 443 } accept # anti-lockout admin/ingress preserve',
+        '    ip daddr 169.254.169.254 drop # block cloud IMDS metadata',
+        '    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } drop # block lateral LAN',
+        '  }',
+        '}',
+      ],
+      auditedAt: new Date().toISOString(),
+    });
+  }
+
+  if (pathname === '/api/build/multiarch/verify' && method === 'POST') {
+    const norm = (a: string) => (a === 'x86_64' ? 'amd64' : a === 'aarch64' ? 'arm64' : a.replace(/^linux\//, '').toLowerCase());
+    const hostArch = norm(String(body.hostArch || 'amd64'));
+    const platforms = Array.isArray(body.manifestPlatforms) && body.manifestPlatforms.length > 0
+      ? body.manifestPlatforms.map((p: string) => norm(String(p)))
+      : [norm(String(body.imageArch || 'amd64'))];
+    const compatible = platforms.includes(hostArch);
+    const warnings: string[] = [];
+    if (body.strictOciRegistry && body.includeAttestations) {
+      warnings.push('Strict OCI registry detected: set --provenance=false or enable OCI image index v1.1 to avoid attestation reject.');
+    }
+    return jsonResponse({
+      ok: true,
+      compatible,
+      code: compatible ? 'ARCH_COMPATIBLE' : 'EXEC_FORMAT_MISMATCH',
+      warnings,
+      remediation: compatible
+        ? 'Manifest covers target host architecture.'
+        : `Rebuild with multi-arch manifest covering linux/${hostArch} (or route to a native ${platforms[0]} fleet builder).`,
+    });
+  }
+
+  if (pathname === '/api/build/multiarch/plan' && method === 'POST') {
+    const targetPlatforms = Array.isArray(body.targetPlatforms) ? body.targetPlatforms : ['linux/amd64', 'linux/arm64'];
+    const builders = Array.isArray(body.builders) ? body.builders : [];
+    const imageTag = String(body.imageTag || 'app:latest');
+    const assignments = targetPlatforms.map((plat: string) => {
+      const arch = plat.replace(/^linux\//, '');
+      const nativeBuilder = builders.find((b: any) => String(b.arch || '').toLowerCase() === arch);
+      return {
+        platform: plat,
+        builder: nativeBuilder ? (nativeBuilder.name || nativeBuilder.id) : 'local-qemu',
+        native: Boolean(nativeBuilder),
+        mode: nativeBuilder ? 'native' : 'qemu',
+      };
+    });
+    const usesQemu = assignments.some((a: any) => !a.native);
+    return jsonResponse({
+      ok: true,
+      imageTag,
+      assignments,
+      usesQemu,
+      qemuWarning: usesQemu ? 'Missing native fleet node for one or more architectures; falling back to QEMU.' : null,
+      buildxArgv: ['docker', 'buildx', 'build', '--platform', targetPlatforms.join(','), '-t', imageTag, '--push', '.'],
+      manifestCreateArgv: ['docker', 'buildx', 'imagetools', 'create', '-t', imageTag, ...targetPlatforms.map((p: string) => `${imageTag}-${p.replace('linux/', '')}`)],
+    });
+  }
+
+  const chaosMatch = pathname.match(/^\/api\/projects\/([^/]+)\/chaos\/(gamedays|simulate)$/);
+  if (chaosMatch) {
+    const pid = decodeURIComponent(chaosMatch[1]);
+    const action = chaosMatch[2];
+    const list = s.chaosGameDays[pid] || (s.chaosGameDays[pid] = []);
+    if (action === 'gamedays' && method === 'GET') {
+      return jsonResponse({ ok: true, gamedays: list });
+    }
+    if (action === 'simulate' && method === 'POST') {
+      const env = String(body.environment || 'staging').toLowerCase();
+      if (env === 'production' && body.explicitProdConfirm !== true) {
+        return jsonResponse({
+          ok: false,
+          blocked: true,
+          code: 'PROD_CHAOS_CONFIRM_REQUIRED',
+          environment: 'production',
+          faultType: body.faultType || 'latency_jitter',
+          message: 'Production chaos drill hard-blocked: pass explicitProdConfirm: true after change-window signoff.',
+        });
+      }
+      const errRate = Number(body.faultRatePct ?? 1);
+      const maxAbort = Number(body.maxErrorAbortPct ?? 15);
+      const recSec = Number(body.recoverySec ?? 10);
+      const aborted = errRate > maxAbort;
+      const score = aborted ? 42 : Math.max(85, Math.min(100, Math.round(100 - errRate * 2 - Math.max(0, recSec - 5) * 0.5)));
+      const record = {
+        ok: true,
+        id: `gd_${Date.now()}`,
+        projectId: pid,
+        environment: env,
+        faultType: body.faultType || 'latency_jitter',
+        blocked: false,
+        aborted,
+        status: aborted ? 'AUTO_ABORTED' : 'COMPLETED',
+        resilienceScore: score,
+        grade: score >= 90 ? 'A' : score >= 80 ? 'B' : 'D',
+        breakdown: {
+          errorScore: aborted ? 20 : 98,
+          latencyScore: aborted ? 55 : 94,
+          recoveryScore: aborted ? 50 : 96,
+        },
+        observedErrorRatePct: errRate,
+        p95LatencyMs: Number(body.latencyMs ?? 180) + Number(body.jitterMs ?? 25),
+        recoverySec: recSec,
+        dryRun: body.dryRun !== false,
+        message: aborted
+          ? `Observed error rate (${errRate}%) breached maxErrorAbortPct (${maxAbort}%) — fault injector aborted automatically.`
+          : `Service absorbed ${body.faultType || 'latency_jitter'} within SLO and recovered in ${recSec}s.`,
+      };
+      list.unshift(record);
+      return jsonResponse(record);
+    }
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -3841,16 +4124,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (150 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (155 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 150 MCP tools on demand without bloating context (-89%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 155 MCP tools on demand without bloating context (-89%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_egress_firewall', description: 'Container egress & DOCKER-USER/nftables drift auditor blocking IMDS metadata with anti-lockout SSH/80/443 rules', readOnly: false, profile: 'security' },
+      { name: 'culkibo_replica_failover', description: 'Blue/Green DB read-replica promotion & split-brain fencing blocking lagging/unfenced promotions', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_secret_gate', description: 'Pre-deploy 12-rule Shannon-entropy & pattern secret gate with zero raw echoes and UUID/SHA benign filters', readOnly: true, profile: 'security' },
+      { name: 'culkibo_multiarch_planner', description: 'Multi-arch amd64/arm64 OCI manifest verifier (EXEC_FORMAT_MISMATCH) & native fleet builder matrix planner', readOnly: true, profile: 'deploy' },
+      { name: 'culkibo_chaos_gameday', description: 'Toxiproxy/Chaos Mesh GameDay fault-injection simulator with prod safety lock & auto-abort scorecards', readOnly: false, profile: 'ops' },
       { name: 'culkibo_audit_image_bloat', description: '8-rule Dockerfile layer bloat & secret-in-layer auditor with efficiencyScore & multi-stage slimming tips', readOnly: true, profile: 'deploy' },
       { name: 'culkibo_cron_lease', description: 'Distributed cron fencing-token lease guard blocking duplicate scheduled fires & concurrent overlaps', readOnly: false, profile: 'ops' },
       { name: 'culkibo_mask_preview_pii', description: 'Deterministic HMAC-SHA256 PR-Preview PII masker (FK-safe) + dalibo pg_anonymizer SECURITY LABEL DDL', readOnly: true, profile: 'security' },
@@ -3887,26 +4175,26 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 150 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 155 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 150, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 155, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_oom_forensics', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_audit_image_bloat', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_secret_gate', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_egress_firewall', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 150,
+      totalTools: 155,
       profiles: { core: { count: 17, savedPct: 89 } },
     });
   }
