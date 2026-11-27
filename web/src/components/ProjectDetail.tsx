@@ -47,6 +47,7 @@ import {
   GitCompare,
   Wrench,
   Send,
+  Gauge,
 } from 'lucide-react';
 import {
   api,
@@ -62,6 +63,7 @@ import {
   type BuildHealerDiagnosis,
   type BuildHealerApplyResult,
   type ProjectDriftResult,
+  type SloCanaryRollout,
 } from '../lib/api';
 import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
@@ -168,8 +170,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [smartPackShowDockerfile, setSmartPackShowDockerfile] = useState(false);
   const [smartPackCopied, setSmartPackCopied] = useState<'ignore' | 'dockerfile' | null>(null);
 
-  // Cycle-5..8 Cockpit Panels (SLSA, Migrations, Micro-Wasm, Time-Machine, Shadow Replay, Terminal, Auto-Healer, Drift Check)
-  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | null>(null);
+  // Cycle-5..10 Cockpit Panels (SLSA, Migrations, Micro-Wasm, Time-Machine, Shadow Replay, Terminal, Auto-Healer, Drift Check, SLO Canary)
+  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | null>(null);
   const [slsaAttest, setSlsaAttest] = useState<ReleaseAttestationResult | null>(null);
   const [slsaVerify, setSlsaVerify] = useState<AttestationVerifyResult | null>(null);
   const [slsaLoading, setSlsaLoading] = useState(false);
@@ -224,6 +226,11 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [driftReport, setDriftReport] = useState<ProjectDriftResult | null>(null);
   const [driftLoading, setDriftLoading] = useState(false);
   const [driftError, setDriftError] = useState<string | null>(null);
+
+  // Cycle-10 SLO Error-Budget Canary Auto-Rollback state
+  const [canaryRollout, setCanaryRollout] = useState<SloCanaryRollout | null>(null);
+  const [canaryBusy, setCanaryBusy] = useState<'load' | 'start' | 'advance' | 'spike' | 'abort' | null>(null);
+  const [canaryError, setCanaryError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -940,7 +947,96 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
   };
 
-  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift') => {
+  const handleLoadCanary = async () => {
+    setCanaryBusy('load');
+    setCanaryError(null);
+    try {
+      const res = await api.listSloCanaries(project.id);
+      const list = Array.isArray(res?.rollouts) ? res.rollouts : [];
+      setCanaryRollout(list[0] || null);
+    } catch (err: unknown) {
+      setCanaryError(err instanceof Error ? err.message : 'Could not load SLO canary status');
+    } finally {
+      setCanaryBusy(null);
+    }
+  };
+
+  const handleStartCanary = async () => {
+    setCanaryBusy('start');
+    setCanaryError(null);
+    try {
+      const host = project.domains?.[0] || `${project.name}.local`;
+      const basePort = project.citadelPort || project.containerPort || 3000;
+      const res = await api.startSloCanary(project.id, {
+        hostname: host,
+        stableUpstream: `127.0.0.1:${basePort}`,
+        canaryUpstream: `127.0.0.1:${basePort + 1}`,
+        steps: [10, 25, 50, 100],
+        sloTarget: 0.999,
+        maxBurnRate: 14.4,
+      });
+      setCanaryRollout(res);
+      onNotify(`SLO Canary started at ${res.canaryWeight}% weight (Caddy weighted_round_robin)`, 'success');
+    } catch (err: unknown) {
+      setCanaryError(err instanceof Error ? err.message : 'Could not start SLO canary');
+    } finally {
+      setCanaryBusy(null);
+    }
+  };
+
+  const handleEvaluateCanary = async (mode: 'advance' | 'spike') => {
+    if (!canaryRollout) return;
+    setCanaryBusy(mode);
+    setCanaryError(null);
+    try {
+      const payload = mode === 'spike'
+        ? { totalRequests: 1000, error5xxCount: 45, baselineP95Ms: 18, canaryP95Ms: 92 }
+        : { totalRequests: 1000, error5xxCount: 0, baselineP95Ms: 18, canaryP95Ms: 19 };
+      const res = await api.evaluateSloCanary(project.id, canaryRollout.id, payload);
+      const next: SloCanaryRollout = res.rollout
+        ? res.rollout
+        : res.id
+          ? (res as unknown as SloCanaryRollout)
+          : {
+              ...canaryRollout,
+              status: res.status || (res.breached ? 'ROLLED_BACK' : canaryRollout.status),
+              canaryWeight: res.canaryWeight ?? (res.breached ? 0 : canaryRollout.canaryWeight),
+              stableWeight: res.stableWeight ?? (100 - (res.canaryWeight ?? (res.breached ? 0 : canaryRollout.canaryWeight))),
+              lastBurnRate: res.burnRate,
+              breachReasons: res.breachReasons || [],
+              evaluations: res.evaluations ?? canaryRollout.evaluations,
+            };
+      setCanaryRollout(next);
+      if (next.status === 'ROLLED_BACK') {
+        onNotify('SLO burn-rate breached — instant 100/0 Caddy auto-rollback triggered!', 'error');
+      } else if (next.status === 'PROMOTED') {
+        onNotify('SLO Canary passed all gates — promoted to 100% production traffic!', 'success');
+      } else {
+        onNotify(`Healthy step verified — canary weight shifted to ${next.canaryWeight}%`, 'success');
+      }
+    } catch (err: unknown) {
+      setCanaryError(err instanceof Error ? err.message : 'Could not evaluate SLO canary');
+    } finally {
+      setCanaryBusy(null);
+    }
+  };
+
+  const handleAbortCanary = async () => {
+    if (!canaryRollout) return;
+    setCanaryBusy('abort');
+    setCanaryError(null);
+    try {
+      const res = await api.abortSloCanary(project.id, canaryRollout.id, 'operator_manual_abort');
+      setCanaryRollout(res);
+      onNotify('SLO Canary manually aborted — restored 100/0 stable weights', 'info');
+    } catch (err: unknown) {
+      setCanaryError(err instanceof Error ? err.message : 'Could not abort SLO canary');
+    } finally {
+      setCanaryBusy(null);
+    }
+  };
+
+  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary') => {
     const next = activeCockpit === panel ? null : panel;
     setActiveCockpit(next);
     if (next === 'timemachine' && tmCheckpoints.length === 0 && !tmLoading) {
@@ -951,6 +1047,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
     if (next === 'drift' && !driftReport && !driftLoading) {
       void handleRunDriftCheck();
+    }
+    if (next === 'canary' && !canaryRollout && canaryBusy === null) {
+      void handleLoadCanary();
     }
   };
 
@@ -1316,6 +1415,19 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           >
             <Activity className="w-3.5 h-3.5" />
             <span>{t('pd.driftBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('canary')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'canary'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Gauge className="w-3.5 h-3.5" />
+            <span>{t('pd.canaryBtn')}</span>
           </button>
         </div>
       </div>
@@ -2263,6 +2375,156 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                         <li key={idx}>{typeof a === 'string' ? a : (a.summary || a.action || a.field || 'Reconcile')}</li>
                       ))}
                     </ul>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </section>
+      )}
+
+      {/* Cycle-10 Cockpit Drawer: SLO Error-Budget Canary Auto-Rollback */}
+      {activeCockpit === 'canary' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-4 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <Gauge className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.canaryTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.canaryDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={canaryBusy !== null}
+                onClick={() => void handleStartCanary()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {canaryBusy === 'start' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                <span>{canaryBusy === 'start' ? t('pd.canaryStarting') : t('pd.canaryStart')}</span>
+              </button>
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close SLO Canary panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {canaryError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{canaryError}</div>}
+
+          {(() => {
+            const steps = Array.isArray(canaryRollout?.steps) && canaryRollout.steps.length > 0 ? canaryRollout.steps : [10, 25, 50, 100];
+            const weight = canaryRollout?.canaryWeight ?? 0;
+            const stableW = canaryRollout?.stableWeight ?? (100 - weight);
+            const status = canaryRollout?.status || 'IDLE';
+            const evals = Array.isArray(canaryRollout?.evaluations) ? canaryRollout.evaluations : [];
+            const lastEvalBurn = evals.length > 0 ? evals[evals.length - 1]?.burn?.burnRate : undefined;
+            const burnRate = canaryRollout?.lastBurnRate ?? lastEvalBurn ?? 0;
+            const breachList = Array.isArray(canaryRollout?.breachReasons) ? canaryRollout.breachReasons : [];
+            const isRolledBack = status === 'ROLLED_BACK' || status === 'ABORTED';
+            return (
+              <div className="space-y-3.5">
+                {/* 10% -> 25% -> 50% -> 100% Caddy v2.11 Weighted Stepper */}
+                <div className="grid grid-cols-4 gap-2 tabular-nums">
+                  {steps.map((stepPct) => {
+                    const reached = !isRolledBack && weight >= stepPct;
+                    const isCurrent = status === 'IN_PROGRESS' && weight === stepPct;
+                    return (
+                      <div
+                        key={stepPct}
+                        className={`p-2.5 rounded-xl border text-center transition-colors ${
+                          isRolledBack
+                            ? 'bg-red-50 border-red-200 text-red-700'
+                            : isCurrent
+                              ? 'bg-slate-900 border-slate-900 text-white'
+                              : reached
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                                : 'bg-slate-50 border-slate-200 text-slate-500'
+                        }`}
+                      >
+                        <div className="font-mono text-sm font-semibold">{stepPct}%</div>
+                        <div className="text-[10px] opacity-80">
+                          {stepPct === 100 ? 'Promoted' : `Stable ${100 - stepPct}%`}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Live Status, SRE Burn-Rate & Caddy Weights */}
+                <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-slate-50 border border-slate-200 tabular-nums">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`px-2.5 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                      isRolledBack
+                        ? 'bg-red-50 text-red-700 border-red-200'
+                        : status === 'PROMOTED'
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : status === 'IN_PROGRESS'
+                            ? 'bg-amber-50 text-amber-800 border-amber-200'
+                            : 'bg-white text-slate-600 border-slate-200'
+                    }`}>
+                      {isRolledBack ? `${status} · 100/0` : `${status} · ${stableW}/${weight}`}
+                    </span>
+                    <span className={`px-2 py-0.5 rounded-md font-mono text-[10px] border ${
+                      burnRate > (canaryRollout?.maxBurnRate ?? 14.4)
+                        ? 'bg-red-50 text-red-700 border-red-200 font-semibold'
+                        : 'bg-white text-slate-700 border-slate-200'
+                    }`}>
+                      SRE Burn Rate: {Number(burnRate).toFixed(1)}x / {canaryRollout?.maxBurnRate ?? 14.4}x
+                    </span>
+                    <span className="font-mono text-[10px] text-slate-500">
+                      Caddy weights: [{stableW}, {weight}]
+                    </span>
+                  </div>
+
+                  {canaryRollout && status === 'IN_PROGRESS' && (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button
+                        type="button"
+                        disabled={canaryBusy !== null}
+                        onClick={() => void handleEvaluateCanary('advance')}
+                        className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-medium cursor-pointer disabled:opacity-50"
+                      >
+                        {canaryBusy === 'advance' ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+                        <span>{t('pd.canaryAdvance')}</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={canaryBusy !== null}
+                        onClick={() => void handleEvaluateCanary('spike')}
+                        className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white font-medium cursor-pointer disabled:opacity-50"
+                      >
+                        {canaryBusy === 'spike' ? <Loader2 className="w-3 h-3 animate-spin" /> : <ShieldAlert className="w-3 h-3" />}
+                        <span>{t('pd.canarySpike')}</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={canaryBusy !== null}
+                        onClick={() => void handleAbortCanary()}
+                        className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                      >
+                        {t('pd.canaryAbort')}
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {breachList.length > 0 && (
+                  <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 space-y-1">
+                    <div className="font-semibold flex items-center gap-1.5">
+                      <ShieldAlert className="w-4 h-4 shrink-0" />
+                      <span>SLO Breach Auto-Rollback Executed (weights flipped instantly to 100 / 0)</span>
+                    </div>
+                    {breachList.map((reason, i) => {
+                      const text = typeof reason === 'string'
+                        ? reason
+                        : (reason?.message || reason?.code || 'SLO threshold breached');
+                      return (
+                        <div key={i} className="font-mono text-[11px]">• {text}</div>
+                      );
+                    })}
                   </div>
                 )}
               </div>

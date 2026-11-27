@@ -97,6 +97,11 @@ function getWebhookEventBus() { return _lazyV2.whbus || (_lazyV2.whbus = require
 function getDbStudioService() { return _lazyV2.dbstudio || (_lazyV2.dbstudio = require('../services/dbStudioService')); }
 function getObjectStorageService() { return _lazyV2.s3 || (_lazyV2.s3 = require('../services/objectStorageService')); }
 function getQuotaMeteringService() { return _lazyV2.quotas || (_lazyV2.quotas = require('../services/quotaMeteringService')); }
+function getBackupDrillService() { return _lazyV2.drdrill || (_lazyV2.drdrill = require('../services/backupDrillService')); }
+function getSloCanaryController() { return _lazyV2.slocanary || (_lazyV2.slocanary = require('../services/sloCanaryController')); }
+function getAiWorkloadService() { return _lazyV2.aiworkload || (_lazyV2.aiworkload = require('../services/aiWorkloadService')); }
+function getRemoteBuilderService() { return _lazyV2.remotebuilder || (_lazyV2.remotebuilder = require('../services/remoteBuilderService')); }
+function getLogArchiveService() { return _lazyV2.logarchive || (_lazyV2.logarchive = require('../services/logArchiveService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -8057,6 +8062,281 @@ router.get('/billing/ledger', (req, res) => {
     res.json(ledger);
   } catch (err) {
     sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #10 MILESTONE LAZY ROUTES (DR Backup Fire-Drill, SLO Error-Budget Canary, Self-Hosted AI/GPU, Remote Build-Node Offloader, Compressed Log Archive) ---
+
+// 1. Automated DR Backup Restore Fire-Drill Verifier (`dokploy#1382`, `coolify#6506`/`#12244`, `dokploy#6035`)
+router.get('/dr/drills', (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const dbIdFilter = req.query.databaseId ? String(req.query.databaseId).trim() : undefined;
+    const raw = getBackupDrillService().listDrills(dbIdFilter);
+    const allDrills = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.drills) ? raw.drills : []);
+    if (allowedProjectIds === null) {
+      return res.json({ drills: allDrills });
+    }
+    const allowedSet = new Set(allowedProjectIds);
+    const allowedDbIds = new Set(
+      databaseManager.list().filter((d) => d && d.projectId && allowedSet.has(d.projectId)).map((d) => d.id)
+    );
+    const drills = allDrills.filter((d) => d && ((d.projectId && allowedSet.has(d.projectId)) || (d.databaseId && allowedDbIds.has(d.databaseId))));
+    res.json({ drills });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/databases/:id/dr-drill', heavyOpLimiter, async (req, res) => {
+  try {
+    const resolved = resolveDbForStudio(req, res);
+    if (!resolved.ok) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    /** @type {Buffer | undefined} */
+    let artifactBuffer;
+    if (typeof body.artifactBase64 === 'string' && body.artifactBase64.length > 0) {
+      artifactBuffer = Buffer.from(body.artifactBase64, 'base64');
+    } else if (typeof body.sqlSample === 'string') {
+      artifactBuffer = Buffer.from(body.sqlSample, 'utf8');
+    } else if (body.artifactBase64 === '') {
+      artifactBuffer = Buffer.alloc(0);
+    }
+    let artifactPath;
+    if (typeof body.artifactPath === 'string' && body.artifactPath.trim()) {
+      if (!assertHostLocalPathAllowed(req, res)) return;
+      artifactPath = body.artifactPath.trim();
+    }
+    const out = await getBackupDrillService().runFireDrill({
+      databaseId: req.params.id,
+      projectId: (resolved.db && resolved.db.projectId) || (typeof body.projectId === 'string' ? body.projectId : ''),
+      engine: (resolved.db && resolved.db.engine) || (typeof body.engine === 'string' ? body.engine : 'postgres'),
+      artifactBuffer,
+      artifactPath,
+      expectedSha256: typeof body.expectedSha256 === 'string' ? body.expectedSha256 : undefined,
+      encryptedKeyHex: typeof body.encryptedKeyHex === 'string' ? body.encryptedKeyHex : undefined,
+      preserveAcl: body.preserveAcl !== false,
+      sourceMajorVersion: body.sourceMajorVersion,
+      targetMajorVersion: body.targetMajorVersion,
+      createdAt: body.createdAt
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/databases/cross-restore/plan', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const sourceOrgId = body.sourceOrgId !== undefined
+      ? String(body.sourceOrgId)
+      : String(principal.teamId || 'team_default');
+    const targetOrgId = body.targetOrgId !== undefined
+      ? String(body.targetOrgId)
+      : String(principal.teamId || 'team_default');
+    if (!principal.isSuperAdmin && principal.teamId && (sourceOrgId !== principal.teamId || targetOrgId !== principal.teamId)) {
+      return res.status(403).json({
+        error: 'Restauración cross-org bloqueada por aislamiento de tenant',
+        code: 'CROSS_ORG_RESTORE_FORBIDDEN'
+      });
+    }
+    const out = getBackupDrillService().planCrossTargetRestore({
+      sourceDatabaseId: body.sourceDatabaseId,
+      targetDatabaseId: body.targetDatabaseId,
+      sourceOrgId,
+      targetOrgId,
+      engine: body.engine || 'postgres',
+      preserveAcl: body.preserveAcl !== false
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. SLO Error-Budget Canary Auto-Rollback Controller (Caddy v2.11 weighted_round_robin)
+router.get('/projects/:id/slo-canary', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const raw = getSloCanaryController().listRollouts(project.id);
+    const rollouts = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.rollouts) ? raw.rollouts : []);
+    res.json({ projectId: project.id, rollouts });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/projects/:id/slo-canary/start', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getSloCanaryController().startRollout({
+      ...body,
+      projectId: project.id,
+      hostname: body.hostname || (Array.isArray(project.domains) && project.domains[0]) || `${project.id}.local`
+    });
+    res.status(201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/slo-canary/:rolloutId/evaluate', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const ctrl = getSloCanaryController();
+    const existing = typeof ctrl.getRollout === 'function' ? ctrl.getRollout(req.params.rolloutId) : null;
+    if (existing && existing.projectId && existing.projectId !== project.id) {
+      return res.status(403).json({ error: 'Rollout canary pertenece a otro proyecto', code: 'CROSS_TENANT_FORBIDDEN' });
+    }
+    const out = await ctrl.evaluateRollout(req.params.rolloutId, req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/slo-canary/:rolloutId/abort', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const ctrl = getSloCanaryController();
+    const existing = typeof ctrl.getRollout === 'function' ? ctrl.getRollout(req.params.rolloutId) : null;
+    if (existing && existing.projectId && existing.projectId !== project.id) {
+      return res.status(403).json({ error: 'Rollout canary pertenece a otro proyecto', code: 'CROSS_TENANT_FORBIDDEN' });
+    }
+    const out = await ctrl.abortRollout(req.params.rolloutId, req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Self-Hosted AI / GPU & Local LLM Workload Orchestrator (Ollama / vLLM / llama.cpp)
+router.get('/ai/presets', (_req, res) => {
+  try {
+    const svc = getAiWorkloadService();
+    const presets = typeof svc.listPresets === 'function'
+      ? svc.listPresets()
+      : Object.values(svc.AI_RUNTIME_PRESETS || {});
+    res.json({ presets });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/ai/vram-estimate', (req, res) => {
+  try {
+    const out = getAiWorkloadService().estimateVram(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/ai/plan', (req, res) => {
+  try {
+    const out = getAiWorkloadService().buildAiWorkloadSpec(req.body || {});
+    if (out && out.ok === false) {
+      return res.status(400).json(out);
+    }
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Distributed Remote Build-Node Offloader (`coolify#11372`, `dokploy#3226`/`#3450`)
+router.get('/fleet/builders', (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'consultar nodos remotos de build')) return;
+    const raw = getRemoteBuilderService().listBuilders();
+    const builders = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.builders) ? raw.builders : []);
+    res.json({ builders });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/fleet/builders', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'fleet:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden registrar nodos de build', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'registrar nodo remoto de build')) return;
+    const out = getRemoteBuilderService().registerBuilder(req.body || {});
+    res.status(201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/fleet/builders/schedule', heavyOpLimiter, (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertProjectAccess(req, res, String(body.projectId), 'projects:write')) return;
+    const svc = getRemoteBuilderService();
+    if (body.action === 'release' && body.leaseId) {
+      return res.json(svc.releaseBuildSlot(String(body.leaseId)));
+    }
+    if (body.action === 'can_recycle_mux' && body.builderId) {
+      return res.json(svc.canRecycleMux(String(body.builderId)));
+    }
+    const out = svc.acquireBuildSlot(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Compressed Log Archive (`.ndjson.gz`) & ReDoS-Safe Streaming Search (`coolify#12170`)
+router.get('/projects/:id/logs/archive/stats', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const out = await getLogArchiveService().getArchiveStats(req.params.id);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/logs/archive/append', heavyOpLimiter, async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const entries = Array.isArray(body.entries)
+      ? body.entries
+      : (Array.isArray(body.logs) ? body.logs : (body.message ? [body] : []));
+    const out = await getLogArchiveService().appendLogs(req.params.id, entries, {
+      dateStr: typeof body.dateStr === 'string' ? body.dateStr : undefined,
+      maxArchiveMb: body.maxArchiveMb !== undefined ? Number(body.maxArchiveMb) : undefined,
+      retentionDays: body.retentionDays !== undefined ? Number(body.retentionDays) : undefined
+    });
+    res.status(201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/logs/archive/search', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getLogArchiveService().searchArchives({
+      ...body,
+      projectId: req.params.id
+    });
+    res.json(out);
+  } catch (err) {
+    const code = err && /** @type {any} */ (err).code ? /** @type {any} */ (err).code : undefined;
+    const status = code === 'UNSAFE_REGEX' ? 400 : 400;
+    sendServiceError(err, res, status);
   }
 });
 

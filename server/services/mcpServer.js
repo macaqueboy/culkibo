@@ -57,7 +57,12 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'dbStudioService',
   'objectStorageService',
   'quotaMeteringService',
-  'brandThemeService'
+  'brandThemeService',
+  'backupDrillService',
+  'sloCanaryController',
+  'aiWorkloadService',
+  'remoteBuilderService',
+  'logArchiveService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -114,14 +119,16 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (39 destructivas + 4 = 43). */
+/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (40 destructivas + 5 = 45). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment',
   'culkibo_heal_build_failure',
   'culkibo_secret_lease',
   'culkibo_webhook_dlq',
-  'culkibo_brand_theme'
+  'culkibo_brand_theme',
+  'culkibo_slo_canary',
+  'culkibo_remote_builder'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -183,7 +190,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_export_iac',
     'culkibo_webhook_dlq',
     'culkibo_db_studio',
-    'culkibo_s3_storage'
+    'culkibo_s3_storage',
+    'culkibo_slo_canary',
+    'culkibo_ai_workload',
+    'culkibo_remote_builder'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -224,6 +234,11 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_s3_storage',
     'culkibo_agency_ledger',
     'culkibo_brand_theme',
+    'culkibo_dr_drill',
+    'culkibo_slo_canary',
+    'culkibo_ai_workload',
+    'culkibo_remote_builder',
+    'culkibo_log_archive_search',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -260,7 +275,8 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_verify_attestation',
     'culkibo_cve_scan',
     'culkibo_secret_lease',
-    'culkibo_brand_theme'
+    'culkibo_brand_theme',
+    'culkibo_dr_drill'
   ])
 });
 
@@ -349,7 +365,18 @@ const SEARCH_SYNONYMS = Object.freeze({
   billing: ['ledger', 'quota', 'agency', 'csv', 'finops', 'cost'],
   quota: ['ledger', 'billing', 'agency', 'limit', 'tenant'],
   brand: ['whitelabel', 'theme', 'logo', 'login', 'accent'],
-  whitelabel: ['brand', 'theme', 'logo', 'login', 'agency']
+  whitelabel: ['brand', 'theme', 'logo', 'login', 'agency'],
+  drill: ['backup', 'restore', 'dr', 'recovery', 'checksum', 'sql'],
+  dr: ['drill', 'backup', 'restore', 'recovery', 'disaster'],
+  slo: ['canary', 'burn', 'rollback', 'budget', 'progressive', 'caddy'],
+  canary: ['slo', 'burn', 'rollback', 'budget', 'progressive', 'weight'],
+  gpu: ['ai', 'llm', 'vram', 'ollama', 'vllm', 'llamacpp', 'cuda', 'cdi'],
+  vram: ['ai', 'gpu', 'llm', 'ollama', 'vllm', 'llamacpp', 'quantization'],
+  llm: ['ai', 'gpu', 'vram', 'ollama', 'vllm', 'llamacpp'],
+  ollama: ['ai', 'gpu', 'vram', 'llm', 'vllm', 'llamacpp'],
+  vllm: ['ai', 'gpu', 'vram', 'llm', 'ollama', 'llamacpp'],
+  builder: ['remote', 'buildx', 'offload', 'mux', 'ssh', 'prune', 'preview'],
+  archive: ['logs', 'ndjson', 'gzip', 'search', 'retention', 'history']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -516,7 +543,13 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_db_studio: { minRole: 'developer', scope: 'databases:read', projectScoped: true },
   culkibo_s3_storage: { minRole: 'developer', scope: 'storage:read', projectScoped: false, secretSensitive: true },
   culkibo_agency_ledger: { minRole: 'viewer', scope: 'observability:read', projectScoped: true },
-  culkibo_brand_theme: { minRole: 'viewer', scope: 'system:read', projectScoped: false }
+  culkibo_brand_theme: { minRole: 'viewer', scope: 'system:read', projectScoped: false },
+  // MCP 2026 Cycle-10: DR Fire-Drill, SLO Canary Auto-Rollback, AI/GPU LLM, Remote Builder & Compressed Log Archive (+5 = 135)
+  culkibo_dr_drill: { minRole: 'developer', scope: 'databases:write', projectScoped: true },
+  culkibo_slo_canary: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
+  culkibo_ai_workload: { minRole: 'developer', scope: 'projects:read', projectScoped: false },
+  culkibo_remote_builder: { minRole: 'admin', scope: 'fleet:write', projectScoped: false },
+  culkibo_log_archive_search: { minRole: 'viewer', scope: 'logs:read', projectScoped: true }
 });
 
 /**
@@ -3757,6 +3790,180 @@ class McpServer extends EventEmitter {
             }
           }
         }
+      },
+
+      // --- MCP 2026 Cycle-10: DR Fire-Drill, SLO Canary Auto-Rollback, AI/GPU LLM, Remote Builder & Log Archive (+5 = 135) ---
+      {
+        name: 'culkibo_dr_drill',
+        title: 'Ejecutar DR Fire-Drill de backups y planificar restore',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            verdict: { type: ['string', 'null'] },
+            drill: { type: ['object', 'null'] },
+            drills: { type: 'array' },
+            restorePlan: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Audita backups reales mediante DR Fire-Drills (rechaza dumps vacíos 0B/20B gzip, checksum SHA-256 corrupto, detecta --no-acl en Supabase y registra scorecards RTO/RPO), lista drills históricos filtrados por ACL o planifica restauraciones cross-target (misma org permitida, cross-org bloqueada 403).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list_drills', 'run_drill', 'cross_restore_plan'], description: 'Operación DR Fire-Drill (default "list_drills")' },
+            databaseId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de base de datos objetivo (validado por ACL)' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de proyecto asociado (validado por ACL)' },
+            engine: { type: 'string', enum: ['postgres', 'mysql', 'sqlite'], description: 'Motor SQL del backup (default "postgres")' },
+            sqlSample: { type: 'string', maxLength: 262144, description: 'Contenido SQL de muestra para verificación en memoria (para action="run_drill")' },
+            artifactBase64: { type: 'string', maxLength: 524288, description: 'Payload .sql o .sql.gz codificado en base64 para action="run_drill"' },
+            artifactPath: { type: 'string', maxLength: 512, description: 'Ruta opcional del artefacto de backup local' },
+            expectedSha256: { type: 'string', maxLength: 128, description: 'Checksum SHA-256 esperado para verificar integridad' },
+            preserveAcl: { type: 'boolean', description: 'Exigir preservación de ACL/GRANTs sin --no-acl (default true)' },
+            sourceMajorVersion: { type: 'integer', minimum: 1, maximum: 99, description: 'Versión mayor origen para detectar downgrades' },
+            targetMajorVersion: { type: 'integer', minimum: 1, maximum: 99, description: 'Versión mayor destino para detectar downgrades' },
+            sourceDatabaseId: { type: 'string', minLength: 1, maxLength: 128, description: 'BD origen para action="cross_restore_plan"' },
+            targetDatabaseId: { type: 'string', minLength: 1, maxLength: 128, description: 'BD destino para action="cross_restore_plan"' },
+            sourceOrgId: { type: 'string', minLength: 1, maxLength: 128, description: 'Organización origen para action="cross_restore_plan"' },
+            targetOrgId: { type: 'string', minLength: 1, maxLength: 128, description: 'Organización destino para action="cross_restore_plan"' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_slo_canary',
+        title: 'Controlar despliegues SLO Canary con auto-rollback Caddy',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            rollout: { type: ['object', 'null'] },
+            rollouts: { type: 'array' },
+            caddyRoute: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Orquesta canarios progresivos (10→25→50→100%) sobre Caddy v2.11 weighted_round_robin con Google SRE error-budget burn rate (>14.4x) y p95 latency gate: en cualquier brecha revierte al instante a 100/0 (ROLLED_BACK). Soporta dryRun: true por defecto en start y abort (ACL estricto por proyecto).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'start', 'evaluate', 'abort'], description: 'Operación del controlador SLO Canary (default "list")' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto (obligatorio para start; validado por ACL)' },
+            rolloutId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del rollout activo (obligatorio para evaluate/abort)' },
+            hostname: { type: 'string', maxLength: 253, description: 'Dominio público del servicio para compilar ruta Caddy' },
+            stableUpstream: { type: 'string', maxLength: 253, description: 'Upstream estable (ej. 127.0.0.1:4101)' },
+            canaryUpstream: { type: 'string', maxLength: 253, description: 'Upstream canario (ej. 127.0.0.1:4102)' },
+            steps: { type: 'array', maxItems: 10, items: { type: 'integer', minimum: 1, maximum: 100 }, description: 'Pasos de peso canario (default [10, 25, 50, 100])' },
+            sloTarget: { type: 'number', minimum: 0.9, maximum: 0.99999, description: 'Objetivo SLO (default 0.999)' },
+            maxBurnRate: { type: 'number', minimum: 1, maximum: 1000, description: 'Burn rate máximo tolerado antes de rollback (default 14.4)' },
+            maxLatencyRatio: { type: 'number', minimum: 1.1, maximum: 20, description: 'Ratio máximo p95 canario/estable (default 2.0)' },
+            totalRequests: { type: 'integer', minimum: 0, maximum: 100000000, description: 'Total de peticiones observadas en la ventana (para evaluate)' },
+            error5xxCount: { type: 'integer', minimum: 0, maximum: 100000000, description: 'Total de errores 5xx en la ventana (para evaluate)' },
+            baselineP95Ms: { type: 'number', minimum: 0, maximum: 600000, description: 'Latencia p95 estable en ms (para evaluate)' },
+            canaryP95Ms: { type: 'number', minimum: 0, maximum: 600000, description: 'Latencia p95 canaria en ms (para evaluate)' },
+            reason: { type: 'string', maxLength: 240, description: 'Motivo de aborto manual (para abort)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_ai_workload',
+        title: 'Planificar cargas AI/GPU y LLM locales (Ollama/vLLM/llama.cpp)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            presets: { type: 'array' },
+            vram: { type: ['object', 'null'] },
+            security: { type: ['object', 'null'] },
+            spec: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Calcula requisitos de VRAM y KV-cache para LLMs locales (Ollama, vLLM, llama.cpp), audita etiquetas vulnerables (Ollama CVE-2026-7482, vLLM CVE-2026-22778/137477) y compila especificaciones Docker con NVIDIA CDI (--device nvidia.com/gpu=all) o legacy (--gpus all), bloqueando fail-closed el overflow de VRAM y la exposición pública 0.0.0.0:11434 sin proxy Bearer (CVE-2025-63389).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['presets', 'vram_estimate', 'plan', 'audit_image'], description: 'Operación AI/GPU (default "presets")' },
+            runtime: { type: 'string', enum: ['ollama', 'vllm', 'llamacpp'], description: 'Motor LLM local (default "ollama")' },
+            model: { type: 'string', maxLength: 160, description: 'Identificador del modelo (ej. llama3.2:8b, Qwen/Qwen2.5-14B-Instruct)' },
+            imageTag: { type: 'string', maxLength: 200, description: 'Etiqueta Docker explícita para auditar o planificar' },
+            paramsB: { type: 'number', minimum: 0.1, maximum: 1000, description: 'Miles de millones de parámetros del modelo (default 7)' },
+            quantization: { type: 'string', enum: ['Q4_K_M', 'Q5_K_M', 'Q6_K', 'Q8_0', 'FP16', 'BF16', 'FP32'], description: 'Cuantización del modelo (default "Q4_K_M")' },
+            contextLen: { type: 'integer', minimum: 256, maximum: 1048576, description: 'Longitud de contexto en tokens (default 8192)' },
+            batchSize: { type: 'integer', minimum: 1, maximum: 256, description: 'Tamaño de lote concurrente (default 1)' },
+            availableVramGb: { type: 'number', minimum: 1, maximum: 2048, description: 'VRAM GPU disponible en GB para comprobación fail-closed' },
+            gpuMode: { type: 'string', enum: ['cdi', 'legacy', 'cpu'], description: 'Modo GPU Docker: cdi, legacy o cpu (default "cdi")' },
+            bindAddress: { type: 'string', maxLength: 64, description: 'Dirección de escucha (default "127.0.0.1"; 0.0.0.0 sin authProxy se bloquea)' },
+            authProxyEnabled: { type: 'boolean', description: 'Si el proxy Bearer de Caddy protege el endpoint (default true)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_remote_builder',
+        title: 'Orquestar nodos remotos de build y pinning SSH mux',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            builders: { type: 'array' },
+            builder: { type: ['object', 'null'] },
+            lease: { type: ['object', 'null'] },
+            muxStatus: { type: ['object', 'null'] },
+            pruneArgs: { type: 'array' }
+          }
+        },
+        description: 'Gestiona nodos remotos de compilación distribuida (colas de concurrencia independientes por nodo, offload de PR previews, protección SSH mux ref-count pinning para impedir cierres en mitad de builds y comandos buildx prune sin shell; solo admin/owner, dryRun: true por defecto en register y schedule).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'register', 'schedule', 'can_recycle_mux', 'prune_plan'], description: 'Operación sobre remote builders (default "list")' },
+            builderId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del builder (para schedule/can_recycle_mux)' },
+            name: { type: 'string', minLength: 1, maxLength: 120, description: 'Nombre del nodo builder (para register)' },
+            host: { type: 'string', minLength: 1, maxLength: 253, description: 'Host/IP del nodo builder remoto (para register)' },
+            arch: { type: 'string', enum: ['linux/amd64', 'linux/arm64'], description: 'Arquitectura destino (default "linux/amd64")' },
+            maxConcurrency: { type: 'integer', minimum: 1, maximum: 64, description: 'Builds concurrentes máximos por builder (default 2)' },
+            allowPreviews: { type: 'boolean', description: 'Permitir offload de PR previews en este builder (default true)' },
+            isPreview: { type: 'boolean', description: 'Indica si el build a planificar es un PR preview (para schedule)' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'Proyecto propietario del build (para schedule)' },
+            keepStorageGb: { type: 'integer', minimum: 1, maximum: 2000, description: 'Almacenamiento caché BuildKit a conservar en GB (default 20)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_log_archive_search',
+        title: 'Buscar en archivo comprimido .ndjson.gz de logs persistentes',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            projectId: { type: ['string', 'null'] },
+            stats: { type: ['object', 'null'] },
+            search: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Consulta estadísticas o busca en archivos comprimidos .ndjson.gz persistentes que sobreviven a cada redespliegue, filtrando por fecha, nivel, releaseId, subcadena o regex con guardia estricta anti-ReDoS (rechaza cuantificadores anidados con UNSAFE_REGEX) y ACL estricto por proyecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['stats', 'search'], description: 'Operación sobre el archivo comprimido de logs (default "search")' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto (obligatorio para search; validado estrictamente por ACL)' },
+            since: { type: 'string', maxLength: 64, description: 'Fecha/ISO mínima opcional (ej. 2026-11-01)' },
+            until: { type: 'string', maxLength: 64, description: 'Fecha/ISO máxima opcional' },
+            level: { type: 'string', maxLength: 32, description: 'Nivel de log opcional (info, warn, error, fatal)' },
+            releaseId: { type: 'string', maxLength: 128, description: 'ID de release concreto a filtrar' },
+            query: { type: 'string', maxLength: 256, description: 'Subcadena case-insensitive a buscar' },
+            regex: { type: 'string', maxLength: 120, description: 'Expresión regular validada contra ReDoS (máx. 120 chars)' },
+            limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Máximo de entradas devueltas (default 200)' }
+          }
+        }
       }
     ];
 
@@ -5758,6 +5965,16 @@ class McpServer extends EventEmitter {
       const db = allDbs.find((d) => d.id === args.databaseId);
       refs.push({ projectId: db?.projectId || null, resourceKind: 'database', missing: !db });
     }
+    if (args.sourceDatabaseId) {
+      const allDbs = databaseManager.list();
+      const db = allDbs.find((d) => d.id === args.sourceDatabaseId);
+      refs.push({ projectId: db?.projectId || null, resourceKind: 'database', missing: !db });
+    }
+    if (args.rolloutId) {
+      const slo = lazySvc('sloCanaryController');
+      const r = slo && typeof slo.getRollout === 'function' ? slo.getRollout(String(args.rolloutId)) : null;
+      refs.push({ projectId: r?.projectId || null, resourceKind: 'slo_rollout', missing: !r });
+    }
     if (args.cronId) {
       const allCrons = cronManager.list();
       const cron = Array.isArray(allCrons) ? allCrons.find((c) => c.id === args.cronId) : null;
@@ -6755,6 +6972,75 @@ class McpServer extends EventEmitter {
           reversible = true;
         } else {
           effects.push('Leerá la marca white-label actual sin mutar estado.');
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_slo_canary': {
+        const action = String(args.action || 'list');
+        Object.assign(target, {
+          action,
+          projectId: args.projectId || null,
+          rolloutId: args.rolloutId || null,
+          hostname: args.hostname || null,
+          steps: Array.isArray(args.steps) ? args.steps : [10, 25, 50, 100]
+        });
+        if (action === 'start') {
+          if (!args.projectId) blockers.push('MISSING_PROJECT_ID');
+          if (!args.hostname) blockers.push('MISSING_HOSTNAME');
+          if (!args.stableUpstream) blockers.push('MISSING_STABLE_UPSTREAM');
+          if (!args.canaryUpstream) blockers.push('MISSING_CANARY_UPSTREAM');
+          const sloSvc = lazySvc('sloCanaryController');
+          const firstWeight = Array.isArray(args.steps) && args.steps.length > 0 ? Number(args.steps[0]) : 10;
+          if (sloSvc && typeof sloSvc.buildCaddyWeightedRoute === 'function' && args.hostname && args.stableUpstream && args.canaryUpstream) {
+            preview.caddyRoute = sloSvc.buildCaddyWeightedRoute({
+              hostname: String(args.hostname),
+              stableUpstream: String(args.stableUpstream),
+              canaryUpstream: String(args.canaryUpstream),
+              canaryWeight: firstWeight
+            });
+          }
+          effects.push(`Iniciará un rollout SLO Canary (${firstWeight}% inicial) sobre '${args.hostname || '?'}' con auto-rollback inmediato a 100/0 si el burn rate > ${args.maxBurnRate ?? 14.4}x.`);
+          riskLevel = 'high';
+          reversible = true;
+        } else if (action === 'abort') {
+          if (!args.rolloutId) blockers.push('MISSING_ROLLOUT_ID');
+          effects.push(`Abortará el rollout canario '${args.rolloutId || '?'}' devolviendo 100% del tráfico al upstream estable.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' en el controlador SLO Canary sin mutar pesos activos.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_remote_builder': {
+        const action = String(args.action || 'list');
+        Object.assign(target, {
+          action,
+          builderId: args.builderId || null,
+          name: args.name || null,
+          host: args.host || null,
+          arch: args.arch || 'linux/amd64',
+          isPreview: Boolean(args.isPreview),
+          projectId: args.projectId || null
+        });
+        if (action === 'register') {
+          if (!args.name) blockers.push('MISSING_BUILDER_NAME');
+          if (!args.host) blockers.push('MISSING_BUILDER_HOST');
+          effects.push(`Registrará el nodo remote builder '${args.name || '?'}' (${args.host || '?'}, ${args.arch || 'linux/amd64'}) con concurrencia máxima ${args.maxConcurrency ?? 2}.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'schedule') {
+          effects.push(`Reservará una ranura de build remoto (${args.arch || 'linux/amd64'}${args.isPreview ? ', PR preview' : ''}) fijando SSH mux ref-count hasta liberar el lease.`);
+          riskLevel = 'low';
+          reversible = true;
+        } else {
+          effects.push(`Consultará '${action}' de remote builders sin modificar nodos ni ranuras activas.`);
           riskLevel = 'low';
           reversible = true;
         }
@@ -10080,6 +10366,456 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_dr_drill': {
+          const drSvc = requireLazySvc('backupDrillService', 'Automated DR Backup Fire-Drill Verifier');
+          const action = String(args.action || 'list_drills');
+
+          if (action === 'list_drills') {
+            const raw = drSvc.listDrills(args.databaseId ? String(args.databaseId) : undefined);
+            const allDrills = Array.isArray(raw) ? raw : (Array.isArray(raw?.drills) ? raw.drills : []);
+            const accessibleDbIds = new Set(
+              databaseManager.list()
+                .filter((d) => principal.isSuperAdmin || canAccessProject(principal, d.projectId))
+                .map((d) => d.id)
+            );
+            const filtered = principal.isSuperAdmin
+              ? allDrills
+              : allDrills.filter((d) => {
+                  if (d.projectId) return canAccessProject(principal, d.projectId);
+                  if (d.databaseId && accessibleDbIds.has(d.databaseId)) return true;
+                  return false;
+                });
+            res = { ok: true, action: 'list_drills', verdict: null, drill: null, drills: filtered, restorePlan: null };
+          } else if (action === 'run_drill') {
+            const db = args.databaseId ? databaseManager.list().find((d) => d.id === String(args.databaseId)) : null;
+            if (db && !principal.isSuperAdmin && !canAccessProject(principal, db.projectId)) {
+              throw new McpToolError('FORBIDDEN', `No tienes acceso a la base de datos '${db.id}'.`, {
+                retryable: false,
+                remediation: 'Usa un databaseId perteneciente a tus proyectos autorizados.'
+              });
+            }
+            const targetProjectId = args.projectId ? String(args.projectId) : (db?.projectId || '');
+            if (targetProjectId && !principal.isSuperAdmin && !canAccessProject(principal, targetProjectId)) {
+              throw new McpToolError('FORBIDDEN', `No tienes acceso al proyecto '${targetProjectId}'.`, {
+                retryable: false,
+                remediation: 'Indica un projectId autorizado desde culkibo_list_projects.'
+              });
+            }
+            /** @type {Buffer | undefined} */
+            let artifactBuffer;
+            if (typeof args.artifactBase64 === 'string') {
+              artifactBuffer = Buffer.from(args.artifactBase64, 'base64');
+            } else if (typeof args.sqlSample === 'string') {
+              artifactBuffer = Buffer.from(args.sqlSample, 'utf8');
+            }
+            if (artifactBuffer === undefined && !args.artifactPath) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="run_drill" requiere sqlSample, artifactBase64 o artifactPath.', {
+                retryable: true,
+                remediation: 'Pasa artifactBase64, sqlSample o artifactPath del backup a verificar.'
+              });
+            }
+            try {
+              const drill = await drSvc.runFireDrill({
+                databaseId: args.databaseId ? String(args.databaseId) : (db?.id || 'db_drill'),
+                projectId: targetProjectId,
+                engine: String(args.engine || db?.engine || 'postgres'),
+                ...(artifactBuffer !== undefined ? { artifactBuffer } : {}),
+                ...(args.artifactPath ? { artifactPath: String(args.artifactPath) } : {}),
+                ...(args.expectedSha256 ? { expectedSha256: String(args.expectedSha256) } : {}),
+                preserveAcl: args.preserveAcl !== false,
+                ...(args.sourceMajorVersion !== undefined ? { sourceMajorVersion: Number(args.sourceMajorVersion) } : {}),
+                ...(args.targetMajorVersion !== undefined ? { targetMajorVersion: Number(args.targetMajorVersion) } : {})
+              });
+              res = {
+                ok: drill.verdict === 'PASS',
+                action: 'run_drill',
+                verdict: drill.verdict,
+                drill,
+                drills: [],
+                restorePlan: null
+              };
+            } catch (e) {
+              throw new McpToolError(e.code || 'DR_DRILL_ERROR', e.message || 'Error ejecutando DR Fire-Drill.', {
+                retryable: false,
+                remediation: 'Revisa la ruta/payload del backup y los parámetros del motor SQL.'
+              });
+            }
+          } else {
+            // action === 'cross_restore_plan'
+            if (!args.sourceDatabaseId || !args.targetDatabaseId || !args.sourceOrgId || !args.targetOrgId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="cross_restore_plan" requiere sourceDatabaseId, targetDatabaseId, sourceOrgId y targetOrgId.', {
+                retryable: true,
+                remediation: 'Especifica ambos databaseId y ambos orgId para validar aislamiento organizativo.'
+              });
+            }
+            try {
+              const restorePlan = drSvc.planCrossTargetRestore({
+                sourceDatabaseId: String(args.sourceDatabaseId),
+                targetDatabaseId: String(args.targetDatabaseId),
+                sourceOrgId: String(args.sourceOrgId),
+                targetOrgId: String(args.targetOrgId),
+                engine: String(args.engine || 'postgres'),
+                preserveAcl: args.preserveAcl !== false
+              });
+              res = { ok: true, action: 'cross_restore_plan', verdict: 'ALLOWED', drill: null, drills: [], restorePlan };
+            } catch (e) {
+              throw new McpToolError(e.code || 'CROSS_ORG_RESTORE_FORBIDDEN', e.message || 'Restauración cross-target rechazada.', {
+                retryable: false,
+                remediation: 'Solo se permiten restauraciones cross-target dentro de la misma organización (sourceOrgId === targetOrgId).'
+              });
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_slo_canary': {
+          const sloSvc = requireLazySvc('sloCanaryController', 'SLO Error-Budget Canary Auto-Rollback Controller');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const raw = sloSvc.listRollouts(args.projectId ? String(args.projectId) : undefined);
+            const list = (Array.isArray(raw) ? raw : []).filter((r) => principal.isSuperAdmin || canAccessProject(principal, r.projectId));
+            res = { ok: true, action: 'list', dryRun: false, rollout: null, rollouts: list, caddyRoute: null };
+          } else if (action === 'start') {
+            if (!args.projectId || !args.hostname || !args.stableUpstream || !args.canaryUpstream) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="start" requiere projectId, hostname, stableUpstream y canaryUpstream.', {
+                retryable: true,
+                remediation: 'Proporciona projectId, hostname, stableUpstream y canaryUpstream (dryRun: true por defecto).'
+              });
+            }
+            const steps = Array.isArray(args.steps) && args.steps.length > 0 ? args.steps.map(Number) : [10, 25, 50, 100];
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              const caddyRoute = sloSvc.buildCaddyWeightedRoute({
+                hostname: String(args.hostname),
+                stableUpstream: String(args.stableUpstream),
+                canaryUpstream: String(args.canaryUpstream),
+                canaryWeight: steps[0]
+              });
+              res = {
+                ok: true,
+                action: 'start',
+                dryRun: true,
+                started: false,
+                rollout: null,
+                rollouts: [],
+                caddyRoute
+              };
+            } else {
+              try {
+                const rollout = await sloSvc.startRollout({
+                  projectId: String(args.projectId),
+                  hostname: String(args.hostname),
+                  stableUpstream: String(args.stableUpstream),
+                  canaryUpstream: String(args.canaryUpstream),
+                  steps,
+                  ...(args.sloTarget !== undefined ? { sloTarget: Number(args.sloTarget) } : {}),
+                  ...(args.maxBurnRate !== undefined ? { maxBurnRate: Number(args.maxBurnRate) } : {}),
+                  ...(args.maxLatencyRatio !== undefined ? { maxLatencyRatio: Number(args.maxLatencyRatio) } : {})
+                });
+                res = {
+                  ok: true,
+                  action: 'start',
+                  dryRun: false,
+                  started: true,
+                  rollout,
+                  rollouts: [],
+                  caddyRoute: rollout?.caddyRoute || null
+                };
+              } catch (e) {
+                throw new McpToolError(e.code || 'SLO_CANARY_START_FAILED', e.message || 'No se pudo iniciar el rollout SLO Canary.', {
+                  retryable: true,
+                  remediation: 'Revisa los upstreams (host:puerto) y pasos de peso canario (1..100).'
+                });
+              }
+            }
+          } else if (action === 'evaluate') {
+            if (!args.rolloutId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="evaluate" requiere rolloutId.', {
+                retryable: true,
+                remediation: 'Lista rollouts con culkibo_slo_canary({ action: "list" }) y pasa rolloutId.'
+              });
+            }
+            const existing = sloSvc.getRollout(String(args.rolloutId));
+            if (!existing) {
+              throw new McpToolError('ROLLOUT_NOT_FOUND', `Rollout SLO Canary '${args.rolloutId}' no encontrado.`, {
+                retryable: false,
+                remediation: 'Consulta rollouts activos con action="list".'
+              });
+            }
+            if (!principal.isSuperAdmin && !canAccessProject(principal, existing.projectId)) {
+              throw new McpToolError('FORBIDDEN', `No tienes acceso al rollout '${args.rolloutId}'.`, {
+                retryable: false,
+                remediation: 'Solo puedes evaluar rollouts de tus proyectos autorizados.'
+              });
+            }
+            try {
+              const evalRes = await sloSvc.evaluateRollout(String(args.rolloutId), {
+                totalRequests: Number(args.totalRequests ?? 1000),
+                error5xxCount: Number(args.error5xxCount ?? 0),
+                baselineP95Ms: Number(args.baselineP95Ms ?? 50),
+                canaryP95Ms: Number(args.canaryP95Ms ?? 50)
+              });
+              res = {
+                ok: true,
+                action: 'evaluate',
+                dryRun: false,
+                rollout: evalRes?.rollout || evalRes,
+                rollouts: [],
+                caddyRoute: evalRes?.caddyRoute || evalRes?.rollout?.caddyRoute || null,
+                evaluation: evalRes
+              };
+            } catch (e) {
+              throw new McpToolError(e.code || 'SLO_CANARY_EVAL_FAILED', e.message || 'Error evaluando rollout SLO Canary.', {
+                retryable: false,
+                remediation: 'Verifica que el rollout esté en estado IN_PROGRESS.'
+              });
+            }
+          } else {
+            // action === 'abort'
+            if (!args.rolloutId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="abort" requiere rolloutId.', {
+                retryable: true,
+                remediation: 'Lista rollouts con culkibo_slo_canary({ action: "list" }) y pasa rolloutId.'
+              });
+            }
+            const existing = sloSvc.getRollout(String(args.rolloutId));
+            if (!existing) {
+              throw new McpToolError('ROLLOUT_NOT_FOUND', `Rollout SLO Canary '${args.rolloutId}' no encontrado.`, {
+                retryable: false,
+                remediation: 'Consulta rollouts activos con action="list".'
+              });
+            }
+            if (!principal.isSuperAdmin && !canAccessProject(principal, existing.projectId)) {
+              throw new McpToolError('FORBIDDEN', `No tienes acceso al rollout '${args.rolloutId}'.`, {
+                retryable: false,
+                remediation: 'Solo puedes abortar rollouts de tus proyectos autorizados.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                ok: true,
+                action: 'abort',
+                dryRun: true,
+                aborted: false,
+                rollout: existing,
+                rollouts: [],
+                caddyRoute: null
+              };
+            } else {
+              const aborted = await sloSvc.abortRollout(String(args.rolloutId), {
+                reason: args.reason ? String(args.reason) : 'mcp_manual_abort'
+              });
+              res = {
+                ok: true,
+                action: 'abort',
+                dryRun: false,
+                aborted: true,
+                rollout: aborted?.rollout || aborted,
+                rollouts: [],
+                caddyRoute: aborted?.caddyRoute || aborted?.rollout?.caddyRoute || null
+              };
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_ai_workload': {
+          const aiSvc = requireLazySvc('aiWorkloadService', 'Self-Hosted AI/GPU & Local LLM Workload Orchestrator');
+          const action = String(args.action || 'presets');
+
+          if (action === 'presets') {
+            const rawPresets = aiSvc.AI_RUNTIME_PRESETS ? Object.values(aiSvc.AI_RUNTIME_PRESETS) : [];
+            res = { ok: true, action: 'presets', presets: rawPresets, vram: null, security: null, spec: null };
+          } else if (action === 'vram_estimate') {
+            const vram = aiSvc.estimateVram({
+              paramsB: args.paramsB !== undefined ? Number(args.paramsB) : 7,
+              quantization: String(args.quantization || 'Q4_K_M'),
+              contextLen: args.contextLen !== undefined ? Number(args.contextLen) : 8192,
+              batchSize: args.batchSize !== undefined ? Number(args.batchSize) : 1,
+              availableVramGb: args.availableVramGb !== undefined ? Number(args.availableVramGb) : null
+            });
+            res = { ok: true, action: 'vram_estimate', presets: [], vram, security: null, spec: null };
+          } else if (action === 'audit_image') {
+            const security = aiSvc.auditAiImageSecurity({
+              runtime: String(args.runtime || 'ollama'),
+              imageTag: args.imageTag ? String(args.imageTag) : undefined,
+              bindAddress: String(args.bindAddress || '127.0.0.1'),
+              authProxyEnabled: args.authProxyEnabled !== false
+            });
+            res = { ok: Boolean(security && security.safe), action: 'audit_image', presets: [], vram: null, security, spec: null };
+          } else {
+            // action === 'plan'
+            try {
+              const spec = aiSvc.buildAiWorkloadSpec({
+                runtime: String(args.runtime || 'ollama'),
+                model: String(args.model || 'llama3.2:8b'),
+                paramsB: args.paramsB !== undefined ? Number(args.paramsB) : 8,
+                quantization: String(args.quantization || 'Q4_K_M'),
+                contextLen: args.contextLen !== undefined ? Number(args.contextLen) : 8192,
+                availableVramGb: args.availableVramGb !== undefined ? Number(args.availableVramGb) : 16,
+                gpuMode: String(args.gpuMode || 'cdi'),
+                bindAddress: String(args.bindAddress || '127.0.0.1'),
+                authProxyEnabled: args.authProxyEnabled !== false,
+                ...(args.imageTag ? { imageTag: String(args.imageTag) } : {})
+              });
+              if (spec && spec.ok === false) {
+                throw new McpToolError(spec.code || 'AI_WORKLOAD_BLOCKED', spec.error || 'Especificación AI/GPU rechazada por guardrails de VRAM o seguridad.', {
+                  retryable: true,
+                  remediation: 'Ajusta cuantización/contextLen/availableVramGb o vincula a 127.0.0.1 con authProxyEnabled: true.',
+                  details: { vram: spec.vram || null, security: spec.security || null }
+                });
+              }
+              res = { ok: true, action: 'plan', presets: [], vram: spec?.vram || null, security: spec?.security || null, spec };
+            } catch (e) {
+              if (e instanceof McpToolError) throw e;
+              throw new McpToolError(e.code || 'AI_WORKLOAD_BLOCKED', e.message || 'Especificación AI/GPU bloqueada por guardrails.', {
+                retryable: true,
+                remediation: 'Verifica VRAM suficiente, imagen sin CVEs críticos y bindAddress="127.0.0.1" (o authProxyEnabled: true).'
+              });
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_remote_builder': {
+          const rbSvc = requireLazySvc('remoteBuilderService', 'Distributed Remote Build-Node Offloader');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const rawB = rbSvc.listBuilders();
+            const builders = Array.isArray(rawB) ? rawB : (Array.isArray(rawB?.builders) ? rawB.builders : []);
+            res = { ok: true, action: 'list', dryRun: false, builders, builder: null, lease: null, muxStatus: null, pruneArgs: [] };
+          } else if (action === 'register') {
+            if (!args.name || !args.host) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="register" requiere name y host.', {
+                retryable: true,
+                remediation: 'Indica name y host del nodo builder remoto (dryRun: true por defecto).'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const cfg = {
+              ...(args.builderId ? { id: String(args.builderId) } : {}),
+              name: String(args.name),
+              host: String(args.host),
+              arch: String(args.arch || 'linux/amd64'),
+              maxConcurrency: Math.min(64, Math.max(1, Number(args.maxConcurrency) || 2)),
+              allowPreviews: args.allowPreviews !== false,
+              keepStorageGb: Math.min(2000, Math.max(1, Number(args.keepStorageGb) || 20))
+            };
+            if (dryRun) {
+              res = { ok: true, action: 'register', dryRun: true, registered: false, builders: [], builder: null, lease: null, muxStatus: null, pruneArgs: [], wouldRegister: cfg };
+            } else {
+              try {
+                const builder = rbSvc.registerBuilder(cfg);
+                res = { ok: true, action: 'register', dryRun: false, registered: true, builders: [], builder, lease: null, muxStatus: null, pruneArgs: [] };
+              } catch (e) {
+                throw new McpToolError(e.code || 'REMOTE_BUILDER_REGISTER_FAILED', e.message || 'Error registrando remote builder.', {
+                  retryable: true,
+                  remediation: 'Verifica name, host y arquitectura (linux/amd64 o linux/arm64).'
+                });
+              }
+            }
+          } else if (action === 'schedule') {
+            const dryRun = args.dryRun !== false;
+            const req = {
+              ...(args.builderId ? { builderId: String(args.builderId) } : {}),
+              arch: String(args.arch || 'linux/amd64'),
+              isPreview: Boolean(args.isPreview),
+              projectId: args.projectId ? String(args.projectId) : 'default'
+            };
+            if (dryRun) {
+              res = { ok: true, action: 'schedule', dryRun: true, leased: false, builders: [], builder: null, lease: null, muxStatus: null, pruneArgs: [], wouldSchedule: req };
+            } else {
+              try {
+                const lease = rbSvc.acquireBuildSlot(req);
+                res = { ok: true, action: 'schedule', dryRun: false, leased: Boolean(lease && lease.leased), builders: [], builder: null, lease, muxStatus: null, pruneArgs: [] };
+              } catch (e) {
+                throw new McpToolError(e.code || 'REMOTE_BUILDER_SCHEDULE_FAILED', e.message || 'No se pudo planificar build remoto.', {
+                  retryable: true,
+                  remediation: 'Registra al menos un nodo compatible con action="register" y revisa concurrencia.'
+                });
+              }
+            }
+          } else if (action === 'can_recycle_mux') {
+            if (!args.builderId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="can_recycle_mux" requiere builderId.', {
+                retryable: true,
+                remediation: 'Lista nodos con action="list" y pasa builderId.'
+              });
+            }
+            const muxStatus = rbSvc.canRecycleMux(String(args.builderId));
+            res = { ok: true, action: 'can_recycle_mux', dryRun: false, builders: [], builder: null, lease: null, muxStatus, pruneArgs: [] };
+          } else {
+            // action === 'prune_plan'
+            const pruneArgs = rbSvc.buildPruneArgs({ keepStorageGb: Math.min(2000, Math.max(1, Number(args.keepStorageGb) || 20)) });
+            res = { ok: true, action: 'prune_plan', dryRun: true, builders: [], builder: null, lease: null, muxStatus: null, pruneArgs };
+          }
+          break;
+        }
+
+        case 'culkibo_log_archive_search': {
+          const logArch = requireLazySvc('logArchiveService', 'Compressed Persistent Log Archive & ReDoS-Safe Search');
+          const action = String(args.action || 'search');
+
+          if (args.projectId && !principal.isSuperAdmin && !canAccessProject(principal, String(args.projectId))) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a los logs archivados del proyecto '${args.projectId}'.`, {
+              retryable: false,
+              remediation: 'Indica un projectId autorizado desde culkibo_list_projects.'
+            });
+          }
+
+          if (action === 'stats') {
+            if (args.projectId) {
+              const stats = logArch.getArchiveStats(String(args.projectId));
+              res = { ok: true, action: 'stats', projectId: String(args.projectId), stats, search: null };
+            } else {
+              const rawStats = logArch.getArchiveStats();
+              if (!principal.isSuperAdmin && rawStats && typeof rawStats === 'object' && Array.isArray(rawStats.projects)) {
+                const allowed = new Set(this._accessibleProjectIds(principal) || []);
+                const scoped = rawStats.projects.filter((p) => p && allowed.has(String(p.projectId)));
+                res = {
+                  ok: true,
+                  action: 'stats',
+                  projectId: null,
+                  stats: { ...rawStats, projects: scoped, totalProjects: scoped.length },
+                  search: null
+                };
+              } else {
+                res = { ok: true, action: 'stats', projectId: null, stats: rawStats, search: null };
+              }
+            }
+          } else {
+            // action === 'search'
+            if (!args.projectId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="search" requiere projectId.', {
+                retryable: true,
+                remediation: 'Indica el projectId obtenido desde culkibo_list_projects.'
+              });
+            }
+            try {
+              const search = logArch.searchArchives({
+                projectId: String(args.projectId),
+                ...(args.since ? { since: String(args.since) } : {}),
+                ...(args.until ? { until: String(args.until) } : {}),
+                ...(args.level ? { level: String(args.level) } : {}),
+                ...(args.releaseId ? { releaseId: String(args.releaseId) } : {}),
+                ...(args.query ? { query: String(args.query) } : {}),
+                ...(args.regex ? { regex: String(args.regex) } : {}),
+                limit: Math.min(500, Math.max(1, Number(args.limit) || 200))
+              });
+              res = { ok: true, action: 'search', projectId: String(args.projectId), stats: null, search };
+            } catch (e) {
+              throw new McpToolError(e.code || 'UNSAFE_REGEX', e.message || 'Patrón de búsqueda o parámetro de archivo rechazado.', {
+                retryable: true,
+                remediation: 'Usa regex simples sin cuantificadores anidados (<=120 chars) o busca con el parámetro literal query.'
+              });
+            }
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -11063,7 +11799,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 130 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 135 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

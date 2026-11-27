@@ -52,7 +52,9 @@ const svc = {
   get iacExporter() { return require('../server/services/iacExporter'); },
   get cveDriftService() { return require('../server/services/cveDriftService'); },
   get quotaMeteringService() { return require('../server/services/quotaMeteringService'); },
-  get objectStorageService() { return require('../server/services/objectStorageService'); }
+  get objectStorageService() { return require('../server/services/objectStorageService'); },
+  get backupDrillService() { return require('../server/services/backupDrillService'); },
+  get aiWorkloadService() { return require('../server/services/aiWorkloadService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2875,15 +2877,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 130,
+            mcpTools: 135,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '130 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
-            'WebAuthn Passkeys, Secret Leases, OSV CVE Scan, Read-Only DB Studio, Post-MinIO S3, Agency Ledger & White-Label Brand'
+            '135 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
+            'DR Fire-Drills, SLO Canary Auto-Rollback, AI/GPU VRAM Planner, Remote Builders, Compressed Log Archive & Post-MinIO S3'
           ]
         };
       };
@@ -3471,6 +3473,128 @@ program
         Port: p.s3Port,
         RAM: `~${p.ramEstimateMb} MB`
       })));
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-10 CLI: dr-drill (Backup Fire-Drill) & ai-vram (GPU/LLM Calc)
+// ===========================================================================
+
+program
+  .command('dr-drill <backupFile>')
+  .description('DR Backup Fire-Drill Verifier: audita cualquier .sql/.sql.gz local (rechaza dumps vacíos 0B/20B, SHA-256 corrupto y --no-acl)')
+  .option('-e, --engine <engine>', 'Motor SQL: postgres | mysql | sqlite', 'postgres')
+  .option('--sha256 <hex>', 'Checksum SHA-256 esperado para verificar integridad criptográfica')
+  .option('--no-preserve-acl', 'Desactivar alerta por --no-acl / GRANTs eliminados')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (backupFile, options) => {
+    try {
+      const resolved = path.resolve(String(backupFile));
+      if (!fs.existsSync(resolved)) {
+        throw new Error(`Archivo de backup no encontrado: ${resolved}`);
+      }
+      const rawEngine = String(options.engine || 'postgres').toLowerCase();
+      if (rawEngine !== 'postgres' && rawEngine !== 'mysql' && rawEngine !== 'sqlite') {
+        throw new Error(`Motor SQL inválido "${options.engine}". Usa: postgres | mysql | sqlite`);
+      }
+      const drSvc = svc.backupDrillService;
+      const drill = await drSvc.runFireDrill({
+        databaseId: path.basename(resolved),
+        engine: rawEngine,
+        artifactPath: resolved,
+        ...(options.sha256 ? { expectedSha256: String(options.sha256).trim() } : {}),
+        preserveAcl: options.preserveAcl !== false
+      });
+
+      const passed = drill.verdict === 'PASS';
+      const payload = {
+        ...drill,
+        ok: passed,
+        file: resolved
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!passed) process.exitCode = 1;
+        return;
+      }
+
+      const badge = passed ? '\x1b[32mPASS\x1b[0m' : '\x1b[31mFAIL\x1b[0m';
+      console.log(`\n🛡️  Culkibo DR Backup Fire-Drill — [${badge}]`);
+      console.log(`   Archivo:     ${resolved}`);
+      console.log(`   Motor:       ${rawEngine}`);
+      console.log(`   Tamaño:      ${drill.bytesVerified ?? 0} B (descomprimido: ${drill.uncompressedBytes ?? 0} B)`);
+      console.log(`   SHA-256:     ${drill.sha256 || '—'}`);
+      console.log(`   RTO:         ${drill.rtoMs ?? 0} ms`);
+      if (Array.isArray(drill.warnings) && drill.warnings.length > 0) {
+        console.log(`   Avisos:      ${drill.warnings.map((w) => (typeof w === 'string' ? w : (w.code || w.message))).join('; ')}`);
+      }
+      if (Array.isArray(drill.errors) && drill.errors.length > 0) {
+        console.log(`   Errores:     ${drill.errors.map((e) => (typeof e === 'string' ? e : (e.code || e.message))).join('; ')}`);
+      }
+      console.log('');
+      if (!passed) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('ai-vram')
+  .description('Self-Hosted AI / GPU LLM Pre-Flight Calculator: estima VRAM de pesos + KV-cache y valida ajuste en GPU')
+  .option('--params <B>', 'Tamaño del modelo en miles de millones de parámetros (ej. 7, 14, 32, 70)', '8')
+  .option('--quant <q>', 'Cuantización: Q4_K_M | Q5_K_M | Q6_K | Q8_0 | FP16 | BF16 | FP32', 'Q4_K_M')
+  .option('--ctx <n>', 'Longitud de contexto en tokens', '8192')
+  .option('--vram <GB>', 'VRAM disponible en GB para evaluar ajuste fail-closed')
+  .option('--runtime <rt>', 'Runtime LLM: ollama | vllm | llamacpp', 'ollama')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const rawRt = String(options.runtime || 'ollama').toLowerCase();
+      if (rawRt !== 'ollama' && rawRt !== 'vllm' && rawRt !== 'llamacpp') {
+        throw new Error(`Runtime AI inválido "${options.runtime}". Usa: ollama | vllm | llamacpp`);
+      }
+      const paramsB = Number(options.params);
+      if (!Number.isFinite(paramsB) || paramsB <= 0) {
+        throw new Error(`--params inválido "${options.params}". Usa un número positivo en B (ej. 8, 14, 70).`);
+      }
+      const contextLen = Math.max(256, parseInt(String(options.ctx || '8192'), 10) || 8192);
+      const availableVramGb = options.vram !== undefined ? Number(options.vram) : null;
+      if (availableVramGb !== null && (!Number.isFinite(availableVramGb) || availableVramGb <= 0)) {
+        throw new Error(`--vram inválido "${options.vram}". Usa GB positivos (ej. 16, 24, 80).`);
+      }
+
+      const aiSvc = svc.aiWorkloadService;
+      const estimate = aiSvc.estimateVram({
+        paramsB,
+        quantization: String(options.quant || 'Q4_K_M').toUpperCase(),
+        contextLen,
+        availableVramGb
+      });
+      const presetsMap = aiSvc.AI_RUNTIME_PRESETS || {};
+      const preset = presetsMap[rawRt] || null;
+      const payload = {
+        ok: true,
+        runtime: rawRt,
+        preset,
+        ...estimate
+      };
+      if (isJsonMode(options)) return printJson(payload);
+
+      console.log(`\n\x1b[36m🧠 Culkibo AI/GPU VRAM Pre-Flight (${rawRt} · ${paramsB}B · ${estimate.quantization} · ctx=${contextLen})\x1b[0m`);
+      console.log(`   Pesos:       ${estimate.weightsGb} GB`);
+      console.log(`   KV-Cache:    ${estimate.kvCacheGb} GB`);
+      console.log(`   Overhead:    ${estimate.overheadGb} GB`);
+      console.log(`   Total VRAM:  ${estimate.totalRequiredGb} GB`);
+      if (availableVramGb !== null) {
+        const fitLabel = estimate.fits ? '\x1b[32mFITS ✅\x1b[0m' : '\x1b[31mOVERFLOW ❌\x1b[0m';
+        console.log(`   GPU ${availableVramGb} GB:   ${fitLabel}`);
+      }
+      if (preset) {
+        console.log(`   Imagen CVE-safe: ${preset.image} (bind=${preset.bindAddress}, volume=${preset.cacheMount || '—'})`);
+      }
+      console.log('');
     } catch (err) {
       failCli(err, options);
     }

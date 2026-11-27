@@ -1,9 +1,27 @@
 import React, { useState, useEffect, useRef, useDeferredValue, useMemo, useCallback } from 'react';
-import { Play, Pause, Trash2, Download, Search, Terminal, Copy, Check, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
-import type { LogEntry, Project } from '../lib/api';
+import {
+  Play,
+  Pause,
+  Trash2,
+  Download,
+  Search,
+  Terminal,
+  Copy,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  RefreshCw,
+  Archive,
+  ShieldCheck,
+  ShieldAlert,
+  Loader2,
+} from 'lucide-react';
+import type { LogEntry, Project, LogArchiveStatsResult, LogArchiveSearchResult } from '../lib/api';
 import { api, apiFetch } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n } from '../lib/i18n';
 
 interface LiveLogsProps {
   incomingLog?: LogEntry | null;
@@ -72,9 +90,20 @@ function tryParseJsonMessage(msg: string): Record<string, any> | null {
 }
 
 export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) => {
+  const { t } = useI18n();
   const [logs, setLogs] = useState<ExtendedLogEntry[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>(projectId || 'all');
+
+  // Cycle-10 Compressed Persistent Log Archive (.ndjson.gz) state
+  const [archiveOpen, setArchiveOpen] = useState<boolean>(true);
+  const [archiveStats, setArchiveStats] = useState<LogArchiveStatsResult | null>(null);
+  const [archiveQuery, setArchiveQuery] = useState<string>('');
+  const [archiveLevel, setArchiveLevel] = useState<string>('ALL');
+  const [archiveUseRegex, setArchiveUseRegex] = useState<boolean>(false);
+  const [archiveResult, setArchiveResult] = useState<LogArchiveSearchResult | null>(null);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveBusy, setArchiveBusy] = useState<boolean>(false);
   const [selectedPod, setSelectedPod] = useState<string>('all');
   const [selectedLevel, setSelectedLevel] = useState<string>('all');
   const [sinceWindow, setSinceWindow] = useState<string>('all');
@@ -101,6 +130,41 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
   const rafRef = useRef<number | null>(null);
 
   const effectiveProjectId = projectId || (selectedProjectId !== 'all' ? selectedProjectId : undefined);
+  const archiveTargetProjectId = effectiveProjectId || projects[0]?.id || 'proj_acme_web';
+
+  useEffect(() => {
+    let active = true;
+    api.getLogArchiveStats(archiveTargetProjectId)
+      .then((res) => {
+        if (active && res) setArchiveStats(res);
+      })
+      .catch(() => {
+        if (active) setArchiveStats(null);
+      });
+    return () => { active = false; };
+  }, [archiveTargetProjectId]);
+
+  const handleSearchArchive = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setArchiveBusy(true);
+    setArchiveError(null);
+    try {
+      const payload: { query?: string; regex?: string; level?: string; limit: number } = { limit: 100 };
+      if (archiveLevel !== 'ALL') payload.level = archiveLevel;
+      const cleanQ = archiveQuery.trim();
+      if (cleanQ) {
+        if (archiveUseRegex) payload.regex = cleanQ;
+        else payload.query = cleanQ;
+      }
+      const res = await api.searchLogArchive(archiveTargetProjectId, payload);
+      setArchiveResult(res);
+    } catch (err: unknown) {
+      setArchiveResult(null);
+      setArchiveError(err instanceof Error ? err.message : 'Compressed log archive search rejected');
+    } finally {
+      setArchiveBusy(false);
+    }
+  };
 
   useEffect(() => {
     isPausedRef.current = isPaused;
@@ -534,6 +598,124 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
           </div>
         )}
       </div>
+
+      {/* Cycle-10 Collapsible Persistent Log Archive (.ndjson.gz) Search Panel */}
+      <section className="culkibo-surface rounded-xl overflow-hidden text-xs">
+        <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 flex-wrap min-w-0">
+            <Archive className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+            <span className="font-semibold text-slate-900">{t('logs.archiveTitle')}</span>
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+              <ShieldCheck className="w-3 h-3" />
+              {t('logs.archiveBadge')}
+            </span>
+            {archiveStats && (
+              <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                {archiveStats.shardCount ?? archiveStats.filesCount ?? archiveStats.totalFiles ?? 0} shards ·{' '}
+                {archiveStats.totalBytes != null
+                  ? `${(archiveStats.totalBytes / 1024).toFixed(1)} KB gz`
+                  : '0 KB gz'}
+                {archiveStats.retentionDays ? ` · ${archiveStats.retentionDays}d cap` : ''}
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setArchiveOpen((v) => !v)}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer shrink-0"
+          >
+            {archiveOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+            <span>{archiveOpen ? 'Hide' : 'Search'}</span>
+          </button>
+        </div>
+
+        {archiveOpen && (
+          <div className="p-3.5 space-y-2.5 bg-white">
+            <p className="text-[11px] text-slate-500">{t('logs.archiveDesc')}</p>
+            <form onSubmit={(e) => void handleSearchArchive(e)} className="flex flex-wrap items-center gap-2">
+              <div className="relative flex-1 min-w-[200px]">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={archiveQuery}
+                  onChange={(e) => setArchiveQuery(e.target.value)}
+                  placeholder={t('logs.archivePlaceholder')}
+                  className="w-full pl-8 pr-10 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-xs text-slate-900"
+                />
+                <button
+                  type="button"
+                  onClick={() => setArchiveUseRegex((v) => !v)}
+                  title="Toggle ReDoS-safe regex mode"
+                  className={`absolute right-1.5 top-1/2 -translate-y-1/2 px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold border cursor-pointer ${
+                    archiveUseRegex
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-slate-50 text-slate-500 border-slate-200 hover:text-slate-900'
+                  }`}
+                >
+                  .*
+                </button>
+              </div>
+              <select
+                aria-label="Archive level filter"
+                value={archiveLevel}
+                onChange={(e) => setArchiveLevel(e.target.value)}
+                className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-700"
+              >
+                <option value="ALL">All levels</option>
+                <option value="INFO">INFO</option>
+                <option value="WARN">WARN</option>
+                <option value="ERROR">ERROR</option>
+              </select>
+              <button
+                type="submit"
+                disabled={archiveBusy}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {archiveBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                <span>{archiveBusy ? t('logs.archiveSearching') : t('logs.archiveSearch')}</span>
+              </button>
+            </form>
+
+            {archiveError && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 font-mono text-[11px] flex items-center gap-2">
+                <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                <span>{archiveError}</span>
+              </div>
+            )}
+
+            {archiveResult ? (
+              <div className="border border-slate-200 rounded-lg overflow-hidden">
+                <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-200 font-mono text-[10px] text-slate-500 flex items-center justify-between tabular-nums">
+                  <span>{archiveResult.totalMatches ?? (Array.isArray(archiveResult.entries) ? archiveResult.entries.length : 0)} matches across {archiveResult.filesScanned ?? 0} .ndjson.gz shard(s)</span>
+                  <span>ReDoS-Safe Engine</span>
+                </div>
+                {Array.isArray(archiveResult.entries) && archiveResult.entries.length > 0 ? (
+                  <div className="divide-y divide-slate-100 max-h-44 overflow-y-auto font-mono text-[11px]">
+                    {archiveResult.entries.slice(0, 30).map((entry, idx) => (
+                      <div key={idx} className="px-3 py-1.5 flex flex-wrap items-start gap-2">
+                        <span className="text-slate-400 tabular-nums shrink-0">{formatLogTime(entry.ts)}</span>
+                        <span className={`px-1.5 py-0.2 rounded text-[10px] font-semibold border shrink-0 ${getLevelBadge(entry.level)}`}>
+                          {entry.level}
+                        </span>
+                        {entry.releaseId && (
+                          <span className="px-1.5 py-0.2 rounded bg-slate-100 border border-slate-200 text-slate-600 text-[10px] shrink-0">
+                            {entry.releaseId}
+                          </span>
+                        )}
+                        <span className="text-slate-800 break-words flex-1 min-w-0">{entry.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="p-3 text-center text-slate-400">0 archived matches found.</div>
+                )}
+              </div>
+            ) : (
+              <div className="text-[11px] text-slate-400">{t('logs.archiveEmpty')}</div>
+            )}
+          </div>
+        )}
+      </section>
 
       <div className="flex-1 rounded-xl bg-white border border-slate-200 flex flex-col overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 border-b border-slate-200">

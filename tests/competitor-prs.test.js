@@ -2296,6 +2296,118 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #9 CVEs (11a-11e): Dokploy CVE-2026-116068/127212 tenant ACL+CSV, Portainer CVE-2026-134756 webhook SSRF+dual-secret, Dokploy CVE-2026-24841 SQL/Redis guard, SigV4+CORS, coolify#1744 White-Label XSS');
 
+  // -------------------------------------------------------------------------
+  // 12. Cycle #10 Milestone Regressions (docs/COMPETITOR_RADAR_CYCLE9.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const zlib = require('zlib');
+    const { BackupDrillService, planCrossTargetRestore } = require('../server/services/backupDrillService');
+    const { RemoteBuilderService, buildPruneArgs } = require('../server/services/remoteBuilderService');
+    const { estimateVram, auditAiImageSecurity, buildAiWorkloadSpec } = require('../server/services/aiWorkloadService');
+    const { SloCanaryController } = require('../server/services/sloCanaryController');
+    const { LogArchiveService, assertSafeRegex } = require('../server/services/logArchiveService');
+
+    const c10Tmp = makeTempDir('culkibo-c10-cve-');
+    try {
+      // 12a. Empty/Corrupt Backup & Stripped-ACL Drill (dokploy#1382, coolify#6506/#12244, dokploy#6035)
+      const dr = new BackupDrillService({ dataDir: c10Tmp });
+      const zeroRes = await dr.runFireDrill({ databaseId: 'db_empty', engine: 'postgres', artifactBuffer: Buffer.alloc(0) });
+      assert.strictEqual(zeroRes.verdict, 'FAIL', '0 B backup must FAIL DR fire-drill');
+      const gz20Res = await dr.runFireDrill({ databaseId: 'db_gz20', engine: 'postgres', artifactBuffer: zlib.gzipSync(Buffer.alloc(0)) });
+      assert.strictEqual(gz20Res.verdict, 'FAIL', 'Empty 20-byte gzip backup must FAIL DR fire-drill (dokploy#1382)');
+      const noAclSql = '-- PostgreSQL database dump\n-- pg_dump --no-acl --no-owner\nCREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);\n';
+      const aclWarnRes = await dr.runFireDrill({ databaseId: 'db_noacl', engine: 'postgres', artifactBuffer: Buffer.from(noAclSql, 'utf8'), preserveAcl: true });
+      assert.ok(Array.isArray(aclWarnRes.warnings) && aclWarnRes.warnings.length >= 1, 'preserveAcl: true must flag stripped ACL/no-acl (coolify#12244)');
+      const sameOrgPlan = planCrossTargetRestore({ sourceDatabaseId: 'db_prod', targetDatabaseId: 'db_dev', sourceOrgId: 'org_1', targetOrgId: 'org_1', engine: 'postgres', preserveAcl: true });
+      assert.ok(sameOrgPlan && !JSON.stringify(sameOrgPlan).includes('--no-acl'), 'Same-org restore with preserveAcl: true must keep grants (dokploy#6035 / coolify#12244)');
+      assert.throws(
+        () => planCrossTargetRestore({ sourceDatabaseId: 'db_prod', targetDatabaseId: 'db_other', sourceOrgId: 'org_1', targetOrgId: 'org_2', engine: 'postgres' }),
+        (err) => err && (err.status === 403 || err.code === 'CROSS_ORG_RESTORE_FORBIDDEN')
+      );
+
+      // 12b. In-Flight SSH Mux Pin & Preview Builder Offload (coolify#11372, dokploy#3226/#3450)
+      const rb = new RemoteBuilderService({ dataDir: c10Tmp });
+      rb.registerBuilder({ id: 'b_prod', name: 'Prod Builder', host: '10.88.0.10', arch: 'linux/amd64', maxConcurrency: 1, allowPreviews: false });
+      rb.registerBuilder({ id: 'b_prev', name: 'Preview Builder', host: '10.88.0.11', arch: 'linux/amd64', maxConcurrency: 2, allowPreviews: true });
+      const slot1 = rb.acquireBuildSlot({ builderId: 'b_prod', projectId: 'p1', arch: 'linux/amd64', isPreview: false });
+      assert.strictEqual(slot1.leased, true);
+      assert.strictEqual(rb.canRecycleMux('b_prod').allowed, false, 'SSH mux recycle MUST be blocked while activeBuilds > 0 (coolify#11372)');
+      const prevSlot = rb.acquireBuildSlot({ projectId: 'p2', arch: 'linux/amd64', isPreview: true });
+      assert.strictEqual(prevSlot.leased, true);
+      assert.strictEqual(prevSlot.builderId, 'b_prev', 'PR preview must offload to allowPreviews: true builder independently of busy prod builder (dokploy#3226/#3450)');
+      rb.releaseBuildSlot(slot1.leaseId);
+      assert.strictEqual(rb.canRecycleMux('b_prod').allowed, true, 'SSH mux recycle allowed once activeBuilds === 0');
+      const pruneArgv = buildPruneArgs({ keepStorageGb: 20 });
+      assert.ok(Array.isArray(pruneArgv) && pruneArgv.includes('--keep-storage') && pruneArgv.includes('20GB'));
+
+      // 12c. AI/GPU Security & VRAM Guard (dokploy#1621, CVE-2025-63389, CVE-2026-7482, CVE-2026-137477, CVE-2026-22778)
+      const vramTooBig = estimateVram({ paramsB: 70, quantization: 'FP16', contextLen: 8192, availableVramGb: 24 });
+      assert.strictEqual(vramTooBig.fits, false);
+      const vulnOllama = auditAiImageSecurity({ runtime: 'ollama', imageTag: 'ollama/ollama:0.16.0', bindAddress: '0.0.0.0', authProxyEnabled: false });
+      assert.strictEqual(vulnOllama.safe, false);
+      assert.ok(JSON.stringify(vulnOllama).includes('CVE-2025-63389') && JSON.stringify(vulnOllama).includes('CVE-2026-7482'));
+      const vulnVllm = auditAiImageSecurity({ runtime: 'vllm', imageTag: 'vllm/vllm-openai:v0.19.0', bindAddress: '127.0.0.1', authProxyEnabled: true });
+      assert.strictEqual(vulnVllm.safe, false);
+      assert.ok(JSON.stringify(vulnVllm).includes('CVE-2026-22778'));
+      const cdiSpec = buildAiWorkloadSpec({ runtime: 'ollama', model: 'llama3.2:8b', paramsB: 8, quantization: 'Q4_K_M', availableVramGb: 16, gpuMode: 'cdi', bindAddress: '127.0.0.1', authProxyEnabled: true });
+      assert.strictEqual(cdiSpec.ok, true);
+      assert.ok(cdiSpec.dockerArgs.includes('nvidia.com/gpu=all'), 'CDI mode must pass --device nvidia.com/gpu=all (dokploy#1621)');
+
+      // 12d. SLO Burn-Rate Canary Auto-Rollback (10->25->50->100 & instant 100/0 rollback)
+      const sc = new SloCanaryController({ dataDir: c10Tmp });
+      /** @type {number[]} */
+      const appliedWeights = [];
+      const applyMock = async ({ canaryWeight }) => { appliedWeights.push(canaryWeight); };
+      const r1 = await sc.startRollout({
+        projectId: 'p_slo_1',
+        hostname: 'slo.example.test',
+        stableUpstream: '127.0.0.1:5000',
+        canaryUpstream: '127.0.0.1:5001',
+        steps: [10, 25, 50, 100],
+        applyWeightsImpl: applyMock
+      });
+      const r1Id = (r1.rollout || r1).id;
+      for (const expectedWeight of [25, 50, 100]) {
+        const ev = await sc.evaluateRollout(r1Id, { totalRequests: 1000, error5xxCount: 0, baselineP95Ms: 30, canaryP95Ms: 32, applyWeightsImpl: applyMock });
+        assert.strictEqual((ev.rollout || ev).canaryWeight, expectedWeight);
+      }
+      assert.strictEqual(sc.getRollout(r1Id).status, 'PROMOTED');
+
+      const r2 = await sc.startRollout({
+        projectId: 'p_slo_2',
+        hostname: 'slo2.example.test',
+        stableUpstream: '127.0.0.1:5002',
+        canaryUpstream: '127.0.0.1:5003',
+        steps: [10, 25, 50, 100],
+        sloTarget: 0.999,
+        maxBurnRate: 14.4
+      });
+      const r2Id = (r2.rollout || r2).id;
+      const rbEval = await sc.evaluateRollout(r2Id, { totalRequests: 1000, error5xxCount: 30, baselineP95Ms: 30, canaryP95Ms: 35 });
+      assert.strictEqual((rbEval.rollout || rbEval).status, 'ROLLED_BACK');
+      assert.strictEqual((rbEval.rollout || rbEval).canaryWeight, 0);
+
+      // 12e. Compressed Log Archive Survival, Pruning & ReDoS Guard (coolify#12170)
+      const la = new LogArchiveService({ dataDir: c10Tmp });
+      await la.appendLogs('p_log_1', [
+        { ts: '2026-11-26T10:00:00Z', level: 'info', releaseId: 'rel_1', stream: 'stdout', message: 'Pre-redeploy event alpha' }
+      ], { dateStr: '2026-11-26' });
+      await la.appendLogs('p_log_1', [
+        { ts: '2026-11-27T10:00:00Z', level: 'error', releaseId: 'rel_2', stream: 'stderr', message: 'Post-redeploy event beta' }
+      ], { dateStr: '2026-11-27' });
+      const searchAll = await la.searchArchives({ projectId: 'p_log_1', query: 'redeploy' });
+      assert.strictEqual(searchAll.totalMatches, 2, 'Compressed .ndjson.gz logs must survive across simulated redeploys (coolify#12170)');
+      assert.throws(
+        () => assertSafeRegex('(a+)+$'),
+        (err) => err && err.code === 'UNSAFE_REGEX',
+        'ReDoS regex MUST be rejected with UNSAFE_REGEX'
+      );
+    } finally {
+      fs.rmSync(c10Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #10 CVEs (12a-12e): dokploy#1382/#6035/coolify#12244 DR drill, coolify#11372/dokploy#3226/#3450 SSH mux pin, AI/GPU CVE-2025-63389/CVE-2026-7482/CVE-2026-22778+CDI, SLO Canary burn-rate rollback, coolify#12170 log archive+ReDoS');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

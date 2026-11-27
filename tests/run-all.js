@@ -48,6 +48,9 @@ const testUptimeMaintenanceCaa = require('./uptime-maintenance-caa.test');
 const testWebhooksAndS3 = require('./webhooks-and-s3.test');
 const testDbStudioAndQuotas = require('./dbstudio-and-quotas.test');
 const testBrandTheme = require('./brand-theme.test');
+const testCanaryAndLogArchive = require('./canary-and-logarchive.test');
+const testDrAiBuilder = require('./dr-ai-builder.test');
+const testCycle10HttpE2E = require('./cycle10-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -121,6 +124,9 @@ async function runAll() {
     { name: 'Standard-Webhooks Outbound Event Bus + DLQ & Post-MinIO S3 Orchestrator / AWS SigV4 Presigner', fn: testWebhooksAndS3 },
     { name: 'Zero-Dep Read-Only Live DB Studio, Safe Redis Inspector & Agency Multi-Tenant Quotas / CSV Billing Ledger', fn: testDbStudioAndQuotas },
     { name: 'Open-Core White-Label Brand & Custom Login Theme Engine (coolify#1744 Anti-XSS)', fn: testBrandTheme },
+    { name: 'SLO Error-Budget Canary Auto-Rollback (Caddy v2.11) & Compressed .ndjson.gz Log Archive', fn: testCanaryAndLogArchive },
+    { name: 'DR Backup Fire-Drill Verifier, Self-Hosted AI/GPU LLM Orchestrator & Remote Build-Node Offloader', fn: testDrAiBuilder },
+    { name: 'Cycle #10 Milestone Live Isolated HTTP E2E (All 5 API Families + Cross-Tenant ACL + ReDoS Guard)', fn: testCycle10HttpE2E },
   ];
 
   for (const suite of suites) {

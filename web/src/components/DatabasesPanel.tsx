@@ -33,6 +33,8 @@ import {
   ChevronDown,
   ChevronUp,
   Loader2,
+  CheckCircle2,
+  Flame,
 } from 'lucide-react';
 import {
   api,
@@ -47,6 +49,7 @@ import {
   type DbStudioBloatResult,
   type S3StoragePreset,
   type S3PresignResult,
+  type DrDrillScorecard,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
@@ -158,6 +161,11 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [presignError, setPresignError] = useState<string | null>(null);
   const [presignBusy, setPresignBusy] = useState(false);
 
+  // Cycle-10 Automated DR Backup Fire-Drill Verifier
+  const [drDrills, setDrDrills] = useState<DrDrillScorecard[]>([]);
+  const [drBusy, setDrBusy] = useState<'valid' | 'corrupt' | null>(null);
+  const [drError, setDrError] = useState<string | null>(null);
+
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
     databasesRef.current = databases;
@@ -165,12 +173,13 @@ export const DatabasesPanel: React.FC<Props> = ({
 
   const load = useCallback(async () => {
     try {
-      const [dbs, eng, status, store, presetsRes] = await Promise.all([
+      const [dbs, eng, status, store, presetsRes, drillsRes] = await Promise.all([
         api.getDatabases(projectId),
         api.getDbEngines().catch(() => ({ engines: [] })),
         api.getDbDockerStatus().catch(() => ({ available: true, reason: null })),
         api.getDbStorage().catch((): DbStorageConfig => ({ configured: false })),
         api.getStoragePresets().catch(() => ({ presets: [] })),
+        api.listDrDrills().catch(() => ({ drills: [] })),
       ]);
       const dbList = Array.isArray(dbs?.databases) ? dbs.databases : [];
       setDatabases(dbList);
@@ -179,11 +188,12 @@ export const DatabasesPanel: React.FC<Props> = ({
       setDockerReason(status?.reason ?? null);
       setStorage(store || { configured: false });
       setS3Presets(Array.isArray(presetsRes?.presets) ? presetsRes.presets : []);
+      setDrDrills(Array.isArray(drillsRes?.drills) ? drillsRes.drills : []);
       if (dbList.length > 0) {
         setStudioDbId((prev) => prev || dbList[0].id);
       }
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos', 'error');
+      onNotify(err instanceof Error ? err.message : 'Error loading databases', 'error');
     }
   }, [projectId, onNotify]);
 
@@ -195,8 +205,9 @@ export const DatabasesPanel: React.FC<Props> = ({
       api.getDbDockerStatus().catch(() => ({ available: true, reason: null })),
       api.getDbStorage().catch((): DbStorageConfig => ({ configured: false })),
       api.getStoragePresets().catch(() => ({ presets: [] })),
+      api.listDrDrills().catch(() => ({ drills: [] })),
     ])
-      .then(([dbs, eng, status, store, presetsRes]) => {
+      .then(([dbs, eng, status, store, presetsRes, drillsRes]) => {
         if (!active) return;
         const dbList = Array.isArray(dbs?.databases) ? dbs.databases : [];
         setDatabases(dbList);
@@ -205,16 +216,51 @@ export const DatabasesPanel: React.FC<Props> = ({
         setDockerReason(status?.reason ?? null);
         setStorage(store || { configured: false });
         setS3Presets(Array.isArray(presetsRes?.presets) ? presetsRes.presets : []);
+        setDrDrills(Array.isArray(drillsRes?.drills) ? drillsRes.drills : []);
         if (dbList.length > 0) {
           setStudioDbId((prev) => prev || dbList[0].id);
         }
       })
       .catch((err) => {
         if (!active) return;
-        onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos', 'error');
+        onNotify(err instanceof Error ? err.message : 'Error loading databases', 'error');
       });
     return () => { active = false; };
   }, [projectId, onNotify]);
+
+  const handleRunDrDrill = async (mode: 'valid' | 'corrupt') => {
+    const targetDb = studioDbId || databases[0]?.id || 'db_pg_main';
+    setDrBusy(mode);
+    setDrError(null);
+    try {
+      const payload = mode === 'corrupt'
+        ? {
+            engine: 'postgres',
+            projectId,
+            artifactBase64: 'H4sIAAAAAAAAAAMAAAAAAAAAAAA=',
+            preserveAcl: true,
+          }
+        : {
+            engine: 'postgres',
+            projectId,
+            sqlSample: '-- PostgreSQL database dump\nCREATE TABLE IF NOT EXISTS deployments (id text PRIMARY KEY, status text NOT NULL, created_at timestamptz DEFAULT now());\nINSERT INTO deployments (id, status) VALUES (\'dep_01\', \'active\');\nGRANT SELECT, INSERT ON TABLE deployments TO acme;\n',
+            preserveAcl: true,
+          };
+      const drill = await api.runDatabaseDrDrill(targetDb, payload);
+      setDrDrills((prev) => [drill, ...prev.filter((d) => d.id !== drill.id)].slice(0, 12));
+      if (drill.verdict === 'PASS') {
+        onNotify(`DR Fire-Drill PASS (${drill.rtoMs ?? 0} ms RTO, SHA-256 + ACL verified)`, 'success');
+      } else {
+        onNotify(`DR Fire-Drill BLOCKED (${drill.errors?.[0] || 'Corrupt or empty dump detected'})`, 'error');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'DR fire-drill verification failed';
+      setDrError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setDrBusy(null);
+    }
+  };
 
   const handleRunStudioSql = async (queryOverride?: string) => {
     const q = (queryOverride ?? sqlInput).trim();
@@ -468,9 +514,9 @@ export const DatabasesPanel: React.FC<Props> = ({
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
           <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
           <div className="text-xs">
-            <p className="font-semibold text-amber-900">Docker no está disponible</p>
+            <p className="font-semibold text-amber-900">{t('db.dockerOffTitle')}</p>
             <p className="text-amber-800 mt-0.5">
-              {dockerReason || 'Las bases de datos gestionadas necesitan Docker en marcha.'}
+              {dockerReason || t('db.dockerOffDesc')}
             </p>
           </div>
         </div>
@@ -479,11 +525,11 @@ export const DatabasesPanel: React.FC<Props> = ({
       {/* Aprovisionar */}
       <div className="bg-white p-5 rounded-xl border border-slate-200">
         <h3 className="font-semibold text-slate-900 flex items-center gap-2 text-base">
-          <Database className="w-4 h-4 text-slate-600" /> Aprovisionar base de datos
+          <Database className="w-4 h-4 text-slate-600" /> {t('db.provisionTitle')}
         </h3>
         <p className="text-xs text-slate-500 mt-1 mb-4">
-          Contraseña aleatoria cifrada, volumen persistente, red privada del proyecto, límites de recursos y sonda de salud.{' '}
-          <strong className="text-slate-700 font-medium">Sin puertos expuestos por defecto.</strong>
+          {t('db.provisionDesc')}{' '}
+          <strong className="text-slate-700 font-medium">{t('db.provisionNoPorts')}</strong>
         </p>
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
           {engines.map((e) => (
@@ -510,12 +556,20 @@ export const DatabasesPanel: React.FC<Props> = ({
       {/* Listado */}
       {databases.length === 0 && (
         <div className="bg-white p-8 rounded-xl border border-slate-200 text-center text-slate-500 text-xs">
-          Este proyecto todavía no tiene bases de datos gestionadas.
+          {t('db.emptyList')}
         </div>
       )}
 
       {databases.map((db) => {
         const health = HEALTH_STYLE[db.health] || HEALTH_STYLE.unknown;
+        const healthLabel =
+          db.health === 'healthy'
+            ? t('db.healthHealthy')
+            : db.health === 'starting'
+              ? t('db.healthStarting')
+              : db.health === 'unhealthy'
+                ? t('db.healthUnhealthy')
+                : t('db.healthUnknown');
         const open = expanded === db.id;
         const isLinked = linkedIds.includes(db.id);
         return (
@@ -531,13 +585,13 @@ export const DatabasesPanel: React.FC<Props> = ({
                     <span className="text-[11px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded">{db.engineLabel}</span>
                     {isLinked && (
                       <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                        <Link2 className="w-3 h-3" /> Conectada al proyecto
+                        <Link2 className="w-3 h-3" /> {t('db.connectedProject')}
                       </span>
                     )}
                   </div>
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 mt-1 tabular-nums">
                     <span className="flex items-center gap-1.5">
-                      <span className={`w-1.5 h-1.5 rounded-full ${health.dot}`} /> {health.label}
+                      <span className={`w-1.5 h-1.5 rounded-full ${health.dot}`} /> {healthLabel}
                     </span>
                     <span className="font-mono truncate max-w-[200px]">{db.containerName}</span>
                     <span>{db.memoryMb} MB · {db.cpus} vCPU</span>
@@ -554,18 +608,18 @@ export const DatabasesPanel: React.FC<Props> = ({
                     className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-amber-300 bg-amber-50 hover:bg-amber-100 text-amber-900 cursor-pointer disabled:opacity-50"
                   >
                     <Wrench className="w-3.5 h-3.5" />
-                    <span>{isBusy(`rec-${db.id}`) ? 'Recreando…' : 'Recrear contenedor'}</span>
+                    <span>{isBusy(`rec-${db.id}`) ? t('db.recreating') : t('db.recreate')}</span>
                   </button>
                 )}
                 <button
                   type="button"
                   onClick={() => void handleInspectDb(db)}
                   disabled={isBusy(`ins-${db.id}`)}
-                  title="Probar conexión, versión y tamaño real de la base de datos"
+                  title={t('db.inspect')}
                   className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer disabled:opacity-50"
                 >
                   <Stethoscope className="w-3.5 h-3.5 text-slate-500" />
-                  <span>{isBusy(`ins-${db.id}`) ? 'Probando…' : 'Inspeccionar'}</span>
+                  <span>{isBusy(`ins-${db.id}`) ? t('db.inspecting') : t('db.inspect')}</span>
                 </button>
                 <button
                   type="button"
@@ -578,7 +632,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                   }`}
                 >
                   {isLinked ? <Unlink className="w-3.5 h-3.5" /> : <Link2 className="w-3.5 h-3.5" />}
-                  <span>{isLinked ? 'Desvincular' : 'Enlazar al proyecto'}</span>
+                  <span>{isLinked ? t('db.unlink') : t('db.linkProject')}</span>
                 </button>
                 {db.exposure?.enabled ? (
                   <span className={`text-xs px-2 py-1 rounded-md font-mono flex items-center gap-1 tabular-nums ${
@@ -590,7 +644,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                   </span>
                 ) : (
                   <span className="text-xs px-2 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
-                    <Lock className="w-3 h-3" /> Solo red privada
+                    <Lock className="w-3 h-3" /> {t('db.privateOnly')}
                   </span>
                 )}
                 <button
@@ -600,9 +654,9 @@ export const DatabasesPanel: React.FC<Props> = ({
                     await load();
                   })}
                   disabled={isBusy(`ctl-${db.id}`)}
-                  aria-label={db.status === 'running' ? 'Detener base de datos' : 'Iniciar base de datos'}
+                  aria-label={db.status === 'running' ? 'Stop database' : 'Start database'}
                   className="p-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 disabled:opacity-50 cursor-pointer"
-                  title={db.status === 'running' ? 'Detener' : 'Iniciar'}
+                  title={db.status === 'running' ? 'Stop' : 'Start'}
                 >
                   {db.status === 'running' ? <Square className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
                 </button>
@@ -611,7 +665,7 @@ export const DatabasesPanel: React.FC<Props> = ({
                   onClick={() => { setExpanded(open ? null : db.id); if (!open) void loadBackups(db); }}
                   className="text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 px-3 py-1.5 rounded-lg cursor-pointer"
                 >
-                  {open ? 'Cerrar' : 'Gestionar'}
+                  {open ? t('db.close') : t('db.manage')}
                 </button>
               </div>
             </div>
@@ -1437,6 +1491,112 @@ export const DatabasesPanel: React.FC<Props> = ({
         )}
       </section>
 
+      {/* Cycle-10: Automated DR Backup Restore Fire-Drill Verifier */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <Flame className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.drTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  SHA-256 · gunzip · ACL Preserved
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.drDesc')}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap shrink-0">
+            <button
+              type="button"
+              disabled={drBusy !== null}
+              onClick={() => void handleRunDrDrill('corrupt')}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+            >
+              {drBusy === 'corrupt' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+              <span>{t('db.drTestCorrupt')}</span>
+            </button>
+            <button
+              type="button"
+              disabled={drBusy !== null}
+              onClick={() => void handleRunDrDrill('valid')}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+            >
+              {drBusy === 'valid' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+              <span>{drBusy === 'valid' ? t('db.drRunning') : t('db.drRun')}</span>
+            </button>
+          </div>
+        </div>
+
+        {drError && (
+          <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 shrink-0" />
+            <span>{drError}</span>
+          </div>
+        )}
+
+        {drDrills.length === 0 ? (
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-500 text-center">
+            {t('db.drEmpty')}
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+            {drDrills.slice(0, 5).map((d) => {
+              const isPass = d.verdict === 'PASS';
+              const errs = Array.isArray(d.errors) ? d.errors : [];
+              const warns = Array.isArray(d.warnings) ? d.warnings : [];
+              return (
+                <div key={d.id} className="px-4 py-3 bg-white space-y-1.5">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                        isPass
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-red-50 text-red-700 border-red-200'
+                      }`}>
+                        {isPass ? <CheckCircle2 className="w-3 h-3" /> : <ShieldAlert className="w-3 h-3" />}
+                        {d.verdict}
+                      </span>
+                      <span className="font-mono font-semibold text-slate-900">{d.databaseId}</span>
+                      <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600 tabular-nums">
+                        RTO {d.rtoMs ?? 0} ms · RPO {d.rpoSec != null ? `${Math.round(d.rpoSec / 60)}m` : '0m'}
+                      </span>
+                      {d.bytesVerified != null && (
+                        <span className="font-mono text-[10px] text-slate-500 tabular-nums">
+                          {formatBytes(d.bytesVerified)}
+                        </span>
+                      )}
+                      {(d.aclPreserved ?? d.preserveAcl) !== false && isPass && (
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 font-mono text-[10px] text-emerald-700">
+                          ACL OK
+                        </span>
+                      )}
+                    </div>
+                    {d.sha256 && (
+                      <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                        sha256:{String(d.sha256).slice(0, 12)}
+                      </span>
+                    )}
+                  </div>
+                  {errs.length > 0 && (
+                    <div className="p-2 rounded-lg bg-red-50 border border-red-200 font-mono text-[11px] text-red-800">
+                      {errs.join(' · ')}
+                    </div>
+                  )}
+                  {warns.length > 0 && (
+                    <div className="p-2 rounded-lg bg-amber-50 border border-amber-200 font-mono text-[11px] text-amber-800">
+                      {warns.join(' · ')}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       {/* Franja compacta de Almacenamiento S3 / R2 global (configuración unificada en Ajustes → Backups y DR) */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
         <div className="flex items-center gap-3 min-w-0">
@@ -1446,13 +1606,13 @@ export const DatabasesPanel: React.FC<Props> = ({
           <div className="min-w-0">
             <div className="font-semibold text-slate-900">
               {storage.configured
-                ? `Copias externas activas en S3 / R2 (${storage.bucket})`
-                : 'Copias externas S3 / R2 sin configurar'}
+                ? t('db.s3GlobalActive', { bucket: storage.bucket || 's3' })
+                : t('db.s3GlobalUnconfigured')}
             </div>
             <p className="text-slate-500 truncate mt-0.5">
               {storage.configured
-                ? `${storage.endpoint} · Región ${storage.region || 'auto'}`
-                : 'Ahora las copias se guardan en disco local. Configura un bucket S3/R2 global y snapshots completos en Ajustes.'}
+                ? t('db.s3GlobalActiveDesc', { endpoint: storage.endpoint || '', region: storage.region || 'auto' })
+                : t('db.s3GlobalUnconfiguredDesc')}
             </p>
           </div>
         </div>
@@ -1462,12 +1622,12 @@ export const DatabasesPanel: React.FC<Props> = ({
               type="button"
               onClick={() => void guard('s3test', async () => {
                 const r = await api.testDbStorage();
-                onNotify(`Conexión correcta con ${r.bucket}`, 'success');
+                onNotify(`S3 connection verified (${r.bucket})`, 'success');
               })}
               disabled={isBusy('s3test')}
               className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
             >
-              Probar S3
+              {t('db.s3TestBtn')}
             </button>
           )}
           {onOpenBackupSettings && (
@@ -1476,7 +1636,7 @@ export const DatabasesPanel: React.FC<Props> = ({
               onClick={onOpenBackupSettings}
               className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer"
             >
-              {storage.configured ? 'Gestionar en Backups y DR' : 'Configurar S3 / Backups'}
+              {storage.configured ? t('db.s3ManageBtn') : t('db.s3ConfigureBtn')}
             </button>
           )}
         </div>

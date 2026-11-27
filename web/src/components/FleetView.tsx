@@ -25,6 +25,11 @@ import {
   Network,
   RotateCw,
   X,
+  Hammer,
+  Sparkles,
+  Lock,
+  CheckCircle2,
+  Play,
 } from 'lucide-react';
 import {
   api,
@@ -34,6 +39,11 @@ import {
   type FleetMeshStatusResult,
   type FleetMeshPlanResult,
   type FleetMeshRotateResult,
+  type RemoteBuilderNode,
+  type RemoteBuildScheduleResult,
+  type AiRuntimePreset,
+  type AiVramEstimateResult,
+  type AiWorkloadPlanResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -143,6 +153,24 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
   const [meshBusy, setMeshBusy] = useState<'plan' | 'rotate' | null>(null);
   const [meshError, setMeshError] = useState<string | null>(null);
 
+  // Cycle-10 Remote Build-Node Offloader state
+  const [builders, setBuilders] = useState<RemoteBuilderNode[]>([]);
+  const [builderSchedule, setBuilderSchedule] = useState<RemoteBuildScheduleResult | null>(null);
+  const [builderBusy, setBuilderBusy] = useState(false);
+  const [builderError, setBuilderError] = useState<string | null>(null);
+
+  // Cycle-10 Self-Hosted AI / GPU & Local LLM Workload Planner state
+  const [aiPresets, setAiPresets] = useState<AiRuntimePreset[]>([]);
+  const [aiRuntime, setAiRuntime] = useState<'ollama' | 'vllm' | 'llamacpp'>('ollama');
+  const [aiParamsB, setAiParamsB] = useState<number>(14);
+  const [aiQuant, setAiQuant] = useState<'Q4_K_M' | 'Q8_0' | 'FP16'>('Q4_K_M');
+  const [aiVramGb, setAiVramGb] = useState<number>(24);
+  const [aiGpuMode, setAiGpuMode] = useState<'cdi' | 'legacy' | 'cpu'>('cdi');
+  const [aiVramEst, setAiVramEst] = useState<AiVramEstimateResult | null>(null);
+  const [aiPlan, setAiPlan] = useState<AiWorkloadPlanResult | null>(null);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+
   const [probingId, setProbingId] = useState<string | null>(null);
   const [probingAll, setProbingAll] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -184,17 +212,21 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
 
   const loadFleet = useCallback(async () => {
     try {
-      const [srvRes, keyRes, meshRes] = await Promise.all([
+      const [srvRes, keyRes, meshRes, bldRes, aiRes] = await Promise.all([
         api.getServers(),
         api.getFleetKeys().catch(() => ({ keys: [] })),
         api.getFleetMesh().catch(() => null),
+        api.listRemoteBuilders().catch(() => ({ builders: [] })),
+        api.getAiPresets().catch(() => ({ presets: [] })),
       ]);
-      setServers(srvRes.servers || []);
-      setKeys(keyRes.keys || []);
+      setServers(Array.isArray(srvRes?.servers) ? srvRes.servers : []);
+      setKeys(Array.isArray(keyRes?.keys) ? keyRes.keys : []);
       if (meshRes) setMesh(meshRes);
+      setBuilders(Array.isArray(bldRes?.builders) ? bldRes.builders : []);
+      setAiPresets(Array.isArray(aiRes?.presets) ? aiRes.presets : []);
       setLoadError(null);
     } catch (err) {
-      setLoadError(err instanceof Error ? err.message : 'No se pudo cargar la flota de servidores');
+      setLoadError(err instanceof Error ? err.message : 'Could not load server fleet');
     } finally {
       setLoading(false);
     }
@@ -206,23 +238,99 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
       api.getServers(),
       api.getFleetKeys().catch(() => ({ keys: [] })),
       api.getFleetMesh().catch(() => null),
+      api.listRemoteBuilders().catch(() => ({ builders: [] })),
+      api.getAiPresets().catch(() => ({ presets: [] })),
     ])
-      .then(([srvRes, keyRes, meshRes]) => {
+      .then(([srvRes, keyRes, meshRes, bldRes, aiRes]) => {
         if (!active) return;
-        setServers(srvRes.servers || []);
-        setKeys(keyRes.keys || []);
+        setServers(Array.isArray(srvRes?.servers) ? srvRes.servers : []);
+        setKeys(Array.isArray(keyRes?.keys) ? keyRes.keys : []);
         if (meshRes) setMesh(meshRes);
+        setBuilders(Array.isArray(bldRes?.builders) ? bldRes.builders : []);
+        setAiPresets(Array.isArray(aiRes?.presets) ? aiRes.presets : []);
         setLoadError(null);
       })
       .catch((err) => {
         if (!active) return;
-        setLoadError(err instanceof Error ? err.message : 'No se pudo cargar la flota de servidores');
+        setLoadError(err instanceof Error ? err.message : 'Could not load server fleet');
       })
       .finally(() => {
         if (active) setLoading(false);
       });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    api.estimateAiVram({
+      paramsB: aiParamsB,
+      quantization: aiQuant,
+      contextLen: 8192,
+      batchSize: 1,
+      availableVramGb: aiVramGb,
+    })
+      .then((res) => {
+        if (active && res) setAiVramEst(res);
+      })
+      .catch(() => {
+        // optional
+      });
+    return () => { active = false; };
+  }, [aiParamsB, aiQuant, aiVramGb]);
+
+  const handleTestPreviewOffload = async () => {
+    setBuilderBusy(true);
+    setBuilderError(null);
+    try {
+      if (builders.length === 0) {
+        await api.registerRemoteBuilder({
+          name: 'builder-eu-01',
+          host: '10.88.0.10',
+          arch: 'linux/amd64',
+          maxConcurrency: 4,
+          allowPreviews: true,
+          keepStorageGb: 20,
+        }).catch(() => null);
+      }
+      const res = await api.scheduleRemoteBuild({
+        arch: 'linux/amd64',
+        isPreview: true,
+      });
+      setBuilderSchedule(res);
+      const refreshed = await api.listRemoteBuilders().catch(() => null);
+      if (refreshed && Array.isArray(refreshed.builders)) setBuilders(refreshed.builders);
+      onNotify(`PR Preview offloaded to ${res.builderName || res.builderId} (SSH mux pinned)`, 'success');
+    } catch (err: unknown) {
+      setBuilderError(err instanceof Error ? err.message : 'Could not schedule remote build offload');
+    } finally {
+      setBuilderBusy(false);
+    }
+  };
+
+  const handlePlanAiWorkload = async () => {
+    setAiBusy(true);
+    setAiError(null);
+    try {
+      const res = await api.planAiWorkload({
+        runtime: aiRuntime,
+        model: `${aiRuntime === 'vllm' ? 'Qwen/Qwen2.5' : 'qwen2.5'}:${aiParamsB}b-${aiQuant.toLowerCase()}`,
+        paramsB: aiParamsB,
+        quantization: aiQuant,
+        contextLen: 8192,
+        availableVramGb: aiVramGb,
+        gpuMode: aiGpuMode,
+        bindAddress: '127.0.0.1',
+        authProxyEnabled: true,
+      });
+      setAiPlan(res);
+      onNotify(`Secure ${aiRuntime} plan generated (127.0.0.1 + Bearer proxy + CVE-safe tag)`, 'success');
+    } catch (err: unknown) {
+      setAiPlan(null);
+      setAiError(err instanceof Error ? err.message : 'AI/GPU guardrail rejected workload plan');
+    } finally {
+      setAiBusy(false);
+    }
+  };
 
   const copy = async (text: string, id: string, label = 'Copiado al portapapeles') => {
     const ok = await copyToClipboard(text);
@@ -1124,6 +1232,284 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                     <ul className="list-disc list-inside text-[11px] text-slate-600 space-y-0.5">
                       {steps.map((step, idx) => <li key={idx}>{step}</li>)}
                     </ul>
+                  )}
+                </div>
+              );
+            })()}
+          </section>
+
+          {/* Cycle-10: Distributed Remote Build-Node Offloader */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                  <Hammer className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('fleet.buildersTitle')}</h2>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      <ShieldCheck className="w-3 h-3" />
+                      {t('fleet.buildersMuxPinned')}
+                    </span>
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600">
+                      {t('fleet.buildersPreviewPill')}
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('fleet.buildersDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={builderBusy}
+                onClick={() => void handleTestPreviewOffload()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {builderBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                <span>{builderBusy ? t('fleet.buildersTesting') : t('fleet.buildersTestPreview')}</span>
+              </button>
+            </div>
+
+            {builderError && (
+              <div className="mx-5 mt-3 p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{builderError}</div>
+            )}
+
+            <div className="divide-y divide-slate-100">
+              {(builders.length > 0
+                ? builders
+                : [
+                    { id: 'bld_local_default', name: 'local-buildkit-node', host: '127.0.0.1', arch: 'linux/amd64', maxConcurrency: 2, activeBuilds: 0, allowPreviews: true, keepStorageGb: 20, sshMuxPinned: false },
+                  ]
+              ).map((b) => {
+                const maxC = Math.max(1, b.maxConcurrency || 2);
+                const act = Math.max(0, b.activeBuilds || 0);
+                const pct = Math.min(100, Math.round((act / maxC) * 100));
+                return (
+                  <div key={b.id} className="px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-slate-900">{b.name}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
+                          {b.arch}
+                        </span>
+                        {b.allowPreviews !== false && (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 font-mono text-[10px] text-emerald-700">
+                            {t('fleet.buildersPreviewPill')}
+                          </span>
+                        )}
+                        {(b.sshMuxPinned || act > 0) && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 font-mono text-[10px] text-amber-800">
+                            Mux Pinned ({act} active)
+                          </span>
+                        )}
+                      </div>
+                      <div className="font-mono text-[11px] text-slate-500">
+                        {b.host} · cache keep {b.keepStorageGb ?? 20} GB
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2.5 shrink-0 min-w-[150px] tabular-nums">
+                      <div className="flex-1 h-1.5 rounded-full bg-slate-200 overflow-hidden">
+                        <div className={`h-full rounded-full ${pct >= 90 ? 'bg-amber-500' : 'bg-emerald-500'}`} style={{ width: `${Math.max(8, pct)}%` }} />
+                      </div>
+                      <span className="font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                        {act} / {maxC} slots
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {builderSchedule && (() => {
+              const target = builderSchedule.directPushTarget;
+              const targetLabel = typeof target === 'string'
+                ? target
+                : target && typeof target === 'object'
+                  ? `${target.host || '127.0.0.1'}:${target.port ?? 22}${target.protocol ? ` (${target.protocol})` : ''}`
+                  : '127.0.0.1:5055';
+              return (
+                <div className="px-5 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 font-mono text-[11px]">
+                  <span className="text-emerald-700 inline-flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    Leased {builderSchedule.leaseId || 'slot'} on {builderSchedule.builderName || builderSchedule.builderId} · DirectPush: {targetLabel}
+                  </span>
+                  <span className="text-slate-500">
+                    canRecycleMux: {String(builderSchedule.canRecycleMux?.allowed ?? false)} ({builderSchedule.canRecycleMux?.reason || 'ACTIVE_BUILDS_IN_FLIGHT'})
+                  </span>
+                </div>
+              );
+            })()}
+          </section>
+
+          {/* Cycle-10: Self-Hosted AI / GPU & Local LLM Workload Planner */}
+          <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                  <Sparkles className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('fleet.aiTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                      NVIDIA CDI
+                    </span>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      <Lock className="w-3 h-3" />
+                      127.0.0.1 + Bearer Proxy
+                    </span>
+                    <span className="px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 font-mono text-[10px] text-emerald-700">
+                      CVE-Safe Tags
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('fleet.aiDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={aiBusy}
+                onClick={() => void handlePlanAiWorkload()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {aiBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Cpu className="w-3.5 h-3.5" />}
+                <span>{aiBusy ? t('fleet.aiGenerating') : t('fleet.aiGeneratePlan')}</span>
+              </button>
+            </div>
+
+            {/* Interactive Runtime / Params / Quantization / VRAM / GPU Mode Selectors */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+              <label className="block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">Runtime</span>
+                <select
+                  value={aiRuntime}
+                  onChange={(e) => setAiRuntime(e.target.value as 'ollama' | 'vllm' | 'llamacpp')}
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                >
+                  <option value="ollama">Ollama (0.17.4)</option>
+                  <option value="vllm">vLLM (v0.21.2)</option>
+                  <option value="llamacpp">llama.cpp CUDA</option>
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">Model Size</span>
+                <select
+                  value={aiParamsB}
+                  onChange={(e) => setAiParamsB(Number(e.target.value))}
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                >
+                  {[7, 14, 32, 70].map((b) => (
+                    <option key={b} value={b}>{b}B params</option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">Quantization</span>
+                <select
+                  value={aiQuant}
+                  onChange={(e) => setAiQuant(e.target.value as 'Q4_K_M' | 'Q8_0' | 'FP16')}
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                >
+                  <option value="Q4_K_M">Q4_K_M</option>
+                  <option value="Q8_0">Q8_0</option>
+                  <option value="FP16">FP16</option>
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">GPU VRAM</span>
+                <select
+                  value={aiVramGb}
+                  onChange={(e) => setAiVramGb(Number(e.target.value))}
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                >
+                  {[8, 16, 24, 48, 80].map((gb) => (
+                    <option key={gb} value={gb}>{gb} GB VRAM</option>
+                  ))}
+                </select>
+              </label>
+              <label className="block col-span-2 sm:col-span-1">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">GPU Passthrough</span>
+                <select
+                  value={aiGpuMode}
+                  onChange={(e) => setAiGpuMode(e.target.value as 'cdi' | 'legacy' | 'cpu')}
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                >
+                  <option value="cdi">NVIDIA CDI</option>
+                  <option value="legacy">Legacy --gpus all</option>
+                  <option value="cpu">CPU Only</option>
+                </select>
+              </label>
+            </div>
+
+            {/* Live VRAM Pre-Flight Bar (weights + KV-cache + overhead) */}
+            {aiVramEst && (() => {
+              const reqGb = Number(aiVramEst.totalRequiredGb) || 0;
+              const availGb = Math.max(1, Number(aiVramEst.availableVramGb ?? aiVramGb) || 24);
+              const fits = aiVramEst.fits ?? (reqGb <= availGb);
+              const barPct = Math.min(100, Math.round((reqGb / availGb) * 100));
+              const activePreset = aiPresets.find((p) => p.id === aiRuntime);
+              return (
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2 tabular-nums">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                        fits
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-red-50 text-red-700 border-red-200'
+                      }`}>
+                        {fits ? 'VRAM FITS' : 'VRAM OVERFLOW (BLOCKED)'}
+                      </span>
+                      <span className="font-mono font-semibold text-slate-900">
+                        {reqGb.toFixed(1)} GB / {availGb} GB
+                      </span>
+                      <span className="font-mono text-[11px] text-slate-500">
+                        weights {Number(aiVramEst.weightsGb).toFixed(1)} GB + KV-cache {Number(aiVramEst.kvCacheGb).toFixed(1)} GB + overhead {Number(aiVramEst.overheadGb).toFixed(1)} GB
+                      </span>
+                    </div>
+                    {activePreset?.image && (
+                      <span className="font-mono text-[10px] text-slate-500">{activePreset.image}</span>
+                    )}
+                  </div>
+                  <div className="h-2 rounded-full bg-slate-200 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all ${fits ? (barPct > 85 ? 'bg-amber-500' : 'bg-emerald-500') : 'bg-red-600'}`}
+                      style={{ width: `${Math.max(5, barPct)}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })()}
+
+            {aiError && (
+              <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 font-mono text-[11px] flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4 shrink-0" />
+                <span>{aiError}</span>
+              </div>
+            )}
+
+            {aiPlan && (() => {
+              const vol = aiPlan.volumeMount;
+              const volumeLabel = typeof vol === 'string'
+                ? vol
+                : vol && typeof vol === 'object'
+                  ? `${vol.volumeName || 'culkibo_ai_cache'}:${vol.containerPath || '/models'}`
+                  : 'persistent';
+              const guard = aiPlan.caddyProxyGuard;
+              const guardLabel = typeof guard === 'string'
+                ? guard
+                : guard && typeof guard === 'object'
+                  ? `Caddy Bearer Auth Proxy -> ${guard.upstream || '127.0.0.1'} (${guard.rateLimitPerMinute ?? 60} req/m)`
+                  : null;
+              return (
+                <div className="p-3.5 rounded-xl bg-slate-950 text-emerald-300 border border-slate-800 font-mono text-[11px] space-y-1.5 overflow-x-auto">
+                  <div className="flex items-center justify-between gap-2 flex-wrap text-slate-400">
+                    <span>Image: {aiPlan.image || aiPlan.imageTag || aiRuntime} · Cache: {volumeLabel}</span>
+                    <span className="text-emerald-400">security.safe = {String(aiPlan.security?.safe ?? true)}</span>
+                  </div>
+                  {Array.isArray(aiPlan.dockerArgs) && aiPlan.dockerArgs.length > 0 && (
+                    <div className="break-all">docker {aiPlan.dockerArgs.join(' ')}</div>
+                  )}
+                  {guardLabel && (
+                    <div className="text-slate-300">{guardLabel}</div>
                   )}
                 </div>
               );

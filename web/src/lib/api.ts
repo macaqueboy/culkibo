@@ -4818,6 +4818,226 @@ export const api = {
       'Could not load tenant quotas'
     );
   },
+
+  // --- Cycle-10 Milestone APIs (DR Fire-Drills, SLO Canary Auto-Rollback, Compressed Log Archive, Remote Builders, Self-Hosted AI/GPU Planner) ---
+
+  async listDrDrills(databaseId?: string): Promise<{ drills: DrDrillScorecard[] }> {
+    const qs = databaseId ? `?databaseId=${encodeURIComponent(databaseId)}` : '';
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/dr/drills${qs}`),
+      'Could not load DR fire-drill scorecards'
+    );
+    const list = Array.isArray(res?.drills) ? res.drills : Array.isArray(res) ? res : [];
+    return { drills: list };
+  },
+
+  async runDatabaseDrDrill(
+    databaseId: string,
+    payload: {
+      engine?: string;
+      artifactBase64?: string;
+      sqlSample?: string;
+      expectedSha256?: string;
+      preserveAcl?: boolean;
+      projectId?: string;
+    } = {}
+  ): Promise<DrDrillScorecard> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${encodeURIComponent(databaseId)}/dr-drill`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'DR backup fire-drill failed'
+    );
+    return (res?.drill || res) as DrDrillScorecard;
+  },
+
+  async listSloCanaries(projectId: string): Promise<{ rollouts: SloCanaryRollout[] }> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/slo-canary`),
+      'Could not load SLO canary rollouts'
+    );
+    const list = Array.isArray(res?.rollouts) ? res.rollouts : Array.isArray(res) ? res : [];
+    return { rollouts: list };
+  },
+
+  async startSloCanary(
+    projectId: string,
+    payload: {
+      hostname?: string;
+      stableUpstream?: string;
+      canaryUpstream?: string;
+      steps?: number[];
+      sloTarget?: number;
+      maxBurnRate?: number;
+    } = {}
+  ): Promise<SloCanaryRollout> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/slo-canary/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not start SLO canary rollout'
+    );
+    return (res?.rollout || res) as SloCanaryRollout;
+  },
+
+  async evaluateSloCanary(
+    projectId: string,
+    rolloutId: string,
+    payload: {
+      totalRequests: number;
+      error5xxCount: number;
+      baselineP95Ms: number;
+      canaryP95Ms: number;
+    }
+  ): Promise<SloCanaryEvaluateResult> {
+    return jsonOrThrow(
+      await apiFetch(
+        `${API_BASE}/projects/${encodeURIComponent(projectId)}/slo-canary/${encodeURIComponent(rolloutId)}/evaluate`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }
+      ),
+      'Could not evaluate SLO canary rollout'
+    );
+  },
+
+  async abortSloCanary(
+    projectId: string,
+    rolloutId: string,
+    reason = 'manual_abort'
+  ): Promise<SloCanaryRollout> {
+    const res = await jsonOrThrow(
+      await apiFetch(
+        `${API_BASE}/projects/${encodeURIComponent(projectId)}/slo-canary/${encodeURIComponent(rolloutId)}/abort`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason }),
+        }
+      ),
+      'Could not abort SLO canary rollout'
+    );
+    return (res?.rollout || res) as SloCanaryRollout;
+  },
+
+  async getLogArchiveStats(projectId: string): Promise<LogArchiveStatsResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/logs/archive/stats`),
+      'Could not load compressed log archive stats'
+    );
+  },
+
+  async searchLogArchive(
+    projectId: string,
+    payload: { query?: string; regex?: string; level?: string; releaseId?: string; limit?: number }
+  ): Promise<LogArchiveSearchResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/logs/archive/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Compressed log archive search failed'
+    );
+  },
+
+  async listRemoteBuilders(): Promise<{ builders: RemoteBuilderNode[] }> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/builders`),
+      'Could not load remote build nodes'
+    );
+    const list = Array.isArray(res?.builders) ? res.builders : Array.isArray(res) ? res : [];
+    return { builders: list };
+  },
+
+  async registerRemoteBuilder(payload: {
+    name: string;
+    host: string;
+    arch?: string;
+    maxConcurrency?: number;
+    allowPreviews?: boolean;
+    keepStorageGb?: number;
+    sshPort?: number;
+  }): Promise<{ ok?: boolean; builder: RemoteBuilderNode }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/builders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not register remote build node'
+    );
+  },
+
+  async scheduleRemoteBuild(payload: {
+    builderId?: string;
+    arch?: string;
+    isPreview?: boolean;
+    projectId?: string;
+  }): Promise<RemoteBuildScheduleResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/fleet/builders/schedule`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not schedule remote build offload'
+    );
+  },
+
+  async getAiPresets(): Promise<{ presets: AiRuntimePreset[] }> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/ai/presets`),
+      'Could not load AI/GPU runtime presets'
+    );
+    const list = Array.isArray(res?.presets) ? res.presets : Array.isArray(res) ? res : [];
+    return { presets: list };
+  },
+
+  async estimateAiVram(payload: {
+    paramsB: number;
+    quantization: string;
+    contextLen?: number;
+    batchSize?: number;
+    availableVramGb?: number;
+  }): Promise<AiVramEstimateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ai/vram-estimate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not estimate GPU VRAM footprint'
+    );
+  },
+
+  async planAiWorkload(payload: {
+    runtime: string;
+    model?: string;
+    paramsB: number;
+    quantization: string;
+    contextLen?: number;
+    availableVramGb: number;
+    gpuMode?: 'cdi' | 'legacy' | 'cpu';
+    bindAddress?: string;
+    authProxyEnabled?: boolean;
+    imageTag?: string;
+  }): Promise<AiWorkloadPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/ai/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'AI/GPU workload guardrail blocked plan'
+    );
+  },
 };
 
 // =====================================================================
@@ -5920,4 +6140,185 @@ export interface BillingLedgerResult {
     bandwidthGb?: number;
     estimatedCostUsd?: number;
   };
+}
+
+// --- Cycle-10 Milestone Types (DR Fire-Drills, SLO Canary, Log Archive, Remote Builders, Self-Hosted AI/GPU Planner) ---
+
+export interface DrDrillScorecard {
+  id: string;
+  databaseId: string;
+  projectId?: string;
+  engine?: string;
+  verdict: 'PASS' | 'FAIL' | string;
+  rtoMs?: number;
+  rpoSec?: number;
+  bytesVerified?: number;
+  uncompressedBytes?: number;
+  sha256?: string | null;
+  aclPreserved?: boolean;
+  preserveAcl?: boolean;
+  checks?: Array<{ name?: string; check?: string; id?: string; passed?: boolean; ok?: boolean; code?: string; detail?: string }>;
+  warnings?: string[];
+  errors?: string[];
+  createdAt?: string;
+  executedAt?: string;
+}
+
+export type SloCanaryBreach = string | {
+  code?: string;
+  message?: string;
+  actual?: number;
+  threshold?: number;
+  deltaMs?: number;
+};
+
+export interface SloCanaryRollout {
+  id: string;
+  projectId: string;
+  hostname?: string;
+  stableUpstream?: string;
+  canaryUpstream?: string;
+  steps?: number[];
+  stepIndex?: number;
+  canaryWeight: number;
+  stableWeight?: number;
+  status: 'IN_PROGRESS' | 'PROMOTED' | 'ROLLED_BACK' | 'ABORTED' | string;
+  sloTarget?: number;
+  maxBurnRate?: number;
+  lastBurnRate?: number;
+  lastLatencyRatio?: number;
+  breachReasons?: SloCanaryBreach[];
+  evaluations?: Array<{
+    evaluatedAt?: string;
+    burn?: { burnRate?: number };
+    latencyRatio?: number;
+    passed?: boolean;
+    action?: string;
+  }>;
+  caddyRoute?: Record<string, unknown>;
+  startedAt?: string;
+  updatedAt?: string;
+}
+
+export interface SloCanaryEvaluateResult {
+  ok?: boolean;
+  id?: string;
+  rollout?: SloCanaryRollout;
+  status?: string;
+  canaryWeight?: number;
+  stableWeight?: number;
+  burnRate?: number;
+  breached?: boolean;
+  breachReasons?: SloCanaryBreach[];
+  evaluations?: SloCanaryRollout['evaluations'];
+  caddyRoute?: Record<string, unknown>;
+}
+
+export interface LogArchiveStatsResult {
+  ok?: boolean;
+  projectId?: string;
+  shardCount?: number;
+  filesCount?: number;
+  totalFiles?: number;
+  totalBytes?: number;
+  totalMb?: number;
+  totalEntries?: number;
+  retentionDays?: number;
+  maxArchiveMb?: number;
+  oldestDate?: string | null;
+  newestDate?: string | null;
+  shards?: Array<{ date: string; file: string; sizeBytes: number }>;
+  files?: Array<{ name: string; sizeBytes: number; date?: string }>;
+}
+
+export interface LogArchiveEntry {
+  ts: string;
+  level: string;
+  releaseId?: string | null;
+  stream?: string;
+  message: string;
+}
+
+export interface LogArchiveSearchResult {
+  ok?: boolean;
+  projectId?: string;
+  filesScanned?: number;
+  totalMatches?: number;
+  truncated?: boolean;
+  entries?: LogArchiveEntry[];
+}
+
+export interface RemoteBuilderNode {
+  id: string;
+  name: string;
+  host: string;
+  arch: string;
+  maxConcurrency: number;
+  activeBuilds: number;
+  allowPreviews?: boolean;
+  keepStorageGb?: number;
+  sshMuxPinned?: boolean;
+  status?: string;
+}
+
+export interface RemoteBuildScheduleResult {
+  ok?: boolean;
+  leased: boolean;
+  queued?: boolean;
+  leaseId?: string | null;
+  builderId?: string;
+  builderName?: string;
+  arch?: string;
+  isPreview?: boolean;
+  activeBuilds?: number;
+  maxConcurrency?: number;
+  sshMuxPinned?: boolean;
+  directPushTarget?: string | { host?: string; port?: number; protocol?: string };
+  canRecycleMux?: { allowed: boolean; reason?: string; activeBuilds?: number };
+}
+
+export interface AiRuntimePreset {
+  id: string;
+  name?: string;
+  label?: string;
+  image: string;
+  bindAddress?: string;
+  port?: number;
+  cacheMount?: string;
+  description?: string;
+  summary?: string;
+}
+
+export interface AiVramEstimateResult {
+  ok?: boolean;
+  paramsB: number;
+  quantization: string;
+  contextLen?: number;
+  weightsGb: number;
+  kvCacheGb: number;
+  overheadGb: number;
+  totalRequiredGb: number;
+  availableVramGb?: number | null;
+  fits?: boolean;
+}
+
+export interface AiWorkloadPlanResult {
+  ok?: boolean;
+  runtime: string;
+  model: string;
+  image?: string;
+  imageTag?: string;
+  gpuMode?: string;
+  bindAddress?: string;
+  authProxyEnabled?: boolean;
+  vram: AiVramEstimateResult;
+  security?: {
+    safe: boolean;
+    blockers?: string[];
+    warnings?: string[];
+    cves?: string[];
+  };
+  dockerArgs?: string[];
+  volumeMount?: string | { volumeName?: string; containerPath?: string };
+  caddyProxyGuard?: string | { enabled?: boolean; upstream?: string; requireBearerToken?: boolean; rateLimitPerMinute?: number };
 }

@@ -4047,7 +4047,22 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:read');
     }
 
+    // Cycle-10: DR Fire-Drills, AI/GPU Workload Planner y Búsqueda de Archivo de Logs (.ndjson.gz)
+    if (p === '/api/dr/drills') {
+      return this.authorizeAction(principal, 'databases:read');
+    }
+    if (p === '/api/ai' || p.startsWith('/api/ai/')) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/logs\/archive\/search$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
+    // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
+    if (p === '/api/fleet/builders/schedule') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
     if (p === '/api/servers' || p.startsWith('/api/servers/') || p === '/api/fleet' || p.startsWith('/api/fleet/')) {
       return this.authorizeAction(principal, isRead ? 'fleet:read' : 'fleet:write');
     }

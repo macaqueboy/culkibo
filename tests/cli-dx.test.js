@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 130);
+    assert.strictEqual(demoJson.datasets.mcpTools, 135);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -722,6 +722,46 @@ async function testCliDx() {
     assert.deepStrictEqual(s3PresetsJson.presets.map((p) => p.id).sort(), ['garage', 'rustfs', 'seaweedfs']);
     assert.ok(s3PresetsJson.presets.every((p) => p.bindAddress === '127.0.0.1'));
     console.log(`  ✓ Pioneer CLI Cycle-9 verificado (culkibo ledger --json/--csv formula-safe, culkibo s3-presets 3 engines Post-MinIO, culkibo demo 130 tools)`);
+
+    // 14. Pioneer Cycle-10 CLI: `culkibo dr-drill <backupFile> [--engine] [--sha256] [--json]` y `culkibo ai-vram [--params --quant --ctx --vram --runtime --json]`
+    const zlib = require('zlib');
+    const crypto = require('crypto');
+    const validSqlDump = '-- PostgreSQL database dump\nCREATE TABLE invoices (id SERIAL PRIMARY KEY, amount NUMERIC);\nINSERT INTO invoices (amount) VALUES (42.00);\nGRANT SELECT ON invoices TO readonly;\n';
+    const validGzPath = path.join(tmpRoot, 'prod-backup.sql.gz');
+    const validGzBuf = zlib.gzipSync(Buffer.from(validSqlDump, 'utf8'));
+    fs.writeFileSync(validGzPath, validGzBuf);
+    const validSha = crypto.createHash('sha256').update(validGzBuf).digest('hex');
+
+    const drillPassCli = await runCli(['dr-drill', validGzPath, '--engine', 'postgres', '--sha256', validSha, '--json'], { env: isolatedEnv });
+    assert.strictEqual(drillPassCli.status, 0, `culkibo dr-drill PASS falló: ${drillPassCli.stderr} ${drillPassCli.stdout}`);
+    const drillPassJson = JSON.parse(drillPassCli.stdout);
+    assert.strictEqual(drillPassJson.ok, true);
+    assert.strictEqual(drillPassJson.verdict, 'PASS');
+    assert.strictEqual(drillPassJson.sha256, validSha);
+
+    // Empty 20-byte gzip -> MUST fail with verdict FAIL & non-zero exit code!
+    const emptyGzPath = path.join(tmpRoot, 'empty-20b.sql.gz');
+    fs.writeFileSync(emptyGzPath, zlib.gzipSync(Buffer.alloc(0)));
+    const drillFailCli = await runCli(['dr-drill', emptyGzPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(drillFailCli.status, 1, 'culkibo dr-drill debe retornar exit=1 en backup vacío 20B');
+    const drillFailJson = JSON.parse(drillFailCli.stdout);
+    assert.strictEqual(drillFailJson.ok, false);
+    assert.strictEqual(drillFailJson.verdict, 'FAIL');
+
+    // culkibo ai-vram --json (fits + overflow check)
+    const vramFitCli = await runCli(['ai-vram', '--params', '8', '--quant', 'Q4_K_M', '--ctx', '8192', '--vram', '16', '--runtime', 'ollama', '--json'], { env: isolatedEnv });
+    assert.strictEqual(vramFitCli.status, 0, `culkibo ai-vram falló: ${vramFitCli.stderr} ${vramFitCli.stdout}`);
+    const vramFitJson = JSON.parse(vramFitCli.stdout);
+    assert.strictEqual(vramFitJson.ok, true);
+    assert.strictEqual(vramFitJson.runtime, 'ollama');
+    assert.strictEqual(vramFitJson.fits, true);
+    assert.ok(vramFitJson.totalRequiredGb > 0 && vramFitJson.totalRequiredGb < 16);
+
+    const vramOverflowCli = await runCli(['ai-vram', '--params', '70', '--quant', 'FP16', '--vram', '24', '--runtime', 'vllm', '--json'], { env: isolatedEnv });
+    assert.strictEqual(vramOverflowCli.status, 0, vramOverflowCli.stderr);
+    const vramOverflowJson = JSON.parse(vramOverflowCli.stdout);
+    assert.strictEqual(vramOverflowJson.fits, false);
+    console.log(`  ✓ Pioneer CLI Cycle-10 verificado (culkibo dr-drill PASS/20B-FAIL, culkibo ai-vram ${vramFitJson.totalRequiredGb}GB fits/overflow, culkibo demo 135 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

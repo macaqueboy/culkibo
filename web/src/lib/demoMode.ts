@@ -103,6 +103,9 @@ interface DemoState {
   webhookSubscriptions: any[];
   webhookDlq: any[];
   quotas: Record<string, { projectId: string; containers: number; memoryMb: number; cpuCores: number; storageGb: number; bandwidthGbMo: number }>;
+  drDrills: any[];
+  sloCanaries: Record<string, any[]>;
+  remoteBuilders: any[];
 }
 
 function createInitialDemoState(): DemoState {
@@ -705,6 +708,57 @@ function createInitialDemoState(): DemoState {
       proj_edge_rust: { projectId: 'proj_edge_rust', containers: 2, memoryMb: 512, cpuCores: 1, storageGb: 10, bandwidthGbMo: 200 },
       proj_ai_worker: { projectId: 'proj_ai_worker', containers: 2, memoryMb: 1024, cpuCores: 2, storageGb: 20, bandwidthGbMo: 100 },
     },
+    drDrills: [
+      {
+        id: 'drill_demo_pg_01',
+        databaseId: 'db_pg_main',
+        projectId: 'proj_acme_web',
+        engine: 'postgres',
+        verdict: 'PASS',
+        rtoMs: 312,
+        rpoSec: 1800,
+        bytesVerified: 18420112,
+        uncompressedBytes: 74910208,
+        sha256: '4e9a2c71f8b03d5e6a1c9f0b2d4e8a7c1f3b5d9e0a2c4f6a8b1d3e5f7a9c0b1d',
+        aclPreserved: true,
+        checks: [
+          { name: 'min_bytes', passed: true, detail: '18.4 MB compressed (> 64 B threshold)' },
+          { name: 'sha256_integrity', passed: true, detail: 'SHA-256 digest verified' },
+          { name: 'gunzip_stream', passed: true, detail: 'Valid gzip stream decompressed (74.9 MB)' },
+          { name: 'sql_ddl_and_acl', passed: true, detail: 'PostgreSQL dump + GRANT ACLs preserved' },
+        ],
+        warnings: [],
+        errors: [],
+        createdAt: t2,
+      },
+    ],
+    sloCanaries: {},
+    remoteBuilders: [
+      {
+        id: 'bld_hetzner_amd64',
+        name: 'hetzner-cpx41-builder-eu',
+        host: '91.107.194.44',
+        arch: 'linux/amd64',
+        maxConcurrency: 4,
+        activeBuilds: 1,
+        allowPreviews: true,
+        keepStorageGb: 40,
+        sshMuxPinned: true,
+        status: 'ready',
+      },
+      {
+        id: 'bld_hetzner_arm64',
+        name: 'hetzner-cax21-arm64-eu',
+        host: '91.107.194.88',
+        arch: 'linux/arm64',
+        maxConcurrency: 2,
+        activeBuilds: 0,
+        allowPreviews: true,
+        keepStorageGb: 25,
+        sshMuxPinned: false,
+        status: 'ready',
+      },
+    ],
   };
 }
 
@@ -2252,6 +2306,322 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ ok: true, periodDays, currency: 'USD', generatedAt: nowIso(), entries: rows, projects: rows, totals });
   }
 
+  // --- Cycle-10 Milestone APIs (DR Fire-Drills, SLO Canary, Compressed Log Archive, Remote Builders, Self-Hosted AI/GPU Planner) ---
+  if (pathname === '/api/dr/drills' && method === 'GET') {
+    const dbFilter = parsed.searchParams.get('databaseId');
+    const drills = dbFilter ? s.drDrills.filter((d) => d.databaseId === dbFilter) : s.drDrills;
+    return jsonResponse({ ok: true, drills });
+  }
+  const drDrillMatch = pathname.match(/^\/api\/databases\/([^/]+)\/dr-drill$/);
+  if (drDrillMatch && method === 'POST') {
+    const dbId = decodeURIComponent(drDrillMatch[1]);
+    const sample = String(body.sqlSample || '');
+    const b64 = String(body.artifactBase64 || '');
+    const decodedLen = b64 ? Math.floor((b64.length * 3) / 4) : sample.length;
+    const isCorrupt = (b64 && decodedLen <= 64) || (!b64 && sample.length > 0 && sample.length <= 64);
+    if (isCorrupt) {
+      const failDrill = {
+        id: `drill_fail_${Date.now().toString(36)}`,
+        databaseId: dbId,
+        projectId: body.projectId || 'proj_acme_web',
+        engine: String(body.engine || 'postgres'),
+        verdict: 'FAIL',
+        rtoMs: 4,
+        rpoSec: 0,
+        bytesVerified: decodedLen || 20,
+        uncompressedBytes: 0,
+        sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        aclPreserved: false,
+        checks: [
+          { name: 'min_bytes', passed: false, detail: `EMPTY_OR_TRUNCATED_DUMP: ${decodedLen || 20} B <= 64 B minimum (silent empty S3 dump caught!)` },
+        ],
+        warnings: [],
+        errors: ['EMPTY_OR_TRUNCATED_DUMP: Backup artifact is 20 B empty gzip — restore aborted and DR alert fired (dokploy#1382 / coolify#6506).'],
+        createdAt: nowIso(),
+      };
+      s.drDrills = [failDrill, ...s.drDrills].slice(0, 20);
+      return jsonResponse({ ok: false, drill: failDrill, ...failDrill });
+    }
+    const passDrill = {
+      id: `drill_pass_${Date.now().toString(36)}`,
+      databaseId: dbId,
+      projectId: body.projectId || 'proj_acme_web',
+      engine: String(body.engine || 'postgres'),
+      verdict: 'PASS',
+      rtoMs: 284,
+      rpoSec: 120,
+      bytesVerified: 18420112,
+      uncompressedBytes: 74910208,
+      sha256: '9c7e4b2a1d8f3056a4c9e8d20f7b1a5c3e9d01f2a4b6c8d0e1f2a3b4c5d6e7f8',
+      aclPreserved: body.preserveAcl !== false,
+      checks: [
+        { name: 'min_bytes', passed: true, detail: '18.4 MB compressed (> 64 B threshold)' },
+        { name: 'sha256_integrity', passed: true, detail: 'SHA-256 digest matched' },
+        { name: 'gunzip_stream', passed: true, detail: 'Clean gzip decompression verified' },
+        { name: 'sql_ddl_and_acl', passed: true, detail: 'CREATE TABLE + GRANT ACL statements intact' },
+      ],
+      warnings: [],
+      errors: [],
+      createdAt: nowIso(),
+    };
+    s.drDrills = [passDrill, ...s.drDrills].slice(0, 20);
+    return jsonResponse({ ok: true, drill: passDrill, ...passDrill });
+  }
+
+  const canaryListMatch = pathname.match(/^\/api\/projects\/([^/]+)\/slo-canary$/);
+  if (canaryListMatch && method === 'GET') {
+    const pid = decodeURIComponent(canaryListMatch[1]);
+    return jsonResponse({ ok: true, rollouts: s.sloCanaries[pid] || [] });
+  }
+  const canaryStartMatch = pathname.match(/^\/api\/projects\/([^/]+)\/slo-canary\/start$/);
+  if (canaryStartMatch && method === 'POST') {
+    const pid = decodeURIComponent(canaryStartMatch[1]);
+    const steps = Array.isArray(body.steps) && body.steps.length > 0 ? body.steps.map(Number) : [10, 25, 50, 100];
+    const w = steps[0] || 10;
+    const rollout = {
+      id: `can_${Date.now().toString(36)}`,
+      projectId: pid,
+      hostname: String(body.hostname || 'app.acme-demo.dev'),
+      stableUpstream: String(body.stableUpstream || '127.0.0.1:3000'),
+      canaryUpstream: String(body.canaryUpstream || '127.0.0.1:3001'),
+      steps,
+      stepIndex: 0,
+      canaryWeight: w,
+      stableWeight: 100 - w,
+      status: 'IN_PROGRESS',
+      sloTarget: Number(body.sloTarget) || 0.999,
+      maxBurnRate: Number(body.maxBurnRate) || 14.4,
+      lastBurnRate: 0.4,
+      lastLatencyRatio: 1.03,
+      breachReasons: [],
+      caddyRoute: {
+        match: [{ host: [String(body.hostname || 'app.acme-demo.dev')] }],
+        handle: [{ handler: 'reverse_proxy', load_balancing: { selection_policy: { policy: 'weighted_round_robin', weights: [100 - w, w] } } }],
+      },
+      startedAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    s.sloCanaries[pid] = [rollout, ...(s.sloCanaries[pid] || [])].slice(0, 10);
+    return jsonResponse({ ok: true, rollout, ...rollout }, 201);
+  }
+  const canaryEvalMatch = pathname.match(/^\/api\/projects\/([^/]+)\/slo-canary\/([^/]+)\/evaluate$/);
+  if (canaryEvalMatch && method === 'POST') {
+    const pid = decodeURIComponent(canaryEvalMatch[1]);
+    const rid = decodeURIComponent(canaryEvalMatch[2]);
+    const list = s.sloCanaries[pid] || [];
+    const r = list.find((x) => x.id === rid) || list[0];
+    if (!r) return jsonResponse({ error: 'Canary rollout not found' }, 404);
+    const total = Math.max(1, Number(body.totalRequests) || 1000);
+    const errs = Math.max(0, Number(body.error5xxCount) || 0);
+    const baseP95 = Math.max(1, Number(body.baselineP95Ms) || 18);
+    const candP95 = Math.max(1, Number(body.canaryP95Ms) || 19);
+    const slo = r.sloTarget || 0.999;
+    const burnRate = Number(((errs / total) / Math.max(0.0001, 1 - slo)).toFixed(2));
+    const latRatio = Number((candP95 / baseP95).toFixed(2));
+    const breachReasons: string[] = [];
+    if (burnRate > (r.maxBurnRate || 14.4)) {
+      breachReasons.push(`SRE error-budget burn rate ${burnRate}x exceeded ${r.maxBurnRate || 14.4}x threshold (${errs}/${total} HTTP 5xx)`);
+    }
+    if (latRatio > 2.0 && candP95 - baseP95 >= 25) {
+      breachReasons.push(`Canary p95 latency regression ${candP95}ms vs ${baseP95}ms baseline (${latRatio}x)`);
+    }
+    r.lastBurnRate = burnRate;
+    r.lastLatencyRatio = latRatio;
+    r.updatedAt = nowIso();
+    if (breachReasons.length > 0) {
+      r.status = 'ROLLED_BACK';
+      r.canaryWeight = 0;
+      r.stableWeight = 100;
+      r.breachReasons = breachReasons;
+      r.caddyRoute = {
+        match: [{ host: [r.hostname] }],
+        handle: [{ handler: 'reverse_proxy', load_balancing: { selection_policy: { policy: 'weighted_round_robin', weights: [100, 0] } } }],
+      };
+    } else {
+      const steps = Array.isArray(r.steps) ? r.steps : [10, 25, 50, 100];
+      const nextIdx = Math.min(steps.length - 1, (r.stepIndex || 0) + 1);
+      r.stepIndex = nextIdx;
+      r.canaryWeight = steps[nextIdx];
+      r.stableWeight = 100 - r.canaryWeight;
+      r.status = r.canaryWeight >= 100 ? 'PROMOTED' : 'IN_PROGRESS';
+      r.breachReasons = [];
+      r.caddyRoute = {
+        match: [{ host: [r.hostname] }],
+        handle: [{ handler: 'reverse_proxy', load_balancing: { selection_policy: { policy: 'weighted_round_robin', weights: [100 - r.canaryWeight, r.canaryWeight] } } }],
+      };
+    }
+    return jsonResponse({ ok: true, rollout: r, burnRate, breached: breachReasons.length > 0, breachReasons, status: r.status, canaryWeight: r.canaryWeight, caddyRoute: r.caddyRoute });
+  }
+  const canaryAbortMatch = pathname.match(/^\/api\/projects\/([^/]+)\/slo-canary\/([^/]+)\/abort$/);
+  if (canaryAbortMatch && method === 'POST') {
+    const pid = decodeURIComponent(canaryAbortMatch[1]);
+    const rid = decodeURIComponent(canaryAbortMatch[2]);
+    const list = s.sloCanaries[pid] || [];
+    const r = list.find((x) => x.id === rid) || list[0];
+    if (r) {
+      r.status = 'ROLLED_BACK';
+      r.canaryWeight = 0;
+      r.stableWeight = 100;
+      r.breachReasons = [String(body.reason || 'manual_abort')];
+      r.updatedAt = nowIso();
+    }
+    return jsonResponse({ ok: true, rollout: r });
+  }
+
+  if (pathname === '/api/logs' && method === 'GET') {
+    return jsonResponse({
+      logs: [
+        { id: 'log_1', projectId: 'proj_acme_web', pod: 'citadel', level: 'INFO', message: 'Caddy HTTP/3 route synced for app.acme-demo.dev -> 127.0.0.1:3000 (3.1ms)', timestamp: nowIso(-12000) },
+        { id: 'log_2', projectId: 'proj_acme_web', pod: 'forge', level: 'HOT_SYNC', message: 'Merkle delta applied src/app/page.tsx (1.41ms, -96.1% brotli)', timestamp: nowIso(-45000) },
+        { id: 'log_3', projectId: 'proj_edge_rust', pod: 'citadel', level: 'SUCCESS', message: 'Health probe /health 200 OK (p95 1.8ms, 48 MB RSS)', timestamp: nowIso(-90000) },
+      ],
+    });
+  }
+  const logStatsMatch = pathname.match(/^\/api\/projects\/([^/]+)\/logs\/archive\/stats$/);
+  if (logStatsMatch && method === 'GET') {
+    const pid = decodeURIComponent(logStatsMatch[1]);
+    const today = new Date().toISOString().slice(0, 10);
+    return jsonResponse({
+      ok: true,
+      projectId: pid,
+      filesCount: 4,
+      totalFiles: 4,
+      totalBytes: 148_240,
+      totalEntries: 3842,
+      retentionDays: 30,
+      maxArchiveMb: 50,
+      files: [
+        { name: `${today}.ndjson.gz`, sizeBytes: 42_180, date: today },
+        { name: '2026-11-26.ndjson.gz', sizeBytes: 38_920, date: '2026-11-26' },
+      ],
+    });
+  }
+  const logSearchMatch = pathname.match(/^\/api\/projects\/([^/]+)\/logs\/archive\/search$/);
+  if (logSearchMatch && method === 'POST') {
+    const pid = decodeURIComponent(logSearchMatch[1]);
+    const regexStr = String(body.regex || '').trim();
+    if (regexStr && (regexStr.length > 120 || /\([^)]*[+*?][^)]*\)[+*?]/.test(regexStr) || /\\[1-9]/.test(regexStr))) {
+      return jsonResponse({ error: 'UNSAFE_REGEX: Nested quantifiers or backreferences rejected by ReDoS guard.' }, 400);
+    }
+    const q = String(body.query || '').trim().toLowerCase();
+    const lvl = String(body.level || '').trim().toUpperCase();
+    const archiveEntries = [
+      { ts: nowIso(-1000 * 60 * 180), level: 'INFO', releaseId: 'rel_8c4f1a', stream: 'stdout', message: 'SmartPack zstd:chunked release rel_8c4f1a promoted with 0ms dropped connections' },
+      { ts: nowIso(-1000 * 60 * 420), level: 'WARN', releaseId: 'rel_5b12d0', stream: 'stderr', message: 'Upstream pool wait 42ms on acme-postgres-16 (survived redeploy #41)' },
+      { ts: nowIso(-1000 * 60 * 960), level: 'ERROR', releaseId: 'rel_5b12d0', stream: 'stderr', message: 'Webhook receiver returned HTTP 503 — persisted to Standard-Webhooks DLQ' },
+      { ts: nowIso(-1000 * 60 * 1440), level: 'INFO', releaseId: 'rel_4a09e1', stream: 'stdout', message: 'DR backup fire-drill PASS (18.4 MB gzipped SQL verified, RTO 312ms)' },
+    ].filter((e) => {
+      if (lvl && lvl !== 'ALL' && e.level !== lvl) return false;
+      if (q && !e.message.toLowerCase().includes(q) && !String(e.releaseId || '').toLowerCase().includes(q)) return false;
+      if (regexStr) {
+        try {
+          if (!new RegExp(regexStr, 'i').test(e.message)) return false;
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    });
+    return jsonResponse({
+      ok: true,
+      projectId: pid,
+      filesScanned: 4,
+      totalMatches: archiveEntries.length,
+      truncated: false,
+      entries: archiveEntries,
+    });
+  }
+
+  if (pathname === '/api/fleet/builders' && method === 'GET') {
+    return jsonResponse({ ok: true, builders: s.remoteBuilders });
+  }
+  if (pathname === '/api/fleet/builders/schedule' && method === 'POST') {
+    const isPreview = Boolean(body.isPreview);
+    const arch = String(body.arch || 'linux/amd64');
+    const chosen = s.remoteBuilders.find((b) => (!isPreview || b.allowPreviews) && b.arch === arch && b.activeBuilds < b.maxConcurrency)
+      || s.remoteBuilders[0];
+    if (chosen) {
+      chosen.activeBuilds = Math.min(chosen.maxConcurrency, (chosen.activeBuilds || 0) + 1);
+      chosen.sshMuxPinned = true;
+    }
+    return jsonResponse({
+      ok: true,
+      leased: true,
+      queued: false,
+      leaseId: `lease_bld_${Date.now().toString(36)}`,
+      builderId: chosen?.id || 'bld_hetzner_amd64',
+      builderName: chosen?.name || 'hetzner-cpx41-builder-eu',
+      arch: chosen?.arch || arch,
+      isPreview,
+      activeBuilds: chosen?.activeBuilds || 1,
+      maxConcurrency: chosen?.maxConcurrency || 4,
+      sshMuxPinned: true,
+      directPushTarget: `127.0.0.1:5055/${String(body.projectId || 'pr-preview')}:latest`,
+      canRecycleMux: { allowed: false, reason: 'ACTIVE_BUILDS_IN_FLIGHT', activeBuilds: chosen?.activeBuilds || 1 },
+    });
+  }
+
+  if (pathname === '/api/ai/presets' && method === 'GET') {
+    return jsonResponse({
+      ok: true,
+      presets: [
+        { id: 'ollama', name: 'Ollama', label: 'Ollama 0.17.4 (Pinned CVE-Safe)', image: 'ollama/ollama:0.17.4', bindAddress: '127.0.0.1', port: 11434, cacheMount: '/root/.ollama', description: 'Zero-config local LLM runner with GGUF quantization and private Bearer proxy.' },
+        { id: 'vllm', name: 'vLLM', label: 'vLLM v0.21.2 (OpenAI API)', image: 'vllm/vllm-openai:v0.21.2', bindAddress: '127.0.0.1', port: 8000, cacheMount: '/root/.cache/huggingface', description: 'High-throughput PagedAttention server (patches CVE-2026-22778 & CVE-2026-137477).' },
+        { id: 'llamacpp', name: 'llama.cpp', label: 'llama.cpp CUDA Server', image: 'ghcr.io/ggml-org/llama.cpp:server-cuda-b5120', bindAddress: '127.0.0.1', port: 8080, cacheMount: '/models', description: 'Ultra-lean C++ GGUF inference server for small 8–24 GB VRAM GPUs.' },
+      ],
+    });
+  }
+  const calcDemoVram = (p: Record<string, any>) => {
+    const paramsB = Math.max(0.5, Number(p.paramsB) || 8);
+    const quant = String(p.quantization || 'Q4_K_M').toUpperCase();
+    const ctx = Math.max(512, Number(p.contextLen) || 8192);
+    const bytesPerParam = quant === 'FP16' ? 2.0 : quant === 'Q8_0' ? 1.08 : 0.62;
+    const weightsGb = Number((paramsB * bytesPerParam).toFixed(2));
+    const kvCacheGb = Number((((ctx / 8192) * (paramsB / 8)) * 0.95).toFixed(2));
+    const overheadGb = Number((0.8 + weightsGb * 0.08).toFixed(2));
+    const totalRequiredGb = Number((weightsGb + kvCacheGb + overheadGb).toFixed(2));
+    const availableVramGb = p.availableVramGb != null ? Number(p.availableVramGb) : 16;
+    return { ok: true, paramsB, quantization: quant, contextLen: ctx, weightsGb, kvCacheGb, overheadGb, totalRequiredGb, availableVramGb, fits: totalRequiredGb <= availableVramGb };
+  };
+  if (pathname === '/api/ai/vram-estimate' && method === 'POST') {
+    return jsonResponse(calcDemoVram(body));
+  }
+  if (pathname === '/api/ai/plan' && method === 'POST') {
+    const vram = calcDemoVram(body);
+    const runtime = String(body.runtime || 'ollama').toLowerCase();
+    const bindAddress = String(body.bindAddress || '127.0.0.1');
+    const authProxyEnabled = body.authProxyEnabled !== false;
+    if (bindAddress === '0.0.0.0' && !authProxyEnabled) {
+      return jsonResponse({ error: 'PUBLIC_AI_ENDPOINT_BLOCKED: Binding AI runtime to 0.0.0.0 without Bearer auth proxy is forbidden (CVE-2025-63389).' }, 400);
+    }
+    if (!vram.fits) {
+      return jsonResponse({ error: `VRAM_INSUFFICIENT: Required ${vram.totalRequiredGb} GB (${vram.weightsGb} GB weights + ${vram.kvCacheGb} GB KV-cache) exceeds ${vram.availableVramGb} GB GPU VRAM.` }, 400);
+    }
+    const imageMap: Record<string, string> = {
+      ollama: 'ollama/ollama:0.17.4',
+      vllm: 'vllm/vllm-openai:v0.21.2',
+      llamacpp: 'ghcr.io/ggml-org/llama.cpp:server-cuda-b5120',
+    };
+    const gpuMode = String(body.gpuMode || 'cdi');
+    const gpuArgs = gpuMode === 'legacy' ? ['--gpus', 'all'] : gpuMode === 'cpu' ? [] : ['--device', 'nvidia.com/gpu=all'];
+    const port = runtime === 'vllm' ? 8000 : runtime === 'llamacpp' ? 8080 : 11434;
+    const cachePath = runtime === 'vllm' ? '/root/.cache/huggingface' : runtime === 'llamacpp' ? '/models' : '/root/.ollama';
+    return jsonResponse({
+      ok: true,
+      runtime,
+      model: String(body.model || `${runtime}-${vram.paramsB}b-${vram.quantization.toLowerCase()}`),
+      image: imageMap[runtime] || imageMap.ollama,
+      gpuMode,
+      bindAddress,
+      authProxyEnabled,
+      vram,
+      security: { safe: true, blockers: [], warnings: [], cves: [] },
+      dockerArgs: ['run', '-d', '--restart=unless-stopped', ...gpuArgs, '-p', `${bindAddress}:${port}:${port}`, '-v', `culkibo_ai_${runtime}_cache:${cachePath}`, imageMap[runtime] || imageMap.ollama],
+      volumeMount: `culkibo_ai_${runtime}_cache:${cachePath}`,
+      caddyProxyGuard: `Caddy Bearer Auth Proxy -> ${bindAddress}:${port} (blocks unauthenticated CVE-2025-63389 access)`,
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -2429,16 +2799,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (130 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (135 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 130 MCP tools on demand without bloating context (-85%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 135 MCP tools on demand without bloating context (-86%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_dr_drill', description: 'Automated DR backup restore fire-drill verifier catching 0 B / 20 B corrupt dumps & ACL strips', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_slo_canary', description: 'Google SRE error-budget SLO canary controller (10->25->50->100%) with instant 100/0 auto-rollback', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_ai_workload', description: 'Self-hosted AI/GPU LLM planner (Ollama/vLLM/llama.cpp) with VRAM pre-flight, CDI & CVE guards', readOnly: true, profile: 'ops' },
+      { name: 'culkibo_remote_builder', description: 'Distributed remote build-node offloader with independent queues & SSH mux ref-count pinning', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_log_archive_search', description: 'Compressed .ndjson.gz persistent log archive search surviving redeploys (ReDoS-safe)', readOnly: true, profile: 'ops' },
       { name: 'culkibo_webhook_dlq', description: 'Manage Standard-Webhooks whsec_ subscriptions, dual-secret rotation & anti-SSRF DLQ replay', readOnly: false, profile: 'ops' },
       { name: 'culkibo_db_studio', description: 'Read-only SQL (BEGIN TRANSACTION READ ONLY) & safe Redis/Valkey inspector + Postgres bloat diagnostics', readOnly: true, profile: 'ops' },
       { name: 'culkibo_s3_storage', description: 'Post-MinIO Garage/RustFS/SeaweedFS presets, pure-crypto AWS SigV4 presigned URLs & CORS/Lifecycle XML', readOnly: false, profile: 'deploy' },
@@ -2455,27 +2830,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 130 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 135 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 130, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 135, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_agency_ledger', status: 'ok', durationMs: 3, timestamp: nowIso(-60000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_db_studio', status: 'ok', durationMs: 2, timestamp: nowIso(-180000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_slo_canary', status: 'ok', durationMs: 2, timestamp: nowIso(-60000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_dr_drill', status: 'ok', durationMs: 4, timestamp: nowIso(-180000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 130,
-      profiles: { core: { count: 17, savedPct: 85 } },
+      totalTools: 135,
+      profiles: { core: { count: 17, savedPct: 86 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {
