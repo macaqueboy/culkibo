@@ -4058,6 +4058,26 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:read');
     }
 
+    // Cycle-11: Policy-as-Code Admission Gate, Ed25519 Compliance Bundle, Stateful Volume Migrations & Edge Geo/A-B Experiments
+    if (p === '/api/security/admission-policy' || p === '/api/security/admission-policy/evaluate') {
+      if (p === '/api/security/admission-policy' && !isRead) {
+        return this.authorizeAction(principal, 'team:write');
+      }
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/compliance/bundle' || p === '/api/compliance/bundle/latest' || p === '/api/compliance/bundle/verify') {
+      if (p === '/api/compliance/bundle/verify') {
+        return this.authorizeAction(principal, 'projects:read');
+      }
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/volumes/migrations' || p.startsWith('/api/volumes/migrations/')) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+    if (p === '/api/edge/experiments' || p.startsWith('/api/edge/experiments/')) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

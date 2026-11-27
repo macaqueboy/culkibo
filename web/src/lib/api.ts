@@ -5038,6 +5038,162 @@ export const api = {
       'AI/GPU workload guardrail blocked plan'
     );
   },
+
+  // --- Cycle-11 Enterprise Governance & Multi-Region Edge APIs ---
+
+  async getAdmissionPolicy(): Promise<AdmissionPolicyState> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/admission-policy`),
+      'Could not load Policy-as-Code admission policy'
+    );
+  },
+
+  async updateAdmissionPolicy(payload: {
+    preset?: 'baseline' | 'restricted' | 'soc2-strict' | string;
+    rules?: Record<string, 'enforce' | 'audit' | 'off' | string>;
+  }): Promise<AdmissionPolicyState> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/admission-policy`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not update Policy-as-Code admission policy'
+    );
+  },
+
+  async evaluateAdmissionPolicy(payload: {
+    spec: Record<string, unknown>;
+    preset?: string;
+    enforceStatus?: boolean;
+  }): Promise<AdmissionEvaluationResult> {
+    const res = await apiFetch(`${API_BASE}/security/admission-policy/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...payload.spec,
+        spec: payload.spec,
+        preset: payload.preset,
+        enforceStatus: payload.enforceStatus ?? false,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (res.status === 422 && data && typeof data === 'object') {
+      return { ...(data as AdmissionEvaluationResult), httpStatus: 422 };
+    }
+    if (!res.ok) {
+      throw new Error((data && (data.error || data.message)) || `Admission evaluation failed (HTTP ${res.status})`);
+    }
+    return { ...(data as AdmissionEvaluationResult), httpStatus: res.status };
+  },
+
+  async generateComplianceBundle(payload: {
+    framework?: 'all' | 'soc2' | 'iso27001' | 'gdpr' | string;
+  } = {}): Promise<ComplianceBundleResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/compliance/bundle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not generate Ed25519 compliance bundle'
+    );
+  },
+
+  async getLatestComplianceBundle(): Promise<ComplianceBundleResult | null> {
+    const res = await apiFetch(`${API_BASE}/compliance/bundle/latest`);
+    if (res.status === 404) return null;
+    return jsonOrThrow(res, 'Could not load latest compliance bundle');
+  },
+
+  async verifyComplianceBundle(bundle: ComplianceBundleResult): Promise<ComplianceVerifyResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/compliance/bundle/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bundle, ...bundle }),
+      }),
+      'Could not verify Ed25519 compliance signature'
+    );
+  },
+
+  async listEdgeExperiments(projectId?: string): Promise<{ experiments: EdgeExperimentRecord[] }> {
+    const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/experiments${qs}`),
+      'Could not load edge geo-routing & A/B experiments'
+    );
+    const list = Array.isArray(res?.experiments) ? res.experiments : Array.isArray(res) ? res : [];
+    return { experiments: list };
+  },
+
+  async upsertEdgeExperiment(payload: {
+    id?: string;
+    projectId?: string;
+    name?: string;
+    hostname: string;
+    headerName?: string;
+    stickyMode?: 'cookie' | 'header' | 'weighted';
+    cookieName?: string;
+    headerField?: string;
+    regions?: EdgeExperimentRegion[];
+    defaultUpstream?: string;
+    variants?: EdgeExperimentVariant[];
+  }): Promise<EdgeExperimentRecord> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/experiments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not save edge geo-routing / A-B experiment'
+    );
+    return (res?.experiment || res) as EdgeExperimentRecord;
+  },
+
+  async killEdgeExperiment(id: string, reason = 'operator_kill_switch'): Promise<EdgeExperimentRecord> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/experiments/${encodeURIComponent(id)}/kill-switch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      }),
+      'Could not trigger experiment kill-switch'
+    );
+    return (res?.experiment || res) as EdgeExperimentRecord;
+  },
+
+  async listVolumeMigrations(projectId?: string): Promise<{ migrations: VolumeMigrationRecord[] }> {
+    const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/volumes/migrations${qs}`),
+      'Could not load stateful volume migrations'
+    );
+    const list = Array.isArray(res?.migrations) ? res.migrations : Array.isArray(res) ? res : [];
+    return { migrations: list };
+  },
+
+  async planVolumeMigration(payload: {
+    projectId?: string;
+    volumeName: string;
+    mountPath: string;
+    sourceHost?: string;
+    targetHost: string;
+    uid?: number;
+    gid?: number;
+    containerName?: string;
+    estimatedMb?: number;
+  }): Promise<VolumeMigrationRecord> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/volumes/migrations/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Volume migration guardrail rejected request'
+    );
+    return (res?.migration || res) as VolumeMigrationRecord;
+  },
 };
 
 // =====================================================================
@@ -6321,4 +6477,159 @@ export interface AiWorkloadPlanResult {
   dockerArgs?: string[];
   volumeMount?: string | { volumeName?: string; containerPath?: string };
   caddyProxyGuard?: string | { enabled?: boolean; upstream?: string; requireBearerToken?: boolean; rateLimitPerMinute?: number };
+}
+
+// --- Cycle-11 Enterprise Governance & Multi-Region Edge Types ---
+
+export interface AdmissionRuleEntry {
+  id: string;
+  mode: 'enforce' | 'audit' | 'off' | string;
+  severity?: string;
+  title?: string;
+  description?: string;
+}
+
+export interface AdmissionPolicyState {
+  ok?: boolean;
+  preset: 'baseline' | 'restricted' | 'soc2-strict' | string;
+  rules: Record<string, string> | AdmissionRuleEntry[];
+  updatedAt?: string | null;
+}
+
+export type AdmissionViolationItem = string | {
+  ruleId?: string;
+  id?: string;
+  code?: string;
+  message?: string;
+  detail?: string;
+  severity?: string;
+};
+
+export interface AdmissionEvaluationResult {
+  ok?: boolean;
+  allowed: boolean;
+  decision: 'ALLOW' | 'DENY' | 'AUDIT_WARN' | string;
+  preset?: string;
+  score: number;
+  totalRules?: number;
+  enforcedViolations?: AdmissionViolationItem[];
+  auditWarnings?: AdmissionViolationItem[];
+  passedRules?: AdmissionViolationItem[];
+  httpStatus?: number;
+}
+
+export interface ComplianceControlItem {
+  id?: string;
+  domain?: string;
+  code?: string;
+  controlIds?: string[];
+  framework?: string;
+  frameworks?: string[];
+  title?: string;
+  name?: string;
+  status?: 'pass' | 'warn' | 'fail' | 'PASS' | 'WARN' | 'FAIL' | string;
+  score?: number;
+  passed?: boolean;
+  summary?: string;
+  evidence?: string | Record<string, unknown>;
+}
+
+export interface ComplianceBundleResult {
+  ok?: boolean;
+  id?: string;
+  bundleId?: string;
+  algorithm?: string;
+  framework?: string;
+  generatedAt?: string;
+  overallScore?: number;
+  payloadSha256: string;
+  signatureB64: string;
+  publicKeyPem?: string;
+  controls?: ComplianceControlItem[];
+  payload?: {
+    framework?: string;
+    generatedAt?: string;
+    overallScore?: number;
+    controls?: ComplianceControlItem[];
+    [key: string]: unknown;
+  };
+  markdownReport?: string;
+}
+
+export interface ComplianceVerifyResult {
+  ok?: boolean;
+  valid: boolean;
+  reason?: string | null;
+  payloadSha256?: string;
+}
+
+export interface EdgeExperimentRegion {
+  countries: string[];
+  upstream: string;
+  label?: string;
+}
+
+export interface EdgeExperimentVariant {
+  name: string;
+  upstream: string;
+  weight: number;
+}
+
+export interface EdgeExperimentRecord {
+  id: string;
+  projectId?: string;
+  name?: string;
+  kind?: 'geo' | 'ab' | string;
+  hostname: string;
+  headerName?: string;
+  stickyMode?: 'cookie' | 'header' | 'weighted' | string;
+  cookieName?: string;
+  headerField?: string;
+  regions?: EdgeExperimentRegion[];
+  defaultUpstream?: string;
+  variants?: EdgeExperimentVariant[];
+  killed?: boolean;
+  killReason?: string | null;
+  compiledCaddy?: Record<string, unknown>;
+  compiledRoute?: Record<string, unknown>;
+  caddyRoute?: Record<string, unknown>;
+  updatedAt?: string;
+}
+
+export interface VolumeMigrationPhase {
+  phase?: number | string;
+  id?: string;
+  name?: string;
+  title?: string;
+  description?: string;
+  disruptive?: boolean;
+  preservesNumericOwner?: string;
+  argv?: string[];
+  commands?: Array<string[] | { program: string; args: string[] }>;
+}
+
+export interface VolumeMigrationRecord {
+  id: string;
+  projectId?: string;
+  volumeName: string;
+  mountPath: string;
+  sourceHost: string;
+  targetHost: string;
+  uid: number;
+  gid: number;
+  containerName?: string;
+  estimatedMb?: number;
+  status?: string;
+  numericOwnerPreserved?: boolean;
+  zeroShell?: boolean;
+  phases?: VolumeMigrationPhase[];
+  plan?: {
+    zeroShell?: boolean;
+    numericOwnerPreserved?: boolean;
+    uidGid?: string;
+    retainSourceVolume?: boolean;
+    requiredFreeSpaceMb?: number;
+    phases?: VolumeMigrationPhase[];
+  };
+  createdAt?: string;
 }

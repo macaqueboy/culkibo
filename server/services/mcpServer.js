@@ -62,7 +62,11 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'sloCanaryController',
   'aiWorkloadService',
   'remoteBuilderService',
-  'logArchiveService'
+  'logArchiveService',
+  'admissionPolicyService',
+  'edgeExperimentService',
+  'complianceBundleService',
+  'volumeMigrationService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -108,7 +112,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_export_iac',
   'culkibo_secret_lease',
   'culkibo_webhook_dlq',
-  'culkibo_s3_storage'
+  'culkibo_s3_storage',
+  'culkibo_compliance_bundle'
 ]);
 
 /** @type {Record<string, number>} */
@@ -119,7 +124,7 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (40 destructivas + 5 = 45). */
+/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (41 destructivas + 6 = 47). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment',
@@ -128,7 +133,9 @@ const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_webhook_dlq',
   'culkibo_brand_theme',
   'culkibo_slo_canary',
-  'culkibo_remote_builder'
+  'culkibo_remote_builder',
+  'culkibo_admission_check',
+  'culkibo_edge_experiment'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -193,7 +200,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_s3_storage',
     'culkibo_slo_canary',
     'culkibo_ai_workload',
-    'culkibo_remote_builder'
+    'culkibo_remote_builder',
+    'culkibo_admission_check',
+    'culkibo_volume_migrate',
+    'culkibo_edge_experiment'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -239,6 +249,9 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_ai_workload',
     'culkibo_remote_builder',
     'culkibo_log_archive_search',
+    'culkibo_volume_migrate',
+    'culkibo_edge_experiment',
+    'culkibo_security_posture',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -276,7 +289,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_cve_scan',
     'culkibo_secret_lease',
     'culkibo_brand_theme',
-    'culkibo_dr_drill'
+    'culkibo_dr_drill',
+    'culkibo_admission_check',
+    'culkibo_compliance_bundle',
+    'culkibo_security_posture'
   ])
 });
 
@@ -376,7 +392,17 @@ const SEARCH_SYNONYMS = Object.freeze({
   ollama: ['ai', 'gpu', 'vram', 'llm', 'vllm', 'llamacpp'],
   vllm: ['ai', 'gpu', 'vram', 'llm', 'ollama', 'llamacpp'],
   builder: ['remote', 'buildx', 'offload', 'mux', 'ssh', 'prune', 'preview'],
-  archive: ['logs', 'ndjson', 'gzip', 'search', 'retention', 'history']
+  archive: ['logs', 'ndjson', 'gzip', 'search', 'retention', 'history'],
+  admission: ['policy', 'cis', 'pss', 'opa', 'kyverno', 'guardrail', 'security', 'privileged'],
+  policy: ['admission', 'cis', 'pss', 'opa', 'kyverno', 'compliance', 'posture'],
+  soc2: ['compliance', 'bundle', 'iso27001', 'gdpr', 'ed25519', 'posture', 'audit'],
+  iso27001: ['compliance', 'bundle', 'soc2', 'gdpr', 'ed25519', 'posture'],
+  gdpr: ['compliance', 'bundle', 'soc2', 'iso27001', 'ed25519', 'posture'],
+  compliance: ['bundle', 'soc2', 'iso27001', 'gdpr', 'posture', 'admission'],
+  volume: ['migrate', 'snapshot', 'tar', 'uid', 'stateful', 'vps', 'fleet'],
+  geo: ['experiment', 'country', 'ab', 'sticky', 'cookie', 'edge', 'caddy'],
+  experiment: ['ab', 'geo', 'sticky', 'cookie', 'killswitch', 'edge', 'caddy'],
+  posture: ['security', 'compliance', 'admission', 'cve', 'drill', 'rotation', 'scorecard']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -549,7 +575,13 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_slo_canary: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
   culkibo_ai_workload: { minRole: 'developer', scope: 'projects:read', projectScoped: false },
   culkibo_remote_builder: { minRole: 'admin', scope: 'fleet:write', projectScoped: false },
-  culkibo_log_archive_search: { minRole: 'viewer', scope: 'logs:read', projectScoped: true }
+  culkibo_log_archive_search: { minRole: 'viewer', scope: 'logs:read', projectScoped: true },
+  // MCP 2026 Cycle-11: Policy-as-Code Admission, Ed25519 Compliance Bundle, Volume Migration, Edge Geo/A-B & Security Posture (+5 = 140)
+  culkibo_admission_check: { minRole: 'developer', scope: 'security:read', projectScoped: false },
+  culkibo_compliance_bundle: { minRole: 'admin', scope: 'security:read', projectScoped: false, secretSensitive: true },
+  culkibo_volume_migrate: { minRole: 'developer', scope: 'fleet:write', projectScoped: true },
+  culkibo_edge_experiment: { minRole: 'developer', scope: 'domains:write', projectScoped: true },
+  culkibo_security_posture: { minRole: 'viewer', scope: 'security:read', projectScoped: false }
 });
 
 /**
@@ -3964,6 +3996,145 @@ class McpServer extends EventEmitter {
             limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Máximo de entradas devueltas (default 200)' }
           }
         }
+      },
+
+      // --- MCP 2026 Cycle-11: Policy-as-Code Admission, Ed25519 Compliance, Volume Migration, Edge Geo/A-B & Security Posture (+5 = 140) ---
+      {
+        name: 'culkibo_admission_check',
+        title: 'Evaluar y configurar Policy-as-Code Admission (10 reglas CIS/PSS)',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            policy: { type: ['object', 'null'] },
+            evaluation: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Motor declarativo Policy-as-Code (Kyverno/OPA-lite) con 10 reglas CIS/PSS (bloquea - /:/host:rw, docker.sock, privileged, SYS_ADMIN, :latest, UID 0 y bindings públicos 0.0.0.0:3000/5432). Permite get_policy y evaluate a developer/admin; apply_preset (baseline|restricted|soc2-strict) exige admin y corre en dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['get_policy', 'evaluate', 'apply_preset'], description: 'Operación sobre políticas de admisión (default "evaluate")' },
+            preset: { type: 'string', enum: ['baseline', 'restricted', 'soc2-strict'], description: 'Preset de política a evaluar o aplicar' },
+            spec: { type: 'object', description: 'Especificación de despliegue a evaluar en action="evaluate" ({ image, privileged, mounts, capAdd, uid, user, memoryLimitMb, cpuLimit, healthcheck, healthcheckPath, attestationVerified, ports, bindAddress })' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_compliance_bundle',
+        title: 'Generar y verificar Compliance Bundle Ed25519 (SOC2/ISO27001/GDPR)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            bundle: { type: ['object', 'null'] },
+            verification: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Genera o verifica criptográficamente un expediente de evidencia SOC 2 / ISO 27001 / GDPR firmado con Ed25519 (JSON canónico + SHA-256 + reporte Markdown, 0 secretos en claro y 0 claves privadas expuestas; solo admin/owner, redactado en auditoría).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['generate', 'verify', 'latest'], description: 'Operación de compliance bundle (default "generate")' },
+            framework: { type: 'string', enum: ['all', 'soc2', 'iso27001', 'gdpr'], description: 'Marco normativo objetivo (default "all")' },
+            snapshot: { type: 'object', description: 'Snapshot agregado opcional para generación determinista' },
+            bundle: { type: 'object', description: 'Bundle firmado a verificar criptográficamente en action="verify"' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_volume_migrate',
+        title: 'Planificar migración stateful de volúmenes entre VPS (4 fases)',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            migrations: { type: 'array' },
+            migration: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Planifica migraciones stateful cross-VPS en 4 fases sin shell (Pre-Sync → Quiesce + tar --numeric-owner + SHA-256 → SSH ControlMaster → Verificación UID/checksum), curando Coolify CVE-2025-66213 (inyección de nombre de volumen) y errores 999:999 de Postgres (ACL estricto por proyecto).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'plan'], description: 'Operación sobre migraciones de volumen (default "list")' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto propietario (obligatorio para plan; validado por ACL)' },
+            volumeName: { type: 'string', minLength: 1, maxLength: 128, description: 'Nombre seguro del volumen Docker (sin metacaracteres shell)' },
+            mountPath: { type: 'string', minLength: 1, maxLength: 256, description: 'Ruta de montaje del volumen dentro del contenedor (sin .. ni raíces host)' },
+            sourceHost: { type: 'string', maxLength: 253, description: 'Nodo origen (default "local")' },
+            targetHost: { type: 'string', maxLength: 253, description: 'Nodo VPS destino (debe diferir de sourceHost)' },
+            uid: { type: 'integer', minimum: 0, maximum: 65534, description: 'UID numérico a preservar con --numeric-owner (default 999)' },
+            gid: { type: 'integer', minimum: 0, maximum: 65534, description: 'GID numérico a preservar con --numeric-owner (default 999)' },
+            containerName: { type: 'string', maxLength: 128, description: 'Contenedor a pausar brevemente en fase 2' },
+            estimatedMb: { type: 'number', minimum: 1, maximum: 1048576, description: 'Tamaño estimado del volumen en MB (default 256)' },
+            sourceOrgId: { type: 'string', maxLength: 128, description: 'ID de organización origen para validación cross-tenant' },
+            targetOrgId: { type: 'string', maxLength: 128, description: 'ID de organización destino para validación cross-tenant' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_edge_experiment',
+        title: 'Orquestar Geo-Routing y experimentos A/B sticky en Caddy v2.11',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            experiments: { type: 'array' },
+            experiment: { type: ['object', 'null'] },
+            compiledRoutes: { type: ['object', 'array', 'null'] }
+          }
+        },
+        description: 'Compila y gestiona enrutado Geo-IP por país ISO-3166 (CF-IPCountry/X-Country) y splits A/B sticky (cookie/header + weighted_round_robin con pesos sumando 100) directamente en Caddy v2.11 sin plugins, incluyendo kill-switch 1-clic a 100% control (dryRun: true por defecto en upsert y kill_switch; ACL estricto por proyecto).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'upsert', 'compile', 'kill_switch'], description: 'Operación sobre experimentos Edge (default "list")' },
+            experimentId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del experimento (obligatorio para kill_switch)' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto (obligatorio para upsert; validado por ACL)' },
+            hostname: { type: 'string', maxLength: 253, description: 'Dominio público del experimento' },
+            kind: { type: 'string', enum: ['ab', 'geo'], description: 'Tipo de compilación: "ab" o "geo" (default "ab")' },
+            stickyMode: { type: 'string', enum: ['cookie', 'header', 'weighted'], description: 'Modo de afinidad A/B (default "cookie")' },
+            cookieName: { type: 'string', maxLength: 64, description: 'Nombre de cookie sticky (ej. ckb_ab_checkout)' },
+            headerField: { type: 'string', maxLength: 64, description: 'Cabecera para stickyMode="header" (default "X-AB-Group")' },
+            headerName: { type: 'string', enum: ['CF-IPCountry', 'X-Country'], description: 'Cabecera Geo-IP para kind="geo" (default "CF-IPCountry")' },
+            variants: { type: 'array', maxItems: 10, description: 'Variantes A/B [{ name, upstream, weight }] cuyos pesos deben sumar 100' },
+            regions: { type: 'array', maxItems: 20, description: 'Regiones Geo-IP [{ countries: ["DE","FR"], upstream }]' },
+            defaultUpstream: { type: 'string', maxLength: 253, description: 'Upstream fallback por defecto para kind="geo"' },
+            reason: { type: 'string', maxLength: 240, description: 'Motivo operativo para action="kill_switch"' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_security_posture',
+        title: 'Consultar scorecard ejecutivo de postura de seguridad y gobernanza',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            generatedAt: { type: 'string' },
+            postureScore: { type: 'number' },
+            grade: { type: 'string' },
+            pillars: { type: 'object' }
+          }
+        },
+        description: 'Scorecard ejecutivo unificado de solo lectura que agrega en una sola llamada el preset Policy-as-Code Admission, último Compliance Bundle Ed25519, resumen SBOM CVE Drift, rotación de secretos (>90 días) y tasa de éxito de DR Fire-Drills (sin secretos en claro; respetando RBAC/ACL).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            maxSecretAgeDays: { type: 'integer', minimum: 1, maximum: 3650, description: 'Umbral en días para secretos obsoletos (default 90)' }
+          }
+        }
       }
     ];
 
@@ -5975,6 +6146,11 @@ class McpServer extends EventEmitter {
       const r = slo && typeof slo.getRollout === 'function' ? slo.getRollout(String(args.rolloutId)) : null;
       refs.push({ projectId: r?.projectId || null, resourceKind: 'slo_rollout', missing: !r });
     }
+    if (args.experimentId) {
+      const expSvc = lazySvc('edgeExperimentService');
+      const exp = expSvc && typeof expSvc.getExperiment === 'function' ? expSvc.getExperiment(String(args.experimentId)) : null;
+      refs.push({ projectId: exp?.projectId || null, resourceKind: 'edge_experiment', missing: !exp });
+    }
     if (args.cronId) {
       const allCrons = cronManager.list();
       const cron = Array.isArray(allCrons) ? allCrons.find((c) => c.id === args.cronId) : null;
@@ -6076,6 +6252,15 @@ class McpServer extends EventEmitter {
         throw new McpToolError('FORBIDDEN', `La acción '${args.action}' de culkibo_brand_theme requiere rol admin/owner sin restricción de proyectos.`, {
           retryable: false,
           remediation: 'Usa action: "get" para leer la marca actual o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_admission_check' && args.action === 'apply_preset') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Cambiar el preset global de Policy-as-Code (apply_preset) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "get_policy" o "evaluate" para evaluar specs, o autentícate como admin/owner.'
         });
       }
     }
@@ -7041,6 +7226,50 @@ class McpServer extends EventEmitter {
           reversible = true;
         } else {
           effects.push(`Consultará '${action}' de remote builders sin modificar nodos ni ranuras activas.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_admission_check': {
+        const action = String(args.action || 'evaluate');
+        Object.assign(target, { action, preset: args.preset || null });
+        if (action === 'apply_preset') {
+          if (!args.preset) blockers.push('MISSING_PRESET');
+          effects.push(`Aplicará el preset global de Policy-as-Code Admission '${args.preset || '?'}' (10 reglas CIS/PSS) en admission-policies.json.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' en Policy-as-Code Admission sin mutar políticas activas.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_edge_experiment': {
+        const action = String(args.action || 'list');
+        Object.assign(target, {
+          action,
+          experimentId: args.experimentId || null,
+          projectId: args.projectId || null,
+          hostname: args.hostname || null,
+          kind: args.kind || 'ab'
+        });
+        if (action === 'upsert') {
+          if (!args.projectId) blockers.push('MISSING_PROJECT_ID');
+          if (!args.hostname) blockers.push('MISSING_HOSTNAME');
+          effects.push(`Guardará y compilará el experimento Edge (${args.kind || 'ab'}) en '${args.hostname || '?'}' para Caddy v2.11.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'kill_switch') {
+          if (!args.experimentId) blockers.push('MISSING_EXPERIMENT_ID');
+          effects.push(`Activará kill-switch inmediato sobre '${args.experimentId || '?'}' revirtiendo 100% del tráfico a la variante de control.`);
+          riskLevel = 'high';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' de Edge Geo/A-B sin modificar experimentos activos.`);
           riskLevel = 'low';
           reversible = true;
         }
@@ -10816,6 +11045,362 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_admission_check': {
+          const admSvc = requireLazySvc('admissionPolicyService', 'Declarative Policy-as-Code Admission Engine');
+          const action = String(args.action || 'evaluate');
+
+          if (action === 'get_policy') {
+            const policy = admSvc.getPolicy();
+            res = { ok: true, action: 'get_policy', dryRun: false, policy, evaluation: null };
+          } else if (action === 'apply_preset') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Cambiar el preset global Policy-as-Code requiere rol admin/owner sin restricción de proyectos.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner o usa action: "evaluate".'
+              });
+            }
+            if (!args.preset) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="apply_preset" requiere preset (baseline|restricted|soc2-strict).', {
+                retryable: true,
+                remediation: 'Indica preset: "baseline", "restricted" o "soc2-strict".'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                ok: true,
+                action: 'apply_preset',
+                dryRun: true,
+                applied: false,
+                policy: admSvc.getPolicy(),
+                evaluation: null,
+                wouldApplyPreset: String(args.preset)
+              };
+            } else {
+              try {
+                const policy = admSvc.applyPreset(String(args.preset));
+                res = { ok: true, action: 'apply_preset', dryRun: false, applied: true, policy, evaluation: null };
+              } catch (e) {
+                throw new McpToolError(e.code || 'INVALID_ADMISSION_PRESET', e.message || 'Preset de admisión inválido.', {
+                  retryable: true,
+                  remediation: 'Usa uno de los presets soportados: baseline, restricted o soc2-strict.'
+                });
+              }
+            }
+          } else {
+            // action === 'evaluate'
+            const spec = args.spec && typeof args.spec === 'object' ? args.spec : {};
+            try {
+              const evaluation = admSvc.evaluateDeployment(spec, args.preset ? { preset: String(args.preset) } : {});
+              res = {
+                ok: Boolean(evaluation && evaluation.allowed !== false),
+                action: 'evaluate',
+                dryRun: false,
+                policy: null,
+                evaluation
+              };
+            } catch (e) {
+              throw new McpToolError(e.code || 'ADMISSION_EVAL_ERROR', e.message || 'Error evaluando política de admisión.', {
+                retryable: true,
+                remediation: 'Pasa un objeto spec válido y un preset soportado (baseline|restricted|soc2-strict).'
+              });
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_compliance_bundle': {
+          const compSvc = requireLazySvc('complianceBundleService', 'Ed25519-Signed SOC2/ISO27001/GDPR Compliance Bundle');
+          const action = String(args.action || 'generate');
+
+          if (action === 'latest') {
+            const bundle = compSvc.getLatestBundle();
+            res = { ok: true, action: 'latest', bundle: bundle || null, verification: null };
+          } else if (action === 'verify') {
+            if (!args.bundle || typeof args.bundle !== 'object') {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="verify" requiere el objeto bundle a verificar.', {
+                retryable: true,
+                remediation: 'Pasa el bundle generado por action="generate" o action="latest".'
+              });
+            }
+            const verification = compSvc.verifyComplianceBundle(args.bundle);
+            res = {
+              ok: Boolean(verification && verification.valid),
+              action: 'verify',
+              bundle: null,
+              verification
+            };
+          } else {
+            // action === 'generate'
+            const actor = principal.email || principal.userId || principal.role || 'mcp-admin';
+            const bundle = await compSvc.generateBundle({
+              framework: String(args.framework || 'all'),
+              actor,
+              ...(args.snapshot && typeof args.snapshot === 'object' ? { snapshot: args.snapshot } : {})
+            });
+            res = { ok: true, action: 'generate', bundle, verification: null };
+          }
+          break;
+        }
+
+        case 'culkibo_volume_migrate': {
+          const volSvc = requireLazySvc('volumeMigrationService', 'Stateful Volume Snapshot Cloner & Cross-VPS Migration Planner');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const allowedIds = this._accessibleProjectIds(principal);
+            const effectiveIds = args.projectId
+              ? [String(args.projectId)]
+              : allowedIds;
+            const rawM = volSvc.listMigrations(effectiveIds !== null ? { projectIds: effectiveIds } : {});
+            const migrations = Array.isArray(rawM) ? rawM : (Array.isArray(rawM?.migrations) ? rawM.migrations : []);
+            res = { ok: true, action: 'list', migrations, migration: null };
+          } else {
+            // action === 'plan'
+            if (!args.projectId || !args.volumeName || !args.mountPath || !args.targetHost) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="plan" requiere projectId, volumeName, mountPath y targetHost.', {
+                retryable: true,
+                remediation: 'Indica projectId autorizado, volumeName seguro (sin shell chars), mountPath no-raíz y targetHost.'
+              });
+            }
+            if (!principal.isSuperAdmin && !canAccessProject(principal, String(args.projectId))) {
+              throw new McpToolError('FORBIDDEN', `No tienes acceso al proyecto '${args.projectId}'.`, {
+                retryable: false,
+                remediation: 'Usa un projectId autorizado desde culkibo_list_projects.'
+              });
+            }
+            try {
+              const migration = volSvc.planMigration({
+                projectId: String(args.projectId),
+                volumeName: String(args.volumeName),
+                mountPath: String(args.mountPath),
+                sourceHost: String(args.sourceHost || 'local'),
+                targetHost: String(args.targetHost),
+                uid: args.uid !== undefined ? Number(args.uid) : 999,
+                gid: args.gid !== undefined ? Number(args.gid) : 999,
+                containerName: args.containerName ? String(args.containerName) : '',
+                estimatedMb: args.estimatedMb !== undefined ? Number(args.estimatedMb) : 256,
+                ...(args.sourceOrgId ? { sourceOrgId: String(args.sourceOrgId) } : {}),
+                ...(args.targetOrgId ? { targetOrgId: String(args.targetOrgId) } : {})
+              });
+              res = { ok: true, action: 'plan', migrations: [], migration };
+            } catch (e) {
+              throw new McpToolError(e.code || 'INVALID_VOLUME_MIGRATION', e.message || 'Solicitud de migración de volumen rechazada.', {
+                retryable: false,
+                remediation: 'Verifica volumeName alfanumérico (CVE-2025-66213), mountPath sin traversal, hosts distintos y misma organización.'
+              });
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_edge_experiment': {
+          const expSvc = requireLazySvc('edgeExperimentService', 'Multi-Region Caddy v2.11 Geo-Routing & Sticky A/B Experiment Compiler');
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const rawE = expSvc.listExperiments(args.projectId ? String(args.projectId) : undefined);
+            const allE = Array.isArray(rawE) ? rawE : (Array.isArray(rawE?.experiments) ? rawE.experiments : []);
+            const filtered = allE.filter((e) => principal.isSuperAdmin || canAccessProject(principal, e.projectId));
+            res = { ok: true, action: 'list', dryRun: false, experiments: filtered, experiment: null, compiledRoutes: null };
+          } else if (action === 'compile') {
+            const kind = String(args.kind || 'ab');
+            try {
+              const compiledRoutes = kind === 'geo'
+                ? expSvc.compileGeoRoutes({
+                    hostname: String(args.hostname || 'app.example.com'),
+                    headerName: String(args.headerName || 'CF-IPCountry'),
+                    regions: Array.isArray(args.regions) ? args.regions : [],
+                    defaultUpstream: String(args.defaultUpstream || '127.0.0.1:3000')
+                  })
+                : expSvc.compileAbExperimentRoute({
+                    id: String(args.experimentId || 'exp_preview'),
+                    hostname: String(args.hostname || 'app.example.com'),
+                    stickyMode: String(args.stickyMode || 'cookie'),
+                    ...(args.cookieName ? { cookieName: String(args.cookieName) } : {}),
+                    ...(args.headerField ? { headerField: String(args.headerField) } : {}),
+                    variants: Array.isArray(args.variants) ? args.variants : [],
+                    killed: false
+                  });
+              res = { ok: true, action: 'compile', dryRun: true, experiments: [], experiment: null, compiledRoutes };
+            } catch (e) {
+              throw new McpToolError(e.code || 'INVALID_EDGE_EXPERIMENT', e.message || 'Configuración de Geo-Routing o A/B inválida.', {
+                retryable: true,
+                remediation: 'Usa códigos país ISO-3166 alpha-2 válidos y pesos enteros positivos que sumen exactamente 100.'
+              });
+            }
+          } else if (action === 'upsert') {
+            if (!args.projectId || !args.hostname) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="upsert" requiere projectId y hostname.', {
+                retryable: true,
+                remediation: 'Proporciona projectId autorizado, hostname y variants (sum=100) o regions Geo-IP.'
+              });
+            }
+            const cfg = {
+              ...(args.experimentId ? { id: String(args.experimentId) } : {}),
+              projectId: String(args.projectId),
+              hostname: String(args.hostname),
+              kind: String(args.kind || 'ab'),
+              stickyMode: String(args.stickyMode || 'cookie'),
+              ...(args.cookieName ? { cookieName: String(args.cookieName) } : {}),
+              ...(args.headerField ? { headerField: String(args.headerField) } : {}),
+              ...(args.headerName ? { headerName: String(args.headerName) } : {}),
+              ...(Array.isArray(args.variants) ? { variants: args.variants } : {}),
+              ...(Array.isArray(args.regions) ? { regions: args.regions } : {}),
+              ...(args.defaultUpstream ? { defaultUpstream: String(args.defaultUpstream) } : {})
+            };
+            const dryRun = args.dryRun !== false;
+            try {
+              if (typeof expSvc.validateExperimentConfig === 'function') {
+                expSvc.validateExperimentConfig(cfg);
+              }
+            } catch (e) {
+              throw new McpToolError(e.code || 'INVALID_EDGE_EXPERIMENT', e.message || 'Configuración de experimento Edge inválida.', {
+                retryable: true,
+                remediation: 'Corrige códigos ISO-3166, upstreams host:port o suma de pesos == 100.'
+              });
+            }
+            if (dryRun) {
+              res = { ok: true, action: 'upsert', dryRun: true, upserted: false, experiments: [], experiment: null, compiledRoutes: null, wouldUpsert: cfg };
+            } else {
+              try {
+                const upserted = expSvc.upsertExperiment(cfg);
+                res = {
+                  ok: true,
+                  action: 'upsert',
+                  dryRun: false,
+                  upserted: true,
+                  experiments: [],
+                  experiment: upserted?.experiment || upserted,
+                  compiledRoutes: upserted?.experiment?.compiledCaddy || upserted?.compiledRoutes || upserted?.caddyRoute || null
+                };
+              } catch (e) {
+                throw new McpToolError(e.code || 'INVALID_EDGE_EXPERIMENT', e.message || 'No se pudo guardar el experimento Edge.', {
+                  retryable: true,
+                  remediation: 'Revisa los parámetros de variantes o regiones Geo-IP.'
+                });
+              }
+            }
+          } else {
+            // action === 'kill_switch'
+            if (!args.experimentId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="kill_switch" requiere experimentId.', {
+                retryable: true,
+                remediation: 'Lista experimentos con action="list" y pasa experimentId.'
+              });
+            }
+            const existing = expSvc.getExperiment(String(args.experimentId));
+            if (!existing) {
+              throw new McpToolError('EXPERIMENT_NOT_FOUND', `Experimento Edge '${args.experimentId}' no encontrado.`, {
+                retryable: false,
+                remediation: 'Consulta experimentos activos con action="list".'
+              });
+            }
+            if (!principal.isSuperAdmin && !canAccessProject(principal, existing.projectId)) {
+              throw new McpToolError('FORBIDDEN', `No tienes acceso al experimento '${args.experimentId}'.`, {
+                retryable: false,
+                remediation: 'Solo puedes revertir experimentos de tus proyectos autorizados.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = { ok: true, action: 'kill_switch', dryRun: true, killed: false, experiments: [], experiment: existing, compiledRoutes: null };
+            } else {
+              const killed = expSvc.triggerKillSwitch(String(args.experimentId), {
+                reason: args.reason ? String(args.reason) : 'mcp_kill_switch'
+              });
+              res = {
+                ok: true,
+                action: 'kill_switch',
+                dryRun: false,
+                killed: true,
+                experiments: [],
+                experiment: killed?.experiment || killed,
+                compiledRoutes: killed?.experiment?.compiledCaddy || killed?.compiledRoutes || killed?.caddyRoute || null
+              };
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_security_posture': {
+          const maxSecretAgeDays = Math.min(3650, Math.max(1, Number(args.maxSecretAgeDays) || 90));
+          const visibleProjects = projectManager.getAll().filter((p) => canAccessProject(principal, p.id, p));
+
+          const admSvc = lazySvc('admissionPolicyService');
+          const compSvc = lazySvc('complianceBundleService');
+          const cveSvc = lazySvc('cveDriftService');
+          const sls = lazySvc('secretLeaseService');
+          const drSvc = lazySvc('backupDrillService');
+
+          const admPolicy = admSvc && typeof admSvc.getPolicy === 'function' ? admSvc.getPolicy() : null;
+          const latestBundle = compSvc && typeof compSvc.getLatestBundle === 'function' ? compSvc.getLatestBundle() : null;
+          /** @type {any} */
+          let cveSummary = null;
+          if (cveSvc && typeof cveSvc.scanSbom === 'function') {
+            try {
+              const scan = await cveSvc.scanSbom({ allowNetwork: false });
+              cveSummary = {
+                mode: scan?.source || 'offline_fallback',
+                scannedPackages: Number(scan?.scannedPackages ?? scan?.scannedComponents ?? 0),
+                totalVulnerabilities: Number(scan?.totalVulnerabilities ?? scan?.vulnerableCount ?? 0),
+                bySeverity: scan?.bySeverity || { critical: 0, high: 0, medium: 0, low: 0 }
+              };
+            } catch (e) {}
+          }
+          const rotAudit = sls && typeof sls.auditSecretRotationAges === 'function'
+            ? sls.auditSecretRotationAges(visibleProjects, { maxAgeDays: maxSecretAgeDays })
+            : null;
+          const rawDrills = drSvc && typeof drSvc.listDrills === 'function'
+            ? drSvc.listDrills(principal.isSuperAdmin ? null : { allowedProjectIds: visibleProjects.map((p) => p.id) })
+            : null;
+          const drillsArr = Array.isArray(rawDrills) ? rawDrills : (Array.isArray(rawDrills?.drills) ? rawDrills.drills : []);
+          const drillsPassed = drillsArr.filter((d) => d && d.verdict === 'PASS').length;
+          const drPassRatePct = drillsArr.length > 0 ? Math.round((drillsPassed / drillsArr.length) * 100) : 100;
+
+          // Weighted executive governance score (0..100)
+          const admScore = admPolicy?.preset === 'soc2-strict' ? 100 : (admPolicy?.preset === 'restricted' ? 95 : 85);
+          const compScore = Number(latestBundle?.overallScore ?? latestBundle?.payload?.overallScore ?? 92);
+          const cveCrit = Number(cveSummary?.bySeverity?.critical ?? 0);
+          const cveHigh = Number(cveSummary?.bySeverity?.high ?? 0);
+          const cveScore = Math.max(0, 100 - cveCrit * 25 - cveHigh * 10);
+          const staleCount = Number(rotAudit?.staleCount ?? 0);
+          const rotScore = staleCount === 0 ? 100 : Math.max(40, 100 - staleCount * 10);
+          const postureScore = Math.round((admScore * 0.25) + (compScore * 0.25) + (cveScore * 0.2) + (rotScore * 0.15) + (drPassRatePct * 0.15));
+          const grade = postureScore >= 95 ? 'A+' : (postureScore >= 88 ? 'A' : (postureScore >= 75 ? 'B' : (postureScore >= 60 ? 'C' : 'D')));
+
+          res = {
+            ok: true,
+            generatedAt: new Date().toISOString(),
+            postureScore,
+            grade,
+            pillars: {
+              admission: {
+                preset: admPolicy?.preset || 'baseline',
+                score: admScore
+              },
+              compliance: {
+                hasBundle: Boolean(latestBundle),
+                overallScore: compScore,
+                signedAlgorithm: latestBundle ? 'Ed25519' : null,
+                generatedAt: latestBundle?.generatedAt || latestBundle?.payload?.generatedAt || null
+              },
+              cveDrift: cveSummary,
+              secretRotation: {
+                maxAgeDays: maxSecretAgeDays,
+                totalKeys: Number(rotAudit?.totalKeys ?? 0),
+                staleCount
+              },
+              drDrills: {
+                totalDrills: drillsArr.length,
+                passedDrills: drillsPassed,
+                passRatePct: drPassRatePct
+              }
+            }
+          };
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -11799,7 +12384,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 135 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 140 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), Policy-as-Code Admission de 10 reglas CIS/PSS (culkibo_admission_check), expedientes SOC2/ISO27001/GDPR firmados Ed25519 (culkibo_compliance_bundle), planificador de migración stateful cross-VPS en 4 fases (culkibo_volume_migrate), Geo-Routing y A/B sticky en Caddy v2.11 (culkibo_edge_experiment), scorecard ejecutivo de seguridad (culkibo_security_posture), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

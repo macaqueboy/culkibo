@@ -55,7 +55,7 @@ function formatPodLabel(pod: string): string {
   if (pod === 'forge') return 'Local';
   if (pod === 'citadel') return 'Prod';
   if (pod === 'edge') return 'Caddy';
-  return pod || 'Sistema';
+  return pod || 'System';
 }
 
 function parseSinceMs(since: string): number | null {
@@ -68,14 +68,14 @@ function parseSinceMs(since: string): number | null {
 
 function compileClientSafeRegex(pattern: string): { regex: RegExp | null; error: string | null } {
   if (!pattern) return { regex: null, error: null };
-  if (pattern.length > 160) return { regex: null, error: 'Regex demasiado larga (máx. 160 caracteres)' };
+  if (pattern.length > 160) return { regex: null, error: 'Regex too long (max 160 chars)' };
   if (/\\[1-9]/.test(pattern) || /\(\?<[=!]/.test(pattern) || /\([^)]*[+*?}][^)]*\)\s*[+*{]/.test(pattern)) {
-    return { regex: null, error: 'Regex rechazada por seguridad (cuantificadores anidados)' };
+    return { regex: null, error: 'Regex rejected by ReDoS safety guard (nested quantifiers)' };
   }
   try {
     return { regex: new RegExp(pattern, 'i'), error: null };
   } catch (e: any) {
-    return { regex: null, error: e?.message || 'Regex inválida' };
+    return { regex: null, error: e?.message || 'Invalid regex' };
   }
 }
 
@@ -443,12 +443,12 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
           <div className="flex flex-wrap items-center gap-2">
             {!projectId && projects.length > 0 && (
               <select
-                aria-label="Filtrar por proyecto"
+                aria-label={t('logs.allProjects')}
                 value={selectedProjectId}
                 onChange={(e) => setSelectedProjectId(e.target.value)}
                 className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
               >
-                <option value="all">Todos los proyectos</option>
+                <option value="all">{t('logs.allProjects')}</option>
                 {projects.map((p) => (
                   <option key={p.id} value={p.id}>{p.name}</option>
                 ))}
@@ -456,24 +456,24 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
             )}
 
             <select
-              aria-label="Filtrar por origen"
+              aria-label={t('logs.allSources')}
               value={selectedPod}
               onChange={(e) => setSelectedPod(e.target.value)}
               className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
             >
-              <option value="all">Todos los orígenes</option>
-              <option value="forge">Desarrollo (Live Sync)</option>
-              <option value="citadel">Producción</option>
-              <option value="edge">Enrutador (Caddy)</option>
+              <option value="all">{t('logs.allSources')}</option>
+              <option value="forge">{t('logs.sourceDev')}</option>
+              <option value="citadel">{t('logs.sourceProd')}</option>
+              <option value="edge">{t('logs.sourceEdge')}</option>
             </select>
 
             <select
-              aria-label="Filtrar por nivel"
+              aria-label={t('logs.allLevels')}
               value={selectedLevel}
               onChange={(e) => setSelectedLevel(e.target.value)}
               className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
             >
-              <option value="all">Todos los niveles</option>
+              <option value="all">{t('logs.allLevels')}</option>
               <option value="info">INFO</option>
               <option value="hot_sync">HOT_SYNC</option>
               <option value="success">SUCCESS</option>
@@ -482,24 +482,24 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
             </select>
 
             <select
-              aria-label="Ventana de tiempo"
+              aria-label={t('logs.allHistory')}
               value={sinceWindow}
               onChange={(e) => setSinceWindow(e.target.value)}
               className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors"
             >
-              <option value="all">Todo el historial</option>
-              <option value="5m">Últimos 5m</option>
-              <option value="15m">Últimos 15m</option>
-              <option value="1h">Última 1h</option>
-              <option value="6h">Últimas 6h</option>
-              <option value="24h">Últimas 24h</option>
+              <option value="all">{t('logs.allHistory')}</option>
+              <option value="5m">{t('logs.last5m')}</option>
+              <option value="15m">{t('logs.last15m')}</option>
+              <option value="1h">{t('logs.last1h')}</option>
+              <option value="6h">{t('logs.last6h')}</option>
+              <option value="24h">{t('logs.last24h')}</option>
             </select>
 
             <div className="relative flex items-center">
               <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 pointer-events-none" />
               <input
                 type="text"
-                placeholder={regexMode ? 'Regex p. ej. timeout|50[0-4]…' : 'Buscar en registros…'}
+                placeholder={regexMode ? t('logs.searchRegexPlaceholder') : t('logs.searchPlaceholder')}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={(e) => {
@@ -510,8 +510,8 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               <button
                 type="button"
                 onClick={() => setRegexMode((v) => !v)}
-                aria-label="Alternar búsqueda por expresión regular"
-                title="Activar/desactivar búsqueda Regex (protegida contra ReDoS)"
+                aria-label="Toggle regular expression search"
+                title="Toggle ReDoS-safe regex search"
                 className={`absolute right-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold cursor-pointer border ${
                   regexMode
                     ? 'bg-slate-900 text-white border-slate-900'
@@ -527,9 +527,9 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               placeholder="@status:500 method=POST"
               value={attrFilter}
               onChange={(e) => setAttrFilter(e.target.value)}
-              aria-label="Filtrar por atributos JSON estructurados"
+              aria-label="Filter by structured JSON attributes"
               className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800 placeholder-slate-400 w-40"
-              title="Filtra campos JSON o key=value (ej. status=500)"
+              title="Filter JSON or key=value attributes (e.g. status=500)"
             />
           </div>
 
@@ -538,8 +538,8 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               type="button"
               onClick={() => void fetchServerLogs()}
               disabled={refreshing}
-              aria-label="Consultar historial en servidor"
-              title="Consultar historial persistente del servidor"
+              aria-label="Refresh server log history"
+              title="Refresh persistent server log history"
               className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-slate-900 transition-colors cursor-pointer"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
@@ -549,10 +549,10 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               type="button"
               onClick={() => void handleCopyForAi()}
               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 transition-colors cursor-pointer"
-              title="Copia los últimos 30 errores más recientes listos para pegar en un agente de IA"
+              title="Copy latest 30 errors formatted for an AI coding agent"
             >
               {copiedAi ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-slate-500" />}
-              <span>{copiedAi ? 'Copiado para IA' : 'Copiar errores para IA'}</span>
+              <span>{copiedAi ? t('logs.copiedAi') : t('logs.copyAi')}</span>
             </button>
 
             <button
@@ -565,15 +565,15 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               }`}
             >
               {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-              <span>{isPaused ? (pausedBuffered > 0 ? `Reanudar (+${pausedBuffered})` : 'Reanudar') : 'Pausar'}</span>
+              <span>{isPaused ? (pausedBuffered > 0 ? `${t('logs.resume')} (+${pausedBuffered})` : t('logs.resume')) : t('logs.pause')}</span>
             </button>
 
             <button
               type="button"
               onClick={() => setLogs([])}
-              aria-label="Limpiar vista de registros"
+              aria-label="Clear log view"
               className="p-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
-              title="Limpiar vista"
+              title="Clear view"
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
@@ -582,9 +582,9 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               type="button"
               disabled={exporting}
               onClick={() => void handleDownload('log')}
-              aria-label="Exportar registros en formato .log"
+              aria-label="Export logs as .log"
               className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-600 hover:text-slate-900 transition-colors cursor-pointer disabled:opacity-50"
-              title="Exportar historial filtrado (.log)"
+              title="Export filtered log history (.log)"
             >
               <Download className="w-3.5 h-3.5" />
               <span>.log</span>
@@ -625,7 +625,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
             className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer shrink-0"
           >
             {archiveOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-            <span>{archiveOpen ? 'Hide' : 'Search'}</span>
+            <span>{archiveOpen ? t('logs.archiveHide') : t('logs.archiveOpenBtn')}</span>
           </button>
         </div>
 
@@ -661,7 +661,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
                 onChange={(e) => setArchiveLevel(e.target.value)}
                 className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-700"
               >
-                <option value="ALL">All levels</option>
+                <option value="ALL">{t('logs.allLevels')}</option>
                 <option value="INFO">INFO</option>
                 <option value="WARN">WARN</option>
                 <option value="ERROR">ERROR</option>
@@ -707,7 +707,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
                     ))}
                   </div>
                 ) : (
-                  <div className="p-3 text-center text-slate-400">0 archived matches found.</div>
+                  <div className="p-3 text-center text-slate-400">{t('logs.archiveNoMatches')}</div>
                 )}
               </div>
             ) : (
@@ -721,7 +721,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
         <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 border-b border-slate-200">
           <div className="flex items-center gap-2">
             <Terminal className="w-4 h-4 text-slate-500" />
-            <span className="text-xs font-semibold text-slate-800">Explorador de registros estructurados</span>
+            <span className="text-xs font-semibold text-slate-800">{t('logs.explorerTitle')}</span>
           </div>
 
           <div className="flex items-center gap-3 text-xs text-slate-500">
@@ -744,12 +744,12 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               </button>
             )}
             <span className="tabular-nums">
-              {filteredLogs.length} {filteredLogs.length === 1 ? 'evento' : 'eventos'}
+              {filteredLogs.length} {filteredLogs.length === 1 ? t('logs.eventSingular') : t('logs.eventPlural')}
             </span>
             {!isPaused && (
               <span className="flex items-center gap-1.5 text-emerald-700 font-medium">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                En vivo
+                {t('logs.liveBadge')}
               </span>
             )}
           </div>
@@ -767,7 +767,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
         >
           {filteredLogs.length === 0 ? (
             <div className="flex h-full items-center justify-center text-slate-400 font-sans text-xs">
-              Todavía no hay registros que coincidan con este filtro.
+              {t('logs.emptyFiltered')}
             </div>
           ) : (
             <div className="space-y-0.5">
@@ -843,7 +843,7 @@ export const LiveLogs: React.FC<LiveLogsProps> = ({ incomingLog, projectId }) =>
               }}
               className="sticky bottom-2 float-right px-2.5 py-1 rounded-full bg-slate-900 text-white text-[11px] font-sans font-medium shadow-md hover:bg-slate-800 cursor-pointer"
             >
-              Ir al final ↓
+              {t('logs.scrollBottom')}
             </button>
           )}
         </div>

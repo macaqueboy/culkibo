@@ -106,6 +106,14 @@ interface DemoState {
   drDrills: any[];
   sloCanaries: Record<string, any[]>;
   remoteBuilders: any[];
+  admissionPolicy: {
+    preset: string;
+    rules: Record<string, string>;
+    updatedAt: string;
+  };
+  latestComplianceBundle: any;
+  edgeExperiments: any[];
+  volumeMigrations: any[];
 }
 
 function createInitialDemoState(): DemoState {
@@ -757,6 +765,154 @@ function createInitialDemoState(): DemoState {
         keepStorageGb: 25,
         sshMuxPinned: false,
         status: 'ready',
+      },
+    ],
+    admissionPolicy: {
+      preset: 'restricted',
+      rules: {
+        no_privileged: 'enforce',
+        no_docker_sock_mount: 'enforce',
+        no_host_root_mount: 'enforce',
+        no_dangerous_caps: 'enforce',
+        no_latest_tag: 'enforce',
+        require_non_root_uid: 'enforce',
+        require_resource_limits: 'enforce',
+        require_healthcheck: 'enforce',
+        require_signed_attestation: 'audit',
+        no_public_db_or_panel_bind: 'enforce',
+      },
+      updatedAt: t1,
+    },
+    latestComplianceBundle: {
+      ok: true,
+      algorithm: 'Ed25519',
+      bundleId: 'cmp_demo_soc2_01',
+      framework: 'all',
+      generatedAt: t1,
+      overallScore: 96,
+      payloadSha256: 'c4f92e1a8b7d30654a2c9e8d10f7b1a5c3e9d01f2a4b6c8d0e1f2a3b4c5d6e7f',
+      signatureB64: 'mN7pQ3rS6tU0vW2xY4zA8bC1dE3fG5hI9jK2lM4nO6pQ8rS0tU2vW4xY6zA8bC1dE3fG5hI9jK2lM4nO6pQ==',
+      publicKeyPem: '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEADEMOCulkiboComplianceEd25519PubKeyOnlyForSandbox==\n-----END PUBLIC KEY-----',
+      payload: {
+        schemaVersion: '1.0.0',
+        bundleId: 'cmp_demo_soc2_01',
+        framework: 'all',
+        overallScore: 96,
+        zeroPlaintextSecrets: true,
+        generatedAt: t1,
+        controls: [
+          { domain: 'Access Control & Strong Authentication', controlIds: ['SOC2-CC6.1', 'ISO27001-A.5.15', 'GDPR-Art32'], status: 'pass', score: 100, summary: 'RBAC=ON, TOTP 2FA + FIDO2 Passkeys active (100% adoption).' },
+          { domain: 'Encryption at Rest & Secret Isolation', controlIds: ['SOC2-CC6.7', 'ISO27001-A.8.24', 'GDPR-Art32'], status: 'pass', score: 100, summary: 'AES-256-GCM encrypted Vault with 0600 file modes (0 plaintext Postgres env storage).' },
+          { domain: 'Tamper-Evident Audit Trail', controlIds: ['SOC2-CC7.2', 'ISO27001-A.8.15'], status: 'pass', score: 100, summary: 'SHA-256 hash-chained append-only audit log integrity VERIFIED.' },
+          { domain: 'Supply-Chain & Vulnerability Management', controlIds: ['SOC2-CC7.1', 'ISO27001-A.8.8'], status: 'pass', score: 95, summary: 'CycloneDX 1.6 SBOM + SLSA v1.1 Ed25519 provenance; 0 critical CVEs.' },
+          { domain: 'Change & Admission Governance', controlIds: ['SOC2-CC8.1', 'ISO27001-A.8.9'], status: 'pass', score: 100, summary: 'Policy-as-Code Admission preset="restricted", shell:false zero-shell enforced.' },
+          { domain: 'Availability & Disaster Recovery Drills', controlIds: ['SOC2-A1.2', 'ISO27001-A.8.14', 'GDPR-Art32'], status: 'pass', score: 100, summary: 'DR Fire-Drills: 100% pass rate, latest RTO=312 ms, RPO=30m.' },
+        ],
+      },
+      markdownReport: [
+        '# Culkibo Cryptographic Compliance Evidence Dossier',
+        '',
+        '- **Bundle ID:** `cmp_demo_soc2_01`',
+        '- **Frameworks:** SOC 2 · ISO 27001 · GDPR',
+        '- **Overall Score:** **96 / 100**',
+        '- **Signature:** Ed25519 Verified · `0` plaintext secrets',
+        '- **Payload SHA-256:** `c4f92e1a8b7d30654a2c9e8d10f7b1a5c3e9d01f2a4b6c8d0e1f2a3b4c5d6e7f`',
+        '',
+        '| Domain | Controls | Status | Score |',
+        '|---|---|---|---|',
+        '| Access Control & Strong Auth | SOC2-CC6.1, ISO27001-A.5.15, GDPR-Art32 | PASS | 100 |',
+        '| Encryption at Rest (AES-256-GCM) | SOC2-CC6.7, ISO27001-A.8.24, GDPR-Art32 | PASS | 100 |',
+        '| Tamper-Evident Audit Trail | SOC2-CC7.2, ISO27001-A.8.15 | PASS | 100 |',
+        '| Supply-Chain & SBOM/SLSA | SOC2-CC7.1, ISO27001-A.8.8 | PASS | 95 |',
+        '| Admission & Zero-Shell Governance | SOC2-CC8.1, ISO27001-A.8.9 | PASS | 100 |',
+        '| Disaster Recovery Fire-Drills | SOC2-A1.2, ISO27001-A.8.14, GDPR-Art32 | PASS | 100 |',
+      ].join('\n'),
+    },
+    edgeExperiments: [
+      {
+        id: 'exp_geo_eu_us',
+        projectId: 'proj_acme_web',
+        name: 'Global Geo-IP Edge Router',
+        kind: 'geo',
+        hostname: 'app.acme-demo.dev',
+        headerName: 'CF-IPCountry',
+        regions: [
+          { countries: ['DE', 'FR', 'ES', 'NL'], upstream: '10.88.0.2:3000', label: 'eu-central' },
+          { countries: ['US', 'CA'], upstream: '10.88.0.3:3000', label: 'us-east' },
+        ],
+        defaultUpstream: '127.0.0.1:3000',
+        killed: false,
+        compiledCaddy: {
+          subroutes: [
+            { match: [{ header: { 'CF-IPCountry': ['DE', 'FR', 'ES', 'NL'] } }], handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: '10.88.0.2:3000' }] }], terminal: true },
+            { match: [{ header: { 'CF-IPCountry': ['US', 'CA'] } }], handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: '10.88.0.3:3000' }] }], terminal: true },
+            { handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: '127.0.0.1:3000' }] }] },
+          ],
+        },
+        updatedAt: t1,
+      },
+      {
+        id: 'exp_ab_checkout_v2',
+        projectId: 'proj_acme_web',
+        name: 'Sticky Checkout v2 A/B Split',
+        kind: 'ab',
+        hostname: 'app.acme-demo.dev',
+        stickyMode: 'cookie',
+        cookieName: 'ckb_ab_checkout',
+        variants: [
+          { name: 'control', upstream: '127.0.0.1:3000', weight: 50 },
+          { name: 'variant-b', upstream: '127.0.0.1:3001', weight: 50 },
+        ],
+        killed: false,
+        compiledCaddy: {
+          route: {
+            match: [{ host: ['app.acme-demo.dev'] }],
+            handle: [{
+              handler: 'reverse_proxy',
+              upstreams: [{ dial: '127.0.0.1:3000' }, { dial: '127.0.0.1:3001' }],
+              load_balancing: {
+                selection_policy: {
+                  policy: 'cookie',
+                  name: 'ckb_ab_checkout',
+                  fallback: { policy: 'weighted_round_robin', weights: [50, 50] },
+                },
+              },
+            }],
+            terminal: true,
+          },
+        },
+        updatedAt: t1,
+      },
+    ],
+    volumeMigrations: [
+      {
+        id: 'volmig_demo_pg_01',
+        projectId: 'proj_acme_web',
+        volumeName: 'acme_postgres_data',
+        mountPath: '/var/lib/postgresql/data',
+        sourceHost: 'local',
+        targetHost: '198.51.100.42',
+        uid: 999,
+        gid: 999,
+        containerName: 'culkibo-db-pg-main',
+        estimatedMb: 420,
+        status: 'planned',
+        numericOwnerPreserved: true,
+        zeroShell: true,
+        plan: {
+          zeroShell: true,
+          numericOwnerPreserved: true,
+          uidGid: '999:999',
+          retainSourceVolume: true,
+          requiredFreeSpaceMb: 924,
+          phases: [
+            { phase: 1, id: 'pre_sync', title: 'Warm pre-sync & disk headroom check', commands: [{ program: 'docker', args: ['volume', 'inspect', 'acme_postgres_data'] }, { program: 'ssh', args: ['-o', 'BatchMode=yes', 'root@198.51.100.42', 'docker', 'volume', 'create', 'acme_postgres_data'] }] },
+            { phase: 2, id: 'quiesce_snapshot', title: 'Quiesce + tar --numeric-owner (999:999) + SHA-256', commands: [{ program: 'docker', args: ['pause', 'culkibo-db-pg-main'] }, { program: 'docker', args: ['run', '--rm', '--mount', 'type=volume,source=acme_postgres_data,target=/source,readonly', 'alpine:3.20', 'tar', '--numeric-owner', '-czf', '/backup/acme_postgres_data.tar.gz', '-C', '/source', '.'] }, { program: 'docker', args: ['unpause', 'culkibo-db-pg-main'] }] },
+            { phase: 3, id: 'ssh_stream_transfer', title: 'SSH ControlMaster zero-shell transfer to 198.51.100.42', commands: [{ program: 'scp', args: ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '/var/tmp/culkibo-volmig/acme_postgres_data/acme_postgres_data.tar.gz', 'root@198.51.100.42:/var/tmp/culkibo-volmig/acme_postgres_data/'] }] },
+            { phase: 4, id: 'verify_and_cutover', title: 'Target SHA-256 verify + tar --numeric-owner extract + stat 999:999', commands: [{ program: 'ssh', args: ['-o', 'BatchMode=yes', 'root@198.51.100.42', 'sha256sum', '-c', '/var/tmp/culkibo-volmig/acme_postgres_data/acme_postgres_data.sha256'] }, { program: 'ssh', args: ['-o', 'BatchMode=yes', 'root@198.51.100.42', 'docker', 'run', '--rm', '--mount', 'type=volume,source=acme_postgres_data,target=/target', 'alpine:3.20', 'tar', '--numeric-owner', '-xzf', '/backup/acme_postgres_data.tar.gz', '-C', '/target'] }] },
+          ],
+        },
+        createdAt: t2,
       },
     ],
   };
@@ -2535,6 +2691,22 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
   if (pathname === '/api/fleet/builders' && method === 'GET') {
     return jsonResponse({ ok: true, builders: s.remoteBuilders });
   }
+  if (pathname === '/api/fleet/builders' && method === 'POST') {
+    const rec = {
+      id: `bld_${Date.now().toString(36)}`,
+      name: String(body.name || 'remote-builder'),
+      host: String(body.host || '10.88.0.10'),
+      arch: String(body.arch || 'linux/amd64'),
+      maxConcurrency: Number(body.maxConcurrency) || 4,
+      activeBuilds: 0,
+      allowPreviews: body.allowPreviews !== false,
+      keepStorageGb: Number(body.keepStorageGb) || 20,
+      sshMuxPinned: false,
+      status: 'ready',
+    };
+    s.remoteBuilders = [rec, ...s.remoteBuilders];
+    return jsonResponse({ ok: true, builder: rec }, 201);
+  }
   if (pathname === '/api/fleet/builders/schedule' && method === 'POST') {
     const isPreview = Boolean(body.isPreview);
     const arch = String(body.arch || 'linux/amd64');
@@ -2620,6 +2792,267 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       volumeMount: `culkibo_ai_${runtime}_cache:${cachePath}`,
       caddyProxyGuard: `Caddy Bearer Auth Proxy -> ${bindAddress}:${port} (blocks unauthenticated CVE-2025-63389 access)`,
     });
+  }
+
+  // --- Cycle-11 Enterprise Governance & Multi-Region Edge APIs ---
+  if (pathname === '/api/security/admission-policy' && method === 'GET') {
+    return jsonResponse({ ok: true, ...s.admissionPolicy });
+  }
+  if (pathname === '/api/security/admission-policy' && method === 'PUT') {
+    const presetMap: Record<string, Record<string, string>> = {
+      baseline: {
+        no_privileged: 'enforce',
+        no_docker_sock_mount: 'enforce',
+        no_host_root_mount: 'enforce',
+        no_dangerous_caps: 'enforce',
+        no_latest_tag: 'audit',
+        require_non_root_uid: 'audit',
+        require_resource_limits: 'audit',
+        require_healthcheck: 'audit',
+        require_signed_attestation: 'audit',
+        no_public_db_or_panel_bind: 'enforce',
+      },
+      restricted: {
+        no_privileged: 'enforce',
+        no_docker_sock_mount: 'enforce',
+        no_host_root_mount: 'enforce',
+        no_dangerous_caps: 'enforce',
+        no_latest_tag: 'enforce',
+        require_non_root_uid: 'enforce',
+        require_resource_limits: 'enforce',
+        require_healthcheck: 'enforce',
+        require_signed_attestation: 'audit',
+        no_public_db_or_panel_bind: 'enforce',
+      },
+      'soc2-strict': {
+        no_privileged: 'enforce',
+        no_docker_sock_mount: 'enforce',
+        no_host_root_mount: 'enforce',
+        no_dangerous_caps: 'enforce',
+        no_latest_tag: 'enforce',
+        require_non_root_uid: 'enforce',
+        require_resource_limits: 'enforce',
+        require_healthcheck: 'enforce',
+        require_signed_attestation: 'enforce',
+        no_public_db_or_panel_bind: 'enforce',
+      },
+    };
+    const nextPreset = String(body.preset || s.admissionPolicy.preset);
+    const baseRules = presetMap[nextPreset] || s.admissionPolicy.rules;
+    s.admissionPolicy = {
+      preset: nextPreset,
+      rules: { ...baseRules, ...(body.rules && typeof body.rules === 'object' ? body.rules : {}) },
+      updatedAt: nowIso(),
+    };
+    return jsonResponse({ ok: true, ...s.admissionPolicy });
+  }
+  if (pathname === '/api/security/admission-policy/evaluate' && method === 'POST') {
+    const spec = (body.spec && typeof body.spec === 'object' ? body.spec : body) as Record<string, any>;
+    const rules = s.admissionPolicy.rules;
+    const mounts = [...(Array.isArray(spec.mounts) ? spec.mounts : []), ...(Array.isArray(spec.volumes) ? spec.volumes : [])].map(String);
+    const ports = Array.isArray(spec.ports) ? spec.ports.map(String) : [];
+    const caps = Array.isArray(spec.capAdd) ? spec.capAdd.map((c: unknown) => String(c).toUpperCase()) : [];
+    const img = String(spec.image || '');
+    const checks: Array<{ id: string; passed: boolean; message: string; severity: string }> = [
+      { id: 'no_privileged', passed: !spec.privileged, severity: 'critical', message: spec.privileged ? 'Container requests privileged: true (full host root escape)' : 'Not privileged' },
+      { id: 'no_docker_sock_mount', passed: !mounts.some((m) => m.includes('docker.sock') || m.includes('containerd.sock')), severity: 'critical', message: mounts.some((m) => m.includes('docker.sock')) ? 'Blocked docker.sock bind mount' : 'No socket mount' },
+      { id: 'no_host_root_mount', passed: !mounts.some((m) => /^(- )?\/(:|$)|\/etc(:|\/|$)|\/proc|\/sys|\/root/.test(m.trim())), severity: 'critical', message: mounts.some((m) => /^(- )?\/(:|$)/.test(m.trim())) ? 'Blocked host root mount (- /:/host:rw — Coolify <=beta.420.6 vector)' : 'No sensitive host mount' },
+      { id: 'no_dangerous_caps', passed: !caps.some((c: string) => ['SYS_ADMIN', 'SYS_PTRACE', 'NET_ADMIN', 'ALL'].includes(c)), severity: 'high', message: 'Linux capabilities restricted' },
+      { id: 'no_latest_tag', passed: Boolean(img && !img.endsWith(':latest') && (img.includes(':') || img.includes('@sha256:'))), severity: 'medium', message: img.endsWith(':latest') || !img.includes(':') ? `Mutable :latest or untagged image "${img || 'none'}"` : 'Immutable image tag pinned' },
+      { id: 'require_non_root_uid', passed: spec.uid != null ? Number(spec.uid) > 0 : (spec.user != null && String(spec.user) !== '0' && String(spec.user) !== 'root'), severity: 'high', message: 'Non-root numeric UID verified' },
+      { id: 'require_resource_limits', passed: Number(spec.memoryLimitMb) > 0 && Number(spec.cpuLimit) > 0, severity: 'medium', message: 'Memory and CPU limits declared' },
+      { id: 'require_healthcheck', passed: Boolean(spec.healthcheck || spec.healthcheckPath), severity: 'medium', message: 'Healthcheck probe declared' },
+      { id: 'require_signed_attestation', passed: Boolean(spec.attestationVerified), severity: 'medium', message: spec.attestationVerified ? 'SLSA v1.1 Ed25519 attestation verified' : 'SLSA attestation not yet attached' },
+      { id: 'no_public_db_or_panel_bind', passed: !ports.some((p) => /^(0\.0\.0\.0|::):(3000|5432|3306|6379|27017|11434)/.test(p)), severity: 'critical', message: ports.some((p) => /^(0\.0\.0\.0|::):(3000|5432|3306|6379|27017|11434)/.test(p)) ? 'Blocked public 0.0.0.0 bind on sensitive DB/panel port (dokploy#2661)' : 'No public DB/panel port binds' },
+    ];
+    const enforcedViolations: any[] = [];
+    const auditWarnings: any[] = [];
+    const passedRules: any[] = [];
+    for (const c of checks) {
+      const mode = rules[c.id] || 'audit';
+      if (mode === 'off' || c.passed) passedRules.push({ ...c, mode });
+      else if (mode === 'enforce') enforcedViolations.push({ ...c, mode });
+      else auditWarnings.push({ ...c, mode });
+    }
+    const allowed = enforcedViolations.length === 0;
+    const decision = !allowed ? 'DENY' : (auditWarnings.length > 0 ? 'AUDIT_WARN' : 'ALLOW');
+    const score = Math.round((passedRules.length / checks.length) * 100);
+    const out = { ok: true, allowed, decision, preset: s.admissionPolicy.preset, score, totalRules: checks.length, enforcedViolations, auditWarnings, passedRules };
+    if (body.enforceStatus === true && !allowed) {
+      return jsonResponse({ ...out, code: 'ADMISSION_DENIED' }, 422);
+    }
+    return jsonResponse(out);
+  }
+
+  if (pathname === '/api/compliance/bundle/latest' && method === 'GET') {
+    return jsonResponse(s.latestComplianceBundle);
+  }
+  if (pathname === '/api/compliance/bundle' && method === 'POST') {
+    const fw = String(body.framework || 'all').toLowerCase();
+    const allControls = s.latestComplianceBundle.payload.controls;
+    const filtered = fw === 'all'
+      ? allControls
+      : allControls.filter((c: any) => Array.isArray(c.controlIds) && c.controlIds.some((id: string) => id.toLowerCase().startsWith(fw === 'iso27001' ? 'iso' : fw)));
+    const nextBundle = {
+      ...s.latestComplianceBundle,
+      bundleId: `cmp_${Date.now().toString(36)}`,
+      framework: fw,
+      generatedAt: nowIso(),
+      payload: {
+        ...s.latestComplianceBundle.payload,
+        bundleId: `cmp_${Date.now().toString(36)}`,
+        framework: fw,
+        generatedAt: nowIso(),
+        controls: filtered.length > 0 ? filtered : allControls,
+      },
+    };
+    s.latestComplianceBundle = nextBundle;
+    return jsonResponse(nextBundle, 201);
+  }
+  if (pathname === '/api/compliance/bundle/verify' && method === 'POST') {
+    const b = body.bundle || body;
+    const valid = Boolean(b && b.payloadSha256 && b.signatureB64 && b.payloadSha256 === s.latestComplianceBundle.payloadSha256);
+    return jsonResponse({
+      ok: true,
+      valid,
+      reason: valid ? null : 'PAYLOAD_SHA256_MISMATCH',
+      payloadSha256: b?.payloadSha256 || s.latestComplianceBundle.payloadSha256,
+    });
+  }
+
+  if (pathname === '/api/edge/experiments' && method === 'GET') {
+    return jsonResponse({ ok: true, experiments: s.edgeExperiments });
+  }
+  if (pathname === '/api/edge/experiments' && method === 'POST') {
+    const isGeo = Array.isArray(body.regions) && body.regions.length > 0;
+    const id = String(body.id || `exp_${Date.now().toString(36)}`);
+    const hostname = String(body.hostname || 'app.acme-demo.dev');
+    const variants = Array.isArray(body.variants) && body.variants.length > 0
+      ? body.variants
+      : [
+          { name: 'control', upstream: '127.0.0.1:3000', weight: 50 },
+          { name: 'variant-b', upstream: '127.0.0.1:3001', weight: 50 },
+        ];
+    const rec = isGeo
+      ? {
+          id,
+          projectId: body.projectId || 'proj_acme_web',
+          name: String(body.name || 'Regional Geo-IP Route'),
+          kind: 'geo',
+          hostname,
+          headerName: String(body.headerName || 'CF-IPCountry'),
+          regions: body.regions,
+          defaultUpstream: String(body.defaultUpstream || '127.0.0.1:3000'),
+          killed: false,
+          compiledCaddy: {
+            subroutes: [
+              ...body.regions.map((r: any) => ({
+                match: [{ header: { [String(body.headerName || 'CF-IPCountry')]: r.countries } }],
+                handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: r.upstream }] }],
+                terminal: true,
+              })),
+              { handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: String(body.defaultUpstream || '127.0.0.1:3000') }] }] },
+            ],
+          },
+          updatedAt: nowIso(),
+        }
+      : {
+          id,
+          projectId: body.projectId || 'proj_acme_web',
+          name: String(body.name || 'Sticky Cookie A/B Split'),
+          kind: 'ab',
+          hostname,
+          stickyMode: String(body.stickyMode || 'cookie'),
+          cookieName: String(body.cookieName || `ckb_ab_${id.slice(-6)}`),
+          variants,
+          killed: false,
+          compiledCaddy: {
+            route: {
+              match: [{ host: [hostname] }],
+              handle: [{
+                handler: 'reverse_proxy',
+                upstreams: variants.map((v: any) => ({ dial: v.upstream })),
+                load_balancing: {
+                  selection_policy: {
+                    policy: String(body.stickyMode || 'cookie'),
+                    name: String(body.cookieName || `ckb_ab_${id.slice(-6)}`),
+                    fallback: { policy: 'weighted_round_robin', weights: variants.map((v: any) => Number(v.weight) || 50) },
+                  },
+                },
+              }],
+              terminal: true,
+            },
+          },
+          updatedAt: nowIso(),
+        };
+    s.edgeExperiments = [rec, ...s.edgeExperiments.filter((e) => e.id !== id)];
+    return jsonResponse({ ok: true, experiment: rec }, 201);
+  }
+  const killExpMatch = pathname.match(/^\/api\/edge\/experiments\/([^/]+)\/kill-switch$/);
+  if (killExpMatch && method === 'POST') {
+    const eid = decodeURIComponent(killExpMatch[1]);
+    const target = s.edgeExperiments.find((e) => e.id === eid);
+    if (!target) return jsonResponse({ error: 'Experiment not found' }, 404);
+    target.killed = true;
+    target.killReason = String(body.reason || 'operator_kill_switch');
+    target.updatedAt = nowIso();
+    const ctrlUpstream = target.variants?.[0]?.upstream || target.defaultUpstream || '127.0.0.1:3000';
+    target.compiledCaddy = {
+      route: {
+        match: [{ host: [target.hostname] }],
+        handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: ctrlUpstream }] }],
+        terminal: true,
+      },
+    };
+    return jsonResponse({ ok: true, killed: true, id: target.id, controlUpstream: ctrlUpstream, experiment: target });
+  }
+
+  if (pathname === '/api/volumes/migrations' && method === 'GET') {
+    return jsonResponse({ ok: true, migrations: s.volumeMigrations });
+  }
+  if (pathname === '/api/volumes/migrations/plan' && method === 'POST') {
+    const volName = String(body.volumeName || '').trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(volName)) {
+      return jsonResponse({ error: `UNSAFE_VOLUME_NAME: Rejected shell metacharacters or unsafe volume name "${volName}" (CVE-2025-66213 guard).` }, 400);
+    }
+    const mountPath = String(body.mountPath || '/var/lib/postgresql/data').trim();
+    if (mountPath.includes('..') || mountPath === '/' || /^\/(etc|proc|sys|var\/run)/.test(mountPath)) {
+      return jsonResponse({ error: `UNSAFE_MOUNT_PATH: Rejected traversal or sensitive host mount "${mountPath}".` }, 400);
+    }
+    const uid = Number.isInteger(Number(body.uid)) ? Number(body.uid) : 999;
+    const gid = Number.isInteger(Number(body.gid)) ? Number(body.gid) : 999;
+    const targetHost = String(body.targetHost || '198.51.100.42').trim();
+    const mig = {
+      id: `volmig_${Date.now().toString(36)}`,
+      projectId: body.projectId || 'proj_acme_web',
+      volumeName: volName,
+      mountPath,
+      sourceHost: String(body.sourceHost || 'local'),
+      targetHost,
+      uid,
+      gid,
+      containerName: String(body.containerName || 'culkibo-db-pg-main'),
+      estimatedMb: Number(body.estimatedMb) || 256,
+      status: 'planned',
+      numericOwnerPreserved: true,
+      zeroShell: true,
+      plan: {
+        zeroShell: true,
+        numericOwnerPreserved: true,
+        uidGid: `${uid}:${gid}`,
+        retainSourceVolume: true,
+        requiredFreeSpaceMb: Math.ceil((Number(body.estimatedMb) || 256) * 2.2),
+        phases: [
+          { phase: 1, id: 'pre_sync', title: 'Warm pre-sync & disk headroom check', commands: [{ program: 'docker', args: ['volume', 'inspect', volName] }, { program: 'ssh', args: ['-o', 'BatchMode=yes', `root@${targetHost}`, 'docker', 'volume', 'create', volName] }] },
+          { phase: 2, id: 'quiesce_snapshot', title: `Quiesce + tar --numeric-owner (${uid}:${gid}) + SHA-256`, commands: [{ program: 'docker', args: ['run', '--rm', '--mount', `type=volume,source=${volName},target=/source,readonly`, 'alpine:3.20', 'tar', '--numeric-owner', '-czf', `/backup/${volName}.tar.gz`, '-C', '/source', '.'] }, { program: 'sha256sum', args: [`/var/tmp/culkibo-volmig/${volName}/${volName}.tar.gz`] }] },
+          { phase: 3, id: 'ssh_stream_transfer', title: `SSH ControlMaster zero-shell transfer to ${targetHost}`, commands: [{ program: 'scp', args: ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', `/var/tmp/culkibo-volmig/${volName}/${volName}.tar.gz`, `root@${targetHost}:/var/tmp/culkibo-volmig/${volName}/`] }] },
+          { phase: 4, id: 'verify_and_cutover', title: `Target SHA-256 verify + tar --numeric-owner extract + stat ${uid}:${gid}`, commands: [{ program: 'ssh', args: ['-o', 'BatchMode=yes', `root@${targetHost}`, 'sha256sum', '-c', `/var/tmp/culkibo-volmig/${volName}/${volName}.sha256`] }, { program: 'ssh', args: ['-o', 'BatchMode=yes', `root@${targetHost}`, 'docker', 'run', '--rm', '--mount', `type=volume,source=${volName},target=/target`, 'alpine:3.20', 'tar', '--numeric-owner', '-xzf', `/backup/${volName}.tar.gz`, '-C', '/target'] }] },
+        ],
+      },
+      createdAt: nowIso(),
+    };
+    s.volumeMigrations = [mig, ...s.volumeMigrations].slice(0, 20);
+    return jsonResponse({ ok: true, migration: mig }, 201);
   }
 
   // --- Catalog ---
@@ -2799,16 +3232,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (135 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (140 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 135 MCP tools on demand without bloating context (-86%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 140 MCP tools on demand without bloating context (-87%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_admission_check', description: 'Declarative Policy-as-Code pre-deploy CIS/PSS admission gate (10 rules, baseline/restricted/soc2-strict)', readOnly: false, profile: 'security' },
+      { name: 'culkibo_compliance_bundle', description: 'Generate & verify Ed25519-signed SOC 2 / ISO 27001 / GDPR compliance evidence bundles (0 plaintext secrets)', readOnly: true, profile: 'security' },
+      { name: 'culkibo_volume_migrate', description: 'Zero-shell 4-phase stateful volume migration planner preserving tar --numeric-owner UID:GID & SHA-256', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_edge_experiment', description: 'Native Caddy v2.11 Geo-Routing (CF-IPCountry) & sticky cookie/header A/B experiment compiler with 1-click Kill-Switch', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_security_posture', description: 'Unified executive governance scorecard combining admission preset, compliance score, CVE drift, secret rotation & DR drills', readOnly: true, profile: 'security' },
       { name: 'culkibo_dr_drill', description: 'Automated DR backup restore fire-drill verifier catching 0 B / 20 B corrupt dumps & ACL strips', readOnly: false, profile: 'ops' },
       { name: 'culkibo_slo_canary', description: 'Google SRE error-budget SLO canary controller (10->25->50->100%) with instant 100/0 auto-rollback', readOnly: false, profile: 'deploy' },
       { name: 'culkibo_ai_workload', description: 'Self-hosted AI/GPU LLM planner (Ollama/vLLM/llama.cpp) with VRAM pre-flight, CDI & CVE guards', readOnly: true, profile: 'ops' },
@@ -2830,27 +3268,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 135 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 140 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 135, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 140, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_slo_canary', status: 'ok', durationMs: 2, timestamp: nowIso(-60000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_dr_drill', status: 'ok', durationMs: 4, timestamp: nowIso(-180000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_admission_check', status: 'ok', durationMs: 1, timestamp: nowIso(-45000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_compliance_bundle', status: 'ok', durationMs: 3, timestamp: nowIso(-150000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 135,
-      profiles: { core: { count: 17, savedPct: 86 } },
+      totalTools: 140,
+      profiles: { core: { count: 17, savedPct: 87 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

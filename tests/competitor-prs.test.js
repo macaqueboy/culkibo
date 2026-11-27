@@ -2408,6 +2408,175 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #10 CVEs (12a-12e): dokploy#1382/#6035/coolify#12244 DR drill, coolify#11372/dokploy#3226/#3450 SSH mux pin, AI/GPU CVE-2025-63389/CVE-2026-7482/CVE-2026-22778+CDI, SLO Canary burn-rate rollback, coolify#12170 log archive+ReDoS');
 
+  // -------------------------------------------------------------------------
+  // 13. Cycle #11 Enterprise Governance & Edge Regressions (docs/COMPETITOR_RADAR_CYCLE10.md §2.5)
+  // -------------------------------------------------------------------------
+  {
+    const { AdmissionPolicyService, evaluateSpec } = require('../server/services/admissionPolicyService');
+    const { ComplianceBundleService, verifyComplianceBundle } = require('../server/services/complianceBundleService');
+    const { VolumeMigrationService, validateVolumeMigrationRequest } = require('../server/services/volumeMigrationService');
+    const { EdgeExperimentService, compileGeoRoutes, compileAbExperimentRoute } = require('../server/services/edgeExperimentService');
+
+    const c11Tmp = makeTempDir('culkibo-c11-cve-');
+    try {
+      // 13a. Coolify CVE-2025-66213 & <=beta.420.6 Host-Root Escape + Volume Name Injection
+      const ap = new AdmissionPolicyService({ dataDir: c11Tmp });
+      const hostEscapeRes = ap.evaluateDeployment({
+        image: 'node:22-alpine',
+        privileged: true,
+        volumes: ['- /:/host:rw', '/var/run/docker.sock:/var/run/docker.sock'],
+        cap_add: ['SYS_ADMIN']
+      });
+      assert.strictEqual(hostEscapeRes.allowed, false, 'Host-root escape spec MUST be denied');
+      const escIds = hostEscapeRes.enforcedViolations.map((v) => v.id);
+      assert.ok(escIds.includes('no_host_root_mount'), 'Must catch - /:/host:rw (Coolify <=beta.420.6)');
+      assert.ok(escIds.includes('no_docker_sock_mount'), 'Must catch /var/run/docker.sock (coolify#8847)');
+      assert.ok(escIds.includes('no_privileged'), 'Must catch privileged: true');
+      assert.ok(escIds.includes('no_dangerous_caps'), 'Must catch cap_add: SYS_ADMIN');
+
+      for (const badVol of ['pgdata;rm -rf /', 'vol$(id)', 'vol`whoami`', 'vol|cat /etc/shadow']) {
+        assert.throws(
+          () => validateVolumeMigrationRequest({
+            projectId: 'proj_sec',
+            volumeName: badVol,
+            mountPath: '/var/lib/postgresql/data',
+            targetHost: '10.88.0.22'
+          }),
+          (err) => err && err.status === 400 && err.code === 'UNSAFE_VOLUME_NAME',
+          `CVE-2025-66213 volumeName "${badVol}" MUST be rejected with 400 UNSAFE_VOLUME_NAME`
+        );
+      }
+
+      // 13b. Dokploy #2661 Public Bind & :latest / Root UID Admission (restricted & soc2-strict vs hardened)
+      const pubFail = evaluateSpec({
+        image: 'postgres:latest',
+        user: '0',
+        ports: ['0.0.0.0:3000:3000', '0.0.0.0:5432:5432']
+      }, { preset: 'restricted' });
+      assert.strictEqual(pubFail.allowed, false, 'Restricted preset MUST deny 0.0.0.0:3000/5432, :latest, UID 0 & missing caps');
+      const pubIds = pubFail.enforcedViolations.map((v) => v.id);
+      assert.ok(pubIds.includes('no_public_db_or_panel_bind'), 'Must block 0.0.0.0:3000 & 0.0.0.0:5432 (dokploy#2661)');
+      assert.ok(pubIds.includes('no_latest_tag'), 'Must block :latest tag');
+      assert.ok(pubIds.includes('require_non_root_uid'), 'Must block UID 0');
+      assert.ok(pubIds.includes('require_resource_limits'), 'Must require memory/CPU limits');
+
+      const hardenedPass = evaluateSpec({
+        image: 'ghcr.io/culkibo/api:2.1.0',
+        privileged: false,
+        user: '1000:1000',
+        memoryLimitMb: 512,
+        cpuLimit: 1,
+        healthcheckPath: '/health',
+        bindAddress: '127.0.0.1',
+        port: 3000,
+        attestationVerified: true
+      }, { preset: 'soc2-strict' });
+      assert.strictEqual(hardenedPass.allowed, true, 'Hardened spec MUST pass soc2-strict');
+      assert.strictEqual(hardenedPass.score, 100);
+
+      // 13c. Dokploy #2642 / #4360 Ed25519-Signed Compliance Bundle + 1-Byte Tamper + 0 Canary Secrets
+      const cb = new ComplianceBundleService({ dataDir: c11Tmp });
+      const bundle = cb.generateBundle({
+        framework: 'all',
+        actor: 'auditor@example.test',
+        snapshot: {
+          accessControl: { userCount: 2, mfaEnabledUsers: 2, passkeyCount: 1, rbacEnabled: true },
+          encryption: { vaultSecretCount: 4, aes256GcmEnabled: true, fileMode0600Enforced: true },
+          audit: { chainValid: true, entryCount: 42 },
+          supplyChain: { sbomCycloneDx16: true, slsaEd25519Enabled: true, criticalCves: 0, highCves: 0, staleSecretsCount: 0 },
+          governance: { admissionPreset: 'soc2-strict', zeroShellEnforced: true },
+          disasterRecovery: { totalDrills: 3, passedDrills: 3, latestRtoMs: 120, latestRpoSec: 15 }
+        }
+      });
+      assert.strictEqual(verifyComplianceBundle(bundle).valid, true, 'Fresh Ed25519 compliance bundle MUST verify');
+      assert.ok(bundle.markdownReport.includes('SOC2-CC6.1') && bundle.markdownReport.includes('ISO27001-A.8.24') && bundle.markdownReport.includes('GDPR-Art32'));
+      assert.ok(!JSON.stringify(bundle).includes('BEGIN PRIVATE KEY'), 'Private key MUST never appear in bundle');
+      const tamperedBundle = JSON.parse(JSON.stringify(bundle));
+      tamperedBundle.payload.actor = 'tampered@example.test';
+      assert.strictEqual(verifyComplianceBundle(tamperedBundle).valid, false, '1-byte tampered compliance bundle MUST fail verify');
+
+      // 13d. Kamal / Dokploy UID-Preserving Volume Migration Plan (999:999 & 1000:1000, traversal block, cross-tenant 403)
+      const vm = new VolumeMigrationService({ dataDir: c11Tmp });
+      const pgPlan = vm.planMigration({
+        projectId: 'proj_pg',
+        volumeName: 'pg_prod_vol',
+        mountPath: '/var/lib/postgresql/data',
+        sourceHost: 'vps-1',
+        targetHost: 'vps-2',
+        uid: 999,
+        gid: 999,
+        sourceOrgId: 'org_a',
+        targetOrgId: 'org_a'
+      });
+      const railsPlan = vm.planMigration({
+        projectId: 'proj_rails',
+        volumeName: 'rails_storage',
+        mountPath: '/rails/storage',
+        sourceHost: 'vps-1',
+        targetHost: 'vps-2',
+        uid: 1000,
+        gid: 1000,
+        sourceOrgId: 'org_a',
+        targetOrgId: 'org_a'
+      });
+      assert.strictEqual(pgPlan.uidGid, '999:999');
+      assert.strictEqual(railsPlan.uidGid, '1000:1000');
+      assert.ok(JSON.stringify(pgPlan.phases).includes('--numeric-owner'), 'Tar phase MUST preserve --numeric-owner');
+      assert.ok(JSON.stringify(pgPlan.phases[3]).includes('sha256sum'), 'Phase 4 MUST verify SHA-256 checksum');
+      assert.throws(
+        () => vm.planMigration({ projectId: 'proj_pg', volumeName: 'ok_vol', mountPath: '/var/data/../../etc/shadow', targetHost: 'vps-2' }),
+        (err) => err && err.status === 400
+      );
+      assert.throws(
+        () => vm.planMigration({ projectId: 'proj_pg', volumeName: 'ok_vol', mountPath: '/var/lib/postgresql/data', targetHost: 'vps-2', sourceOrgId: 'org_a', targetOrgId: 'org_b' }),
+        (err) => err && err.status === 403 && err.code === 'CROSS_TENANT_FORBIDDEN'
+      );
+
+      // 13e. Caddy v2.11 Geo-Routing & Sticky A/B Compilation + Kill-Switch
+      const ee = new EdgeExperimentService({ dataDir: c11Tmp });
+      assert.throws(
+        () => compileGeoRoutes({ regions: [{ countries: ['XX'], upstream: '10.0.0.1:3000' }], defaultUpstream: '10.0.0.2:3000' }),
+        (err) => err && err.code === 'INVALID_COUNTRY_CODE'
+      );
+      assert.throws(
+        () => compileAbExperimentRoute({ stickyMode: 'cookie', variants: [{ name: 'a', upstream: '127.0.0.1:3001', weight: 60 }, { name: 'b', upstream: '127.0.0.1:3002', weight: 30 }] }),
+        (err) => err && err.code === 'INVALID_WEIGHT_SUM'
+      );
+      const geoRoutes = compileGeoRoutes({
+        headerName: 'CF-IPCountry',
+        regions: [{ countries: ['DE', 'FR', 'ES'], upstream: '10.10.0.1:3000' }],
+        defaultUpstream: '10.20.0.1:3000'
+      });
+      assert.deepStrictEqual(geoRoutes[0].match[0].header['CF-IPCountry'], ['DE', 'FR', 'ES']);
+      const hdrRoute = compileAbExperimentRoute({
+        id: 'hdr_test',
+        hostname: 'hdr.example.test',
+        stickyMode: 'header',
+        headerField: 'X-AB-Group',
+        variants: [{ name: 'ctrl', upstream: '127.0.0.1:4001', weight: 70 }, { name: 'var', upstream: '127.0.0.1:4002', weight: 30 }]
+      });
+      assert.strictEqual(hdrRoute.handle[0].load_balancing.selection_policy.policy, 'header');
+      assert.deepStrictEqual(hdrRoute.handle[0].load_balancing.selection_policy.fallback.weights, [70, 30]);
+
+      const savedExp = ee.upsertExperiment({
+        id: 'exp_c11_kill',
+        projectId: 'proj_edge',
+        hostname: 'ab.example.test',
+        stickyMode: 'cookie',
+        variants: [{ name: 'ctrl', upstream: '127.0.0.1:4001', weight: 50 }, { name: 'var', upstream: '127.0.0.1:4002', weight: 50 }]
+      });
+      assert.strictEqual(savedExp.experiment.compiledCaddy.route.handle[0].load_balancing.selection_policy.policy, 'cookie');
+      const killed = ee.triggerKillSwitch('exp_c11_kill', { reason: 'regression_test' });
+      assert.strictEqual(killed.killed, true);
+      assert.strictEqual(killed.experiment.compiledCaddy.route.handle[0].upstreams.length, 1);
+      assert.strictEqual(killed.experiment.compiledCaddy.route.handle[0].upstreams[0].dial, '127.0.0.1:4001');
+      assert.strictEqual(killed.experiment.compiledCaddy.route.handle[0].load_balancing, undefined);
+    } finally {
+      fs.rmSync(c11Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #11 CVEs (13a-13e): Coolify CVE-2025-66213/<=beta.420.6 host escape, dokploy#2661 public bind/UID 0, dokploy#2642/#4360 Ed25519 compliance bundle, Kamal/Dokploy --numeric-owner volume migration, Caddy v2.11 Geo+A/B kill-switch');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

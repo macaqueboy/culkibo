@@ -51,6 +51,9 @@ const testBrandTheme = require('./brand-theme.test');
 const testCanaryAndLogArchive = require('./canary-and-logarchive.test');
 const testDrAiBuilder = require('./dr-ai-builder.test');
 const testCycle10HttpE2E = require('./cycle10-http-e2e.test');
+const testAdmissionAndExperiments = require('./admission-and-experiments.test');
+const testComplianceAndVolumes = require('./compliance-and-volumes.test');
+const testCycle11HttpE2E = require('./cycle11-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -127,6 +130,9 @@ async function runAll() {
     { name: 'SLO Error-Budget Canary Auto-Rollback (Caddy v2.11) & Compressed .ndjson.gz Log Archive', fn: testCanaryAndLogArchive },
     { name: 'DR Backup Fire-Drill Verifier, Self-Hosted AI/GPU LLM Orchestrator & Remote Build-Node Offloader', fn: testDrAiBuilder },
     { name: 'Cycle #10 Milestone Live Isolated HTTP E2E (All 5 API Families + Cross-Tenant ACL + ReDoS Guard)', fn: testCycle10HttpE2E },
+    { name: 'Policy-as-Code Deployment Admission Engine (10 CIS/PSS Rules) & Edge Geo-Routing / Sticky A/B Experiments', fn: testAdmissionAndExperiments },
+    { name: 'Ed25519-Signed Compliance Evidence Bundle (SOC 2/ISO/GDPR) & Zero-Shell Stateful Volume Migration Planner', fn: testComplianceAndVolumes },
+    { name: 'Cycle #11 Enterprise Governance & Multi-Region Edge Live Isolated HTTP E2E (All 4 API Families + 422/403 Guards)', fn: testCycle11HttpE2E },
   ];
 
   for (const suite of suites) {

@@ -79,6 +79,10 @@ import {
   type BrandThemeConfig,
   type OutboundWebhookSubscription,
   type WebhookDlqEntry,
+  type AdmissionPolicyState,
+  type AdmissionEvaluationResult,
+  type ComplianceBundleResult,
+  type ComplianceVerifyResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -304,6 +308,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [whRotatedSecret, setWhRotatedSecret] = useState<{ subId: string; secret: string; expiresAt?: string | null } | null>(null);
   const [whError, setWhError] = useState<string | null>(null);
 
+  // Cycle-11 Policy-as-Code Admission Gate (10 CIS/PSS Rules) & Ed25519 Compliance Evidence Bundle
+  const [admPolicy, setAdmPolicy] = useState<AdmissionPolicyState | null>(null);
+  const [admEval, setAdmEval] = useState<AdmissionEvaluationResult | null>(null);
+  const [admBusy, setAdmBusy] = useState<'preset' | 'root' | 'hardened' | null>(null);
+  const [admError, setAdmError] = useState<string | null>(null);
+
+  const [compFramework, setCompFramework] = useState<'all' | 'soc2' | 'iso27001' | 'gdpr'>('all');
+  const [compBundle, setCompBundle] = useState<ComplianceBundleResult | null>(null);
+  const [compVerify, setCompVerify] = useState<ComplianceVerifyResult | null>(null);
+  const [compBusy, setCompBusy] = useState<'gen' | 'verify' | null>(null);
+  const [compError, setCompError] = useState<string | null>(null);
+  const [compShowMd, setCompShowMd] = useState(false);
+
   useEffect(() => {
     if (tab !== 'security') return;
     let active = true;
@@ -314,7 +331,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       api.getBrandTheme().catch(() => null),
       api.listOutboundWebhooks().catch(() => ({ subscriptions: [] })),
       api.listWebhookDlq(50).catch(() => ({ entries: [] })),
-    ]).then(([pkRes, leaseRes, latestCve, brandRes, whSubRes, whDlqRes]) => {
+      api.getAdmissionPolicy().catch(() => null),
+      api.getLatestComplianceBundle().catch(() => null),
+    ]).then(([pkRes, leaseRes, latestCve, brandRes, whSubRes, whDlqRes, admRes, compRes]) => {
       if (!active) return;
       setPasskeys(Array.isArray(pkRes?.passkeys) ? pkRes.passkeys : []);
       setSecretLeases(Array.isArray(leaseRes?.leases) ? leaseRes.leases : []);
@@ -332,6 +351,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       }
       setWhSubs(Array.isArray(whSubRes?.subscriptions) ? whSubRes.subscriptions : []);
       setWhDlq(Array.isArray(whDlqRes?.entries) ? whDlqRes.entries : []);
+      if (admRes) setAdmPolicy(admRes);
+      if (compRes && compRes.payloadSha256) setCompBundle(compRes);
     });
     return () => { active = false; };
   }, [tab]);
@@ -1363,6 +1384,100 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setWhBusyId(null);
+    }
+  };
+
+  const handleSelectAdmissionPreset = async (preset: 'baseline' | 'restricted' | 'soc2-strict') => {
+    setAdmBusy('preset');
+    setAdmError(null);
+    try {
+      const updated = await api.updateAdmissionPolicy({ preset });
+      setAdmPolicy(updated);
+      onNotify?.(`Admission Gate preset switched to "${preset}"`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not update admission preset';
+      setAdmError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setAdmBusy(null);
+    }
+  };
+
+  const handleTestAdmissionSpec = async (mode: 'root' | 'hardened') => {
+    setAdmBusy(mode);
+    setAdmError(null);
+    try {
+      const spec = mode === 'root'
+        ? {
+            image: 'acme/web:latest',
+            privileged: true,
+            mounts: ['- /:/host:rw', '/var/run/docker.sock:/var/run/docker.sock'],
+            capAdd: ['SYS_ADMIN'],
+            uid: 0,
+            ports: ['0.0.0.0:5432:5432'],
+          }
+        : {
+            image: 'ghcr.io/acme/web:v1.2.4',
+            privileged: false,
+            mounts: ['acme_uploads:/app/uploads'],
+            capAdd: [],
+            uid: 1000,
+            memoryLimitMb: 512,
+            cpuLimit: 1,
+            healthcheckPath: '/health',
+            attestationVerified: true,
+            ports: ['127.0.0.1:8080:8080'],
+          };
+      // Use preview mode (enforceStatus: false) so browser receives structured DENY JSON with HTTP 200 (0 network errors)
+      const res = await api.evaluateAdmissionPolicy({ spec, preset: admPolicy?.preset, enforceStatus: false });
+      setAdmEval(res);
+      if (res.allowed) {
+        onNotify?.(`Admission Gate ALLOW (${res.score}/100 CIS/PSS score)`, 'success');
+      } else {
+        onNotify?.(`Admission Gate DENY (HTTP 422 enforced · ${Array.isArray(res.enforcedViolations) ? res.enforcedViolations.length : 1} rule violation(s))`, 'error');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Admission evaluation failed';
+      setAdmError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setAdmBusy(null);
+    }
+  };
+
+  const handleGenerateComplianceBundle = async () => {
+    setCompBusy('gen');
+    setCompError(null);
+    setCompVerify(null);
+    try {
+      const bundle = await api.generateComplianceBundle({ framework: compFramework });
+      setCompBundle(bundle);
+      const ver = await api.verifyComplianceBundle(bundle).catch(() => null);
+      if (ver) setCompVerify(ver);
+      onNotify?.(`Ed25519-signed compliance bundle generated (${bundle.overallScore ?? bundle.payload?.overallScore ?? 100}/100)`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not generate compliance bundle';
+      setCompError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setCompBusy(null);
+    }
+  };
+
+  const handleVerifyComplianceBundle = async () => {
+    if (!compBundle) return;
+    setCompBusy('verify');
+    setCompError(null);
+    try {
+      const ver = await api.verifyComplianceBundle(compBundle);
+      setCompVerify(ver);
+      onNotify?.(ver.valid ? 'Ed25519 signature & SHA-256 payload cryptographically verified!' : `Tampering detected: ${ver.reason || 'invalid signature'}`, ver.valid ? 'success' : 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not verify compliance bundle';
+      setCompError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setCompBusy(null);
     }
   };
 
@@ -2687,6 +2802,297 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               )}
             </div>
+          </div>
+
+          {/* 11. Cycle-11: Policy-as-Code Deployment Admission Gate (10 CIS/PSS Rules) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.admTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                      Kyverno / OPA-Lite · 0 Deps
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.admDesc')}</p>
+                </div>
+              </div>
+              <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[11px] shrink-0 self-start">
+                {([
+                  { id: 'baseline', label: t('sec.admPresetBaseline') },
+                  { id: 'restricted', label: t('sec.admPresetRestricted') },
+                  { id: 'soc2-strict', label: t('sec.admPresetSoc2') },
+                ] as const).map((p) => {
+                  const active = (admPolicy?.preset || 'restricted') === p.id;
+                  return (
+                    <button
+                      key={p.id}
+                      type="button"
+                      disabled={admBusy !== null}
+                      onClick={() => void handleSelectAdmissionPreset(p.id)}
+                      className={`px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50 ${
+                        active ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {p.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {admError && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{admError}</span>
+              </div>
+            )}
+
+            {/* 10 CIS/PSS Rule Badges */}
+            {(() => {
+              const ruleMap: Record<string, string> = admPolicy?.rules && !Array.isArray(admPolicy.rules)
+                ? admPolicy.rules
+                : {
+                    no_privileged: 'enforce',
+                    no_docker_sock_mount: 'enforce',
+                    no_host_root_mount: 'enforce',
+                    no_dangerous_caps: 'enforce',
+                    no_latest_tag: 'enforce',
+                    require_non_root_uid: 'enforce',
+                    require_resource_limits: 'enforce',
+                    require_healthcheck: 'enforce',
+                    require_signed_attestation: 'audit',
+                    no_public_db_or_panel_bind: 'enforce',
+                  };
+              const entries = Object.entries(ruleMap);
+              return (
+                <div className="flex flex-wrap gap-1.5">
+                  {entries.map(([ruleId, mode]) => (
+                    <span
+                      key={ruleId}
+                      className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border font-mono text-[10px] ${
+                        mode === 'enforce'
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                          : mode === 'audit'
+                            ? 'bg-amber-50 border-amber-200 text-amber-800'
+                            : 'bg-slate-50 border-slate-200 text-slate-500'
+                      }`}
+                    >
+                      <span>{ruleId}</span>
+                      <span className="uppercase opacity-75">{mode}</span>
+                    </span>
+                  ))}
+                </div>
+              );
+            })()}
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={admBusy !== null}
+                onClick={() => void handleTestAdmissionSpec('root')}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+              >
+                {admBusy === 'root' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                <span>{admBusy === 'root' ? t('sec.admTesting') : t('sec.admTestRoot')}</span>
+              </button>
+              <button
+                type="button"
+                disabled={admBusy !== null}
+                onClick={() => void handleTestAdmissionSpec('hardened')}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {admBusy === 'hardened' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                <span>{admBusy === 'hardened' ? t('sec.admTesting') : t('sec.admTestHardened')}</span>
+              </button>
+            </div>
+
+            {admEval && (() => {
+              const viols = Array.isArray(admEval.enforcedViolations) ? admEval.enforcedViolations : [];
+              const warns = Array.isArray(admEval.auditWarnings) ? admEval.auditWarnings : [];
+              return (
+                <div className={`p-3.5 rounded-xl border space-y-2 ${
+                  admEval.allowed
+                    ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                    : 'bg-red-50 border-red-200 text-red-900'
+                }`}>
+                  <div className="flex items-center justify-between gap-2 flex-wrap tabular-nums">
+                    <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-xs">
+                      {admEval.allowed ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <ShieldAlert className="w-4 h-4 text-red-600" />}
+                      <span>
+                        {admEval.allowed ? `ALLOW · ${admEval.score}/100` : `DENY · 422 (${admEval.score}/100)`}
+                      </span>
+                    </span>
+                    <span className="font-mono text-[10px] opacity-80">
+                      preset: {admEval.preset || admPolicy?.preset || 'restricted'} · {viols.length} enforced block(s) · {warns.length} audit warn(s)
+                    </span>
+                  </div>
+                  {viols.length > 0 && (
+                    <div className="space-y-1 font-mono text-[11px]">
+                      {viols.map((v, idx) => {
+                        const label = typeof v === 'string'
+                          ? v
+                          : `[${v.id || v.ruleId || v.code || 'RULE'}] ${v.message || v.detail || 'Blocked by admission policy'}`;
+                        return <div key={idx}>• {label}</div>;
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 12. Cycle-11: Ed25519-Signed Compliance Evidence Bundle (SOC 2 · ISO 27001 · GDPR) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <FileText className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.compTitle')}</h2>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      <Lock className="w-3 h-3" />
+                      {compVerify?.valid !== false && compBundle ? t('sec.compVerifiedBadge') : 'Ed25519 · 0 Plaintext Secrets'}
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.compDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[10px] font-mono">
+                  {(['all', 'soc2', 'iso27001', 'gdpr'] as const).map((fw) => (
+                    <button
+                      key={fw}
+                      type="button"
+                      onClick={() => setCompFramework(fw)}
+                      className={`px-2 py-1 rounded-md uppercase cursor-pointer ${
+                        compFramework === fw ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {fw}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  disabled={compBusy !== null}
+                  onClick={() => void handleGenerateComplianceBundle()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {compBusy === 'gen' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                  <span>{compBusy === 'gen' ? t('sec.compGenerating') : t('sec.compGenerate')}</span>
+                </button>
+                {compBundle && (
+                  <button
+                    type="button"
+                    disabled={compBusy !== null}
+                    onClick={() => void handleVerifyComplianceBundle()}
+                    className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    {compBusy === 'verify' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />}
+                    <span>{compBusy === 'verify' ? t('sec.compVerifying') : t('sec.compVerify')}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {compError && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{compError}</span>
+              </div>
+            )}
+
+            {compBundle && (() => {
+              const score = compBundle.overallScore ?? compBundle.payload?.overallScore ?? 100;
+              const controls = Array.isArray(compBundle.payload?.controls)
+                ? compBundle.payload.controls
+                : Array.isArray(compBundle.controls)
+                  ? compBundle.controls
+                  : [];
+              return (
+                <div className="space-y-3">
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-2 tabular-nums">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[11px] font-semibold">
+                        Score: {score}/100
+                      </span>
+                      <span className="font-mono text-[11px] text-slate-600">
+                        sha256:{String(compBundle.payloadSha256 || '').slice(0, 14)}…
+                      </span>
+                      {compVerify && (
+                        <span className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                          compVerify.valid
+                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            : 'bg-red-50 text-red-700 border-red-200'
+                        }`}>
+                          {compVerify.valid ? 'Ed25519 Signature VALID' : `INVALID (${compVerify.reason || 'tampered'})`}
+                        </span>
+                      )}
+                    </div>
+                    {compBundle.markdownReport && (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setCompShowMd((v) => !v)}
+                          className="px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer"
+                        >
+                          {compShowMd ? 'Hide Dossier' : 'Preview Markdown'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void copySecurityValue(compBundle.markdownReport || '', 'comp_md', 'Compliance Markdown')}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer"
+                        >
+                          {copiedSecKey === 'comp_md' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                          <span>{copiedSecKey === 'comp_md' ? t('sec.compCopiedMd') : t('sec.compCopyMd')}</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {controls.length > 0 && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      {controls.slice(0, 6).map((ctrl, idx) => {
+                        const st = String(ctrl.status || (ctrl.passed ? 'pass' : 'warn')).toLowerCase();
+                        const title = ctrl.domain || ctrl.title || ctrl.name || ctrl.id || `Control ${idx + 1}`;
+                        const codes = Array.isArray(ctrl.controlIds) ? ctrl.controlIds.join(' · ') : (ctrl.code || '');
+                        return (
+                          <div key={idx} className="p-3 rounded-xl bg-white border border-slate-200 space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-semibold text-slate-900 truncate">{title}</span>
+                              <span className={`px-1.5 py-0.5 rounded font-mono text-[10px] uppercase font-semibold border shrink-0 ${
+                                st === 'pass'
+                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                  : st === 'warn'
+                                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                    : 'bg-red-50 text-red-700 border-red-200'
+                              }`}>
+                                {st} {ctrl.score != null ? `${ctrl.score}%` : ''}
+                              </span>
+                            </div>
+                            {codes && <div className="font-mono text-[10px] text-slate-400">{codes}</div>}
+                            {ctrl.summary && <p className="text-[11px] text-slate-600 leading-snug">{ctrl.summary}</p>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {compShowMd && compBundle.markdownReport && (
+                    <pre className="p-3.5 rounded-xl bg-slate-950 text-emerald-200 font-mono text-[11px] leading-relaxed overflow-x-auto max-h-60 border border-slate-800">
+                      {compBundle.markdownReport}
+                    </pre>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

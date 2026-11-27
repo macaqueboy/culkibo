@@ -102,6 +102,10 @@ function getSloCanaryController() { return _lazyV2.slocanary || (_lazyV2.slocana
 function getAiWorkloadService() { return _lazyV2.aiworkload || (_lazyV2.aiworkload = require('../services/aiWorkloadService')); }
 function getRemoteBuilderService() { return _lazyV2.remotebuilder || (_lazyV2.remotebuilder = require('../services/remoteBuilderService')); }
 function getLogArchiveService() { return _lazyV2.logarchive || (_lazyV2.logarchive = require('../services/logArchiveService')); }
+function getAdmissionPolicyService() { return _lazyV2.admission || (_lazyV2.admission = require('../services/admissionPolicyService')); }
+function getComplianceBundleService() { return _lazyV2.compliance || (_lazyV2.compliance = require('../services/complianceBundleService')); }
+function getVolumeMigrationService() { return _lazyV2.volmig || (_lazyV2.volmig = require('../services/volumeMigrationService')); }
+function getEdgeExperimentService() { return _lazyV2.edgeexp || (_lazyV2.edgeexp = require('../services/edgeExperimentService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -8337,6 +8341,198 @@ router.post('/projects/:id/logs/archive/search', async (req, res) => {
     const code = err && /** @type {any} */ (err).code ? /** @type {any} */ (err).code : undefined;
     const status = code === 'UNSAFE_REGEX' ? 400 : 400;
     sendServiceError(err, res, status);
+  }
+});
+
+// --- CYCLE #11 ENTERPRISE GOVERNANCE & MULTI-REGION EDGE LAZY ROUTES (0 boot RAM impact) ---
+
+// 1. Declarative Policy-as-Code Deployment Admission Gate (10 CIS / PSS rules)
+router.get('/security/admission-policy', async (_req, res) => {
+  try {
+    const policy = await getAdmissionPolicyService().getPolicy();
+    res.json(policy);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/security/admission-policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden modificar la política de admisión', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'modificar la política global de admisión')) return;
+    const updated = await getAdmissionPolicyService().updatePolicy(req.body || {});
+    res.json(updated);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/admission-policy/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const spec = body.spec && typeof body.spec === 'object' ? body.spec : body;
+    const preset = typeof body.preset === 'string' && body.preset.trim() ? body.preset.trim() : null;
+    const result = await getAdmissionPolicyService().evaluateDeployment(spec, { preset });
+    if (body.enforceStatus === true && !result.allowed) {
+      return res.status(422).json({ ...result, code: 'ADMISSION_DENIED' });
+    }
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Ed25519-Signed Compliance Evidence Bundle (SOC 2 / ISO 27001 / GDPR, 0 plaintext secrets)
+router.post('/compliance/bundle', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar el dossier de cumplimiento', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'generar el dossier de cumplimiento global')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor } = getAuditActor(req);
+    const actorLabel = (actor && (actor.email || actor.userId || actor.role)) || 'admin';
+    const bundle = await getComplianceBundleService().generateBundle({
+      framework: typeof body.framework === 'string' ? body.framework : 'all',
+      actor: String(actorLabel),
+      snapshot: body.snapshot && typeof body.snapshot === 'object' ? body.snapshot : undefined
+    });
+    res.status(201).json(bundle);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/compliance/bundle/latest', async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden consultar el último dossier de cumplimiento', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'consultar el dossier de cumplimiento global')) return;
+    const latest = await getComplianceBundleService().getLatestBundle();
+    if (!latest) {
+      return res.json({ ok: true, found: false, bundle: null });
+    }
+    res.json({ ...latest, found: true });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/compliance/bundle/verify', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const candidate = body.bundle && typeof body.bundle === 'object' ? body.bundle : body;
+    const result = await getComplianceBundleService().verifyComplianceBundle(candidate);
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Stateful Volume Snapshot Cloner & Cross-VPS Migration Planner (`CVE-2025-66213` + `--numeric-owner`)
+router.get('/volumes/migrations', async (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const requestedProjectId = req.query.projectId ? String(req.query.projectId).trim() : null;
+    if (requestedProjectId && allowedProjectIds !== null && !allowedProjectIds.includes(requestedProjectId)) {
+      return res.status(403).json({
+        error: 'Acceso denegado: no puedes consultar migraciones de volúmenes de otro tenant',
+        code: 'CROSS_TENANT_FORBIDDEN'
+      });
+    }
+    const effectiveProjectIds = requestedProjectId ? [requestedProjectId] : allowedProjectIds;
+    const out = await getVolumeMigrationService().listMigrations({ projectIds: effectiveProjectIds });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/volumes/migrations/plan', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const projectId = body.projectId ? String(body.projectId).trim() : '';
+    if (projectId) {
+      if (!assertTenantProjectAccess403(req, res, projectId, 'projects:write')) return;
+    } else if (!getPrincipal(req).isSuperAdmin) {
+      return res.status(403).json({
+        error: 'Acceso denegado: debes especificar un projectId autorizado',
+        code: 'CROSS_TENANT_FORBIDDEN'
+      });
+    }
+    const plan = await getVolumeMigrationService().planMigration(body);
+    res.status(201).json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Multi-Region Edge Geo-Routing (`CF-IPCountry`) & Sticky A/B Experiments (Caddy v2.11)
+router.get('/edge/experiments', async (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const requestedProjectId = req.query.projectId ? String(req.query.projectId).trim() : null;
+    if (requestedProjectId && allowedProjectIds !== null && !allowedProjectIds.includes(requestedProjectId)) {
+      return res.status(403).json({
+        error: 'Acceso denegado: no puedes consultar experimentos edge de otro tenant',
+        code: 'CROSS_TENANT_FORBIDDEN'
+      });
+    }
+    const raw = await getEdgeExperimentService().listExperiments(requestedProjectId || undefined);
+    const allExps = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.experiments) ? raw.experiments : []);
+    const experiments = allowedProjectIds === null
+      ? allExps
+      : allExps.filter((e) => e && e.projectId && allowedProjectIds.includes(e.projectId));
+    res.json({ ok: true, count: experiments.length, experiments });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/experiments', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getEdgeExperimentService();
+    const projectId = body.projectId ? String(body.projectId).trim() : '';
+    if (projectId) {
+      if (!assertTenantProjectAccess403(req, res, projectId, 'projects:write')) return;
+    } else if (!getPrincipal(req).isSuperAdmin) {
+      return res.status(403).json({
+        error: 'Acceso denegado: debes especificar un projectId autorizado',
+        code: 'CROSS_TENANT_FORBIDDEN'
+      });
+    }
+    if (body.id) {
+      const existing = await svc.getExperiment(String(body.id).trim());
+      if (existing && existing.projectId && !assertTenantProjectAccess403(req, res, existing.projectId, 'projects:write')) {
+        return;
+      }
+    }
+    const out = await svc.upsertExperiment(body);
+    res.status(out && out.created === false ? 200 : 201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/experiments/:id/kill-switch', heavyOpLimiter, async (req, res) => {
+  try {
+    const svc = getEdgeExperimentService();
+    const existing = await svc.getExperiment(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: `Edge experiment not found: ${req.params.id}`, code: 'NOT_FOUND' });
+    }
+    if (!assertTenantProjectAccess403(req, res, existing.projectId || '', 'projects:write')) return;
+    const out = await svc.triggerKillSwitch(req.params.id, req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
   }
 });
 

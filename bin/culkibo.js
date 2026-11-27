@@ -54,7 +54,9 @@ const svc = {
   get quotaMeteringService() { return require('../server/services/quotaMeteringService'); },
   get objectStorageService() { return require('../server/services/objectStorageService'); },
   get backupDrillService() { return require('../server/services/backupDrillService'); },
-  get aiWorkloadService() { return require('../server/services/aiWorkloadService'); }
+  get aiWorkloadService() { return require('../server/services/aiWorkloadService'); },
+  get complianceBundleService() { return require('../server/services/complianceBundleService'); },
+  get admissionPolicyService() { return require('../server/services/admissionPolicyService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2877,15 +2879,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 135,
+            mcpTools: 140,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '135 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
-            'DR Fire-Drills, SLO Canary Auto-Rollback, AI/GPU VRAM Planner, Remote Builders, Compressed Log Archive & Post-MinIO S3'
+            '140 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
+            'Policy-as-Code Admission, Ed25519 SOC2/ISO27001/GDPR Bundle, Cross-VPS Volume Migration, Caddy Geo/A-B & DR Fire-Drills'
           ]
         };
       };
@@ -3595,6 +3597,136 @@ program
         console.log(`   Imagen CVE-safe: ${preset.image} (bind=${preset.bindAddress}, volume=${preset.cacheMount || '—'})`);
       }
       console.log('');
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-11 CLI: compliance-bundle (Ed25519) & admission-check (CIS)
+// ===========================================================================
+
+program
+  .command('compliance-bundle')
+  .description('Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Evidence Bundle: genera o verifica expedientes auditables (0 secretos en claro)')
+  .option('-f, --framework <fw>', 'Marco normativo: all | soc2 | iso27001 | gdpr', 'all')
+  .option('-o, --out <file>', 'Guardar el bundle JSON firmado atómicamente en disco (0600)')
+  .option('--verify <file>', 'Verificar criptográficamente la firma Ed25519 y SHA-256 de un archivo de bundle existente')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (options) => {
+    try {
+      const compSvc = svc.complianceBundleService;
+      if (options.verify) {
+        const targetPath = path.resolve(String(options.verify));
+        if (!fs.existsSync(targetPath)) {
+          throw new Error(`Archivo de compliance bundle no encontrado: ${targetPath}`);
+        }
+        const parsed = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
+        const verification = compSvc.verifyComplianceBundle(parsed);
+        const payload = { ...verification, ok: Boolean(verification && verification.valid), file: targetPath };
+        if (isJsonMode(options)) {
+          printJson(payload);
+          if (!payload.ok) process.exitCode = 1;
+          return;
+        }
+        const badge = payload.ok ? '\x1b[32mVERIFIED ✅\x1b[0m' : '\x1b[31mTAMPERED / INVALID ❌\x1b[0m';
+        console.log(`\n🔐 Culkibo Ed25519 Compliance Bundle Verify — [${badge}]`);
+        console.log(`   Archivo: ${targetPath}`);
+        console.log(`   SHA-256: ${verification.payloadSha256 || '—'}`);
+        if (verification.reason) console.log(`   Detalle: ${verification.reason}`);
+        console.log('');
+        if (!payload.ok) process.exitCode = 1;
+        return;
+      }
+
+      const rawFw = String(options.framework || 'all').toLowerCase();
+      if (!['all', 'soc2', 'iso27001', 'gdpr'].includes(rawFw)) {
+        throw new Error(`Framework inválido "${options.framework}". Usa: all | soc2 | iso27001 | gdpr`);
+      }
+      const bundle = await compSvc.generateBundle({ framework: rawFw, actor: 'cli' });
+      /** @type {string | null} */
+      let writtenFile = null;
+      if (options.out) {
+        const dest = path.resolve(String(options.out));
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        const tmp = `${dest}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(bundle, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+        fs.renameSync(tmp, dest);
+        writtenFile = dest;
+      }
+      const payload = { ...bundle, ok: true, ...(writtenFile ? { writtenFile } : {}) };
+      if (isJsonMode(options)) return printJson(payload);
+
+      console.log(`\n\x1b[32m📜 Culkibo Ed25519 Compliance Evidence Bundle (${rawFw})\x1b[0m`);
+      console.log(`   Score:       ${bundle.overallScore ?? '—'}/100`);
+      console.log(`   SHA-256:     ${bundle.payloadSha256 || '—'}`);
+      console.log(`   Algoritmo:   Ed25519 (0 secretos en claro)`);
+      if (writtenFile) console.log(`   Escrito en:  ${writtenFile}`);
+      console.log('');
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+/**
+ * Acumulador Commander para flags repetibles (`--mount`, `--port-bind`).
+ * @param {string} val
+ * @param {string[]} prev
+ */
+function collectCliList(val, prev) {
+  return prev.concat([String(val)]);
+}
+
+program
+  .command('admission-check')
+  .description('Declarative Policy-as-Code Deployment Admission Gate (10 CIS/PSS rules): sale con código 1 en DENY para pipelines CI/CD')
+  .option('-p, --preset <preset>', 'Preset de política: baseline | restricted | soc2-strict', 'baseline')
+  .option('-i, --image <tag>', 'Imagen Docker con etiqueta o digest (ej. ghcr.io/acme/api:v1.2.3)', 'ghcr.io/acme/app:v1.0.0')
+  .option('--privileged', 'Marcar contenedor como privileged (debe ser bloqueado)')
+  .option('-m, --mount <spec>', 'Montaje de volumen/bind (repetible, ej. /:/host:rw)', collectCliList, [])
+  .option('--cap-add <cap>', 'Capability Linux añadida (repetible, ej. SYS_ADMIN)', collectCliList, [])
+  .option('--uid <n>', 'UID numérico del proceso contenedor (ej. 1000)')
+  .option('--port-bind <bind>', 'Exposición de puerto host (repetible, ej. 0.0.0.0:5432)', collectCliList, [])
+  .option('--memory <mb>', 'Límite de memoria en MB', '512')
+  .option('--cpu <cores>', 'Límite de CPU en cores', '1')
+  .option('--healthcheck <path>', 'Ruta de healthcheck HTTP', '/health')
+  .option('--attested', 'Marcar artefacto con atestación SLSA v1.1 verificada')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const rawPreset = String(options.preset || 'baseline').toLowerCase();
+      if (!['baseline', 'restricted', 'soc2-strict'].includes(rawPreset)) {
+        throw new Error(`Preset inválido "${options.preset}". Usa: baseline | restricted | soc2-strict`);
+      }
+      const admSvc = svc.admissionPolicyService;
+      const spec = {
+        image: String(options.image || ''),
+        privileged: Boolean(options.privileged),
+        mounts: Array.isArray(options.mount) ? options.mount : [],
+        capAdd: Array.isArray(options.capAdd) ? options.capAdd : [],
+        ...(options.uid !== undefined ? { uid: Number(options.uid) } : { uid: 1000 }),
+        ports: Array.isArray(options.portBind) ? options.portBind : [],
+        memoryLimitMb: Number(options.memory) || 0,
+        cpuLimit: Number(options.cpu) || 0,
+        healthcheckPath: options.healthcheck ? String(options.healthcheck) : '',
+        attestationVerified: Boolean(options.attested)
+      };
+      const evaluation = admSvc.evaluateDeployment(spec, { preset: rawPreset });
+      const allowed = Boolean(evaluation && evaluation.allowed !== false && evaluation.decision !== 'DENY');
+      const payload = { ...evaluation, ok: allowed, preset: rawPreset };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!allowed) process.exitCode = 1;
+        return;
+      }
+
+      const badge = allowed ? '\x1b[32mALLOW ✅\x1b[0m' : '\x1b[31mDENY ❌\x1b[0m';
+      console.log(`\n🛡️  Culkibo Policy-as-Code Admission Gate (${rawPreset}) — [${badge}]`);
+      console.log(`   Decisión:    ${evaluation.decision} (score=${evaluation.score ?? '—'}/100)`);
+      console.log(`   Violaciones: ${Array.isArray(evaluation.enforcedViolations) ? evaluation.enforcedViolations.length : 0}`);
+      console.log(`   Avisos:      ${Array.isArray(evaluation.auditWarnings) ? evaluation.auditWarnings.length : 0}`);
+      console.log('');
+      if (!allowed) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
     }

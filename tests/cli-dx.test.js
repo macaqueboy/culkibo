@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 135);
+    assert.strictEqual(demoJson.datasets.mcpTools, 140);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -762,6 +762,44 @@ async function testCliDx() {
     const vramOverflowJson = JSON.parse(vramOverflowCli.stdout);
     assert.strictEqual(vramOverflowJson.fits, false);
     console.log(`  ✓ Pioneer CLI Cycle-10 verificado (culkibo dr-drill PASS/20B-FAIL, culkibo ai-vram ${vramFitJson.totalRequiredGb}GB fits/overflow, culkibo demo 135 tools)`);
+
+    // 15. Pioneer Cycle-11 CLI: `culkibo compliance-bundle` (Ed25519 sign + verify + tamper) & `culkibo admission-check` (DENY exit 1 vs ALLOW exit 0)
+    const bundleOutPath = path.join(tmpRoot, 'compliance-bundle.json');
+    const compGenCli = await runCli(['compliance-bundle', '--framework', 'all', '--out', bundleOutPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(compGenCli.status, 0, `culkibo compliance-bundle falló: ${compGenCli.stderr} ${compGenCli.stdout}`);
+    const compGenJson = JSON.parse(compGenCli.stdout);
+    assert.strictEqual(compGenJson.ok, true);
+    assert.strictEqual(compGenJson.algorithm, 'Ed25519');
+    assert.ok(fs.existsSync(bundleOutPath));
+    assert.ok(!compGenCli.stdout.includes('PRIVATE KEY'), 'compliance-bundle CLI jamás debe exponer claves privadas');
+
+    const compVerOkCli = await runCli(['compliance-bundle', '--verify', bundleOutPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(compVerOkCli.status, 0, `culkibo compliance-bundle --verify falló: ${compVerOkCli.stderr}`);
+    assert.strictEqual(JSON.parse(compVerOkCli.stdout).valid, true);
+
+    const tamperedBundle = JSON.parse(fs.readFileSync(bundleOutPath, 'utf8'));
+    tamperedBundle.payload.overallScore = tamperedBundle.payload.overallScore === 100 ? 99 : 100;
+    const tamperedPath = path.join(tmpRoot, 'compliance-tampered.json');
+    fs.writeFileSync(tamperedPath, JSON.stringify(tamperedBundle), 'utf8');
+    const compVerBadCli = await runCli(['compliance-bundle', '--verify', tamperedPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(compVerBadCli.status, 1, 'compliance-bundle --verify debe retornar exit=1 en bundle alterado');
+    assert.strictEqual(JSON.parse(compVerBadCli.stdout).valid, false);
+
+    // culkibo admission-check: privileged + /:/host:rw -> DENY exit 1; hardened soc2-strict -> ALLOW exit 0
+    const admDenyCli = await runCli(['admission-check', '--preset', 'baseline', '--privileged', '--mount', '/:/host:rw', '--port-bind', '0.0.0.0:5432', '--json'], { env: isolatedEnv });
+    assert.strictEqual(admDenyCli.status, 1, 'culkibo admission-check debe retornar exit=1 en DENY');
+    const admDenyJson = JSON.parse(admDenyCli.stdout);
+    assert.strictEqual(admDenyJson.ok, false);
+    assert.strictEqual(admDenyJson.decision, 'DENY');
+    assert.ok(admDenyJson.enforcedViolations.length >= 3);
+
+    const admAllowCli = await runCli(['admission-check', '--preset', 'soc2-strict', '--image', 'ghcr.io/acme/api:v2.4.1', '--uid', '1000', '--memory', '512', '--cpu', '1', '--healthcheck', '/health', '--attested', '--json'], { env: isolatedEnv });
+    assert.strictEqual(admAllowCli.status, 0, `culkibo admission-check ALLOW falló: ${admAllowCli.stderr} ${admAllowCli.stdout}`);
+    const admAllowJson = JSON.parse(admAllowCli.stdout);
+    assert.strictEqual(admAllowJson.ok, true);
+    assert.strictEqual(admAllowJson.decision, 'ALLOW');
+    assert.strictEqual(admAllowJson.score, 100);
+    console.log(`  ✓ Pioneer CLI Cycle-11 verificado (culkibo compliance-bundle Ed25519 sign/verify/tamper, culkibo admission-check DENY=1/ALLOW=0, culkibo demo 140 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

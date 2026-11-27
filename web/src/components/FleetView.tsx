@@ -44,6 +44,7 @@ import {
   type AiRuntimePreset,
   type AiVramEstimateResult,
   type AiWorkloadPlanResult,
+  type VolumeMigrationRecord,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -171,6 +172,16 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
+  // Cycle-11: Stateful Volume Snapshot Cloner & Cross-VPS Migration Planner
+  const [volMigrations, setVolMigrations] = useState<VolumeMigrationRecord[]>([]);
+  const [volName, setVolName] = useState('acme_postgres_data');
+  const [volMount, setVolMount] = useState('/var/lib/postgresql/data');
+  const [volUidGid, setVolUidGid] = useState('999:999');
+  const [volTargetHost, setVolTargetHost] = useState('198.51.100.42');
+  const [volBusy, setVolBusy] = useState(false);
+  const [volError, setVolError] = useState<string | null>(null);
+  const [activeVolPlan, setActiveVolPlan] = useState<VolumeMigrationRecord | null>(null);
+
   const [probingId, setProbingId] = useState<string | null>(null);
   const [probingAll, setProbingAll] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -240,14 +251,21 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
       api.getFleetMesh().catch(() => null),
       api.listRemoteBuilders().catch(() => ({ builders: [] })),
       api.getAiPresets().catch(() => ({ presets: [] })),
+      api.listVolumeMigrations().catch(() => ({ migrations: [] })),
     ])
-      .then(([srvRes, keyRes, meshRes, bldRes, aiRes]) => {
+      .then(([srvRes, keyRes, meshRes, bldRes, aiRes, volRes]) => {
         if (!active) return;
-        setServers(Array.isArray(srvRes?.servers) ? srvRes.servers : []);
+        const srvList = Array.isArray(srvRes?.servers) ? srvRes.servers : [];
+        setServers(srvList);
+        const firstRemote = srvList.find((x) => !x.isLocal && x.id !== 'local' && x.host);
+        if (firstRemote?.host) setVolTargetHost(firstRemote.host);
         setKeys(Array.isArray(keyRes?.keys) ? keyRes.keys : []);
         if (meshRes) setMesh(meshRes);
         setBuilders(Array.isArray(bldRes?.builders) ? bldRes.builders : []);
         setAiPresets(Array.isArray(aiRes?.presets) ? aiRes.presets : []);
+        const migList = Array.isArray(volRes?.migrations) ? volRes.migrations : [];
+        setVolMigrations(migList);
+        if (migList.length > 0) setActiveVolPlan(migList[0]);
         setLoadError(null);
       })
       .catch((err) => {
@@ -329,6 +347,36 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
       setAiError(err instanceof Error ? err.message : 'AI/GPU guardrail rejected workload plan');
     } finally {
       setAiBusy(false);
+    }
+  };
+
+  const handlePlanVolumeMigration = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setVolBusy(true);
+    setVolError(null);
+    try {
+      const parts = volUidGid.split(':').map((n) => parseInt(n.trim(), 10));
+      const uid = Number.isInteger(parts[0]) ? parts[0] : 999;
+      const gid = Number.isInteger(parts[1]) ? parts[1] : uid;
+      const res = await api.planVolumeMigration({
+        volumeName: volName.trim(),
+        mountPath: volMount.trim(),
+        sourceHost: 'local',
+        targetHost: volTargetHost.trim() || '198.51.100.42',
+        uid,
+        gid,
+        containerName: 'culkibo-db-pg-main',
+        estimatedMb: 512,
+      });
+      setActiveVolPlan(res);
+      setVolMigrations((prev) => [res, ...prev.filter((m) => m.id !== res.id)].slice(0, 10));
+      onNotify(`4-phase zero-shell migration planned for ${res.volumeName} (${uid}:${gid} preserved)`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Volume migration guardrail blocked plan';
+      setVolError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setVolBusy(false);
     }
   };
 
@@ -1514,6 +1562,162 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                 </div>
               );
             })()}
+          </section>
+
+          {/* Cycle-11: Stateful Volume Snapshot Cloner & Cross-VPS Migration Planner */}
+          <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                  <HardDrive className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('fleet.volTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                      tar --numeric-owner · SHA-256
+                    </span>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      <ShieldCheck className="w-3 h-3" />
+                      CVE-2025-66213 Guard
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('fleet.volDesc')}</p>
+                </div>
+              </div>
+            </div>
+
+            <form onSubmit={(e) => void handlePlanVolumeMigration(e)} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-2.5 items-end">
+              <label className="lg:col-span-3 block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">{t('fleet.volNameLabel')}</span>
+                <input
+                  type="text"
+                  required
+                  value={volName}
+                  onChange={(e) => setVolName(e.target.value)}
+                  placeholder="acme_postgres_data"
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                />
+              </label>
+              <label className="lg:col-span-3 block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">{t('fleet.volMountLabel')}</span>
+                <input
+                  type="text"
+                  required
+                  value={volMount}
+                  onChange={(e) => setVolMount(e.target.value)}
+                  placeholder="/var/lib/postgresql/data"
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                />
+              </label>
+              <label className="lg:col-span-2 block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">{t('fleet.volUidLabel')}</span>
+                <input
+                  type="text"
+                  required
+                  value={volUidGid}
+                  onChange={(e) => setVolUidGid(e.target.value)}
+                  placeholder="999:999"
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 tabular-nums"
+                />
+              </label>
+              <label className="lg:col-span-2 block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">{t('fleet.volTargetLabel')}</span>
+                <input
+                  type="text"
+                  required
+                  value={volTargetHost}
+                  onChange={(e) => setVolTargetHost(e.target.value)}
+                  placeholder="198.51.100.42"
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                />
+              </label>
+              <div className="lg:col-span-2">
+                <button
+                  type="submit"
+                  disabled={volBusy}
+                  className="culkibo-press w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {volBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                  <span>{volBusy ? t('fleet.volPlanning') : t('fleet.volPlanBtn')}</span>
+                </button>
+              </div>
+            </form>
+
+            {volError && (
+              <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 font-mono text-[11px] flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4 shrink-0" />
+                <span>{volError}</span>
+              </div>
+            )}
+
+            {activeVolPlan ? (() => {
+              const phases = Array.isArray(activeVolPlan.plan?.phases)
+                ? activeVolPlan.plan.phases
+                : Array.isArray(activeVolPlan.phases)
+                  ? activeVolPlan.phases
+                  : [];
+              return (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-slate-50 border border-slate-200 font-mono text-[11px] tabular-nums">
+                    <span className="font-semibold text-slate-900">
+                      {activeVolPlan.volumeName} ({activeVolPlan.sourceHost} → {activeVolPlan.targetHost})
+                    </span>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                        UID:GID {activeVolPlan.uid}:{activeVolPlan.gid}
+                      </span>
+                      <span className="text-slate-500 text-[10px]">
+                        mount: {activeVolPlan.mountPath} · shell:false
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* 4-Phase Zero-Shell Stepper */}
+                  {phases.length > 0 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                      {phases.map((ph, idx) => {
+                        const cmds = Array.isArray(ph.commands) ? ph.commands : [];
+                        const firstCmd = cmds[0];
+                        const cmdPreview = !firstCmd
+                          ? (Array.isArray(ph.argv) ? ph.argv.join(' ') : '')
+                          : Array.isArray(firstCmd)
+                            ? firstCmd.join(' ')
+                            : `${firstCmd.program} ${(Array.isArray(firstCmd.args) ? firstCmd.args : []).join(' ')}`;
+                        return (
+                          <div key={ph.id || idx} className="p-3 rounded-xl bg-white border border-slate-200 space-y-1.5">
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span className="px-1.5 py-0.5 rounded bg-slate-900 text-white font-mono text-[10px] font-semibold tabular-nums">
+                                Phase {ph.phase ?? idx + 1}
+                              </span>
+                              <span className="font-mono text-[10px] text-slate-400 truncate">{ph.id || ''}</span>
+                            </div>
+                            <div className="font-semibold text-slate-900 text-[11px] leading-snug">
+                              {ph.title || ph.name || `Phase ${idx + 1}`}
+                            </div>
+                            {cmdPreview && (
+                              <div className="p-1.5 rounded bg-slate-950 text-emerald-300 font-mono text-[10px] truncate" title={cmdPreview}>
+                                {cmdPreview}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {volMigrations.length > 1 && (
+                    <div className="text-[11px] font-mono text-slate-500">
+                      {volMigrations.length} volume migration plans recorded (source volumes retained for instant rollback).
+                    </div>
+                  )}
+                </div>
+              );
+            })() : (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-500 text-center">
+                {t('fleet.volEmpty')}
+              </div>
+            )}
           </section>
         </>
       )}

@@ -38,6 +38,7 @@ import type {
   EdgeTunnelCreateResult,
   EdgeShieldStatusResult,
   EdgeShieldChallengeResult,
+  EdgeExperimentRecord,
 } from '../lib/api';
 import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
@@ -92,6 +93,11 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
   const [shieldChallenge, setShieldChallenge] = useState<EdgeShieldChallengeResult | null>(null);
   const [shieldLoading, setShieldLoading] = useState(false);
   const [shieldError, setShieldError] = useState<string | null>(null);
+  // Cycle-11 Multi-Region Edge Geo-Routing (CF-IPCountry) & Sticky A/B Experiments state
+  const [experiments, setExperiments] = useState<EdgeExperimentRecord[]>([]);
+  const [expBusyId, setExpBusyId] = useState<string | null>(null);
+  const [expError, setExpError] = useState<string | null>(null);
+  const [expPreviewId, setExpPreviewId] = useState<string | null>(null);
   const [tunnelName, setTunnelName] = useState('');
   const [tunnelHost, setTunnelHost] = useState('127.0.0.1');
   const [tunnelPort, setTunnelPort] = useState('3000');
@@ -229,8 +235,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       projectId ? Promise.resolve([]) : api.getProjects().catch(() => []),
       projectId ? Promise.resolve(null) : api.getEdgeTunnelStatus().catch(() => null),
       projectId ? Promise.resolve(null) : api.getEdgeShieldStatus().catch(() => null),
+      api.listEdgeExperiments(projectId).catch(() => ({ experiments: [] })),
     ])
-      .then(([domRes, certRes, fastIng, capsRes, projList, tunRes, shRes]) => {
+      .then(([domRes, certRes, fastIng, capsRes, projList, tunRes, shRes, expRes]) => {
         if (!active) return;
         const list = domRes.domains || [];
         setDomains(list);
@@ -243,6 +250,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
         if (Array.isArray(projList)) setProjects(projList);
         if (tunRes) setTunnelStatus(tunRes);
         if (shRes) setShieldStatus(shRes);
+        if (expRes && Array.isArray(expRes.experiments)) setExperiments(expRes.experiments);
         setLoading(false);
         if (list.length > 0) {
           setProbingTls(true);
@@ -269,6 +277,64 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       setShieldError(err instanceof Error ? err.message : 'Edge Shield challenge unavailable');
     } finally {
       setShieldLoading(false);
+    }
+  };
+
+  const handleCreateDemoExperiment = async (kind: 'ab' | 'geo') => {
+    setExpBusyId(`create-${kind}`);
+    setExpError(null);
+    try {
+      const host = domains[0]?.hostname || 'app.acme-demo.dev';
+      const targetProj = projectId || projects[0]?.id || undefined;
+      const payload = kind === 'geo'
+        ? {
+            projectId: targetProj,
+            name: 'EU / US Regional Geo-Router',
+            hostname: host,
+            headerName: 'CF-IPCountry',
+            regions: [
+              { countries: ['DE', 'FR', 'ES'], upstream: '10.88.0.2:3000', label: 'eu-central' },
+              { countries: ['US', 'CA'], upstream: '10.88.0.3:3000', label: 'us-east' },
+            ],
+            defaultUpstream: '127.0.0.1:3000',
+          }
+        : {
+            projectId: targetProj,
+            name: 'Sticky Cookie 50/50 A/B Split',
+            hostname: host,
+            stickyMode: 'cookie' as const,
+            cookieName: `ckb_ab_${Date.now().toString(36).slice(-4)}`,
+            variants: [
+              { name: 'control', upstream: '127.0.0.1:3000', weight: 50 },
+              { name: 'variant-b', upstream: '127.0.0.1:3001', weight: 50 },
+            ],
+          };
+      const created = await api.upsertEdgeExperiment(payload);
+      setExperiments((prev) => [created, ...prev.filter((e) => e.id !== created.id)]);
+      setExpPreviewId(created.id);
+      onNotify?.(`Compiled native Caddy v2.11 ${kind === 'geo' ? 'Geo-IP' : 'Sticky A/B'} route for ${host}`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not compile edge experiment';
+      setExpError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setExpBusyId(null);
+    }
+  };
+
+  const handleKillExperiment = async (expId: string) => {
+    setExpBusyId(`kill-${expId}`);
+    setExpError(null);
+    try {
+      const updated = await api.killEdgeExperiment(expId, 'operator_kill_switch');
+      setExperiments((prev) => prev.map((e) => (e.id === expId ? updated : e)));
+      onNotify?.('Kill-Switch engaged — traffic reverted instantly to 100% control upstream', 'info');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not trigger kill-switch';
+      setExpError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setExpBusyId(null);
     }
   };
 
@@ -1432,6 +1498,169 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
             </div>
           ) : (
             <p className="text-xs text-slate-400">{t('domains.tunnelEmpty')}</p>
+          )}
+        </section>
+      )}
+
+      {/* Cycle-11: Multi-Region Edge Geo-Routing (CF-IPCountry) & Sticky A/B Experiments */}
+      {!projectId && (
+        <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                <ArrowRightLeft className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('domains.expTitle')}</h2>
+                  <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                    CF-IPCountry · Caddy v2.11 Native
+                  </span>
+                </div>
+                <p className="text-slate-500 mt-0.5">{t('domains.expDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+              <button
+                type="button"
+                disabled={expBusyId !== null}
+                onClick={() => void handleCreateDemoExperiment('geo')}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+              >
+                {expBusyId === 'create-geo' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                <span>+ Geo-IP</span>
+              </button>
+              <button
+                type="button"
+                disabled={expBusyId !== null}
+                onClick={() => void handleCreateDemoExperiment('ab')}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {expBusyId === 'create-ab' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                <span>{expBusyId === 'create-ab' ? t('domains.expCreating') : t('domains.expCreateDemo')}</span>
+              </button>
+            </div>
+          </div>
+
+          {expError && (
+            <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4 shrink-0" />
+              <span>{expError}</span>
+            </div>
+          )}
+
+          {experiments.length === 0 ? (
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-500 text-center">
+              {t('domains.expEmpty')}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {experiments.map((exp) => {
+                const regions = Array.isArray(exp.regions) ? exp.regions : [];
+                const variants = Array.isArray(exp.variants) ? exp.variants : [];
+                const caddyJson = exp.compiledCaddy || exp.compiledRoute || exp.caddyRoute;
+                const isPreviewOpen = expPreviewId === exp.id;
+                return (
+                  <div key={exp.id} className="p-4 rounded-xl bg-white border border-slate-200 space-y-3">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 flex-wrap min-w-0">
+                        <span className="font-semibold text-slate-900">{exp.name || exp.id}</span>
+                        <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
+                          {exp.hostname}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                          exp.killed
+                            ? 'bg-red-50 text-red-700 border-red-200'
+                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        }`}>
+                          {exp.killed ? t('domains.expKilledBadge') : t('domains.expActiveBadge')}
+                        </span>
+                        {exp.stickyMode && (
+                          <span className="px-1.5 py-0.5 rounded bg-slate-50 border border-slate-200 font-mono text-[10px] text-slate-600">
+                            sticky: {exp.stickyMode === 'cookie' ? (exp.cookieName || 'ckb_ab') : (exp.headerField || 'X-AB-Group')}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                        {caddyJson && (
+                          <button
+                            type="button"
+                            onClick={() => setExpPreviewId(isPreviewOpen ? null : exp.id)}
+                            className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-mono text-[10px] text-slate-700 cursor-pointer"
+                          >
+                            {isPreviewOpen ? 'Hide JSON' : t('domains.expCaddyPreview')}
+                          </button>
+                        )}
+                        {!exp.killed && (
+                          <button
+                            type="button"
+                            disabled={expBusyId !== null}
+                            onClick={() => void handleKillExperiment(exp.id)}
+                            className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white font-medium text-[11px] cursor-pointer disabled:opacity-50"
+                          >
+                            {expBusyId === `kill-${exp.id}` ? <Loader2 className="w-3 h-3 animate-spin" /> : <ShieldOff className="w-3 h-3" />}
+                            <span>{expBusyId === `kill-${exp.id}` ? t('domains.expKilling') : t('domains.expKillSwitch')}</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* ISO Country Geo-Routing Pills */}
+                    {regions.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-[10px] text-slate-500 uppercase">{exp.headerName || 'CF-IPCountry'}:</span>
+                        {regions.map((r, rIdx) => (
+                          <span
+                            key={rIdx}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200 font-mono text-[11px] text-slate-800"
+                          >
+                            <span className="font-semibold">{(Array.isArray(r.countries) ? r.countries : []).join(', ')}</span>
+                            <span className="text-slate-400">→</span>
+                            <span className="text-emerald-700">{r.label || r.upstream}</span>
+                          </span>
+                        ))}
+                        {exp.defaultUpstream && (
+                          <span className="px-2 py-1 rounded-lg bg-slate-50 border border-slate-200 font-mono text-[10px] text-slate-500">
+                            default → {exp.defaultUpstream}
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Sticky A/B Traffic Split Bar */}
+                    {variants.length > 0 && (
+                      <div className="space-y-1.5 tabular-nums">
+                        <div className="flex items-center justify-between text-[11px] font-mono text-slate-600">
+                          {variants.map((v, vIdx) => (
+                            <span key={vIdx}>
+                              {v.name}: <strong>{exp.killed ? (vIdx === 0 ? 100 : 0) : v.weight}%</strong> ({v.upstream})
+                            </span>
+                          ))}
+                        </div>
+                        <div className="h-2 rounded-full bg-slate-200 overflow-hidden flex">
+                          {variants.map((v, vIdx) => {
+                            const w = exp.killed ? (vIdx === 0 ? 100 : 0) : Math.max(0, Math.min(100, Number(v.weight) || 0));
+                            return (
+                              <div
+                                key={vIdx}
+                                className={vIdx === 0 ? 'bg-slate-900' : 'bg-emerald-500'}
+                                style={{ width: `${w}%` }}
+                              />
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {isPreviewOpen && caddyJson && (
+                      <pre className="p-3 rounded-xl bg-slate-950 text-emerald-300 border border-slate-800 font-mono text-[10px] overflow-x-auto max-h-52">
+                        {JSON.stringify(caddyJson, null, 2)}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </section>
       )}

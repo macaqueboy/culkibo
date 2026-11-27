@@ -1930,6 +1930,8 @@ class CaddyManager {
    *   streamTimeoutMs?: number | null,
    *   earlyHints?: any,
    *   edgeShield?: { enabled?: boolean, powChallenge?: boolean, difficulty?: number, blockedPaths?: string[], blockedUserAgents?: string[], blockSqliXss?: boolean, blockAiScrapers?: boolean, challengeEndpoint?: string, domain?: string } | null,
+   *   edgeExperiment?: { enabled?: boolean, id?: string, hostname?: string, stickyMode?: 'cookie' | 'header' | 'weighted', cookieName?: string, headerField?: string, variants: Array<{ name: string, upstream: string, weight: number }>, killed?: boolean } | null,
+   *   geoRouting?: { enabled?: boolean, hostname?: string, headerName?: string, regions: Array<{ countries: string[], upstream: string }>, defaultUpstream?: string } | null,
    *   dialTimeoutMs?: number | null,
    *   responseHeaderTimeoutMs?: number | null
    * }} spec
@@ -1968,6 +1970,8 @@ class CaddyManager {
       streamTimeoutMs = null,
       earlyHints = null,
       edgeShield = null,
+      edgeExperiment = null,
+      geoRouting = null,
       dialTimeoutMs = 5000,
       responseHeaderTimeoutMs = null
     } = spec;
@@ -2224,6 +2228,26 @@ class CaddyManager {
         handler: 'subroute',
         routes: dispatchRoutes
       });
+    } else if (geoRouting && geoRouting.enabled) {
+      // Multi-Region Geo-IP routing (opt-in, 100% nativo Caddy v2.11 sin plugins extra)
+      const geoExpSvc = require('./edgeExperimentService');
+      const geoSubroutes = geoExpSvc.compileGeoRoutes({
+        ...geoRouting,
+        hostname: geoRouting.hostname || hostnames[0],
+        defaultUpstream: geoRouting.defaultUpstream || upstreams[0]
+      });
+      chain.push({
+        handler: 'subroute',
+        routes: geoSubroutes
+      });
+    } else if (edgeExperiment && edgeExperiment.enabled) {
+      // Sticky Cookie/Header A/B Experiment routing (opt-in, 100% nativo Caddy v2.11 sin plugins extra)
+      const abExpSvc = require('./edgeExperimentService');
+      const abRoute = abExpSvc.compileAbExperimentRoute({
+        ...edgeExperiment,
+        hostname: edgeExperiment.hostname || hostnames[0]
+      });
+      chain.push(...abRoute.handle);
     } else {
       chain.push(mainProxyHandler);
     }
