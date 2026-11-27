@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 140);
+    assert.strictEqual(demoJson.datasets.mcpTools, 145);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -799,7 +799,81 @@ async function testCliDx() {
     assert.strictEqual(admAllowJson.ok, true);
     assert.strictEqual(admAllowJson.decision, 'ALLOW');
     assert.strictEqual(admAllowJson.score, 100);
-    console.log(`  ✓ Pioneer CLI Cycle-11 verificado (culkibo compliance-bundle Ed25519 sign/verify/tamper, culkibo admission-check DENY=1/ALLOW=0, culkibo demo 140 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-11 verificado (culkibo compliance-bundle Ed25519 sign/verify/tamper, culkibo admission-check DENY=1/ALLOW=0)`);
+
+    // 16. Pioneer Cycle-12 CLI: `culkibo lint-sql [sqlFile]` (unsafe exit 1 vs safe exit 0) & `culkibo audit-licenses` (MIT compliant exit 0 vs AGPL/SSPL exit 1)
+    const unsafeSqlCli = await runCli([
+      'lint-sql',
+      '--sql', 'CREATE INDEX idx_users_email ON users(email); DROP TABLE legacy_sessions;',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(unsafeSqlCli.status, 1, 'culkibo lint-sql debe salir con código 1 ante DDL bloqueante');
+    const unsafeSqlJson = JSON.parse(unsafeSqlCli.stdout);
+    assert.strictEqual(unsafeSqlJson.ok, false);
+    assert.strictEqual(unsafeSqlJson.safe, false);
+    assert.ok(Array.isArray(unsafeSqlJson.blockers) && unsafeSqlJson.blockers.length >= 3);
+
+    const safeSqlPath = path.join(tmpRoot, 'safe-migration.sql');
+    fs.writeFileSync(
+      safeSqlPath,
+      "SET lock_timeout = '5s';\nSET statement_timeout = '30s';\nCREATE INDEX CONCURRENTLY idx_users_email ON users(email);\n",
+      'utf8'
+    );
+    const safeSqlCli = await runCli(['lint-sql', safeSqlPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(safeSqlCli.status, 0, `culkibo lint-sql seguro falló: ${safeSqlCli.stderr} ${safeSqlCli.stdout}`);
+    const safeSqlJson = JSON.parse(safeSqlCli.stdout);
+    assert.strictEqual(safeSqlJson.ok, true);
+    assert.strictEqual(safeSqlJson.safe, true);
+    assert.strictEqual(safeSqlJson.blockers.length, 0);
+    assert.strictEqual(safeSqlJson.score, 100);
+
+    // culkibo audit-licenses: isolated MIT-only dir -> exit 0; AGPL+SSPL dir -> exit 1 under saas-strict, exit 0 under audit-only
+    const mitProjDir = path.join(tmpRoot, 'lic-mit-app');
+    fs.mkdirSync(mitProjDir, { recursive: true });
+    fs.writeFileSync(path.join(mitProjDir, 'package.json'), JSON.stringify({ name: 'mit-app', version: '1.0.0', license: 'MIT' }, null, 2), 'utf8');
+    fs.writeFileSync(path.join(mitProjDir, 'package-lock.json'), JSON.stringify({
+      name: 'mit-app',
+      lockfileVersion: 3,
+      packages: {
+        '': { name: 'mit-app', version: '1.0.0', license: 'MIT' },
+        'node_modules/fast-json': { version: '1.2.3', license: 'MIT' },
+        'node_modules/safe-http': { version: '2.0.0', license: 'Apache-2.0' }
+      }
+    }, null, 2), 'utf8');
+
+    const licPassCli = await runCli(['audit-licenses', '--policy', 'saas-strict', '--dir', mitProjDir, '--json'], { env: isolatedEnv });
+    assert.strictEqual(licPassCli.status, 0, `culkibo audit-licenses MIT falló: ${licPassCli.stderr} ${licPassCli.stdout}`);
+    const licPassJson = JSON.parse(licPassCli.stdout);
+    assert.strictEqual(licPassJson.ok, true);
+    assert.strictEqual(licPassJson.compliant, true);
+    assert.strictEqual(licPassJson.violations.length, 0);
+
+    const agplProjDir = path.join(tmpRoot, 'lic-agpl-app');
+    fs.mkdirSync(agplProjDir, { recursive: true });
+    fs.writeFileSync(path.join(agplProjDir, 'package.json'), JSON.stringify({ name: 'agpl-app', version: '1.0.0', license: 'MIT' }, null, 2), 'utf8');
+    fs.writeFileSync(path.join(agplProjDir, 'package-lock.json'), JSON.stringify({
+      name: 'agpl-app',
+      lockfileVersion: 3,
+      packages: {
+        '': { name: 'agpl-app', version: '1.0.0', license: 'MIT' },
+        'node_modules/copyleft-pdf': { version: '3.0.0', license: 'AGPL-3.0-only' },
+        'node_modules/source-avail-db': { version: '1.0.0', license: 'SSPL-1.0' }
+      }
+    }, null, 2), 'utf8');
+
+    const licFailCli = await runCli(['audit-licenses', '--policy', 'saas-strict', '--dir', agplProjDir, '--json'], { env: isolatedEnv });
+    assert.strictEqual(licFailCli.status, 1, 'culkibo audit-licenses debe salir con código 1 ante AGPL/SSPL bajo saas-strict');
+    const licFailJson = JSON.parse(licFailCli.stdout);
+    assert.strictEqual(licFailJson.ok, false);
+    assert.strictEqual(licFailJson.compliant, false);
+    assert.strictEqual(licFailJson.violations.length, 2);
+
+    const licWarnCli = await runCli(['audit-licenses', '--policy', 'audit-only', '--dir', agplProjDir, '--json'], { env: isolatedEnv });
+    assert.strictEqual(licWarnCli.status, 0, `culkibo audit-licenses audit-only falló: ${licWarnCli.stderr}`);
+    const licWarnJson = JSON.parse(licWarnCli.stdout);
+    assert.strictEqual(licWarnJson.compliant, true);
+    assert.ok(licWarnJson.warnings.length >= 2);
+    console.log(`  ✓ Pioneer CLI Cycle-12 verificado (culkibo lint-sql unsafe=1/safe=0, culkibo audit-licenses MIT=0/AGPL+SSPL=1/audit-only=0, culkibo demo 145 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

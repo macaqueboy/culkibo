@@ -64,6 +64,8 @@ import {
   type BuildHealerApplyResult,
   type ProjectDriftResult,
   type SloCanaryRollout,
+  type WorkerAutoscalerPolicy,
+  type WorkerAutoscalerEvaluation,
 } from '../lib/api';
 import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
@@ -170,8 +172,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [smartPackShowDockerfile, setSmartPackShowDockerfile] = useState(false);
   const [smartPackCopied, setSmartPackCopied] = useState<'ignore' | 'dockerfile' | null>(null);
 
-  // Cycle-5..10 Cockpit Panels (SLSA, Migrations, Micro-Wasm, Time-Machine, Shadow Replay, Terminal, Auto-Healer, Drift Check, SLO Canary)
-  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | null>(null);
+  // Cycle-5..12 Cockpit Panels (SLSA, Migrations, Micro-Wasm, Time-Machine, Shadow Replay, Terminal, Auto-Healer, Drift Check, SLO Canary, Autoscaler)
+  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | 'autoscaler' | null>(null);
   const [slsaAttest, setSlsaAttest] = useState<ReleaseAttestationResult | null>(null);
   const [slsaVerify, setSlsaVerify] = useState<AttestationVerifyResult | null>(null);
   const [slsaLoading, setSlsaLoading] = useState(false);
@@ -231,6 +233,25 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [canaryRollout, setCanaryRollout] = useState<SloCanaryRollout | null>(null);
   const [canaryBusy, setCanaryBusy] = useState<'load' | 'start' | 'advance' | 'spike' | 'abort' | null>(null);
   const [canaryError, setCanaryError] = useState<string | null>(null);
+
+  // Cycle-12 KEDA Queue/Worker Autoscaler & Backpressure Breaker state
+  const [autoPolicy, setAutoPolicy] = useState<WorkerAutoscalerPolicy>({
+    minReplicas: 1,
+    maxReplicas: 6,
+    scaleUpQueueThreshold: 40,
+    scaleDownQueueThreshold: 8,
+    scaleUpCooldownSec: 60,
+    scaleDownCooldownSec: 180,
+    perReplicaRamMb: 384,
+    reserveHostRamMb: 512,
+    breakerQueueThreshold: 250,
+    breakerRetryAfterSec: 15,
+  });
+  const [autoQueueDepth, setAutoQueueDepth] = useState('95');
+  const [autoHostFreeRam, setAutoHostFreeRam] = useState('1600');
+  const [autoEval, setAutoEval] = useState<WorkerAutoscalerEvaluation | null>(null);
+  const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
+  const [autoError, setAutoError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1036,7 +1057,69 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
   };
 
-  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary') => {
+  const handleLoadAutoscaler = async () => {
+    setAutoBusy('load');
+    setAutoError(null);
+    try {
+      const pol = await api.getProjectAutoscaler(project.id);
+      if (pol && typeof pol.minReplicas === 'number') setAutoPolicy(pol);
+    } catch (err: unknown) {
+      setAutoError(err instanceof Error ? err.message : 'Could not load autoscaler policy');
+    } finally {
+      setAutoBusy(null);
+    }
+  };
+
+  const handleSaveAutoscaler = async () => {
+    setAutoBusy('save');
+    setAutoError(null);
+    try {
+      const safeUp = Math.max(autoPolicy.scaleDownQueueThreshold + 1, autoPolicy.scaleUpQueueThreshold);
+      const safeBreaker = Math.max(safeUp, autoPolicy.breakerQueueThreshold);
+      const normalized = {
+        ...autoPolicy,
+        maxReplicas: Math.max(autoPolicy.minReplicas, autoPolicy.maxReplicas),
+        scaleUpQueueThreshold: safeUp,
+        breakerQueueThreshold: safeBreaker,
+      };
+      const saved = await api.saveProjectAutoscaler(project.id, normalized);
+      if (saved && typeof saved.minReplicas === 'number') setAutoPolicy(saved);
+      onNotify('Worker autoscaler policy saved (RAM ceiling + breaker armed)', 'success');
+    } catch (err: unknown) {
+      setAutoError(err instanceof Error ? err.message : 'Could not save autoscaler policy');
+    } finally {
+      setAutoBusy(null);
+    }
+  };
+
+  const handleEvaluateAutoscaler = async (overrideQueue?: number, overrideFreeRam?: number) => {
+    setAutoBusy('eval');
+    setAutoError(null);
+    try {
+      const q = overrideQueue ?? (Number(autoQueueDepth) || 0);
+      const ram = overrideFreeRam ?? (Number(autoHostFreeRam) || 1600);
+      if (overrideQueue !== undefined) setAutoQueueDepth(String(overrideQueue));
+      if (overrideFreeRam !== undefined) setAutoHostFreeRam(String(overrideFreeRam));
+      const res = await api.evaluateProjectAutoscaler(project.id, {
+        queueDepth: q,
+        currentReplicas: 1,
+        hostFreeRamMb: ram,
+        perReplicaRamMb: autoPolicy.perReplicaRamMb,
+      });
+      setAutoEval(res);
+      if (res.circuitBreaker?.state === 'OPEN') {
+        onNotify(`Backpressure Circuit Breaker OPEN — HTTP 503 Retry-After: ${res.circuitBreaker.retryAfterSec ?? 15}s`, 'error');
+      } else {
+        onNotify(`Autoscaler: ${res.action} (${res.currentReplicas} → ${res.targetReplicas}, maxSafe=${res.maxSafeReplicas})`, 'success');
+      }
+    } catch (err: unknown) {
+      setAutoError(err instanceof Error ? err.message : 'Could not evaluate autoscaler');
+    } finally {
+      setAutoBusy(null);
+    }
+  };
+
+  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | 'autoscaler') => {
     const next = activeCockpit === panel ? null : panel;
     setActiveCockpit(next);
     if (next === 'timemachine' && tmCheckpoints.length === 0 && !tmLoading) {
@@ -1050,6 +1133,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
     if (next === 'canary' && !canaryRollout && canaryBusy === null) {
       void handleLoadCanary();
+    }
+    if (next === 'autoscaler' && autoBusy === null) {
+      void handleLoadAutoscaler();
     }
   };
 
@@ -1428,6 +1514,19 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           >
             <Gauge className="w-3.5 h-3.5" />
             <span>{t('pd.canaryBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('autoscaler')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'autoscaler'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Cpu className="w-3.5 h-3.5" />
+            <span>{t('pd.autoBtn')}</span>
           </button>
         </div>
       </div>
@@ -2530,6 +2629,130 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               </div>
             );
           })()}
+        </section>
+      )}
+
+      {/* Cycle-12 Cockpit Drawer: OOM-Safe KEDA Worker Autoscaler & 503 Backpressure Circuit Breaker */}
+      {activeCockpit === 'autoscaler' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-4 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <Cpu className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.autoTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.autoDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+              <button
+                type="button"
+                disabled={autoBusy !== null}
+                onClick={() => void handleSaveAutoscaler()}
+                className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>{autoBusy === 'save' ? t('pd.autoSaving') : t('pd.autoSave')}</span>
+              </button>
+              <button
+                type="button"
+                disabled={autoBusy !== null}
+                onClick={() => void handleEvaluateAutoscaler(600, 384)}
+                className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+              >
+                <ShieldAlert className="w-3.5 h-3.5" />
+                <span>{t('pd.autoTestBreaker')}</span>
+              </button>
+              <button
+                type="button"
+                disabled={autoBusy !== null}
+                onClick={() => void handleEvaluateAutoscaler()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {autoBusy === 'eval' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                <span>{autoBusy === 'eval' ? t('pd.autoEvaluating') : t('pd.autoEval')}</span>
+              </button>
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Autoscaler panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {autoError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{autoError}</div>}
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 tabular-nums">
+            <label className="block">
+              <span className="text-[11px] font-medium text-slate-600 block mb-1">Max Replicas</span>
+              <input
+                type="number"
+                min={1}
+                max={32}
+                value={autoPolicy.maxReplicas}
+                onChange={(e) => setAutoPolicy((p) => ({ ...p, maxReplicas: Math.max(1, Number(e.target.value) || 1) }))}
+                className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-medium text-slate-600 block mb-1">Scale-Up Queue</span>
+              <input
+                type="number"
+                min={1}
+                value={autoPolicy.scaleUpQueueThreshold}
+                onChange={(e) => setAutoPolicy((p) => ({ ...p, scaleUpQueueThreshold: Math.max(1, Number(e.target.value) || 40) }))}
+                className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-medium text-slate-600 block mb-1">Simulated Queue Depth</span>
+              <input
+                type="number"
+                min={0}
+                value={autoQueueDepth}
+                onChange={(e) => setAutoQueueDepth(e.target.value)}
+                className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-medium text-slate-600 block mb-1">Host Free RAM (MB)</span>
+              <input
+                type="number"
+                min={128}
+                value={autoHostFreeRam}
+                onChange={(e) => setAutoHostFreeRam(e.target.value)}
+                className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+          </div>
+
+          {autoEval && (
+            <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums ${
+              autoEval.circuitBreaker?.state === 'OPEN'
+                ? 'bg-red-50 border-red-200 text-red-900'
+                : 'bg-slate-50 border-slate-200 text-slate-900'
+            }`}>
+              <div className="flex flex-wrap items-center justify-between gap-2 font-mono">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
+                    autoEval.circuitBreaker?.state === 'OPEN'
+                      ? 'bg-red-100 text-red-800 border-red-300'
+                      : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                  }`}>
+                    {autoEval.action} · {autoEval.reason}
+                  </span>
+                  <span className="text-xs font-semibold">
+                    Replicas: {autoEval.currentReplicas} → {autoEval.targetReplicas} (desired {autoEval.desiredReplicas}, maxSafeReplicas: {autoEval.maxSafeReplicas})
+                  </span>
+                </div>
+                <span className="text-[11px] opacity-80">RAM headroom: {autoEval.memoryHeadroomMb} MB</span>
+              </div>
+              {autoEval.circuitBreaker?.state === 'OPEN' && (
+                <div className="font-mono text-[11px] font-semibold text-red-800">
+                  Circuit Breaker OPEN → HTTP {autoEval.circuitBreaker.httpStatus ?? 503} · Retry-After: {autoEval.circuitBreaker.retryAfterSec ?? 15}s (VPS protected from OOM!)
+                </div>
+              )}
+            </div>
+          )}
         </section>
       )}
 

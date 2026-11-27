@@ -5,16 +5,16 @@
 # Culkibo
 
 **The `49 MB`, `10,679 req/s`, Zero-Shell, AI-Native Self-Hosted PaaS (Open-Source Coolify & Dokploy Alternative)**
-Deploy **140+ 1-Click Apps**, **12 Managed Databases**, **Policy-as-Code Admission (10 CIS/PSS Rules)**, **Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Bundles**, **Multi-Region Geo-Routing & Sticky A/B Experiments**, **Cross-VPS Stateful Volume Migrator**, **AI/GPU LLM Orchestrator (Ollama · vLLM · llama.cpp)**, **Google SRE SLO Canary Auto-Rollback**, **Automated DR Fire-Drills**, **Sub-8ms Live Sync 2.0 (`1.06 ms` apply)**, **Post-MinIO S3**, **Read-Only DB Studio**, **Passkeys (FIDO2)**, **OpenTofu IaC**, **Record `44 µs` (`0.044 ms`) Micro-Wasm**, and **140 MCP Tools + Async Tasks + 3 Inline MCP Apps** for **Claude Code, Antigravity, Cursor, Windsurf & Codex** — on a single **`49 MB`** Node.js control plane (`116.6 ms` boot, `10,679 req/s`) with **6 runtime dependencies**, **56 test suites**, and **Caddy v2.11** atomic routing.
+Deploy **140+ 1-Click Apps**, **12 Managed Databases**, **Zero-Downtime SQL Migration Linter**, **OOM-Safe KEDA Worker Autoscaler**, **Synthetic Multi-Step Flow & TLS/SNI Sentinel**, **SPDX License Auditor**, **Tailored Seccomp & `runc` CVE Guard**, **Policy-as-Code Admission**, **Signed SOC 2 Bundles**, **Geo/A-B Edge**, **AI/GPU LLM Orchestrator (Ollama · vLLM)**, **SRE SLO Canaries**, **DR Fire-Drills**, **Sub-8ms Live Sync 2.0**, **Post-MinIO S3**, **Record `44 µs` Micro-Wasm**, and **145 MCP Tools (`-88.3%` core) + Async Tasks + 3 Inline MCP Apps** for **Claude Code, Antigravity, Cursor, Windsurf & Codex** — on a single **`49 MB`** Node.js control plane (`116.6 ms` boot, `10,679 req/s`) with **6 runtime dependencies**, **59 test suites**, and **Caddy v2.11** atomic routing.
 
 [![Release: v1.2.0](https://img.shields.io/badge/Release-v1.2.0-F59E0B.svg)](.github/workflows/release.yml)
 [![Interactive Sandbox: Zero Install](https://img.shields.io/badge/Live%20Sandbox-Try%20in%2010s%20(%3Fdemo%3D1)-10B981.svg)](.github/workflows/demo-pages.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-2563EB.svg)](LICENSE)
-[![CI: 4 Jobs | 56 Suites | Node 20/22/24 + Caddy + Playwright](https://img.shields.io/badge/CI-56%20Suites%20%7C%20Node%2020%2F22%2F24%20%7C%20Caddy%20%7C%20Playwright-16A34A.svg)](.github/workflows/ci.yml)
+[![CI: 4 Jobs | 59 Suites | Node 20/22/24 + Caddy + Playwright](https://img.shields.io/badge/CI-59%20Suites%20%7C%20Node%2020%2F22%2F24%20%7C%20Caddy%20%7C%20Playwright-16A34A.svg)](.github/workflows/ci.yml)
 [![Idle RAM: 49 MB RSS | 10,679 req/s](https://img.shields.io/badge/Idle%20RAM-49%20MB%20RSS%20%7C%2010.7k%20req%2Fs-10B981.svg)](#benchmarks-and-reproducible-results)
 [![Runtime Deps: 6 | SLSA v1.1 + CycloneDX 1.6](https://img.shields.io/badge/Runtime%20Deps-6%20%7C%20SLSA%20%2B%20SBOM-0F172A.svg)](scripts/release-provenance.js)
 [![Zero Shell: Verified](https://img.shields.io/badge/Shell%20Construction-0%20(CI%20Verified)-0F172A.svg)](tests/shell-safety.test.js)
-[![MCP 2026-07-28: 140 Tools + Tasks + 3 MCP Apps](https://img.shields.io/badge/MCP%202026--07--28-140%20Tools%20%7C%20Tasks%20%7C%203%20MCP%20Apps-7C3AED.svg)](#ai-agent-native-mcp-2026-07-28-tasks-and-mcp-apps)
+[![MCP 2026-07-28: 145 Tools + Tasks + 3 MCP Apps](https://img.shields.io/badge/MCP%202026--07--28-145%20Tools%20%7C%20Tasks%20%7C%203%20MCP%20Apps-7C3AED.svg)](#ai-agent-native-mcp-2026-07-28-tasks-and-mcp-apps)
 
 > **Try Culkibo in 10 Seconds — Zero Install, Zero Docker Required:**
 > Launch the curated read-only **Interactive Browser Sandbox** directly on **[GitHub Pages (`?demo=1`)](https://macaqueboy.github.io/culkibo/?demo=1&lang=en&theme=dark)** *(published automatically via [`.github/workflows/demo-pages.yml`](.github/workflows/demo-pages.yml))* or locally in `<200 ms` with **`npx culkibo demo`**!
@@ -44,13 +44,13 @@ node bin/culkibo.js agent-init claude
 
 ---
 
-Culkibo `v1.2.0` is an open-source **self-hosted PaaS** and **Coolify / Dokploy alternative** engineered for solo builders, agencies, AI/GPU operators, regulated platform teams, and AI coding agents. Instead of bolting a heavy PHP/Laravel or multi-container control stack on top of polling reverse proxies and shell scripts, Culkibo runs a single **49 MB RSS** daemon (first sub-50 MB!, `0%` CPU, **`116.6 ms`** cold boot, **`10,679 req/s`** authed Bearer+Brotli fast-path, **`9,725 req/s`** health) with **zero shell command construction**, atomic **Caddy v2.11** HTTP/3 ingress with **Multi-Region Geo-Routing (`CF-IPCountry`), Sticky A/B Experiments, SRE SLO Canary Auto-Rollback & Edge PoW Shield**, **Declarative Policy-as-Code Deployment Admission (10 CIS/PSS Rules)**, **Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Evidence Bundles**, **Cross-VPS Stateful Volume Snapshot Migration (`--numeric-owner`)**, **Automated DR Fire-Drills**, **AI/GPU Local LLM Orchestration (Ollama · vLLM · llama.cpp)**, **Remote Build-Node Offloading**, **Persistent `.ndjson.gz` Log Archive**, **Post-MinIO S3 (Garage · RustFS · SeaweedFS + SigV4)**, **Read-Only DB Studio**, **Agency Billing Ledger & OSS White-Label**, **FIDO2 Passkeys**, **OSV.dev CVE Drift**, **OpenTofu IaC Export**, **Sub-8ms Live Sync 2.0 (`1.06 ms` apply / `7.67 ms` E2E)**, **all-time record `44 µs` (`0.044 ms`) warm Micro-Wasm** (`0.058 ms` p95, `64 KiB` RAM), and the industry's first **MCP `2026-07-28` (milestone `140` tools, `-87%+` core profile, Autonomous Triage, Async Tasks & inline `ui://culkibo/*` MCP Apps)** control plane — verified by **56 integrated test suites**.
+Culkibo `v1.2.0` is an open-source **self-hosted PaaS** and **Coolify / Dokploy alternative** engineered for solo builders, agencies, AI/GPU operators, regulated platform teams, and AI coding agents. Instead of bolting a heavy PHP/Laravel or multi-container control stack on top of polling reverse proxies and shell scripts, Culkibo runs a single **49 MB RSS** daemon (sub-50 MB across 81+ lazy-loaded services, `0%` CPU, **`116.6 ms`** cold boot, **`10,679 req/s`** authed Bearer+Brotli fast-path, **`9,725 req/s`** health) with **zero shell command construction**, atomic **Caddy v2.11** HTTP/3 ingress with **Multi-Region Geo-Routing, Sticky A/B Experiments, SRE SLO Canaries & Edge PoW Shield**, **Synthetic Multi-Step API Flow & Live TLS/SNI Drift Sentinel**, **10-Rule Zero-Downtime SQL Migration Linter**, **OOM-Safe KEDA Queue/Worker Autoscaler & `503 Retry-After` Breaker**, **CycloneDX 1.6 SPDX License Risk Auditor**, **Tailored Seccomp Generator & `runc` CVE Guard**, **Policy-as-Code Admission (10 CIS/PSS Rules)**, **Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Bundles**, **Cross-VPS Volume Cloner**, **Automated DR Fire-Drills**, **AI/GPU LLM Orchestration (Ollama · vLLM · llama.cpp)**, **Post-MinIO S3**, **Read-Only DB Studio**, **FIDO2 Passkeys**, **OpenTofu IaC**, **Sub-8ms Live Sync 2.0 (`1.06 ms` apply / `7.67 ms` E2E)**, **all-time record `44 µs` (`0.044 ms`) warm Micro-Wasm** (`0.058 ms` p95, `64 KiB` RAM), and the industry's first **MCP `2026-07-28` (`145` tools, `-88.3%` core profile, Autonomous Triage, Async Tasks & inline `ui://culkibo/*` MCP Apps)** control plane — verified by **59 integrated test suites**.
 
 ---
 
 ## Visual Showcase
 
-Culkibo ships with a **Zero-Install Interactive Browser Sandbox (`?demo=1` / `npx culkibo demo`)**, **100% English & Spanish zero-dep localization** across every view (auto-detecting browser locale, defaulting to English globally), **Obsidian Dark Mode & Crisp Light Mode**, an **Open-Core White-Label Brand & Custom Login Theme Engine** (`GET/PUT /api/brand`), a **Pioneer Cockpit, Governance & Edge UI** (Policy-as-Code 10-Rule CIS/PSS Admission Gate, Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Dossier, Multi-Region `CF-IPCountry` Geo-Routing & Sticky A/B Experiments with 1-Click Kill-Switch, Cross-VPS Stateful Volume Migration Planner, SLO Canary Auto-Rollback, Automated DR Fire-Drill Verifier, AI/GPU LLM VRAM Planner, Remote Build-Node Offloader, Persistent `.ndjson.gz` Log Archive, Read-Only Live DB Studio, Post-MinIO S3 + SigV4, Agency Ledger, Standard-Webhooks DLQ, Passkeys FIDO2, OSV CVE Scanner, OpenTofu IaC Exporter, Config Drift, Maintenance Windows, Zero-Dep Web Terminal, 20-Pattern Auto-Healer, WireGuard Mesh, Caddy PoW Shield, SmartPack, Shadow Replay, Time-Machine, `44 µs` Micro-Wasm Tester, FinOps, OTLP, and Coolify Streamer), and an interactive **Spatial SVG Topology Canvas** with click-to-link database env injection.
+Culkibo ships with a **Zero-Install Interactive Browser Sandbox (`?demo=1` / `npx culkibo demo`)**, **100% English & Spanish zero-dep localization** across every view (`100.0/100` EN purity verified in Playwright QA), **Obsidian Dark Mode & Crisp Light Mode**, an **Open-Core White-Label Brand & Custom Login Theme Engine** (`GET/PUT /api/brand`), a **Pioneer Cockpit, Reliability & Governance UI** (Synthetic Multi-Step Flow & Live TLS/SNI Sentinel, 10-Rule Zero-Downtime SQL Migration Linter, OOM-Safe KEDA Worker Autoscaler & `503 Retry-After` Simulator, SPDX License Risk Auditor, Tailored Seccomp & `runc` CVE Guard, Policy-as-Code 10-Rule Admission Gate, Ed25519-Signed SOC 2 / ISO / GDPR Compliance Dossier, Multi-Region `CF-IPCountry` Geo/A-B Experiments, Cross-VPS Volume Migration Planner, SLO Canary Rollback, DR Fire-Drills, AI/GPU VRAM Planner, Remote Build Offloader, `.ndjson.gz` Log Archive, Read-Only DB Studio, Post-MinIO S3 + SigV4, Agency Ledger, Passkeys FIDO2, OSV CVE Scanner, OpenTofu IaC, Zero-Dep Web Terminal, 20-Pattern Auto-Healer, WireGuard Mesh, Caddy PoW Shield, SmartPack, Shadow Replay, Time-Machine, `44 µs` Micro-Wasm Tester, FinOps, OTLP, and Coolify Streamer), and an interactive **Spatial SVG Topology Canvas** with click-to-link database env injection.
 
 ### Live Sync 2.0 (`1.06 ms` Apply · `7.67 ms` E2E) + Inline MCP Apps Flow
 
@@ -68,7 +68,7 @@ Culkibo ships with a **Zero-Install Interactive Browser Sandbox (`?demo=1` / `np
 
 ![Culkibo interactive Spatial SVG Topology Canvas in Obsidian Dark showing Domains, Projects, Managed Databases, animated directional edges, and Node Inspector with Link-to-Project DATABASE_URL injection](docs/assets/topology-dark-en.png)
 
-### AI Agent Hub — MCP `2026-07-28`, `-87%+` Token Profiles & Interactive MCP Apps (`ui://culkibo/*`)
+### AI Agent Hub — MCP `2026-07-28`, `-88.3%` Token Profiles & Interactive MCP Apps (`ui://culkibo/*`)
 
 ![Culkibo 100% English AI Agent Hub showing MCP tools, playbooks, core profile token savings, 1-click Antigravity/Claude/Cursor/Windsurf/Codex setup, and Interactive MCP Apps gallery](docs/assets/ai-agent-hub.png)
 
@@ -76,41 +76,41 @@ Culkibo ships with a **Zero-Install Interactive Browser Sandbox (`?demo=1` / `np
 
 ## Why Culkibo Is Architecturally Different
 
-Traditional self-hosted PaaS platforms force a painful trade-off: burn 500 MB–1.5 GB of VPS RAM just to run the panel, allow `- /:/host:rw` container escapes or plaintext DB secrets, upload silent empty backups, kill mid-build SSH sessions, and live with recurring shell-injection & LLM-runtime CVEs. Culkibo fixes these problems at the architecture layer:
+Traditional self-hosted PaaS platforms force a painful trade-off: burn 500 MB–1.5 GB of VPS RAM just to run the panel, allow `- /:/host:rw` escapes or `unconfined` seccomp containers, run locking SQL DDL straight into prod downtime, thrash VPS RAM on autoscaling spikes, and live with recurring shell-injection & `runc`/LLM CVEs. Culkibo fixes these problems at the architecture layer:
 
-### 1. Zero-Shell Engine (`shell: false`), Policy-as-Code Admission, Signed SOC 2 Bundles & Full CVE Immunity
+### 1. Zero-Shell Engine (`shell: false`), Tailored Seccomp/`runc` Guard, SPDX Auditor, Policy Admission & SOC 2
 - Every subprocess (`docker`, `git`, `caddy`, `ssh`, `cron`, `exec`, `npm`) is invoked through `spawn()` / `execFile()` with tokenized `argv` arrays validated by [`safeCommand.js`](server/services/safeCommand.js) and `shell: false`. Statically verified on every commit by [`tests/shell-safety.test.js`](tests/shell-safety.test.js).
-- **Declarative Policy-as-Code Deployment Admission Engine (`server/services/admissionPolicyService.js` · `culkibo admission-check` + MCP `culkibo_admission_check`):** Kyverno/OPA-lite pre-deploy gate evaluating **10 CIS / Pod Security Standards rules** (`no_privileged`, `no_docker_sock_mount`, `no_host_root_mount` blocking Coolify `- /:/host:rw`, `no_dangerous_caps`, `no_latest_tag`, `require_non_root_uid`, `require_resource_limits`, `require_healthcheck`, `require_signed_attestation`, `no_public_db_or_panel_bind` curing `dokploy#2661`) in `enforce`/`audit` modes with `baseline`/`restricted`/`soc2-strict` presets (exits `1` on `DENY` in CI!).
-- **Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Evidence Bundle (`server/services/complianceBundleService.js` · `culkibo compliance-bundle` + MCP `culkibo_compliance_bundle`):** Directly answers `dokploy#2642` & `#4360` with a 1-click tamper-verifiable JSON + Markdown auditor dossier aggregating RBAC, 2FA/Passkeys, hash-chained audit logs, AES-256-GCM proof, SLSA v1.1, OSV CVE scans, secret rotation ages, DR Fire-Drill scorecards & admission posture — **0 plaintext secrets**.
-- **Automated DR Fire-Drills (`culkibo dr-drill`), Zero-Dep FIDO2 Passkeys, Ephemeral Secret Leases, OSV.dev CVE Drift (`culkibo cve-scan`) & Signed SLSA v1.1 + CycloneDX 1.6 SBOM:** Validates SHA-256/AES-GCM/gunzip/SQL DDL rejecting silent `0 B`/`20 B` dumps (`dokploy#1382`, `coolify#6506`) & stripped Supabase ACLs (`coolify#12244`), authenticates with pure-JS CBOR/COSE ES256/Ed25519 Passkeys, batches CycloneDX PURLs against `api.osv.dev/v1/querybatch`, and ships signed `release.slsa.dsse.json` via [`.github/workflows/release.yml`](.github/workflows/release.yml).
-- **By-Design Immunity to Real-World PaaS & LLM CVEs ([`CYCLE6`](docs/COMPETITOR_RADAR_CYCLE6.md) · [`CYCLE7`](docs/COMPETITOR_RADAR_CYCLE7.md) · [`CYCLE8`](docs/COMPETITOR_RADAR_CYCLE8.md) · [`CYCLE9`](docs/COMPETITOR_RADAR_CYCLE9.md) · [`CYCLE10`](docs/COMPETITOR_RADAR_CYCLE10.md)):** Immune to **`Coolify CVE-2025-66213` (CVSS 10.0)** & `- /:/host:rw`, **`Ollama CVE-2026-7482`** & **`vLLM CVE-2026-22778` (CVSS 9.8) / `CVE-2026-137477`** (`CVE-2025-63389` private/Bearer proxy), Dokploy **`CVE-2026-116068`/`127212`/`24841`/`129433`/`129315`/`133520`**, Portainer **`CVE-2026-134756`**, Runtipi **`CVE-2026-47277`**, Dokku **`CVE-2026-54636`**, **`dokploy#2661/#2642/#4360/#1382/#6035/#3226/#3450/#1621`**, **`coolify#6506/#12244/#11372/#12170`**, **`kamal#1709/#1856/#1790`**, **`uptime-kuma#7704/#8193/#6519`**, and the 2025–2026 MinIO archiving.
+- **Tailored Least-Privilege Seccomp Generator & `runc` CVE Guard (`server/services/seccompProfileService.js` + `systemDoctor.js` + MCP `culkibo_seccomp_profile`):** Emits minimal `SCMP_ACT_ERRNO` OCI `seccomp.json` profiles per stack (`node`/`python`/`go`/`rust`/`static-caddy`) explicitly blocking `io_uring_*`, `ptrace`, `mount`, `unshare`, `setns`, `bpf` & `kexec_load` (hard-rejecting `unconfined` with `400`), and audits host `runc` versions against **`runc CVE-2025-31133`**, **`CVE-2025-52565`**, and **`CVE-2025-52881`**.
+- **CycloneDX 1.6 SPDX License Compliance & Risk Auditor (`server/services/licenseAuditorService.js` · `culkibo audit-licenses` + MCP `culkibo_audit_licenses`):** Parses compound `OR`/`AND` SPDX expressions and custom `LicenseRef-*` strings across CycloneDX SBOMs / lockfiles to flag `AGPL`, `SSPL`, `BSL`, `GPL`, and `unknown` licenses under `saas-strict`, `oss-permissive`, or `audit-only` policies (exits `1` in CI when non-compliant).
+- **Declarative Policy-as-Code Admission (`culkibo admission-check`, 10 CIS/PSS Rules) & Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Bundles (`culkibo compliance-bundle`, 0 plaintext secrets):** Blocks `- /:/host:rw`, `docker.sock`, `:latest`, `UID 0`, and `dokploy#2661` public DB binds; generates tamper-verifiable JSON + Markdown auditor dossiers alongside **Automated DR Fire-Drills (`culkibo dr-drill`)**, **Zero-Dep FIDO2 Passkeys**, **Secret Leases**, **OSV.dev CVE Drift (`culkibo cve-scan`)**, and **Signed SLSA v1.1 + CycloneDX 1.6 SBOM** ([`.github/workflows/release.yml`](.github/workflows/release.yml)).
+- **By-Design Immunity to Real-World PaaS, Runtime & LLM CVEs ([`CYCLE6`](docs/COMPETITOR_RADAR_CYCLE6.md) · [`CYCLE7`](docs/COMPETITOR_RADAR_CYCLE7.md) · [`CYCLE8`](docs/COMPETITOR_RADAR_CYCLE8.md) · [`CYCLE9`](docs/COMPETITOR_RADAR_CYCLE9.md) · [`CYCLE10`](docs/COMPETITOR_RADAR_CYCLE10.md) · [`CYCLE11`](docs/COMPETITOR_RADAR_CYCLE11.md)):** Immune to **`runc CVE-2025-31133`/`52565`/`52881`**, **`Coolify CVE-2025-66213` (CVSS 10.0)** & `- /:/host:rw`, **`Ollama CVE-2026-7482`** & **`vLLM CVE-2026-22778` (CVSS 9.8) / `CVE-2026-137477`**, Dokploy **`CVE-2026-116068`/`127212`/`24841`/`129433`/`129315`/`133520`**, Portainer **`CVE-2026-134756`**, Runtipi **`CVE-2026-47277`**, Dokku **`CVE-2026-54636`**, **`uptime-kuma#5772/#7500/#7704/#8193/#6519`**, **`gatus#856`**, **`dokploy#6105/#2661/#2642/#1382/#3226`**, **`coolify#3862/#6506/#11372/#12170`**, **`caprover#2164`**, **`kamal#1709/#1856/#1790`**, and the 2025–2026 MinIO archiving.
 
-### 2. Sub-50 MB (`49 MB`) Idle RAM, `10,679 req/s` Fast-Path, Persistent `.ndjson.gz` Logs, Agency Quotas & White-Label
-- **All-Time Verified Records (Cycle-10 QA `#278`):** **`49 MB RSS`** idle daemon (first sub-50 MB! `0%` idle CPU across 76+ lazy-loaded services), **`116.6 ms`** cold boot (`4×` faster than Cycle #1), **`10,679 req/s`** authenticated Bearer+Brotli fast-path (`p50 2.20 ms`, first `>10k req/s`!), **`9,725 req/s`** health, and **`0.61 ms`** warm 140-app catalog — fitting effortlessly on a **$4/mo 512 MB–1 GB VPS**.
+### 2. Sub-50 MB (`49 MB`) Idle RAM, `10,679 req/s` Fast-Path, Synthetic Flow & TLS/SNI Sentinel, Logs & White-Label
+- **All-Time Verified Records (Cycle-10/11 QA `#278`/`#297`):** **`49 MB RSS`** idle daemon (sub-50 MB held across 81+ lazy-loaded services, `0%` CPU), **`116.6 ms`** cold boot (`4×` faster than Cycle #1), **`10,679 req/s`** authenticated Bearer+Brotli fast-path (`p50 2.20 ms`), **`9,725 req/s`** health, and **`0.61 ms`** warm 140-app catalog — fitting effortlessly on a **$4/mo 512 MB–1 GB VPS**.
 - **Minimal supply-chain blast radius:** Exactly **6** root npm runtime dependencies ([`package.json`](package.json): `express`, `ws`, `chokidar`, `commander`, `cors`, `dotenv`) and **0** dependencies in [`telemetry-collector/`](telemetry-collector/README.md) — enforced across Node `20`, `22`, and `24` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-- **Compressed `.ndjson.gz` Persistent Log Archive (`logArchiveService.js`), Agency Multi-Tenant Quotas (`culkibo ledger --csv`), Open-Core White-Label Brand (`GET/PUT /api/brand`, `coolify#1744`) & Standard-Webhooks Bus + Anti-SSRF DLQ Replay (`webhookEventBus.js`):** Logs survive every redeploy (`coolify#12170`), per-project quotas + OWASP CSV-safe billing ledgers, Apache-2.0 custom login/workspace themes, and `whsec_` dual-secret outbound webhooks with 500-item DLQ replay.
-- **Zero-Dep OTLP/HTTP JSON ([`otlpExporter.js`](server/services/otlpExporter.js)), FinOps (`finopsOptimizer.js`), Cron Heatmap & Maintenance Windows ([`cronManager.js`](server/services/cronManager.js), [`uptimeMonitor.js`](server/services/uptimeMonitor.js)):** Native gzip OTLP traces/metrics to Tempo/SigNoz/Honeycomb, cloud savings calculator, 24h cron collision heatmap + `/api/heartbeat/:token`, live Maintenance Windows, public Incident Timelines, and Active-Passive Cloudflare DNS Geo-Failover plans.
+- **Synthetic Multi-Step API Flow Monitor & Live TLS/SNI Drift Sentinel (`server/services/syntheticSentinelService.js` · MCP `culkibo_synthetic_sentinel`):** Beats Uptime Kuma `#5772`/`#7500` & Gatus `#856` with chained SSRF-guarded multi-step HTTP flows (`login → extract JSON token → assert status/JSON/latency`, zero secret persistence) plus uncached `tls.connect` expiry, wildcard SAN, issuer & SHA-256 fingerprint drift watchdogs.
+- **Compressed `.ndjson.gz` Persistent Log Archive (`logArchiveService.js`), Agency Multi-Tenant Quotas (`culkibo ledger --csv`), Open-Core White-Label Brand (`GET/PUT /api/brand`, `coolify#1744`), Standard-Webhooks Dual-Secret DLQ (`webhookEventBus.js`), Zero-Dep OTLP ([`otlpExporter.js`](server/services/otlpExporter.js)), FinOps, Cron Heatmap & Maintenance Windows:** Logs survive every redeploy, OWASP CSV-safe billing ledgers, Apache-2.0 custom login/workspace themes, native Tempo/SigNoz/Honeycomb traces, 24h cron collision heatmap + `/api/heartbeat/:token`, and Cloudflare DNS Geo-Failover plans.
 
-### 3. Sub-8ms Live Sync 2.0 (`1.06 ms` Apply), SLO Canary Auto-Rollback, Read-Only DB Studio & `44 µs` Micro-Wasm
+### 3. Zero-Downtime SQL Linter, OOM-Safe KEDA Autoscaler, Sub-8ms Live Sync 2.0 & `44 µs` Micro-Wasm
 When coding with Claude Code, Antigravity, Cursor, or Windsurf, waiting 2–4 minutes per push destroys flow:
 
 ```text
 Traditional PaaS:  save file -> git commit -> push -> webhook -> Docker rebuild (1-4 min) -> check
 Culkibo Forge:     save file -> binary Commit Frame (/ws/sync, Brotli -96.1%) -> 1.06 ms apply / 7.67 ms E2E
-Culkibo Citadel:   env edit  -> Fast Restart (~1.5 s) OR BuildKit -> Policy Gate -> SLO Canary (10->100%)
+Culkibo Citadel:   SQL Lint -> Policy Gate -> BuildKit -> SLO Canary (10->100%) -> OOM-Safe Autoscaler
 ```
 
-- **Adaptive binary framing (`0x02` Brotli / `0x03` Gzip):** `-96.1%` wire reduction on 100-file TSX bursts, SHA-256 LRU deduplication, chunked transfers (`<=100 MB` with SHA-256 check), **Merkle Tree** verification, and **in-memory time-travel patch rollback (`1.60 ms p50`)**.
-- **Google SRE Error-Budget SLO Canary Auto-Rollback (`server/services/sloCanaryController.js` · MCP `culkibo_slo_canary`):** Progressive `10→25→50→100%` weights directly over Caddy v2.11 `weighted_round_robin`, computing Google SRE burn-rate (`>14.4×` or p95 breach triggers instant **`100/0` rollback** + alert) — paired with **Shadow Traffic Replay Gate** and **Whole-Stack Time-Machine (`culkibo timemachine`)**.
-- **Zero-Dep Read-Only Live DB Studio & Safe Redis/Valkey Inspector (`server/services/dbStudioService.js` · MCP `culkibo_db_studio`):** Zero-sidecar SQL/Redis studio replacing Adminer — strips `--`/`/* */` comments before scanning, blocks stacked `;`, DDL/DML, `COPY` & `psql \!`, wraps queries in `BEGIN TRANSACTION READ ONLY` + `5s` timeout + `LIMIT 200`, diagnoses Postgres bloat & `EXPLAIN (FORMAT JSON)`, and runs safe Redis `SCAN`/`TYPE`/`TTL`/`INFO`.
-- **Zero-Dep Container Web Terminal (`/ws/terminal`, zero `node-pty`), 20-Pattern Build Auto-Healer (`culkibo heal`), & Live Config Drift Detector (`kamal#1790` + PgBouncer Smart Pool `max_prepared_statements=200`).**
+- **10-Rule Zero-Downtime SQL Migration Linter (`server/services/sqlMigrationLinter.js` · `culkibo lint-sql` + MCP `culkibo_lint_sql_migration`):** Squawk / Strong Migrations built natively with a pure-JS DDL tokenizer catching `CREATE/DROP INDEX` without `CONCURRENTLY`, missing `lock_timeout`, `FOREIGN KEY`/`CHECK` without `NOT VALID`, `DROP COLUMN`/`TABLE`, `ALTER COLUMN TYPE`, `SET NOT NULL`, volatile `DEFAULT`s, and `RENAME` before prod downtime (exits `1` in CI on blockers).
+- **OOM-Safe KEDA Queue/Worker Autoscaler & `503 Retry-After` Backpressure Breaker (`server/services/workerAutoscalerService.js` · MCP `culkibo_worker_autoscaler`):** Beats Dokploy `#6105`, Coolify `#3862`, and CapRover `#2164` with KEDA-class hysteresis deadbands, scale-up/down cooldown windows (zero flapping), hard VPS RAM ceilings (`maxSafeReplicas` preventing OOM thrash), and an automatic `503 Retry-After` load-shedding circuit breaker.
+- **Adaptive Live Sync 2.0 (`1.06 ms` apply · `7.67 ms` E2E · `-96.1%` Brotli · `1.60 ms` rollback), Google SRE SLO Canary Auto-Rollback (`10→25→50→100%` Caddy weights + instant `100/0` rollback), Shadow Replay Gate & Whole-Stack Time-Machine (`culkibo timemachine`).**
+- **Zero-Dep Read-Only Live DB Studio & Safe Redis Inspector (`BEGIN TRANSACTION READ ONLY` + `5s` timeout + `LIMIT 200`), Zero-Dep Web Terminal (`/ws/terminal`, no `node-pty`), 20-Pattern Build Auto-Healer (`culkibo heal`), & Live Config Drift Detector (`kamal#1790` + PgBouncer Smart Pool).**
 - **All-Time Record `44 µs` (`0.044 ms`) Warm Micro-Wasm Edge Runtime ([`wasmMicroRunner.js`](server/services/wasmMicroRunner.js)):** Sandboxed WebAssembly in isolated `worker_threads` — live-measured at **`0.044 ms` (44 µs) warm p50**, **`0.058 ms` p95**, and **`64 KiB` RAM** (zero host filesystem/network access).
-- **Honest scope:** Live Sync 2.0 accelerates incremental code/asset iteration (*Path B*). Dependency or `Dockerfile` changes run full immutable Docker BuildKit builds (*Path C*) with admission checks, smoke tests, shadow replay, SLO canaries, and multi-release rollback.
+- **Honest scope:** Live Sync 2.0 accelerates incremental code/asset iteration (*Path B*). Dependency or `Dockerfile` changes run full immutable Docker BuildKit builds (*Path C*) with SQL lint, admission checks, smoke tests, shadow replay, SLO canaries, and multi-release rollback.
 
-### 4. Milestone `140` MCP `2026-07-28` Tools (`-87%+` Core), Autonomous Triage, Async Tasks & Inline MCP Apps
-- **140 Tools, 13 Playbook Prompts & 10 Resources** over Streamable HTTP (`POST /api/mcp`) and stdio (`culkibo mcp`) with legacy SSE fallback — verified end-to-end against a real spawned stdio JSON-RPC client ([`tests/release-and-mcp-e2e.test.js`](tests/release-and-mcp-e2e.test.js)), including **`culkibo_security_posture`** (unified executive governance scorecard), `culkibo_admission_check`, `culkibo_compliance_bundle`, `culkibo_volume_migrate`, `culkibo_edge_experiment`, **`culkibo_triage_playbook`**, `culkibo_slo_canary`, `culkibo_ai_workload`, `culkibo_remote_builder`, `culkibo_log_archive_search`, `culkibo_db_studio`, `culkibo_s3_storage`, `culkibo_agency_ledger`, `culkibo_brand_theme`, `culkibo_cve_scan`, `culkibo_drift_check`, `culkibo_export_iac`, and `culkibo_secret_lease`.
+### 4. `145` MCP `2026-07-28` Tools (`-88.3%` Core), Autonomous Triage, Async Tasks & Inline MCP Apps
+- **145 Tools, 13 Playbook Prompts & 10 Resources** over Streamable HTTP (`POST /api/mcp`) and stdio (`culkibo mcp`) with legacy SSE fallback — verified end-to-end against a real spawned stdio JSON-RPC client ([`tests/release-and-mcp-e2e.test.js`](tests/release-and-mcp-e2e.test.js)), including `culkibo_synthetic_sentinel`, `culkibo_lint_sql_migration`, `culkibo_worker_autoscaler`, `culkibo_audit_licenses`, `culkibo_seccomp_profile`, **`culkibo_security_posture`**, `culkibo_admission_check`, `culkibo_compliance_bundle`, `culkibo_volume_migrate`, `culkibo_edge_experiment`, **`culkibo_triage_playbook`**, `culkibo_slo_canary`, `culkibo_ai_workload`, `culkibo_remote_builder`, `culkibo_log_archive_search`, `culkibo_db_studio`, `culkibo_s3_storage`, `culkibo_agency_ledger`, `culkibo_cve_scan`, and `culkibo_export_iac`.
 - **Official MCP `2026-07-28` Async Tasks (`io.modelcontextprotocol/tasks`) & Elicitation (`elicitation/create`):** Long-running Docker builds, Coolify migrations, and DR drills run non-blocking via `tasks/list`, `tasks/get`, `tasks/result`, and `tasks/cancel` with strict cross-tenant RBAC isolation — and declare structured JSON Schema `elicitation` prompts for missing secrets or approvals.
-- **5 Context-Saving Profiles (`?profile=core|deploy|ops|security|all` & `CULKIBO_MCP_PROFILE`):** `?profile=core` serves the 17 essential tools (`17 / 140`) and cuts LLM tool-schema context by **`-87%+`** while `culkibo_search_tools` discovers any of the remaining 140 tools on demand.
+- **5 Context-Saving Profiles (`?profile=core|deploy|ops|security|all` & `CULKIBO_MCP_PROFILE`):** `?profile=core` serves the 17 essential tools (`17 / 145`) and cuts LLM tool-schema context by **`-88.3%`** while `culkibo_search_tools` discovers any of the remaining 145 tools on demand.
 - **Interactive Inline MCP Apps (`modelcontextprotocol/ext-apps` `2026-01-26`):** Serves 3 sandboxed interactive HTML apps (`ui://culkibo/topology`, `ui://culkibo/incident-remediator`, `ui://culkibo/coolify-migration-diff`) with locked-down `_meta.ui.csp` (`default-src 'none'`), zero external URLs, XSS-safe JSON injection, and `postMessage` JSON-RPC bridges so compliant AI hosts render live visual cards inline inside chat.
 
 ### 5. Multi-Region Geo/A-B Edge, Cross-VPS Volume Cloner, AI/GPU LLMs, Remote Builds & Post-MinIO S3
@@ -134,7 +134,9 @@ Culkibo Citadel:   env edit  -> Fast Restart (~1.5 s) OR BuildKit -> Policy Gate
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Control-Plane Stack** | **Node.js (6 deps) + Caddy** | Laravel + PHP + PG + Redis + Soketi + Traefik | Next.js + PG + Redis + Traefik | Node.js + Nginx + Swarm | Local Ruby CLI + `kamal-proxy` | Go + BoltDB *(container UI)* |
 | **Control-Plane RAM & Fast-Path** | **49 MB RSS · 10,679 req/s** *(116.6 ms boot)* | ~800 MB – 1.5 GB *(2 GB VPS min)* | ~450 – 800 MB *(1–2 GB VPS)* | ~150 – 300 MB *(300–450 MB w/ Swarm)* | 0 MB panel *(+15–25 MB proxy)* | ~100 – 200 MB *(external proxy)* |
-| **Policy-as-Code Admission + Signed SOC 2** | ✅ **10 CIS/PSS rules · Ed25519 SOC 2/ISO/GDPR · `0` shell** | ❌ `- /:/host:rw` | ❌ Plaintext (`#2642`) | ⚠️ Swarm CLI | ⚠️ SSH shell | ⚠️ Paid Business |
+| **Seccomp/`runc` + SPDX + Policy Admission + SOC 2** | ✅ **Tailored Seccomp · `runc` CVE · SPDX · 10 CIS · Signed SOC 2** | ❌ `- /:/host:rw` | ❌ Plaintext (`#2642`) | ⚠️ Swarm CLI | ⚠️ SSH shell | ⚠️ Paid Business |
+| **Zero-Downtime SQL Linter + KEDA Autoscaler** | ✅ **10-rule DDL lint (`culkibo lint-sql`) · RAM-capped KEDA + `503`** | ❌ *(`#3862` open)* | ❌ *(`#6105` open)* | ❌ *(`#2164`)* | ❌ | ❌ |
+| **Synthetic API Flows + Live TLS/SNI Sentinel** | ✅ **Multi-step flows (0 secrets) + uncached TLS/SAN/FP drift** | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Multi-Region Geo/A-B + SRE SLO Canary** | **Caddy v2.11** *(`CF-IPCountry` · Sticky A/B · 10→100% SRE · PoW)* | Traefik *(2,000 ms throttle)* | Traefik / Swarm | Nginx reload | `kamal-proxy` *(<1 ms swap)* | ❌ External |
 | **Cross-VPS Stateful Volume Cloner** | ✅ **4-phase `tar --numeric-owner` (`999:999`) + SHA-256** | ❌ `CVE-2025-66213` | ⚠️ UID errors | ❌ | ⚠️ `EACCES` | ❌ |
 | **Self-Hosted AI / GPU LLM Orchestrator** | ✅ **Ollama · vLLM · llama.cpp · VRAM + CDI + CVE shield** | ❌ Manual | ⚠️ Legacy GPU (`#1621`) | ❌ | ❌ | ❌ |
@@ -143,11 +145,9 @@ Culkibo Citadel:   env edit  -> Fast Restart (~1.5 s) OR BuildKit -> Policy Gate
 | **Read-Only DB Studio + Post-MinIO S3** | ✅ **Safe SQL/Redis Studio · Garage/RustFS/SeaweedFS + SigV4** | ⚠️ Adminer / MinIO | ⚠️ Adminer / MinIO | ❌ | ❌ | ❌ |
 | **Agency Quotas, Ledger & OSS White-Label** | ✅ **Tenant Quotas · CSV-safe Ledger · OSS White-Label (`#1744`)** | ❌ *(`#1744` open)* | 💰 Enterprise paywall | ❌ | ❌ | 💰 Business |
 | **Standard-Webhooks Bus + OpenTofu IaC** | ✅ **Dual-secret `whsec_` + Anti-SSRF DLQ · `.tf`/Compose export** | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **AI-Agent Native MCP + Triage + MCP Apps** | ✅ **140 tools · `security_posture` · Tasks · 3 `ui://` Apps · `-87%+`** | ❌ *(3rd-party)* | ❌ *(3rd-party)* | ❌ | ❌ | ❌ |
-| **SmartPack + DirectPush + WireGuard Mesh** | ✅ **18 stacks · `culkibo pussh` · Native `x25519` Mesh · `ET1`** | ⚠️ Nixpacks | ⚠️ Nixpacks | ⚠️ Buildpacks | ❌ Registry req. | ❌ |
-| **Shadow Replay, Time-Machine & `44 µs` Wasm** | ✅ **Auto `PROMOTE`/`BLOCK` · SHA-256 restore · `0.044 ms` Wasm** | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **1-Click Catalog, 12 DBs, Passkeys & RBAC** | ✅ **140 apps · 12 DBs · FIDO2 Passkeys · Leases · 4-role RBAC** | ✅ Catalog / ⚠️ Teams | ✅ Catalog / ⚠️ Basic | ✅ One-click | ❌ Manual | ⚠️ Paid Business |
-| **1-Click Coolify v4 Migration + GitOps** | ✅ **Magic Vars + Traefik→Caddy + `culkibo.yaml` + Auto-Sleep** | — | ❌ | ❌ | ✅ `deploy.yml` | ⚠️ Git stacks |
+| **AI-Agent Native MCP + Triage + MCP Apps** | ✅ **145 tools · `security_posture` · Tasks · 3 `ui://` Apps · `-88.3%`** | ❌ *(3rd-party)* | ❌ *(3rd-party)* | ❌ | ❌ | ❌ |
+| **SmartPack + DirectPush + WireGuard + `44 µs` Wasm** | ✅ **18 stacks · `culkibo pussh` · `x25519` Mesh · `0.044 ms` Wasm** | ⚠️ Nixpacks | ⚠️ Nixpacks | ⚠️ Buildpacks | ❌ Registry req. | ❌ |
+| **1-Click Catalog, 12 DBs, Passkeys & Coolify Migrator** | ✅ **140 apps · 12 DBs · FIDO2 Passkeys · 4-role RBAC · Coolify→Caddy** | ✅ Catalog / ⚠️ Teams | ✅ Catalog / ⚠️ Basic | ✅ One-click | ✅ `deploy.yml` | ⚠️ Paid Business |
 
 ---
 
@@ -164,7 +164,7 @@ node bench/competitor-comparison.bench.js --markdown
 
 | Metric | Live Measured Result | Notes & Verification Command |
 | :--- | :--- | :--- |
-| **Idle Daemon RAM / CPU (Sub-50 MB Record!)** | **49 MB RSS · 0% CPU** | Measured across 76+ lazy-loaded services (`<= 60 MB` invariant) |
+| **Idle Daemon RAM / CPU (Sub-50 MB Record!)** | **49 MB RSS · 0% CPU** | Held across 81+ lazy-loaded services (`<= 60 MB` invariant) |
 | **Cold Boot Time** (`CULKIBO_SKIP_RECONCILE=1`) | **116.6 ms** *(4× faster than Cycle #1)* | Measured via `process.hrtime.bigint()` (`npm run bench:control`) |
 | **Authenticated Fast-Path (Bearer + Brotli, 500 req / 25w)** | **10,679 req/s** *(p50 `2.20 ms` — first >10k req/s!)* | HMAC-SHA256 LRU cache + WeakMap zero-copy Brotli + `Server-Timing` |
 | **Health HTTP (`GET /api/health`, 500 req / 25w)** | **9,725 req/s** | Pre-compiled O(1) fast-path route map |
@@ -174,8 +174,8 @@ node bench/competitor-comparison.bench.js --markdown
 | **Isolated Micro-Wasm Edge Runtime (All-Time Record)** | **warm p50 `0.044 ms` (44 µs) · p95 `0.058 ms` · `64 KiB` RAM** | Verified via `bench/competitor-comparison.bench.js` & [`tests/migrations-and-wasm.test.js`](tests/migrations-and-wasm.test.js) |
 | **WebSocket 40-Client Fan-Out** | **53.4 ms** (`40/40` initial state delivered) | Zero drops under concurrent churn (`tests/websocket-stress.test.js`) |
 | **Caddy v2.11 Atomic Route Swap, Geo/A-B & SLO Canary** | **Synchronous zero-poll Admin API + `weighted_round_robin`** | Verified live in Linux CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml) `live-caddy-e2e`) & `npm run bench` |
-| **MCP `2026-07-28` `?profile=core` Savings** | **-87%+ schema tokens** (`17 / 140` tools) | Verified via `bench/competitor-comparison.bench.js` + external stdio E2E |
-| **Supply-Chain, Shell Safety & Milestone Suite** | **6 root deps · 0 collector deps · 0 shell calls · 56 suites** | Verified in CI + Signed `release.slsa.dsse.json` + Ed25519 SOC 2 Bundle + OSV SBOM |
+| **MCP `2026-07-28` `?profile=core` Savings** | **-88.3% schema tokens** (`17 / 145` tools) | Verified via `bench/competitor-comparison.bench.js` + external stdio E2E |
+| **Supply-Chain, Shell Safety & Test Suite** | **6 root deps · 0 collector deps · 0 shell calls · 59 suites** | Verified in CI + Signed SLSA v1.1 + Ed25519 SOC 2 + SPDX Auditor + Tailored Seccomp |
 
 ---
 
@@ -186,14 +186,14 @@ Culkibo separates rapid developer/AI iteration (**The Forge**) from immutable pr
 ```mermaid
 flowchart LR
     Dev["Developer & AI Agents (Claude Code / Antigravity / Cursor)"]
-    UI["Web Dashboard (EN/ES · White-Label · SOC 2 Governance · AI/GPU · ?demo=1)"]
-    MCP["MCP 2026-07-28 (140 Tools, Security Posture, Tasks, 3 ui:// Apps)"]
+    UI["Web Dashboard (100% EN/ES · White-Label · Governance · Autoscaler · ?demo=1)"]
+    MCP["MCP 2026-07-28 (145 Tools, -88.3% Core, Tasks, 3 ui:// Apps)"]
     Sync["Live Sync 2.0 (/ws/sync 1.06 ms Apply · 7.67 ms E2E)"]
     CP["Culkibo Control Plane (Node.js 49 MB RSS, 10,679 req/s, 6 Deps, shell:false)"]
     Forge["The Forge (Hot Dev + /ws/terminal + Auto-Healer + Remote Build Offloader)"]
-    Citadel["The Citadel (10-Rule Policy Gate + SmartPack + SLO Canary + Volume Cloner + SLSA)"]
+    Citadel["The Citadel (SQL Linter + 10-Rule Policy + Seccomp/runc + KEDA Autoscaler + SLSA)"]
     Caddy["Caddy v2.11 Edge (HTTP/3, Geo/A-B, SRE Canary, PoW Shield, WireGuard, 44us Wasm)"]
-    Obs["Signed SOC 2 Bundles + Zero-Dep OTLP + .ndjson.gz Logs + OSV CVE + Webhooks DLQ"]
+    Obs["Synthetic Flows + TLS/SNI Sentinel + SPDX Audit + Signed SOC 2 + OTLP + Logs"]
     Data["12 DBs + Read-Only DB Studio + Post-MinIO S3 (Garage/RustFS) + AI/GPU LLMs"]
 
     Dev -->|"Streamable HTTP / stdio"| MCP
@@ -205,7 +205,7 @@ flowchart LR
     CP --> Forge
     CP --> Citadel
     CP -->|"Atomic JSON Admin API"| Caddy
-    CP -->|"gzip OTLP / Ed25519 Evidence"| Obs
+    CP -->|"OTLP / Synthetic / Ed25519"| Obs
     Citadel --> Data
     Caddy -->|"Geo/A-B & Progressive SLO Canary"| Citadel
 ```
@@ -268,6 +268,8 @@ node bin/culkibo.js smartpack . --dockerfile --json  # Inspect 18-stack build pl
 node bin/culkibo.js up .                             # Provision & start project
 node bin/culkibo.js sync <projectId> .               # Start Live Sync 2.0 (1.06 ms apply)
 node bin/culkibo.js deploy <projectId>               # Immutable BuildKit deploy + Policy Gate + SLO Canary
+node bin/culkibo.js lint-sql migrations/001.sql --json  # 10-rule zero-downtime SQL DDL linter (exit 1 on lock risk)
+node bin/culkibo.js audit-licenses --policy saas-strict --json  # CycloneDX SPDX AGPL/SSPL risk gate
 node bin/culkibo.js admission-check --preset soc2-strict --image node:22-alpine --uid 1000 --json
 node bin/culkibo.js compliance-bundle --framework all --out soc2-dossier.json --json
 node bin/culkibo.js dr-drill backup.sql.gz --json    # Automated DR Fire-Drill (0B/AES/SQL DDL check)
@@ -290,11 +292,11 @@ npm run release:sbom -- --out-dir dist-release --sign --verify  # Signed SLSA + 
 
 ## AI-Agent Native (MCP `2026-07-28`, Tasks and MCP Apps)
 
-Culkibo is built from day one for autonomous and human-in-the-loop AI coding workflows — shipping a **milestone 140 tools** (including 1-call `culkibo_security_posture`, `culkibo_admission_check`, `culkibo_compliance_bundle`, `culkibo_volume_migrate`, `culkibo_edge_experiment`, `culkibo_triage_playbook`, `culkibo_slo_canary`, `culkibo_ai_workload`, `culkibo_remote_builder`, `culkibo_log_archive_search`), **13 playbooks**, official **MCP `2026-07-28` Async Tasks (`io.modelcontextprotocol/tasks`)**, **Elicitation (`elicitation/create`)**, and the first **`modelcontextprotocol/ext-apps` (`2026-01-26`)** interactive UI resources in any self-hosted PaaS.
+Culkibo is built from day one for autonomous and human-in-the-loop AI coding workflows — shipping **145 tools** (including `culkibo_synthetic_sentinel`, `culkibo_lint_sql_migration`, `culkibo_worker_autoscaler`, `culkibo_audit_licenses`, `culkibo_seccomp_profile`, `culkibo_security_posture`, `culkibo_admission_check`, `culkibo_compliance_bundle`, `culkibo_volume_migrate`, `culkibo_edge_experiment`, `culkibo_triage_playbook`, `culkibo_slo_canary`, `culkibo_ai_workload`, `culkibo_remote_builder`), **13 playbooks**, official **MCP `2026-07-28` Async Tasks (`io.modelcontextprotocol/tasks`)**, **Elicitation (`elicitation/create`)**, and the first **`modelcontextprotocol/ext-apps` (`2026-01-26`)** interactive UI resources in any self-hosted PaaS.
 
 ### 1-Click Agent Kit Generator
 
-Generate drop-in MCP configs (defaulting to `?profile=core` for **-87%+ token savings** across `17 / 140` tools and using `${CULKIBO_TOKEN}` env placeholders — never plaintext secrets):
+Generate drop-in MCP configs (defaulting to `?profile=core` for **-88.3% token savings** across `17 / 145` tools and using `${CULKIBO_TOKEN}` env placeholders — never plaintext secrets):
 
 ```bash
 node bin/culkibo.js agent-init claude       # .mcp.json + CLAUDE.md ops snippet
@@ -378,7 +380,7 @@ Read the complete step-by-step runbook in [`docs/MIGRATION_GUIDE.md`](docs/MIGRA
 
 ## Testing, CI and Repository Map
 
-Culkibo ships **56 integrated test suites** in `tests/run-all.js` (including Policy-as-Code 10-Rule CIS/PSS Admission, Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Bundles, Cross-VPS Stateful Volume Migration, Multi-Region `CF-IPCountry` Geo-Routing & Sticky A/B Experiments, Automated DR Fire-Drill Verifier, Google SRE SLO Canary Auto-Rollback, Self-Hosted AI/GPU LLM Orchestrator, Remote Build-Node Offloader, Persistent `.ndjson.gz` Log Archive, Standard-Webhooks Dual-Secret DLQ, Post-MinIO Garage/RustFS/SeaweedFS S3 + SigV4, Read-Only Live DB Studio, Agency Multi-Tenant Quotas + CSV-Safe Ledger, Open-Core White-Label Brand, WebAuthn Passkeys FIDO2 + Secret Leases + OSV CVE Drift, Live Config Drift + PgBouncer + OpenTofu IaC Export, Maintenance Windows + Multi-CAA + 6-Day ACME, Mock-Coolify v4 E2E Estate Replay, real external MCP stdio E2E, OTLP/SLSA attestation E2E, Atomic DB Migrations + `44 µs` Micro-Wasm E2E, Shadow Replay, Time-Machine, Web Terminal, WireGuard Mesh, Caddy PoW Shield, and 20-Pattern Auto-Healer) + standalone live-server, WebSocket churn, HTTP stress, and zero-dep telemetry collector suites — verified continuously on Linux by [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (`4` jobs: Node 20/22/24 matrix + Live Caddy v2.11 + Docker BuildKit SmartPack & SBOM E2E + Playwright Desktop/Mobile visual QA), released with signed SLSA v1.1 + CycloneDX 1.6 via [`.github/workflows/release.yml`](.github/workflows/release.yml), and published as a zero-install sandbox via [`.github/workflows/demo-pages.yml`](.github/workflows/demo-pages.yml):
+Culkibo ships **59 integrated test suites** in `tests/run-all.js` (including Synthetic Multi-Step API Flow & Live TLS/SNI Sentinel, OOM-Safe KEDA Worker Autoscaler & `503 Retry-After` Breaker, 10-Rule Zero-Downtime SQL Migration Linter, CycloneDX SPDX License Auditor, Tailored Seccomp Generator & `runc` CVE Guard, Policy-as-Code 10-Rule CIS/PSS Admission, Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Bundles, Cross-VPS Stateful Volume Migration, Multi-Region Geo/A-B Experiments, Automated DR Fire-Drills, Google SRE SLO Canary Auto-Rollback, Self-Hosted AI/GPU LLM Orchestrator, Remote Build Offloader, Persistent `.ndjson.gz` Log Archive, Standard-Webhooks DLQ, Post-MinIO S3 + SigV4, Read-Only DB Studio, Agency Quotas + CSV Ledger, Open-Core White-Label, FIDO2 Passkeys + Secret Leases + OSV CVE Drift, Config Drift + PgBouncer + OpenTofu IaC, Mock-Coolify v4 E2E Replay, external MCP stdio E2E, OTLP/SLSA E2E, and `44 µs` Micro-Wasm E2E) + standalone live-server, WebSocket churn, HTTP stress, and zero-dep telemetry collector suites — verified continuously on Linux by [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (`4` jobs: Node 20/22/24 matrix + Live Caddy v2.11 + Docker BuildKit SmartPack & SBOM E2E + Playwright Desktop/Mobile visual QA), released with signed SLSA v1.1 + CycloneDX 1.6 via [`.github/workflows/release.yml`](.github/workflows/release.yml), and published as a zero-install sandbox via [`.github/workflows/demo-pages.yml`](.github/workflows/demo-pages.yml):
 
 ```bash
 node tests/shell-safety.test.js                       # Static AST/source check: 0 shell calls
@@ -386,7 +388,7 @@ npm run typecheck                                     # Server TypeScript checkJ
 npx tsc -p web/tsconfig.app.json --noEmit             # Frontend TypeScript check (0 errors)
 npx --prefix web oxlint --deny-warnings               # oxlint React 19 + Compiler rules (0 warnings)
 npm run web:build                                     # Vite production build + .br/.gz precompression
-npm test                                              # 56 suites + live-server + WS stress + HTTP stress
+npm test                                              # 59 suites + live-server + WS stress + HTTP stress
 node --test telemetry-collector/test/collector.test.js  # Zero-dep telemetry collector suite
 npm run release:sbom -- --out-dir dist-release --sign --verify  # Signed SLSA v1.1 + CycloneDX 1.6 SBOM
 ```
@@ -397,28 +399,27 @@ npm run release:sbom -- --out-dir dist-release --sign --verify  # Signed SLSA v1
 .github/workflows/ci.yml         Active 4-job Linux CI (Node 20/22/24, Live Caddy, BuildKit SmartPack/SBOM, Playwright)
 .github/workflows/release.yml    Automated v* GitHub Release workflow (Signed SLSA v1.1 DSSE + CycloneDX 1.6 SBOM)
 .github/workflows/demo-pages.yml Zero-Install Interactive Browser Sandbox workflow (GitHub Pages ?demo=1)
-bin/culkibo.js                   CLI (demo, init, up, sync, deploy, admission-check, compliance-bundle, dr-drill, ai-vram, heal, mesh, mcp...)
+bin/culkibo.js                   CLI (demo, init, up, sync, deploy, lint-sql, audit-licenses, admission-check, compliance-bundle, dr-drill, ai-vram, mcp...)
 scripts/release-provenance.js    Zero-dep CycloneDX 1.6 SBOM, SHA-256 checksums & Ed25519 SLSA DSSE signer
 server/
   index.js                       O(1) fast-path HTTP daemon (49 MB RSS, 10,679 req/s), Server-Timing, /ws/terminal & /ws/sync
   middleware/auth.js             Constant-time tokens, RBAC middleware, single-use WS tickets, rate limits
-  routes/api.js                  REST API (admission, compliance, volumes, edge/experiments, dr-drill, slo-canary, ai/vram, MCP)
-  services/                      76+ zero-shell services (admissionPolicyService, complianceBundleService, volumeMigrationService,
-                                 edgeExperimentService, backupDrillService, sloCanaryController, aiWorkloadService,
-                                 remoteBuilderService, logArchiveService, webhookEventBus, dbStudioService,
-                                 objectStorageService, quotaMeteringService, brandThemeService, passkeyService,
-                                 secretLeaseService, cveDriftService, driftDetectorService, iacExporter,
-                                 containerTerminalService, fleetMeshService, edgeShieldService, buildHealerService,
-                                 liveSyncEngine, cronManager, uptimeMonitor, shadowReplayService, timeMachineService,
-                                 finopsOptimizer, smartPackBuilder, directPushRegistry, edgeTunnelService,
-                                 sqliteStreamBackup, otlpExporter, supplyChainAttestor, migrationRunner,
-                                 wasmMicroRunner, mcpAppsRenderer, mcpServer, caddyManager, ingressManager...)
+  routes/api.js                  REST API (synthetic/tls, lint-sql, autoscaler, license-audit, seccomp/runc, admission, compliance, MCP)
+  services/                      81+ zero-shell services (syntheticSentinelService, workerAutoscalerService, sqlMigrationLinter,
+                                 licenseAuditorService, seccompProfileService, admissionPolicyService, complianceBundleService,
+                                 volumeMigrationService, edgeExperimentService, backupDrillService, sloCanaryController,
+                                 aiWorkloadService, remoteBuilderService, logArchiveService, webhookEventBus, dbStudioService,
+                                 objectStorageService, quotaMeteringService, brandThemeService, passkeyService, secretLeaseService,
+                                 cveDriftService, driftDetectorService, iacExporter, containerTerminalService, fleetMeshService,
+                                 edgeShieldService, buildHealerService, liveSyncEngine, cronManager, uptimeMonitor,
+                                 shadowReplayService, timeMachineService, finopsOptimizer, smartPackBuilder, directPushRegistry,
+                                 edgeTunnelService, otlpExporter, supplyChainAttestor, wasmMicroRunner, mcpServer, caddyManager...)
 telemetry-collector/             Zero-dep anonymous telemetry collector (node:sqlite WAL + CF Workers/D1)
 web/src/                         React 19 + Tailwind v4 dashboard (100% EN/ES, White-Label, ?demo=1 Sandbox, Pioneer Cockpit)
 bench/                           Reproducible live benchmarks (control-plane, live-sync, route-swap, subsystems)
 scripts/                         Hardened Debian/Ubuntu VPS installer (chmod 700), uninstaller, systemd test & SBOM signer
-tests/                           56 integrated + 4 standalone verification, E2E, security, fuzz & stress suites
-docs/                            MIGRATION_GUIDE.md, GITHUB_SEO_LAUNCH_KIT.md, COMPETITOR_RADAR_CYCLE{6..10}.md, EVOLUTION_LOG.md, assets/
+tests/                           59 integrated + 4 standalone verification, E2E, security, fuzz & stress suites
+docs/                            MIGRATION_GUIDE.md, GITHUB_SEO_LAUNCH_KIT.md, COMPETITOR_RADAR_CYCLE{6..11}.md, EVOLUTION_LOG.md, assets/
 ```
 
 ---
@@ -433,13 +434,13 @@ Culkibo includes opt-out anonymous crash/health telemetry scrubbed through an **
 
 ### Our Open-Core Promise (Enforced in [`editionService.js`](server/services/editionService.js))
 
-- **Community Edition (`Apache-2.0`, Free Forever):** **100% of self-hosted core power with ZERO artificial limits** — unlimited projects, 12 databases + PgBouncer pool + Read-Only Live DB Studio, Declarative Policy-as-Code Admission (10 CIS/PSS rules), Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Evidence Bundles (`culkibo compliance-bundle`), Multi-Region `CF-IPCountry` Geo-Routing & Sticky A/B Experiments, Cross-VPS Stateful Volume Cloner (`--numeric-owner`), Automated DR Fire-Drills (`culkibo dr-drill`), Google SRE SLO Canary Auto-Rollback, Self-Hosted AI/GPU LLM Orchestrator (Ollama · vLLM · llama.cpp), Distributed Remote Build-Node Offloader, Persistent `.ndjson.gz` Log Archive, Post-MinIO S3 (Garage · RustFS · SeaweedFS + Pure-Crypto SigV4), 140 catalog apps, Agency Multi-Tenant Quotas & CSV-Safe Ledger, Open-Core White-Label Brand (`GET/PUT /api/brand`), Standard-Webhooks Dual-Secret Bus + Anti-SSRF DLQ Replay, Live Sync 2.0 (`1.06 ms` apply), Zero-Dep FIDO2 Passkeys, Ephemeral Secret Leases & 15m Break-Glass, OSV.dev SBOM CVE Drift, Live Config Drift, Zero Lock-In OpenTofu/Compose IaC Exporter, Maintenance Windows + 6-Day `shortlived` ACME, Zero-Dep Web Terminal, WireGuard Mesh, Caddy PoW Shield, 20-Pattern Auto-Healer, Shadow Replay, Whole-Stack Time-Machine, Cloud FinOps, SmartPack, DirectPush, EdgeTunnel, Zero-Dep OTLP, SLSA v1.1 + CycloneDX 1.6 SBOM, `44 µs` (`0.044 ms`) Micro-Wasm, Multi-Server SSH Fleet, Teams & 4-role RBAC, rate-limited TOTP 2FA, OIDC SSO, GitOps `culkibo.yaml`, **140-tool MCP Server** + Async Tasks + 3 MCP Apps, and Auto-Sleep Scale-to-Zero. **Zero phone-home.**
+- **Community Edition (`Apache-2.0`, Free Forever):** **100% of self-hosted core power with ZERO artificial limits** — unlimited projects, 12 databases + PgBouncer pool + Read-Only Live DB Studio + 10-Rule Zero-Downtime SQL Migration Linter (`culkibo lint-sql`), OOM-Safe KEDA Worker Autoscaler & `503 Retry-After` Breaker, Synthetic Multi-Step API Flow & Live TLS/SNI Drift Sentinel, CycloneDX 1.6 SPDX License Risk Auditor (`culkibo audit-licenses`), Tailored Seccomp Generator & `runc` CVE Guard, Declarative Policy-as-Code Admission (10 CIS/PSS rules), Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Bundles (`culkibo compliance-bundle`), Multi-Region `CF-IPCountry` Geo-Routing & Sticky A/B Experiments, Cross-VPS Stateful Volume Cloner, Automated DR Fire-Drills (`culkibo dr-drill`), Google SRE SLO Canary Auto-Rollback, Self-Hosted AI/GPU LLM Orchestrator (Ollama · vLLM · llama.cpp), Remote Build-Node Offloader, Persistent `.ndjson.gz` Log Archive, Post-MinIO S3 (Garage · RustFS · SeaweedFS + SigV4), 140 catalog apps, Agency Quotas & CSV-Safe Ledger, Open-Core White-Label Brand, Standard-Webhooks Dual-Secret DLQ, Live Sync 2.0 (`1.06 ms` apply), FIDO2 Passkeys, Secret Leases & 15m Break-Glass, OSV.dev CVE Drift, Live Config Drift, Zero Lock-In OpenTofu IaC, Web Terminal, WireGuard Mesh, Caddy PoW Shield, 20-Pattern Auto-Healer, Shadow Replay, Whole-Stack Time-Machine, FinOps, SmartPack, DirectPush, EdgeTunnel, Zero-Dep OTLP, SLSA v1.1 + CycloneDX 1.6 SBOM, `44 µs` Micro-Wasm, Multi-Server SSH Fleet, Teams & 4-role RBAC, rate-limited TOTP 2FA, OIDC SSO, GitOps `culkibo.yaml`, **145-tool MCP Server (`-88.3%` core)** + Async Tasks + 3 MCP Apps, and Auto-Sleep Scale-to-Zero. **Zero phone-home.**
 - **Optional Commercial Packs (`Pro` / `Enterprise` / `Cloud`):** Verified **100% offline via Ed25519 signed keys (`CKL1.*`)** — strictly for organizational scale & compliance: Managed Multi-Region Relay, Extended Status/Email White-Label Packs, Priority Support Bundles, Enterprise SCIM 2.0 / SAML 2.0, Continuous SIEM Audit Streaming, and Managed Multi-AZ Cloud Control Plane.
 
 ### Public Engineering Roadmap (Zero New Runtime Deps)
 
 - [x] **v1.0 – v1.1 (Shipped):** Sub-50 MB (`49 MB RSS`) fast-path + `Server-Timing`, 140 pinned catalog apps, 12 DB engines, Sub-8ms Live Sync 2.0, SmartPack (18 stacks), DirectPush (`culkibo pussh`), Sovereign EdgeTunnel (`ET1`), World-First PaaS MCP Apps (`ui://culkibo/*`), SnapStream WAL-to-S3 + PR Preview DB Branching, Runtime-Only Fast Restart, OIDC `groups`→RBAC, and Offline Ed25519 Open-Core editions.
-- [x] **v1.2.0 (Cycle #11 All-Time Record Shipped):** **`49 MB RSS`** idle RAM, **`116.6 ms`** cold boot, **`10,679 req/s`** Auth fast-path, **`9,725 req/s`** Health, **`1.06 ms` apply / `7.67 ms` E2E Live Sync 2.0**, and **`44 µs` (`0.044 ms`) warm Micro-Wasm** (`0.058 ms` p95, `64 KiB` RAM); Declarative Policy-as-Code 10-Rule CIS/PSS Admission Engine (`culkibo admission-check`), Ed25519-Signed SOC 2 / ISO 27001 / GDPR Compliance Evidence Bundles (`culkibo compliance-bundle`), Stateful Volume Snapshot Cloner (`--numeric-owner`, curing `Coolify CVE-2025-66213`), Multi-Region `CF-IPCountry` Geo-Routing & Sticky A/B Experiments with Kill-Switch, Automated DR Fire-Drills (`culkibo dr-drill`), Google SRE SLO Canary Auto-Rollback, Self-Hosted AI/GPU LLM Orchestrator (`culkibo ai-vram`), Remote Build-Node Offloader, Persistent `.ndjson.gz` Log Archive, Post-MinIO S3 (Garage · RustFS · SeaweedFS + SigV4), Read-Only Live DB Studio, Agency Quotas & CSV-Safe Ledger, Open-Core White-Label Brand, Standard-Webhooks DLQ, FIDO2 Passkeys, OSV CVE Drift, OpenTofu IaC Exporter, Web Terminal, WireGuard Mesh, Caddy PoW Shield, 20-Pattern Auto-Healer, MCP `2026-07-28` (**milestone `140` tools, `-87%+` core**, `culkibo_security_posture`, Async Tasks + 3 MCP Apps), 4-job Linux CI, and **56 integrated test suites**.
+- [x] **v1.2.0 (Cycle #12 Shipped):** **`49 MB RSS`** idle RAM (81+ lazy services), **`116.6 ms`** cold boot, **`10,679 req/s`** Auth fast-path, **`9,725 req/s`** Health, **`1.06 ms` apply / `7.67 ms` E2E Live Sync 2.0**, and **`44 µs` (`0.044 ms`) warm Micro-Wasm** (`0.058 ms` p95, `64 KiB` RAM); Synthetic Multi-Step API Flow Monitor & Live TLS/SNI Drift Sentinel, 10-Rule Zero-Downtime SQL Migration Linter (`culkibo lint-sql`), OOM-Safe KEDA Queue/Worker Autoscaler & `503 Retry-After` Breaker, CycloneDX 1.6 SPDX License Risk Auditor (`culkibo audit-licenses`), Tailored Least-Privilege Seccomp Generator & `runc CVE-2025-31133`/`52565`/`52881` Guard, Policy-as-Code 10-Rule CIS/PSS Admission (`culkibo admission-check`), Ed25519-Signed SOC 2 / ISO / GDPR Compliance Bundles (`culkibo compliance-bundle`), Cross-VPS Volume Cloner (`--numeric-owner`), Multi-Region Geo/A-B Experiments, Automated DR Fire-Drills (`culkibo dr-drill`), Google SRE SLO Canary Auto-Rollback, Self-Hosted AI/GPU LLM Orchestrator (`culkibo ai-vram`), Remote Build Offloader, `.ndjson.gz` Persistent Logs, Post-MinIO S3, Read-Only DB Studio, Agency Ledger, OSS White-Label, FIDO2 Passkeys, OSV CVE Drift, OpenTofu IaC, MCP `2026-07-28` (**`145` tools, `-88.3%` core**, Async Tasks + 3 MCP Apps), 4-job Linux CI, and **59 integrated test suites**.
 - [ ] **Next (v1.3 Ecosystem & Multi-Region):** Interactive drag-to-wire Topology edges, live multi-node Coolify v4 VPS migration showcase video, official Homebrew / Docker Hub / GHCR signed multi-arch (`amd64`/`arm64`) releases, and multi-region active-active failover policies.
 
 ---

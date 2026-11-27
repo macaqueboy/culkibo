@@ -50,6 +50,7 @@ import {
   type S3StoragePreset,
   type S3PresignResult,
   type DrDrillScorecard,
+  type SqlMigrationLintResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
@@ -166,6 +167,14 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [drBusy, setDrBusy] = useState<'valid' | 'corrupt' | null>(null);
   const [drError, setDrError] = useState<string | null>(null);
 
+  // Cycle-12 Zero-Downtime SQL Migration Linter (10 DDL Rules)
+  const [lintSqlText, setLintSqlText] = useState(
+    "SET lock_timeout = '5s';\nSET statement_timeout = '30s';\nCREATE INDEX CONCURRENTLY idx_users_email ON users(email);"
+  );
+  const [lintResult, setLintResult] = useState<SqlMigrationLintResult | null>(null);
+  const [lintBusy, setLintBusy] = useState(false);
+  const [lintError, setLintError] = useState<string | null>(null);
+
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
     databasesRef.current = databases;
@@ -259,6 +268,30 @@ export const DatabasesPanel: React.FC<Props> = ({
       onNotify(msg, 'error');
     } finally {
       setDrBusy(null);
+    }
+  };
+
+  const handleLintSqlMigration = async (overrideSql?: string) => {
+    const sql = (overrideSql ?? lintSqlText).trim();
+    if (!sql) return;
+    if (overrideSql !== undefined) setLintSqlText(overrideSql);
+    setLintBusy(true);
+    setLintError(null);
+    try {
+      const res = await api.lintSqlMigration(sql);
+      setLintResult(res);
+      onNotify(
+        res.safe
+          ? `Zero-Downtime SQL Linter: SAFE (${res.score}/100)`
+          : `SQL Linter BLOCKED (${Array.isArray(res.blockers) ? res.blockers.length : 1} lock/rewrite blocker(s))`,
+        res.safe ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'SQL migration linter failed';
+      setLintError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setLintBusy(false);
     }
   };
 
@@ -1595,6 +1628,111 @@ export const DatabasesPanel: React.FC<Props> = ({
             })}
           </div>
         )}
+      </section>
+
+      {/* Cycle-12: Zero-Downtime SQL Migration Linter (10 DDL Rules) */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <Stethoscope className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.sqlLintTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                  Squawk-Class · Pure JS · 0 Deps
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.sqlLintDesc')}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+            <button
+              type="button"
+              disabled={lintBusy}
+              onClick={() => void handleLintSqlMigration('CREATE INDEX idx_orders_uid ON orders(user_id);\nALTER TABLE orders DROP COLUMN legacy_token;')}
+              className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+            >
+              <ShieldAlert className="w-3.5 h-3.5" />
+              <span>{t('db.sqlLintTestUnsafe')}</span>
+            </button>
+            <button
+              type="button"
+              disabled={lintBusy}
+              onClick={() => void handleLintSqlMigration("SET lock_timeout = '5s';\nSET statement_timeout = '30s';\nCREATE INDEX CONCURRENTLY idx_orders_uid ON orders(user_id);")}
+              className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-medium cursor-pointer disabled:opacity-50"
+            >
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>{t('db.sqlLintTestSafe')}</span>
+            </button>
+            <button
+              type="button"
+              disabled={lintBusy || !lintSqlText.trim()}
+              onClick={() => void handleLintSqlMigration()}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+            >
+              {lintBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+              <span>{lintBusy ? t('db.sqlLintRunning') : t('db.sqlLintRun')}</span>
+            </button>
+          </div>
+        </div>
+
+        <textarea
+          rows={3}
+          value={lintSqlText}
+          onChange={(e) => setLintSqlText(e.target.value)}
+          placeholder={t('db.sqlLintPlaceholder')}
+          spellCheck={false}
+          className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white font-mono text-[11px] text-slate-900 leading-relaxed"
+        />
+
+        {lintError && (
+          <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 shrink-0" />
+            <span>{lintError}</span>
+          </div>
+        )}
+
+        {lintResult && (() => {
+          const blockers = Array.isArray(lintResult.blockers) ? lintResult.blockers : [];
+          const hints = Array.isArray(lintResult.rewriteHints) ? lintResult.rewriteHints : [];
+          return (
+            <div className={`p-3.5 rounded-xl border space-y-2 ${
+              lintResult.safe
+                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                : 'bg-red-50 border-red-200 text-red-900'
+            }`}>
+              <div className="flex items-center justify-between gap-2 flex-wrap font-mono tabular-nums">
+                <span className="inline-flex items-center gap-1.5 font-semibold">
+                  {lintResult.safe ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <ShieldAlert className="w-4 h-4 text-red-600" />}
+                  <span>{lintResult.safe ? `${lintResult.score}/100 SAFE` : `BLOCKED · ${lintResult.score}/100`}</span>
+                </span>
+                <span className="text-[10px] opacity-80">
+                  {lintResult.analyzedStatements ?? 0} stmt(s) · lock_timeout: {lintResult.hasLockTimeout ? 'OK' : 'MISSING'}
+                </span>
+              </div>
+              {blockers.length > 0 && (
+                <div className="space-y-1 font-mono text-[11px]">
+                  {blockers.map((b, idx) => {
+                    const txt = typeof b === 'string'
+                      ? b
+                      : `[${b.rule || b.ruleId || b.id || b.code || 'DDL'}] ${b.message || 'Unsafe DDL operation'}`;
+                    return <div key={idx}>• {txt}</div>;
+                  })}
+                </div>
+              )}
+              {hints.length > 0 && (
+                <div className="pt-1.5 border-t border-red-200/70 space-y-0.5 text-[11px]">
+                  <span className="font-semibold">Zero-Downtime Rewrite Hints:</span>
+                  {hints.slice(0, 4).map((h, idx) => (
+                    <div key={idx} className="font-mono">→ {h}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </section>
 
       {/* Franja compacta de Almacenamiento S3 / R2 global (configuración unificada en Ajustes → Backups y DR) */}

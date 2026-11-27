@@ -106,6 +106,11 @@ function getAdmissionPolicyService() { return _lazyV2.admission || (_lazyV2.admi
 function getComplianceBundleService() { return _lazyV2.compliance || (_lazyV2.compliance = require('../services/complianceBundleService')); }
 function getVolumeMigrationService() { return _lazyV2.volmig || (_lazyV2.volmig = require('../services/volumeMigrationService')); }
 function getEdgeExperimentService() { return _lazyV2.edgeexp || (_lazyV2.edgeexp = require('../services/edgeExperimentService')); }
+function getSyntheticSentinelService() { return _lazyV2.synthetic || (_lazyV2.synthetic = require('../services/syntheticSentinelService')); }
+function getWorkerAutoscalerService() { return _lazyV2.autoscaler || (_lazyV2.autoscaler = require('../services/workerAutoscalerService')); }
+function getSqlMigrationLinter() { return _lazyV2.sqllint || (_lazyV2.sqllint = require('../services/sqlMigrationLinter')); }
+function getLicenseAuditorService() { return _lazyV2.licenseaudit || (_lazyV2.licenseaudit = require('../services/licenseAuditorService')); }
+function getSeccompProfileService() { return _lazyV2.seccomp || (_lazyV2.seccomp = require('../services/seccompProfileService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -8531,6 +8536,258 @@ router.post('/edge/experiments/:id/kill-switch', heavyOpLimiter, async (req, res
     if (!assertTenantProjectAccess403(req, res, existing.projectId || '', 'projects:write')) return;
     const out = await svc.triggerKillSwitch(req.params.id, req.body || {});
     res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #12 RELIABILITY & SECURITY LAZY ROUTES (0 boot RAM impact) ---
+
+// 1. Synthetic Multi-Step API Flow Monitor & Live TLS/SNI Drift Sentinel (`uptime-kuma#5772/#7500`, `gatus#856`)
+router.get('/uptime/synthetic/flows', async (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const raw = await getSyntheticSentinelService().listFlows();
+    const allFlows = Array.isArray(raw) ? raw : [];
+    const flows = allowedProjectIds === null
+      ? allFlows
+      : allFlows.filter((f) => f && (!f.projectId || allowedProjectIds.includes(f.projectId)));
+    res.json({ ok: true, count: flows.length, flows });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/uptime/synthetic/flows', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden guardar flujos sintéticos', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getSyntheticSentinelService();
+    const projectId = body.projectId ? String(body.projectId).trim() : '';
+    if (projectId) {
+      if (!assertTenantProjectAccess403(req, res, projectId, 'projects:write')) return;
+    } else if (denyInstanceGlobalForTenant(req, res, 'guardar flujos sintéticos globales')) {
+      return;
+    }
+    if (body.id) {
+      const existing = await svc.getFlow(String(body.id).trim());
+      if (existing && existing.projectId && !assertTenantProjectAccess403(req, res, existing.projectId, 'projects:write')) {
+        return;
+      }
+    }
+    const flow = await svc.saveFlow(body);
+    res.status(201).json({ ok: true, flow });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.delete('/uptime/synthetic/flows/:id', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden eliminar flujos sintéticos', code: 'FORBIDDEN' });
+    }
+    const svc = getSyntheticSentinelService();
+    const existing = await svc.getFlow(req.params.id);
+    if (existing && existing.projectId) {
+      if (!assertTenantProjectAccess403(req, res, existing.projectId, 'projects:write')) return;
+    } else if (denyInstanceGlobalForTenant(req, res, 'eliminar flujos sintéticos globales')) {
+      return;
+    }
+    const out = await svc.deleteFlow(req.params.id);
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/uptime/synthetic/run', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getSyntheticSentinelService();
+    const allowLoopback = process.env.CULKIBO_ALLOW_LOOPBACK_SYNTHETIC === '1';
+    let flowOrId;
+    if (typeof body.flowId === 'string' && body.flowId.trim()) {
+      const existing = await svc.getFlow(body.flowId.trim());
+      if (existing && existing.projectId && !assertTenantProjectAccess403(req, res, existing.projectId, 'projects:read')) {
+        return;
+      }
+      flowOrId = body.flowId.trim();
+    } else {
+      flowOrId = body.flow && typeof body.flow === 'object' ? body.flow : body;
+    }
+    const report = await svc.runFlow(flowOrId, {
+      allowLoopback,
+      persist: body.persist !== undefined ? Boolean(body.persist) : undefined
+    });
+    res.json(report);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/uptime/tls-sentinel', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rawHost = String(body.host || '').trim();
+    if (!rawHost || /[\s\r\n\0]/.test(rawHost)) {
+      return res.status(400).json({ error: 'Host TLS inválido o ausente', code: 'INVALID_HOST' });
+    }
+    const allowLoopback = process.env.CULKIBO_ALLOW_LOOPBACK_SYNTHETIC === '1';
+    const ssrf = require('../services/ssrfGuard');
+    const net = require('net');
+    const cleanHost = rawHost.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+    const port = Number.isInteger(Number(body.port)) && Number(body.port) >= 1 && Number(body.port) <= 65535
+      ? Number(body.port)
+      : 443;
+    if (
+      ssrf.isMetadataIp(cleanHost) ||
+      cleanHost === '169.254.169.254' ||
+      cleanHost === 'metadata.google.internal' ||
+      cleanHost.endsWith('.metadata.google.internal')
+    ) {
+      return res.status(403).json({ error: `Host TLS bloqueado por guardia SSRF: ${cleanHost}`, code: 'SSRF_BLOCKED' });
+    }
+    if (net.isIP(cleanHost) !== 0 || cleanHost === 'localhost' || cleanHost.endsWith('.localhost')) {
+      const isLoop = cleanHost === 'localhost' || cleanHost.endsWith('.localhost') || ssrf.isLoopbackIp(cleanHost);
+      if (isLoop && !allowLoopback) {
+        return res.status(403).json({ error: `Host loopback bloqueado por guardia SSRF: ${cleanHost}`, code: 'SSRF_BLOCKED' });
+      }
+      if (!isLoop && ssrf.isPrivateIp(cleanHost)) {
+        return res.status(403).json({ error: `IP privada bloqueada por guardia SSRF: ${cleanHost}`, code: 'SSRF_BLOCKED' });
+      }
+    } else {
+      try {
+        await ssrf.assertSafeUrl(`https://${cleanHost}:${port}/`, { allowLoopback });
+      } catch (ssrfErr) {
+        return res.status(403).json({
+          error: (ssrfErr && ssrfErr.message) || 'Host TLS bloqueado por guardia SSRF',
+          code: 'SSRF_BLOCKED'
+        });
+      }
+    }
+    const report = await getSyntheticSentinelService().checkTlsSentinel(
+      { ...body, host: cleanHost, port },
+      { allowLoopback }
+    );
+    res.json(report);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Zero-Downtime SQL Migration Linter (Squawk / Strong Migrations — 10 Rules)
+router.post('/databases/lint-sql', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (typeof body.sql !== 'string') {
+      return res.status(400).json({ error: 'Se requiere el campo "sql" (string)', code: 'INVALID_SQL_INPUT' });
+    }
+    const opts = body.options && typeof body.options === 'object' ? body.options : {};
+    const out = await getSqlMigrationLinter().lintSqlMigration(body.sql, opts);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Queue/Worker Autoscaler & Backpressure Circuit Breaker (`dokploy#6105`, `coolify#3862`, `caprover#2164`)
+router.get('/projects/:id/autoscaler', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const policy = await getWorkerAutoscalerService().getPolicy(req.params.id);
+    res.json({ ok: true, ...policy, policy });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/projects/:id/autoscaler', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden modificar la política de autoscaling', code: 'FORBIDDEN' });
+    }
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const policy = await getWorkerAutoscalerService().savePolicy(req.params.id, req.body || {});
+    res.json({ ok: true, ...policy, policy });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/autoscaler/evaluate', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const policyOverride = body.policyOverride && typeof body.policyOverride === 'object' ? body.policyOverride : null;
+    const result = await getWorkerAutoscalerService().evaluateAutoscaler(
+      { ...body, projectId: req.params.id },
+      policyOverride
+    );
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. CycloneDX 1.6 SPDX License Risk Auditor
+router.post('/security/license-audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectDir !== undefined && body.projectDir !== null && String(body.projectDir).trim() !== '') {
+      if (!assertHostLocalPathAllowed(req, res)) return;
+    }
+    const out = await getLicenseAuditorService().auditLicenses({
+      sbom: body.sbom,
+      projectDir: typeof body.projectDir === 'string' && body.projectDir.trim() ? body.projectDir.trim() : undefined,
+      policy: typeof body.policy === 'string' ? body.policy : 'saas-strict'
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Runtime-Tailored Seccomp Profile Generator & `runc` CVE Guard (`CVE-2025-31133`/`52565`/`52881`)
+router.post('/security/seccomp/profile', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getSeccompProfileService();
+    if (body.action === 'validate' || body.spec !== undefined) {
+      const val = await svc.validateSeccompSpec(body.spec !== undefined ? body.spec : body.profile);
+      return res.json({ ok: true, ...val });
+    }
+    const out = await svc.generateSeccompProfile(
+      body.stack !== undefined ? String(body.stack) : 'node',
+      {
+        mode: body.mode !== undefined ? String(body.mode) : undefined,
+        extraAllowed: Array.isArray(body.extraAllowed) ? body.extraAllowed : undefined
+      }
+    );
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/runc-audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const versionStr = typeof body.version === 'string'
+      ? body.version
+      : (typeof body.versionOutput === 'string' ? body.versionOutput : '');
+    if (versionStr.trim()) {
+      const out = await getSeccompProfileService().auditRuncVersion(versionStr);
+      return res.json(out);
+    }
+    const doctor = require('../services/systemDoctor');
+    const check = doctor.checkRuncRuntime();
+    res.json({ ok: true, hostProbe: true, check, ...(check.metrics || {}) });
   } catch (err) {
     sendServiceError(err, res, 400);
   }

@@ -5194,6 +5194,139 @@ export const api = {
     );
     return (res?.migration || res) as VolumeMigrationRecord;
   },
+
+  // --- Cycle-12 Reliability & Security APIs (Synthetic/TLS Sentinel, SQL Linter, Worker Autoscaler, SPDX Auditor, Seccomp/runc) ---
+
+  async listSyntheticFlows(): Promise<{ flows: SyntheticFlowRecord[] }> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/synthetic/flows`),
+      'Could not load synthetic API flows'
+    );
+    const list = Array.isArray(res?.flows) ? res.flows : Array.isArray(res) ? res : [];
+    return { flows: list };
+  },
+
+  async runSyntheticFlow(payload: { flowId?: string; flow?: Partial<SyntheticFlowRecord> }): Promise<SyntheticFlowRunResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/synthetic/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Synthetic multi-step API flow failed'
+    );
+  },
+
+  async checkTlsSentinel(payload: {
+    host: string;
+    port?: number;
+    servername?: string;
+    expectedSan?: string;
+    baselineFingerprintSha256?: string;
+    baselineIssuer?: string;
+    warnDays?: number;
+    critDays?: number;
+  }): Promise<TlsSentinelResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/uptime/tls-sentinel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'TLS/SNI sentinel probe failed'
+    );
+  },
+
+  async lintSqlMigration(sql: string): Promise<SqlMigrationLintResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/lint-sql`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql }),
+      }),
+      'Zero-downtime SQL migration linter failed'
+    );
+  },
+
+  async getProjectAutoscaler(projectId: string): Promise<WorkerAutoscalerPolicy> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/autoscaler`),
+      'Could not load worker autoscaler policy'
+    );
+    return (res?.policy || res) as WorkerAutoscalerPolicy;
+  },
+
+  async saveProjectAutoscaler(projectId: string, policy: Partial<WorkerAutoscalerPolicy>): Promise<WorkerAutoscalerPolicy> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/autoscaler`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(policy),
+      }),
+      'Could not save worker autoscaler policy'
+    );
+    return (res?.policy || res) as WorkerAutoscalerPolicy;
+  },
+
+  async evaluateProjectAutoscaler(
+    projectId: string,
+    payload: {
+      queueDepth: number;
+      httpSaturationPct?: number;
+      currentReplicas: number;
+      hostFreeRamMb: number;
+      perReplicaRamMb?: number;
+      lastScaleAtMs?: number;
+    }
+  ): Promise<WorkerAutoscalerEvaluation> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/autoscaler/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not evaluate worker autoscaler'
+    );
+  },
+
+  async auditSpdxLicenses(payload: {
+    policy?: 'saas-strict' | 'oss-permissive' | 'audit-only' | string;
+    sbom?: Record<string, unknown>;
+  } = {}): Promise<LicenseAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/license-audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'SPDX license risk audit failed'
+    );
+  },
+
+  async generateSeccompProfile(payload: {
+    stack: string;
+    mode?: string;
+  }): Promise<SeccompProfileResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/seccomp/profile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Seccomp profile generator rejected spec'
+    );
+  },
+
+  async auditRuncVersion(version: string): Promise<RuncAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/runc-audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version }),
+      }),
+      'runc CVE audit failed'
+    );
+  },
 };
 
 // =====================================================================
@@ -6632,4 +6765,161 @@ export interface VolumeMigrationRecord {
     phases?: VolumeMigrationPhase[];
   };
   createdAt?: string;
+}
+
+// --- Cycle-12 Reliability & Security Types ---
+
+export interface SyntheticFlowStep {
+  name: string;
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  assert?: { status?: number; maxLatencyMs?: number; bodyIncludes?: string; jsonPathEquals?: Record<string, unknown> };
+  extract?: Record<string, string>;
+}
+
+export interface SyntheticFlowRecord {
+  id: string;
+  name: string;
+  steps: SyntheticFlowStep[];
+  lastRunAt?: string | null;
+  lastOk?: boolean | null;
+  lastLatencyMs?: number | null;
+  createdAt?: string;
+}
+
+export interface SyntheticFlowStepResult {
+  name: string;
+  method: string;
+  url: string;
+  status?: number | null;
+  latencyMs: number;
+  ok: boolean;
+  errors?: string[];
+  extractedKeys?: string[];
+}
+
+export interface SyntheticFlowRunResult {
+  ok: boolean;
+  flowId?: string;
+  flowName?: string;
+  totalLatencyMs: number;
+  failedStep?: string | null;
+  steps: SyntheticFlowStepResult[];
+  checkedAt?: string;
+}
+
+export interface TlsSentinelResult {
+  host?: string;
+  port?: number;
+  daysRemaining: number;
+  validFrom?: string;
+  validTo?: string;
+  subject?: string;
+  issuer?: string;
+  fingerprintSha256?: string;
+  protocol?: string;
+  sanList?: string[];
+  sanMatched?: boolean;
+  fingerprintDrifted?: boolean;
+  issuerDrifted?: boolean;
+  status: 'OK' | 'WARNING' | 'CRITICAL' | string;
+  alerts?: Array<string | { code?: string; message?: string; severity?: string }>;
+}
+
+export type SqlLintFinding = string | {
+  rule?: string;
+  ruleId?: string;
+  id?: string;
+  code?: string;
+  severity?: string;
+  statement?: string;
+  message?: string;
+  hint?: string;
+  rewriteHint?: string;
+};
+
+export interface SqlMigrationLintResult {
+  safe: boolean;
+  score: number;
+  blockers?: SqlLintFinding[];
+  warnings?: SqlLintFinding[];
+  rewriteHints?: string[];
+  analyzedStatements?: number;
+  hasLockTimeout?: boolean;
+  hasStatementTimeout?: boolean;
+}
+
+export interface WorkerAutoscalerPolicy {
+  projectId?: string;
+  minReplicas: number;
+  maxReplicas: number;
+  scaleUpQueueThreshold: number;
+  scaleDownQueueThreshold: number;
+  scaleUpCooldownSec: number;
+  scaleDownCooldownSec: number;
+  perReplicaRamMb: number;
+  reserveHostRamMb: number;
+  breakerQueueThreshold: number;
+  breakerRetryAfterSec: number;
+}
+
+export interface WorkerAutoscalerEvaluation {
+  projectId?: string;
+  action: 'SCALE_UP' | 'SCALE_DOWN' | 'HOLD' | string;
+  reason: string;
+  currentReplicas: number;
+  desiredReplicas: number;
+  targetReplicas: number;
+  maxSafeReplicas: number;
+  memoryHeadroomMb: number;
+  cooldownRemainingSec?: number;
+  circuitBreaker?: {
+    state: 'OPEN' | 'CLOSED' | string;
+    httpStatus?: number | null;
+    retryAfterSec?: number | null;
+    headers?: Record<string, string>;
+  };
+  policy?: WorkerAutoscalerPolicy;
+  evaluatedAt?: string;
+}
+
+export type LicenseAuditFinding = string | {
+  component?: string;
+  name?: string;
+  version?: string;
+  license?: string;
+  category?: string;
+  message?: string;
+  reason?: string;
+};
+
+export interface LicenseAuditResult {
+  compliant: boolean;
+  policy: string;
+  score: number;
+  totalComponents: number;
+  countsByCategory?: Record<string, number>;
+  violations?: LicenseAuditFinding[];
+  warnings?: LicenseAuditFinding[];
+  auditedAt?: string;
+}
+
+export interface SeccompProfileResult {
+  stack: string;
+  profile: Record<string, unknown>;
+  allowedCount: number;
+  blockedSyscalls: string[];
+  dockerSecurityOpt?: string | string[];
+  sha256: string;
+}
+
+export interface RuncAuditResult {
+  version?: string;
+  parsedVersion?: string | null;
+  status: 'PASS' | 'CRITICAL' | 'UNKNOWN' | string;
+  vulnerable: boolean;
+  cves: string[];
+  fixedIn?: string | null;
+  message?: string;
 }

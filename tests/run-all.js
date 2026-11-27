@@ -54,6 +54,9 @@ const testCycle10HttpE2E = require('./cycle10-http-e2e.test');
 const testAdmissionAndExperiments = require('./admission-and-experiments.test');
 const testComplianceAndVolumes = require('./compliance-and-volumes.test');
 const testCycle11HttpE2E = require('./cycle11-http-e2e.test');
+const testSyntheticAndAutoscaler = require('./synthetic-and-autoscaler.test');
+const testSqllintLicenseSeccomp = require('./sqllint-license-seccomp.test');
+const testCycle12HttpE2E = require('./cycle12-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -133,6 +136,9 @@ async function runAll() {
     { name: 'Policy-as-Code Deployment Admission Engine (10 CIS/PSS Rules) & Edge Geo-Routing / Sticky A/B Experiments', fn: testAdmissionAndExperiments },
     { name: 'Ed25519-Signed Compliance Evidence Bundle (SOC 2/ISO/GDPR) & Zero-Shell Stateful Volume Migration Planner', fn: testComplianceAndVolumes },
     { name: 'Cycle #11 Enterprise Governance & Multi-Region Edge Live Isolated HTTP E2E (All 4 API Families + 422/403 Guards)', fn: testCycle11HttpE2E },
+    { name: 'Synthetic Multi-Step API Flow Monitor, Live TLS/SNI Sentinel & KEDA Worker Autoscaler / Backpressure Breaker', fn: testSyntheticAndAutoscaler },
+    { name: 'Zero-Downtime SQL DDL Linter (10 Rules), CycloneDX 1.6 SPDX License Auditor & Tailored Seccomp / runc CVE Guard', fn: testSqllintLicenseSeccomp },
+    { name: 'Cycle #12 Reliability & Security Live Isolated HTTP E2E (All 5 API Families + RBAC/ACL + Seccomp/SSRF Guards)', fn: testCycle12HttpE2E },
   ];
 
   for (const suite of suites) {

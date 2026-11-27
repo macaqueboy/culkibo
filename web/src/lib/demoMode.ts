@@ -114,6 +114,8 @@ interface DemoState {
   latestComplianceBundle: any;
   edgeExperiments: any[];
   volumeMigrations: any[];
+  syntheticFlows: any[];
+  autoscalerPolicies: Record<string, any>;
 }
 
 function createInitialDemoState(): DemoState {
@@ -915,6 +917,35 @@ function createInitialDemoState(): DemoState {
         createdAt: t2,
       },
     ],
+    syntheticFlows: [
+      {
+        id: 'flow_demo_auth_checkout',
+        name: 'Auth Login → JWT Session → Orders API',
+        steps: [
+          { name: 'POST /api/auth/token', method: 'POST', url: 'https://api.acme-demo.dev/v1/auth/token', headers: { Authorization: '[REDACTED]' }, extract: { token: 'json.access_token' }, assert: { status: 200, maxLatencyMs: 400 } },
+          { name: 'GET /v1/orders/health', method: 'GET', url: 'https://api.acme-demo.dev/v1/orders/health', headers: { Authorization: '[REDACTED]' }, assert: { status: 200, maxLatencyMs: 300 } },
+        ],
+        lastRunAt: t1,
+        lastOk: true,
+        lastLatencyMs: 64,
+        createdAt: t3,
+      },
+    ],
+    autoscalerPolicies: {
+      proj_acme_web: {
+        projectId: 'proj_acme_web',
+        minReplicas: 1,
+        maxReplicas: 6,
+        scaleUpQueueThreshold: 40,
+        scaleDownQueueThreshold: 8,
+        scaleUpCooldownSec: 60,
+        scaleDownCooldownSec: 180,
+        perReplicaRamMb: 384,
+        reserveHostRamMb: 512,
+        breakerQueueThreshold: 250,
+        breakerRetryAfterSec: 15,
+      },
+    },
   };
 }
 
@@ -3055,6 +3086,221 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ ok: true, migration: mig }, 201);
   }
 
+  // --- Cycle-12 Reliability & Security APIs (Synthetic/TLS Sentinel, SQL Linter, Worker Autoscaler, SPDX Auditor, Seccomp/runc) ---
+  if (pathname === '/api/uptime/synthetic/flows' && method === 'GET') {
+    return jsonResponse({ ok: true, flows: s.syntheticFlows });
+  }
+  if (pathname === '/api/uptime/synthetic/flows' && method === 'POST') {
+    const id = String(body.id || `flow_${Date.now().toString(36)}`);
+    const saved = { id, name: String(body.name || 'Synthetic API Flow'), steps: Array.isArray(body.steps) ? body.steps : [], lastRunAt: null, lastOk: null, createdAt: nowIso() };
+    s.syntheticFlows = [saved, ...s.syntheticFlows.filter((f) => f.id !== id)];
+    return jsonResponse({ ok: true, flow: saved }, 201);
+  }
+  if (pathname === '/api/uptime/synthetic/run' && method === 'POST') {
+    const flow = s.syntheticFlows.find((f) => f.id === body.flowId) || s.syntheticFlows[0];
+    if (flow) {
+      flow.lastRunAt = nowIso();
+      flow.lastOk = true;
+      flow.lastLatencyMs = 58;
+    }
+    return jsonResponse({
+      ok: true,
+      flowId: flow?.id || 'flow_demo_auth_checkout',
+      flowName: flow?.name || 'Auth Login → JWT Session → Orders API',
+      totalLatencyMs: 58,
+      failedStep: null,
+      steps: [
+        { name: 'POST /api/auth/token', method: 'POST', url: 'https://api.acme-demo.dev/v1/auth/token', status: 200, latencyMs: 31, ok: true, errors: [], extractedKeys: ['token ([REDACTED])'] },
+        { name: 'GET /v1/orders/health', method: 'GET', url: 'https://api.acme-demo.dev/v1/orders/health', status: 200, latencyMs: 27, ok: true, errors: [], extractedKeys: [] },
+      ],
+      checkedAt: nowIso(),
+    });
+  }
+  if (pathname === '/api/uptime/tls-sentinel' && method === 'POST') {
+    const host = String(body.host || 'app.acme-demo.dev').trim();
+    return jsonResponse({
+      host,
+      port: Number(body.port) || 443,
+      daysRemaining: 84,
+      validFrom: nowIso(-1000 * 60 * 60 * 24 * 6),
+      validTo: nowIso(1000 * 60 * 60 * 24 * 84),
+      subject: `CN=${host}`,
+      issuer: "Let's Encrypt E6",
+      fingerprintSha256: 'A4:7F:19:0C:E2:44:8B:91:3D:66:20:5E:1F:8A:90:C3:41:2B:7E:05:89:D1:3A:4C:6F:11:9E:22:7C:8D:04:B2',
+      protocol: 'TLSv1.3',
+      sanList: [host, `*.${host.replace(/^[^.]+\./, '')}`],
+      sanMatched: true,
+      fingerprintDrifted: false,
+      issuerDrifted: false,
+      status: 'OK',
+      alerts: [],
+    });
+  }
+  if (pathname === '/api/databases/lint-sql' && method === 'POST') {
+    const rawSql = String(body.sql || '');
+    const stripped = rawSql
+      .replace(/--[^\n]*/g, ' ')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/'(?:''|[^'])*'/g, "''");
+    const stmts = stripped.split(';').map((x) => x.trim()).filter(Boolean);
+    const hasLockTimeout = /\bSET\s+(?:LOCAL\s+)?lock_timeout\b/i.test(stripped);
+    const hasStmtTimeout = /\bSET\s+(?:LOCAL\s+)?statement_timeout\b/i.test(stripped);
+    const blockers: any[] = [];
+    const warnings: any[] = [];
+    const rewriteHints: string[] = [];
+    const hasDdl = /\b(CREATE|ALTER|DROP)\b/i.test(stripped);
+    if (/\bCREATE\s+(?:UNIQUE\s+)?INDEX\b(?![\s\S]{0,40}\bCONCURRENTLY\b)/i.test(stripped)) {
+      blockers.push({ rule: 'CREATE_INDEX_NOT_CONCURRENT', severity: 'critical', message: 'CREATE INDEX without CONCURRENTLY acquires SHARE lock and blocks writes.' });
+      rewriteHints.push('Use CREATE INDEX CONCURRENTLY idx_name ON table(col);');
+    }
+    if (/\bDROP\s+INDEX\b(?![\s\S]{0,30}\bCONCURRENTLY\b)/i.test(stripped)) {
+      blockers.push({ rule: 'DROP_INDEX_NOT_CONCURRENT', severity: 'high', message: 'DROP INDEX without CONCURRENTLY acquires ACCESS EXCLUSIVE lock.' });
+      rewriteHints.push('Use DROP INDEX CONCURRENTLY IF EXISTS idx_name;');
+    }
+    if (/\bDROP\s+(?:TABLE|COLUMN)\b/i.test(stripped)) {
+      blockers.push({ rule: 'DESTRUCTIVE_DROP_COLUMN_OR_TABLE', severity: 'critical', message: 'Destructive DROP COLUMN / DROP TABLE breaks rolling zero-downtime replicas.' });
+      rewriteHints.push('Follow expand-and-contract: stop reading column in app code first, drop in a follow-up release.');
+    }
+    if (/\bALTER\s+TABLE\b[\s\S]*\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:FOREIGN\s+KEY|CHECK)\b(?![\s\S]*\bNOT\s+VALID\b)/i.test(stripped)) {
+      blockers.push({ rule: 'UNSAFE_ADD_CONSTRAINT', severity: 'high', message: 'ADD CONSTRAINT (FOREIGN KEY / CHECK) without NOT VALID scans full table under lock.' });
+      rewriteHints.push('Add with NOT VALID, then run ALTER TABLE ... VALIDATE CONSTRAINT in a separate transaction.');
+    }
+    if (/\bALTER\s+TABLE\b[\s\S]*\bALTER\s+COLUMN\b[\s\S]*\bTYPE\b/i.test(stripped)) {
+      blockers.push({ rule: 'ALTER_COLUMN_TYPE_REWRITE', severity: 'critical', message: 'ALTER COLUMN TYPE triggers full table rewrite under ACCESS EXCLUSIVE lock.' });
+      rewriteHints.push('Add a new typed column, backfill in batches, swap in app, then retire old column.');
+    }
+    if (/\bADD\s+COLUMN\b[\s\S]*\bDEFAULT\b[\s\S]*\b(now|random|gen_random_uuid|uuid_generate_v4|clock_timestamp|current_timestamp)\b/i.test(stripped)) {
+      blockers.push({ rule: 'VOLATILE_ADD_COLUMN_DEFAULT', severity: 'high', message: 'Volatile ADD COLUMN DEFAULT forces full table rewrite.' });
+      rewriteHints.push('Add nullable column first, set DEFAULT for new rows, then backfill existing rows in chunks.');
+    }
+    if (hasDdl && !hasLockTimeout) {
+      blockers.push({ rule: 'MISSING_LOCK_TIMEOUT', severity: 'high', message: 'DDL migration lacks SET lock_timeout — blocked lock queue will stall all app queries.' });
+      rewriteHints.push("Prepend SET lock_timeout = '5s'; at top of migration.");
+    }
+    if (hasDdl && !hasStmtTimeout) {
+      warnings.push({ rule: 'MISSING_STATEMENT_TIMEOUT', severity: 'low', message: "Consider adding SET statement_timeout = '30s'; to bound long DDL runs." });
+    }
+    const safe = blockers.length === 0;
+    const score = Math.max(0, 100 - blockers.length * 22 - warnings.length * 4);
+    return jsonResponse({ safe, score, blockers, warnings, rewriteHints, analyzedStatements: stmts.length, hasLockTimeout, hasStatementTimeout: hasStmtTimeout });
+  }
+  const autoMatch = pathname.match(/^\/api\/projects\/([^/]+)\/autoscaler$/);
+  if (autoMatch) {
+    const pid = decodeURIComponent(autoMatch[1]);
+    const fallback = { projectId: pid, minReplicas: 1, maxReplicas: 6, scaleUpQueueThreshold: 40, scaleDownQueueThreshold: 8, scaleUpCooldownSec: 60, scaleDownCooldownSec: 180, perReplicaRamMb: 384, reserveHostRamMb: 512, breakerQueueThreshold: 250, breakerRetryAfterSec: 15 };
+    if (method === 'PUT') {
+      s.autoscalerPolicies[pid] = { ...(s.autoscalerPolicies[pid] || fallback), ...body, projectId: pid };
+      return jsonResponse({ ok: true, policy: s.autoscalerPolicies[pid] });
+    }
+    return jsonResponse({ ok: true, policy: s.autoscalerPolicies[pid] || fallback });
+  }
+  const autoEvalMatch = pathname.match(/^\/api\/projects\/([^/]+)\/autoscaler\/evaluate$/);
+  if (autoEvalMatch && method === 'POST') {
+    const pid = decodeURIComponent(autoEvalMatch[1]);
+    const pol = s.autoscalerPolicies[pid] || { projectId: pid, minReplicas: 1, maxReplicas: 6, scaleUpQueueThreshold: 40, scaleDownQueueThreshold: 8, scaleUpCooldownSec: 60, scaleDownCooldownSec: 180, perReplicaRamMb: 384, reserveHostRamMb: 512, breakerQueueThreshold: 250, breakerRetryAfterSec: 15 };
+    const queueDepth = Math.max(0, Number(body.queueDepth) || 0);
+    const currentReplicas = Math.max(1, Number(body.currentReplicas) || 1);
+    const hostFreeRamMb = Math.max(0, Number(body.hostFreeRamMb ?? 2048));
+    const perReplicaRamMb = Math.max(64, Number(body.perReplicaRamMb || pol.perReplicaRamMb || 384));
+    const maxSafeReplicas = Math.max(pol.minReplicas, Math.floor(Math.max(0, hostFreeRamMb - pol.reserveHostRamMb) / perReplicaRamMb));
+    const breakerTripped = queueDepth >= pol.breakerQueueThreshold || hostFreeRamMb < pol.reserveHostRamMb;
+    let desiredReplicas = currentReplicas;
+    let action = 'HOLD';
+    let reason = 'HYSTERESIS_HOLD';
+    if (queueDepth >= pol.scaleUpQueueThreshold) {
+      desiredReplicas = Math.min(pol.maxReplicas, currentReplicas + Math.max(1, Math.ceil((queueDepth - pol.scaleUpQueueThreshold) / 30)));
+      action = 'SCALE_UP';
+      reason = 'SCALE_UP';
+    } else if (queueDepth <= pol.scaleDownQueueThreshold && currentReplicas > pol.minReplicas) {
+      desiredReplicas = Math.max(pol.minReplicas, currentReplicas - 1);
+      action = 'SCALE_DOWN';
+      reason = 'SCALE_DOWN';
+    }
+    let targetReplicas = Math.min(desiredReplicas, maxSafeReplicas);
+    if (targetReplicas < desiredReplicas) reason = 'MEMORY_CEILING_CAPPED';
+    if (breakerTripped) {
+      action = targetReplicas > currentReplicas ? 'SCALE_UP' : 'HOLD';
+      reason = 'BREAKER_OPEN';
+    }
+    return jsonResponse({
+      projectId: pid,
+      action,
+      reason,
+      currentReplicas,
+      desiredReplicas,
+      targetReplicas,
+      maxSafeReplicas,
+      memoryHeadroomMb: Math.max(0, hostFreeRamMb - pol.reserveHostRamMb),
+      cooldownRemainingSec: 0,
+      circuitBreaker: breakerTripped
+        ? { state: 'OPEN', httpStatus: 503, retryAfterSec: pol.breakerRetryAfterSec, headers: { 'Retry-After': String(pol.breakerRetryAfterSec) } }
+        : { state: 'CLOSED', httpStatus: null, retryAfterSec: null, headers: {} },
+      policy: pol,
+      evaluatedAt: nowIso(),
+    });
+  }
+  if (pathname === '/api/security/license-audit' && method === 'POST') {
+    const policy = String(body.policy || 'saas-strict');
+    const isStrict = policy === 'saas-strict';
+    const isAuditOnly = policy === 'audit-only';
+    const countsByCategory = { permissive: 11, weak_copyleft: 1, strong_copyleft: 0, source_available: 0, unknown: 0 };
+    return jsonResponse({
+      compliant: true,
+      policy,
+      score: isStrict ? 98 : isAuditOnly ? 100 : 100,
+      totalComponents: 12,
+      countsByCategory,
+      violations: [],
+      warnings: isStrict ? [{ component: 'culkibo-collector-optional', license: 'MPL-2.0', category: 'weak_copyleft', message: 'Weak copyleft file-level disclosure (permitted under saas-strict).' }] : [],
+      auditedAt: nowIso(),
+    });
+  }
+  if (pathname === '/api/security/seccomp/profile' && method === 'POST') {
+    const stack = String(body.stack || 'node').toLowerCase();
+    if (stack === 'unconfined' || String(body.mode || '').toLowerCase() === 'unconfined') {
+      return jsonResponse({ error: 'SECCOMP_UNCONFINED_FORBIDDEN: seccomp=unconfined is strictly prohibited.', code: 'SECCOMP_UNCONFINED_FORBIDDEN' }, 400);
+    }
+    const blockedSyscalls = ['io_uring_setup', 'io_uring_enter', 'io_uring_register', 'ptrace', 'mount', 'umount2', 'pivot_root', 'unshare', 'setns', 'keyctl', 'bpf', 'kexec_load', 'init_module', 'reboot'];
+    const baseAllow = ['read', 'write', 'close', 'fstat', 'mmap', 'mprotect', 'munmap', 'brk', 'rt_sigaction', 'rt_sigprocmask', 'epoll_wait', 'epoll_ctl', 'socket', 'connect', 'accept4', 'sendto', 'recvfrom', 'futex', 'clock_gettime', 'exit_group'];
+    const profile = {
+      defaultAction: 'SCMP_ACT_ERRNO',
+      architectures: ['SCMP_ARCH_X86_64', 'SCMP_ARCH_AARCH64'],
+      syscalls: [
+        { names: baseAllow, action: 'SCMP_ACT_ALLOW' },
+        { names: blockedSyscalls, action: 'SCMP_ACT_ERRNO', errnoRet: 1 },
+      ],
+    };
+    return jsonResponse({
+      stack,
+      profile,
+      allowedCount: stack === 'static-caddy' ? 42 : stack === 'rust' ? 54 : stack === 'go' ? 68 : stack === 'python' ? 84 : 76,
+      blockedSyscalls,
+      dockerSecurityOpt: [
+        '--security-opt', 'no-new-privileges:true',
+        '--security-opt', `seccomp=/etc/culkibo/seccomp-${stack}.json`,
+      ],
+      sha256: '7e4c9a12b8d0f3e6a1c5b9d2e4f8a0c3d5e7f9a1b3c5d7e9f1a3b5c7d9e1f3a5',
+    });
+  }
+  if (pathname === '/api/security/runc-audit' && method === 'POST') {
+    const raw = String(body.version || '1.3.3').trim();
+    const m = raw.match(/(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?/i);
+    if (!m) return jsonResponse({ version: raw, parsedVersion: null, status: 'UNKNOWN', vulnerable: false, cves: [], fixedIn: '1.2.8 / 1.3.3 / 1.4.0-rc.3' });
+    const maj = Number(m[1]);
+    const min = Number(m[2]);
+    const pat = Number(m[3]);
+    const rc = m[4] != null ? Number(m[4]) : null;
+    const vuln = (maj === 1 && min < 2) || (maj === 1 && min === 2 && pat <= 7) || (maj === 1 && min === 3 && pat <= 2) || (maj === 1 && min === 4 && pat === 0 && rc != null && rc <= 2);
+    return jsonResponse({
+      version: raw,
+      parsedVersion: `${maj}.${min}.${pat}${rc != null ? `-rc.${rc}` : ''}`,
+      status: vuln ? 'CRITICAL' : 'PASS',
+      vulnerable: vuln,
+      cves: vuln ? ['CVE-2025-31133', 'CVE-2025-52565', 'CVE-2025-52881'] : [],
+      fixedIn: '1.2.8 / 1.3.3 / 1.4.0-rc.3',
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -3232,16 +3478,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (140 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (145 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 140 MCP tools on demand without bloating context (-87%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 145 MCP tools on demand without bloating context (-88%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_synthetic_sentinel', description: 'Synthetic multi-step API flow monitor (SSRF-guarded, zero-secret) & live uncached TLS/SNI drift sentinel', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_lint_sql_migration', description: '10-rule pure-JS zero-downtime SQL DDL linter catching lock/rewrite footguns before prod', readOnly: true, profile: 'deploy' },
+      { name: 'culkibo_worker_autoscaler', description: 'OOM-safe KEDA queue/worker autoscaler with hysteresis, RAM ceiling & 503 Retry-After circuit breaker', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_audit_licenses', description: 'CycloneDX 1.6 SPDX compound license risk auditor flagging AGPL/SSPL/GPL/LicenseRef violations', readOnly: true, profile: 'security' },
+      { name: 'culkibo_seccomp_profile', description: 'Runtime-tailored least-privilege SCMP_ACT_ERRNO seccomp generator & runc CVE-2025-31133/52565/52881 guard', readOnly: true, profile: 'security' },
       { name: 'culkibo_admission_check', description: 'Declarative Policy-as-Code pre-deploy CIS/PSS admission gate (10 rules, baseline/restricted/soc2-strict)', readOnly: false, profile: 'security' },
       { name: 'culkibo_compliance_bundle', description: 'Generate & verify Ed25519-signed SOC 2 / ISO 27001 / GDPR compliance evidence bundles (0 plaintext secrets)', readOnly: true, profile: 'security' },
       { name: 'culkibo_volume_migrate', description: 'Zero-shell 4-phase stateful volume migration planner preserving tar --numeric-owner UID:GID & SHA-256', readOnly: false, profile: 'deploy' },
@@ -3268,27 +3519,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 140 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 145 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 140, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 145, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_admission_check', status: 'ok', durationMs: 1, timestamp: nowIso(-45000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_compliance_bundle', status: 'ok', durationMs: 3, timestamp: nowIso(-150000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_lint_sql_migration', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_seccomp_profile', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 140,
-      profiles: { core: { count: 17, savedPct: 87 } },
+      totalTools: 145,
+      profiles: { core: { count: 17, savedPct: 88 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

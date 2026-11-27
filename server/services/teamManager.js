@@ -4078,6 +4078,26 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
     }
 
+    // Cycle-12: Synthetic Multi-Step Flows & Live TLS/SNI Sentinel, Zero-Downtime SQL Linter, KEDA Autoscaler, SPDX License Audit & Seccomp/runc Guard
+    if (p === '/api/uptime/synthetic/flows' || p.startsWith('/api/uptime/synthetic/flows/')) {
+      return this.authorizeAction(principal, isRead ? 'uptime:read' : 'team:write');
+    }
+    if (p === '/api/uptime/synthetic/run' || p === '/api/uptime/tls-sentinel') {
+      return this.authorizeAction(principal, 'uptime:write');
+    }
+    if (p === '/api/databases/lint-sql') {
+      return this.authorizeAction(principal, 'databases:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/autoscaler$/.test(p)) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'team:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/autoscaler\/evaluate$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/security/license-audit' || p === '/api/security/seccomp/profile' || p === '/api/security/runc-audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

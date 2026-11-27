@@ -83,6 +83,9 @@ import {
   type AdmissionEvaluationResult,
   type ComplianceBundleResult,
   type ComplianceVerifyResult,
+  type LicenseAuditResult,
+  type SeccompProfileResult,
+  type RuncAuditResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -320,6 +323,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [compBusy, setCompBusy] = useState<'gen' | 'verify' | null>(null);
   const [compError, setCompError] = useState<string | null>(null);
   const [compShowMd, setCompShowMd] = useState(false);
+
+  // Cycle-12: CycloneDX 1.6 SPDX License Risk Auditor & Tailored Seccomp / runc CVE Guard
+  const [licPolicy, setLicPolicy] = useState<'saas-strict' | 'oss-permissive' | 'audit-only'>('saas-strict');
+  const [licReport, setLicReport] = useState<LicenseAuditResult | null>(null);
+  const [licBusy, setLicBusy] = useState(false);
+  const [licError, setLicError] = useState<string | null>(null);
+
+  const [seccompStack, setSeccompStack] = useState<'node' | 'python' | 'go' | 'rust' | 'static-caddy'>('node');
+  const [seccompProfile, setSeccompProfile] = useState<SeccompProfileResult | null>(null);
+  const [runcVersionInput, setRuncVersionInput] = useState('1.3.3');
+  const [runcAudit, setRuncAudit] = useState<RuncAuditResult | null>(null);
+  const [seccompBusy, setSeccompBusy] = useState<'gen' | 'runc' | null>(null);
+  const [seccompError, setSeccompError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -1478,6 +1494,70 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setCompBusy(null);
+    }
+  };
+
+  const handleAuditLicenses = async (overridePolicy?: 'saas-strict' | 'oss-permissive' | 'audit-only') => {
+    const pol = overridePolicy || licPolicy;
+    if (overridePolicy) setLicPolicy(overridePolicy);
+    setLicBusy(true);
+    setLicError(null);
+    try {
+      const res = await api.auditSpdxLicenses({ policy: pol });
+      setLicReport(res);
+      onNotify?.(
+        res.compliant
+          ? `SPDX License Audit (${pol}): COMPLIANT (${res.score}/100 across ${res.totalComponents} pkg)`
+          : `SPDX License Audit flagged ${Array.isArray(res.violations) ? res.violations.length : 1} violation(s)`,
+        res.compliant ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'SPDX license audit failed';
+      setLicError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setLicBusy(false);
+    }
+  };
+
+  const handleGenerateSeccomp = async (overrideStack?: 'node' | 'python' | 'go' | 'rust' | 'static-caddy') => {
+    const st = overrideStack || seccompStack;
+    if (overrideStack) setSeccompStack(overrideStack);
+    setSeccompBusy('gen');
+    setSeccompError(null);
+    try {
+      const res = await api.generateSeccompProfile({ stack: st });
+      setSeccompProfile(res);
+      onNotify?.(`Generated tailored SCMP_ACT_ERRNO seccomp profile for "${st}" (${res.allowedCount} allowed)`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Seccomp profile generation failed';
+      setSeccompError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setSeccompBusy(null);
+    }
+  };
+
+  const handleAuditRunc = async (overrideVer?: string) => {
+    const v = (overrideVer ?? runcVersionInput).trim() || '1.3.3';
+    if (overrideVer !== undefined) setRuncVersionInput(overrideVer);
+    setSeccompBusy('runc');
+    setSeccompError(null);
+    try {
+      const res = await api.auditRuncVersion(v);
+      setRuncAudit(res);
+      onNotify?.(
+        res.vulnerable
+          ? `runc ${res.parsedVersion || v} VULNERABLE (${res.cves.join(', ')})`
+          : `runc ${res.parsedVersion || v} PASS (patched against CVE-2025-31133/52565/52881)`,
+        res.vulnerable ? 'error' : 'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'runc audit failed';
+      setSeccompError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setSeccompBusy(null);
     }
   };
 
@@ -3093,6 +3173,204 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               );
             })()}
+          </div>
+
+          {/* 13. Cycle-12: CycloneDX 1.6 SPDX License Risk Auditor */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ListChecks className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.licTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                      AGPL · SSPL · BSL · LicenseRef
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.licDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[10px] font-mono">
+                  {(['saas-strict', 'oss-permissive', 'audit-only'] as const).map((pol) => (
+                    <button
+                      key={pol}
+                      type="button"
+                      onClick={() => void handleAuditLicenses(pol)}
+                      className={`px-2 py-1 rounded-md cursor-pointer ${
+                        licPolicy === pol ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {pol}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  disabled={licBusy}
+                  onClick={() => void handleAuditLicenses()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {licBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                  <span>{licBusy ? t('sec.licRunning') : t('sec.licRun')}</span>
+                </button>
+              </div>
+            </div>
+
+            {licError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{licError}</div>}
+
+            {licReport && (() => {
+              const counts = licReport.countsByCategory || {};
+              const viols = Array.isArray(licReport.violations) ? licReport.violations : [];
+              return (
+                <div className="space-y-3 tabular-nums">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`px-2.5 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                      licReport.compliant
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-red-50 text-red-700 border-red-200'
+                    }`}>
+                      {licReport.compliant ? `COMPLIANT · ${licReport.score}/100` : `VIOLATIONS (${viols.length})`}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
+                      Permissive: {counts.permissive ?? 0}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 font-mono text-[10px] text-amber-800">
+                      Weak Copyleft: {counts.weak_copyleft ?? 0}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 font-mono text-[10px] text-red-700">
+                      Strong Copyleft: {counts.strong_copyleft ?? 0}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 font-mono text-[10px] text-red-700">
+                      Source-Avail: {counts.source_available ?? 0}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600">
+                      Unknown: {counts.unknown ?? 0}
+                    </span>
+                  </div>
+                  {viols.length > 0 && (
+                    <div className="p-3 rounded-xl bg-red-50 border border-red-200 font-mono text-[11px] text-red-800 space-y-1">
+                      {viols.slice(0, 6).map((v, idx) => (
+                        <div key={idx}>
+                          • {typeof v === 'string' ? v : `${v.component || v.name || 'pkg'} (${v.license || 'UNKNOWN'}): ${v.message || v.reason || v.category || 'blocked'}`}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 14. Cycle-12: Tailored Least-Privilege Seccomp & runc CVE Guard */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Lock className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.seccompTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      CVE-2025-31133 / 52565 / 52881
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.seccompDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[10px] font-mono">
+                  {(['node', 'python', 'go', 'rust', 'static-caddy'] as const).map((st) => (
+                    <button
+                      key={st}
+                      type="button"
+                      onClick={() => setSeccompStack(st)}
+                      className={`px-2 py-1 rounded-md cursor-pointer ${
+                        seccompStack === st ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {st}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  disabled={seccompBusy !== null}
+                  onClick={() => void handleGenerateSeccomp()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {seccompBusy === 'gen' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                  <span>{seccompBusy === 'gen' ? t('sec.seccompGenerating') : t('sec.seccompGen')}</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                value={runcVersionInput}
+                onChange={(e) => setRuncVersionInput(e.target.value)}
+                aria-label="runc version to audit"
+                placeholder="runc version 1.3.3"
+                className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 w-44"
+              />
+              <button
+                type="button"
+                disabled={seccompBusy !== null}
+                onClick={() => void handleAuditRunc()}
+                className="culkibo-press inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+              >
+                <ScanSearch className="w-3.5 h-3.5" />
+                <span>{t('sec.seccompAuditRunc')}</span>
+              </button>
+              <button
+                type="button"
+                disabled={seccompBusy !== null}
+                onClick={() => void handleAuditRunc('1.2.7')}
+                className="px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 font-mono text-[10px] font-semibold cursor-pointer disabled:opacity-50"
+              >
+                Test Vulnerable 1.2.7
+              </button>
+              {runcAudit && (
+                <span className={`px-2.5 py-1 rounded-full font-mono text-[10px] font-semibold border ${
+                  runcAudit.vulnerable
+                    ? 'bg-red-50 text-red-700 border-red-200'
+                    : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                }`}>
+                  runc {runcAudit.parsedVersion || runcAudit.version}: {runcAudit.status}
+                  {runcAudit.vulnerable && Array.isArray(runcAudit.cves) && runcAudit.cves.length > 0 ? ` (${runcAudit.cves.join(', ')})` : ''}
+                </span>
+              )}
+            </div>
+
+            {seccompError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{seccompError}</div>}
+
+            {seccompProfile && (
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] tabular-nums">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 font-semibold">
+                      SCMP_ACT_ERRNO · {seccompProfile.allowedCount} allowed · {(Array.isArray(seccompProfile.blockedSyscalls) ? seccompProfile.blockedSyscalls.length : 0)} blocked
+                    </span>
+                    <span className="text-slate-500">sha256:{String(seccompProfile.sha256 || '').slice(0, 12)}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void copySecurityValue(JSON.stringify(seccompProfile.profile, null, 2), 'seccomp_json', 'seccomp.json')}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                  >
+                    {copiedSecKey === 'seccomp_json' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                    <span>{t('sec.seccompCopy')}</span>
+                  </button>
+                </div>
+                <pre className="p-3 rounded-xl bg-slate-950 text-emerald-300 font-mono text-[10px] leading-relaxed overflow-x-auto max-h-48 border border-slate-800">
+                  {JSON.stringify(seccompProfile.profile, null, 2)}
+                </pre>
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -2577,6 +2577,256 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #11 CVEs (13a-13e): Coolify CVE-2025-66213/<=beta.420.6 host escape, dokploy#2661 public bind/UID 0, dokploy#2642/#4360 Ed25519 compliance bundle, Kamal/Dokploy --numeric-owner volume migration, Caddy v2.11 Geo+A/B kill-switch');
 
+  // -------------------------------------------------------------------------
+  // 14. Cycle #12 Reliability & Security Regressions (docs/COMPETITOR_RADAR_CYCLE11.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const http = require('http');
+    const { SyntheticSentinelService, checkTlsSentinel } = require('../server/services/syntheticSentinelService');
+    const { WorkerAutoscalerService } = require('../server/services/workerAutoscalerService');
+    const { lintSqlMigration } = require('../server/services/sqlMigrationLinter');
+    const { auditLicenses } = require('../server/services/licenseAuditorService');
+    const { generateSeccompProfile, validateSeccompSpec, auditRuncVersion } = require('../server/services/seccompProfileService');
+    const systemDoctor = require('../server/services/systemDoctor');
+
+    const c12Tmp = makeTempDir('culkibo-c12-cve-');
+    try {
+      // 14a. Uptime Kuma #5772/#7500 & Gatus #856: Live 2-step loopback login->token->assert + redaction + 169.254.169.254 SSRF + TLS drift
+      const ss = new SyntheticSentinelService({ dataDir: c12Tmp });
+      const EPHEMERAL_TOKEN = 'eyJhbGciOiJIUzI1NiJ9.c12_ephemeral_secret_token';
+      const mockSrv = await new Promise((resolve) => {
+        const s = http.createServer((req, res) => {
+          if (req.url === '/login' && req.method === 'POST') {
+            res.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' });
+            res.end(JSON.stringify({ access_token: EPHEMERAL_TOKEN, role: 'operator' }));
+            return;
+          }
+          if (req.url === '/me' && req.headers.authorization === `Bearer ${EPHEMERAL_TOKEN}`) {
+            res.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' });
+            res.end(JSON.stringify({ ok: true, user: 'alice' }));
+            return;
+          }
+          res.writeHead(401, { 'Content-Type': 'application/json', Connection: 'close' });
+          res.end(JSON.stringify({ error: 'unauthorized' }));
+        });
+        s.listen(0, '127.0.0.1', () => resolve(s));
+      });
+      // Clean agent:false loopback HTTP fetch (avoids Windows Node/Undici keep-alive handle race on process.exit)
+      const loopbackFetch = (urlStr, init = {}) => new Promise((resolve, reject) => {
+        const u = new URL(urlStr);
+        const req = http.request({
+          hostname: u.hostname,
+          port: u.port,
+          path: u.pathname + u.search,
+          method: init.method || 'GET',
+          headers: { ...(init.headers || {}), connection: 'close' },
+          agent: false
+        }, (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            resolve({
+              status: res.statusCode,
+              headers: { get: (k) => res.headers[String(k).toLowerCase()] || null },
+              text: async () => text
+            });
+          });
+        });
+        req.on('error', reject);
+        if (init.body !== undefined) req.write(init.body);
+        req.end();
+      });
+      try {
+        const mockPort = mockSrv.address().port;
+        const savedFlow = ss.saveFlow({
+          id: 'c12_2step_flow',
+          name: 'Login -> Me 2-Step',
+          steps: [
+            {
+              name: 'login',
+              method: 'POST',
+              url: `http://127.0.0.1:${mockPort}/login`,
+              body: { username: 'alice', password: 'RawPasswordNeverSaved!' },
+              extract: { tok: 'json.access_token' },
+              assert: { status: 200 }
+            },
+            {
+              name: 'me',
+              method: 'GET',
+              url: `http://127.0.0.1:${mockPort}/me`,
+              headers: { Authorization: 'Bearer {{tok}}' },
+              assert: { status: 200, jsonPathEquals: { 'json.user': 'alice' } }
+            }
+          ]
+        });
+        const runOk = await ss.runFlow(savedFlow.id, { allowLoopback: true, fetchImpl: loopbackFetch });
+        assert.strictEqual(runOk.ok, true, '2-step login->token->assert flow MUST succeed');
+        assert.strictEqual(runOk.steps.length, 2);
+        const persistedRaw = fs.readFileSync(ss.getStoreFilePath(), 'utf8');
+        assert.ok(!persistedRaw.includes(EPHEMERAL_TOKEN), 'Extracted ephemeral token MUST NEVER be persisted on disk');
+        assert.ok(!persistedRaw.includes('RawPasswordNeverSaved!'), 'Password in saved flow MUST be redacted');
+
+        const ssrfRes = await ss.runFlow({
+          name: 'IMDS SSRF',
+          steps: [{ name: 'imds', method: 'GET', url: 'http://169.254.169.254/latest/meta-data/' }]
+        }, { allowLoopback: true, persist: false, fetchImpl: loopbackFetch });
+        assert.strictEqual(ssrfRes.ok, false, '169.254.169.254 MUST be unconditionally blocked');
+        assert.ok(JSON.stringify(ssrfRes).includes('SSRF_BLOCKED'));
+      } finally {
+        if (typeof mockSrv.closeAllConnections === 'function') mockSrv.closeAllConnections();
+        await new Promise((r) => mockSrv.close(r));
+      }
+
+      const nowFixed = Date.UTC(2026, 10, 27, 12, 0, 0);
+      const tlsDrifted = await checkTlsSentinel({
+        host: 'app.example.test',
+        servername: 'app.example.test',
+        expectedSan: 'app.example.test',
+        baselineFingerprintSha256: 'AA:BB:CC:DD',
+        baselineIssuer: 'CN=R10, O=Let\'s Encrypt',
+        warnDays: 14,
+        critDays: 3
+      }, {
+        nowMs: nowFixed,
+        tlsProbeImpl: async () => ({
+          protocol: 'TLSv1.3',
+          cert: {
+            subject: { CN: 'other.example.test' },
+            issuer: { CN: 'ZeroSSL RSA', O: 'ZeroSSL' },
+            subjectaltname: 'DNS:other.example.test',
+            fingerprint256: '11:22:33:44',
+            valid_from: new Date(nowFixed - 10 * 86400000).toUTCString(),
+            valid_to: new Date(nowFixed + 2 * 86400000).toUTCString()
+          }
+        })
+      });
+      assert.strictEqual(tlsDrifted.status, 'CRITICAL');
+      assert.strictEqual(tlsDrifted.sanMatched, false);
+      assert.strictEqual(tlsDrifted.fingerprintDrifted, true);
+      assert.strictEqual(tlsDrifted.issuerDrifted, true);
+
+      // 14b. Squawk / Strong Migrations DDL Locks
+      const badDdl = lintSqlMigration(`
+        CREATE INDEX idx_users_email ON users(email);
+        ALTER TABLE orders ADD CONSTRAINT fk_u FOREIGN KEY (user_id) REFERENCES users(id);
+        ALTER TABLE users DROP COLUMN legacy_col;
+        ALTER TABLE users ALTER COLUMN age TYPE BIGINT;
+      `);
+      assert.strictEqual(badDdl.safe, false);
+      const ddlRuleIds = badDdl.blockers.map((b) => b.rule);
+      assert.ok(ddlRuleIds.includes('CREATE_INDEX_NOT_CONCURRENT'));
+      assert.ok(ddlRuleIds.includes('UNSAFE_ADD_CONSTRAINT'));
+      assert.ok(ddlRuleIds.includes('DESTRUCTIVE_DROP_COLUMN_OR_TABLE'));
+      assert.ok(ddlRuleIds.includes('ALTER_COLUMN_TYPE_REWRITE'));
+      assert.ok(ddlRuleIds.includes('MISSING_LOCK_TIMEOUT'));
+
+      const goodDdl = lintSqlMigration("SET lock_timeout = '5s'; CREATE INDEX CONCURRENTLY idx_users_email ON users(email);");
+      assert.strictEqual(goodDdl.safe, true, 'Safe CONCURRENTLY migration with lock_timeout MUST pass');
+
+      // 14c. Dokploy #6105 / CapRover #2164 / KEDA Worker Autoscaler (cooldown + RAM cap + 503 Retry-After breaker)
+      const wa = new WorkerAutoscalerService({ dataDir: c12Tmp });
+      wa.savePolicy('p_c12', {
+        minReplicas: 1,
+        maxReplicas: 10,
+        perReplicaRamMb: 256,
+        reserveHostRamMb: 512,
+        scaleUpCooldownSec: 60,
+        breakerQueueThreshold: 200,
+        breakerRetryAfterSec: 30
+      });
+      const coolRes = wa.evaluateAutoscaler({
+        projectId: 'p_c12',
+        queueDepth: 120,
+        currentReplicas: 2,
+        hostFreeRamMb: 4096,
+        lastScaleAtMs: nowFixed - 15000,
+        nowMs: nowFixed
+      });
+      assert.strictEqual(coolRes.action, 'HOLD');
+      assert.strictEqual(coolRes.reason, 'COOLDOWN_ACTIVE');
+
+      const capRes = wa.evaluateAutoscaler({
+        projectId: 'p_c12',
+        queueDepth: 150,
+        currentReplicas: 1,
+        hostFreeRamMb: 1024,
+        lastScaleAtMs: 0,
+        nowMs: nowFixed
+      });
+      assert.strictEqual(capRes.maxSafeReplicas, 2);
+      assert.strictEqual(capRes.targetReplicas, 2);
+      assert.strictEqual(capRes.reason, 'MEMORY_CEILING_CAPPED');
+
+      const breakerRes = wa.evaluateAutoscaler({
+        projectId: 'p_c12',
+        queueDepth: 300,
+        currentReplicas: 2,
+        hostFreeRamMb: 4096,
+        nowMs: nowFixed
+      });
+      assert.strictEqual(breakerRes.circuitBreaker.state, 'OPEN');
+      assert.strictEqual(breakerRes.circuitBreaker.httpStatus, 503);
+      assert.strictEqual(breakerRes.circuitBreaker.headers['Retry-After'], '30');
+
+      // 14d. CycloneDX 1.6 AGPL / SSPL / LicenseRef-* / Missing vs MIT/Apache-2.0/ISC
+      const badLic = auditLicenses({
+        policy: 'saas-strict',
+        sbom: {
+          bomFormat: 'CycloneDX',
+          specVersion: '1.6',
+          components: [
+            { name: 'pkg-agpl', version: '1.0.0', licenses: [{ license: { id: 'AGPL-3.0-only' } }] },
+            { name: 'pkg-sspl', version: '1.0.0', licenses: [{ license: { id: 'SSPL-1.0' } }] },
+            { name: 'pkg-custom', version: '1.0.0', licenses: [{ license: { id: 'LicenseRef-proprietary' } }] },
+            { name: 'pkg-missing', version: '1.0.0', licenses: [] }
+          ]
+        }
+      });
+      assert.strictEqual(badLic.compliant, false);
+      assert.strictEqual(badLic.violations.length, 4);
+
+      const goodLic = auditLicenses({
+        policy: 'saas-strict',
+        sbom: {
+          bomFormat: 'CycloneDX',
+          specVersion: '1.6',
+          components: [
+            { name: 'a', version: '1.0.0', licenses: [{ license: { id: 'MIT' } }] },
+            { name: 'b', version: '1.0.0', licenses: [{ license: { id: 'Apache-2.0' } }] },
+            { name: 'c', version: '1.0.0', licenses: [{ license: { id: 'ISC' } }] }
+          ]
+        }
+      });
+      assert.strictEqual(goodLic.compliant, true);
+      assert.strictEqual(goodLic.score, 100);
+
+      // 14e. runc CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881 & io_uring Seccomp
+      const nodeSec = generateSeccompProfile('node');
+      assert.strictEqual(nodeSec.profile.defaultAction, 'SCMP_ACT_ERRNO');
+      assert.strictEqual(validateSeccompSpec(nodeSec.profile).safe, true);
+      const allowRule = nodeSec.profile.syscalls.find((r) => r.action === 'SCMP_ACT_ALLOW');
+      for (const denied of ['io_uring_setup', 'io_uring_enter', 'mount', 'ptrace', 'bpf']) {
+        assert.ok(nodeSec.blockedSyscalls.includes(denied), `${denied} must be denied`);
+        assert.ok(!allowRule.names.includes(denied), `${denied} must NEVER appear in SCMP_ACT_ALLOW`);
+      }
+      assert.throws(
+        () => generateSeccompProfile('unconfined'),
+        (err) => err && err.code === 'SECCOMP_UNCONFINED_FORBIDDEN'
+      );
+      assert.strictEqual(validateSeccompSpec('unconfined').safe, false);
+      assert.strictEqual(auditRuncVersion('runc version 1.2.7').status, 'CRITICAL');
+      assert.strictEqual(auditRuncVersion('runc version 1.3.2').status, 'CRITICAL');
+      assert.strictEqual(auditRuncVersion('runc version 1.2.8').status, 'PASS');
+      assert.strictEqual(auditRuncVersion('runc version 1.3.3').status, 'PASS');
+      assert.strictEqual(systemDoctor.checkRuncRuntime({ versionOutput: 'runc version 1.2.7' }).status, 'fail');
+      assert.strictEqual(systemDoctor.checkRuncRuntime({ versionOutput: 'runc version 1.2.8' }).status, 'ok');
+    } finally {
+      fs.rmSync(c12Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #12 CVEs (14a-14e): Uptime Kuma #5772/#7500 & Gatus #856 synthetic+TLS, Squawk DDL linter, Dokploy #6105/KEDA RAM-cap+503 breaker, CycloneDX 1.6 AGPL/SSPL, runc CVE-2025-31133/52565/52881+io_uring seccomp');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

@@ -56,7 +56,9 @@ const svc = {
   get backupDrillService() { return require('../server/services/backupDrillService'); },
   get aiWorkloadService() { return require('../server/services/aiWorkloadService'); },
   get complianceBundleService() { return require('../server/services/complianceBundleService'); },
-  get admissionPolicyService() { return require('../server/services/admissionPolicyService'); }
+  get admissionPolicyService() { return require('../server/services/admissionPolicyService'); },
+  get sqlMigrationLinter() { return require('../server/services/sqlMigrationLinter'); },
+  get licenseAuditorService() { return require('../server/services/licenseAuditorService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2879,15 +2881,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 140,
+            mcpTools: 145,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '140 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
-            'Policy-as-Code Admission, Ed25519 SOC2/ISO27001/GDPR Bundle, Cross-VPS Volume Migration, Caddy Geo/A-B & DR Fire-Drills'
+            '145 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
+            'Synthetic API/TLS Sentinel, SQL Migration Linter, KEDA OOM-Safe Autoscaler, SPDX License Audit & Tailored Seccomp'
           ]
         };
       };
@@ -3727,6 +3729,103 @@ program
       console.log(`   Avisos:      ${Array.isArray(evaluation.auditWarnings) ? evaluation.auditWarnings.length : 0}`);
       console.log('');
       if (!allowed) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-12 CLI: lint-sql (Zero-Downtime DDL) & audit-licenses (SPDX)
+// ===========================================================================
+
+program
+  .command('lint-sql [sqlFile]')
+  .description('Zero-Downtime SQL Migration Linter (10 reglas DDL Squawk/Strong-Migrations): sale con código 1 si hay bloqueos de producción')
+  .option('--sql <sql>', 'Cadena SQL DDL inline a analizar')
+  .option('--json', 'Salida JSON estructurada')
+  .action((sqlFile, options) => {
+    try {
+      let sql = '';
+      /** @type {string | null} */
+      let sourceFile = null;
+      if (typeof options.sql === 'string' && options.sql.trim()) {
+        sql = options.sql;
+      } else if (sqlFile) {
+        sourceFile = path.resolve(String(sqlFile));
+        if (!fs.existsSync(sourceFile)) {
+          throw new Error(`Archivo SQL no encontrado: ${sourceFile}`);
+        }
+        sql = fs.readFileSync(sourceFile, 'utf8');
+      } else {
+        throw new Error('Proporciona un archivo <sqlFile> o el flag --sql "<SQL>".');
+      }
+
+      const sqlLint = svc.sqlMigrationLinter;
+      const result = sqlLint.lintSqlMigration(sql);
+      const safe = Boolean(result && result.safe);
+      const payload = {
+        ...result,
+        ok: safe,
+        ...(sourceFile ? { file: sourceFile } : {})
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!safe) process.exitCode = 1;
+        return;
+      }
+
+      const badge = safe ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n🛡️  Culkibo Zero-Downtime SQL Migration Linter — [${badge}]`);
+      console.log(`   Score:       ${result.score ?? '—'}/100 (${result.analyzedStatements ?? 0} sentencia(s))`);
+      console.log(`   Bloqueos:    ${Array.isArray(result.blockers) ? result.blockers.length : 0}`);
+      console.log(`   Avisos:      ${Array.isArray(result.warnings) ? result.warnings.length : 0}`);
+      if (Array.isArray(result.blockers) && result.blockers.length > 0) {
+        for (const b of result.blockers) {
+          console.log(`     • [${b.rule || 'BLOCKER'}] ${b.message || ''}`);
+        }
+      }
+      console.log('');
+      if (!safe) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('audit-licenses')
+  .description('CycloneDX 1.6 SPDX License Compliance & Risk Auditor: detecta AGPL/GPL/SSPL/BSL/unknown y sale con código 1 si no cumple')
+  .option('-p, --policy <policy>', 'Política SPDX: saas-strict | oss-permissive | audit-only', 'saas-strict')
+  .option('-d, --dir <path>', 'Directorio del proyecto con package-lock.json / package.json')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const rawPolicy = String(options.policy || 'saas-strict').toLowerCase();
+      if (!['saas-strict', 'oss-permissive', 'audit-only'].includes(rawPolicy)) {
+        throw new Error(`Política de licencias inválida "${options.policy}". Usa: saas-strict | oss-permissive | audit-only`);
+      }
+      const licSvc = svc.licenseAuditorService;
+      const result = licSvc.auditLicenses({
+        policy: rawPolicy,
+        ...(options.dir ? { projectDir: path.resolve(String(options.dir)) } : {})
+      });
+      const compliant = Boolean(result && result.compliant);
+      const payload = {
+        ...result,
+        ok: compliant
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!compliant) process.exitCode = 1;
+        return;
+      }
+
+      const badge = compliant ? '\x1b[32mCOMPLIANT ✅\x1b[0m' : '\x1b[31mNON-COMPLIANT ❌\x1b[0m';
+      console.log(`\n⚖️  Culkibo SPDX License Auditor (${rawPolicy}) — [${badge}]`);
+      console.log(`   Score:        ${result.score ?? '—'}/100 (${result.totalComponents ?? 0} componente(s))`);
+      console.log(`   Violaciones:  ${Array.isArray(result.violations) ? result.violations.length : 0}`);
+      console.log(`   Avisos:       ${Array.isArray(result.warnings) ? result.warnings.length : 0}`);
+      console.log('');
+      if (!compliant) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
     }

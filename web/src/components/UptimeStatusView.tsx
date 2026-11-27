@@ -20,6 +20,10 @@ import {
   Clock,
   HeartPulse,
   Send,
+  Play,
+  Lock,
+  CheckCircle2,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   api,
@@ -35,6 +39,9 @@ import {
   type MaintenanceWindowRecord,
   type StatusIncidentRecord,
   type GeoFailoverPlanResult,
+  type SyntheticFlowRecord,
+  type SyntheticFlowRunResult,
+  type TlsSentinelResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -97,6 +104,14 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const [geoPlan, setGeoPlan] = useState<GeoFailoverPlanResult | null>(null);
   const [geoBusy, setGeoBusy] = useState(false);
 
+  // Cycle-12: Synthetic Multi-Step API Flow & Live TLS/SNI Sentinel
+  const [synthFlows, setSynthFlows] = useState<SyntheticFlowRecord[]>([]);
+  const [synthRun, setSynthRun] = useState<SyntheticFlowRunResult | null>(null);
+  const [tlsHost, setTlsHost] = useState('app.acme-demo.dev');
+  const [tlsResult, setTlsResult] = useState<TlsSentinelResult | null>(null);
+  const [synthBusy, setSynthBusy] = useState<'flow' | 'tls' | null>(null);
+  const [synthError, setSynthError] = useState<string | null>(null);
+
   const [vpsMonthlyEur, setVpsMonthlyEur] = useState<string>('12');
   const [advisorBusy, setAdvisorBusy] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -150,7 +165,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
   const loadAll = useCallback(async (eurOverride?: number) => {
     try {
       const eur = eurOverride ?? (Number.parseFloat(vpsMonthlyEur) || 12);
-      const [monRes, pageRes, projRes, advRes, cronRes, hbRes, mwRes, incRes] = await Promise.all([
+      const [monRes, pageRes, projRes, advRes, cronRes, hbRes, mwRes, incRes, flowRes] = await Promise.all([
         api.getUptimeMonitors().catch(() => ({ monitors: [] })),
         api.getStatusPages().catch(() => ({ pages: [] })),
         api.getProjects().catch(() => []),
@@ -159,6 +174,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
         api.listHeartbeats().catch(() => ({ heartbeats: [] })),
         api.listMaintenanceWindows().catch((): { windows?: MaintenanceWindowRecord[]; maintenanceWindows?: MaintenanceWindowRecord[] } => ({ windows: [] })),
         api.listUptimeIncidents().catch(() => ({ incidents: [] })),
+        api.listSyntheticFlows().catch(() => ({ flows: [] })),
       ]);
       const projList = Array.isArray(projRes) ? projRes : [];
       setMonitors(monRes.monitors || []);
@@ -170,6 +186,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
       const mwList = Array.isArray(mwRes?.windows) ? mwRes.windows : (Array.isArray(mwRes?.maintenanceWindows) ? mwRes.maintenanceWindows : []);
       setMaintWindows(mwList);
       setUptimeIncidents(Array.isArray(incRes?.incidents) ? incRes.incidents : []);
+      setSynthFlows(Array.isArray(flowRes?.flows) ? flowRes.flows : []);
 
       if (projList.length > 0) {
         // Prefer bulk GET /api/sleep to avoid N+1 requests; fallback to batched per-project reads for ALL projects
@@ -725,6 +742,51 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
     }
   };
 
+  const handleRunSyntheticFlow = async (flowId?: string) => {
+    setSynthBusy('flow');
+    setSynthError(null);
+    try {
+      const targetId = flowId || synthFlows[0]?.id;
+      const res = await api.runSyntheticFlow(
+        targetId
+          ? { flowId: targetId }
+          : {
+              flow: {
+                name: 'Edge API Health Flow',
+                steps: [
+                  { name: 'GET /health', method: 'GET', url: 'https://api.acme-demo.dev/health', assert: { status: 200, maxLatencyMs: 500 } },
+                ],
+              },
+            }
+      );
+      setSynthRun(res);
+      onNotify(res.ok ? `Synthetic flow passed (${res.totalLatencyMs} ms)` : `Synthetic flow failed at ${res.failedStep || 'step'}`, res.ok ? 'success' : 'error');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Could not run synthetic flow';
+      setSynthError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setSynthBusy(null);
+    }
+  };
+
+  const handleProbeTlsSentinel = async () => {
+    const cleanHost = tlsHost.trim() || 'app.acme-demo.dev';
+    setSynthBusy('tls');
+    setSynthError(null);
+    try {
+      const res = await api.checkTlsSentinel({ host: cleanHost, port: 443, expectedSan: cleanHost, warnDays: 14, critDays: 3 });
+      setTlsResult(res);
+      onNotify(`TLS/SNI Sentinel: ${res.status} (${res.daysRemaining}d remaining, ${res.protocol || 'TLS'})`, res.status === 'OK' ? 'success' : 'error');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'TLS/SNI probe failed';
+      setSynthError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setSynthBusy(null);
+    }
+  };
+
   const summary = useMemo(() => {
     const upCount = monitors.filter((m) => m.status === 'up').length;
     const incidents = monitors.filter((m) => Boolean(m.incidentOpen || m.activeIncidentId || m.status === 'down')).length;
@@ -1161,6 +1223,160 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                     </div>
                   );
                 })}
+              </div>
+            )}
+          </section>
+
+          {/* Cycle-12: Synthetic Multi-Step API Flow & Live TLS/SNI Sentinel */}
+          <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                  <Lock className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('uptime.synthTitle')}</h2>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      <ShieldCheck className="w-3 h-3" />
+                      {t('uptime.synthZeroSecret')}
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('uptime.synthDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <input
+                  type="text"
+                  value={tlsHost}
+                  onChange={(e) => setTlsHost(e.target.value)}
+                  aria-label="TLS Sentinel hostname"
+                  placeholder="app.acme-demo.dev"
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 w-44"
+                />
+                <button
+                  type="button"
+                  disabled={synthBusy !== null}
+                  onClick={() => void handleProbeTlsSentinel()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {synthBusy === 'tls' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
+                  <span>{synthBusy === 'tls' ? t('uptime.synthProbing') : t('uptime.synthProbeTls')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={synthBusy !== null}
+                  onClick={() => void handleRunSyntheticFlow()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {synthBusy === 'flow' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                  <span>{synthBusy === 'flow' ? t('uptime.synthRunning') : t('uptime.synthRunFlow')}</span>
+                </button>
+              </div>
+            </div>
+
+            {synthError && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4 shrink-0" />
+                <span>{synthError}</span>
+              </div>
+            )}
+
+            {synthFlows.length > 0 && (
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                {synthFlows.slice(0, 4).map((fl) => (
+                  <div key={fl.id} className="px-4 py-2.5 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-slate-900">{fl.name}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600 tabular-nums">
+                          {(Array.isArray(fl.steps) ? fl.steps.length : 0)} steps
+                        </span>
+                        {fl.lastOk != null && (
+                          <span className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                            fl.lastOk ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-700 border-red-200'
+                          }`}>
+                            {fl.lastOk ? `PASS · ${fl.lastLatencyMs ?? 0}ms` : 'FAIL'}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={synthBusy !== null}
+                      onClick={() => void handleRunSyntheticFlow(fl.id)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer shrink-0 disabled:opacity-50"
+                    >
+                      <Play className="w-3 h-3" />
+                      <span>{t('uptime.synthRunFlow')}</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {synthRun && (
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2 tabular-nums">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className={`inline-flex items-center gap-1.5 font-mono font-semibold ${synthRun.ok ? 'text-emerald-700' : 'text-red-700'}`}>
+                    {synthRun.ok ? <CheckCircle2 className="w-4 h-4" /> : <ShieldAlert className="w-4 h-4" />}
+                    <span>{synthRun.flowName || 'Synthetic Flow'} · {synthRun.ok ? 'ALL STEPS PASSED' : `FAILED (${synthRun.failedStep || 'step'})`}</span>
+                  </span>
+                  <span className="font-mono text-[11px] text-slate-500">Total: {synthRun.totalLatencyMs} ms</span>
+                </div>
+                <div className="space-y-1">
+                  {(Array.isArray(synthRun.steps) ? synthRun.steps : []).map((st, idx) => (
+                    <div key={idx} className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 flex items-center justify-between gap-2 font-mono text-[11px]">
+                      <span className="truncate text-slate-800">{idx + 1}. {st.name} ({st.method})</span>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className={st.ok ? 'text-emerald-700 font-semibold' : 'text-red-700 font-semibold'}>
+                          HTTP {st.status ?? 'ERR'} · {st.latencyMs}ms
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {tlsResult && (
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2 tabular-nums">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`px-2.5 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                    tlsResult.status === 'OK'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : tlsResult.status === 'WARNING'
+                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : 'bg-red-50 text-red-700 border-red-200'
+                  }`}>
+                    TLS {tlsResult.status} · {tlsResult.daysRemaining}d left
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-700">
+                    {tlsResult.protocol || 'TLSv1.3'}
+                  </span>
+                  <span className={`px-2 py-0.5 rounded font-mono text-[10px] border ${
+                    tlsResult.sanMatched !== false
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-red-50 text-red-700 border-red-200'
+                  }`}>
+                    SAN {tlsResult.sanMatched !== false ? 'MATCH' : 'MISMATCH'}
+                  </span>
+                  <span className={`px-2 py-0.5 rounded font-mono text-[10px] border ${
+                    tlsResult.fingerprintDrifted || tlsResult.issuerDrifted
+                      ? 'bg-amber-50 text-amber-800 border-amber-200'
+                      : 'bg-white text-slate-600 border-slate-200'
+                  }`}>
+                    {tlsResult.fingerprintDrifted || tlsResult.issuerDrifted ? 'Cert Drift Detected' : '0 Issuer/FP Drift'}
+                  </span>
+                  {tlsResult.issuer && (
+                    <span className="font-mono text-[10px] text-slate-500 ml-auto">Issuer: {tlsResult.issuer}</span>
+                  )}
+                </div>
+                {tlsResult.fingerprintSha256 && (
+                  <div className="font-mono text-[10px] text-slate-500 truncate">
+                    SHA-256: {tlsResult.fingerprintSha256}
+                  </div>
+                )}
               </div>
             )}
           </section>

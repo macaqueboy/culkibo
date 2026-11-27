@@ -767,6 +767,9 @@ async function runDoctor() {
     });
   } catch (e) {}
 
+  // 12. Auditoría del runtime OCI `runc` (CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881)
+  checks.push(checkRuncRuntime());
+
   const summary = {
     ok: checks.filter((c) => c.status === 'ok').length,
     warn: checks.filter((c) => c.status === 'warn').length,
@@ -878,4 +881,99 @@ async function applyFix(action) {
   throw err;
 }
 
-module.exports = { runDoctor, applyFix, checkDiskSpace, checkHostMemory, checkKeyFilePermissions, listOrphanedManagedContainers, checkCostAndFleet, auditExposedDatabases };
+/**
+ * Comprobación #12: Auditoría del runtime OCI `runc` (CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881).
+ * Carga de forma perezosa `seccompProfileService.auditRuncVersion` y sondea `runc --version`
+ * sin shell (`shell: false`), degradando limpiamente en Windows o hosts sin `runc`.
+ *
+ * @param {{ versionOutput?: string | null, seccompMod?: any, platform?: string }} [opts]
+ */
+function checkRuncRuntime({ versionOutput = undefined, seccompMod = undefined, platform = process.platform } = {}) {
+  let mod = seccompMod;
+  if (mod === undefined) {
+    try { mod = require('./seccompProfileService'); } catch (e) { mod = null; }
+  }
+
+  /** @type {string | null} */
+  let rawOutput = versionOutput !== undefined ? versionOutput : null;
+  if (versionOutput === undefined) {
+    if (platform === 'win32') {
+      return {
+        id: 'runc_runtime',
+        name: 'Runtime OCI runc (CVE-2025-31133/52565/52881)',
+        status: /** @type {'ok'} */ ('ok'),
+        summary: 'Comprobación de runc omitida en Windows (aplica a hosts Linux Docker)',
+        detail: 'En servidores Linux de producción, Culkibo audita automáticamente runc frente a escapes de montaje CVE-2025-31133, CVE-2025-52565 y CVE-2025-52881.',
+        fixAction: null,
+        fixLabel: null,
+        metrics: { available: false, platform, status: 'SKIPPED', vulnerable: false, cves: [] }
+      };
+    }
+    try {
+      const { execFileSync } = require('child_process');
+      rawOutput = String(execFileSync('runc', ['--version'], {
+        encoding: 'utf8',
+        shell: false,
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'pipe']
+      }) || '').trim();
+    } catch (e) {
+      return {
+        id: 'runc_runtime',
+        name: 'Runtime OCI runc (CVE-2025-31133/52565/52881)',
+        status: /** @type {'ok'} */ ('ok'),
+        summary: 'Binario runc no detectado en el PATH del host',
+        detail: 'No se encontró `runc` localmente (modo ligero o contenedor remoto). Verifica `runc --version` (>= 1.2.8 / >= 1.3.3) en tus nodos Docker Linux.',
+        fixAction: null,
+        fixLabel: null,
+        metrics: { available: false, platform, status: 'UNAVAILABLE', vulnerable: false, cves: [] }
+      };
+    }
+  }
+
+  if (!mod || typeof mod.auditRuncVersion !== 'function') {
+    return {
+      id: 'runc_runtime',
+      name: 'Runtime OCI runc (CVE-2025-31133/52565/52881)',
+      status: /** @type {'ok'} */ ('ok'),
+      summary: 'Módulo seccompProfileService no disponible',
+      detail: 'No se pudo cargar la auditoría semver de runc.',
+      fixAction: null,
+      fixLabel: null,
+      metrics: { available: false, status: 'UNKNOWN', vulnerable: false, cves: [] }
+    };
+  }
+
+  const audit = mod.auditRuncVersion(rawOutput || '');
+  const isCritical = Boolean(audit && (audit.vulnerable === true || audit.status === 'CRITICAL'));
+  const verLabel = (audit && (audit.version || audit.parsedVersion)) ? String(audit.version || audit.parsedVersion) : 'desconocida';
+  const cves = Array.isArray(audit && audit.cves) ? audit.cves : [];
+
+  if (isCritical) {
+    return {
+      id: 'runc_runtime',
+      name: 'Runtime OCI runc (CVE-2025-31133/52565/52881)',
+      status: /** @type {'fail'} */ ('fail'),
+      summary: `CRITICAL: runc ${verLabel} vulnerable a escapes de contenedor (${cves.join(', ')})`,
+      detail: `Actualiza runc/containerd inmediatamente (${audit.fixedIn || '>= 1.2.8 / >= 1.3.3'}) y aplica perfiles seccomp restringidos sin io_uring/mount.`,
+      fixAction: null,
+      fixLabel: null,
+      metrics: { available: true, ...audit }
+    };
+  }
+
+  return {
+    id: 'runc_runtime',
+    name: 'Runtime OCI runc (CVE-2025-31133/52565/52881)',
+    status: /** @type {'ok'} */ ('ok'),
+    summary: audit && audit.status === 'PASS'
+      ? `runc ${verLabel} parcheado (sin CVE-2025-31133/52565/52881)`
+      : `runc detectado (${verLabel}) · versión sin coincidencia vulnerable`,
+    detail: 'Runtime OCI verificado frente a los escapes críticos de montaje de runc 2025.',
+    fixAction: null,
+    fixLabel: null,
+    metrics: { available: true, ...audit }
+  };
+}
+
+module.exports = { runDoctor, applyFix, checkDiskSpace, checkHostMemory, checkKeyFilePermissions, listOrphanedManagedContainers, checkCostAndFleet, auditExposedDatabases, checkRuncRuntime };
