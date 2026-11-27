@@ -18,10 +18,13 @@ import {
   Plus,
   Radio,
   RefreshCw,
+  Send,
   Server,
   ShieldAlert,
+  SlidersHorizontal,
   Trash2,
   Wrench,
+  X,
   XCircle,
   ZoomIn,
   ZoomOut,
@@ -32,6 +35,7 @@ import {
   type DoctorCheck,
   type ObservabilityHistoryPoint,
   type ObservabilitySnapshot,
+  type OtlpStatusResult,
   type SystemDoctorReport,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
@@ -404,6 +408,72 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [linkingDb, setLinkingDb] = useState(false);
   const topoDragRef = useRef<{ startX: number; startY: number; originX: number; originY: number; moved: boolean } | null>(null);
 
+  // Native Zero-Dep OTLP Exporter state
+  const [otlpStatus, setOtlpStatus] = useState<OtlpStatusResult | null>(null);
+  const [otlpDrawerOpen, setOtlpDrawerOpen] = useState(false);
+  const [otlpEnabled, setOtlpEnabled] = useState(false);
+  const [otlpEndpoint, setOtlpEndpoint] = useState('');
+  const [otlpServiceName, setOtlpServiceName] = useState('culkibo-control-plane');
+  const [otlpAuthHeader, setOtlpAuthHeader] = useState('');
+  const [otlpSaving, setOtlpSaving] = useState(false);
+  const [otlpFlushing, setOtlpFlushing] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    api.getOtlpStatus()
+      .then((st) => {
+        if (!active || !st) return;
+        setOtlpStatus(st);
+        setOtlpEnabled(Boolean(st.enabled));
+        setOtlpEndpoint(st.endpoint || '');
+        if (st.serviceName) setOtlpServiceName(st.serviceName);
+      })
+      .catch(() => {
+        // optional endpoint
+      });
+    return () => { active = false; };
+  }, []);
+
+  const handleSaveOtlp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setOtlpSaving(true);
+    try {
+      const payload: { enabled: boolean; endpoint: string; serviceName: string; headers?: Record<string, string> } = {
+        enabled: otlpEnabled,
+        endpoint: otlpEndpoint.trim(),
+        serviceName: otlpServiceName.trim() || 'culkibo-control-plane',
+      };
+      if (otlpAuthHeader.trim()) {
+        payload.headers = { Authorization: otlpAuthHeader.trim() };
+      }
+      const next = await api.updateOtlpConfig(payload);
+      setOtlpStatus(next);
+      setOtlpAuthHeader('');
+      onNotify(t('obs.otlpSaved'), 'success');
+    } catch (err: unknown) {
+      onNotify(err instanceof Error ? err.message : 'OTLP update failed', 'error');
+    } finally {
+      setOtlpSaving(false);
+    }
+  };
+
+  const handleFlushOtlp = async () => {
+    setOtlpFlushing(true);
+    try {
+      const res = await api.flushOtlp();
+      if (res.status) setOtlpStatus(res.status);
+      else {
+        const refreshed = await api.getOtlpStatus().catch(() => null);
+        if (refreshed) setOtlpStatus(refreshed);
+      }
+      onNotify(t('obs.otlpFlushed', { count: res.flushed ?? 0 }), 'info');
+    } catch (err: unknown) {
+      onNotify(err instanceof Error ? err.message : 'OTLP flush failed', 'error');
+    } finally {
+      setOtlpFlushing(false);
+    }
+  };
+
   const loadSnapshot = useCallback(async (fresh = false) => {
     try {
       const snap = await api.getObservabilitySnapshot(fresh);
@@ -579,7 +649,11 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
       const res = await apiFetch('/api/topology');
       if (res.ok) {
         const data = await res.json();
-        setTopology(data);
+        if (data && Array.isArray(data.nodes) && Array.isArray(data.edges)) {
+          setTopology(data);
+        } else {
+          setTopology(await buildFallbackTopology());
+        }
       } else {
         setTopology(await buildFallbackTopology());
       }
@@ -856,7 +930,8 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
 
   // Topology layout calculation (pure SVG coordinates for crisp 4-column architecture map)
   const topologyLayout = useMemo(() => {
-    if (!topology) return null;
+    if (!topology || !Array.isArray(topology.nodes)) return null;
+    const nodes = topology.nodes || [];
     const cols: Array<{ title: string; kinds: TopologyNode['kind'][]; x: number }> = [
       { title: 'Dominios y Uptime', kinds: ['domain', 'monitor'], x: 24 },
       { title: 'Proyectos', kinds: ['project'], x: 268 },
@@ -871,7 +946,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
     let maxColHeight = 160;
 
     for (const col of cols) {
-      const colNodes = topology.nodes.filter((n) => col.kinds.includes(n.kind));
+      const colNodes = nodes.filter((n) => col.kinds.includes(n.kind));
       colNodes.forEach((node, idx) => {
         const y = headerY + idx * (nodeH + gapY);
         positioned.set(node.id, { node, x: col.x, y });
@@ -891,17 +966,17 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   }, [topology]);
 
   const selectedNode = useMemo(
-    () => (topology && selectedNodeId ? topology.nodes.find((n) => n.id === selectedNodeId) || null : null),
+    () => (topology && Array.isArray(topology.nodes) && selectedNodeId ? topology.nodes.find((n) => n.id === selectedNodeId) || null : null),
     [topology, selectedNodeId]
   );
 
   const selectedEdges = useMemo(
-    () => (topology && selectedNodeId ? topology.edges.filter((e) => e.from === selectedNodeId || e.to === selectedNodeId) : []),
+    () => (topology && Array.isArray(topology.edges) && selectedNodeId ? topology.edges.filter((e) => e.from === selectedNodeId || e.to === selectedNodeId) : []),
     [topology, selectedNodeId]
   );
 
   const projectNodes = useMemo(
-    () => (topology ? topology.nodes.filter((n) => n.kind === 'project') : []),
+    () => (topology && Array.isArray(topology.nodes) ? topology.nodes.filter((n) => n.kind === 'project') : []),
     [topology]
   );
 
@@ -932,6 +1007,26 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
           <p className="text-sm text-slate-500 mt-1">{t('obs.subtitle')}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setOtlpDrawerOpen((v) => !v)}
+            title="Grafana Tempo / SigNoz / Honeycomb · 0 deps"
+            className={`culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer tabular-nums ${
+              otlpDrawerOpen
+                ? 'bg-slate-900 text-white border-slate-900'
+                : otlpStatus?.enabled
+                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${otlpStatus?.enabled ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+            <span>{otlpStatus?.enabled ? t('obs.otlpActive') : t('obs.otlpStandby')}</span>
+            <span className="font-mono text-[10px] opacity-75">
+              {otlpStatus?.bufferedSpans != null ? `· ${otlpStatus.bufferedSpans}s` : '· 0 deps'}
+            </span>
+            <SlidersHorizontal className="w-3 h-3 opacity-70" />
+          </button>
+
           <div className="inline-flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200 text-xs">
             {([
               { id: 'overview', label: t('obs.tabOverview'), icon: Activity },
@@ -961,6 +1056,106 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
           </div>
         </div>
       </div>
+
+      {/* Native Zero-Dep OTLP Exporter Inline Drawer */}
+      {otlpDrawerOpen && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-4 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-200">
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="text-sm font-semibold text-slate-900">{t('obs.otlpDrawerTitle')}</h2>
+                <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600">
+                  Grafana Tempo · SigNoz · Honeycomb
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('obs.otlpDrawerDesc')}</p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {otlpStatus && (
+                <span className="px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700 tabular-nums">
+                  buf {otlpStatus.bufferedSpans ?? 0}/{otlpStatus.maxBufferSize ?? 256} · sent {otlpStatus.totalExported ?? 0} · cb:{otlpStatus.circuitState || (otlpStatus.circuitOpen ? 'open' : 'closed')}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => setOtlpDrawerOpen(false)}
+                aria-label="Close OTLP config"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <form onSubmit={(e) => void handleSaveOtlp(e)} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+            <label className="sm:col-span-4 block">
+              <span className="font-medium text-slate-700 block mb-1">{t('obs.otlpEndpoint')}</span>
+              <input
+                type="url"
+                value={otlpEndpoint}
+                onChange={(e) => setOtlpEndpoint(e.target.value)}
+                placeholder="https://otlp.your-tempo.io:4318"
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="sm:col-span-3 block">
+              <span className="font-medium text-slate-700 block mb-1">{t('obs.otlpService')}</span>
+              <input
+                type="text"
+                value={otlpServiceName}
+                onChange={(e) => setOtlpServiceName(e.target.value)}
+                placeholder="culkibo-control-plane"
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="sm:col-span-3 block">
+              <span className="font-medium text-slate-700 block mb-1">{t('obs.otlpAuth')}</span>
+              <input
+                type="password"
+                value={otlpAuthHeader}
+                onChange={(e) => setOtlpAuthHeader(e.target.value)}
+                placeholder={otlpStatus?.hasAuthHeader ? '•••••••• (configured)' : 'Bearer …'}
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <div className="sm:col-span-2 flex items-center gap-2 pb-1.5">
+              <label className="inline-flex items-center gap-2 cursor-pointer font-medium text-slate-700 select-none">
+                <input
+                  type="checkbox"
+                  checked={otlpEnabled}
+                  onChange={(e) => setOtlpEnabled(e.target.checked)}
+                  className="rounded border-slate-300 accent-slate-900"
+                />
+                <span>{t('obs.otlpEnabled')}</span>
+              </label>
+            </div>
+            <div className="sm:col-span-12 flex items-center justify-between gap-2 flex-wrap pt-1">
+              <span className="text-[11px] font-mono text-slate-400">
+                W3C traceparent · gzip JSON · lowercase hex IDs · 0 @opentelemetry/* deps
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={otlpFlushing}
+                  onClick={() => void handleFlushOtlp()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {otlpFlushing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                  <span>{t('obs.otlpFlush')}</span>
+                </button>
+                <button
+                  type="submit"
+                  disabled={otlpSaving}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {otlpSaving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{t('obs.otlpSave')}</span>
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
+      )}
 
       {/* TAB 1: METRICS + DOCTOR */}
       {activeTab === 'overview' && (

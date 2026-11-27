@@ -92,6 +92,106 @@ function normalizeRepoSlug(raw) {
 }
 
 const SKIP_CI_RE = /\[(skip ci|ci skip|skip cd|cd skip|no ci|culkibo skip)\]/i;
+const WEBHOOK_MAX_REPLAY_AGE_SEC = 300;
+
+/**
+ * Redacta secretos, tokens de deploy hook y cabeceras de autorización de mensajes/errores de webhook
+ * sin filtrar jamás prefijos ni fragmentos de tokens (cura dokploy#4898).
+ *
+ * @param {any} input
+ * @param {string[]} [extraSecrets]
+ * @returns {string}
+ */
+function redactWebhookSecrets(input, extraSecrets = []) {
+  let out = String(input == null ? '' : input);
+  if (!out) return '';
+  for (const raw of extraSecrets) {
+    if (typeof raw === 'string' && raw.length >= 6) {
+      out = out.split(raw).join('[REDACTED]');
+    }
+  }
+  out = out
+    .replace(/\b(?:ckh|cks|ckt|ckp|whsec|ghp|gho|ghu|ghs|ghr|glpat|sk_live|sk_test|pk_live|xox[baprs])_[A-Za-z0-9._-]{4,}\b/gi, '[REDACTED]')
+    .replace(/\b(?:glpat|github_pat|npm)-[A-Za-z0-9._-]{6,}\b/gi, '[REDACTED]')
+    .replace(/(Authorization\s*:\s*Bearer\s+)[^\s'",;]+/gi, '$1[REDACTED]')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]')
+    .replace(/((?:token|secret|password|x-gitlab-token|x-deploy-token)\s*[:=]\s*)['"]?[^\s'",;&}]+['"]?/gi, '$1[REDACTED]');
+  return out;
+}
+
+/**
+ * Valida la ventana opcional de marca temporal anti-replay (`<= 300 s`) en webhooks.
+ * - Si no viene cabecera ni campo `timestamp`, devuelve `{ valid: true, skipped: true }`
+ *   para mantener compatibilidad total con proveedores que no firman timestamps.
+ * - Si viene `x-webhook-timestamp` / `x-gitlab-event-timestamp` / `x-culkibo-timestamp` /
+ *   `body.timestamp`, rechaza cualquier entrega con desfase superior a `maxAgeSec` (por defecto 300 s)
+ *   con código `401 WEBHOOK_REPLAY_EXPIRED`.
+ *
+ * @param {any} reqOrHeaders
+ * @param {{ maxAgeSec?: number, nowMs?: number, body?: any }} [opts]
+ */
+function validateWebhookTimestamp(reqOrHeaders, opts = {}) {
+  const headers = reqOrHeaders && reqOrHeaders.headers ? reqOrHeaders.headers : (reqOrHeaders || {});
+  const body = opts.body !== undefined ? opts.body : (reqOrHeaders && reqOrHeaders.body ? reqOrHeaders.body : null);
+  const rawTs = headers['x-webhook-timestamp']
+    ?? headers['x-gitlab-event-timestamp']
+    ?? headers['x-culkibo-timestamp']
+    ?? headers['x-timestamp']
+    ?? (body && typeof body === 'object' ? body.timestamp : undefined);
+
+  if (rawTs === undefined || rawTs === null || String(rawTs).trim() === '') {
+    return { valid: true, skipped: true, status: 200, code: null, error: null, ageSec: 0 };
+  }
+
+  const maxAgeSec = Number.isFinite(Number(opts.maxAgeSec)) && Number(opts.maxAgeSec) > 0
+    ? Number(opts.maxAgeSec)
+    : WEBHOOK_MAX_REPLAY_AGE_SEC;
+  const nowMs = opts.nowMs != null && Number.isFinite(Number(opts.nowMs)) ? Number(opts.nowMs) : Date.now();
+
+  let tsMs = NaN;
+  const str = String(rawTs).trim();
+  if (/^\d+(?:\.\d+)?$/.test(str)) {
+    const num = Number(str);
+    // Unix segundos (<= 1e11) vs milisegundos (> 1e11)
+    tsMs = num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+  } else {
+    tsMs = Date.parse(str);
+  }
+
+  if (!Number.isFinite(tsMs) || tsMs <= 0) {
+    return {
+      valid: false,
+      skipped: false,
+      status: 401,
+      code: 'WEBHOOK_REPLAY_EXPIRED',
+      error: 'Marca temporal de webhook inválida o malformada',
+      ageSec: null
+    };
+  }
+
+  const driftMs = Math.abs(nowMs - tsMs);
+  const ageSec = Math.round(driftMs / 1000);
+  if (driftMs > maxAgeSec * 1000) {
+    return {
+      valid: false,
+      skipped: false,
+      status: 401,
+      code: 'WEBHOOK_REPLAY_EXPIRED',
+      error: `Webhook expirado o fuera de ventana anti-replay (${ageSec}s > ${maxAgeSec}s)`,
+      ageSec
+    };
+  }
+
+  return {
+    valid: true,
+    skipped: false,
+    status: 200,
+    code: null,
+    error: null,
+    timestampMs: tsMs,
+    ageSec
+  };
+}
 
 /** Convierte un patrón glob sencillo (`*`, `**`) a RegExp sin dependencias ni ReDoS. */
 function compileWatchGlob(pattern) {
@@ -171,7 +271,9 @@ async function dispatchPush({
   deliveryId = null,
   changedFiles = [],
   manifestYaml = null,
-  gitopsManager = null
+  gitopsManager = null,
+  awaitSync = false,
+  failOnDeployError = false
 }) {
   const shortSha = String(commitSha || `c_${Date.now().toString(36)}`).slice(0, 7);
   const now = new Date().toISOString();
@@ -279,14 +381,15 @@ async function dispatchPush({
     const repoName = target.gitRepo || target.name;
     containerOrchestrator.addLog('INFO', 'citadel', `[${label}:Webhook] Push recibido en ${repoName} (${branch}) por ${author}: "${String(commitMsg || '').trim()}" (${shortSha})`, new Date(), target.id);
 
-    /** @type {{ dispatched: boolean, queued: boolean, reason: string | null }} */
-    let pipeline = { dispatched: false, queued: false, reason: null };
+    /** @type {{ dispatched: boolean, queued: boolean, failed?: boolean, blocked?: boolean, code?: string | null, reason: string | null }} */
+    let pipeline = { dispatched: false, queued: false, failed: false, blocked: false, code: null, reason: null };
+    const projectSecrets = [target.webhookSecret, target.deployHookToken].filter(Boolean);
     if (target.autoDeploy === false) {
       pipeline.reason = 'autoDeploy deshabilitado (solo GitOps ejecutado)';
     } else if (!target.gitRepo) {
       pipeline.reason = 'El proyecto no tiene repositorio configurado';
     } else if (!dockerProbe.available) {
-      pipeline.reason = dockerProbe.reason;
+      pipeline.reason = redactWebhookSecrets(dockerProbe.reason, projectSecrets);
     } else {
       containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Iniciando despliegue automatizado para ${target.name}...`, new Date(), target.id);
       try {
@@ -295,14 +398,58 @@ async function dispatchPush({
           version: `${provider.slice(0, 2)}-${shortSha}`,
           trigger: 'webhook'
         });
-        pipeline = { dispatched: started.started, queued: started.queued, reason: null };
+        if (started && started.blocked) {
+          pipeline = {
+            dispatched: false,
+            queued: false,
+            failed: true,
+            blocked: true,
+            code: started.code || 'DEPLOY_FROZEN',
+            reason: redactWebhookSecrets(started.reason || 'Despliegue bloqueado por ventana de congelación', projectSecrets)
+          };
+        } else if (awaitSync && started && started.promise) {
+          try {
+            const depResult = await started.promise;
+            const depFailed = !depResult || depResult.status === 'fallido' || depResult.ok === false;
+            pipeline = {
+              dispatched: !depFailed,
+              queued: false,
+              failed: depFailed,
+              blocked: false,
+              code: depFailed ? 'DEPLOY_FAILED' : null,
+              reason: depFailed ? redactWebhookSecrets(depResult?.error || 'El despliegue síncrono falló', projectSecrets) : null
+            };
+          } catch (syncErr) {
+            /** @type {any} */
+            const se = syncErr;
+            pipeline = {
+              dispatched: false,
+              queued: false,
+              failed: true,
+              blocked: false,
+              code: (se && se.code) || 'DEPLOY_FAILED',
+              reason: redactWebhookSecrets((se && se.message) || String(syncErr), projectSecrets)
+            };
+          }
+        } else {
+          pipeline = { dispatched: Boolean(started.started), queued: Boolean(started.queued), failed: false, blocked: false, code: null, reason: null };
+        }
       } catch (err) {
-        pipeline.reason = err.message;
+        /** @type {any} */
+        const e = err;
+        pipeline = {
+          dispatched: false,
+          queued: false,
+          failed: true,
+          blocked: false,
+          code: (e && e.code) || 'DEPLOY_FAILED',
+          reason: redactWebhookSecrets((e && e.message) || String(err), projectSecrets)
+        };
       }
     }
 
     if (pipeline.reason && target.autoDeploy !== false) {
-      containerOrchestrator.addLog('WARN', 'citadel', `[Citadel:Deploy] No se lanza la construcción de imagen: ${pipeline.reason}.`, new Date(), target.id);
+      containerOrchestrator.addLog('WARN', 'citadel', `[Citadel:Deploy] No se lanza la construcción de imagen: ${redactWebhookSecrets(pipeline.reason, projectSecrets)}.`, new Date(), target.id);
     } else if (pipeline.queued) {
       containerOrchestrator.addLog('INFO', 'citadel', `[Citadel:Deploy] Ya hay un despliegue en curso; ${shortSha} queda en cola y se construirá al terminar.`, new Date(), target.id);
     }
@@ -330,19 +477,22 @@ async function dispatchPush({
     });
 
     containerOrchestrator.addLog(
-      'SUCCESS',
+      pipeline.failed ? 'ERROR' : 'SUCCESS',
       'citadel',
-      pipeline.dispatched || pipeline.queued
-        ? `[${label}:Webhook] Despliegue en curso para ${target.name} (${shortSha}); sigue el progreso en la pestaña Despliegues.`
-        : `[${label}:Webhook] Push procesado para ${target.name} (${shortSha})`,
+      pipeline.failed
+        ? `[${label}:Webhook] Despliegue fallido para ${target.name} (${shortSha}): ${redactWebhookSecrets(pipeline.reason || 'error desconocido', projectSecrets)}`
+        : (pipeline.dispatched || pipeline.queued
+          ? `[${label}:Webhook] Despliegue en curso para ${target.name} (${shortSha}); sigue el progreso en la pestaña Despliegues.`
+          : `[${label}:Webhook] Push procesado para ${target.name} (${shortSha})`),
       new Date(),
       target.id
     );
 
     dispatched.push({
       projectId: target.id,
-      pipeline: pipeline.dispatched ? 'building' : pipeline.queued ? 'queued' : 'registro',
+      pipeline: pipeline.failed ? 'failed' : (pipeline.dispatched ? 'building' : pipeline.queued ? 'queued' : 'registro'),
       pipelineReason: pipeline.reason,
+      ...(pipeline.code ? { code: pipeline.code } : {}),
       ...(gitopsResult ? { gitops: gitopsResult } : {})
     });
   }
@@ -362,6 +512,27 @@ async function dispatchPush({
   }
 
   const primary = dispatched[0];
+  const anyFailed = dispatched.some((d) => d.pipeline === 'failed');
+  if (anyFailed && (awaitSync || failOnDeployError)) {
+    const failedEntry = dispatched.find((d) => d.pipeline === 'failed') || primary;
+    const isFrozen = failedEntry && failedEntry.code === 'DEPLOY_FROZEN';
+    return {
+      status: isFrozen ? 423 : 502,
+      body: {
+        success: false,
+        deployed: false,
+        code: (failedEntry && failedEntry.code) || 'DEPLOY_FAILED',
+        error: redactWebhookSecrets((failedEntry && failedEntry.pipelineReason) || 'El despliegue disparado por webhook falló'),
+        provider,
+        projectId: primary.projectId,
+        matchedProjects: dispatched.length,
+        dispatched,
+        branch,
+        commit: shortSha
+      }
+    };
+  }
+
   return {
     status: 200,
     body: {
@@ -456,18 +627,40 @@ async function dispatchPullRequest({
           const res = await pm.deployPreview(project, { prNumber, branch, commit: commitSha, isFork });
           results.push({ projectId: project.id, action: 'preview_deployed', preview: res });
         } catch (e) {
-          results.push({ projectId: project.id, action: 'preview_error', error: e.message });
+          results.push({
+            projectId: project.id,
+            action: 'preview_error',
+            error: redactWebhookSecrets(e && e.message ? e.message : String(e), [project.webhookSecret, project.deployHookToken].filter(Boolean))
+          });
         }
       } else {
         queuedCount++;
         Promise.resolve()
           .then(() => pm.deployPreview(project, { prNumber, branch, commit: commitSha, isFork }))
           .catch((e) => {
-            containerOrchestrator.addLog('WARN', 'citadel', `[${provider}:Preview] Error desplegando preview PR #${prNumber}: ${e && e.message ? e.message : String(e)}`, new Date(), project.id);
+            containerOrchestrator.addLog('WARN', 'citadel', `[${provider}:Preview] Error desplegando preview PR #${prNumber}: ${redactWebhookSecrets(e && e.message ? e.message : String(e), [project.webhookSecret, project.deployHookToken].filter(Boolean))}`, new Date(), project.id);
           });
         results.push({ projectId: project.id, action: 'preview_queued', async: true, prNumber, branch });
       }
     }
+  }
+
+  const allPreviewErrored = Boolean(awaitCompletion && results.length > 0 && results.every((r) => r.action === 'preview_error'));
+  if (allPreviewErrored) {
+    return {
+      status: 502,
+      body: {
+        success: false,
+        code: 'PREVIEW_DEPLOY_FAILED',
+        error: results[0].error || 'El despliegue de vista previa falló',
+        provider,
+        event: 'pull_request',
+        prNumber,
+        branch,
+        queued: 0,
+        results
+      }
+    };
   }
 
   return {
@@ -511,6 +704,11 @@ async function handleGitLabWebhook(req) {
   const authorized = matched.filter((p) => p.webhookSecret && timingSafeStrEqual(p.webhookSecret, token));
   if (authorized.length === 0) {
     return { status: 401, body: { error: 'X-Gitlab-Token ausente o inválido para los proyectos coincidentes' } };
+  }
+
+  const tsCheck = validateWebhookTimestamp(req);
+  if (!tsCheck.valid) {
+    return { status: 401, body: { success: false, code: tsCheck.code, error: tsCheck.error } };
   }
 
   if (event === 'Merge Request Hook' || body.object_kind === 'merge_request') {
@@ -581,6 +779,11 @@ async function handleGiteaWebhook(req) {
     return { status: 401, body: { error: 'Firma HMAC de Gitea/Forgejo ausente o inválida' } };
   }
 
+  const tsCheck = validateWebhookTimestamp(req);
+  if (!tsCheck.valid) {
+    return { status: 401, body: { success: false, code: tsCheck.code, error: tsCheck.error } };
+  }
+
   if (event === 'pull_request' && body.pull_request) {
     const pr = body.pull_request;
     const headFull = String(pr.head?.repo?.full_name || '').trim().toLowerCase();
@@ -640,6 +843,11 @@ async function handleBitbucketWebhook(req) {
   const authorized = matched.filter((p) => p.webhookSecret && verifyHmacSha256(rawBody, p.webhookSecret, sig));
   if (authorized.length === 0) {
     return { status: 401, body: { error: 'Firma HMAC de Bitbucket ausente o inválida' } };
+  }
+
+  const tsCheck = validateWebhookTimestamp(req);
+  if (!tsCheck.valid) {
+    return { status: 401, body: { success: false, code: tsCheck.code, error: tsCheck.error } };
   }
 
   if (event === 'repo:push') {
@@ -720,16 +928,119 @@ async function handleDeployHook(req) {
     return { status: 401, body: { error: 'Token de Deploy Hook inválido' } };
   }
 
+  const tsCheck = validateWebhookTimestamp(req);
+  if (!tsCheck.valid) {
+    return { status: 401, body: { success: false, code: tsCheck.code, error: tsCheck.error } };
+  }
+
+  const projectSecrets = [project.deployHookToken, project.webhookSecret].filter(Boolean);
   const dockerProbe = await deployManager.detectDocker({ force: true });
   if (!dockerProbe.available) {
-    return { status: 503, body: { error: `Docker no está disponible: ${dockerProbe.reason}` } };
+    return {
+      status: 503,
+      body: {
+        success: false,
+        deployed: false,
+        code: 'DOCKER_UNAVAILABLE',
+        error: redactWebhookSecrets(`Docker no está disponible: ${dockerProbe.reason}`, projectSecrets)
+      }
+    };
   }
 
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const commit = body.commit && /^[0-9a-f]{7,40}$/i.test(String(body.commit)) ? String(body.commit) : null;
   const version = body.version ? String(body.version).slice(0, 48) : (commit ? `hook-${commit.slice(0, 7)}` : null);
-  const queued = deployManager.enqueue(project, { commit, version, trigger: 'deploy_hook' });
+  const awaitSync = Boolean(body.sync || body.wait || req.query?.sync === '1' || req.query?.sync === 'true');
+
+  /** @type {any} */
+  let queued;
+  try {
+    queued = deployManager.enqueue(project, { commit, version, trigger: 'deploy_hook' });
+  } catch (err) {
+    /** @type {any} */
+    const e = err;
+    const safeErr = redactWebhookSecrets((e && e.message) || String(err), projectSecrets);
+    containerOrchestrator.addLog('ERROR', 'citadel', `[DeployHook] Error lanzando despliegue para ${project.name}: ${safeErr}`, new Date(), project.id);
+    const errStatus = (e && Number.isInteger(e.status) && e.status >= 400 && e.status < 600) ? e.status : 500;
+    return {
+      status: errStatus,
+      body: {
+        success: false,
+        deployed: false,
+        code: (e && e.code) || 'DEPLOY_FAILED',
+        projectId: project.id,
+        error: safeErr
+      }
+    };
+  }
+
+  if (queued && queued.blocked) {
+    const safeReason = redactWebhookSecrets(queued.reason || 'Despliegue bloqueado por ventana de congelación', projectSecrets);
+    return {
+      status: 423,
+      body: {
+        success: false,
+        deployed: false,
+        blocked: true,
+        code: queued.code || 'DEPLOY_FROZEN',
+        projectId: project.id,
+        error: safeReason,
+        window: queued.window || null
+      }
+    };
+  }
+
+  if (awaitSync && queued && queued.promise) {
+    try {
+      const depResult = await queued.promise;
+      if (!depResult || depResult.status === 'fallido' || depResult.ok === false) {
+        const safeErr = redactWebhookSecrets(depResult?.error || 'El despliegue síncrono falló', projectSecrets);
+        containerOrchestrator.addLog('ERROR', 'citadel', `[DeployHook] Despliegue síncrono fallido para ${project.name}: ${safeErr}`, new Date(), project.id);
+        return {
+          status: 502,
+          body: {
+            success: false,
+            deployed: false,
+            code: 'DEPLOY_FAILED',
+            projectId: project.id,
+            trigger: 'deploy_hook',
+            error: safeErr
+          }
+        };
+      }
+      containerOrchestrator.addLog('INFO', 'citadel', `[DeployHook] Despliegue síncrono completado para ${project.name}`, new Date(), project.id);
+      return {
+        status: 200,
+        body: {
+          success: true,
+          deployed: true,
+          projectId: project.id,
+          trigger: 'deploy_hook',
+          deploymentId: depResult.id || depResult.deploymentId || null,
+          status: depResult.status || 'activo'
+        }
+      };
+    } catch (syncErr) {
+      /** @type {any} */
+      const se = syncErr;
+      const safeErr = redactWebhookSecrets((se && se.message) || String(syncErr), projectSecrets);
+      containerOrchestrator.addLog('ERROR', 'citadel', `[DeployHook] Excepción en despliegue síncrono para ${project.name}: ${safeErr}`, new Date(), project.id);
+      return {
+        status: 502,
+        body: {
+          success: false,
+          deployed: false,
+          code: (se && se.code) || 'DEPLOY_FAILED',
+          projectId: project.id,
+          trigger: 'deploy_hook',
+          error: safeErr
+        }
+      };
+    }
+  }
+
   containerOrchestrator.addLog('INFO', 'citadel', `[DeployHook] Despliegue disparado por webhook CI/CD para ${project.name}`, new Date(), project.id);
+  const { promise: _ignoredPromise, ...safeQueued } = queued || {};
 
   return {
     status: 202,
@@ -737,7 +1048,7 @@ async function handleDeployHook(req) {
       success: true,
       projectId: project.id,
       trigger: 'deploy_hook',
-      ...queued
+      ...safeQueued
     }
   };
 }
@@ -758,8 +1069,11 @@ async function rotateDeployHookToken(projectId) {
 }
 
 module.exports = {
+  WEBHOOK_MAX_REPLAY_AGE_SEC,
   timingSafeStrEqual,
   verifyHmacSha256,
+  validateWebhookTimestamp,
+  redactWebhookSecrets,
   normalizeRepoSlug,
   matchesWatchPaths,
   didChangeGitOpsManifest,

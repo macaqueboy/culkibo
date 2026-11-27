@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
-import { Keyboard, X, CheckCircle2, AlertCircle, Info } from 'lucide-react';
+import { Keyboard, X, CheckCircle2, AlertCircle, Info, Sparkles, ExternalLink } from 'lucide-react';
 import { Header, type AppView, type DaemonHeaderStats } from './components/Header';
 import { ProjectList } from './components/ProjectList';
 import { AuthGate } from './components/AuthGate';
@@ -7,6 +7,7 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { CommandPalette } from './components/CommandPalette';
 import { ShortcutsModal } from './components/ShortcutsModal';
 import { api, clearAuthToken, getAuthToken, setUnauthorizedHandler, type Project } from './lib/api';
+import { isDemoMode } from './lib/demoMode';
 import { deployStream } from './lib/deployStream';
 import { liveEvents } from './lib/liveEvents';
 import { setTelemetryCurrentView } from './lib/clientTelemetry';
@@ -130,11 +131,13 @@ const ViewFallback = () => (
 
 export function App() {
   const { t, locale } = useI18n();
+  const demoActive = isDemoMode();
   const initialRoute = parseHashRoute();
-  const [authChecked, setAuthChecked] = useState(false);
-  const [authenticated, setAuthenticated] = useState(false);
+  const [authChecked, setAuthChecked] = useState(demoActive);
+  const [authenticated, setAuthenticated] = useState(demoActive);
   const [sessionOffline, setSessionOffline] = useState(false);
   const [tokenSource, setTokenSource] = useState('data/auth.json');
+  const [demoRibbonDismissed, setDemoRibbonDismissed] = useState(false);
 
   const [activeView, setActiveView] = useState<AppView>(initialRoute.view);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(initialRoute.projectId);
@@ -156,7 +159,7 @@ export function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [checklistRestoreTick, setChecklistRestoreTick] = useState(0);
 
-  const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [wsConnected, setWsConnected] = useState<boolean>(demoActive);
   const [daemonStats, setDaemonStats] = useState<DaemonHeaderStats | null>(null);
   const [deployStates, setDeployStates] = useState<Record<string, FaviconState>>({});
   const [toasts, setToasts] = useState<Array<{ id: number; msg: string; kind: ToastKind }>>([]);
@@ -204,6 +207,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (demoActive) return;
     let active = true;
     api.getAuthSession()
       .then((s) => {
@@ -227,7 +231,7 @@ export function App() {
       active = false;
       setUnauthorizedHandler(null);
     };
-  }, []);
+  }, [demoActive]);
 
   // Telemetría ligera del daemon (RAM RSS + RTT real) sin polling agresivo
   useEffect(() => {
@@ -430,7 +434,7 @@ export function App() {
   }, [authenticated]);
 
   useEffect(() => {
-    if (!authenticated) return;
+    if (!authenticated || demoActive) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.port === '5173' ? '127.0.0.1:3030' : window.location.host;
     const wsUrl = `${protocol}//${host}/ws`;
@@ -581,7 +585,7 @@ export function App() {
         wsRef.current = null;
       }
     };
-  }, [authenticated, fetchProjects, showToast]);
+  }, [authenticated, demoActive, fetchProjects, showToast]);
 
   const navigate = useCallback((rawView: AppView | 'logs', subTab?: string | null) => {
     const view: AppView = rawView === 'logs' ? 'global_logs' : rawView;
@@ -741,6 +745,47 @@ export function App() {
         </div>
       )}
 
+      {demoActive && !demoRibbonDismissed && (
+        <div
+          role="region"
+          aria-label="Interactive Sandbox Banner"
+          className="border-b border-zinc-800 px-3.5 sm:px-6 py-2 text-xs"
+          style={{ backgroundColor: '#0c0c0f', color: '#f4f4f5', borderBottomColor: '#27272a' }}
+        >
+          <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="inline-flex items-center justify-center w-5 h-5 rounded-md bg-amber-500/15 text-amber-400 shrink-0">
+                <Sparkles className="w-3 h-3" />
+              </span>
+              <span className="truncate font-medium" style={{ color: '#e4e4e7' }}>
+                {t('demo.ribbonLabel')}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <a
+                href="https://github.com/macaqueboy/culkibo#quick-start"
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors whitespace-nowrap"
+                style={{ backgroundColor: '#f4f4f5', color: '#09090b' }}
+              >
+                <span>{t('demo.deployCta')}</span>
+                <ExternalLink className="w-3 h-3" />
+              </a>
+              <button
+                type="button"
+                onClick={() => setDemoRibbonDismissed(true)}
+                aria-label={t('demo.dismiss')}
+                className="inline-flex items-center justify-center w-7 h-7 rounded-md hover:bg-zinc-800 transition-colors cursor-pointer"
+                style={{ color: '#a1a1aa' }}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <Header
         activeView={activeView}
         setActiveView={navigate}
@@ -880,7 +925,7 @@ export function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-2">
           <div className="flex items-center gap-2 flex-wrap justify-center sm:justify-start">
             <span className="font-semibold text-slate-800">
-              Culkibo v{daemonStats?.version || '1.1.0'}
+              Culkibo v{daemonStats?.version || '1.2.0'}
             </span>
             <span className="text-slate-300">·</span>
             <span>Apache-2.0</span>

@@ -85,6 +85,64 @@ const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
 const DATA_DIR = path.join(ROOT_BASE_DIR, 'data');
 const TMP_ENV_DIR = path.join(DATA_DIR, '.tmp');
 
+/** Etiqueta que protege contenedores dormidos/críticos de cualquier poda agresiva (coolify#10996/#12542, kamal#1655). */
+const PROTECTED_CONTAINER_LABEL = 'culkibo.protected';
+/** Tope seguro para `--keep-storage` de BuildKit para evitar crecimiento descontrolado (>20 GB). */
+const MAX_BUILDKIT_KEEP_STORAGE_GB = 20;
+/** TTL por defecto de un bloqueo de despliegue antes de considerarse huérfano/bloqueado (Dokploy BullMQ deadlock). */
+const DEPLOY_LOCK_DEFAULT_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * Comprueba de forma portable si un PID sigue vivo en el sistema operativo.
+ * `EPERM` significa que el proceso existe pero pertenece a otro usuario; `ESRCH` significa muerto.
+ * @param {number} pid
+ * @returns {boolean}
+ */
+function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    /** @type {any} */
+    const e = err;
+    if (e && e.code === 'EPERM') return true;
+    return false;
+  }
+}
+
+/**
+ * Construye argumentos seguros de poda Docker (`container` | `image` | `builder`),
+ * excluyendo siempre `label!=culkibo.protected=1` y acotando `--keep-storage` de BuildKit.
+ * @param {'container' | 'image' | 'builder'} [kind]
+ * @param {{ projectId?: string | null, keepStorageGb?: number, untilHours?: number | null }} [opts]
+ * @returns {string[]}
+ */
+function buildSafePruneArgs(kind = 'container', opts = {}) {
+  if (kind === 'builder') {
+    const rawGb = opts.keepStorageGb != null ? Number(opts.keepStorageGb) : 10;
+    const boundedGb = Math.min(Math.max(0, Math.round(Number.isFinite(rawGb) ? rawGb : 10)), MAX_BUILDKIT_KEEP_STORAGE_GB);
+    const args = ['builder', 'prune', '--force', '--keep-storage', `${boundedGb}GB`];
+    if (opts.untilHours != null && Number.isFinite(Number(opts.untilHours)) && Number(opts.untilHours) > 0) {
+      args.push('--filter', `until=${Math.min(8760, Math.round(Number(opts.untilHours)))}h`);
+    }
+    return args;
+  }
+  if (kind === 'image') {
+    const args = ['image', 'prune', '-f', '--filter', `label!=${PROTECTED_CONTAINER_LABEL}=1`];
+    if (opts.projectId) {
+      args.push('--filter', `label=com.culkibo.project_id=${String(opts.projectId)}`);
+    }
+    return args;
+  }
+  const args = ['container', 'prune', '-f', '--filter', `label!=${PROTECTED_CONTAINER_LABEL}=1`];
+  if (opts.untilHours != null && Number.isFinite(Number(opts.untilHours)) && Number(opts.untilHours) > 0) {
+    args.push('--filter', `until=${Math.min(8760, Math.round(Number(opts.untilHours)))}h`);
+  }
+  return args;
+}
+
 /** Variables del host que un proyecto jamás puede sobreescribir al invocar herramientas del host. */
 const HOST_HIJACK_ENV_BLOCKLIST = new Set([
   'PATH', 'PATHEXT', 'COMSPEC', 'SYSTEMROOT', 'WINDIR',
@@ -941,6 +999,12 @@ class DeployManager extends EventEmitter {
     super();
     /** projectId -> Promise, para serializar despliegues del mismo proyecto. */
     this.locks = new Map();
+    /** Metadatos de bloqueo (PID propietario + TTL) para auto-recuperar deadlocks tras crash/OOM. */
+    /** @type {Map<string, { projectId: string, ownerId: string, pid: number, acquiredAt: number, expiresAt: number, ttlMs: number }>} */
+    this._lockMeta = new Map();
+    /** Directorio opcional de lockfiles en disco (aislable en pruebas). */
+    /** @type {string | null} */
+    this._lockDir = null;
     /**
      * projectId -> { project, options } pendiente de lanzar cuando termine el
      * despliegue en curso. Una sola plaza y gana el último: si llegan tres
@@ -2926,7 +2990,8 @@ class DeployManager extends EventEmitter {
   /**
    * @param {{containerName: string, imageTag: string, hostPort: number, containerPort: number,
    *   envNames?: string[], envFile?: string | null, network?: string | null, memoryMb?: number, cpus?: string | number,
-   *   pidsLimit?: number, healthCmd?: string | null, healthStartPeriodSec?: number, healthRetries?: number, labels?: Record<string, any>}} spec
+   *   pidsLimit?: number, healthCmd?: string | null, healthStartPeriodSec?: number, healthRetries?: number,
+   *   labels?: Record<string, any>, protectedContainer?: boolean, sleeping?: boolean}} spec
    * @returns {string[]}
    */
   runArgs({
@@ -2943,7 +3008,9 @@ class DeployManager extends EventEmitter {
     healthCmd = null,
     healthStartPeriodSec = DEFAULTS.healthStartPeriodSec,
     healthRetries = DEFAULTS.healthRetries,
-    labels = {}
+    labels = {},
+    protectedContainer = false,
+    sleeping = false
   }) {
     const args = [
       'run', '-d',
@@ -2992,7 +3059,16 @@ class DeployManager extends EventEmitter {
       );
     }
 
-    for (const [key, value] of Object.entries(labels)) {
+    /** @type {Record<string, any>} */
+    const effectiveLabels = { ...(labels || {}) };
+    if (protectedContainer || sleeping) {
+      effectiveLabels[PROTECTED_CONTAINER_LABEL] = '1';
+    }
+    if (sleeping) {
+      effectiveLabels['culkibo.sleeping'] = '1';
+    }
+
+    for (const [key, value] of Object.entries(effectiveLabels)) {
       if (/^[a-z0-9.\-_]+$/i.test(key)) args.push('--label', `${key}=${String(value).slice(0, 200)}`);
     }
 
@@ -3913,17 +3989,198 @@ class DeployManager extends EventEmitter {
       });
     }
 
+    const reapCheck = this.reapStaleDeployLock(project.id);
     const inFlight = this.locks.get(project.id);
-    if (inFlight) {
+    if (inFlight && !reapCheck.reaped) {
       throw new Error('Ya hay un despliegue en curso para este proyecto');
     }
+    const lockOwner = `dep_${crypto.randomBytes(6).toString('hex')}`;
+    const lockNow = Date.now();
+    const lockTtlMs = sanitizeBoundedInt(options.lockTtlMs, DEPLOY_LOCK_DEFAULT_TTL_MS, 5000, 24 * 60 * 60 * 1000);
     const deployOpts = freezeOverrideMeta ? { ...options, _freezeOverride: freezeOverrideMeta } : options;
     const task = this._deploy(project, deployOpts).finally(() => {
-      if (this.locks.get(project.id) === task) this.locks.delete(project.id);
+      if (this.locks.get(project.id) === task) {
+        this.locks.delete(project.id);
+        this._lockMeta.delete(project.id);
+      }
       this.drainPending(project.id);
     });
     this.locks.set(project.id, task);
+    this._lockMeta.set(project.id, {
+      projectId: project.id,
+      ownerId: lockOwner,
+      pid: process.pid,
+      acquiredAt: lockNow,
+      expiresAt: lockNow + lockTtlMs,
+      ttlMs: lockTtlMs
+    });
     return task;
+  }
+
+  /**
+   * Resuelve la ruta del archivo de lock para un proyecto dentro de un directorio dado.
+   * @param {string} projectId
+   * @param {string | null} [lockDir]
+   * @returns {string | null}
+   */
+  _resolveLockFile(projectId, lockDir = null) {
+    const dir = lockDir || this._lockDir || null;
+    if (!dir) return null;
+    const slug = safeSlug(projectId);
+    return path.join(path.resolve(dir), `${slug}.lock.json`);
+  }
+
+  /**
+   * Detecta y libera automáticamente bloqueos de despliegue obsoletos por PID muerto
+   * (`process.kill(pid, 0)` → `ESRCH`) o TTL vencido (cura deadlocks tras OOM/crash tipo Dokploy BullMQ).
+   *
+   * @param {string} projectId
+   * @param {{ nowMs?: number, lockDir?: string | null, isPidAlive?: (pid: number) => boolean }} [opts]
+   */
+  reapStaleDeployLock(projectId, opts = {}) {
+    if (!projectId || typeof projectId !== 'string') {
+      return { reaped: false, active: false, reason: null, staleLock: null, lock: null };
+    }
+    const nowMs = opts.nowMs != null ? Number(opts.nowMs) : Date.now();
+    const checkPid = typeof opts.isPidAlive === 'function' ? opts.isPidAlive : isPidAlive;
+    const lockFile = this._resolveLockFile(projectId, opts.lockDir);
+
+    /** @type {any} */
+    let meta = this._lockMeta.get(projectId) || null;
+    let fromDisk = false;
+    if (!meta && lockFile && fs.existsSync(lockFile)) {
+      try {
+        meta = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+        fromDisk = true;
+      } catch (e) {
+        try { fs.unlinkSync(lockFile); } catch (_) {}
+        return { reaped: true, active: false, reason: 'corrupt_lockfile', staleLock: null, lock: null };
+      }
+    }
+
+    if (!meta) {
+      return { reaped: false, active: this.locks.has(projectId), reason: null, staleLock: null, lock: null };
+    }
+
+    /** @type {'dead_pid' | 'ttl_expired' | null} */
+    let staleReason = null;
+    if (Number.isInteger(Number(meta.pid)) && Number(meta.pid) > 0 && !checkPid(Number(meta.pid))) {
+      staleReason = 'dead_pid';
+    } else if (meta.expiresAt != null && Number.isFinite(Number(meta.expiresAt)) && nowMs >= Number(meta.expiresAt)) {
+      staleReason = 'ttl_expired';
+    }
+
+    if (staleReason) {
+      this._lockMeta.delete(projectId);
+      this.locks.delete(projectId);
+      if (lockFile && fs.existsSync(lockFile)) {
+        try { fs.unlinkSync(lockFile); } catch (e) {}
+      }
+      this.emit('stale_lock_reaped', {
+        projectId,
+        reason: staleReason,
+        fromDisk,
+        staleLock: meta,
+        reapedAt: new Date(nowMs).toISOString()
+      });
+      return { reaped: true, active: false, reason: staleReason, staleLock: meta, lock: null };
+    }
+
+    return { reaped: false, active: true, reason: null, staleLock: null, lock: meta };
+  }
+
+  /**
+   * Adquiere el bloqueo de despliegue por proyecto con auto-recuperación previa de locks huérfanos.
+   *
+   * @param {string} projectId
+   * @param {{
+   *   ownerId?: string,
+   *   pid?: number,
+   *   ttlMs?: number,
+   *   nowMs?: number,
+   *   lockDir?: string | null,
+   *   persistLock?: boolean,
+   *   task?: any,
+   *   isPidAlive?: (pid: number) => boolean
+   * }} [opts]
+   */
+  acquireDeployLock(projectId, opts = {}) {
+    if (!projectId || typeof projectId !== 'string') throw new Error('Proyecto inválido');
+    const nowMs = opts.nowMs != null ? Number(opts.nowMs) : Date.now();
+    const ttlMs = sanitizeBoundedInt(opts.ttlMs, DEPLOY_LOCK_DEFAULT_TTL_MS, 1000, 24 * 60 * 60 * 1000);
+    const reap = this.reapStaleDeployLock(projectId, {
+      nowMs,
+      lockDir: opts.lockDir,
+      isPidAlive: opts.isPidAlive
+    });
+
+    if (reap.active || this.locks.has(projectId)) {
+      /** @type {any} */
+      const err = new Error('Ya hay un despliegue en curso para este proyecto');
+      err.code = 'DEPLOY_LOCKED';
+      err.status = 409;
+      err.lock = reap.lock || this._lockMeta.get(projectId) || null;
+      throw err;
+    }
+
+    const ownerId = String(opts.ownerId || `lk_${crypto.randomBytes(8).toString('hex')}`);
+    const pid = Number.isInteger(Number(opts.pid)) && Number(opts.pid) > 0 ? Number(opts.pid) : process.pid;
+    const record = {
+      projectId,
+      ownerId,
+      pid,
+      acquiredAt: nowMs,
+      expiresAt: nowMs + ttlMs,
+      ttlMs
+    };
+    this._lockMeta.set(projectId, record);
+    this.locks.set(projectId, opts.task || { ownerId, pid, acquiredAt: nowMs });
+
+    const lockFile = this._resolveLockFile(projectId, opts.lockDir);
+    if (lockFile && (opts.lockDir || opts.persistLock || this._lockDir)) {
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      atomicWriteJsonSync(lockFile, record);
+    }
+
+    return {
+      acquired: true,
+      ownerId,
+      pid,
+      acquiredAt: nowMs,
+      expiresAt: record.expiresAt,
+      reapedStale: Boolean(reap.reaped),
+      reapedReason: reap.reason || null
+    };
+  }
+
+  /**
+   * Libera el bloqueo de despliegue de un proyecto (verificando `ownerId` si se aporta).
+   * @param {string} projectId
+   * @param {string | null} [ownerId]
+   * @param {{ lockDir?: string | null }} [opts]
+   */
+  releaseDeployLock(projectId, ownerId = null, opts = {}) {
+    const current = this._lockMeta.get(projectId);
+    if (ownerId && current && current.ownerId !== ownerId) {
+      return { released: false, reason: 'owner_mismatch' };
+    }
+    this._lockMeta.delete(projectId);
+    if (!ownerId || !current || current.ownerId === ownerId) {
+      this.locks.delete(projectId);
+    }
+    const lockFile = this._resolveLockFile(projectId, opts.lockDir);
+    if (lockFile && fs.existsSync(lockFile)) {
+      try {
+        if (ownerId) {
+          const onDisk = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+          if (onDisk && onDisk.ownerId && onDisk.ownerId !== ownerId) {
+            return { released: false, reason: 'owner_mismatch' };
+          }
+        }
+        fs.unlinkSync(lockFile);
+      } catch (e) {}
+    }
+    return { released: true };
   }
 
   /**
@@ -3980,6 +4237,7 @@ class DeployManager extends EventEmitter {
         reason: freezeCheck.reason
       };
     }
+    this.reapStaleDeployLock(project.id);
     if (this.locks.has(project.id)) {
       this.pending.set(project.id, { project, options });
       return { started: false, queued: true };
@@ -4569,7 +4827,10 @@ class DeployManager extends EventEmitter {
               'com.culkibo.project': safeSlug(project.id),
               'com.culkibo.project_id': project.id,
               'com.culkibo.deployment': deployment.id,
-              'com.culkibo.version': version
+              'com.culkibo.version': version,
+              ...(project.protectedContainer || options.protectedContainer || project.sleepEnabled || project.autoSleep || (project.sleepPolicy && project.sleepPolicy.enabled)
+                ? { [PROTECTED_CONTAINER_LABEL]: '1' }
+                : {})
             }
           });
 
@@ -5460,28 +5721,28 @@ class DeployManager extends EventEmitter {
     ]);
     const aliveImages = new Set([state.current, state.previous].filter(Boolean).map(r => r.imageTag));
 
-    // Buscar primero por label exacto `com.culkibo.project_id`, excluyendo SIEMPRE previews y hooks activos (Kamal #1923, Coolify #9654)
+    // Buscar primero por label exacto `com.culkibo.project_id`, excluyendo SIEMPRE previews, hooks y contenedores protegidos/dormidos (Kamal #1923/#1655, Coolify #9654/#10996/#12542)
     const listById = await this.runDocker(
-      ['ps', '-a', '--filter', `label=com.culkibo.project_id=${projectId}`, '--format', '{{.Names}}|{{.Label "com.culkibo.preview"}}|{{.Label "com.culkibo.hook"}}'],
+      ['ps', '-a', '--filter', `label=com.culkibo.project_id=${projectId}`, '--filter', `label!=${PROTECTED_CONTAINER_LABEL}=1`, '--format', '{{.Names}}|{{.Label "com.culkibo.preview"}}|{{.Label "com.culkibo.hook"}}|{{.Label "culkibo.protected"}}|{{.Label "culkibo.sleeping"}}'],
       { timeoutMs: 10000, env }
     );
     const listBySlug = await this.runDocker(
-      ['ps', '-a', '--filter', `label=com.culkibo.project=${slug}`, '--format', '{{.Names}}|{{.Label "com.culkibo.project_id"}}|{{.Label "com.culkibo.preview"}}|{{.Label "com.culkibo.hook"}}'],
+      ['ps', '-a', '--filter', `label=com.culkibo.project=${slug}`, '--filter', `label!=${PROTECTED_CONTAINER_LABEL}=1`, '--format', '{{.Names}}|{{.Label "com.culkibo.project_id"}}|{{.Label "com.culkibo.preview"}}|{{.Label "com.culkibo.hook"}}|{{.Label "culkibo.protected"}}|{{.Label "culkibo.sleeping"}}'],
       { timeoutMs: 10000, env }
     );
     /** @type {Set<string>} */
     const candidateContainers = new Set();
     if (listById.code === 0) {
       for (const line of (listById.stdout || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
-        const [name, isPreview, hookType] = line.split('|');
-        if (!name || isPreview === 'true' || Boolean(hookType)) continue;
+        const [name, isPreview, hookType, isProtected, isSleeping] = line.split('|');
+        if (!name || isPreview === 'true' || Boolean(hookType) || isProtected === '1' || isProtected === 'true' || isSleeping === '1' || isSleeping === 'true') continue;
         candidateContainers.add(name);
       }
     }
     if (listBySlug.code === 0) {
       for (const line of (listBySlug.stdout || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
-        const [name, labelProjId, isPreview, hookType] = line.split('|');
-        if (!name || isPreview === 'true' || Boolean(hookType)) continue;
+        const [name, labelProjId, isPreview, hookType, isProtected, isSleeping] = line.split('|');
+        if (!name || isPreview === 'true' || Boolean(hookType) || isProtected === '1' || isProtected === 'true' || isSleeping === '1' || isSleeping === 'true') continue;
         if (!labelProjId || labelProjId === projectId) {
           candidateContainers.add(name);
         }
@@ -5528,8 +5789,8 @@ class DeployManager extends EventEmitter {
       const rmi = await this.runDocker(['rmi', tag], { timeoutMs: 20000, env });
       if (rmi.code === 0) removedImages.push(tag);
     }
-    // Podar capas huérfanas `<none>` etiquetadas para este proyecto
-    await this.runDocker(['image', 'prune', '-f', '--filter', `label=com.culkibo.project_id=${projectId}`], { timeoutMs: 15000, env }).catch(() => {});
+    // Podar capas huérfanas `<none>` etiquetadas para este proyecto, excluyendo SIEMPRE culkibo.protected=1 (coolify#10996/#12542, kamal#1655)
+    await this.runDocker(buildSafePruneArgs('image', { projectId }), { timeoutMs: 15000, env }).catch(() => {});
 
     return { removed, removedImages, keep };
   }
@@ -6019,7 +6280,10 @@ class DeployManager extends EventEmitter {
       return { ok: false, error: 'keepStorageGb debe ser un número entre 0 y 10000' };
     }
 
-    const args = ['builder', 'prune', '--force', '--keep-storage', `${Math.round(gb)}GB`];
+    const roundedGb = Math.round(gb);
+    const effectiveGb = Math.min(roundedGb, MAX_BUILDKIT_KEEP_STORAGE_GB);
+    const capped = roundedGb > MAX_BUILDKIT_KEEP_STORAGE_GB;
+    const args = ['builder', 'prune', '--force', '--keep-storage', `${effectiveGb}GB`];
     if (untilHours != null) {
       const hours = Number(untilHours);
       if (!Number.isFinite(hours) || hours <= 0 || hours > 8760) {
@@ -6030,8 +6294,8 @@ class DeployManager extends EventEmitter {
 
     const res = await this.runDocker(args, { timeoutMs: 120000 });
     return res.code === 0
-      ? { ok: true, output: (res.stdout || '').trim().slice(0, 2000) }
-      : { ok: false, error: (res.stderr || '').trim().slice(0, 600) };
+      ? { ok: true, keepStorageGb: effectiveGb, capped, output: (res.stdout || '').trim().slice(0, 2000) }
+      : { ok: false, keepStorageGb: effectiveGb, capped, error: (res.stderr || '').trim().slice(0, 600) };
   }
 
   /**
@@ -6203,6 +6467,7 @@ class DeployManager extends EventEmitter {
         const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000, env });
         if (res.code === 0) {
           state.current.status = 'detenido';
+          state.current.protected = true;
           this.saveStore();
           this.notify({
             event: 'project_stopped',
@@ -6921,6 +7186,11 @@ instance.readContainerCgroupV2Memory = readContainerCgroupV2Memory;
 instance.buildComposeResourceOverride = buildComposeResourceOverride;
 instance.enforceComposeResourceLimits = enforceComposeResourceLimits;
 instance.buildComposeUpArgs = buildComposeUpArgs;
+instance.isPidAlive = isPidAlive;
+instance.buildSafePruneArgs = buildSafePruneArgs;
+instance.PROTECTED_CONTAINER_LABEL = PROTECTED_CONTAINER_LABEL;
+instance.MAX_BUILDKIT_KEEP_STORAGE_GB = MAX_BUILDKIT_KEEP_STORAGE_GB;
+instance.DEPLOY_LOCK_DEFAULT_TTL_MS = DEPLOY_LOCK_DEFAULT_TTL_MS;
 instance.helpers = {
   safeSlug,
   isValidEnvName,
@@ -6944,7 +7214,12 @@ instance.helpers = {
   extractComposeServiceNames,
   buildComposeResourceOverride,
   enforceComposeResourceLimits,
-  buildComposeUpArgs
+  buildComposeUpArgs,
+  isPidAlive,
+  buildSafePruneArgs,
+  PROTECTED_CONTAINER_LABEL,
+  MAX_BUILDKIT_KEEP_STORAGE_GB,
+  DEPLOY_LOCK_DEFAULT_TTL_MS
 };
 
 module.exports = instance;

@@ -51,6 +51,9 @@ const {
   isHttpsRequest
 } = require('../middleware/auth');
 const Project = require('../models/Project');
+const APP_VERSION = (() => {
+  try { return String(require('../../package.json').version || '1.2.0'); } catch (e) { return '1.2.0'; }
+})();
 
 // Carga perezosa de los módulos v2 (0 impacto en RAM al arrancar en 1 solo VPS)
 /** @type {Record<string, any>} */
@@ -73,6 +76,10 @@ function getDirectPushRegistry() { return _lazyV2.directpush || (_lazyV2.directp
 function getEdgeTunnelService() { return _lazyV2.edgetunnel || (_lazyV2.edgetunnel = require('../services/edgeTunnelService')); }
 function getSqliteStreamBackup() { return _lazyV2.snapstream || (_lazyV2.snapstream = require('../services/sqliteStreamBackup')); }
 function getReleaseProvenance() { return _lazyV2.provenance || (_lazyV2.provenance = require('../../scripts/release-provenance')); }
+function getOtlpExporter() { return _lazyV2.otlp || (_lazyV2.otlp = require('../services/otlpExporter')); }
+function getSupplyChainAttestor() { return _lazyV2.attestor || (_lazyV2.attestor = require('../services/supplyChainAttestor')); }
+function getMigrationRunner() { return _lazyV2.migrations || (_lazyV2.migrations = require('../services/migrationRunner')); }
+function getWasmMicroRunner() { return _lazyV2.wasm || (_lazyV2.wasm = require('../services/wasmMicroRunner')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -1391,6 +1398,38 @@ router.post('/projects/:id/previews/:prNumber/branch-db', heavyOpLimiter, (req, 
   }
 });
 
+// Per-PR Postgres Schema Isolation (dokploy#2462, zero-shell parameterized psql -v)
+router.post('/projects/:id/previews/:prNumber/schema-isolation', heavyOpLimiter, (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'previews:write');
+    if (!project) return;
+    const prNumber = parseInt(String(req.params.prNumber || ''), 10);
+    if (!Number.isInteger(prNumber) || prNumber < 1 || prNumber > 999999) {
+      return res.status(400).json({ error: 'prNumber debe ser un entero positivo (1..999999)' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    /** @type {Record<string, any>} */
+    const dbConfig = { ...body };
+    if (body.databaseId) {
+      const db = assertDatabaseAccess(req, res, String(body.databaseId), 'databases:read');
+      if (!db) return;
+      dbConfig.engine = dbConfig.engine || db.engine;
+      dbConfig.sourceDbName = dbConfig.sourceDbName || db.dbName;
+      dbConfig.dbName = dbConfig.dbName || db.dbName;
+      dbConfig.containerName = dbConfig.containerName || db.containerName;
+      dbConfig.username = dbConfig.username || db.username;
+    }
+    const pmAny = /** @type {any} */ (previewManager);
+    if (typeof pmAny.planPreviewSchemaIsolation !== 'function') {
+      return res.status(501).json({ error: 'Preview Schema Isolation no disponible en este runtime' });
+    }
+    const plan = pmAny.planPreviewSchemaIsolation(project, prNumber, dbConfig);
+    res.json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 // Runtime-only Fast Restart con variables actualizadas sin reconstruir imagen (dokploy#2547)
 router.post('/projects/:id/fast-restart', heavyOpLimiter, async (req, res) => {
   try {
@@ -2002,7 +2041,7 @@ router.get('/system/status', (req, res) => {
     res.json({
       name: 'Culkibo',
       status: 'operational',
-      version: '1.0.0',
+      version: APP_VERSION,
       tagline: 'Orquestador cloud autohospedado',
       platform: process.platform,
       arch: process.arch,
@@ -6704,6 +6743,115 @@ router.get('/databases/:id/snapstream/generations', (req, res) => {
     const generations = snap.listGenerations(db.id, { destDir });
     const status = snap.getStatus(db.id, { destDir });
     res.json({ databaseId: db.id, generations, status });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #4 PIONEER LAZY ROUTES (OTLP, SLSA v1.1 DSSE Attestation, Atomic Migrations, Micro-Wasm) ---
+
+router.get('/observability/otlp', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'estado global de exportación OTLP')) return;
+    res.json(getOtlpExporter().getStatus());
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/observability/otlp', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'configurar exportador OTLP')) return;
+    const status = getOtlpExporter().configure(req.body || {});
+    res.json(status);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/observability/otlp/flush', heavyOpLimiter, async (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'enviar lote OTLP')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const snapshot = body.metricsSnapshot || JSON.parse(metricsCollector.getSnapshotBuffer(true).toString('utf8'));
+    const out = await getOtlpExporter().flush({ ...body, metricsSnapshot: snapshot });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/projects/:id/releases/:rev/attestation', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const att = getSupplyChainAttestor().getAttestation(project.id, req.params.rev);
+    if (!att) {
+      return res.status(404).json({
+        error: 'Atestación SLSA no encontrada para esta release',
+        code: 'ATTESTATION_NOT_FOUND',
+        projectId: project.id,
+        revision: req.params.rev
+      });
+    }
+    res.json(att);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/releases/:rev/attest', heavyOpLimiter, (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const att = getSupplyChainAttestor().attestRelease({
+      ...body,
+      projectId: project.id,
+      revision: req.params.rev
+    });
+    res.status(201).json(att);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/attestation/verify', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    const publicKeyPem = typeof body.publicKeyPem === 'string' && body.publicKeyPem.trim()
+      ? body.publicKeyPem
+      : undefined;
+    const result = getSupplyChainAttestor().verifyAttestation(envelope, publicKeyPem);
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/migrations/plan', heavyOpLimiter, (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'deployments:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const plan = getMigrationRunner().planMigration(project, body);
+    res.json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/wasm/invoke', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.wasmPath && !project.localPath) {
+      if (!assertHostLocalPathAllowed(req, res, project.teamId)) return;
+    }
+    const result = await getWasmMicroRunner().invokeProject(project, body);
+    res.json(result);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

@@ -40,6 +40,7 @@ import type {
 import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
+import { useTheme } from '../lib/theme';
 import { DomainWizardModal } from './DomainWizardModal';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
@@ -74,7 +75,8 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
   wizardPreset = null,
   onClearWizardPreset,
 }) => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const { isDark } = useTheme();
   const [domains, setDomains] = useState<DomainItem[]>([]);
   const [certs, setCerts] = useState<SslCertificate[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -691,19 +693,40 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
         <div
           className={`p-4 rounded-xl border text-xs ${
             ingress.available
-              ? (ingress.inSync ? 'bg-white border-slate-200' : 'bg-amber-50 border-amber-200')
-              : 'bg-amber-50/80 border-amber-200'
+              ? (ingress.inSync
+                  ? 'bg-white border-slate-200'
+                  : 'bg-amber-50 border-amber-200 dark:bg-amber-950/40 dark:border-amber-800/60 dark:text-amber-200')
+              : 'bg-amber-50/80 border-amber-200 dark:bg-amber-950/40 dark:border-amber-800/60 dark:text-amber-200'
           }`}
+          style={
+            isDark && (!ingress.available || !ingress.inSync)
+              ? {
+                  backgroundColor: 'rgba(69, 26, 3, 0.42)',
+                  borderColor: 'rgba(146, 64, 14, 0.65)',
+                  color: '#fde68a',
+                }
+              : undefined
+          }
         >
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
             <div className="flex items-start gap-2.5">
-              <div className={`w-8 h-8 rounded-lg border flex items-center justify-center shrink-0 ${
-                ingress.available ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-100 border-amber-200 text-amber-800'
-              }`}>
+              <div
+                className={`w-8 h-8 rounded-lg border flex items-center justify-center shrink-0 ${
+                  ingress.available ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-100 border-amber-200 text-amber-800'
+                }`}
+                style={
+                  isDark && !ingress.available
+                    ? { backgroundColor: 'rgba(120, 53, 15, 0.55)', borderColor: 'rgba(180, 83, 9, 0.65)', color: '#fcd34d' }
+                    : undefined
+                }
+              >
                 {ingress.available ? <Zap className="w-4 h-4" /> : <ShieldOff className="w-4 h-4" />}
               </div>
               <div>
-                <div className="font-semibold text-slate-900">
+                <div
+                  className="font-semibold text-slate-900"
+                  style={isDark && (!ingress.available || !ingress.inSync) ? { color: '#fef3c7' } : undefined}
+                >
                   {ingress.available
                     ? t('domains.caddyActive', {
                         ver: ingress.version && /^v?\d/i.test(ingress.version) ? ` ${ingress.version}` : '',
@@ -711,15 +734,25 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                       })
                     : t('domains.caddyStopped')}
                 </div>
-                <p className="text-slate-600 mt-0.5 max-w-2xl leading-relaxed">{ingress.message}</p>
+                <p
+                  className="text-slate-600 mt-0.5 max-w-2xl leading-relaxed"
+                  style={isDark && (!ingress.available || !ingress.inSync) ? { color: '#fde68a' } : undefined}
+                >
+                  {ingress.message}
+                </p>
                 {ingress.available && (
                   <p className="text-slate-500 mt-1 tabular-nums">
-                    {ingress.routesManaged} {ingress.routesManaged === 1 ? 'ruta publicada' : 'rutas publicadas'}
+                    {t('domains.routesPublished', {
+                      count: ingress.routesManaged,
+                      unit: locale === 'es'
+                        ? (ingress.routesManaged === 1 ? 'ruta publicada' : 'rutas publicadas')
+                        : (ingress.routesManaged === 1 ? 'route' : 'routes'),
+                    })}
                     {ingress.inSync
-                      ? ' · sincronizado'
-                      : ` · ${ingress.drift.missing.length} sin publicar, ${ingress.drift.unexpected.length} sobrantes${(ingress.drift.modified?.length || 0) > 0 ? `, ${ingress.drift.modified?.length} desactualizadas` : ''}`}
-                    {probingTls ? ' · comprobando TLS…' : ''}
-                    {tlsAuditSummary && ` · Auditoría TLS: ${tlsAuditSummary.ok} OK${tlsAuditSummary.expiring ? `, ${tlsAuditSummary.expiring} por caducar` : ''}${tlsAuditSummary.expired ? `, ${tlsAuditSummary.expired} caducados` : ''}`}
+                      ? ` · ${t('domains.inSync')}`
+                      : ` · ${ingress.drift.missing.length} missing, ${ingress.drift.unexpected.length} extra${(ingress.drift.modified?.length || 0) > 0 ? `, ${ingress.drift.modified?.length} outdated` : ''}`}
+                    {probingTls ? ` · ${t('domains.tlsChecking')}` : ''}
+                    {tlsAuditSummary && ` · TLS: ${tlsAuditSummary.ok} OK${tlsAuditSummary.expiring ? `, ${tlsAuditSummary.expiring} expiring` : ''}${tlsAuditSummary.expired ? `, ${tlsAuditSummary.expired} expired` : ''}`}
                   </p>
                 )}
               </div>
@@ -789,7 +822,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
           <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             type="text"
-            placeholder="Filtrar dominio…"
+            placeholder={t('domains.searchPlaceholder')}
             value={searchFilter}
             onChange={(e) => setSearchFilter(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-slate-900 placeholder-slate-400"
@@ -803,12 +836,12 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-medium text-slate-500">
-                <th className="py-2.5 px-4">Dominio</th>
-                <th className="py-2.5 px-4">Destino</th>
-                <th className="py-2.5 px-4">Ruta Caddy</th>
-                <th className="py-2.5 px-4">Cloudflare</th>
-                <th className="py-2.5 px-4">Certificado TLS</th>
-                <th className="py-2.5 px-4 text-right">Acciones</th>
+                <th className="py-2.5 px-4">{t('domains.colDomain')}</th>
+                <th className="py-2.5 px-4">{t('domains.colTarget')}</th>
+                <th className="py-2.5 px-4">{t('domains.colRoute')}</th>
+                <th className="py-2.5 px-4">{t('domains.colCloudflare')}</th>
+                <th className="py-2.5 px-4">{t('domains.colTls')}</th>
+                <th className="py-2.5 px-4 text-right">{t('domains.colActions')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs">
@@ -827,26 +860,26 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         <span className="font-medium text-slate-900 font-mono">{domain.hostname}</span>
                         {domain.isWildcard && (
                           <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-800 border border-amber-200">
-                            Comodín
+                            {t('domains.badgeWildcard')}
                           </span>
                         )}
                         {domain.canonicalRedirect === 'www_to_apex' && (
                           <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
-                            www → raíz
+                            {t('domains.badgeWwwToApex')}
                           </span>
                         )}
                         {domain.canonicalRedirect === 'apex_to_www' && (
                           <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
-                            raíz → www
+                            {t('domains.badgeApexToWww')}
                           </span>
                         )}
                         {domain.basicAuth?.enabled && (
-                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-900 text-white" title="Protegido con contraseña HTTP (Basic Auth)">
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-900 text-white" title="HTTP Basic Auth">
                             Basic Auth
                           </span>
                         )}
                         {Array.isArray(domain.ipAllowlist) && domain.ipAllowlist.length > 0 && (
-                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-700 border border-slate-200" title={`IPs permitidas: ${domain.ipAllowlist.join(', ')}`}>
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-700 border border-slate-200" title={domain.ipAllowlist.join(', ')}>
                             {domain.ipAllowlist.length} IPs
                           </span>
                         )}
@@ -856,20 +889,19 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                     <td className="py-3 px-4">
                       {isService ? (
                         <span
-                          title={`Servicio de catálogo en puerto :${domain.targetPort}`}
+                          title={`:${domain.targetPort}`}
                           className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border border-slate-200 bg-slate-50 text-slate-700 tabular-nums"
                         >
-                          <span>{domain.serviceName || 'Servicio'}</span>
+                          <span>{domain.serviceName || 'Service'}</span>
                           <span className="text-slate-400 font-mono">:{domain.targetPort}</span>
                         </span>
                       ) : (
                         <button
                           type="button"
                           onClick={() => void handleToggleEntorno(domain.id, domain.targetPod, domain.hostname)}
-                          title="Pulsa para alternar entre Producción y Desarrollo"
                           className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 cursor-pointer tabular-nums"
                         >
-                          <span>{isForge ? 'Desarrollo' : 'Producción'}</span>
+                          <span>{isForge ? t('domains.envDev') : t('domains.envProd')}</span>
                           <span className="text-slate-400 font-mono">:{domain.targetPort}</span>
                           <ArrowRightLeft className="w-3 h-3 text-slate-400" />
                         </button>
@@ -881,7 +913,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         <div className="space-y-0.5">
                           <div className="flex items-center gap-1 text-emerald-700 font-medium">
                             <Link2 className="w-3.5 h-3.5" />
-                            <span>Publicada</span>
+                            <span>{t('domains.routePublished')}</span>
                           </div>
                           <div className="text-[11px] text-slate-500 font-mono">{liveRoute.upstreams.join(', ')}</div>
                         </div>
@@ -889,10 +921,10 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         <div className="space-y-0.5">
                           <div className="flex items-center gap-1 text-slate-500">
                             <ShieldOff className="w-3.5 h-3.5 text-slate-400" />
-                            <span>Sin ruta</span>
+                            <span>{t('domains.routeNone')}</span>
                           </div>
                           <div className="text-[11px] text-slate-400 max-w-[180px] truncate">
-                            {skippedReason || (ingress && !ingress.available ? 'Caddy detenido' : 'Pendiente')}
+                            {skippedReason || (ingress && !ingress.available ? t('domains.caddyStopped') : t('domains.routePending'))}
                           </div>
                         </div>
                       )}
@@ -909,14 +941,14 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         }`}
                       >
                         <Cloud className="w-3.5 h-3.5" />
-                        <span>{domain.cloudflareProxied ? 'Proxy' : 'Solo DNS'}</span>
+                        <span>{domain.cloudflareProxied ? t('domains.cfProxy') : t('domains.cfDnsOnly')}</span>
                       </button>
                     </td>
 
                     <td className="py-3 px-4">
                       {!probe ? (
                         <span className="text-[11px] text-slate-400">
-                          {probingTls ? 'Comprobando…' : 'Sin sondear'}
+                          {probingTls ? t('domains.tlsChecking') : t('domains.tlsNotProbed')}
                         </span>
                       ) : probe.reachable && probe.notAfter ? (
                         <div className="space-y-0.5">
@@ -927,11 +959,11 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                               <ShieldAlert className="w-3.5 h-3.5 text-amber-600" />
                             )}
                             <span className={`font-medium ${probe.trusted && !probe.expired ? 'text-emerald-700' : 'text-amber-700'}`}>
-                              {probe.issuer || probe.issuerCN || 'Certificado detectado'}
+                              {probe.issuer || probe.issuerCN || t('domains.tlsDetected')}
                             </span>
                           </div>
                           <div className="text-[11px] text-slate-500 tabular-nums">
-                            Caduca {formatDate(probe.notAfter)}
+                            {t('domains.tlsExpires')} {formatDate(probe.notAfter)}
                             {typeof probe.daysRemaining === 'number' && ` · ${probe.daysRemaining} d`}
                           </div>
                         </div>
@@ -939,10 +971,10 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         <div className="space-y-0.5">
                           <div className="flex items-center gap-1 text-slate-500">
                             <ShieldOff className="w-3.5 h-3.5 text-slate-400" />
-                            <span>Pendiente</span>
+                            <span>{t('domains.routePending')}</span>
                           </div>
                           <div className="text-[11px] text-slate-400 max-w-[180px] truncate" title={probe.error}>
-                            {probe.error || 'Apunta el DNS para emitirlo'}
+                            {probe.error || t('domains.tlsPointDns')}
                           </div>
                         </div>
                       )}
@@ -956,7 +988,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                             onClick={() => void handleConfirmDelete(domain.id, domain.hostname)}
                             className="px-2 py-1 rounded-md bg-red-600 text-white text-[11px] font-medium cursor-pointer"
                           >
-                            Confirmar
+                            {t('domains.confirm')}
                           </button>
                           <button
                             type="button"
@@ -971,11 +1003,10 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                           <button
                             type="button"
                             onClick={() => void handleDiagnose(domain.id)}
-                            title="Diagnóstico 4 capas (DNS, Caddy, TLS y destino)"
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer"
                           >
                             <Stethoscope className="w-3 h-3 text-slate-500" />
-                            <span>Diagnosticar</span>
+                            <span>{t('domains.diagnose')}</span>
                           </button>
                           <button
                             type="button"
@@ -1045,12 +1076,12 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                 {capabilities.hasCloudflareDnsPlugin === true ? (
                   <>
                     <CheckCircle2 className="w-3.5 h-3.5" />
-                    <span>caddy-dns/cloudflare activo</span>
+                    <span>{t('domains.cfPluginActive')}</span>
                   </>
                 ) : (
                   <>
                     <AlertTriangle className="w-3.5 h-3.5" />
-                    <span>Sin plugin caddy-dns/cloudflare</span>
+                    <span>{t('domains.cfPluginMissing')}</span>
                   </>
                 )}
               </span>
@@ -1059,9 +1090,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
 
           {capabilities && capabilities.hasCloudflareDnsPlugin === false && (
             <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <span>
-                Para emitir comodines automáticos Let&apos;s Encrypt DNS-01 compila <code className="font-mono text-slate-800">Dockerfile.caddy</code>, o sube un certificado <strong>Cloudflare Origin CA</strong> gratuito (15 años).
-              </span>
+              <span>{t('domains.cfPluginHint')}</span>
               <button
                 type="button"
                 onClick={async () => {
@@ -1073,7 +1102,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 text-[11px] font-mono shrink-0 cursor-pointer"
               >
                 {copiedCaddyCmd ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                <span>Copiar build Caddy</span>
+                <span>{t('domains.copyCaddyBuild')}</span>
               </button>
             </div>
           )}
@@ -1086,7 +1115,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   type="text"
                   value={newWildcardRoot}
                   onChange={(e) => setNewWildcardRoot(e.target.value)}
-                  placeholder="midominio.com (crea *.midominio.com)"
+                  placeholder={t('domains.wildcardPlaceholder')}
                   className="flex-1 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono"
                 />
                 <button
@@ -1094,7 +1123,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   disabled={addingWildcard || !newWildcardRoot.trim().includes('.')}
                   className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer disabled:opacity-50 shrink-0"
                 >
-                  {addingWildcard ? 'Añadiendo…' : 'Añadir comodín'}
+                  {addingWildcard ? t('domains.adding') : t('domains.addWildcard')}
                 </button>
               </form>
 
@@ -1111,7 +1140,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         disabled={removingWildcard === pol.rootDomain}
                         onClick={() => void handleRemoveWildcardPolicy(pol.rootDomain)}
                         className="text-slate-400 hover:text-red-600 p-1 rounded cursor-pointer"
-                        title={`Quitar política *.${pol.rootDomain}`}
+                        title={`Remove *.${pol.rootDomain}`}
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -1119,21 +1148,19 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   ))}
                 </div>
               ) : (
-                <p className="text-[11px] text-slate-400">Aún no hay políticas comodín DNS-01 registradas.</p>
+                <p className="text-[11px] text-slate-400">{t('domains.noWildcards')}</p>
               )}
             </div>
 
             {/* Correo ACME para avisos de Let's Encrypt */}
             <form onSubmit={handleSaveAcmeEmail} className="space-y-2">
-              <label className="block text-xs font-medium text-slate-700">
-                Correo de avisos ACME (Let&apos;s Encrypt / ZeroSSL)
-              </label>
+              <label className="block text-xs font-medium text-slate-700">{t('domains.acmeEmailLabel')}</label>
               <div className="flex gap-2">
                 <input
                   type="email"
                   value={acmeEmailInput}
                   onChange={(e) => setAcmeEmailInput(e.target.value)}
-                  placeholder="ops@miempresa.com"
+                  placeholder={t('domains.acmeEmailPlaceholder')}
                   className="flex-1 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs"
                 />
                 <button
@@ -1141,12 +1168,10 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   disabled={savingAcme}
                   className="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer disabled:opacity-50 shrink-0"
                 >
-                  {savingAcme ? 'Guardando…' : 'Guardar'}
+                  {savingAcme ? t('domains.saving') : t('domains.save')}
                 </button>
               </div>
-              <p className="text-[11px] text-slate-500">
-                Recibirás alertas oficiales si algún certificado estuviera cerca de caducar.
-              </p>
+              <p className="text-[11px] text-slate-500">{t('domains.acmeEmailHint')}</p>
             </form>
           </div>
         </div>

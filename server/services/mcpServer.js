@@ -40,7 +40,9 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'smartPackBuilder',
   'directPushRegistry',
   'edgeTunnelService',
-  'topologyService'
+  'topologyService',
+  'supplyChainAttestor',
+  'otlpExporter'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -79,7 +81,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_fleet_add_server',
   'culkibo_team_invite_member',
   'culkibo_rbac_manage_token',
-  'culkibo_edge_tunnel'
+  'culkibo_edge_tunnel',
+  'culkibo_otlp_status'
 ]);
 
 /** @type {Record<string, number>} */
@@ -145,7 +148,8 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_canary_rollout',
     'culkibo_deploy_freeze',
     'culkibo_env_list',
-    'culkibo_env_promote'
+    'culkibo_env_promote',
+    'culkibo_verify_attestation'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -157,6 +161,7 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_get_logs',
     'culkibo_get_container_logs',
     'culkibo_get_observability',
+    'culkibo_otlp_status',
     'culkibo_system_doctor',
     'culkibo_system_doctor_fix',
     'culkibo_docker_status',
@@ -197,7 +202,8 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_list_databases',
     'culkibo_database_list_backups',
     'culkibo_export_instance_snapshot',
-    'culkibo_diagnose_incident'
+    'culkibo_diagnose_incident',
+    'culkibo_verify_attestation'
   ])
 });
 
@@ -235,7 +241,17 @@ const SEARCH_SYNONYMS = Object.freeze({
   dockerfile: ['smartpack', 'build', 'plan', 'deploy'],
   tunnel: ['edge', 'cgnat', 'ingress', 'cloudflare', 'edgetunnel'],
   cgnat: ['tunnel', 'edge', 'ingress', 'cloudflare'],
-  edgetunnel: ['tunnel', 'edge', 'cgnat', 'ingress']
+  edgetunnel: ['tunnel', 'edge', 'cgnat', 'ingress'],
+  slsa: ['attestation', 'verify', 'provenance', 'dsse', 'sbom', 'ed25519', 'security'],
+  attestation: ['slsa', 'verify', 'provenance', 'dsse', 'sbom', 'ed25519', 'security'],
+  dsse: ['slsa', 'attestation', 'verify', 'provenance', 'ed25519'],
+  provenance: ['slsa', 'attestation', 'verify', 'sbom', 'dsse'],
+  sbom: ['slsa', 'attestation', 'provenance', 'security'],
+  otlp: ['observability', 'traces', 'metrics', 'tempo', 'signoz', 'honeycomb', 'telemetry'],
+  tempo: ['otlp', 'observability', 'traces'],
+  signoz: ['otlp', 'observability', 'traces', 'metrics'],
+  honeycomb: ['otlp', 'observability', 'traces'],
+  traces: ['otlp', 'observability', 'metrics']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -378,7 +394,10 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_export_agent_kit: { minRole: 'viewer', scope: 'tools:read', projectScoped: false },
   // MCP 2026 Cycle-2: SmartPack Build Intelligence & Sovereign EdgeTunnel (+2 = 111)
   culkibo_smartpack_plan: { minRole: 'viewer', scope: 'deployments:read', projectScoped: true },
-  culkibo_edge_tunnel: { minRole: 'admin', scope: 'ingress:write', projectScoped: false, secretSensitive: true }
+  culkibo_edge_tunnel: { minRole: 'admin', scope: 'ingress:write', projectScoped: false, secretSensitive: true },
+  // MCP 2026 Cycle-4: SLSA v1.1 Attestation Verification & Native OTLP/HTTP Export (+2 = 113)
+  culkibo_verify_attestation: { minRole: 'viewer', scope: 'security:read', projectScoped: true },
+  culkibo_otlp_status: { minRole: 'admin', scope: 'observability:write', projectScoped: false, secretSensitive: true }
 });
 
 /**
@@ -404,8 +423,13 @@ function normalizePrincipal(authOrPrincipal) {
       isScoped: false
     };
   }
-  // Fail-closed: un resultado de autenticación rechazado (`{ ok: false }`) NUNCA puede escalar a superadmin.
-  if (authOrPrincipal.ok === false) {
+  // Fail-closed: un resultado de autenticación rechazado (`{ ok: false }`) o un principal ya denegado (`role: 'none'` / `kind: 'denied'`) NUNCA puede escalar a viewer/superadmin (idempotente).
+  if (
+    authOrPrincipal.ok === false ||
+    authOrPrincipal.role === 'none' ||
+    authOrPrincipal.kind === 'denied' ||
+    (authOrPrincipal.principal && (authOrPrincipal.principal.role === 'none' || authOrPrincipal.principal.kind === 'denied'))
+  ) {
     return {
       method: 'unauthenticated',
       kind: 'denied',
@@ -714,6 +738,16 @@ const META_PROTOCOL_VERSION = 'io.modelcontextprotocol/protocolVersion';
 const META_CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const META_CLIENT_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
+const META_ELICITATION = 'io.modelcontextprotocol/elicitation';
+const META_RELATED_TASK = 'io.modelcontextprotocol/related-task';
+
+// Límites acotados del almacén en memoria de MCP Async Tasks (2026-07-28, cero crecimiento sin cota)
+const MAX_ASYNC_TASKS = 128;
+const DEFAULT_TASK_TTL_MS = 60000;
+const MIN_TASK_TTL_MS = 100;
+const MAX_TASK_TTL_MS = 300000;
+const DEFAULT_TASK_POLL_INTERVAL_MS = 1000;
+const DEFAULT_TASK_RESULT_WAIT_MS = 30000;
 
 // Prefijo propio para metadatos que no define la especificación. La segunda
 // etiqueta no puede ser `mcp` ni `modelcontextprotocol`: esas están reservadas.
@@ -743,11 +777,44 @@ const MODERN_METHODS = [
   'resources/list',
   'resources/read',
   'prompts/list',
-  'prompts/get'
+  'prompts/get',
+  'tasks/list',
+  'tasks/get',
+  'tasks/result',
+  'tasks/cancel'
 ];
 
 // Métodos que obligan a enviar la cabecera `Mcp-Name`.
 const NAME_BEARING_METHODS = ['tools/call', 'resources/read', 'prompts/get'];
+
+/**
+ * Construye una solicitud estructurada `elicitation/create` conforme a MCP 2026
+ * para que clientes compatibles rendericen formularios interactivos de remediación
+ * (confirmación HMAC, secreto faltante o override de deploy freeze).
+ * @param {{ message: string, requestedSchema: Record<string, any>, action?: string | null, projectId?: string | null, mode?: 'form' | 'url' }} opts
+ */
+function buildElicitationRequest({ message, requestedSchema, action = null, projectId = null, mode = 'form' }) {
+  const safeMessage = String(message || 'Additional confirmation or structured input is required to continue.').slice(0, 500);
+  const rawSchema = requestedSchema && typeof requestedSchema === 'object' ? requestedSchema : { type: 'object', properties: {} };
+  const schema = {
+    type: 'object',
+    properties: rawSchema.properties && typeof rawSchema.properties === 'object' ? rawSchema.properties : {},
+    ...(Array.isArray(rawSchema.required) && rawSchema.required.length > 0 ? { required: rawSchema.required } : {})
+  };
+  /** @type {Record<string, any>} */
+  const meta = {};
+  if (action) meta.action = String(action);
+  if (projectId) meta.projectId = String(projectId);
+  return {
+    method: 'elicitation/create',
+    params: {
+      mode: mode === 'url' ? 'url' : 'form',
+      message: safeMessage,
+      requestedSchema: schema,
+      ...(Object.keys(meta).length > 0 ? { _meta: meta } : {})
+    }
+  };
+}
 
 /**
  * Error de ejecución de herramienta con forma accionable.
@@ -771,7 +838,12 @@ const DEFAULT_ERROR_REMEDIATIONS = Object.freeze({
   CONFIRM_TOKEN_EXPIRED: 'El confirmToken caducó (5 min); genera uno nuevo con culkibo_auto_remediate y dryRun: true.',
   CONFIRM_TOKEN_REPLAYED: 'Cada confirmToken es de un solo uso; ejecuta dryRun: true para generar uno nuevo si necesitas repetir la acción.',
   CONFIRM_TOKEN_MISMATCH: 'El confirmToken está vinculado al llamante, acción, proyecto y parámetros exactos del dryRun; solicita uno nuevo para estos parámetros.',
+  MISSING_SECRET: 'Almacena el secreto requerido en el Vault cifrado de Culkibo (${vault.KEY}) o mediante culkibo_set_project_env antes de reintentar.',
   SECRET_LEAK_DETECTED: 'Mueve los secretos detectados al Vault cifrado de Culkibo (${vault.KEY}) o a secretos de entorno antes de desplegar.',
+  DEPLOY_FROZEN: 'Espera a que finalice la ventana con culkibo_deploy_freeze (action: "list") o repite el flujo con overrideFreeze: true (admin/owner).',
+  DEPLOY_FREEZE_ACTIVE: 'Espera a que finalice la ventana con culkibo_deploy_freeze (action: "list") o repite el flujo con overrideFreeze: true (admin/owner).',
+  TASK_NOT_FOUND: 'Verifica el taskId con tasks/list (cada tarea es estrictamente privada para el principal que la creó y expira tras su TTL).',
+  TASK_CANCELLED: 'La tarea asíncrona fue cancelada; vuelve a lanzar tools/call con params.task si deseas reiniciar la ejecución.',
   CANARY_NOT_ACTIVE: 'Inicia primero un despliegue canario con culkibo_canary_rollout (action: "start") o consulta su estado con action: "status".',
   FORBIDDEN_PATH: 'Usa un directorio dentro del workspace actual o de la carpeta projects/ de Culkibo.'
 });
@@ -1162,6 +1234,9 @@ class McpServer extends EventEmitter {
     this._remediationHmacKey = crypto.randomBytes(32);
     /** @type {Map<string, { exp: number, used: boolean, principalKey: string, action: string, projectId: string | null, paramsHash: string }>} */
     this._pendingRemediations = new Map();
+    /** Almacén acotado (<=128) con TTL por principal para MCP 2026-07-28 Async Tasks (`io.modelcontextprotocol/tasks`). */
+    /** @type {Map<string, any>} */
+    this._tasks = new Map();
   }
 
   getToolsDefinition() {
@@ -3013,6 +3088,65 @@ class McpServer extends EventEmitter {
           },
           required: ['action']
         }
+      },
+
+      // --- MCP 2026 Cycle-4: SLSA v1.1 Attestations & Native OTLP/HTTP Export (+2 -> 113) ---
+      {
+        name: 'culkibo_verify_attestation',
+        title: 'Verificar atestación SLSA v1.1 Ed25519 DSSE',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            valid: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            revision: { type: ['string', 'null'] },
+            count: { type: 'number' },
+            attestations: { type: 'array' },
+            attestation: { type: ['object', 'null'] },
+            verification: { type: ['object', 'null'] },
+            publicKeyPem: { type: 'string' }
+          }
+        },
+        description: 'Inspecciona, lista o verifica criptográficamente sobres DSSE Ed25519 con proveniencia SLSA v1.1 (in-toto Statement v1 + CycloneDX 1.6 SBOM summary) por proyecto/revisión o sobre un sobre DSSE aportado.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['verify', 'get', 'list', 'public_key'], description: 'Operación sobre atestaciones SLSA v1.1 (default automático según parámetros)' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de proyecto opcional para consultar o verificar atestaciones persistidas' },
+            revision: { type: 'string', minLength: 1, maxLength: 128, description: 'Revisión o etiqueta del despliegue a inspeccionar/verificar' },
+            envelope: { type: 'object', description: 'Sobre DSSE v1 raw ({ payloadType, payload, signatures }) para verificación directa' },
+            publicKeyPem: { type: 'string', maxLength: 4096, description: 'Clave pública Ed25519 SPKI PEM opcional para verificar sobres firmados externamente' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_otlp_status',
+        title: 'Estado y configuración de OTLP/HTTP nativo',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            configured: { type: 'boolean' },
+            status: { type: 'object' },
+            flush: { type: 'object' }
+          }
+        },
+        description: 'Consulta el estado del exportador OTLP/HTTP JSON nativo sin dependencias (Grafana Tempo, SigNoz, Honeycomb; IDs hex en minúsculas, gzip, circuit breaker y cabeceras redactadas), configura su endpoint/cabeceras o fuerza un flush manual (admin/owner).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['status', 'configure', 'flush'], description: 'Acción sobre el exportador OTLP (default "status")' },
+            endpoint: { type: ['string', 'null'], maxLength: 512, description: 'URL base OTLP/HTTP destino (ej. https://tempo.acme.dev:4318) o null para limpiar (solo action="configure")' },
+            headers: { type: 'object', description: 'Cabeceras HTTP opcionales para autenticación OTLP (siempre redactadas en status y auditoría)' },
+            enabled: { type: 'boolean', description: 'Activar o desactivar exportación OTLP (solo action="configure")' },
+            serviceName: { type: 'string', minLength: 1, maxLength: 128, description: 'Nombre del servicio OTLP (resource attribute service.name)' },
+            allowLoopback: { type: 'boolean', description: 'Permitir colector OTLP en loopback local (127.0.0.1/::1; metadatos cloud siempre bloqueados)' },
+            timeoutMs: { type: 'integer', minimum: 200, maximum: 60000, description: 'Timeout HTTP del colector en milisegundos' }
+          }
+        }
       }
     ];
 
@@ -3266,6 +3400,453 @@ class McpServer extends EventEmitter {
    */
   _principalKey(principal) {
     return `${principal.method}:${principal.userId || 'anon'}:${principal.role}:${principal.teamId || 'global'}:${principal.tokenId || ''}`;
+  }
+
+  /**
+   * Clave estricta por llamante para aislar MCP Async Tasks (`tasks/list|get|result|cancel`).
+   * Incluye restricciones de `projectIds` y `scopes` para impedir cualquier lectura cruzada entre tokens/tenants.
+   * @param {ReturnType<typeof normalizePrincipal>} principal
+   */
+  _taskPrincipalKey(principal) {
+    const base = this._principalKey(principal);
+    const projScope = Array.isArray(principal.projectIds) ? [...principal.projectIds].sort().join(',') : '*';
+    const scopeSig = Array.isArray(principal.scopes) ? [...principal.scopes].sort().join(',') : '*';
+    return `${base}|p:${projScope}|s:${scopeSig}`;
+  }
+
+  /**
+   * Construye una solicitud `elicitation/create` conforme a MCP 2026.
+   * @param {{ message: string, requestedSchema: Record<string, any>, action?: string | null, projectId?: string | null, mode?: 'form' | 'url' }} opts
+   */
+  buildElicitationRequest(opts) {
+    return buildElicitationRequest(opts);
+  }
+
+  /**
+   * Genera metadatos estructurados `io.modelcontextprotocol/elicitation` para rutas
+   * de remediación interactiva (`CONFIRMATION_REQUIRED`, `MISSING_SECRET`, `SECRET_LEAK_DETECTED`,
+   * `DEPLOY_FROZEN`, `DEPLOY_FREEZE_ACTIVE`) o payloads explícitos en `err.details.elicitation`.
+   * @param {string} toolName
+   * @param {any} args
+   * @param {any} envelope
+   * @param {any} err
+   */
+  _buildErrorElicitation(toolName, args, envelope, err) {
+    if (err instanceof McpToolError && err.details && err.details.elicitation && typeof err.details.elicitation === 'object') {
+      return err.details.elicitation;
+    }
+    const code = String(envelope?.code || '');
+    const projectId = args && typeof args === 'object' && args.projectId ? String(args.projectId) : (envelope?.details?.projectId ? String(envelope.details.projectId) : null);
+    const action = (args && typeof args === 'object' && args.action ? String(args.action) : toolName) || toolName;
+
+    if (code === 'CONFIRMATION_REQUIRED') {
+      return buildElicitationRequest({
+        message: envelope.message || `Confirm execution of '${toolName}' with a single-use HMAC confirmToken from dryRun: true.`,
+        action,
+        projectId,
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            confirm: {
+              type: 'boolean',
+              title: 'Confirm execution',
+              description: `I reviewed the dry-run plan for ${toolName} and approve applying the change.`,
+              default: false
+            },
+            confirmToken: {
+              type: 'string',
+              title: 'Single-use confirmToken (ckr_...)',
+              description: 'HMAC-SHA256 confirmation token issued by calling this tool with dryRun: true.',
+              minLength: 10
+            },
+            reason: {
+              type: 'string',
+              title: 'Audit justification (optional)',
+              maxLength: 200
+            }
+          },
+          required: ['confirm', 'confirmToken']
+        }
+      });
+    }
+
+    if (code === 'MISSING_SECRET' || code === 'SECRET_LEAK_DETECTED') {
+      const missingKey = envelope?.details?.secretKey || envelope?.details?.key || '';
+      return buildElicitationRequest({
+        message: envelope.message || `Secret remediation required for '${projectId || toolName}'. Store secrets encrypted in Culkibo Vault (\${vault.KEY}).`,
+        action,
+        projectId,
+        requestedSchema: code === 'MISSING_SECRET'
+          ? {
+              type: 'object',
+              properties: {
+                secretKey: {
+                  type: 'string',
+                  title: 'Missing secret key',
+                  description: 'Environment or Vault key name (e.g. DATABASE_URL, STRIPE_SECRET_KEY).',
+                  ...(missingKey ? { default: String(missingKey) } : {}),
+                  minLength: 1,
+                  maxLength: 128
+                },
+                storeInVault: {
+                  type: 'boolean',
+                  title: 'Store encrypted in Culkibo Vault (AES-256-GCM)',
+                  default: true
+                },
+                vaultRef: {
+                  type: 'string',
+                  title: 'Vault reference placeholder',
+                  description: 'Use ${vault.KEY} syntax instead of plaintext literals in config/logs.',
+                  ...(missingKey ? { default: `\${vault.${String(missingKey)}}` } : {})
+                }
+              },
+              required: ['secretKey', 'storeInVault']
+            }
+          : {
+              type: 'object',
+              properties: {
+                remediationStrategy: {
+                  type: 'string',
+                  title: 'Secret remediation action',
+                  enum: ['move_to_vault', 'rotate_and_vault', 'admin_warn_override'],
+                  default: 'move_to_vault'
+                },
+                acknowledgeVaultPolicy: {
+                  type: 'boolean',
+                  title: 'Confirm secrets will be referenced via ${vault.KEY}',
+                  default: true
+                }
+              },
+              required: ['remediationStrategy', 'acknowledgeVaultPolicy']
+            }
+      });
+    }
+
+    if (code === 'DEPLOY_FROZEN' || code === 'DEPLOY_FREEZE_ACTIVE') {
+      return buildElicitationRequest({
+        message: envelope.message || `Deployment is blocked by an active deploy freeze window${projectId ? ` on '${projectId}'` : ''}.`,
+        action,
+        projectId,
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            overrideFreeze: {
+              type: 'boolean',
+              title: 'Override active deploy freeze (admin/owner only)',
+              description: 'Set true only for emergency hotfixes authorized by an admin or owner.',
+              default: false
+            },
+            incidentTicket: {
+              type: 'string',
+              title: 'Incident / Change Ticket ID',
+              description: 'Tracking ticket authorizing emergency freeze override (e.g. INC-402).',
+              maxLength: 80
+            },
+            reason: {
+              type: 'string',
+              title: 'Override justification',
+              minLength: 5,
+              maxLength: 240
+            }
+          },
+          required: ['overrideFreeze', 'reason']
+        }
+      });
+    }
+
+    return null;
+  }
+
+  /** Limpia tareas expiradas y mantiene el almacén acotado a `MAX_ASYNC_TASKS` (128) sin timers en reposo. */
+  _pruneTasks() {
+    const now = Date.now();
+    for (const [taskId, task] of this._tasks.entries()) {
+      if (now > task.expiresAt) {
+        if (task.status === 'working') {
+          try { task.abortController.abort(); } catch (e) {}
+          if (task.startTimer) {
+            clearImmediate(task.startTimer);
+            task.startTimer = null;
+          }
+          task.status = 'cancelled';
+          task.statusMessage = 'Task TTL expired';
+          task.lastUpdatedAt = new Date(now).toISOString();
+          if (typeof task.resolveDone === 'function') task.resolveDone(task);
+        }
+        this._tasks.delete(taskId);
+      }
+    }
+    while (this._tasks.size >= MAX_ASYNC_TASKS) {
+      /** @type {string | null} */
+      let victimId = null;
+      for (const [tid, t] of this._tasks.entries()) {
+        if (t.status !== 'working') {
+          victimId = tid;
+          break;
+        }
+      }
+      if (!victimId) {
+        victimId = this._tasks.keys().next().value || null;
+      }
+      if (!victimId) break;
+      const victim = this._tasks.get(victimId);
+      if (victim && victim.status === 'working') {
+        try { victim.abortController.abort(); } catch (e) {}
+        if (victim.startTimer) {
+          clearImmediate(victim.startTimer);
+          victim.startTimer = null;
+        }
+        if (typeof victim.resolveDone === 'function') victim.resolveDone(victim);
+      }
+      this._tasks.delete(victimId);
+    }
+  }
+
+  /** Serializa una tarea MCP 2026-07-28 sin filtrar campos internos ni identidad de otros tenants. */
+  _serializeTask(task) {
+    return {
+      taskId: task.taskId,
+      status: task.status,
+      statusMessage: task.statusMessage,
+      createdAt: task.createdAt,
+      lastUpdatedAt: task.lastUpdatedAt,
+      ttl: task.ttl,
+      pollInterval: task.pollInterval
+    };
+  }
+
+  /**
+   * Encola una llamada `tools/call` como MCP Async Task (`io.modelcontextprotocol/tasks`),
+   * devolviendo inmediatamente `{ taskId, status: 'working', createdAt, lastUpdatedAt, ttl, pollInterval }`.
+   * @param {string} toolName
+   * @param {any} args
+   * @param {any} taskOpts
+   * @param {{ transport?: string, clientInfo?: any, auth?: any, onProgress?: (msg: string) => void }} [context]
+   */
+  enqueueToolTask(toolName, args, taskOpts = {}, context = {}) {
+    const principal = normalizePrincipal(context.auth);
+    if (principal.role === 'none') {
+      throw new McpToolError('FORBIDDEN', 'Autenticación inválida o revocada para crear tareas MCP.', {
+        retryable: false,
+        remediation: 'Proporciona un token Bearer o sesión válida antes de usar MCP Async Tasks.'
+      });
+    }
+    this._pruneTasks();
+
+    const rawTtl = taskOpts && typeof taskOpts === 'object' ? Number(taskOpts.ttl) : NaN;
+    const ttl = Number.isFinite(rawTtl)
+      ? Math.min(MAX_TASK_TTL_MS, Math.max(MIN_TASK_TTL_MS, Math.round(rawTtl)))
+      : DEFAULT_TASK_TTL_MS;
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const taskId = `tsk_${crypto.randomBytes(12).toString('hex')}`;
+    const abortController = new AbortController();
+
+    /** @type {(v: any) => void} */
+    let resolveDone = () => {};
+    const donePromise = new Promise((resolve) => {
+      resolveDone = resolve;
+    });
+
+    /** @type {any} */
+    const task = {
+      taskId,
+      principalKey: this._taskPrincipalKey(principal),
+      toolName: String(toolName || ''),
+      status: 'working',
+      statusMessage: `Executing '${toolName}'...`,
+      createdAt: nowIso,
+      lastUpdatedAt: nowIso,
+      ttl,
+      expiresAt: now + ttl,
+      pollInterval: DEFAULT_TASK_POLL_INTERVAL_MS,
+      abortController,
+      result: null,
+      error: null,
+      donePromise,
+      resolveDone,
+      startTimer: null
+    };
+
+    this._tasks.set(taskId, task);
+
+    const run = async () => {
+      task.startTimer = null;
+      if (task.status !== 'working' || abortController.signal.aborted) {
+        if (task.status === 'working') {
+          task.status = 'cancelled';
+          task.statusMessage = 'Task cancelled before execution';
+          task.lastUpdatedAt = new Date().toISOString();
+        }
+        resolveDone(task);
+        return;
+      }
+      try {
+        const toolResult = await this.executeTool(toolName, args, {
+          transport: context.transport || `MCP ${PROTOCOL_VERSION} (async-task)`,
+          clientInfo: context.clientInfo || null,
+          signal: abortController.signal,
+          onProgress: (msg) => {
+            if (task.status === 'working') {
+              task.statusMessage = String(msg || '').slice(0, 240);
+              task.lastUpdatedAt = new Date().toISOString();
+            }
+            if (typeof context.onProgress === 'function') context.onProgress(msg);
+          },
+          auth: context.auth
+        });
+        if (task.status === 'cancelled' || abortController.signal.aborted) {
+          task.status = 'cancelled';
+          task.statusMessage = 'Cancelled by client';
+          task.lastUpdatedAt = new Date().toISOString();
+        } else if (toolResult && toolResult.isError) {
+          task.status = 'failed';
+          task.statusMessage = `Tool '${toolName}' returned an error`;
+          task.result = toolResult;
+          task.lastUpdatedAt = new Date().toISOString();
+        } else {
+          task.status = 'completed';
+          task.statusMessage = `Completed '${toolName}'`;
+          task.result = toolResult;
+          task.lastUpdatedAt = new Date().toISOString();
+        }
+      } catch (err) {
+        if (task.status !== 'cancelled') {
+          task.status = 'failed';
+          task.statusMessage = err && err.message ? String(err.message).slice(0, 240) : 'Async task execution failed';
+          task.error = { code: ERROR_CODES.INTERNAL_ERROR, message: task.statusMessage };
+          task.lastUpdatedAt = new Date().toISOString();
+        }
+      } finally {
+        resolveDone(task);
+      }
+    };
+
+    task.startTimer = setImmediate(() => {
+      run().catch(() => {});
+    });
+    if (task.startTimer && typeof task.startTimer.unref === 'function') {
+      task.startTimer.unref();
+    }
+
+    return this._serializeTask(task);
+  }
+
+  /**
+   * Lista las tareas asíncronas visibles ÚNICAMENTE para el principal invocador.
+   * @param {any} [authOrPrincipal]
+   */
+  listTasks(authOrPrincipal = null) {
+    const principal = normalizePrincipal(authOrPrincipal);
+    if (principal.role === 'none') {
+      throw new McpToolError('FORBIDDEN', 'Autenticación inválida o revocada para listar tareas MCP.');
+    }
+    this._pruneTasks();
+    const callerKey = this._taskPrincipalKey(principal);
+    const items = [];
+    for (const task of this._tasks.values()) {
+      if (task.principalKey === callerKey) {
+        items.push(this._serializeTask(task));
+      }
+    }
+    return items;
+  }
+
+  /**
+   * Resuelve una tarea propiedad exclusiva del principal; devuelve error `TASK_NOT_FOUND`
+   * si no existe, expiró o pertenece a otro principal (cero fuga cross-tenant).
+   * @param {string} taskId
+   * @param {any} [authOrPrincipal]
+   */
+  _getOwnedTask(taskId, authOrPrincipal = null) {
+    const principal = normalizePrincipal(authOrPrincipal);
+    if (principal.role === 'none') {
+      throw new McpToolError('FORBIDDEN', 'Autenticación inválida o revocada para consultar tareas MCP.');
+    }
+    this._pruneTasks();
+    const cleanId = typeof taskId === 'string' ? taskId.trim() : '';
+    if (!cleanId) {
+      throw new McpToolError('MISSING_ARGUMENT', 'Falta el parámetro obligatorio taskId.');
+    }
+    const task = this._tasks.get(cleanId);
+    const callerKey = this._taskPrincipalKey(principal);
+    if (!task || task.principalKey !== callerKey) {
+      throw new McpToolError('TASK_NOT_FOUND', `Tarea MCP no encontrada o sin acceso: '${cleanId}'.`);
+    }
+    return task;
+  }
+
+  /** @param {string} taskId @param {any} [authOrPrincipal] */
+  getTask(taskId, authOrPrincipal = null) {
+    const task = this._getOwnedTask(taskId, authOrPrincipal);
+    return this._serializeTask(task);
+  }
+
+  /**
+   * Espera hasta que la tarea alcance estado terminal y devuelve su resultado con `_meta['io.modelcontextprotocol/related-task']`.
+   * @param {string} taskId
+   * @param {any} [authOrPrincipal]
+   * @param {{ timeoutMs?: number }} [opts]
+   */
+  async getTaskResult(taskId, authOrPrincipal = null, opts = {}) {
+    const task = this._getOwnedTask(taskId, authOrPrincipal);
+    if (task.status === 'working') {
+      const waitMs = Math.min(MAX_TASK_TTL_MS, Math.max(100, Number(opts.timeoutMs) || Math.min(task.ttl, DEFAULT_TASK_RESULT_WAIT_MS)));
+      /** @type {any} */
+      let timer = null;
+      await Promise.race([
+        task.donePromise,
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, waitMs);
+          if (timer && typeof timer.unref === 'function') timer.unref();
+        })
+      ]);
+      if (timer) clearTimeout(timer);
+    }
+    if (task.status === 'cancelled') {
+      throw new McpToolError('TASK_CANCELLED', `La tarea '${task.taskId}' fue cancelada y no tiene resultado.`);
+    }
+    if (task.status === 'working') {
+      throw new McpToolError('TASK_IN_PROGRESS', `La tarea '${task.taskId}' sigue en ejecución; vuelve a consultar con tasks/get o tasks/result.`, {
+        retryable: true,
+        details: { task: this._serializeTask(task) }
+      });
+    }
+    if (task.result && typeof task.result === 'object') {
+      return {
+        ...task.result,
+        _meta: {
+          ...(task.result._meta || {}),
+          [META_RELATED_TASK]: { taskId: task.taskId }
+        }
+      };
+    }
+    throw new McpToolError('INTERNAL_ERROR', task.error?.message || `La tarea '${task.taskId}' finalizó sin resultado.`);
+  }
+
+  /**
+   * Cancela una tarea `working` propiedad del principal; rechaza cancelar tareas ya terminales.
+   * @param {string} taskId
+   * @param {any} [authOrPrincipal]
+   */
+  cancelTask(taskId, authOrPrincipal = null) {
+    const task = this._getOwnedTask(taskId, authOrPrincipal);
+    if (task.status !== 'working') {
+      throw new McpToolError('INVALID_ARGUMENT', `No se puede cancelar la tarea '${task.taskId}' en estado terminal '${task.status}'.`, {
+        retryable: false,
+        remediation: 'Solo las tareas en estado "working" pueden cancelarse.'
+      });
+    }
+    if (task.startTimer) {
+      clearImmediate(task.startTimer);
+      task.startTimer = null;
+    }
+    task.status = 'cancelled';
+    task.statusMessage = 'Cancelled by client';
+    task.lastUpdatedAt = new Date().toISOString();
+    try { task.abortController.abort(); } catch (e) {}
+    if (typeof task.resolveDone === 'function') task.resolveDone(task);
+    return this._serializeTask(task);
   }
 
   /**
@@ -7330,6 +7911,150 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_verify_attestation': {
+          const sca = requireLazySvc('supplyChainAttestor', 'SLSA v1.1 Supply Chain Attestor');
+          const resolvedAction = args.action
+            ? String(args.action)
+            : (args.envelope
+                ? 'verify'
+                : (args.projectId && args.revision ? 'verify' : (args.projectId ? 'list' : 'public_key')));
+
+          if (resolvedAction === 'public_key') {
+            const publicKeyPem = sca.getPublicKeyPem();
+            res = {
+              action: 'public_key',
+              valid: true,
+              projectId: null,
+              revision: null,
+              publicKeyPem
+            };
+          } else if (resolvedAction === 'list') {
+            /** @type {any[]} */
+            let items = [];
+            try {
+              items = sca.listAttestations(args.projectId ? String(args.projectId) : undefined);
+            } catch (e) {
+              throw new McpToolError('INVALID_ARGUMENT', e.message, {
+                retryable: true,
+                remediation: 'Usa un projectId válido (alfanumérico, ".", "_" o "-").'
+              });
+            }
+            if (!principal.isSuperAdmin) {
+              items = items.filter((item) => canAccessProject(principal, item.projectId));
+            }
+            res = {
+              action: 'list',
+              valid: items.every((i) => i.valid !== false),
+              projectId: args.projectId ? String(args.projectId) : null,
+              revision: null,
+              count: items.length,
+              attestations: items
+            };
+          } else if (resolvedAction === 'get') {
+            if (!args.projectId || !args.revision) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="get" requiere projectId y revision.', {
+                retryable: true,
+                remediation: 'Lista atestaciones disponibles con culkibo_verify_attestation({ action: "list", projectId }) y pasa revision.'
+              });
+            }
+            /** @type {any} */
+            let att = null;
+            try {
+              att = sca.getAttestation(String(args.projectId), String(args.revision));
+            } catch (e) {
+              throw new McpToolError('INVALID_ARGUMENT', e.message, {
+                retryable: true,
+                remediation: 'Usa identificadores projectId y revision válidos sin separadores de ruta.'
+              });
+            }
+            if (!att) {
+              throw new McpToolError('NOT_FOUND', `No existe atestación SLSA para '${args.projectId}@${args.revision}'.`, {
+                retryable: false,
+                remediation: 'Consulta las revisiones atestadas con culkibo_verify_attestation({ action: "list", projectId }).'
+              });
+            }
+            res = {
+              action: 'get',
+              valid: Boolean(att.verification?.valid),
+              projectId: String(args.projectId),
+              revision: String(args.revision),
+              attestation: att,
+              verification: att.verification || null
+            };
+          } else {
+            // action === 'verify'
+            /** @type {any} */
+            let targetEnvelope = args.envelope || null;
+            if (!targetEnvelope) {
+              if (!args.projectId || !args.revision) {
+                throw new McpToolError('MISSING_ARGUMENT', 'Indica envelope (DSSE JSON) o projectId + revision para verificar la atestación SLSA v1.1.', {
+                  retryable: true,
+                  remediation: 'Pasa { envelope } para verificar offline o { projectId, revision } para verificar una release persistida.'
+                });
+              }
+              /** @type {any} */
+              let stored = null;
+              try {
+                stored = sca.getAttestation(String(args.projectId), String(args.revision));
+              } catch (e) {
+                throw new McpToolError('INVALID_ARGUMENT', e.message, {
+                  retryable: true,
+                  remediation: 'Usa identificadores projectId y revision válidos.'
+                });
+              }
+              if (!stored) {
+                throw new McpToolError('NOT_FOUND', `No existe atestación SLSA para '${args.projectId}@${args.revision}'.`, {
+                  retryable: false,
+                  remediation: 'Lista atestaciones disponibles con culkibo_verify_attestation({ action: "list", projectId }).'
+                });
+              }
+              targetEnvelope = stored.envelope || stored;
+            }
+            const verification = sca.verifyAttestation(targetEnvelope, args.publicKeyPem ? String(args.publicKeyPem) : undefined);
+            res = {
+              action: 'verify',
+              valid: Boolean(verification && verification.valid),
+              projectId: args.projectId ? String(args.projectId) : null,
+              revision: args.revision ? String(args.revision) : null,
+              verification
+            };
+          }
+          break;
+        }
+
+        case 'culkibo_otlp_status': {
+          const otlp = requireLazySvc('otlpExporter', 'OpenTelemetry OTLP/HTTP Exporter');
+          const action = String(args.action || 'status');
+          if (action === 'configure') {
+            /** @type {Record<string, any>} */
+            const cfg = {};
+            if (args.endpoint !== undefined) cfg.endpoint = args.endpoint;
+            if (args.headers !== undefined) cfg.headers = args.headers;
+            if (args.enabled !== undefined) cfg.enabled = Boolean(args.enabled);
+            if (args.serviceName !== undefined) cfg.serviceName = String(args.serviceName);
+            if (args.allowLoopback !== undefined) cfg.allowLoopback = Boolean(args.allowLoopback);
+            if (args.timeoutMs !== undefined) cfg.timeoutMs = Number(args.timeoutMs);
+            /** @type {any} */
+            let status;
+            try {
+              status = otlp.configure(cfg);
+            } catch (e) {
+              throw new McpToolError('INVALID_ARGUMENT', e.message, {
+                retryable: true,
+                remediation: 'Proporciona un endpoint OTLP/HTTP válido (Grafana Tempo, SigNoz o Honeycomb) que no apunte a metadatos cloud.'
+              });
+            }
+            res = { action: 'configure', configured: true, status };
+          } else if (action === 'flush') {
+            const flush = await otlp.flush();
+            res = { action: 'flush', configured: Boolean(otlp.getStatus().enabled), flush, status: otlp.getStatus() };
+          } else {
+            const status = otlp.getStatus();
+            res = { action: 'status', configured: Boolean(status.enabled), status };
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -7361,6 +8086,7 @@ class McpServer extends EventEmitter {
     } catch (err) {
       const durationMs = performance.now() - start;
       const envelope = this.describeToolFailure(toolName, tool, err, durationMs);
+      const elicitation = this._buildErrorElicitation(toolName, args, envelope, err);
       this.logCall(toolName, args, { error: envelope.code, message: envelope.message }, false, durationMs, transport, clientInfo, { dryRun: isDryRun, principal });
       try {
         const ts = require('./telemetryService');
@@ -7377,7 +8103,10 @@ class McpServer extends EventEmitter {
       return {
         isError: true,
         content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        _meta: { [META_CULKIBO_ERROR]: envelope }
+        _meta: {
+          [META_CULKIBO_ERROR]: envelope,
+          ...(elicitation ? { [META_ELICITATION]: elicitation } : {})
+        }
       };
     }
   }
@@ -8123,6 +8852,15 @@ class McpServer extends EventEmitter {
             tools: { listChanged: false },
             resources: { listChanged: false },
             prompts: { listChanged: false },
+            tasks: {
+              list: {},
+              cancel: {},
+              requests: {
+                tools: {
+                  call: {}
+                }
+              }
+            },
             extensions: {
               'io.modelcontextprotocol/ui': {
                 mimeTypes: [mcpAppsRenderer.MCP_APP_MIME_TYPE],
@@ -8164,6 +8902,28 @@ class McpServer extends EventEmitter {
     if (method === 'tools/call') {
       const toolName = params?.name;
       const args = params?.arguments === undefined ? {} : params.arguments;
+      if (params && params.task && typeof params.task === 'object' && !Array.isArray(params.task)) {
+        try {
+          const task = this.enqueueToolTask(toolName, args, params.task, {
+            transport: context.transport || `MCP ${LEGACY_PROTOCOL_VERSION} (async-task)`,
+            auth: context.auth
+          });
+          return {
+            jsonrpc: '2.0',
+            id: safeId,
+            result: {
+              task,
+              _meta: { [META_RELATED_TASK]: { taskId: task.taskId } }
+            }
+          };
+        } catch (err) {
+          return {
+            jsonrpc: '2.0',
+            id: safeId,
+            error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_ERROR' } }
+          };
+        }
+      }
       const toolResult = await this.executeTool(toolName, args, {
         transport: context.transport || `MCP ${LEGACY_PROTOCOL_VERSION} (deprecado)`,
         auth: context.auth
@@ -8173,6 +8933,38 @@ class McpServer extends EventEmitter {
         id: safeId,
         result: toolResult
       };
+    }
+
+    if (method === 'tasks/list') {
+      try {
+        return { jsonrpc: '2.0', id: safeId, result: { tasks: this.listTasks(context.auth) } };
+      } catch (err) {
+        return { jsonrpc: '2.0', id: safeId, error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_ERROR' } } };
+      }
+    }
+
+    if (method === 'tasks/get') {
+      try {
+        return { jsonrpc: '2.0', id: safeId, result: this.getTask(params?.taskId, context.auth) };
+      } catch (err) {
+        return { jsonrpc: '2.0', id: safeId, error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_NOT_FOUND', taskId: params?.taskId } } };
+      }
+    }
+
+    if (method === 'tasks/result') {
+      try {
+        return { jsonrpc: '2.0', id: safeId, result: await this.getTaskResult(params?.taskId, context.auth) };
+      } catch (err) {
+        return { jsonrpc: '2.0', id: safeId, error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_ERROR', taskId: params?.taskId } } };
+      }
+    }
+
+    if (method === 'tasks/cancel') {
+      try {
+        return { jsonrpc: '2.0', id: safeId, result: this.cancelTask(params?.taskId, context.auth) };
+      } catch (err) {
+        return { jsonrpc: '2.0', id: safeId, error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_ERROR', taskId: params?.taskId } } };
+      }
     }
 
     if (method === 'resources/list') {
@@ -8206,7 +8998,7 @@ class McpServer extends EventEmitter {
         code: ERROR_CODES.METHOD_NOT_FOUND,
         message: `Method '${method}' not found`,
         data: {
-          supported: ['initialize', 'tools/list', 'tools/call', 'resources/list', 'resources/read', 'prompts/list', 'prompts/get'],
+          supported: ['initialize', 'tools/list', 'tools/call', 'resources/list', 'resources/read', 'prompts/list', 'prompts/get', 'tasks/list', 'tasks/get', 'tasks/result', 'tasks/cancel'],
           hint: `Este endpoint sirve la revisión ${LEGACY_PROTOCOL_VERSION}. Para ${PROTOCOL_VERSION} usa POST /api/mcp.`
         }
       }
@@ -8229,6 +9021,15 @@ class McpServer extends EventEmitter {
           tools: { listChanged: false, filtering: true },
           resources: { listChanged: false },
           prompts: { listChanged: false },
+          tasks: {
+            list: {},
+            cancel: {},
+            requests: {
+              tools: {
+                call: {}
+              }
+            }
+          },
           extensions: {
             'io.modelcontextprotocol/ui': {
               mimeTypes: [mcpAppsRenderer.MCP_APP_MIME_TYPE],
@@ -8237,12 +9038,13 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026: 111 herramientas anotadas, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 113 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
+          'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',
           'Las herramientas culkibo_list_projects, culkibo_list_pods, culkibo_diagnose_incident y culkibo_migrate_coolify enlazan MCP Apps nativas (ui://culkibo/topology, ui://culkibo/incident-remediator, ui://culkibo/coolify-migration-diff) con mimeType text/html;profile=mcp-app y CSP estricta.',
-          'Usa prompts/list para acceder a los 8 playbooks interactivos (deploy_safely, migrate_from_coolify, debug_production_crash, zero_downtime_db_upgrade, security_audit_stack, setup_wildcard_tls_and_tunnel, optimize_ram_and_costs, disaster_recovery_drill) y culkibo_export_agent_kit para generar configs drop-in sin secretos en claro.',
-          'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation: úsalo para decidir si reintentar o corregir los argumentos.'
+          'Usa prompts/list para acceder a los 8 playbooks interactivos y culkibo_export_agent_kit para generar configs drop-in sin secretos en claro.',
+          'Cuando una llamada falla, el bloque de texto del resultado es un JSON con code, retryable y remediation (y _meta["io.modelcontextprotocol/elicitation"] en confirmación/secretos/freeze).'
         ].join(' '),
         ttlMs: 300000,
         cacheScope: 'public'
@@ -8314,6 +9116,31 @@ class McpServer extends EventEmitter {
     if (method === 'tools/call') {
       const toolName = params?.name;
       const args = params?.arguments === undefined ? {} : params.arguments;
+      if (params && params.task && typeof params.task === 'object' && !Array.isArray(params.task)) {
+        try {
+          const task = this.enqueueToolTask(toolName, args, params.task, {
+            transport,
+            clientInfo,
+            onProgress: context.onProgress,
+            auth: context.auth
+          });
+          return ok({
+            task,
+            cacheScope: 'private',
+            _meta: { [META_RELATED_TASK]: { taskId: task.taskId } }
+          });
+        } catch (err) {
+          return {
+            jsonrpc: '2.0',
+            id,
+            error: {
+              code: ERROR_CODES.INVALID_PARAMS,
+              message: err.message,
+              data: { code: err.code || 'TASK_ERROR' }
+            }
+          };
+        }
+      }
       const toolResult = await this.executeTool(toolName, args, {
         transport,
         clientInfo,
@@ -8322,6 +9149,68 @@ class McpServer extends EventEmitter {
         auth: context.auth
       });
       return ok(toolResult);
+    }
+
+    if (method === 'tasks/list') {
+      try {
+        return ok({
+          tasks: this.listTasks(principal),
+          ttlMs: 0,
+          cacheScope: 'private'
+        });
+      } catch (err) {
+        return {
+          jsonrpc: '2.0',
+          id,
+          error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_ERROR' } }
+        };
+      }
+    }
+
+    if (method === 'tasks/get') {
+      try {
+        return ok({
+          ...this.getTask(params?.taskId, principal),
+          cacheScope: 'private'
+        });
+      } catch (err) {
+        return {
+          jsonrpc: '2.0',
+          id,
+          error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_NOT_FOUND', taskId: params?.taskId } }
+        };
+      }
+    }
+
+    if (method === 'tasks/result') {
+      try {
+        const taskResult = await this.getTaskResult(params?.taskId, principal);
+        return ok({
+          ...taskResult,
+          cacheScope: 'private'
+        });
+      } catch (err) {
+        return {
+          jsonrpc: '2.0',
+          id,
+          error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_ERROR', taskId: params?.taskId } }
+        };
+      }
+    }
+
+    if (method === 'tasks/cancel') {
+      try {
+        return ok({
+          ...this.cancelTask(params?.taskId, principal),
+          cacheScope: 'private'
+        });
+      } catch (err) {
+        return {
+          jsonrpc: '2.0',
+          id,
+          error: { code: ERROR_CODES.INVALID_PARAMS, message: err.message, data: { code: err.code || 'TASK_ERROR', taskId: params?.taskId } }
+        };
+      }
     }
 
     if (method === 'resources/list') {
@@ -8471,6 +9360,8 @@ const mcpServer = Object.assign(new McpServer(), {
     META_CLIENT_INFO,
     META_CLIENT_CAPABILITIES,
     META_SERVER_INFO,
+    META_ELICITATION,
+    META_RELATED_TASK,
     ERROR_CODES,
     MODERN_METHODS,
     NAME_BEARING_METHODS,
@@ -8483,7 +9374,8 @@ const mcpServer = Object.assign(new McpServer(), {
   VALID_TOOL_PROFILES,
   normalizePrincipal,
   lazySvc,
-  redactForAudit
+  redactForAudit,
+  buildElicitationRequest
 });
 
 module.exports = mcpServer;

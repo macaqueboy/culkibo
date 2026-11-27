@@ -31,6 +31,58 @@ function assertSafePgIdent(val, label) {
   return s;
 }
 
+const PR_SCHEMA_IDENT_RE = /^pr_[1-9][0-9]{0,7}$/;
+
+/**
+ * Redacta credenciales de una URL PostgreSQL antes de persistir o emitir logs.
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+function redactDatabaseUrl(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || ''));
+    if (u.password) u.password = '***';
+    return u.toString();
+  } catch (e) {
+    return String(rawUrl || '').replace(/(:\/\/[^:@/\s]+):[^@/\s]+@/g, '$1:***@');
+  }
+}
+
+/**
+ * Reescribe de forma segura una `DATABASE_URL` de PostgreSQL añadiendo el parámetro
+ * `options=-csearch_path%3Dpr_<n>` sin perder parámetros previos ni filtrar credenciales
+ * en mensajes de error.
+ *
+ * @param {string} databaseUrl
+ * @param {string} schemaName
+ * @returns {string}
+ */
+function rewriteDatabaseUrlWithSchema(databaseUrl, schemaName) {
+  const cleanSchema = assertSafePgIdent(schemaName, 'schemaName');
+  if (!PR_SCHEMA_IDENT_RE.test(cleanSchema)) {
+    throw new Error(`Nombre de esquema PR inválido (se requiere pr_<n>): "${cleanSchema}"`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(String(databaseUrl || '').trim());
+  } catch (e) {
+    throw new Error('DATABASE_URL inválida para aislamiento de esquema PostgreSQL');
+  }
+  if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') {
+    throw new Error(`Protocolo de DATABASE_URL no soportado para esquema PostgreSQL: "${parsed.protocol}"`);
+  }
+
+  const existingOptions = String(parsed.searchParams.get('options') || '').trim();
+  const cleanedOptions = existingOptions
+    .replace(/(?:^|\s)-c\s*search_path=[^\s]+/g, '')
+    .trim();
+  const nextOptions = cleanedOptions
+    ? `${cleanedOptions} -csearch_path=${cleanSchema}`
+    : `-csearch_path=${cleanSchema}`;
+  parsed.searchParams.set('options', nextOptions);
+  return parsed.toString();
+}
+
 const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
   ? path.resolve(process.env.CULKIBO_DATA_DIR)
   : path.resolve(__dirname, '..', '..');
@@ -119,11 +171,15 @@ class PreviewManager extends EventEmitter {
     }
     this.storeBakFile = `${this.storeFile}.bak`;
     this.branchStoreFile = path.join(path.dirname(this.storeFile), 'preview-db-branches.json');
+    this.schemaStoreFile = path.join(path.dirname(this.storeFile), 'preview-db-schemas.json');
     /** @type {Record<string, Record<string, any>>} */
     this.store = {};
     /** @type {Record<string, any>} */
     this._dbBranches = {};
     this._branchesLoaded = false;
+    /** @type {Record<string, any>} */
+    this._dbSchemas = {};
+    this._schemasLoaded = false;
     /** @type {Set<string>} */
     this.inFlightKeys = new Set();
     /**
@@ -745,7 +801,7 @@ class PreviewManager extends EventEmitter {
       this.save();
     }
 
-    // Limpieza automática e idempotente de ramas de BD de preview (cura coolify#12458 zombie leaks)
+    // Limpieza automática e idempotente de ramas de BD y esquemas aislados de preview (cura coolify#12458 y dokploy#2462)
     /** @type {any} */
     let dbBranchTeardown = null;
     try {
@@ -753,9 +809,16 @@ class PreviewManager extends EventEmitter {
         branchPlan: prev?.dbBranch || null
       });
     } catch (e) {}
+    /** @type {any} */
+    let dbSchemaTeardown = null;
+    try {
+      dbSchemaTeardown = await this.teardownPreviewSchemaIsolation(`${projectId}:${key}`, {
+        schemaPlan: prev?.dbSchema || null
+      });
+    } catch (e) {}
 
-    this.emit('preview_event', { action: 'destroyed', projectId, key, abortedBuild, dbBranchTeardown });
-    return { removed: true, abortedBuild, key, dbBranchTeardown };
+    this.emit('preview_event', { action: 'destroyed', projectId, key, abortedBuild, dbBranchTeardown, dbSchemaTeardown });
+    return { removed: true, abortedBuild, key, dbBranchTeardown, dbSchemaTeardown };
   }
 
   _ensureBranchesLoaded() {
@@ -1054,6 +1117,210 @@ class PreviewManager extends EventEmitter {
     };
   }
 
+  _ensureSchemasLoaded() {
+    if (this._schemasLoaded) return;
+    this._schemasLoaded = true;
+    try {
+      if (fs.existsSync(this.schemaStoreFile)) {
+        const parsed = JSON.parse(fs.readFileSync(this.schemaStoreFile, 'utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          this._dbSchemas = parsed;
+          return;
+        }
+      }
+    } catch (e) {}
+    this._dbSchemas = {};
+  }
+
+  _saveSchemas() {
+    this._ensureSchemasLoaded();
+    try {
+      fs.mkdirSync(path.dirname(this.schemaStoreFile), { recursive: true });
+      atomicWriteJsonSync(this.schemaStoreFile, this._dbSchemas, 0o600);
+    } catch (e) {
+      console.error('[PreviewManager] No se pudo guardar preview-db-schemas.json:', e.message);
+    }
+  }
+
+  /**
+   * Planifica aislamiento ligero de esquema PostgreSQL por Pull Request (`pr_<n>`)
+   * con variables parametrizadas `psql -v` (cero shell, cero interpolación SQL) y
+   * reescritura segura de `DATABASE_URL` (`options=-csearch_path%3Dpr_<n>`).
+   * Cura `dokploy#2462`.
+   *
+   * @param {any} project
+   * @param {number | string} prNumber
+   * @param {{
+   *   dbName?: string,
+   *   database?: string,
+   *   username?: string,
+   *   containerName?: string,
+   *   host?: string,
+   *   port?: number | string,
+   *   databaseUrl?: string
+   * }} [dbConfig]
+   */
+  planPreviewSchemaIsolation(project, prNumber, dbConfig = {}) {
+    if (!project || !project.id) {
+      throw new Error('planPreviewSchemaIsolation requiere un proyecto válido con id');
+    }
+    const cleanPr = String(prNumber == null ? '' : prNumber).replace(/^pr-/i, '').trim();
+    if (!/^[1-9][0-9]{0,7}$/.test(cleanPr)) {
+      throw new Error(`Número de PR inválido para aislamiento de esquema PostgreSQL: "${String(prNumber)}"`);
+    }
+    const key = `pr-${cleanPr}`;
+    const previewId = `${project.id}:${key}`;
+    const schemaName = assertSafePgIdent(`pr_${cleanPr}`, 'schemaName');
+    if (!PR_SCHEMA_IDENT_RE.test(schemaName)) {
+      throw new Error(`Identificador de esquema PR inválido: "${schemaName}"`);
+    }
+
+    const dbName = assertSafePgIdent(dbConfig.dbName || dbConfig.database || 'app', 'dbName');
+    const username = assertSafePgIdent(dbConfig.username || 'postgres', 'username');
+    const containerName = String(dbConfig.containerName || 'culkibo-postgres').trim();
+    if (!SAFE_DOCKER_CONTAINER_RE.test(containerName)) {
+      throw new Error(`Nombre de contenedor PostgreSQL inválido: "${containerName.slice(0, 60)}"`);
+    }
+    const host = String(dbConfig.host || containerName).trim();
+    if (!/^[a-zA-Z0-9._-]+$/.test(host)) {
+      throw new Error(`Host PostgreSQL inválido: "${host.slice(0, 60)}"`);
+    }
+    const port = Number(dbConfig.port || 5432);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`Puerto PostgreSQL inválido: "${dbConfig.port}"`);
+    }
+
+    // Zero-shell: variables `psql -v` con identificadores citados `:"schema_name"`
+    const createSql = 'CREATE SCHEMA IF NOT EXISTS :"schema_name" AUTHORIZATION :"db_owner";';
+    const dropSql = 'DROP SCHEMA IF EXISTS :"schema_name" CASCADE;';
+
+    const createArgv = [
+      'exec', '-i', containerName,
+      'psql', '-v', 'ON_ERROR_STOP=1',
+      '-v', `schema_name=${schemaName}`,
+      '-v', `db_owner=${username}`,
+      '-U', username, '-d', dbName,
+      '-c', createSql
+    ];
+    const teardownArgv = [
+      'exec', '-i', containerName,
+      'psql', '-v', 'ON_ERROR_STOP=1',
+      '-v', `schema_name=${schemaName}`,
+      '-U', username, '-d', dbName,
+      '-c', dropSql
+    ];
+
+    const rewrittenDatabaseUrl = dbConfig.databaseUrl
+      ? rewriteDatabaseUrlWithSchema(dbConfig.databaseUrl, schemaName)
+      : `postgresql://${username}:\${vault.DB_PASSWORD}@${host}:${port}/${dbName}?options=-csearch_path%3D${schemaName}`;
+    const databaseUrlRedacted = redactDatabaseUrl(rewrittenDatabaseUrl);
+
+    const persistedRecord = {
+      ok: true,
+      previewId,
+      projectId: String(project.id),
+      key,
+      prNumber: Number(cleanPr),
+      engine: 'postgres',
+      strategy: 'postgres_schema_isolation',
+      zeroShell: true,
+      idempotentTeardown: true,
+      schemaName,
+      dbName,
+      username,
+      containerName,
+      host,
+      port,
+      sqlTemplates: {
+        createSql,
+        dropSql
+      },
+      createCommand: { program: 'docker', args: createArgv },
+      teardownCommand: { program: 'docker', args: teardownArgv },
+      createArgv,
+      teardownArgv,
+      databaseUrlRedacted,
+      createdAt: new Date().toISOString()
+    };
+
+    // Persistir únicamente metadatos redactados (JAMÁS contraseñas en claro en disco)
+    this._ensureSchemasLoaded();
+    this._dbSchemas[previewId] = persistedRecord;
+    this._saveSchemas();
+
+    return {
+      ...persistedRecord,
+      envOverride: {
+        DATABASE_URL: rewrittenDatabaseUrl,
+        PGOPTIONS: `-c search_path=${schemaName}`,
+        CULKIBO_PREVIEW_SCHEMA: schemaName,
+        CULKIBO_PREVIEW_DB_SCHEMA: previewId
+      }
+    };
+  }
+
+  /**
+   * Elimina de forma 100% idempotente el esquema PostgreSQL aislado (`DROP SCHEMA IF EXISTS ... CASCADE`)
+   * asociado a una Pull Request.
+   *
+   * @param {string | { projectId: string, key?: string, prNumber?: number | string }} previewIdOrTarget
+   * @param {{
+   *   schemaPlan?: any,
+   *   dryRun?: boolean,
+   *   executor?: (argv: string[]) => Promise<{ code: number, stdout?: string, stderr?: string }>
+   * }} [opts]
+   */
+  async teardownPreviewSchemaIsolation(previewIdOrTarget, opts = {}) {
+    this._ensureSchemasLoaded();
+    let previewId = '';
+    if (typeof previewIdOrTarget === 'string') {
+      previewId = previewIdOrTarget.trim();
+    } else if (previewIdOrTarget && typeof previewIdOrTarget === 'object') {
+      const k = previewIdOrTarget.key
+        || (previewIdOrTarget.prNumber != null ? `pr-${String(previewIdOrTarget.prNumber).replace(/[^0-9]/g, '')}` : '');
+      if (previewIdOrTarget.projectId && k) previewId = `${previewIdOrTarget.projectId}:${k}`;
+    }
+    if (!previewId) {
+      return { ok: true, previewId: '', destroyed: false, alreadyCleaned: true };
+    }
+
+    const record = this._dbSchemas[previewId] || opts.schemaPlan || null;
+    if (!record) {
+      return { ok: true, previewId, destroyed: false, alreadyCleaned: true };
+    }
+
+    const teardownArgv = Array.isArray(record.teardownArgv) ? record.teardownArgv : null;
+    /** @type {any} */
+    let execResult = null;
+    if (!opts.dryRun && teardownArgv) {
+      const runner = typeof opts.executor === 'function'
+        ? opts.executor
+        : (argv) => this._getDeployManager().runDocker(argv, { timeoutMs: 20000 });
+      try {
+        execResult = await runner(teardownArgv);
+      } catch (err) {
+        execResult = { code: -1, stderr: err.message };
+      }
+    }
+
+    if (!opts.dryRun) {
+      delete this._dbSchemas[previewId];
+      this._saveSchemas();
+    }
+
+    return {
+      ok: true,
+      previewId,
+      engine: 'postgres',
+      schemaName: record.schemaName || null,
+      destroyed: !opts.dryRun,
+      alreadyCleaned: false,
+      dryRun: Boolean(opts.dryRun),
+      teardownCommand: { program: 'docker', args: teardownArgv || [] },
+      execResult
+    };
+  }
+
   async destroyProjectPreviews(projectId) {
     this._ensureLoaded();
     const keys = new Set(Object.keys(this.store[projectId] || {}));
@@ -1125,4 +1392,6 @@ class PreviewManager extends EventEmitter {
 const instance = /** @type {any} */ (new PreviewManager());
 instance.PreviewManager = PreviewManager;
 instance.computePreviewIdentity = computePreviewIdentity;
+instance.rewriteDatabaseUrlWithSchema = rewriteDatabaseUrlWithSchema;
+instance.redactDatabaseUrl = redactDatabaseUrl;
 module.exports = instance;

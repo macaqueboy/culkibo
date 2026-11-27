@@ -45,6 +45,9 @@ const {
 const { createRateLimiter } = require('./services/rateLimiter');
 
 const PORT = Number(process.env.PORT) || 3030;
+const APP_VERSION = String((() => {
+  try { return require('../package.json').version; } catch (e) { return '1.2.0'; }
+})() || '1.2.0');
 const MCP_PROTOCOL_VERSION = '2026-07-28';
 const MCP_LEGACY_PROTOCOL_VERSION = '2024-11-05';
 const ROOT_BASE_DIR = process.env.CULKIBO_DATA_DIR
@@ -1234,7 +1237,7 @@ function getSystemStatusBuffer() {
   const payload = {
     name: 'Culkibo',
     status: 'operational',
-    version: '1.0.0',
+    version: APP_VERSION,
     platform: process.platform,
     arch: process.arch,
     nodeVersion: process.version,
@@ -2532,9 +2535,9 @@ function getApp() {
       res.setHeader('Content-Security-Policy', SPA_CSP);
       res.send(`
         <html lang="es">
-          <head><meta charset="utf-8"><title>Daemon de Culkibo v1.0.0</title><style>body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#fafafa;color:#18181b;padding:40px;text-align:center;}code{background:#f4f4f5;border:1px solid #e4e4e7;border-radius:6px;padding:1px 5px;}</style></head>
+          <head><meta charset="utf-8"><title>Daemon de Culkibo v${APP_VERSION}</title><style>body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#fafafa;color:#18181b;padding:40px;text-align:center;}code{background:#f4f4f5;border:1px solid #e4e4e7;border-radius:6px;padding:1px 5px;}</style></head>
           <body>
-            <h1>Daemon de Culkibo v1.0.0 en marcha</h1>
+            <h1>Daemon de Culkibo v${APP_VERSION} en marcha</h1>
             <p>API REST y WebSocket escuchando en el puerto ${PORT}.</p>
             <p>Compila el panel con <code>npm run build</code>, o arráncalo en modo desarrollo en el puerto 5173.</p>
           </body>
@@ -2773,7 +2776,7 @@ function startServer(port = PORT, host = '127.0.0.1', {
   return new Promise((resolve, reject) => {
     server.listen(port, host, () => {
       console.log(`\n========================================================`);
-      console.log(`🚀 Culkibo Orchestrator v1.0.0 Daemon running`);
+      console.log(`🚀 Culkibo Orchestrator v${APP_VERSION} Daemon running`);
       console.log(`📡 REST API:          http://localhost:${port}/api`);
       console.log(`📊 Prometheus:        http://localhost:${port}/metrics`);
       console.log(`🤖 MCP ${MCP_PROTOCOL_VERSION}:     POST http://localhost:${port}/api/mcp`);

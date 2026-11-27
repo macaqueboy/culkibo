@@ -21,6 +21,7 @@ import {
   type PlatformParseResult,
   type DomainWizardPreset,
 } from '../lib/api';
+import { useI18n } from '../lib/i18n';
 import { WordPressMigrationWizard } from './WordPressMigrationWizard';
 import { CoolifyImport } from './CoolifyImport';
 
@@ -49,6 +50,7 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
   onOpenDomains,
   onNotify,
 }) => {
+  const { t, locale } = useI18n();
   const [source, setSource] = useState<'wordpress' | 'coolify' | 'compose' | 'git' | 'platforms'>(() =>
     normalizeSource(initialSource)
   );
@@ -99,11 +101,11 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
   };
 
   const cards = [
-    { id: 'wordpress' as const, title: 'WordPress', subtitle: 'Analiza y migra tu web o WooCommerce', icon: Globe },
-    { id: 'coolify' as const, title: 'Coolify v4', subtitle: 'Apps, bases de datos y dominios', icon: Download },
-    { id: 'compose' as const, title: 'Docker Compose', subtitle: 'Pega o sube docker-compose.yml', icon: FileCode2 },
-    { id: 'git' as const, title: 'URL Git', subtitle: 'GitHub, GitLab, Bitbucket, Gitea', icon: GitBranch },
-    { id: 'platforms' as const, title: 'Otras nubes', subtitle: 'Vercel, Netlify, Railway, Render, Dokploy', icon: Layers },
+    { id: 'wordpress' as const, title: t('imp.tabWordpress'), icon: Globe },
+    { id: 'coolify' as const, title: t('imp.tabCoolify'), icon: Download },
+    { id: 'compose' as const, title: t('imp.tabCompose'), icon: FileCode2 },
+    { id: 'git' as const, title: t('imp.tabGit'), icon: GitBranch },
+    { id: 'platforms' as const, title: t('imp.tabPlatforms'), icon: Layers },
   ];
 
   const handleParseCompose = async () => {
@@ -238,15 +240,13 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
   return (
     <div className="space-y-5 max-w-5xl mx-auto">
       <div>
-        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Importar y migrar</h1>
-        <p className="text-sm text-slate-500 mt-1">
-          Trae sitios WordPress, stacks Docker Compose, repositorios Git o proyectos de otras plataformas sin fricción.
-        </p>
+        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('imp.title')}</h1>
+        <p className="text-sm text-slate-500 mt-1">{t('imp.subtitle')}</p>
       </div>
 
       {/* Selector de origen: pestañas limpias con subrayado (sin sobrecarga de tarjetas) */}
       <div className="border-b border-slate-200 overflow-x-auto no-scrollbar">
-        <div role="tablist" aria-label="Origen de importación" className="flex items-center gap-1 -mb-px min-w-max">
+        <div role="tablist" aria-label={t('imp.title')} className="flex items-center gap-1 -mb-px min-w-max">
           {cards.map((c) => {
             const Icon = c.icon;
             const active = source === c.id;
@@ -292,14 +292,12 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
         <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <h2 className="text-base font-semibold text-slate-900">Importar docker-compose.yml</h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Detecta aplicaciones, bases de datos, puertos, volúmenes y avisos de seguridad antes de importar.
-              </p>
+              <h2 className="text-base font-semibold text-slate-900">{t('imp.composeTitle')}</h2>
+              <p className="text-xs text-slate-500 mt-0.5">{t('imp.composeDesc')}</p>
             </div>
             <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700 cursor-pointer self-start">
               <Upload className="w-3.5 h-3.5" />
-              <span>Cargar archivo .yml</span>
+              <span>{t('imp.composeUpload')}</span>
               <input
                 type="file"
                 accept=".yml,.yaml,.txt"
@@ -338,7 +336,7 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
             >
               {composeBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
-              <span>Analizar servicios</span>
+              <span>{t('imp.composeAnalyze')}</span>
             </button>
           </div>
 
@@ -346,14 +344,13 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
             <div className="space-y-4 pt-4 border-t border-slate-200">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div className="text-xs font-medium text-slate-700 tabular-nums">
-                  Detectados: {composePreview.appsCount} {composePreview.appsCount === 1 ? 'aplicación' : 'aplicaciones'} y{' '}
-                  {composePreview.databasesCount} {composePreview.databasesCount === 1 ? 'base de datos' : 'bases de datos'}
+                  {composePreview.appsCount} app(s) · {composePreview.databasesCount} database(s)
                 </div>
                 <input
                   type="text"
                   value={composeName}
                   onChange={(e) => setComposeName(e.target.value)}
-                  placeholder="Nombre del proyecto"
+                  placeholder={t('imp.composeProjectPlaceholder')}
                   className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs w-full sm:w-64"
                 />
               </div>
@@ -409,7 +406,12 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
                   className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer disabled:opacity-50 tabular-nums"
                 >
                   <span>
-                    Importar {composeSelected.size} {composeSelected.size === 1 ? 'servicio' : 'servicios'}
+                    {t('imp.composeImport', {
+                      count: composeSelected.size,
+                      unit: locale === 'es'
+                        ? (composeSelected.size === 1 ? 'servicio' : 'servicios')
+                        : (composeSelected.size === 1 ? 'service' : 'services'),
+                    })}
                   </span>
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
@@ -422,10 +424,8 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
       {source === 'git' && (
         <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
           <div>
-            <h2 className="text-base font-semibold text-slate-900">Importar desde URL Git</h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Compatible con GitHub, GitLab, Bitbucket o Gitea. Los repositorios públicos no requieren token.
-            </p>
+            <h2 className="text-base font-semibold text-slate-900">{t('imp.gitTitle')}</h2>
+            <p className="text-xs text-slate-500 mt-0.5">{t('imp.gitDesc')}</p>
           </div>
 
           {gitError && (
@@ -442,14 +442,14 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
                 setGitUrl(e.target.value);
                 if (gitInfo) setGitInfo(null);
               }}
-              placeholder="https://github.com/usuario/mi-app o usuario/mi-app"
+              placeholder={t('imp.gitUrlPlaceholder')}
               className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono"
             />
             <input
               type="text"
               value={gitBranch}
               onChange={(e) => setGitBranch(e.target.value)}
-              placeholder="Rama (opcional)"
+              placeholder={t('imp.gitBranchPlaceholder')}
               className="sm:w-36 px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono"
             />
             <button
@@ -458,7 +458,7 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
               className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
               {gitBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
-              <span>Analizar</span>
+              <span>{t('imp.gitAnalyze')}</span>
             </button>
           </form>
 
@@ -477,26 +477,26 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
                 </div>
                 {gitInfo.verifiedPublic && (
                   <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
-                    <CheckCircle2 className="w-3.5 h-3.5" /> Repositorio público
+                    <CheckCircle2 className="w-3.5 h-3.5" /> {t('imp.gitPublicBadge')}
                   </span>
                 )}
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block font-medium text-slate-700 mb-1">Nombre del proyecto</label>
+                  <label className="block font-medium text-slate-700 mb-1">{t('imp.gitProjectName')}</label>
                   <input value={gitProjectName} onChange={(e) => setGitProjectName(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg" />
                 </div>
                 <div>
-                  <label className="block font-medium text-slate-700 mb-1">Puerto interno</label>
+                  <label className="block font-medium text-slate-700 mb-1">{t('imp.gitInternalPort')}</label>
                   <input type="number" value={gitPort} onChange={(e) => setGitPort(Number(e.target.value))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono tabular-nums" />
                 </div>
                 <div>
-                  <label className="block font-medium text-slate-700 mb-1">Comando de compilación</label>
+                  <label className="block font-medium text-slate-700 mb-1">{t('imp.gitBuildCmd')}</label>
                   <input value={gitBuildCmd} onChange={(e) => setGitBuildCmd(e.target.value)} placeholder="npm run build" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
                 </div>
                 <div>
-                  <label className="block font-medium text-slate-700 mb-1">Comando de inicio</label>
+                  <label className="block font-medium text-slate-700 mb-1">{t('imp.gitStartCmd')}</label>
                   <input value={gitStartCmd} onChange={(e) => setGitStartCmd(e.target.value)} placeholder="npm start" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg font-mono" />
                 </div>
               </div>
@@ -508,7 +508,7 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
                   disabled={gitBusy}
                   className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
                 >
-                  <span>Crear proyecto</span>
+                  <span>{t('imp.gitCreate')}</span>
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -520,10 +520,8 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
       {source === 'platforms' && (
         <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
           <div>
-            <h2 className="text-base font-semibold text-slate-900">Migrar desde Vercel, Netlify, Railway, Render o Dokploy</h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Pega tu configuración (<code className="font-mono">vercel.json</code>, <code className="font-mono">netlify.toml</code>, <code className="font-mono">railway.json</code>, <code className="font-mono">render.yaml</code> o JSON de Dokploy) y tus variables <code className="font-mono">.env</code>.
-            </p>
+            <h2 className="text-base font-semibold text-slate-900">{t('imp.platTitle')}</h2>
+            <p className="text-xs text-slate-500 mt-0.5">{t('imp.platDesc')}</p>
           </div>
 
           {platformError && (
@@ -534,7 +532,7 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
 
           <div className="flex flex-wrap gap-1.5 text-xs">
             {([
-              { id: 'auto', label: 'Detectar automáticamente' },
+              { id: 'auto', label: t('imp.platAuto') },
               { id: 'vercel', label: 'Vercel' },
               { id: 'netlify', label: 'Netlify' },
               { id: 'railway', label: 'Railway' },
@@ -556,17 +554,17 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Archivo de configuración</label>
+              <label className="block text-xs font-medium text-slate-700 mb-1">{t('imp.platConfigLabel')}</label>
               <textarea
                 value={platformConfigText}
                 onChange={(e) => setPlatformConfigText(e.target.value)}
                 rows={7}
-                placeholder="Pega vercel.json, netlify.toml, railway.json, render.yaml o JSON de Dokploy…"
+                placeholder={t('imp.platConfigPlaceholder')}
                 className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-xs focus:bg-white"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Variables .env (opcional)</label>
+              <label className="block text-xs font-medium text-slate-700 mb-1">{t('imp.platEnvLabel')}</label>
               <textarea
                 value={platformEnvText}
                 onChange={(e) => setPlatformEnvText(e.target.value)}
@@ -585,7 +583,7 @@ export const UniversalImporter: React.FC<UniversalImporterProps> = ({
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
             >
               {platformBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
-              <span>Analizar configuración</span>
+              <span>{t('imp.platAnalyze')}</span>
             </button>
           </div>
 

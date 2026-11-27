@@ -16,11 +16,12 @@ async function testLiveServer() {
 
   try {
     // 1. Fetch system status
+    const expectedVersion = require('../package.json').version;
     const statusRes = await fetch('http://localhost:3031/api/system/status');
     const statusData = await statusRes.json();
-    assert.strictEqual(statusData.version, '1.0.0');
+    assert.strictEqual(statusData.version, expectedVersion);
     assert.strictEqual(statusData.name, 'Culkibo');
-    console.log('  ✓ API /api/system/status responding with v1.0.0');
+    console.log(`  ✓ API /api/system/status responding with v${expectedVersion}`);
 
     // 2. Fetch root / (Dashboard HTML on direct access)
     const indexRes = await fetch('http://localhost:3031/');

@@ -35,6 +35,8 @@ const testSmartPackDirectPush = require('./smartpack-directpush.test');
 const testEdgeTunnelSnapStream = require('./edgetunnel-snapstream.test');
 const testCoolifyE2EReplay = require('./coolify-e2e-replay.test');
 const testReleaseAndMcpE2E = require('./release-and-mcp-e2e.test');
+const testOtlpAndSlsa = require('./otlp-and-slsa.test');
+const testMigrationsAndWasm = require('./migrations-and-wasm.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -79,7 +81,7 @@ async function runAll() {
     { name: 'Observability, Prometheus, Doctor & Bug Regressions', fn: testMetricsAndBugs },
     { name: 'Scale, Multi-Wildcard SSL, Build Semaphore & Fast-Path', fn: testScaleAndWildcard },
     { name: 'Resilience, Edge Hardening, DR Snapshots, Crons/Previews & Multi-Git', fn: testResilienceAndFeatures },
-    { name: 'Competitor PR & CVE Regressions (Wave-1 + Wave-2)', fn: testCompetitorPrs },
+    { name: 'Competitor PR & CVE Regressions (Wave-1 + Wave-2 + Wave-3)', fn: testCompetitorPrs },
     { name: 'Anonymous Telemetry, PII Scrubbing, Circuit Breaker & E2E Collector', fn: testTelemetry },
     { name: 'Multi-Server SSH Fleet Orchestration (TOFU, Tunnels, Key Vault)', fn: testFleet },
     { name: 'Multi-User Teams, RBAC, Scoped Tokens & Triple-Layer Revocation', fn: testRbac },
@@ -95,6 +97,8 @@ async function runAll() {
     { name: 'Sovereign EdgeTunnel WS, SnapStream SQLite WAL-to-S3 & Preview DB Branching', fn: testEdgeTunnelSnapStream },
     { name: 'Mock-Coolify v4 Full E2E Migration & Bundle Roundtrip Replay', fn: testCoolifyE2EReplay },
     { name: 'Release Provenance (CycloneDX 1.6 SBOM / SHA-256) & External MCP Stdio E2E', fn: testReleaseAndMcpE2E },
+    { name: 'Zero-Dep OTLP/HTTP JSON Exporter & SLSA v1.1 Ed25519 DSSE Attestation', fn: testOtlpAndSlsa },
+    { name: 'Atomic Single-Leader DB Migrations, Per-PR Schema Isolation & Micro-Wasm Edge Runtime', fn: testMigrationsAndWasm },
   ];
 
   for (const suite of suites) {

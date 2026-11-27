@@ -354,7 +354,7 @@ async function respondJson(req, res, body, profile = 'all') {
       res.setHeader('X-Culkibo-Mcp-Profile', profile);
       res.setHeader('Vary', 'Authorization, Accept, X-Culkibo-Mcp-Profile');
     }
-    if (envelope?.result?.cacheScope === 'private') {
+    if (envelope?.result?.cacheScope === 'private' || envelope?.result?.task || String(body.method || '').startsWith('tasks/')) {
       res.setHeader('Cache-Control', 'private, no-store');
       res.setHeader('Vary', 'Authorization, Accept, X-Culkibo-Mcp-Profile');
     }

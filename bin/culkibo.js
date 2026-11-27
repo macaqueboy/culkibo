@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { Command } = require('commander');
+const crypto = require('crypto');
 const readline = require('readline');
 const fs = require('fs');
 const http = require('http');
@@ -38,7 +39,9 @@ const svc = {
   get LiveSyncClient() { return require('../server/services/liveSyncClient').LiveSyncClient; },
   get smartPackBuilder() { return require('../server/services/smartPackBuilder'); },
   get directPushRegistry() { return require('../server/services/directPushRegistry'); },
-  get edgeTunnelService() { return require('../server/services/edgeTunnelService'); }
+  get edgeTunnelService() { return require('../server/services/edgeTunnelService'); },
+  get supplyChainAttestor() { return require('../server/services/supplyChainAttestor'); },
+  get releaseProvenance() { return require('../scripts/release-provenance'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2524,6 +2527,431 @@ program
     }
   });
 
+// ===========================================================================
+// PIONEER CYCLE-4 CLI: verify (SHA-256 + SLSA v1.1 DSSE) & demo (<200ms sandbox)
+// ===========================================================================
+
+/**
+ * Resuelve una clave pública Ed25519 desde ruta de archivo o PEM directo.
+ * @param {string | undefined | null} rawPubKey
+ * @returns {string | undefined}
+ */
+function resolvePublicKeyPemInput(rawPubKey) {
+  if (!rawPubKey) return undefined;
+  const trimmed = String(rawPubKey).trim();
+  if (!trimmed) return undefined;
+  if (trimmed.includes('BEGIN PUBLIC KEY')) return trimmed;
+  const resolved = path.resolve(trimmed);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`No se encontró el archivo de clave pública Ed25519: ${resolved}`);
+  }
+  return fs.readFileSync(resolved, 'utf8').trim();
+}
+
+/**
+ * Detecta si un objeto JSON corresponde a un sobre DSSE v1 (o wrapper `{ envelope }`).
+ * @param {any} parsed
+ */
+function isDsseEnvelopeObject(parsed) {
+  if (!parsed || typeof parsed !== 'object') return false;
+  const env = parsed.envelope && typeof parsed.envelope === 'object' ? parsed.envelope : parsed;
+  return typeof env.payloadType === 'string' && typeof env.payload === 'string' && Array.isArray(env.signatures);
+}
+
+/**
+ * Verificación offline unificada de `CHECKSUMS.sha256`, `provenance.json` o sobres
+ * SLSA v1.1 Ed25519 DSSE (`.dsse.json` / `.json`).
+ * @param {string | undefined} dirOrFile
+ * @param {{ root?: string, publicKey?: string }} [options]
+ */
+function runOfflineVerification(dirOrFile, options = {}) {
+  const defaultRoot = path.resolve(__dirname, '..');
+  const rootDir = options.root ? path.resolve(String(options.root)) : defaultRoot;
+  const pubKeyPem = resolvePublicKeyPemInput(options.publicKey);
+  const provMod = svc.releaseProvenance;
+
+  // Sin argumento explícito: comprobar `dist-release/` si existe o autoverificar árbol local
+  if (!dirOrFile) {
+    const defaultDist = path.join(rootDir, 'dist-release');
+    if (fs.existsSync(path.join(defaultDist, 'CHECKSUMS.sha256'))) {
+      dirOrFile = defaultDist;
+    } else {
+      const generated = provMod.generateChecksums({ rootDir });
+      const check = provMod.verifyChecksums(generated.text, { rootDir });
+      const sbom = provMod.generateCycloneDxSbom({ rootDir });
+      const rootPkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+      return {
+        ok: check.valid,
+        valid: check.valid,
+        mode: 'self-integrity',
+        rootDir,
+        checked: check.checked,
+        missing: check.missing,
+        mismatched: check.mismatched,
+        malformed: check.malformed,
+        sbom: {
+          bomFormat: sbom.bomFormat,
+          specVersion: sbom.specVersion,
+          components: Array.isArray(sbom.components) ? sbom.components.length : 0,
+          rootDeps: Object.keys(rootPkg.dependencies || {}).length
+        },
+        version: String(rootPkg.version || '1.2.0')
+      };
+    }
+  }
+
+  const target = path.resolve(String(dirOrFile));
+  if (!fs.existsSync(target)) {
+    throw new Error(`La ruta a verificar no existe: ${target}`);
+  }
+  const stat = fs.statSync(target);
+
+  if (stat.isFile()) {
+    const ext = path.extname(target).toLowerCase();
+    if (ext === '.json') {
+      const parsed = JSON.parse(fs.readFileSync(target, 'utf8'));
+      if (isDsseEnvelopeObject(parsed)) {
+        const sca = svc.supplyChainAttestor;
+        const verification = sca.verifyAttestation(parsed, pubKeyPem);
+        return {
+          ...verification,
+          ok: Boolean(verification.valid),
+          valid: Boolean(verification.valid),
+          mode: 'slsa-dsse',
+          file: target
+        };
+      }
+      if (parsed && parsed.schema === 'culkibo-release-provenance/v1') {
+        const dir = path.dirname(target);
+        const csFile = path.join(dir, String(parsed.artifacts?.checksums?.file || 'CHECKSUMS.sha256'));
+        const sbomFile = path.join(dir, String(parsed.artifacts?.sbom?.file || 'sbom.cdx.json'));
+        if (!fs.existsSync(csFile)) {
+          throw new Error(`Falta ${csFile} referenciado por provenance.json`);
+        }
+        const csBuf = fs.readFileSync(csFile);
+        const csSha = crypto.createHash('sha256').update(csBuf).digest('hex');
+        const expectedCsSha = parsed.artifacts?.checksums?.sha256 || null;
+        const csDigestOk = !expectedCsSha || csSha === expectedCsSha;
+
+        let sbomDigestOk = true;
+        /** @type {string | null} */
+        let sbomSha = null;
+        if (fs.existsSync(sbomFile)) {
+          sbomSha = crypto.createHash('sha256').update(fs.readFileSync(sbomFile)).digest('hex');
+          const expectedSbomSha = parsed.artifacts?.sbom?.sha256 || null;
+          sbomDigestOk = !expectedSbomSha || sbomSha === expectedSbomSha;
+        }
+        const csRes = provMod.verifyChecksums(csFile, { rootDir });
+        const valid = Boolean(csRes.valid && csDigestOk && sbomDigestOk);
+        return {
+          ok: valid,
+          valid,
+          mode: 'release-provenance',
+          file: target,
+          version: parsed.version || null,
+          rootDir,
+          checksums: csRes,
+          artifacts: {
+            checksumsDigestValid: csDigestOk,
+            checksumsSha256: csSha,
+            sbomDigestValid: sbomDigestOk,
+            sbomSha256: sbomSha
+          }
+        };
+      }
+      throw new Error(`JSON no reconocido en ${target}. Se esperaba un sobre SLSA v1.1 DSSE o provenance.json.`);
+    }
+
+    // Archivo CHECKSUMS.sha256
+    const csRes = provMod.verifyChecksums(target, { rootDir });
+    return {
+      ...csRes,
+      ok: Boolean(csRes.valid),
+      valid: Boolean(csRes.valid),
+      mode: 'checksums',
+      file: target,
+      rootDir
+    };
+  }
+
+  // Directorio: buscar provenance.json / CHECKSUMS.sha256 / *.dsse.json
+  const provPath = path.join(target, 'provenance.json');
+  const csPath = path.join(target, 'CHECKSUMS.sha256');
+  const dsseFiles = fs.readdirSync(target)
+    .filter((f) => f.endsWith('.dsse.json'))
+    .sort()
+    .map((f) => path.join(target, f));
+
+  if (fs.existsSync(provPath)) {
+    const base = runOfflineVerification(provPath, options);
+    if (dsseFiles.length > 0) {
+      const sca = svc.supplyChainAttestor;
+      const attestations = dsseFiles.map((fp) => ({
+        file: fp,
+        ...sca.verifyAttestation(JSON.parse(fs.readFileSync(fp, 'utf8')), pubKeyPem)
+      }));
+      const allValid = Boolean(base.valid && attestations.every((a) => a.valid));
+      return { ...base, ok: allValid, valid: allValid, attestations };
+    }
+    return base;
+  }
+
+  if (fs.existsSync(csPath)) {
+    const csRes = provMod.verifyChecksums(csPath, { rootDir });
+    return {
+      ...csRes,
+      ok: Boolean(csRes.valid),
+      valid: Boolean(csRes.valid),
+      mode: 'checksums',
+      file: csPath,
+      rootDir
+    };
+  }
+
+  if (dsseFiles.length > 0) {
+    const sca = svc.supplyChainAttestor;
+    const attestations = dsseFiles.map((fp) => ({
+      file: fp,
+      ...sca.verifyAttestation(JSON.parse(fs.readFileSync(fp, 'utf8')), pubKeyPem)
+    }));
+    const valid = attestations.every((a) => a.valid);
+    return {
+      ok: valid,
+      valid,
+      mode: 'slsa-dsse-dir',
+      directory: target,
+      count: attestations.length,
+      attestations
+    };
+  }
+
+  // Si es un directorio de código fuente Culkibo (contiene package.json), hacer autoverificación
+  if (fs.existsSync(path.join(target, 'package.json'))) {
+    const generated = provMod.generateChecksums({ rootDir: target });
+    const check = provMod.verifyChecksums(generated.text, { rootDir: target });
+    return {
+      ...check,
+      ok: Boolean(check.valid),
+      valid: Boolean(check.valid),
+      mode: 'self-integrity',
+      rootDir: target
+    };
+  }
+
+  throw new Error(`No se encontró CHECKSUMS.sha256, provenance.json ni sobres .dsse.json en ${target}`);
+}
+
+program
+  .command('verify [dirOrFile]')
+  .description('Verificación offline de CHECKSUMS.sha256, provenance.json o atestaciones SLSA v1.1 Ed25519 DSSE')
+  .option('--root <dir>', 'Directorio raíz contra el que comprobar rutas de CHECKSUMS.sha256')
+  .option('--public-key <pemOrPath>', 'Clave pública Ed25519 SPKI PEM (cadena o ruta de archivo) para sobres DSSE')
+  .option('--json', 'Salida JSON estructurada')
+  .action((dirOrFile, options) => {
+    try {
+      const result = runOfflineVerification(dirOrFile, {
+        root: options.root,
+        publicKey: options.publicKey
+      });
+      if (!result.valid) process.exitCode = 1;
+      if (isJsonMode(options)) {
+        return printJson(result);
+      }
+      if (result.valid) {
+        console.log(`\n\x1b[32m✅ Culkibo Verify PASS\x1b[0m (mode: ${result.mode})`);
+        if (result.mode === 'slsa-dsse') {
+          console.log(`   Algoritmo: ${result.algorithm} · KeyId: ${result.keyId}`);
+          console.log(`   SLSA:      v${result.slsaVersion} (${result.predicateType})`);
+          console.log(`   Builder:   ${result.builderId || 'n/a'}`);
+        } else if (typeof result.checked === 'number') {
+          console.log(`   Archivos SHA-256 verificados: ${result.checked} (0 alterados, 0 faltantes)`);
+        } else if (result.checksums) {
+          console.log(`   Release v${result.version}: ${result.checksums.checked} archivos SHA-256 + artefactos verificados`);
+        }
+        console.log('');
+      } else {
+        console.error(`\n\x1b[31m❌ Culkibo Verify FAILED\x1b[0m (mode: ${result.mode}${result.reason ? `, reason: ${result.reason}` : ''})`);
+        if (Array.isArray(result.mismatched) && result.mismatched.length > 0) {
+          console.error(`   Archivos alterados: ${result.mismatched.map((m) => m.path).join(', ')}`);
+        }
+        console.error('');
+      }
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+const DEMO_MIME_TYPES = Object.freeze({
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8'
+});
+
+/**
+ * Abre una URL HTTP/HTTPS en el navegador predeterminado sin invocar jamás shell ni cmd/powershell.
+ * @param {string} targetUrl
+ */
+function openBrowserSafe(targetUrl) {
+  try {
+    if (process.platform === 'darwin') {
+      const child = spawn('open', [targetUrl], { detached: true, stdio: 'ignore', shell: false });
+      child.unref();
+    } else if (process.platform === 'win32') {
+      const child = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', targetUrl], { detached: true, stdio: 'ignore', shell: false, windowsHide: true });
+      child.unref();
+    } else {
+      const child = spawn('xdg-open', [targetUrl], { detached: true, stdio: 'ignore', shell: false });
+      child.unref();
+    }
+  } catch (e) {}
+}
+
+program
+  .command('demo')
+  .description('Lanza o imprime el sandbox interactivo instantáneo de Culkibo (?demo=1&lang=en&theme=dark) en <200 ms')
+  .option('-p, --port <port>', 'Puerto loopback del sandbox interactivo', '3030')
+  .option('--host <host>', 'Dirección loopback de escucha', '127.0.0.1')
+  .option('--no-open', 'No abrir automáticamente el navegador')
+  .option('--dry-run', 'Mostrar configuración del sandbox sin iniciar servidor HTTP')
+  .option('--serve', 'Forzar inicio del servidor HTTP demo incluso en modo --json')
+  .option('--json', 'Salida JSON estructurada instantánea (<200 ms)')
+  .action(async (options) => {
+    const startedAt = performance.now();
+    try {
+      const rawPort = parseInt(String(options.port ?? '3030'), 10);
+      const allowZero = Boolean(options.serve);
+      if (!Number.isInteger(rawPort) || rawPort < (allowZero ? 0 : 1) || rawPort > 65535) {
+        throw new Error(`Puerto inválido para culkibo demo: "${options.port}"`);
+      }
+      const host = String(options.host || '127.0.0.1').trim() || '127.0.0.1';
+      process.env.CULKIBO_DEMO = '1';
+
+      const repoRoot = path.resolve(__dirname, '..');
+      const webDistDir = path.join(repoRoot, 'web', 'dist');
+      const indexHtmlPath = path.join(webDistDir, 'index.html');
+      const uiBuilt = fs.existsSync(indexHtmlPath);
+      const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+      const version = String(pkg.version || '1.2.0');
+
+      const buildPayload = (boundPort) => {
+        const url = `http://${host}:${boundPort}/?demo=1&lang=en&theme=dark`;
+        return {
+          ok: true,
+          mode: 'demo',
+          demo: true,
+          version,
+          env: { CULKIBO_DEMO: '1' },
+          host,
+          port: boundPort,
+          url,
+          sandboxUrl: url,
+          uiBuilt,
+          readOnly: true,
+          bootMs: Math.max(1, Math.round(performance.now() - startedAt)),
+          openBrowser: Boolean(options.open !== false && !options.dryRun && !isJsonMode(options) && !process.env.CI),
+          datasets: {
+            projects: 3,
+            databases: 2,
+            domains: 4,
+            edgeTunnels: 1,
+            mcpTools: 113,
+            mcpApps: 3,
+            topologyNodes: 7
+          },
+          highlights: [
+            'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
+            '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
+            '113 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'Spatial SVG Topology, SmartPack Build Intelligence & Coolify v4 100% Migration Preview'
+          ]
+        };
+      };
+
+      if ((isJsonMode(options) && !options.serve) || options.dryRun) {
+        const payload = buildPayload(rawPort);
+        if (isJsonMode(options)) return printJson(payload);
+        console.log(`\n\x1b[36m⚡ Culkibo Interactive Demo Sandbox (v${version})\x1b[0m`);
+        console.log(`   URL:      ${payload.url}`);
+        console.log(`   Env:      CULKIBO_DEMO=1 (read-only · 0 mutations to data/)`);
+        console.log(`   UI build: ${payload.uiBuilt ? 'ready (web/dist)' : 'run `npm run web:build` first'}`);
+        console.log(`   Ready in: ${payload.bootMs} ms\n`);
+        return;
+      }
+
+      const fallbackHtml = `<!doctype html><html lang="en"><head><meta charset="utf-8"/><title>Culkibo Demo Sandbox</title></head><body style="background:#09090b;color:#f4f4f5;font-family:system-ui;padding:2rem"><h1>Culkibo Interactive Demo Sandbox (v${version})</h1><p><code>CULKIBO_DEMO=1</code> active. Run <code>npm run web:build</code> to serve the full Obsidian UI bundle.</p></body></html>`;
+
+      const demoServer = http.createServer((req, res) => {
+        const parsed = new URL(req.url || '/', `http://${host}`);
+        if (parsed.pathname === '/api/health') {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: true, mode: 'demo', demo: true, version }));
+          return;
+        }
+        if (!uiBuilt) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(fallbackHtml);
+          return;
+        }
+        const safeRel = decodeURIComponent(parsed.pathname || '/').replace(/^\/+/, '');
+        let filePath = safeRel ? path.resolve(webDistDir, safeRel) : indexHtmlPath;
+        const relBack = path.relative(webDistDir, filePath);
+        if (relBack.startsWith('..') || path.isAbsolute(relBack) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+          filePath = indexHtmlPath;
+        }
+        const ext = path.extname(filePath).toLowerCase();
+        res.writeHead(200, {
+          'Content-Type': DEMO_MIME_TYPES[ext] || 'application/octet-stream',
+          'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600'
+        });
+        fs.createReadStream(filePath).pipe(res);
+      });
+
+      await new Promise((resolve, reject) => {
+        demoServer.once('error', reject);
+        demoServer.listen(rawPort, host, () => {
+          demoServer.removeListener('error', reject);
+          resolve(undefined);
+        });
+      });
+
+      const addr = /** @type {import('net').AddressInfo} */ (demoServer.address());
+      const payload = buildPayload(addr && typeof addr === 'object' ? addr.port : rawPort);
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+      } else {
+        console.log(`\n\x1b[32m⚡ Culkibo Interactive Demo Sandbox ready in ${payload.bootMs} ms\x1b[0m`);
+        console.log(`   URL:   ${payload.url}`);
+        console.log(`   Mode:  CULKIBO_DEMO=1 (read-only · 0 Docker/DB required · 0 data/ writes)`);
+        console.log(`   Stop:  Press Ctrl+C\n`);
+      }
+
+      if (payload.openBrowser) {
+        openBrowserSafe(payload.url);
+      }
+
+      const stopDemo = () => {
+        demoServer.close(() => {
+          process.exitCode = 0;
+        });
+      };
+      process.once('SIGINT', stopDemo);
+      process.once('SIGTERM', stopDemo);
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
 if (require.main === module) {
   program.parseAsync(process.argv).catch((err) => {
     failCli(err, program.opts());
@@ -2537,5 +2965,6 @@ module.exports = {
   generateStarterManifest,
   parseEnvAssignments,
   remoteApiRequest,
-  writeAgentKitFiles
+  writeAgentKitFiles,
+  runOfflineVerification
 };

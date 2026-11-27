@@ -2027,7 +2027,7 @@ class ServerFleetManager extends EventEmitter {
     const load = os.loadavg();
     return {
       id: LOCAL_SERVER_ID,
-      name: 'Servidor Local (Principal)',
+      name: 'Local Server (Primary)',
       host: '127.0.0.1',
       port: null,
       user: null,

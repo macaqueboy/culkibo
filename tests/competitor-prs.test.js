@@ -14,7 +14,9 @@ const domainManager = require('../server/services/domainManager');
 const projectManager = require('../server/services/projectManager');
 const { OidcService, resolveRoleFromClaims } = require('../server/services/oidcService');
 const { SslManager } = require('../server/services/sslManager');
-const { DeployManager, assertDiskHeadroom, parseCgroupV2MemoryStats, readContainerCgroupV2Memory, buildComposeResourceOverride, enforceComposeResourceLimits } = require('../server/services/deployManager');
+const { DeployManager, assertDiskHeadroom, parseCgroupV2MemoryStats, readContainerCgroupV2Memory, buildComposeResourceOverride, enforceComposeResourceLimits, buildSafePruneArgs, MAX_BUILDKIT_KEEP_STORAGE_GB } = require('../server/services/deployManager');
+const { GitOpsManager } = require('../server/services/gitopsManager');
+const { ServerFleetManager } = require('../server/services/serverFleetManager');
 const { PreviewManager } = require('../server/services/previewManager');
 const databaseManager = require('../server/services/databaseManager');
 const dbBackupManager = require('../server/services/dbBackupManager');
@@ -28,7 +30,7 @@ function makeTempDir(prefix) {
 }
 
 async function testCompetitorPrs() {
-  console.log('\n🧪 Suite #23: Regresiones de PRs y CVEs de competidores (Wave-1 + Wave-2)...');
+  console.log('\n🧪 Suite #23: Regresiones de PRs y CVEs de competidores (Wave-1 + Wave-2 + Wave-3)...');
 
   // -------------------------------------------------------------------------
   // 1. Auth & Proxy Hardening (Coolify / Dokploy / Traefik / NPM)
@@ -887,6 +889,65 @@ function reqJson(port, method, pth, { token, body } = {}) {
     assert.strictEqual(snapList.status, 200, 'snapstream generations failed: ' + snapList.text);
     assert.ok(Array.isArray(snapList.json.generations) && snapList.json.generations.length >= 1);
 
+    // Cycle-4 Lazy Routes: version sync, OTLP, SLSA v1.1 DSSE Attestation, Migrations Plan, Micro-Wasm, PR Schema Isolation
+    const sysSt = await reqJson(port, 'GET', '/api/system/status', { token: master });
+    assert.strictEqual(sysSt.status, 200);
+    const pkgVer = require(path.join(ROOT_DIR, 'package.json')).version;
+    assert.strictEqual(sysSt.json.version, pkgVer, 'GET /api/system/status debe reportar la versión dinámica de package.json');
+
+    const otlpGet = await reqJson(port, 'GET', '/api/observability/otlp', { token: master });
+    assert.strictEqual(otlpGet.status, 200, 'GET /api/observability/otlp failed: ' + otlpGet.text);
+    const otlpPut = await reqJson(port, 'PUT', '/api/observability/otlp', {
+      token: master,
+      body: { enabled: false, serviceName: 'culkibo-c4-test' }
+    });
+    assert.strictEqual(otlpPut.status, 200, 'PUT /api/observability/otlp failed: ' + otlpPut.text);
+    assert.strictEqual(otlpPut.json.serviceName, 'culkibo-c4-test');
+    const otlpFlush = await reqJson(port, 'POST', '/api/observability/otlp/flush', { token: master, body: {} });
+    assert.strictEqual(otlpFlush.status, 200, 'POST /api/observability/otlp/flush failed: ' + otlpFlush.text);
+    assert.strictEqual(otlpFlush.json.skipped, true);
+
+    const attPost = await reqJson(port, 'POST', '/api/projects/proj_c2_api/releases/v1.0.0/attest', {
+      token: master,
+      body: { imageDigest: 'sha256:' + 'a'.repeat(64), commitSha: '0123456789abcdef0123456789abcdef01234567' }
+    });
+    assert.strictEqual(attPost.status, 201, 'POST release attest failed: ' + attPost.text);
+    assert.ok(attPost.json.envelope && attPost.json.statement, 'POST release attest debe devolver envelope y statement');
+    const attGet = await reqJson(port, 'GET', '/api/projects/proj_c2_api/releases/v1.0.0/attestation', { token: master });
+    assert.strictEqual(attGet.status, 200, 'GET release attestation failed: ' + attGet.text);
+    assert.strictEqual(attGet.json.revision, 'v1.0.0');
+    assert.ok(attGet.json.verification && attGet.json.verification.valid, 'GET release attestation debe incluir verification.valid=true');
+    const attVerify = await reqJson(port, 'POST', '/api/security/attestation/verify', {
+      token: master,
+      body: { envelope: attPost.json.envelope }
+    });
+    assert.strictEqual(attVerify.status, 200, 'POST attestation verify failed: ' + attVerify.text);
+    assert.strictEqual(attVerify.json.valid, true);
+
+    const migPlan = await reqJson(port, 'POST', '/api/projects/proj_c2_api/migrations/plan', {
+      token: master,
+      body: { command: 'npx prisma migrate deploy' }
+    });
+    assert.strictEqual(migPlan.status, 200, 'POST migrations/plan failed: ' + migPlan.text);
+    assert.strictEqual(migPlan.json.abortCutoverOnFailure, true);
+    assert.strictEqual(migPlan.json.zeroShell, true);
+
+    const { buildMinimalHttpTestWasm } = require(path.join(ROOT_DIR, 'server/services/wasmMicroRunner'));
+    const wasmRes = await reqJson(port, 'POST', '/api/projects/proj_c2_api/wasm/invoke', {
+      token: master,
+      body: { wasmBase64: buildMinimalHttpTestWasm().toString('base64'), exportName: 'handle', args: [21] }
+    });
+    assert.strictEqual(wasmRes.status, 200, 'POST wasm/invoke failed: ' + wasmRes.text);
+    assert.strictEqual(wasmRes.json.status, 200);
+    assert.strictEqual(typeof wasmRes.json.execMs, 'number');
+
+    const schemaIso = await reqJson(port, 'POST', '/api/projects/proj_c2_api/previews/42/schema-isolation', {
+      token: master,
+      body: { engine: 'postgres', dbName: 'app_prod', containerName: 'culkibo_pg_main', databaseUrl: 'postgres://app:secretpass@127.0.0.1:5432/app_prod' }
+    });
+    assert.strictEqual(schemaIso.status, 200, 'POST schema-isolation failed: ' + schemaIso.text);
+    assert.strictEqual(schemaIso.json.schemaName, 'pr_42');
+
     console.log('CYCLE2_HTTP_OK');
   } finally {
     await new Promise((r) => srv.close(r));
@@ -895,12 +956,392 @@ function reqJson(port, method, pth, { token, body } = {}) {
 `, 'utf8');
     try {
       const out = execFileSync(process.execPath, [runnerPath], { cwd: rootDir, encoding: 'utf8', timeout: 30000 });
-      assert.ok(out.includes('CYCLE2_HTTP_OK'), `Cycle-2 HTTP check failed:\n${out}`);
+      assert.ok(out.includes('CYCLE2_HTTP_OK'), `Cycle-2/4 HTTP check failed:\n${out}`);
     } finally {
       fs.rmSync(httpTmp, { recursive: true, force: true });
     }
   }
-  console.log('  ✓ Cycle #2: CULKIBO_DATA_DIR, coolify#12414 Compose limits, dokploy#2547 FastRestart, Cosmos#591/#616, runtipi#2445 cgroup v2, OIDC groups & lazy routes');
+  console.log('  ✓ Cycle #2/#4: CULKIBO_DATA_DIR, coolify#12414 Compose limits, dokploy#2547 FastRestart, Cosmos#591/#616, runtipi#2445 cgroup v2, OIDC groups & lazy routes');
+
+  // -------------------------------------------------------------------------
+  // 8. Wave-3 Competitor-CVE Guardrails (Cycle #4: 8a - 8f)
+  // -------------------------------------------------------------------------
+
+  // 8a. coolify#10996/#12542 & kamal#1655: Protected/sleeping container label + prune exclusion + BuildKit --keep-storage cap
+  {
+    const dmProt = new DeployManager();
+    dmProt.store = {};
+    dmProt.saveStore = () => {};
+    dmProt.notify = () => {};
+    dmProt.detectDocker = async () => ({ available: true, version: '27.0.0', reason: null });
+
+    const protectedRunArgs = dmProt.runArgs({
+      containerName: 'culkibo_sleep_demo',
+      imageTag: 'culkibo/sleep:v1',
+      hostPort: 23456,
+      containerPort: 3000,
+      protectedContainer: true,
+      sleeping: true
+    });
+    assert.ok(protectedRunArgs.includes('culkibo.protected=1'), 'runArgs debe etiquetar culkibo.protected=1 en contenedores protegidos/dormidos');
+    assert.ok(protectedRunArgs.includes('culkibo.sleeping=1'), 'runArgs debe etiquetar culkibo.sleeping=1 en contenedores dormidos');
+
+    const safeContainerPrune = buildSafePruneArgs('container', { untilHours: 24 });
+    assert.ok(safeContainerPrune.includes('label!=culkibo.protected=1'), 'container prune debe excluir label!=culkibo.protected=1');
+    const safeImagePrune = buildSafePruneArgs('image', { projectId: 'proj_w3' });
+    assert.ok(safeImagePrune.includes('label!=culkibo.protected=1'), 'image prune debe excluir label!=culkibo.protected=1');
+
+    /** @type {string[][]} */
+    const seenDockerCalls = [];
+    /** @type {string[]} */
+    const removedInPrune = [];
+    dmProt.store['proj_w3'] = {
+      current: { containerName: 'c_cur', imageTag: 'culkibo/proj_w3:v3' },
+      previous: { containerName: 'c_prev', imageTag: 'culkibo/proj_w3:v2' },
+      history: []
+    };
+    dmProt.runDocker = async (args) => {
+      seenDockerCalls.push(args);
+      if (args[0] === 'ps' && args.some((a) => a.includes('com.culkibo.project_id='))) {
+        return {
+          code: 0,
+          stdout: [
+            'c_cur||||',
+            'c_sleeping|||1|1',
+            'c_protected_only|||1|',
+            'c_unprotected_stale||||'
+          ].join('\n'),
+          stderr: ''
+        };
+      }
+      if (args[0] === 'ps') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'images') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rm') removedInPrune.push(args[args.length - 1]);
+      return { code: 0, stdout: 'Total reclaimed space: 500MB', stderr: '' };
+    };
+
+    const pruneRes = await dmProt.pruneOldReleases('proj_w3', 2);
+    assert.deepStrictEqual(removedInPrune, ['c_unprotected_stale'], 'pruneOldReleases JAMÁS debe borrar contenedores culkibo.protected=1 o culkibo.sleeping=1');
+    assert.deepStrictEqual(pruneRes.removed, ['c_unprotected_stale']);
+    assert.ok(
+      seenDockerCalls.some((a) => a[0] === 'image' && a[1] === 'prune' && a.includes('label!=culkibo.protected=1')),
+      'docker image prune debe incluir --filter label!=culkibo.protected=1'
+    );
+
+    /** @type {string[] | null} */
+    let capturedBuilderPrune = null;
+    dmProt.runDocker = async (args) => { capturedBuilderPrune = args; return { code: 0, stdout: 'ok', stderr: '' }; };
+    const cappedRes = await dmProt.pruneBuildCache({ keepStorageGb: 80 });
+    assert.strictEqual(cappedRes.ok, true);
+    assert.strictEqual(cappedRes.capped, true);
+    assert.strictEqual(cappedRes.keepStorageGb, MAX_BUILDKIT_KEEP_STORAGE_GB);
+    assert.ok(
+      capturedBuilderPrune && capturedBuilderPrune.includes(`${MAX_BUILDKIT_KEEP_STORAGE_GB}GB`),
+      'pruneBuildCache debe acotar --keep-storage al tope seguro anti-bloat'
+    );
+  }
+
+  // 8b. Dokploy BullMQ deadlock: Stale deploy-lock auto-recovery (dead PID & expired TTL)
+  {
+    const lockTmp = makeTempDir('culkibo-deploy-lock-');
+    try {
+      const dmLock = new DeployManager();
+      dmLock.saveStore = () => {};
+      const reapedEvents = [];
+      dmLock.on('stale_lock_reaped', (ev) => reapedEvents.push(ev));
+
+      // Lock vivo bloquea a un segundo competidor con 409 DEPLOY_LOCKED
+      const l1 = dmLock.acquireDeployLock('proj_lock_1', {
+        ownerId: 'worker_alive',
+        pid: process.pid,
+        ttlMs: 60000,
+        lockDir: lockTmp
+      });
+      assert.strictEqual(l1.acquired, true);
+      assert.throws(
+        () => dmLock.acquireDeployLock('proj_lock_1', { ownerId: 'worker_b', lockDir: lockTmp }),
+        (err) => err && err.code === 'DEPLOY_LOCKED' && err.status === 409,
+        'Un lock vivo debe bloquear despliegues concurrentes con 409 DEPLOY_LOCKED'
+      );
+
+      // PID muerto -> auto-reap automático y nueva adquisición inmediata
+      const reapedDead = dmLock.acquireDeployLock('proj_lock_1', {
+        ownerId: 'worker_recovered_pid',
+        pid: process.pid,
+        ttlMs: 60000,
+        lockDir: lockTmp,
+        isPidAlive: () => false
+      });
+      assert.strictEqual(reapedDead.acquired, true);
+      assert.strictEqual(reapedDead.reapedStale, true);
+      assert.strictEqual(reapedDead.reapedReason, 'dead_pid');
+
+      // TTL expirado -> auto-reap automático incluso si el PID sigue vivo
+      const futureNow = Date.now() + 120000;
+      const reapedTtl = dmLock.acquireDeployLock('proj_lock_1', {
+        ownerId: 'worker_recovered_ttl',
+        pid: process.pid,
+        ttlMs: 60000,
+        nowMs: futureNow,
+        lockDir: lockTmp,
+        isPidAlive: () => true
+      });
+      assert.strictEqual(reapedTtl.acquired, true);
+      assert.strictEqual(reapedTtl.reapedStale, true);
+      assert.strictEqual(reapedTtl.reapedReason, 'ttl_expired');
+      assert.strictEqual(reapedEvents.length, 2);
+
+      // Lockfile huérfano en disco dejado por un proceso caído -> recuperado en nueva instancia
+      const dmFresh = new DeployManager();
+      dmFresh.saveStore = () => {};
+      const orphanReap = dmFresh.reapStaleDeployLock('proj_lock_1', {
+        lockDir: lockTmp,
+        isPidAlive: () => false
+      });
+      assert.strictEqual(orphanReap.reaped, true);
+      assert.strictEqual(orphanReap.reason, 'dead_pid');
+      dmLock.releaseDeployLock('proj_lock_1', null, { lockDir: lockTmp });
+    } finally {
+      fs.rmSync(lockTmp, { recursive: true, force: true });
+    }
+  }
+
+  // 8c. portainer#13298: GitOps symlink rejection (file + parent dir) & pinned commitSha preservation across manual redeploys
+  {
+    const gitTmp = makeTempDir('culkibo-gitops-w3-');
+    try {
+      const repoDir = path.join(gitTmp, 'repo');
+      const outsideDir = path.join(gitTmp, 'outside');
+      fs.mkdirSync(repoDir, { recursive: true });
+      fs.mkdirSync(outsideDir, { recursive: true });
+      const secretOutside = path.join(outsideDir, 'secret.yaml');
+      fs.writeFileSync(secretOutside, 'version: 1\nname: stolen\n', 'utf8');
+
+      const mockProjects = new Map();
+      const gm = new GitOpsManager({
+        dataDir: path.join(gitTmp, 'state'),
+        projectManager: {
+          getAll: () => Array.from(mockProjects.values()),
+          getById: (id) => mockProjects.get(id) || null,
+          create: (data) => {
+            const p = { id: data.id || `p_${mockProjects.size + 1}`, ...data };
+            mockProjects.set(p.id, p);
+            return p;
+          },
+          update: (id, patch) => {
+            const cur = mockProjects.get(id);
+            const next = { ...cur, ...patch };
+            mockProjects.set(id, next);
+            return next;
+          },
+          delete: (id) => mockProjects.delete(id)
+        },
+        domainManager: { getAll: () => [], list: () => [], addDomain: async () => {}, deleteDomain: async () => {} },
+        cronManager: { list: () => [], create: () => ({ id: 'c1' }), update: () => {}, remove: () => {} },
+        databaseManager: { list: () => [] },
+        environmentManager: { listEnvironments: () => [], upsertEnvironment: () => {}, deleteEnvironment: () => {} },
+        ingressManager: { reconcile: async () => {} },
+        uptimeMonitor: { listMonitors: () => [] },
+        auditLogger: { record: () => {} }
+      });
+
+      // Rechazo de symlink directo fuera del repo y directorio padre symlink
+      let symlinkCreated = false;
+      try {
+        fs.symlinkSync(secretOutside, path.join(repoDir, 'culkibo.yaml'));
+        fs.symlinkSync(outsideDir, path.join(repoDir, 'linked-dir'), process.platform === 'win32' ? 'junction' : 'dir');
+        symlinkCreated = true;
+      } catch (e) {
+        try {
+          fs.symlinkSync(outsideDir, path.join(repoDir, 'linked-dir'), 'junction');
+          symlinkCreated = true;
+        } catch (_) {}
+      }
+      if (symlinkCreated) {
+        if (fs.existsSync(path.join(repoDir, 'culkibo.yaml'))) {
+          assert.throws(
+            () => gm.readRepoManifestSafe(repoDir, 'culkibo.yaml'),
+            (err) => err && (err.code === 'GITOPS_SYMLINK_FORBIDDEN' || /symlink|enlace simbólico/i.test(err.message)),
+            'readRepoManifestSafe debe rechazar culkibo.yaml symlink fuera del repo'
+          );
+        }
+        if (fs.existsSync(path.join(repoDir, 'linked-dir'))) {
+          assert.throws(
+            () => gm.readRepoManifestSafe(repoDir, 'linked-dir/secret.yaml'),
+            (err) => err && (err.code === 'GITOPS_SYMLINK_FORBIDDEN' || /symlink|enlace simbólico/i.test(err.message)),
+            'readRepoManifestSafe debe rechazar directorios intermedios symlink'
+          );
+        }
+      }
+
+      // Preservación de pinnedCommitSha tras redeploy manual y reapply sin commitSha
+      const pinnedSha = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+      const stackYaml = [
+        'version: 1',
+        'name: prod-stack',
+        'projects:',
+        '  - id: proj_gitops_w3',
+        '    name: Web W3',
+        '    gitRepo: https://github.com/acme/web-w3.git',
+        '    gitBranch: main'
+      ].join('\n');
+
+      const applied1 = await gm.applyStack(stackYaml, {
+        stackId: 'prod-stack',
+        commitSha: pinnedSha,
+        branch: 'main',
+        actor: 'webhook:github'
+      });
+      assert.strictEqual(applied1.pinnedCommitSha, pinnedSha);
+
+      const manualRes = gm.recordManualRedeploy('prod-stack', { actor: 'admin@acme.test', reason: 'hotfix restart' });
+      assert.strictEqual(manualRes.pinnedCommitSha, pinnedSha, 'recordManualRedeploy debe preservar pinnedCommitSha intacto');
+      assert.strictEqual(manualRes.preservedCommitSha, true);
+      assert.strictEqual(manualRes.manualRedeployCount, 1);
+
+      const applied2 = await gm.applyStack(stackYaml, { stackId: 'prod-stack', actor: 'operator' });
+      assert.strictEqual(applied2.pinnedCommitSha, pinnedSha, 'applyStack sin commitSha no debe borrar pinnedCommitSha');
+
+      const drift = gm.detectDrift('prod-stack');
+      assert.strictEqual(drift.drifted, false, 'Un redeploy manual no debe corromper el estado GitOps ni inducir drift');
+      assert.strictEqual(drift.pinnedCommitSha, pinnedSha);
+    } finally {
+      fs.rmSync(gitTmp, { recursive: true, force: true });
+    }
+  }
+
+  // 8d. portainer#13139 & dokploy#4898: <=300s replay timestamp window, NEVER 204 on failed sync deploy, strict token redaction
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    assert.strictEqual(webhookService.validateWebhookTimestamp({ headers: {} }).skipped, true);
+    assert.strictEqual(webhookService.validateWebhookTimestamp({ headers: { 'x-webhook-timestamp': String(nowSec - 45) } }).valid, true);
+    const staleTs = webhookService.validateWebhookTimestamp({ headers: { 'x-webhook-timestamp': String(nowSec - 601) } });
+    assert.strictEqual(staleTs.valid, false);
+    assert.strictEqual(staleTs.status, 401);
+    assert.strictEqual(staleTs.code, 'WEBHOOK_REPLAY_EXPIRED');
+
+    const rawHookToken = 'ckh_9f8e7d6c5b4a3210fedcba9876543210abcdef12345678';
+    const rawGhToken = 'ghp_SuperSecretGitHubToken998877665544';
+    const redacted = webhookService.redactWebhookSecrets(
+      `Deploy failed with token=${rawHookToken} Authorization: Bearer ${rawGhToken} glpat-SecretGitLab12345`,
+      [rawHookToken]
+    );
+    assert.ok(!redacted.includes(rawHookToken) && !redacted.includes('ckh_9f8e'), 'No debe filtrar ni el token ni su prefijo');
+    assert.ok(!redacted.includes(rawGhToken) && !redacted.includes('ghp_'), 'No debe filtrar prefijo ghp_');
+    assert.ok(!redacted.includes('glpat-'), 'No debe filtrar prefijo glpat-');
+
+    const hookProj = projectManager.create({
+      name: 'W3 Webhook Guard Proj',
+      gitRepo: 'https://gitlab.example.test/acme/w3-hook.git',
+      gitBranch: 'main',
+      webhookSecret: 'gl_secret_w3_999',
+      deployHookToken: rawHookToken
+    });
+    const deployMgr = require('../server/services/deployManager');
+    const origDetect = deployMgr.detectDocker;
+    const origEnqueue = deployMgr.enqueue;
+    try {
+      const expiredHook = await webhookService.handleDeployHook({
+        params: { projectId: hookProj.id },
+        headers: {
+          authorization: `Bearer ${rawHookToken}`,
+          'x-webhook-timestamp': String(nowSec - 900)
+        },
+        query: {},
+        body: {}
+      });
+      assert.strictEqual(expiredHook.status, 401);
+      assert.strictEqual(expiredHook.body.code, 'WEBHOOK_REPLAY_EXPIRED');
+
+      const expiredGl = await webhookService.handleGitLabWebhook({
+        headers: {
+          'x-gitlab-token': 'gl_secret_w3_999',
+          'x-gitlab-event': 'Push Hook',
+          'x-gitlab-event-timestamp': new Date(Date.now() - 400 * 1000).toISOString()
+        },
+        query: { projectId: hookProj.id },
+        body: { ref: 'refs/heads/main', after: '1111111111111111111111111111111111111111', commits: [] }
+      });
+      assert.strictEqual(expiredGl.status, 401);
+      assert.strictEqual(expiredGl.body.code, 'WEBHOOK_REPLAY_EXPIRED');
+
+      deployMgr.detectDocker = async () => ({ available: true, version: '27.0.0' });
+      deployMgr.enqueue = () => ({
+        started: true,
+        queued: false,
+        promise: Promise.resolve({
+          status: 'fallido',
+          error: `Container failed auth with ${rawHookToken}`
+        })
+      });
+      const failedSync = await webhookService.handleDeployHook({
+        params: { projectId: hookProj.id },
+        headers: {
+          authorization: `Bearer ${rawHookToken}`,
+          'x-webhook-timestamp': String(nowSec)
+        },
+        query: {},
+        body: { sync: true }
+      });
+      assert.notStrictEqual(failedSync.status, 204, 'Un deploy fallido JAMÁS puede devolver HTTP 204');
+      assert.strictEqual(failedSync.status, 502);
+      assert.strictEqual(failedSync.body.success, false);
+      assert.strictEqual(failedSync.body.code, 'DEPLOY_FAILED');
+      assert.ok(!JSON.stringify(failedSync.body).includes(rawHookToken) && !JSON.stringify(failedSync.body).includes('ckh_9f8e'), 'La respuesta de error jamás debe filtrar tokens ni prefijos');
+    } finally {
+      deployMgr.detectDocker = origDetect;
+      deployMgr.enqueue = origEnqueue;
+      projectManager.delete(hookProj.id);
+    }
+  }
+
+  // 8e. arcane#3855/#1485/#3620 & Cosmos#625: OIDC 5s JWKS timeout + stale-while-revalidate cached JWKS fallback
+  {
+    const oidcW3Tmp = makeTempDir('culkibo-oidc-jwks-w3-');
+    try {
+      const oidc = new OidcService({ dataDir: oidcW3Tmp });
+      const prov = { id: 'corp-idp', allowInsecureLocal: true };
+      const jwksUri = 'https://idp.example.test/.well-known/jwks.json';
+      const staleEvents = [];
+      oidc.on('jwks_stale_fallback', (ev) => staleEvents.push(ev));
+
+      const t0 = Date.now();
+      await assert.rejects(
+        () => oidc._getJwks(prov, jwksUri, {
+          timeoutMs: 120,
+          fetchImpl: () => new Promise(() => {})
+        }),
+        (err) => err && err.code === 'OIDC_JWKS_TIMEOUT' && err.status === 502,
+        'Debe cortar con OIDC_JWKS_TIMEOUT cuando el IdP JWKS se cuelga'
+      );
+      assert.ok(Date.now() - t0 < 1500, 'El timeout de JWKS debe dispararse en tiempo acotado');
+
+      const cachedKeys = { keys: [{ kty: 'RSA', kid: 'kid-stale-1', n: 'abc', e: 'AQAB' }] };
+      oidc.jwksCache.set(prov.id, { at: Date.now() - (20 * 60 * 1000), jwks: cachedKeys });
+      const fallbackJwks = await oidc._getJwks(prov, jwksUri, {
+        timeoutMs: 120,
+        fetchImpl: () => new Promise(() => {})
+      });
+      assert.deepStrictEqual(fallbackJwks, cachedKeys, 'Debe servir JWKS cacheado (stale-while-revalidate) si el IdP tarda o cae');
+      assert.strictEqual(staleEvents.length, 1);
+      assert.strictEqual(staleEvents[0].reason, 'OIDC_JWKS_TIMEOUT');
+    } finally {
+      fs.rmSync(oidcW3Tmp, { recursive: true, force: true });
+    }
+  }
+
+  // 8f. Clean English default local node name in ServerFleetManager
+  {
+    const fleetTmp = makeTempDir('culkibo-fleet-name-');
+    try {
+      const fleet = new ServerFleetManager({ dataDir: fleetTmp });
+      const localNode = fleet._buildVirtualLocalServer();
+      assert.strictEqual(localNode.name, 'Local Server (Primary)', 'El nodo local por defecto debe llamarse Local Server (Primary)');
+    } finally {
+      fs.rmSync(fleetTmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Wave-3 CVEs (8a-8f): culkibo.protected+BuildKit cap, stale lock PID/TTL reap, GitOps symlink+commitSha, webhook replay/no-204/redact, OIDC JWKS SWR y Local Server (Primary)');
 
   console.log('✅ Suite #23 completada correctamente.\n');
 }

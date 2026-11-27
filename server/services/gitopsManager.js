@@ -2335,7 +2335,10 @@ class GitOpsManager extends EventEmitter {
    *   prune?: boolean,
    *   confirmDestructive?: boolean,
    *   actor?: string,
-   *   stackId?: string | null
+   *   stackId?: string | null,
+   *   commitSha?: string | null,
+   *   branch?: string | null,
+   *   preserveCommitSha?: boolean
    * }} [opts]
    */
   async applyStack(yamlText, opts = {}) {
@@ -2654,9 +2657,21 @@ class GitOpsManager extends EventEmitter {
     const liveExport = this.exportStack({ projectIds: managedProjectIds, name: manifest.name });
 
     const prevRecord = this.state.stacks[stackId] || null;
+    const incomingCommitSha = typeof opts.commitSha === 'string' && /^[0-9a-f]{7,40}$/i.test(opts.commitSha.trim())
+      ? opts.commitSha.trim().toLowerCase()
+      : null;
+    const preserveCommitSha = opts.preserveCommitSha !== false;
+    const pinnedCommitSha = incomingCommitSha || (preserveCommitSha && prevRecord && prevRecord.pinnedCommitSha ? prevRecord.pinnedCommitSha : null);
+    const incomingBranch = typeof opts.branch === 'string' && opts.branch.trim()
+      ? opts.branch.trim().slice(0, 120)
+      : null;
+    const pinnedBranch = incomingBranch || (preserveCommitSha && prevRecord && prevRecord.pinnedBranch ? prevRecord.pinnedBranch : null);
+
     const history = Array.isArray(prevRecord && prevRecord.history) ? [...prevRecord.history] : [];
     history.push({
       manifestHash: plan.manifestHash,
+      commitSha: pinnedCommitSha,
+      branch: pinnedBranch,
       appliedAt: now,
       actor,
       prune,
@@ -2668,6 +2683,11 @@ class GitOpsManager extends EventEmitter {
       name: manifest.name,
       manifestHash: plan.manifestHash,
       postApplyExportHash: liveExport.manifestHash,
+      pinnedCommitSha,
+      pinnedBranch,
+      manualRedeployCount: Number(prevRecord && prevRecord.manualRedeployCount) || 0,
+      lastManualRedeployAt: (prevRecord && prevRecord.lastManualRedeployAt) || null,
+      lastManualRedeployBy: (prevRecord && prevRecord.lastManualRedeployBy) || null,
       canonicalYaml,
       managedResources: {
         projectIds: Array.from(new Set(managedProjectIds)).sort(),
@@ -2687,6 +2707,8 @@ class GitOpsManager extends EventEmitter {
     this._audit('gitops.stack_applied', stackId, {
       stackId,
       manifestHash: plan.manifestHash,
+      pinnedCommitSha,
+      pinnedBranch,
       prune,
       confirmDestructive,
       appliedCounts,
@@ -2700,6 +2722,8 @@ class GitOpsManager extends EventEmitter {
       stackId,
       stackName: manifest.name,
       manifestHash: plan.manifestHash,
+      pinnedCommitSha,
+      pinnedBranch,
       appliedCounts,
       plan: {
         create: plan.create,
@@ -2716,6 +2740,54 @@ class GitOpsManager extends EventEmitter {
     return result;
   }
 
+  /**
+   * Registra un redespliegue manual sobre un stack GitOps preservando intactos
+   * `pinnedCommitSha`, `pinnedBranch` y el hash canónico (cura portainer#13298:
+   * un redeploy manual jamás debe borrar ni corromper la referencia Git ni inducir drift falso).
+   *
+   * @param {string} stackId
+   * @param {{ actor?: string, reason?: string | null, commitSha?: string | null, allowCommitOverride?: boolean }} [opts]
+   */
+  recordManualRedeploy(stackId, opts = {}) {
+    this._ensureLoaded();
+    const targetId = normalizeStackId(stackId);
+    const stack = this.state.stacks[targetId];
+    if (!stack) {
+      throw new Error(`Stack GitOps "${targetId}" no encontrado`);
+    }
+    const now = new Date().toISOString();
+    const actor = String(opts.actor || 'operator').slice(0, 80);
+    const prevCommitSha = stack.pinnedCommitSha || null;
+    let nextCommitSha = prevCommitSha;
+    if (opts.allowCommitOverride === true && typeof opts.commitSha === 'string' && /^[0-9a-f]{7,40}$/i.test(opts.commitSha.trim())) {
+      nextCommitSha = opts.commitSha.trim().toLowerCase();
+    }
+    stack.pinnedCommitSha = nextCommitSha;
+    stack.manualRedeployCount = (Number(stack.manualRedeployCount) || 0) + 1;
+    stack.lastManualRedeployAt = now;
+    stack.lastManualRedeployBy = actor;
+    this._save();
+
+    this._audit('gitops.manual_redeploy', targetId, {
+      stackId: targetId,
+      actor,
+      reason: opts.reason ? String(opts.reason).slice(0, 200) : null,
+      pinnedCommitSha: stack.pinnedCommitSha,
+      preservedCommitSha: stack.pinnedCommitSha === prevCommitSha
+    });
+
+    return {
+      ok: true,
+      stackId: targetId,
+      manifestHash: stack.manifestHash,
+      pinnedCommitSha: stack.pinnedCommitSha,
+      pinnedBranch: stack.pinnedBranch || null,
+      preservedCommitSha: stack.pinnedCommitSha === prevCommitSha,
+      manualRedeployCount: stack.manualRedeployCount,
+      lastManualRedeployAt: now
+    };
+  }
+
   // =========================================================================
   // 5. DRIFT DETECTION & STACK REGISTRY
   // =========================================================================
@@ -2729,6 +2801,10 @@ class GitOpsManager extends EventEmitter {
         id: s.id,
         name: s.name,
         manifestHash: s.manifestHash,
+        pinnedCommitSha: s.pinnedCommitSha || null,
+        pinnedBranch: s.pinnedBranch || null,
+        manualRedeployCount: Number(s.manualRedeployCount) || 0,
+        lastManualRedeployAt: s.lastManualRedeployAt || null,
         lastAppliedAt: s.lastAppliedAt,
         lastAppliedBy: s.lastAppliedBy,
         managedResources: s.managedResources,
@@ -2787,6 +2863,8 @@ class GitOpsManager extends EventEmitter {
       expectedHash: stack.manifestHash,
       expectedExportHash: stack.postApplyExportHash || null,
       liveHash: liveExport.manifestHash,
+      pinnedCommitSha: stack.pinnedCommitSha || null,
+      pinnedBranch: stack.pinnedBranch || null,
       lastAppliedAt: stack.lastAppliedAt,
       differences: {
         create: diffPlan.create,
@@ -2833,14 +2911,33 @@ class GitOpsManager extends EventEmitter {
     if (!fs.existsSync(candidate)) {
       return { found: false, absPath: null, yamlText: null };
     }
+    // Verificar cada componente intermedio del camino para bloquear directorios symlink que escapen del repo (portainer#13298)
+    const segments = cleanRel.split('/');
+    let walkPath = realBase;
+    for (let i = 0; i < segments.length; i++) {
+      walkPath = path.join(walkPath, segments[i]);
+      const segStat = fs.lstatSync(walkPath);
+      if (segStat.isSymbolicLink()) {
+        /** @type {any} */
+        const symErr = new Error(`El manifiesto GitOps "${cleanRel}" atraviesa o apunta a un enlace simbólico bloqueado`);
+        symErr.code = 'GITOPS_SYMLINK_FORBIDDEN';
+        throw symErr;
+      }
+    }
     const lstat = fs.lstatSync(candidate);
     if (lstat.isSymbolicLink() || !lstat.isFile()) {
-      throw new Error(`El manifiesto GitOps "${cleanRel}" no puede ser un enlace simbólico ni directorio`);
+      /** @type {any} */
+      const fileErr = new Error(`El manifiesto GitOps "${cleanRel}" no puede ser un enlace simbólico ni directorio`);
+      fileErr.code = 'GITOPS_SYMLINK_FORBIDDEN';
+      throw fileErr;
     }
     const realCandidate = fs.realpathSync(candidate);
     const relReal = path.relative(realBase, realCandidate);
     if (!relReal || relReal.startsWith('..') || path.isAbsolute(relReal)) {
-      throw new Error(`Escape por symlink bloqueado en manifiesto GitOps: "${manifestPath}"`);
+      /** @type {any} */
+      const escErr = new Error(`Escape por symlink bloqueado en manifiesto GitOps: "${manifestPath}"`);
+      escErr.code = 'GITOPS_SYMLINK_FORBIDDEN';
+      throw escErr;
     }
     if (lstat.size > MAX_YAML_BYTES) {
       throw new Error(`El manifiesto GitOps "${cleanRel}" supera el límite de ${Math.round(MAX_YAML_BYTES / 1024)} KB`);
@@ -2949,7 +3046,9 @@ class GitOpsManager extends EventEmitter {
       prune: false,
       confirmDestructive: false,
       stackId,
-      actor
+      actor,
+      commitSha: opts.commitSha || null,
+      branch: opts.branch || null
     });
     this._audit('gitops.webhook_applied', stackId, {
       projectId: project.id,

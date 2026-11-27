@@ -27,6 +27,8 @@ const PENDING_STATE_TTL_MS = 5 * 60 * 1000;
 const PENDING_STATE_CAP = 500;
 const DISCOVERY_CACHE_TTL_MS = 15 * 60 * 1000;
 const JWKS_CACHE_TTL_MS = 15 * 60 * 1000;
+const JWKS_FETCH_TIMEOUT_MS = 5000;
+const JWKS_STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CLOCK_SKEW_SEC = 60;
 
 const COMPARE_HMAC_KEY = crypto.randomBytes(32);
@@ -450,6 +452,9 @@ class OidcService extends EventEmitter {
     this._discoveryCache = new Map();
     /** @type {Map<string, { at: number, jwks: any }>} */
     this._jwksCache = new Map();
+    /** Alias público para diagnóstico y stale-while-revalidate fallback (arcane#3855, Cosmos#625). */
+    this.jwksCache = this._jwksCache;
+    this._jwksStaleFallbackCount = 0;
   }
 
   _getPaths() {
@@ -872,30 +877,64 @@ class OidcService extends EventEmitter {
   }
 
   /**
-   * Obtiene (y cachea 15 min) las claves públicas JWKS del proveedor.
+   * Obtiene (y cachea 15 min) las claves públicas JWKS del proveedor con timeout acotado de 5 s
+   * y fallback stale-while-revalidate sobre `jwksCache` (hasta 24 h) si el IdP tarda o cae
+   * temporalmente (cura arcane#3855/#1485/#3620 y Cosmos#625).
    * @param {any} provider
    * @param {string} jwksUri
-   * @param {{ forceRefresh?: boolean, fetchImpl?: Function | null }} [opts]
+   * @param {{ forceRefresh?: boolean, fetchImpl?: Function | null, timeoutMs?: number, allowStaleFallback?: boolean }} [opts]
    */
-  async _getJwks(provider, jwksUri, { forceRefresh = false, fetchImpl = null } = {}) {
+  async _getJwks(provider, jwksUri, { forceRefresh = false, fetchImpl = null, timeoutMs = JWKS_FETCH_TIMEOUT_MS, allowStaleFallback = true } = {}) {
     const cached = this._jwksCache.get(provider.id);
-    if (!forceRefresh && cached && (Date.now() - cached.at) < JWKS_CACHE_TTL_MS) {
+    const now = Date.now();
+    if (!forceRefresh && cached && (now - cached.at) < JWKS_CACHE_TTL_MS) {
       return cached.jwks;
     }
-    const res = await this._httpFetch(jwksUri, provider, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      fetchImpl
-    });
-    if (!res || !res.ok) {
-      throw oidcError(`Error al descargar JWKS desde ${jwksUri} (HTTP ${res?.status || 0})`, 502, 'OIDC_JWKS_FAILED');
+    const effectiveTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Math.min(Math.max(50, Number(timeoutMs)), 30000)
+      : JWKS_FETCH_TIMEOUT_MS;
+
+    /** @type {any} */
+    let timer = null;
+    try {
+      const fetchPromise = this._httpFetch(jwksUri, provider, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        timeoutMs: effectiveTimeoutMs,
+        fetchImpl
+      });
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(oidcError(`Timeout (${effectiveTimeoutMs}ms) descargando JWKS desde ${jwksUri}`, 502, 'OIDC_JWKS_TIMEOUT'));
+        }, effectiveTimeoutMs);
+      });
+      const res = await Promise.race([fetchPromise, timeoutPromise]);
+      if (!res || !res.ok) {
+        throw oidcError(`Error al descargar JWKS desde ${jwksUri} (HTTP ${res?.status || 0})`, 502, 'OIDC_JWKS_FAILED');
+      }
+      const jwks = typeof res.json === 'function' ? await res.json() : res.body;
+      if (!jwks || !Array.isArray(jwks.keys)) {
+        throw oidcError('Respuesta JWKS inválida', 502, 'OIDC_JWKS_INVALID');
+      }
+      this._jwksCache.set(provider.id, { at: Date.now(), jwks });
+      return jwks;
+    } catch (err) {
+      if (allowStaleFallback !== false && cached && cached.jwks && (Date.now() - cached.at) < JWKS_STALE_MAX_AGE_MS) {
+        this._jwksStaleFallbackCount++;
+        /** @type {any} */
+        const e = err;
+        this.emit('jwks_stale_fallback', {
+          providerId: provider.id,
+          jwksUri,
+          ageMs: Date.now() - cached.at,
+          reason: (e && e.code) || (e && e.message) || 'OIDC_JWKS_FAILED'
+        });
+        return cached.jwks;
+      }
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    const jwks = typeof res.json === 'function' ? await res.json() : res.body;
-    if (!jwks || !Array.isArray(jwks.keys)) {
-      throw oidcError('Respuesta JWKS inválida', 502, 'OIDC_JWKS_INVALID');
-    }
-    this._jwksCache.set(provider.id, { at: Date.now(), jwks });
-    return jwks;
   }
 
   /**

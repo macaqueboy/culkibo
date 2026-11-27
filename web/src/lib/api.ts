@@ -1,3 +1,5 @@
+import { isDemoMode, handleDemoFetch } from './demoMode';
+
 const API_BASE = '/api';
 const TOKEN_STORAGE_KEY = 'culkibo_control_token';
 
@@ -38,6 +40,9 @@ export function clearAuthToken(): void {
 }
 
 export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  if (isDemoMode()) {
+    return handleDemoFetch(input, init);
+  }
   const token = getAuthToken();
   const headers = new Headers(init.headers || {});
   if (token && !headers.has('Authorization')) {
@@ -4094,6 +4099,38 @@ export const api = {
       'Could not query Culkibo edition'
     );
   },
+
+  // --- Cycle-4 Native Zero-Dep OTLP/HTTP JSON Exporter ---
+
+  async getOtlpStatus(): Promise<OtlpStatusResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/otlp`),
+      'Could not load OTLP exporter status'
+    );
+  },
+
+  async updateOtlpConfig(payload: {
+    enabled?: boolean;
+    endpoint?: string;
+    serviceName?: string;
+    headers?: Record<string, string>;
+  }): Promise<OtlpStatusResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/otlp`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not update OTLP exporter configuration'
+    );
+  },
+
+  async flushOtlp(): Promise<{ ok?: boolean; flushed?: number; status?: OtlpStatusResult }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/otlp/flush`, { method: 'POST' }),
+      'Could not flush OTLP spans'
+    );
+  },
 };
 
 // =====================================================================
@@ -4513,4 +4550,21 @@ export interface EditionStatusResult {
   licensee?: string | null;
   expiresAt?: string | null;
   features?: Record<string, boolean>;
+}
+
+export interface OtlpStatusResult {
+  enabled: boolean;
+  endpoint: string;
+  serviceName: string;
+  protocol?: string;
+  bufferedSpans?: number;
+  maxBufferSize?: number;
+  totalExported?: number;
+  totalFailed?: number;
+  circuitOpen?: boolean;
+  circuitState?: string;
+  lastFlushAt?: string | null;
+  lastError?: string | null;
+  headersRedacted?: Record<string, string>;
+  hasAuthHeader?: boolean;
 }

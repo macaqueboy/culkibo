@@ -492,6 +492,83 @@ async function testCliDx() {
     assert.strictEqual(tunJson.targetPort, 3000);
     console.log('  ✓ Pioneer CLI Cycle-2 verificado (culkibo smartpack, culkibo pussh --dry-run, culkibo tunnel-agent --dry-run)');
 
+    // 9. Pioneer Cycle-4 CLI: `culkibo verify --json` (self-check, CHECKSUMS.sha256 + tamper, SLSA v1.1 DSSE + tamper) y `culkibo demo --json`
+    const verifySelf = await runCli(['verify', '--json'], { env: isolatedEnv });
+    assert.strictEqual(verifySelf.status, 0, `culkibo verify --json falló: ${verifySelf.stderr} ${verifySelf.stdout}`);
+    const verifySelfJson = JSON.parse(verifySelf.stdout);
+    assert.strictEqual(verifySelfJson.ok, true);
+    assert.strictEqual(verifySelfJson.valid, true);
+    assert.ok(verifySelfJson.checked > 0);
+    assert.strictEqual(verifySelfJson.sbom?.specVersion, '1.6');
+
+    // CHECKSUMS.sha256 verification (pass + tampered fail)
+    const releaseProvenance = require('../scripts/release-provenance');
+    const tmpProvDir = path.join(tmpRoot, 'prov-out');
+    const provOut = releaseProvenance.writeReleaseProvenance({ outDir: tmpProvDir });
+    const verifyChecksumsOk = await runCli(['verify', provOut.files.checksums, '--json'], { env: isolatedEnv });
+    assert.strictEqual(verifyChecksumsOk.status, 0, `culkibo verify CHECKSUMS.sha256 falló: ${verifyChecksumsOk.stderr}`);
+    const verifyCsOkJson = JSON.parse(verifyChecksumsOk.stdout);
+    assert.strictEqual(verifyCsOkJson.ok, true);
+    assert.strictEqual(verifyCsOkJson.valid, true);
+    assert.strictEqual(verifyCsOkJson.mode, 'checksums');
+    assert.ok(verifyCsOkJson.checked > 0);
+
+    const tamperedCsPath = path.join(tmpProvDir, 'CHECKSUMS.tampered.sha256');
+    const origCsText = fs.readFileSync(provOut.files.checksums, 'utf8');
+    fs.writeFileSync(tamperedCsPath, origCsText.replace(/^[a-f0-9]{64}/m, '0'.repeat(64)), 'utf8');
+    const verifyCsBad = await runCli(['verify', tamperedCsPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(verifyCsBad.status, 1, 'CHECKSUMS.sha256 manipulado debe salir con código 1');
+    const verifyCsBadJson = JSON.parse(verifyCsBad.stdout);
+    assert.strictEqual(verifyCsBadJson.valid, false);
+    assert.ok(Array.isArray(verifyCsBadJson.mismatched) && verifyCsBadJson.mismatched.length >= 1);
+
+    // SLSA v1.1 Ed25519 DSSE verification (pass + tampered signature fail)
+    const { SupplyChainAttestor } = require('../server/services/supplyChainAttestor');
+    const attestDataDir = path.join(tmpRoot, 'data');
+    const attestor = new SupplyChainAttestor({ dataDir: attestDataDir });
+    const signedAtt = attestor.attestRelease({
+      projectId: 'cli-verify-proj',
+      revision: 'rev-1',
+      commitSha: '1234567890abcdef1234567890abcdef12345678'
+    });
+    const pubKeyPath = path.join(tmpRoot, 'attest.pub.pem');
+    fs.writeFileSync(pubKeyPath, signedAtt.publicKeyPem, 'utf8');
+    const verifyDsseOk = await runCli(['verify', signedAtt.storedPath, '--public-key', pubKeyPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(verifyDsseOk.status, 0, `culkibo verify DSSE falló: ${verifyDsseOk.stderr} ${verifyDsseOk.stdout}`);
+    const verifyDsseOkJson = JSON.parse(verifyDsseOk.stdout);
+    assert.strictEqual(verifyDsseOkJson.ok, true);
+    assert.strictEqual(verifyDsseOkJson.valid, true);
+    assert.strictEqual(verifyDsseOkJson.mode, 'slsa-dsse');
+    assert.strictEqual(verifyDsseOkJson.algorithm, 'Ed25519');
+    assert.strictEqual(verifyDsseOkJson.slsaVersion, '1.1');
+
+    const badDssePath = path.join(tmpRoot, 'tampered.dsse.json');
+    const badEnv = JSON.parse(JSON.stringify(signedAtt.envelope));
+    badEnv.signatures[0].sig = Buffer.alloc(64, 7).toString('base64');
+    fs.writeFileSync(badDssePath, JSON.stringify(badEnv, null, 2), 'utf8');
+    const verifyDsseBad = await runCli(['verify', badDssePath, '--public-key', pubKeyPath, '--json'], { env: isolatedEnv });
+    assert.strictEqual(verifyDsseBad.status, 1, 'Sobre DSSE manipulado debe salir con código 1');
+    const verifyDsseBadJson = JSON.parse(verifyDsseBad.stdout);
+    assert.strictEqual(verifyDsseBadJson.valid, false);
+    assert.strictEqual(verifyDsseBadJson.reason, 'INVALID_SIGNATURE');
+
+    // culkibo demo --json (<200 ms sandbox metadata + custom port)
+    const demoCli = await runCli(['demo', '--no-open', '--json'], { env: isolatedEnv });
+    assert.strictEqual(demoCli.status, 0, `culkibo demo --json falló: ${demoCli.stderr} ${demoCli.stdout}`);
+    const demoJson = JSON.parse(demoCli.stdout);
+    assert.strictEqual(demoJson.ok, true);
+    assert.strictEqual(demoJson.mode, 'demo');
+    assert.strictEqual(demoJson.demo, true);
+    assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
+    assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
+    assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
+    assert.strictEqual(demoJson.datasets.mcpTools, 113);
+
+    const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
+    assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
+    assert.strictEqual(JSON.parse(demoCustomPort.stdout).url, 'http://127.0.0.1:4044/?demo=1&lang=en&theme=dark');
+    console.log(`  ✓ Pioneer CLI Cycle-4 verificado (culkibo verify SHA-256/SLSA-DSSE + tamper detect, culkibo demo --json en ${demoJson.bootMs} ms)`);
+
     console.log('✅ All CLI DX tests passed!\n');
   } finally {
     if (mockServer) await new Promise((r) => mockServer.close(() => r(undefined)));
