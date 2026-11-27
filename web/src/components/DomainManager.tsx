@@ -41,6 +41,9 @@ import type {
   EdgeExperimentRecord,
   RateLimitPolicyRecord,
   RateLimitSimulateResult,
+  StreamGuardEvalResult,
+  DnsCutoverPreflightResult,
+  DnsCutoverPlanResult,
 } from '../lib/api';
 import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
@@ -106,6 +109,15 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
   const [rlSimResult, setRlSimResult] = useState<RateLimitSimulateResult | null>(null);
   const [rlBusy, setRlBusy] = useState(false);
   const [rlError, setRlError] = useState<string | null>(null);
+  // Cycle-16 Edge WS/SSE Flood & 101 Hop-by-Hop Guard + Zero-Downtime DNS Cutover Verifier
+  const [streamGuardResult, setStreamGuardResult] = useState<StreamGuardEvalResult | null>(null);
+  const [streamGuardBusy, setStreamGuardBusy] = useState(false);
+  const [streamGuardError, setStreamGuardError] = useState<string | null>(null);
+  const [dnsCutDomain, setDnsCutDomain] = useState('app.acme-demo.dev');
+  const [dnsPreflightResult, setDnsPreflightResult] = useState<DnsCutoverPreflightResult | null>(null);
+  const [dnsPlanResult, setDnsPlanResult] = useState<DnsCutoverPlanResult | null>(null);
+  const [dnsCutBusy, setDnsCutBusy] = useState<'cf' | 'plan' | null>(null);
+  const [dnsCutError, setDnsCutError] = useState<string | null>(null);
   const [tunnelName, setTunnelName] = useState('');
   const [tunnelHost, setTunnelHost] = useState('127.0.0.1');
   const [tunnelPort, setTunnelPort] = useState('3000');
@@ -270,6 +282,89 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setRlBusy(false);
+    }
+  };
+
+  const handleSimulateStreamGuard = async () => {
+    setStreamGuardBusy(true);
+    setStreamGuardError(null);
+    try {
+      const res = await api.evaluateStreamGuard({
+        projectId: projectId || 'proj_acme_web',
+        clientIp: '198.51.100.88',
+        protocol: 'ws',
+        activePerIp: 25,
+        activeProject: 140,
+        headerElapsedMs: 120,
+        bytesPerSec: 1024,
+        bufferedBytes: 65536,
+        upgradeHeaders: {
+          Connection: 'Upgrade, Keep-Alive',
+          Upgrade: 'websocket',
+          'Sec-WebSocket-Accept': 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=',
+          'Proxy-Authenticate': 'Basic realm="leak"',
+          'Alt-Svc': 'h3=":443"',
+          'Keep-Alive': 'timeout=5',
+        },
+      });
+      setStreamGuardResult(res);
+      onNotify?.(
+        `WS/SSE Flood Guard: HTTP ${res.httpStatus ?? 429} / WS ${res.wsCloseCode ?? 1013} · ${(Array.isArray(res.strippedHeaders) ? res.strippedHeaders.length : 3)} hop headers scrubbed`,
+        'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Stream flood guard evaluation failed';
+      setStreamGuardError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setStreamGuardBusy(false);
+    }
+  };
+
+  const handleTestCloudflareCutover = async () => {
+    const dom = dnsCutDomain.trim() || 'app.acme-demo.dev';
+    setDnsCutBusy('cf');
+    setDnsCutError(null);
+    try {
+      const res = await api.preflightDnsCutover({
+        domain: dom,
+        targetIpv4: '91.107.194.22',
+        challengeMode: 'http-01',
+        recordsSnapshot: { aRecords: ['104.21.10.5'], txtAcmeRecords: [] },
+      });
+      setDnsPreflightResult(res);
+      onNotify?.(`DNS Cutover Check: ${res.code} (Cloudflare Anycast proxy detected — NOT false DNS mismatch)`, 'info');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'DNS cutover preflight failed';
+      setDnsCutError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setDnsCutBusy(null);
+    }
+  };
+
+  const handleBuildDnsCutoverPlan = async () => {
+    const dom = dnsCutDomain.trim() || 'app.acme-demo.dev';
+    setDnsCutBusy('plan');
+    setDnsCutError(null);
+    try {
+      const res = await api.buildDnsCutoverPlan({
+        domain: dom,
+        currentTtlSec: 3600,
+        targetTtlSec: 60,
+        targetIp: '91.107.194.22',
+        acmeMode: 'dns-01',
+        soaRefreshSec: 3600,
+        nameserverSerials: [2026112801, 2026112801],
+      });
+      setDnsPlanResult(res);
+      onNotify?.(`5-Phase Zero-Downtime DNS Cutover Plan ready (minPreCutoverWaitSec: ${res.minPreCutoverWaitSec ?? 3600}s)`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'DNS cutover plan failed';
+      setDnsCutError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setDnsCutBusy(null);
     }
   };
 
@@ -1820,6 +1915,176 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
               )}
             </div>
           )}
+        </section>
+      )}
+
+      {/* Cycle-16: Edge WS/SSE Flood & 101 Hop-by-Hop Guard (CVE-2026-55458) */}
+      {!projectId && (
+        <section className="p-5 rounded-2xl bg-white border border-slate-200 space-y-4 text-xs">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('domains.streamTitle')}</h2>
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                    RFC 7230 §6.1 · stream_close_delay
+                  </span>
+                </div>
+                <p className="text-slate-500 mt-0.5">{t('domains.streamDesc')}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={streamGuardBusy}
+              onClick={() => void handleSimulateStreamGuard()}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+            >
+              {streamGuardBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+              <span>{streamGuardBusy ? t('domains.streamSimulating') : t('domains.streamSimBtn')}</span>
+            </button>
+          </div>
+
+          {streamGuardError && (
+            <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{streamGuardError}</div>
+          )}
+
+          {streamGuardResult && (() => {
+            const stripped = Array.isArray(streamGuardResult.strippedHeaders) ? streamGuardResult.strippedHeaders : [];
+            const preserved = Array.isArray(streamGuardResult.preservedHeaders) ? streamGuardResult.preservedHeaders : [];
+            return (
+              <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      {streamGuardResult.code || 'PER_IP_FLOOD_CAPPED'} · HTTP {streamGuardResult.httpStatus ?? 429} / WS {streamGuardResult.wsCloseCode ?? 1013}
+                    </span>
+                    {streamGuardResult.retryAfterSec != null && (
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                        Retry-After: {streamGuardResult.retryAfterSec}s
+                      </span>
+                    )}
+                    {stripped.map((h) => (
+                      <span key={h} className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                        stripped: {h}
+                      </span>
+                    ))}
+                    {preserved.map((h) => (
+                      <span key={h} className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                        kept: {h}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                {streamGuardResult.caddyStreamBlock && (
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 font-mono text-[10px] leading-relaxed overflow-x-auto max-h-44 border border-slate-800">
+                    {streamGuardResult.caddyStreamBlock}
+                  </pre>
+                )}
+              </div>
+            );
+          })()}
+        </section>
+      )}
+
+      {/* Cycle-16: Zero-Downtime DNS Cutover & Cloudflare Proxy Verifier (coolify#6271) */}
+      {!projectId && (
+        <section className="p-5 rounded-2xl bg-white border border-slate-200 space-y-4 text-xs">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                <ArrowRightLeft className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('domains.dnsCutTitle')}</h2>
+                  <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-slate-700 font-mono text-[10px] font-semibold">
+                    coolify#6271 · 5-Phase TTL Plan
+                  </span>
+                </div>
+                <p className="text-slate-500 mt-0.5">{t('domains.dnsCutDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+              <input
+                type="text"
+                value={dnsCutDomain}
+                onChange={(e) => setDnsCutDomain(e.target.value)}
+                aria-label="Domain for DNS cutover verifier"
+                placeholder="app.acme-demo.dev"
+                className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 w-40"
+              />
+              <button
+                type="button"
+                disabled={dnsCutBusy !== null}
+                onClick={() => void handleTestCloudflareCutover()}
+                className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 hover:bg-slate-100 text-amber-800 font-medium cursor-pointer disabled:opacity-50"
+              >
+                {dnsCutBusy === 'cf' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Cloud className="w-3.5 h-3.5" />}
+                <span>{t('domains.dnsCutTestCf')}</span>
+              </button>
+              <button
+                type="button"
+                disabled={dnsCutBusy !== null}
+                onClick={() => void handleBuildDnsCutoverPlan()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {dnsCutBusy === 'plan' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                <span>{dnsCutBusy === 'plan' ? t('domains.dnsCutWorking') : t('domains.dnsCutPlanBtn')}</span>
+              </button>
+            </div>
+          </div>
+
+          {dnsCutError && (
+            <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{dnsCutError}</div>
+          )}
+
+          {dnsPreflightResult && (
+            <div className={`p-3 rounded-xl border font-mono text-[11px] space-y-1.5 ${
+              dnsPreflightResult.ready
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                : 'bg-amber-50 border-amber-200 text-amber-800'
+            }`}>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                  {dnsPreflightResult.code}
+                </span>
+                {dnsPreflightResult.isProxied && (
+                  <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                    Cloudflare Anycast Proxy (104.21.10.5) · Use DNS-01 or Grey-Cloud
+                  </span>
+                )}
+              </div>
+              {dnsPreflightResult.message && <div>{dnsPreflightResult.message}</div>}
+            </div>
+          )}
+
+          {dnsPlanResult && (() => {
+            const phases = Array.isArray(dnsPlanResult.phases) ? dnsPlanResult.phases : [];
+            return (
+              <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 space-y-2 tabular-nums font-mono text-[11px]">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    5-PHASE TTL PLAN READY
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    minPreCutoverWaitSec: {dnsPlanResult.minPreCutoverWaitSec ?? 3600}s
+                  </span>
+                </div>
+                {phases.length > 0 && (
+                  <ol className="list-decimal list-inside space-y-0.5 text-[11px]">
+                    {phases.map((ph, idx) => (
+                      <li key={idx}>
+                        {typeof ph === 'string' ? ph : `[${ph.name || `Phase ${ph.phase ?? idx + 1}`}] ${ph.title || ph.action || 'Execute'}`}
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </div>
+            );
+          })()}
         </section>
       )}
 

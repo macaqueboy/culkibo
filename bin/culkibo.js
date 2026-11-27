@@ -64,7 +64,9 @@ const svc = {
   get preDeploySecretGate() { return require('../server/services/preDeploySecretGate'); },
   get multiArchPlannerService() { return require('../server/services/multiArchPlannerService'); },
   get runtimeAnomalyService() { return require('../server/services/runtimeAnomalyService'); },
-  get digestPromotionService() { return require('../server/services/digestPromotionService'); }
+  get digestPromotionService() { return require('../server/services/digestPromotionService'); },
+  get apiContractGateService() { return require('../server/services/apiContractGateService'); },
+  get dnsCutoverService() { return require('../server/services/dnsCutoverService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2887,15 +2889,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 160,
+            mcpTools: 165,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '160 MCP tools (-90% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'SPIFFE-Lite mTLS CA, Feature Flags Kill-Switch, AI RPM+TPM Shield, Falco-Lite Anomaly & @sha256: GitOps Promotion'
+            '165 MCP tools (-90.6% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'API Contract Gate, OCI/SLSA Rekor Verifier, WS/SSE 101 Flood Guard, DNS Cutover & Orphan PR Reaper'
           ]
         };
       };
@@ -4166,6 +4168,137 @@ program
       if (!valid) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-16 CLI: contract-diff (Post-Optic) & dns-cutover (TTL + CF ACME)
+// ===========================================================================
+
+program
+  .command('contract-diff <baseFile> <revFile>')
+  .description('API Contract & Schema Drift Gate (OpenAPI 3.x / JSON-Schema / GraphQL SDL + SemVer): sale con código 1 si hay breaking changes sin major bump')
+  .option('--format <fmt>', 'Formato del contrato: openapi | jsonschema | graphql')
+  .option('--json', 'Salida JSON estructurada')
+  .action((baseFile, revFile, options) => {
+    try {
+      const basePath = path.resolve(String(baseFile || ''));
+      const revPath = path.resolve(String(revFile || ''));
+      if (!fs.existsSync(basePath)) throw new Error(`Archivo base no encontrado: ${basePath}`);
+      if (!fs.existsSync(revPath)) throw new Error(`Archivo candidato no encontrado: ${revPath}`);
+
+      const rawBase = fs.readFileSync(basePath, 'utf8');
+      const rawRev = fs.readFileSync(revPath, 'utf8');
+      const ext = path.extname(basePath).toLowerCase();
+      const format = String(
+        options.format || ((ext === '.graphql' || ext === '.gql' || ext === '.sdl') ? 'graphql' : 'openapi')
+      ).trim().toLowerCase();
+
+      const parseSpec = (raw, label) => {
+        if (format === 'graphql') return raw;
+        try {
+          return JSON.parse(raw);
+        } catch (err) {
+          throw new Error(`El archivo ${label} no es JSON válido para formato "${format}": ${err.message}`);
+        }
+      };
+
+      const baseSpec = parseSpec(rawBase, basePath);
+      const revisionSpec = parseSpec(rawRev, revPath);
+      const contractSvc = svc.apiContractGateService;
+      const result = contractSvc.diffContracts({ format, baseSpec, revisionSpec });
+      const allowed = Boolean(result && result.allowed);
+      const payload = {
+        ...result,
+        ok: allowed,
+        format,
+        baseFile: basePath,
+        revFile: revPath
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!allowed) process.exitCode = 1;
+        return;
+      }
+
+      const badge = allowed ? '\x1b[32mALLOWED ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n📜 Culkibo API Contract Gate (${format}) — [${badge}]`);
+      if (result.code) console.log(`   Código:    ${result.code}`);
+      console.log(`   Breaking:  ${Array.isArray(result.breakingChanges) ? result.breakingChanges.length : 0}`);
+      console.log('');
+      if (!allowed) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('dns-cutover <domain>')
+  .description('Zero-Downtime DNS Cutover Planner & Cloudflare Proxy ACME Checker (5 fases TTL + detector Anycast)')
+  .option('--target-ip <ip>', 'IPv4/IPv6 destino esperada o IP resuelta a comprobar contra Cloudflare Anycast')
+  .option('--current-ttl <sec>', 'TTL DNS actual en segundos', '3600')
+  .option('--target-ttl <sec>', 'TTL objetivo previo al cutover en segundos', '60')
+  .option('--acme <mode>', 'Modo ACME: http-01 | tls-alpn-01 | dns-01', 'http-01')
+  .option('--json', 'Salida JSON estructurada')
+  .action((domain, options) => {
+    const osMod = require('os');
+    const scratchDir = fs.mkdtempSync(path.join(osMod.tmpdir(), 'culkibo-cli-dns-'));
+    try {
+      const dnsMod = svc.dnsCutoverService;
+      const dnsInst = typeof dnsMod.DnsCutoverService === 'function'
+        ? new dnsMod.DnsCutoverService({ dataDir: scratchDir })
+        : dnsMod;
+      const targetIp = options.targetIp ? String(options.targetIp).trim() : null;
+      const currentTtlSec = Number(options.currentTtl ?? 3600);
+      const targetTtlSec = Number(options.targetTtl ?? 60);
+      const acmeMode = String(options.acme || 'http-01').trim().toLowerCase();
+      const isIpv6 = targetIp ? net.isIP(targetIp) === 6 : false;
+
+      const recordsSnapshot = targetIp
+        ? { a: isIpv6 ? [] : [targetIp], aaaa: isIpv6 ? [targetIp] : [], acmeTxt: [], soaSerials: [2026112801] }
+        : { a: [], aaaa: [], acmeTxt: [], soaSerials: [2026112801] };
+
+      const preflight = dnsInst.preflightDnsCutover({
+        domain: String(domain),
+        ...(targetIp && !isIpv6 ? { targetIpv4: targetIp } : {}),
+        ...(targetIp && isIpv6 ? { targetIpv6: targetIp } : {}),
+        challengeMode: acmeMode,
+        recordsSnapshot
+      });
+      const plan = dnsInst.buildTtlCutoverPlan({
+        domain: String(domain),
+        currentTtlSec,
+        targetTtlSec,
+        ...(targetIp ? { targetIp } : {}),
+        acmeMode
+      });
+
+      const payload = {
+        ok: true,
+        domain: preflight.domain,
+        isProxied: Boolean(preflight.isProxied),
+        acmeMode,
+        preflight,
+        plan
+      };
+
+      if (isJsonMode(options)) {
+        return printJson(payload);
+      }
+
+      const badge = plan.ready && preflight.ready ? '\x1b[32mREADY ✅\x1b[0m' : '\x1b[33mATTENTION ⚠️\x1b[0m';
+      console.log(`\n🌐 Culkibo Zero-Downtime DNS Cutover (${preflight.domain}) — [${badge}]`);
+      console.log(`   ACME Mode:    ${acmeMode} · Cloudflare Proxied: ${preflight.isProxied ? 'YES' : 'NO'} · Preflight: ${preflight.code}`);
+      console.log(`   Min Wait:     ${plan.minPreCutoverWaitSec}s (TTL ${plan.currentTtlSec}s → ${plan.targetTtlSec}s)`);
+      for (const ph of plan.phases || []) {
+        console.log(`     ${ph.phase}. ${ph.title} (wait=${ph.waitSec}s)`);
+      }
+      console.log('');
+    } catch (err) {
+      failCli(err, options);
+    } finally {
+      try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (e) {}
     }
   });
 

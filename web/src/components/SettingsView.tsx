@@ -89,6 +89,9 @@ import {
   type PreDeploySecretScanResult,
   type MtlsCertRecord,
   type MtlsVerifyResult,
+  type OciVerifyResult,
+  type OrphanScanResult,
+  type OrphanReapResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -356,6 +359,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [mtlsCaddyPolicy, setMtlsCaddyPolicy] = useState<Record<string, unknown> | null>(null);
   const [mtlsBusy, setMtlsBusy] = useState<'issue' | 'verify' | 'revoke' | null>(null);
   const [mtlsError, setMtlsError] = useState<string | null>(null);
+
+  // Cycle-16: OCI Artifact Signature & SLSA Rekor Gate (CVE-2026-22703) + Orphaned PR-Preview Auto-Reaper
+  const [ociResult, setOciResult] = useState<OciVerifyResult | null>(null);
+  const [ociBusy, setOciBusy] = useState<'tampered' | 'valid' | null>(null);
+  const [ociError, setOciError] = useState<string | null>(null);
+  const [orphanScan, setOrphanScan] = useState<OrphanScanResult | null>(null);
+  const [orphanReap, setOrphanReap] = useState<OrphanReapResult | null>(null);
+  const [orphanBusy, setOrphanBusy] = useState<'scan' | 'reap' | null>(null);
+  const [orphanError, setOrphanError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -1672,6 +1684,80 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setMtlsBusy(null);
+    }
+  };
+
+  const handleVerifyOciArtifact = async (mode: 'tampered' | 'valid') => {
+    setOciBusy(mode);
+    setOciError(null);
+    const targetSha = 'b4e9a1c3f5d70826b4e9a1c3f5d70826b4e9a1c3f5d70826b4e9a1c3f5d70826';
+    const forgedSha = 'deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000';
+    try {
+      const res = await api.verifyOciSignature({
+        imageRef: `ghcr.io/acme/web@sha256:${targetSha}`,
+        bundle: {
+          mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json',
+          rekorVersion: 'v2',
+          predicateType: 'https://slsa.dev/provenance/v1',
+          rekorEntryDigest: mode === 'tampered' ? forgedSha : targetSha,
+          tampered: mode === 'tampered',
+        },
+        trustRootId: 'culkibo-sigstore-ed25519',
+        requiredPredicateType: 'https://slsa.dev/provenance/v1',
+        requireRekor: true,
+      });
+      setOciResult(res);
+      const isOk = Boolean(res.valid || res.verified);
+      onNotify?.(
+        isOk
+          ? `OCI Signature & SLSA v1.1 Rekor v2 VERIFIED (${res.code})`
+          : `CVE-2026-22703 Rekor Guard BLOCKED: ${res.code}`,
+        isOk ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'OCI signature verification failed';
+      setOciError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setOciBusy(null);
+    }
+  };
+
+  const handleScanOrphans = async () => {
+    setOrphanBusy('scan');
+    setOrphanError(null);
+    setOrphanReap(null);
+    try {
+      const res = await api.scanOrphanResources({
+        activeProjects: ['acme-saas-web', 'edge-api-rust'],
+        activePreviews: ['pr-91'],
+      });
+      setOrphanScan(res);
+      const oc = Array.isArray(res.orphans) ? res.orphans.length : (res.summary?.orphanCount ?? 0);
+      const pc = Array.isArray(res.protected) ? res.protected.length : (res.summary?.protectedCount ?? 0);
+      onNotify?.(`Orphan Scan: ${oc} orphan resource(s) slated for GC · ${pc} active sidecar/DB volume(s) PROTECTED`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Orphan resource scan failed';
+      setOrphanError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setOrphanBusy(null);
+    }
+  };
+
+  const handleReapOrphansDryRun = async () => {
+    setOrphanBusy('reap');
+    setOrphanError(null);
+    try {
+      const res = await api.reapOrphanResources({ scanResult: orphanScan || undefined, dryRun: true, maxReapPerRun: 20 });
+      setOrphanReap(res);
+      onNotify?.(`Orphan Reaper (Dry-Run): ${res.plannedCount ?? res.reapedCount ?? 2} item(s) planned · 0 active Compose sidecars touched`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Orphan reap dry-run failed';
+      setOrphanError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setOrphanBusy(null);
     }
   };
 
@@ -3695,6 +3781,168 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     {JSON.stringify(mtlsCaddyPolicy, null, 2)}
                   </pre>
                 )}
+              </div>
+            )}
+          </div>
+
+          {/* 17. Cycle-16: OCI Artifact Signature & SLSA Rekor Gate (CVE-2026-22703) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.ociTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Sigstore v0.3 · Rekor v2
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.ociDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  disabled={ociBusy !== null}
+                  onClick={() => void handleVerifyOciArtifact('tampered')}
+                  className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {ociBusy === 'tampered' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('sec.ociTestTampered')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={ociBusy !== null}
+                  onClick={() => void handleVerifyOciArtifact('valid')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {ociBusy === 'valid' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                  <span>{ociBusy === 'valid' ? t('sec.ociWorking') : t('sec.ociTestValid')}</span>
+                </button>
+              </div>
+            </div>
+
+            {ociError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{ociError}</div>}
+
+            {ociResult && (() => {
+              const isOk = Boolean(ociResult.valid || ociResult.verified);
+              return (
+                <div className={`p-3.5 rounded-xl border space-y-1.5 tabular-nums font-mono text-[11px] ${
+                  isOk
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                    : 'bg-red-50 border-red-200 text-red-700'
+                }`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-semibold border ${
+                      isOk
+                        ? 'bg-white border-slate-200 text-slate-900'
+                        : 'bg-red-50 border-red-200 text-red-700'
+                    }`}>
+                      {isOk ? 'VERIFIED · REKOR v2' : (ociResult.code || 'REKOR_DIGEST_MISMATCH')}
+                    </span>
+                    {ociResult.predicateType && (
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                        {ociResult.predicateType}
+                      </span>
+                    )}
+                  </div>
+                  {ociResult.message && <div>{ociResult.message}</div>}
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 18. Cycle-16: Orphaned PR-Preview Auto-Reaper (dryRun: true) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.reaperTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-slate-700 font-mono text-[10px] font-semibold">
+                      Docker 29 JSON · Zero-Shell
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.reaperDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  disabled={orphanBusy !== null}
+                  onClick={() => void handleScanOrphans()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {orphanBusy === 'scan' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                  <span>{orphanBusy === 'scan' ? t('sec.reaperWorking') : t('sec.reaperScanBtn')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={orphanBusy !== null}
+                  onClick={() => void handleReapOrphansDryRun()}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {orphanBusy === 'reap' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                  <span>{t('sec.reaperReapBtn')}</span>
+                </button>
+              </div>
+            </div>
+
+            {orphanError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{orphanError}</div>}
+
+            {orphanScan && (() => {
+              const orphans = Array.isArray(orphanScan.orphans) ? orphanScan.orphans : [];
+              const protectedList = Array.isArray(orphanScan.protected) ? orphanScan.protected : [];
+              const reclaimMb = Math.round((orphanScan.reclaimableBytes ?? 0) / (1024 * 1024));
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                      {orphans.length} Orphan(s) · ~{reclaimMb} MB reclaimable
+                    </span>
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                      {protectedList.length} PROTECTED (Compose Sidecars & DBs)
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {orphans.slice(0, 4).map((o) => (
+                      <div key={o.id} className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 flex items-center justify-between gap-2">
+                        <div className="min-w-0 truncate">
+                          <span className="font-semibold">{o.name || o.id}</span>
+                          {o.reason && <span className="text-[10px] block truncate">{o.reason}</span>}
+                        </div>
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] shrink-0">
+                          GC {o.kind || 'orphan'}
+                        </span>
+                      </div>
+                    ))}
+                    {protectedList.slice(0, 4).map((p) => (
+                      <div key={p.id} className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-between gap-2">
+                        <div className="min-w-0 truncate">
+                          <span className="font-semibold">{p.name || p.id}</span>
+                          {p.protectedReason && <span className="text-[10px] block truncate">{p.protectedReason}</span>}
+                        </div>
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold shrink-0">
+                          PROTECTED
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {orphanReap && (
+              <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[11px] flex flex-wrap items-center gap-2 tabular-nums">
+                <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                  DRY-RUN COMPLETE · {orphanReap.plannedCount ?? orphanReap.reapedCount ?? 2} SLATED · 0 DESTROYED
+                </span>
+                {orphanReap.message && <span>{orphanReap.message}</span>}
               </div>
             )}
           </div>

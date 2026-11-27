@@ -3254,6 +3254,213 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #15 CVEs (17a-17e): coolify#8524/dokploy#2605 SPIFFE mTLS, OpenFeature flags+kill-switch, IETF RateLimit AI DoW shield, dokploy#5156 cryptominer/Falco, dokploy#2097/Kargo immutable digest promotions');
 
+  // -------------------------------------------------------------------------
+  // 18. Cycle #16 Contract Gate, OCI/SLSA Rekor, WS/SSE 101 Scrub, DNS Cutover & Orphan Reaper Regressions (docs/COMPETITOR_RADAR_CYCLE15.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const contractGate = require('../server/services/apiContractGateService');
+    const ociVerifier = require('../server/services/ociSignatureVerifier');
+    const { StreamFloodGuardService, scrubUpgradeHeaders, generateCaddyStreamBlock } = require('../server/services/streamFloodGuardService');
+    const { DnsCutoverService } = require('../server/services/dnsCutoverService');
+    const orphanReaper = require('../server/services/orphanReaperService');
+
+    const c16Tmp = makeTempDir('culkibo-c16-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c16Tmp;
+    try {
+      // 18a. Post-Optic API Contract Gate: OpenAPI 3.1 MISSING-VERSION-BUMP on 1.4.0->1.5.0, pass on 2.0.0; GraphQL SDL BREAKING
+      const baseOas = {
+        openapi: '3.1.0',
+        info: { title: 'Users', version: '1.4.0' },
+        security: [{ bearerAuth: [] }],
+        paths: {
+          '/v1/users/{id}': {
+            get: { responses: { '200': { description: 'ok' } } },
+            delete: { responses: { '204': { description: 'deleted' } } }
+          }
+        }
+      };
+      const revMinorOas = {
+        openapi: '3.1.0',
+        info: { title: 'Users', version: '1.5.0' },
+        security: [],
+        paths: {
+          '/v1/users/{id}': {
+            get: {
+              parameters: [{ name: 'tenantId', in: 'header', required: true }],
+              responses: { '200': { description: 'ok' } }
+            }
+          }
+        }
+      };
+      const oasBlock = contractGate.diffContracts({ format: 'openapi', baseSpec: baseOas, revisionSpec: revMinorOas });
+      assert.strictEqual(oasBlock.allowed, false);
+      assert.strictEqual(oasBlock.code, 'MISSING-VERSION-BUMP');
+      const oasAllow = contractGate.diffContracts({
+        format: 'openapi',
+        baseSpec: baseOas,
+        revisionSpec: { ...revMinorOas, info: { title: 'Users', version: '2.0.0' } }
+      });
+      assert.strictEqual(oasAllow.allowed, true);
+      const gqlDiff = contractGate.diffContracts({
+        format: 'graphql',
+        baseSpec: 'type User { id: ID! email: String! }\ntype Query { users(limit: Int): [User!]! }',
+        revisionSpec: 'type User { id: ID! }\ntype Query { users(limit: Int!): [User!]! }'
+      });
+      assert.strictEqual(gqlDiff.classification, 'BREAKING');
+      const gqlCodes = gqlDiff.breakingChanges.map((c) => c.code);
+      assert.ok(gqlCodes.includes('FIELD_REMOVED'));
+      assert.ok(gqlCodes.includes('ARG_MADE_NON_NULL_WITHOUT_DEFAULT'));
+
+      // 18b. OCI Rekor Binding (CVE-2026-22703 / cosign#4640 / GHCR 404 fallback preserving tlsVerify)
+      const kp = crypto.generateKeyPairSync('ed25519');
+      const pubPem = kp.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+      const hexA = 'a'.repeat(64);
+      const hexB = 'b'.repeat(64);
+      const pt = 'application/vnd.in-toto+json';
+      const stmtBuf = Buffer.from(JSON.stringify({
+        _type: 'https://in-toto.io/Statement/v1',
+        subject: [{ name: 'ghcr.io/culkibo/demo', digest: { sha256: hexA } }],
+        predicateType: 'https://slsa.dev/provenance/v1',
+        predicate: { runDetails: { builder: { id: 'https://github.com/actions/runner' } } }
+      }), 'utf8');
+      const pae = ociVerifier.computeDssePae(pt, stmtBuf);
+      const sigB64 = crypto.sign(null, pae, kp.privateKey).toString('base64');
+
+      const badRekor = ociVerifier.verifyOciBundle({
+        imageRef: 'ghcr.io/culkibo/demo@sha256:' + hexA,
+        publicKeyPem: pubPem,
+        bundle: {
+          dsseEnvelope: { payloadType: pt, payload: stmtBuf.toString('base64'), signatures: [{ sig: sigB64 }] },
+          verificationMaterial: {
+            tlogEntries: [{
+              canonicalizedBody: JSON.stringify({ spec: { artifactDigest: 'sha256:' + hexB } }),
+              signedTimestamp: '2026-11-28T00:00:00Z'
+            }]
+          }
+        }
+      });
+      assert.strictEqual(badRekor.verified, false);
+      assert.strictEqual(badRekor.code, 'REKOR_DIGEST_MISMATCH');
+
+      const okRekor = ociVerifier.verifyOciBundle({
+        imageRef: 'ghcr.io/culkibo/demo@sha256:' + hexA,
+        publicKeyPem: pubPem,
+        bundle: {
+          dsseEnvelope: { payloadType: pt, payload: stmtBuf.toString('base64'), signatures: [{ sig: sigB64 }] },
+          verificationMaterial: {
+            tlogEntries: [{
+              canonicalizedBody: JSON.stringify({ spec: { artifactDigest: 'sha256:' + hexA } }),
+              signedTimestamp: '2026-11-28T00:00:00Z'
+            }]
+          }
+        }
+      });
+      assert.strictEqual(okRekor.verified, true);
+      assert.strictEqual(okRekor.rekorVersion, 'v2');
+
+      const fb = ociVerifier.resolveReferrerStrategy({ referrersStatus: 404, digest: 'sha256:' + hexA, tlsVerify: true });
+      assert.strictEqual(fb.strategy, 'tag_fallback');
+      assert.strictEqual(fb.fallbackTag, 'sha256-' + hexA + '.att');
+      assert.strictEqual(fb.tlsVerify, true);
+
+      // 18c. WS/SSE & 101 Scrub (CVE-2026-55458 / Dokploy#3033)
+      const scrubbed = scrubUpgradeHeaders({
+        Connection: 'Upgrade, Keep-Alive, X-Secret-Hop',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Accept': 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=',
+        'Proxy-Authenticate': 'Basic realm="proxy"',
+        'Alt-Svc': 'h3=":443"',
+        'Keep-Alive': 'timeout=10',
+        'X-Secret-Hop': 'drop-me'
+      });
+      assert.strictEqual(scrubbed.headers.Upgrade, 'websocket');
+      assert.ok(scrubbed.headers['Sec-WebSocket-Accept']);
+      assert.strictEqual(scrubbed.headers['Proxy-Authenticate'], undefined);
+      assert.strictEqual(scrubbed.headers['Alt-Svc'], undefined);
+      assert.strictEqual(scrubbed.headers['Keep-Alive'], undefined);
+      assert.strictEqual(scrubbed.headers['X-Secret-Hop'], undefined);
+
+      const sg = new StreamFloodGuardService({ dataDir: c16Tmp });
+      const floodRes = sg.evaluateStreamAdmission({ projectId: 'proj_18c', clientIp: '198.51.100.5', protocol: 'ws', activePerIp: 25 });
+      assert.strictEqual(floodRes.allowed, false);
+      assert.strictEqual(floodRes.httpStatus, 429);
+      assert.strictEqual(floodRes.wsCloseCode, 1013);
+      const slowRes = sg.evaluateStreamAdmission({ projectId: 'proj_18c', clientIp: '198.51.100.6', headerElapsedMs: 9000, bytesPerSec: 16 });
+      assert.strictEqual(slowRes.code, 'SLOWLORIS_DETECTED');
+      const oomRes = sg.evaluateStreamAdmission({ projectId: 'proj_18c', clientIp: '198.51.100.7', bufferedBytes: 16 * 1024 * 1024 });
+      assert.strictEqual(oomRes.code, 'SLOW_READER_BACKPRESSURE');
+      const caddyBlk = generateCaddyStreamBlock({ streamCloseDelaySec: 30, heartbeatIntervalSec: 30 });
+      assert.ok(caddyBlk.caddyfile.includes('stream_close_delay 30s'));
+      assert.ok(caddyBlk.caddyfile.includes('read_timeout 0'));
+      assert.ok(caddyBlk.caddyfile.includes('flush_interval -1'));
+
+      // 18d. DNS Cutover (Coolify#6271/#11831 / Kamal#26)
+      const dnsSvc = new DnsCutoverService({ dataDir: c16Tmp });
+      const cfBlock = dnsSvc.preflightDnsCutover({
+        domain: 'edge.example.test',
+        targetIpv4: '198.51.100.20',
+        challengeMode: 'http-01',
+        recordsSnapshot: { a: ['104.21.10.5'], soaSerials: [2026112801] }
+      });
+      assert.strictEqual(cfBlock.ready, false);
+      assert.strictEqual(cfBlock.isProxied, true);
+      assert.strictEqual(cfBlock.code, 'CLOUDFLARE_PROXY_ACME_CONFLICT');
+      const cfDns01 = dnsSvc.preflightDnsCutover({
+        domain: 'edge.example.test',
+        targetIpv4: '198.51.100.20',
+        challengeMode: 'dns-01',
+        recordsSnapshot: { a: ['104.21.10.5'], acmeTxt: [], soaSerials: [2026112801, 2026112801] }
+      });
+      assert.strictEqual(cfDns01.ready, true);
+      const ttlPlan = dnsSvc.buildTtlCutoverPlan({
+        domain: 'edge.example.test',
+        currentTtlSec: 3600,
+        targetTtlSec: 60,
+        targetIp: '198.51.100.20',
+        acmeMode: 'dns-01',
+        nameserverSerials: [2026112801, 2026112802]
+      });
+      assert.ok(ttlPlan.minPreCutoverWaitSec >= 3600);
+      assert.strictEqual(ttlPlan.blocked, true);
+      assert.strictEqual(ttlPlan.code, 'SOA_SERIAL_DIVERGENT');
+
+      // 18e. PR-Preview Orphan Reaper (Coolify#11441 / Dokploy#4203/#4893/#3973)
+      const scan18e = orphanReaper.scanOrphans({
+        activeProjects: ['myapp'],
+        activePreviews: [],
+        dockerSnapshot: {
+          containers: [
+            { id: 'c_pr42', name: 'myapp-pr-42', labels: { 'culkibo.managed': 'true', 'culkibo.project': 'myapp', 'culkibo.preview.pr': '42' }, sizeBytes: 1024 },
+            { id: 'c_ghost', name: 'preview-shop-a9f2', labels: { 'culkibo.managed': 'true' }, sizeBytes: 2048 }
+          ],
+          volumes: [
+            { name: 'app-pr-42-pgdata', labels: { 'culkibo.preview.pr': '42' }, sizeBytes: 4096 },
+            { name: 'prod-pgdata', labels: { 'culkibo.project': 'myapp' }, sizeBytes: 8192 }
+          ],
+          images: [
+            { id: 'img_sc', tag: 'myapp-backup-runner:local', labels: { 'com.docker.compose.project': 'myapp' }, sidecar: true, sizeBytes: 4096 }
+          ]
+        }
+      });
+      const oNames = scan18e.orphans.map((o) => o.name);
+      const pNames = scan18e.protected.map((p) => p.name);
+      assert.ok(oNames.includes('myapp-pr-42') && oNames.includes('preview-shop-a9f2') && oNames.includes('app-pr-42-pgdata'));
+      assert.ok(pNames.includes('prod-pgdata') && pNames.includes('myapp-backup-runner:local'));
+      assert.ok(scan18e.protected.every((p) => Array.isArray(p.protectedReasons) && p.protectedReasons.length > 0));
+      const plan18e = orphanReaper.planReap({ scanResult: scan18e });
+      const exec18e = orphanReaper.executeReap({ plan: plan18e });
+      assert.strictEqual(exec18e.dryRun, true);
+      assert.strictEqual(exec18e.executedCount, 0);
+      assert.ok(plan18e.actions.every((a) => Array.isArray(a.argv) && a.argv[0] === 'docker'));
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c16Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #16 CVEs (18a-18e): Post-Optic API Contract Gate, CVE-2026-22703 OCI Rekor binding, CVE-2026-55458 WS/SSE 101 scrub, coolify#6271 DNS/CF proxy cutover, coolify#11441/dokploy#3973 orphan reaper');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

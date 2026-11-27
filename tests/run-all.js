@@ -66,6 +66,9 @@ const testCycle14HttpE2E = require('./cycle14-http-e2e.test');
 const testMtlsAndRatelimit = require('./mtls-and-ratelimit.test');
 const testFlagsAnomalyPromotion = require('./flags-anomaly-promotion.test');
 const testCycle15HttpE2E = require('./cycle15-http-e2e.test');
+const testStreamGuardAndDnsCutover = require('./stream-guard-and-dns-cutover.test');
+const testContractOciOrphan = require('./contract-oci-orphan.test');
+const testCycle16HttpE2E = require('./cycle16-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -157,6 +160,9 @@ async function runAll() {
     { name: 'Zero-Trust SPIFFE-Lite mTLS Identity CA & Edge API Rate-Limit / AI Wallet-Drain Shield (RPM + TPM)', fn: testMtlsAndRatelimit },
     { name: 'OpenFeature-Lite Feature Flags / Kill-Switch, Falco-Lite Runtime Anomaly Detector & Immutable Digest Promotion', fn: testFlagsAnomalyPromotion },
     { name: 'Cycle #15 160-MCP Milestone Live Isolated HTTP E2E (All 5 API Families + Zero-CA-Key + 429/Dual-Control Guards)', fn: testCycle15HttpE2E },
+    { name: 'Edge WS/SSE Flood & 101 Hop-by-Hop Guard (CVE-2026-55458) & Zero-Downtime DNS Cutover / Cloudflare Proxy Verifier', fn: testStreamGuardAndDnsCutover },
+    { name: 'Post-Optic API Contract Gate, Pure-Node OCI/SLSA Rekor Verifier (CVE-2026-22703) & Orphan PR-Preview Auto-Reaper', fn: testContractOciOrphan },
+    { name: 'Cycle #16 165-MCP Milestone Live Isolated HTTP E2E (All 5 API Families + Rekor/101/Proxy/Reaper Guards + RBAC)', fn: testCycle16HttpE2E },
   ];
 
   for (const suite of suites) {

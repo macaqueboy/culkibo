@@ -76,6 +76,7 @@ import {
   type FeatureFlagEvalResult,
   type RuntimeAnomalyInspectResult,
   type DigestPromotionActionResult,
+  type ApiContractDiffResult,
 } from '../lib/api';
 import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
@@ -263,8 +264,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..15 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly & Digest Promotion state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion'>('oom');
+  // Cycle-13..16 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion & API Contract state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -296,6 +297,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [promoResult, setPromoResult] = useState<DigestPromotionActionResult | null>(null);
   const [promoBusy, setPromoBusy] = useState<'latest' | 'self' | 'sha' | null>(null);
   const [promoError, setPromoError] = useState<string | null>(null);
+  // Cycle-16 API Contract & Schema Drift Gate state
+  const [contractResult, setContractResult] = useState<ApiContractDiffResult | null>(null);
+  const [contractBusy, setContractBusy] = useState<'breaking' | 'major' | null>(null);
+  const [contractError, setContractError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1452,6 +1457,42 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setPromoBusy(null);
+    }
+  };
+
+  const handleRunApiContractDiff = async (mode: 'breaking' | 'major') => {
+    setContractBusy(mode);
+    setContractError(null);
+    try {
+      const baseSpec = {
+        openapi: '3.1.0',
+        info: { title: `${project.name} API`, version: '1.4.0' },
+        paths: {
+          '/v1/orders': { get: { security: [{ bearerAuth: [] }], responses: { '200': { description: 'OK' } } } },
+          '/v1/billing/invoices': { get: { security: [{ bearerAuth: [] }], responses: { '200': { description: 'OK' } } } },
+        },
+      };
+      const revisionSpec = {
+        openapi: '3.1.0',
+        info: { title: `${project.name} API`, version: mode === 'major' ? '2.0.0' : '1.5.0' },
+        paths: {
+          '/v1/orders': { get: { responses: { '200': { description: 'OK' } } } },
+        },
+      };
+      const res = await api.diffApiContract({ format: 'openapi', baseSpec, revisionSpec });
+      setContractResult(res);
+      onNotify(
+        res.allowed
+          ? `API Contract Gate ALLOWED (${res.baseVersion || '1.4.0'} → ${res.revisionVersion || '2.0.0'} · SAFE MAJOR BUMP)`
+          : `API Contract Gate BLOCKED (${res.code || 'MISSING-VERSION-BUMP'} · ${res.breakingCount ?? 2} breaking change(s))`,
+        res.allowed ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'API contract diff failed';
+      setContractError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setContractBusy(null);
     }
   };
 
@@ -3105,51 +3146,52 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
         </section>
       )}
 
-      {/* Cycle-13 Cockpit Drawer: OOM & Crash-Loop Forensics + Image Layer Bloat & Secret Auditor */}
+      {/* Cycle-13..16 Cockpit Drawer: Forensics, Egress, Multi-Arch, Chaos, Flags, Anomaly, Promotion & API Contract */}
       {activeCockpit === 'forensics' && (
         <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-4 text-xs">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
-            <div className="flex items-start gap-2.5">
-              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
-                <Search className="w-4 h-4" />
+          <div className="flex flex-col gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start justify-between gap-2.5">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                  <Search className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('pd.forensicsTitle')}</h2>
+                  <p className="text-slate-500 mt-0.5">{t('pd.forensicsDesc')}</p>
+                </div>
               </div>
-              <div>
-                <h2 className="text-sm font-semibold text-slate-900">{t('pd.forensicsTitle')}</h2>
-                <p className="text-slate-500 mt-0.5">{t('pd.forensicsDesc')}</p>
-              </div>
-            </div>
-            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
-              <div className="inline-flex flex-wrap items-center gap-0.5 bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[11px] font-medium">
-                {([
-                  { id: 'oom' as const, label: t('pd.forensicsTabOom') },
-                  { id: 'image' as const, label: t('pd.forensicsTabImage') },
-                  { id: 'egress' as const, label: t('pd.forensicsTabEgress') },
-                  { id: 'multiarch' as const, label: t('pd.forensicsTabMultiArch') },
-                  { id: 'chaos' as const, label: t('pd.forensicsTabChaos') },
-                  { id: 'flags' as const, label: t('pd.forensicsTabFlags') },
-                  { id: 'anomaly' as const, label: t('pd.forensicsTabAnomaly') },
-                  { id: 'promotion' as const, label: t('pd.forensicsTabPromo') },
-                ]).map((tabItem) => (
-                  <button
-                    key={tabItem.id}
-                    type="button"
-                    onClick={() => {
-                      setForensicsTab(tabItem.id);
-                      if (tabItem.id === 'flags' && flagsList.length === 0 && flagBusy === null) {
-                        void handleLoadFlags();
-                      }
-                    }}
-                    className={`px-2.5 py-1 rounded-md cursor-pointer ${
-                      forensicsTab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {tabItem.label}
-                  </button>
-                ))}
-              </div>
-              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Forensics panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Forensics panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer shrink-0">
                 <X className="w-4 h-4" />
               </button>
+            </div>
+            <div className="w-full flex flex-wrap items-center gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1 text-[11px] font-medium">
+              {([
+                { id: 'oom' as const, label: t('pd.forensicsTabOom') },
+                { id: 'image' as const, label: t('pd.forensicsTabImage') },
+                { id: 'egress' as const, label: t('pd.forensicsTabEgress') },
+                { id: 'multiarch' as const, label: t('pd.forensicsTabMultiArch') },
+                { id: 'chaos' as const, label: t('pd.forensicsTabChaos') },
+                { id: 'flags' as const, label: t('pd.forensicsTabFlags') },
+                { id: 'anomaly' as const, label: t('pd.forensicsTabAnomaly') },
+                { id: 'promotion' as const, label: t('pd.forensicsTabPromo') },
+                { id: 'contract' as const, label: t('pd.forensicsTabContract') },
+              ]).map((tabItem) => (
+                <button
+                  key={tabItem.id}
+                  type="button"
+                  onClick={() => {
+                    setForensicsTab(tabItem.id);
+                    if (tabItem.id === 'flags' && flagsList.length === 0 && flagBusy === null) {
+                      void handleLoadFlags();
+                    }
+                  }}
+                  className={`px-2.5 py-1 rounded-md cursor-pointer ${
+                    forensicsTab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {tabItem.label}
+                </button>
+              ))}
             </div>
           </div>
 
@@ -3729,6 +3771,64 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                         {JSON.stringify(manifest, null, 2)}
                       </pre>
                     )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'contract' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={contractBusy !== null}
+                  onClick={() => void handleRunApiContractDiff('breaking')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {contractBusy === 'breaking' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.contractTestBreaking')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={contractBusy !== null}
+                  onClick={() => void handleRunApiContractDiff('major')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {contractBusy === 'major' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.contractTestMajor')}</span>
+                </button>
+              </div>
+              {contractError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{contractError}</div>}
+              {contractResult && (() => {
+                const breaking = Array.isArray(contractResult.breakingChanges) ? contractResult.breakingChanges : [];
+                return (
+                  <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums font-mono text-[11px] ${
+                    contractResult.allowed
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                      : 'bg-red-50 border-red-200 text-red-700'
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {contractResult.allowed ? 'SAFE · MAJOR BUMP' : (contractResult.code || 'MISSING-VERSION-BUMP')}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                        {contractResult.baseVersion || '1.4.0'} → {contractResult.revisionVersion || '1.5.0'}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                        breaking: {contractResult.breakingCount ?? breaking.length}
+                      </span>
+                    </div>
+                    {breaking.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5">
+                        {breaking.slice(0, 6).map((ch, idx) => (
+                          <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                            {typeof ch === 'string' ? ch : `${ch.code || ch.rule || 'BREAKING'}${ch.path ? ` (${ch.path})` : ''}`}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {contractResult.message && <div>{contractResult.message}</div>}
                   </div>
                 );
               })()}

@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 160);
+    assert.strictEqual(demoJson.datasets.mcpTools, 165);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1011,7 +1011,83 @@ async function testCliDx() {
     const digOkCli = await runCli(['verify-digest', validDigestRef, '--json'], { env: isolatedEnv });
     assert.strictEqual(digOkCli.status, 0, `culkibo verify-digest @sha256: falló: ${digOkCli.stderr}`);
     assert.strictEqual(JSON.parse(digOkCli.stdout).valid, true);
-    console.log(`  ✓ Pioneer CLI Cycle-15 verificado (culkibo anomaly-scan xmrig=1/clean=0, culkibo verify-digest :latest=1/@sha256=0, culkibo demo 160 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-15 verificado (culkibo anomaly-scan xmrig=1/clean=0, culkibo verify-digest :latest=1/@sha256=0)`);
+
+    // 20. Pioneer Cycle-16 CLI: `culkibo contract-diff` (OpenAPI 1.4->1.5 exit 1 vs 2.0 exit 0, GraphQL exit 1) & `culkibo dns-cutover` (Cloudflare proxy ACME + 5-phase TTL)
+    const oaBasePath = path.join(tmpRoot, 'openapi-v1.4.json');
+    const oaBreakPath = path.join(tmpRoot, 'openapi-v1.5.json');
+    const oaMajorPath = path.join(tmpRoot, 'openapi-v2.0.json');
+    const oaBase = {
+      openapi: '3.1.0',
+      info: { title: 'Shop API', version: '1.4.0' },
+      paths: {
+        '/v1/orders': { get: { responses: { '200': {} } } },
+        '/v1/orders/{id}': { delete: { responses: { '204': {} } } }
+      }
+    };
+    const oaBreak = {
+      openapi: '3.1.0',
+      info: { title: 'Shop API', version: '1.5.0' },
+      paths: { '/v1/orders': { get: { responses: { '200': {} } } } }
+    };
+    const oaMajor = { ...oaBreak, info: { title: 'Shop API', version: '2.0.0' } };
+    fs.writeFileSync(oaBasePath, JSON.stringify(oaBase, null, 2), 'utf8');
+    fs.writeFileSync(oaBreakPath, JSON.stringify(oaBreak, null, 2), 'utf8');
+    fs.writeFileSync(oaMajorPath, JSON.stringify(oaMajor, null, 2), 'utf8');
+
+    const cdFailCli = await runCli(['contract-diff', oaBasePath, oaBreakPath, '--format', 'openapi', '--json'], { env: isolatedEnv });
+    assert.strictEqual(cdFailCli.status, 1, 'culkibo contract-diff debe salir con código 1 ante MISSING-VERSION-BUMP');
+    const cdFailJson = JSON.parse(cdFailCli.stdout);
+    assert.strictEqual(cdFailJson.ok, false);
+    assert.strictEqual(cdFailJson.allowed, false);
+    assert.strictEqual(cdFailJson.code, 'MISSING-VERSION-BUMP');
+
+    const cdPassCli = await runCli(['contract-diff', oaBasePath, oaMajorPath, '--format', 'openapi', '--json'], { env: isolatedEnv });
+    assert.strictEqual(cdPassCli.status, 0, `culkibo contract-diff major 2.0 falló: ${cdPassCli.stderr} ${cdPassCli.stdout}`);
+    const cdPassJson = JSON.parse(cdPassCli.stdout);
+    assert.strictEqual(cdPassJson.ok, true);
+    assert.strictEqual(cdPassJson.allowed, true);
+    assert.strictEqual(cdPassJson.code, 'MAJOR_VERSION_BUMP_ALLOWED');
+
+    const gqlBasePath = path.join(tmpRoot, 'schema-v1.graphql');
+    const gqlRevPath = path.join(tmpRoot, 'schema-v2.graphql');
+    fs.writeFileSync(gqlBasePath, 'type User { id: ID! email: String! }\ntype Query { users(limit: Int): [User!]! }\n', 'utf8');
+    fs.writeFileSync(gqlRevPath, 'type User { id: ID! }\ntype Query { users(limit: Int!): [User!]! }\n', 'utf8');
+    const cdGqlCli = await runCli(['contract-diff', gqlBasePath, gqlRevPath, '--format', 'graphql', '--json'], { env: isolatedEnv });
+    assert.strictEqual(cdGqlCli.status, 1, 'culkibo contract-diff GraphQL breaking debe salir con código 1');
+    const cdGqlJson = JSON.parse(cdGqlCli.stdout);
+    assert.strictEqual(cdGqlJson.allowed, false);
+    assert.ok(cdGqlJson.breakingChanges.some((c) => c.code === 'FIELD_REMOVED'));
+
+    const dnsCfCli = await runCli([
+      'dns-cutover', 'app.acme.dev',
+      '--target-ip', '104.21.10.5',
+      '--current-ttl', '3600',
+      '--target-ttl', '60',
+      '--acme', 'http-01',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(dnsCfCli.status, 0, `culkibo dns-cutover http-01 falló: ${dnsCfCli.stderr} ${dnsCfCli.stdout}`);
+    const dnsCfJson = JSON.parse(dnsCfCli.stdout);
+    assert.strictEqual(dnsCfJson.ok, true);
+    assert.strictEqual(dnsCfJson.isProxied, true);
+    assert.strictEqual(dnsCfJson.preflight.code, 'CLOUDFLARE_PROXY_ACME_CONFLICT');
+    assert.strictEqual(dnsCfJson.plan.phases.length, 5);
+    assert.ok(dnsCfJson.plan.minPreCutoverWaitSec >= 3600);
+
+    const dnsOkCli = await runCli([
+      'dns-cutover', 'app.acme.dev',
+      '--target-ip', '104.21.10.5',
+      '--current-ttl', '3600',
+      '--target-ttl', '60',
+      '--acme', 'dns-01',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(dnsOkCli.status, 0, `culkibo dns-cutover dns-01 falló: ${dnsOkCli.stderr}`);
+    const dnsOkJson = JSON.parse(dnsOkCli.stdout);
+    assert.strictEqual(dnsOkJson.preflight.ready, true);
+    assert.strictEqual(dnsOkJson.plan.ready, true);
+    console.log(`  ✓ Pioneer CLI Cycle-16 verificado (culkibo contract-diff OpenAPI=1/2.0=0/GraphQL=1, culkibo dns-cutover CF-ACME+5-phase TTL, culkibo demo 165 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

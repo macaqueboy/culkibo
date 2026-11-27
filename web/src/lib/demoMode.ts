@@ -4250,6 +4250,169 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ ok: true, dryRun: body.dryRun !== false, promotion: { ...promo, status: 'rolled_back' } });
   }
 
+  // --- Cycle-16: API Contract Gate, OCI/SLSA Rekor Verifier, WS/SSE Flood Guard, DNS Cutover & Orphan PR Reaper ---
+  if (pathname === '/api/contracts/diff' && method === 'POST') {
+    const baseVer = String(body.baseSpec?.info?.version || '1.4.0');
+    const revVer = String(body.revisionSpec?.info?.version || '1.5.0');
+    const baseMajor = Number(baseVer.split('.')[0] || 1);
+    const revMajor = Number(revVer.split('.')[0] || 1);
+    const breakingChanges = [
+      { code: 'PATH_REMOVED', path: '/v1/billing/invoices', severity: 'breaking', message: 'Endpoint /v1/billing/invoices removed from revision spec.' },
+      { code: 'AUTH_REMOVED', path: '/v1/orders', severity: 'breaking', message: 'Required bearerAuth security scheme removed on GET /v1/orders.' },
+    ];
+    const allowed = revMajor > baseMajor;
+    return jsonResponse({
+      ok: true,
+      allowed,
+      code: allowed ? 'MAJOR_VERSION_BUMP_ALLOWED' : 'MISSING-VERSION-BUMP',
+      baseVersion: baseVer,
+      revisionVersion: revVer,
+      breakingCount: breakingChanges.length,
+      breakingChanges,
+      nonBreakingChanges: [],
+      message: allowed
+        ? `Major SemVer bump (${baseVer} → ${revVer}) explicitly authorizes ${breakingChanges.length} breaking API contract change(s).`
+        : `Blocked: ${breakingChanges.length} breaking change(s) detected without a major SemVer bump (${baseVer} → ${revVer}).`,
+    });
+  }
+
+  if (pathname === '/api/supply-chain/oci-verify' && method === 'POST') {
+    const imageRef = String(body.imageRef || '');
+    const bundle = body.bundle || {};
+    if (!/@sha256:[a-f0-9]{64}$/i.test(imageRef)) {
+      return jsonResponse({ ok: false, valid: false, verified: false, code: 'MUTABLE_TAG_FORBIDDEN', imageRef, message: 'Image reference must be pinned with @sha256:<64hex>.' });
+    }
+    if (bundle.tampered === true || (bundle.rekorEntryDigest && !imageRef.endsWith(String(bundle.rekorEntryDigest)))) {
+      return jsonResponse({
+        ok: false,
+        valid: false,
+        verified: false,
+        code: 'REKOR_DIGEST_MISMATCH',
+        imageRef,
+        rekorVersion: 'v2',
+        predicateType: 'https://slsa.dev/provenance/v1',
+        message: 'CVE-2026-22703 blocked: Rekor transparency log entry digest does not match target OCI image digest.',
+      });
+    }
+    return jsonResponse({
+      ok: true,
+      valid: true,
+      verified: true,
+      code: 'OCI_SLSA_REKOR_VERIFIED',
+      imageRef,
+      rekorVersion: 'v2',
+      predicateType: 'https://slsa.dev/provenance/v1',
+      builderId: 'https://github.com/slsa-framework/slsa-github-generator',
+      message: 'Ed25519 DSSE SLSA v1.1 signature and Rekor v2 signed timestamp cryptographically bound to image digest.',
+    });
+  }
+
+  if (pathname === '/api/edge/stream-guard/evaluate' && method === 'POST') {
+    const activePerIp = Number(body.activePerIp ?? 25);
+    const allowed = activePerIp <= 20;
+    return jsonResponse({
+      ok: true,
+      allowed,
+      code: allowed ? 'STREAM_ADMITTED' : 'PER_IP_FLOOD_CAPPED',
+      httpStatus: allowed ? 101 : 429,
+      wsCloseCode: allowed ? 1000 : 1013,
+      retryAfterSec: allowed ? 0 : 15,
+      strippedHeaders: ['Proxy-Authenticate', 'Alt-Svc', 'Keep-Alive'],
+      preservedHeaders: ['Upgrade', 'Sec-WebSocket-Accept'],
+      caddyStreamBlock: [
+        'reverse_proxy 127.0.0.1:3000 {',
+        '  flush_interval -1',
+        '  stream_close_delay 30s',
+        '  transport http {',
+        '    read_timeout 0',
+        '    write_timeout 0',
+        '  }',
+        '}',
+      ].join('\n'),
+      message: allowed ? 'WebSocket/SSE upgrade admitted with 101 hop-by-hop headers scrubbed.' : 'Per-IP WS/SSE flood capped (25 > 20) and CVE-2026-55458 hop headers scrubbed.',
+    });
+  }
+
+  if (pathname === '/api/domains/cutover/preflight' && method === 'POST') {
+    const dom = String(body.domain || 'app.acme-demo.dev');
+    const challenge = String(body.challengeMode || 'http-01');
+    const aRecs: string[] = Array.isArray(body.recordsSnapshot?.aRecords) ? body.recordsSnapshot.aRecords : ['104.21.10.5'];
+    const isCf = aRecs.some((ip) => ip.startsWith('104.'));
+    if (isCf && challenge !== 'dns-01') {
+      return jsonResponse({
+        ok: true,
+        ready: false,
+        code: 'CLOUDFLARE_PROXY_ACME_CONFLICT',
+        domain: dom,
+        isProxied: true,
+        warnings: ['Cloudflare Orange-Cloud proxy IP detected — switch to DNS-01 ACME challenge or temporarily grey-cloud during issuance.'],
+        message: `Cloudflare Anycast proxy (${aRecs[0]}) detected for ${dom}: HTTP-01 ACME would loop (coolify#6271); NOT a false DNS mismatch.`,
+      });
+    }
+    return jsonResponse({
+      ok: true,
+      ready: true,
+      code: 'DNS_CUTOVER_READY',
+      domain: dom,
+      isProxied: isCf,
+      warnings: [],
+      message: `${dom} authoritative NS/SOA converged and ACME challenge path verified.`,
+    });
+  }
+
+  if (pathname === '/api/domains/cutover/plan' && method === 'POST') {
+    const dom = String(body.domain || 'app.acme-demo.dev');
+    const curTtl = Number(body.currentTtlSec ?? 3600);
+    const soaRef = Number(body.soaRefreshSec ?? 3600);
+    const minWait = Math.max(curTtl, soaRef);
+    return jsonResponse({
+      ok: true,
+      domain: dom,
+      minPreCutoverWaitSec: minWait,
+      blocked: false,
+      code: 'CUTOVER_PLAN_READY',
+      phases: [
+        { phase: 1, name: 'Lower TTL', title: `Lower ${dom} A/AAAA TTL from ${curTtl}s to ${body.targetTtlSec ?? 60}s and wait >= ${minWait}s.` },
+        { phase: 2, name: 'Pre-Issue TLS', title: `Pre-provision Caddy ${body.acmeMode || 'dns-01'} TLS cert on target VPS (${body.targetIp || '91.107.194.22'}).` },
+        { phase: 3, name: 'SOA Convergence', title: 'Verify all authoritative nameservers report identical SOA serial.' },
+        { phase: 4, name: 'Atomic DNS Switch', title: `Flip A record for ${dom} → ${body.targetIp || '91.107.194.22'} with dual-origin warm standby.` },
+        { phase: 5, name: 'Restore TTL', title: `After 15m zero-5xx verification, restore TTL to ${curTtl}s and drain old VPS.` },
+      ],
+    });
+  }
+
+  if (pathname === '/api/cleanup/orphans/scan' && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      reclaimableBytes: 486 * 1024 * 1024,
+      orphans: [
+        { id: 'ctr_ghost_pr42', name: 'preview-deleted-pr-42-web', kind: 'container', reason: 'Closed PR #42 container orphaned 9d ago (dokploy#4203)', sizeBytes: 192 * 1024 * 1024 },
+        { id: 'vol_leak_pr42', name: 'acme-saas-web-pr-42-cache', kind: 'volume', reason: 'Leaked -pr-42 named volume after PR teardown (coolify#11441)', sizeBytes: 294 * 1024 * 1024 },
+      ],
+      protected: [
+        { id: 'ctr_sidecar_redis', name: 'acme-saas-web-redis-sidecar', kind: 'container', protected: true, protectedReason: 'Active Compose project sidecar (dokploy#3973 protected)' },
+        { id: 'vol_pg_prod', name: 'culkibo-db-pg-main-data', kind: 'volume', protected: true, protectedReason: 'culkibo.protect=true active PostgreSQL data volume' },
+      ],
+      summary: { orphanCount: 2, protectedCount: 2, reclaimableMb: 486 },
+    });
+  }
+
+  if (pathname === '/api/cleanup/orphans/reap' && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      plannedCount: 2,
+      reapedCount: body.dryRun === false ? 2 : 0,
+      protectedCount: 2,
+      reclaimableBytes: 486 * 1024 * 1024,
+      actions: [
+        { id: 'ctr_ghost_pr42', kind: 'container', action: 'docker rm -f preview-deleted-pr-42-web' },
+        { id: 'vol_leak_pr42', kind: 'volume', action: 'docker volume rm acme-saas-web-pr-42-cache' },
+      ],
+      message: 'Dry-run verified: 486 MB reclaimable across 2 orphaned PR-42 artifacts; 2 Compose sidecar/DB resources PROTECTED.',
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -4427,16 +4590,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (160 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (165 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 160 MCP tools on demand without bloating context (-90%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 165 MCP tools on demand without bloating context (-91%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_api_contract_gate', description: 'Zero-dep OpenAPI/JSON-Schema/GraphQL breaking-change diff & MISSING-VERSION-BUMP SemVer gate', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_verify_oci_signature', description: 'Pure-Node Ed25519/ECDSA Sigstore v0.3 + DSSE SLSA v1.1 Rekor v2 verifier (CVE-2026-22703)', readOnly: false, profile: 'security' },
+      { name: 'culkibo_stream_flood_guard', description: 'Edge WS/SSE per-IP flood cap (429/1013), Slowloris shedding & 101 hop-by-hop scrubber (CVE-2026-55458)', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_dns_cutover_plan', description: 'Zero-downtime DNS cutover verifier detecting Cloudflare proxy ACME conflicts (coolify#6271) & 5-phase TTL plans', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_orphan_reaper', description: 'Docker-29-safe JSON label-graph PR-preview orphan reaper protecting Compose sidecars & DB volumes', readOnly: false, profile: 'ops' },
       { name: 'culkibo_mtls_mesh', description: 'Zero-Trust SPIFFE-Lite Ed25519 mTLS workload CA with CRL revocation & Caddy require_and_verify JSON', readOnly: false, profile: 'security' },
       { name: 'culkibo_feature_flags', description: 'OpenFeature-Lite deterministic SHA-256 feature flags with tenant overrides & zero-redeploy kill-switch', readOnly: false, profile: 'deploy' },
       { name: 'culkibo_api_ratelimit', description: 'Edge dual RPM+TPM AI wallet-drain shield emitting IETF RateLimit + 429 Retry-After headers', readOnly: false, profile: 'ops' },
@@ -4483,27 +4651,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 160 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 165 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 160, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 165, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_mtls_mesh', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_runtime_anomaly', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_verify_oci_signature', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_api_contract_gate', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 160,
-      profiles: { core: { count: 17, savedPct: 90 } },
+      totalTools: 165,
+      profiles: { core: { count: 17, savedPct: 91 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

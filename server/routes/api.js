@@ -126,6 +126,11 @@ function getFeatureFlagService() { return _lazyV2.flags || (_lazyV2.flags = requ
 function getApiRateLimitService() { return _lazyV2.ratelimit || (_lazyV2.ratelimit = require('../services/apiRateLimitService')); }
 function getRuntimeAnomalyService() { return _lazyV2.anomaly || (_lazyV2.anomaly = require('../services/runtimeAnomalyService')); }
 function getDigestPromotionService() { return _lazyV2.promotion || (_lazyV2.promotion = require('../services/digestPromotionService')); }
+function getApiContractGateService() { return _lazyV2.contractgate || (_lazyV2.contractgate = require('../services/apiContractGateService')); }
+function getOciSignatureVerifier() { return _lazyV2.ociverify || (_lazyV2.ociverify = require('../services/ociSignatureVerifier')); }
+function getStreamFloodGuardService() { return _lazyV2.streamguard || (_lazyV2.streamguard = require('../services/streamFloodGuardService')); }
+function getDnsCutoverService() { return _lazyV2.dnscutover || (_lazyV2.dnscutover = require('../services/dnsCutoverService')); }
+function getOrphanReaperService() { return _lazyV2.orphanreaper || (_lazyV2.orphanreaper = require('../services/orphanReaperService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -9481,6 +9486,259 @@ router.post('/projects/:id/promotions/:promoId/rollback', heavyOpLimiter, async 
       dryRun: body.dryRun !== undefined ? Boolean(body.dryRun) : true
     });
     res.status(out && out.ok === false ? (Number(out.status) || 400) : 200).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #16 MILESTONE LAZY ROUTES (165 MCP Tools -90.6% Core & 71 Suites — 0 boot RAM impact) ---
+
+// 1. API Contract & Schema Drift Gate (Post-Optic Jan 2026 + oasdiff MISSING-VERSION-BUMP + GraphQL SDL)
+router.post('/contracts/diff', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getApiContractGateService().diffContracts(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/contracts/gate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getApiContractGateService().evaluateDeployGate(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/contracts/baseline', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden fijar baselines de contratos API', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getApiContractGateService().saveBaseline(body);
+    res.status(201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/contracts/history', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getApiContractGateService().listContractHistory(projectId);
+    const history = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.history) ? raw.history : []);
+    res.json({ ok: true, projectId: projectId || null, count: history.length, history });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+// 2. Pure-Node OCI Artifact Signature & SLSA Rekor Verifier (`CVE-2026-22703`, `cosign#4640`, GHCR Referrers)
+router.get('/supply-chain/oci-policies', async (_req, res) => {
+  try {
+    const raw = await getOciSignatureVerifier().listTrustRoots();
+    const trustRoots = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.trustRoots) ? raw.trustRoots : []);
+    res.json({ ok: true, count: trustRoots.length, trustRoots });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/supply-chain/trust-roots', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden gestionar trust roots OCI/SLSA', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'gestionar trust roots OCI globales')) return;
+    const out = await getOciSignatureVerifier().upsertTrustRoot(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/supply-chain/oci-verify', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getOciSignatureVerifier();
+    if (body.action === 'referrer_strategy' || (body.referrersStatus !== undefined && !body.bundle && !body.imageRef)) {
+      const strategy = await svc.resolveReferrerStrategy(body);
+      return res.json(strategy);
+    }
+    const out = await svc.verifyOciBundle(body);
+    if (body.referrersStatus !== undefined && out && typeof out === 'object') {
+      try {
+        out.referrerStrategy = await svc.resolveReferrerStrategy({
+          referrersStatus: body.referrersStatus,
+          digest: body.digest || out.digest,
+          tlsVerify: body.tlsVerify !== undefined ? body.tlsVerify : true,
+          allowedArtifactTypes: body.allowedArtifactTypes
+        });
+      } catch (e) {}
+    }
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Edge WS / SSE Flood & Slowloris Backpressure Guard (`CVE-2026-55458`, `Dokploy#3033`/`#4202`)
+router.get('/edge/stream-guard', async (_req, res) => {
+  try {
+    const svc = getStreamFloodGuardService();
+    const summary = await svc.getStreamGuardSummary();
+    res.json(summary);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/stream-guard/policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden configurar políticas de WS/SSE stream guard', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const projectId = typeof body.projectId === 'string' && body.projectId.trim() ? body.projectId.trim() : 'default';
+    if (projectId !== 'default' && !assertTenantProjectAccess403(req, res, projectId, 'projects:write')) return;
+    const svc = getStreamFloodGuardService();
+    const saved = await svc.upsertStreamPolicy(projectId, body.policy && typeof body.policy === 'object' ? body.policy : body);
+    const policyObj = saved && saved.policy ? saved.policy : saved;
+    const caddyBlock = await svc.generateCaddyStreamBlock(policyObj);
+    res.json({ ok: true, projectId, policy: policyObj, caddyBlock });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/stream-guard/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getStreamFloodGuardService();
+    const rawHeaders = body.upgradeHeaders || body.headers || null;
+    const admission = await svc.evaluateStreamAdmission({
+      ...body,
+      ...(rawHeaders && typeof rawHeaders === 'object' ? { upgradeHeaders: rawHeaders } : {})
+    });
+    res.json(admission);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Zero-Downtime DNS Cutover & TTL Pre-Flight Verifier (`coolify#6271`/`#11831`, `kamal-proxy#26`)
+router.post('/domains/cutover/preflight', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getDnsCutoverService().preflightDnsCutover(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/domains/cutover/plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar planes de cutover DNS', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getDnsCutoverService().buildTtlCutoverPlan(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/domains/cutover/status/:domain', async (req, res) => {
+  try {
+    const out = await getDnsCutoverService().getCutoverStatus(req.params.domain);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Orphaned PR-Preview Auto-Reaper & Dangling Resource GC (`coolify#11441`/`#12148`, `dokploy#4203`/`#3973`)
+router.get('/cleanup/orphans/policy', async (_req, res) => {
+  try {
+    const out = await getOrphanReaperService().getReaperPolicy();
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/cleanup/orphans/policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden modificar la política del orphan reaper', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'modificar la política global del orphan reaper')) return;
+    const out = await getOrphanReaperService().upsertReaperPolicy(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/cleanup/orphans/scan', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getOrphanReaperService().scanOrphans(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/cleanup/orphans/reap', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden ejecutar el orphan reaper', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'ejecutar el orphan reaper global')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getOrphanReaperService();
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    let plan = body.plan || null;
+    let protectedItems = null;
+    if (!plan) {
+      const scanResult = body.scanResult || await svc.scanOrphans({
+        dockerSnapshot: body.dockerSnapshot || {},
+        activeProjects: body.activeProjects || [],
+        activePreviews: body.activePreviews || [],
+        policy: body.policy || {}
+      });
+      if (scanResult && Array.isArray(scanResult.protected)) {
+        protectedItems = scanResult.protected;
+      }
+      plan = await svc.planReap({
+        scanResult,
+        maxReapPerRun: body.maxReapPerRun !== undefined ? Number(body.maxReapPerRun) : 20
+      });
+    }
+    const out = await svc.executeReap({ plan, dryRun });
+    res.json(protectedItems ? { ...out, protected: protectedItems } : out);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

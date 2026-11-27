@@ -5857,6 +5857,134 @@ export const api = {
     }
     throw new Error(data?.error || data?.message || 'Could not execute digest promotion');
   },
+
+  // --- Cycle-16: API Contract Gate, OCI/SLSA Rekor Verifier, WS/SSE Flood Guard, DNS Cutover, Orphan PR Reaper ---
+
+  async diffApiContract(payload: {
+    format?: 'openapi' | 'jsonschema' | 'graphql';
+    baseSpec: Record<string, unknown> | string;
+    revisionSpec: Record<string, unknown> | string;
+    policy?: Record<string, unknown>;
+  }): Promise<ApiContractDiffResult> {
+    const res = await apiFetch(`${API_BASE}/contracts/diff`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.code === 'MISSING-VERSION-BUMP' || data?.allowed === false) {
+      return data as ApiContractDiffResult;
+    }
+    throw new Error(data?.error || data?.message || 'API contract diff failed');
+  },
+
+  async verifyOciSignature(payload: {
+    imageRef: string;
+    bundle: Record<string, unknown>;
+    trustRootId?: string;
+    publicKeyPem?: string;
+    requiredPredicateType?: string;
+    requireRekor?: boolean;
+  }): Promise<OciVerifyResult> {
+    const res = await apiFetch(`${API_BASE}/supply-chain/oci-verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.code === 'REKOR_DIGEST_MISMATCH' || data?.code === 'REKOR_PUBKEY_MISMATCH' || data?.code === 'MUTABLE_TAG_FORBIDDEN' || data?.valid === false) {
+      return data as OciVerifyResult;
+    }
+    throw new Error(data?.error || data?.message || 'OCI signature verification failed');
+  },
+
+  async evaluateStreamGuard(payload: {
+    projectId?: string;
+    clientIp: string;
+    protocol?: 'ws' | 'sse';
+    activePerIp?: number;
+    activeProject?: number;
+    headerElapsedMs?: number;
+    bytesPerSec?: number;
+    bufferedBytes?: number;
+    upgradeHeaders?: Record<string, string>;
+  }): Promise<StreamGuardEvalResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/stream-guard/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Stream flood guard evaluation failed'
+    );
+  },
+
+  async preflightDnsCutover(payload: {
+    domain: string;
+    targetIpv4?: string;
+    targetIpv6?: string;
+    challengeMode?: 'http-01' | 'tls-alpn-01' | 'dns-01';
+    recordsSnapshot?: Record<string, unknown>;
+  }): Promise<DnsCutoverPreflightResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains/cutover/preflight`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'DNS cutover preflight failed'
+    );
+  },
+
+  async buildDnsCutoverPlan(payload: {
+    domain: string;
+    currentTtlSec?: number;
+    targetTtlSec?: number;
+    targetIp?: string;
+    acmeMode?: 'http-01' | 'dns-01';
+    soaRefreshSec?: number;
+    nameserverSerials?: Array<number | { ns: string; serial: number }>;
+  }): Promise<DnsCutoverPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/domains/cutover/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'DNS cutover plan failed'
+    );
+  },
+
+  async scanOrphanResources(payload: {
+    dockerSnapshot?: Record<string, unknown>;
+    activeProjects?: string[];
+    activePreviews?: string[];
+    policy?: Record<string, unknown>;
+  } = {}): Promise<OrphanScanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cleanup/orphans/scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Orphan resource scan failed'
+    );
+  },
+
+  async reapOrphanResources(payload: {
+    scanResult?: OrphanScanResult;
+    dryRun?: boolean;
+    maxReapPerRun?: number;
+  } = { dryRun: true }): Promise<OrphanReapResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/cleanup/orphans/reap`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Orphan resource reap failed'
+    );
+  },
 };
 
 // =====================================================================
@@ -7792,4 +7920,104 @@ export interface DigestPromotionActionResult {
   promotion?: DigestPromotionRecord;
   rollbackManifest?: Record<string, unknown>;
   dryRun?: boolean;
+}
+
+// --- Cycle-16 API Contract, OCI/SLSA Rekor, WS/SSE Flood Guard, DNS Cutover & Orphan Reaper Types ---
+
+export type ApiContractChangeItem = string | {
+  code?: string;
+  rule?: string;
+  path?: string;
+  severity?: string;
+  message?: string;
+};
+
+export interface ApiContractDiffResult {
+  ok?: boolean;
+  allowed: boolean;
+  code?: string;
+  baseVersion?: string;
+  revisionVersion?: string;
+  breakingCount?: number;
+  breakingChanges?: ApiContractChangeItem[];
+  nonBreakingChanges?: ApiContractChangeItem[];
+  message?: string;
+}
+
+export interface OciVerifyResult {
+  ok?: boolean;
+  valid: boolean;
+  verified?: boolean;
+  code: string;
+  imageRef?: string;
+  rekorVersion?: string;
+  predicateType?: string;
+  builderId?: string;
+  message?: string;
+}
+
+export interface StreamGuardEvalResult {
+  ok?: boolean;
+  allowed: boolean;
+  code?: string;
+  httpStatus?: number;
+  wsCloseCode?: number;
+  retryAfterSec?: number;
+  strippedHeaders?: string[];
+  preservedHeaders?: string[];
+  caddyStreamBlock?: string;
+  message?: string;
+}
+
+export interface DnsCutoverPreflightResult {
+  ok?: boolean;
+  ready: boolean;
+  code: string;
+  domain?: string;
+  isProxied?: boolean;
+  warnings?: string[];
+  message?: string;
+}
+
+export interface DnsCutoverPlanResult {
+  ok?: boolean;
+  domain?: string;
+  minPreCutoverWaitSec?: number;
+  phases?: Array<string | { phase?: number; name?: string; title?: string; action?: string; waitSec?: number }>;
+  blocked?: boolean;
+  code?: string;
+  message?: string;
+}
+
+export interface OrphanResourceItem {
+  id: string;
+  name?: string;
+  kind?: 'container' | 'volume' | 'image' | string;
+  reason?: string;
+  sizeBytes?: number;
+  protected?: boolean;
+  protectedReason?: string;
+}
+
+export interface OrphanScanResult {
+  ok?: boolean;
+  orphans?: OrphanResourceItem[];
+  protected?: OrphanResourceItem[];
+  reclaimableBytes?: number;
+  summary?: {
+    orphanCount?: number;
+    protectedCount?: number;
+    reclaimableMb?: number;
+  };
+}
+
+export interface OrphanReapResult {
+  ok?: boolean;
+  dryRun: boolean;
+  reapedCount?: number;
+  plannedCount?: number;
+  protectedCount?: number;
+  reclaimableBytes?: number;
+  actions?: Array<string | { id?: string; kind?: string; action?: string; name?: string }>;
+  message?: string;
 }
