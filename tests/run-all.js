@@ -45,6 +45,9 @@ const testCronHeartbeat = require('./cron-heartbeat.test');
 const testPasskeyLeaseCve = require('./passkey-lease-cve.test');
 const testDriftAndIac = require('./drift-and-iac.test');
 const testUptimeMaintenanceCaa = require('./uptime-maintenance-caa.test');
+const testWebhooksAndS3 = require('./webhooks-and-s3.test');
+const testDbStudioAndQuotas = require('./dbstudio-and-quotas.test');
+const testBrandTheme = require('./brand-theme.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -115,6 +118,9 @@ async function runAll() {
     { name: 'Zero-Dep WebAuthn Passkeys (FIDO2), Ephemeral Secret Leases & OSV.dev SBOM CVE Drift', fn: testPasskeyLeaseCve },
     { name: 'Live Container/DB Config Drift Detector, PgBouncer Smart Pool & OpenTofu/Compose IaC Exporter', fn: testDriftAndIac },
     { name: 'Maintenance Windows (#7704/#8193), Public Incident Timeline, Multi-CAA (#6519), 6-Day ACME & Geo-Failover', fn: testUptimeMaintenanceCaa },
+    { name: 'Standard-Webhooks Outbound Event Bus + DLQ & Post-MinIO S3 Orchestrator / AWS SigV4 Presigner', fn: testWebhooksAndS3 },
+    { name: 'Zero-Dep Read-Only Live DB Studio, Safe Redis Inspector & Agency Multi-Tenant Quotas / CSV Billing Ledger', fn: testDbStudioAndQuotas },
+    { name: 'Open-Core White-Label Brand & Custom Login Theme Engine (coolify#1744 Anti-XSS)', fn: testBrandTheme },
   ];
 
   for (const suite of suites) {

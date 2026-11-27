@@ -4018,6 +4018,35 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:write');
     }
 
+    // White-Label Brand Theme -> lectura pública/autenticada; mutaciones solo admin/owner (`team:write`)
+    if (p === '/api/brand' || p === '/api/brand/reset') {
+      if (isRead && p === '/api/brand') {
+        if (!this.isPrincipalStillValid(principal)) {
+          return { allowed: false, status: 401, reason: 'PRINCIPAL_REVOKED', effectiveRole: null };
+        }
+        return { allowed: true, status: 200, reason: 'PUBLIC_BRAND_READ', effectiveRole: principal.role };
+      }
+      return this.authorizeAction(principal, 'team:write');
+    }
+
+    // Standard-Webhooks Outbound & DLQ -> developer+ en escritura, viewer+ en lectura
+    if (p === '/api/webhooks/outbound' || p.startsWith('/api/webhooks/outbound/') || p === '/api/webhooks/dlq' || p.startsWith('/api/webhooks/dlq/')) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+
+    // Post-MinIO S3 Storage Orchestrator & SigV4 Presigner -> viewer+ lectura presets, developer+ generación
+    if (p === '/api/storage' || p.startsWith('/api/storage/')) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+
+    // Agency Multi-Tenant Quotas & Billing Usage Ledger -> filtrado estricto por tenant/proyecto ACL
+    if (p === '/api/quotas' || p.startsWith('/api/quotas/')) {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'projects:write');
+    }
+    if (p === '/api/billing/ledger') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     if (p === '/api/servers' || p.startsWith('/api/servers/') || p === '/api/fleet' || p.startsWith('/api/fleet/')) {
       return this.authorizeAction(principal, isRead ? 'fleet:read' : 'fleet:write');

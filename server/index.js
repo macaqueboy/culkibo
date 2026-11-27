@@ -2452,6 +2452,16 @@ function getApp() {
     }
   });
 
+  app.get('/api/brand', (_req, res) => {
+    try {
+      const brandTheme = require('./services/brandThemeService');
+      res.setHeader('Cache-Control', 'public, max-age=30');
+      return res.status(200).json(brandTheme.getBrand());
+    } catch (err) {
+      return res.status(500).json({ error: err && err.message ? err.message : 'Brand theme error' });
+    }
+  });
+
   app.use('/api', authMiddleware);
   app.use('/api', apiRouter);
 

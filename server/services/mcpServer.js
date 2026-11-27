@@ -52,7 +52,12 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'cveDriftService',
   'secretLeaseService',
   'driftDetectorService',
-  'iacExporter'
+  'iacExporter',
+  'webhookEventBus',
+  'dbStudioService',
+  'objectStorageService',
+  'quotaMeteringService',
+  'brandThemeService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -78,7 +83,7 @@ function lazySvc(name) {
 }
 
 const SENSITIVE_KEY_RE = /(token|password|passwd|secret|apikey|api_key|authorization|credential|connectionstring|envvars|passphrase|privatekey|private_key|sshkey|ssh_key|invitetoken|invite_token|tokenhash|token_hash|signingsecret|signing_secret|masterkey|master_key|confirmtoken|confirm_token)/i;
-const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|ck(?:[stihprl]|et|bg)_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+const SENSITIVE_VALUE_RE = /(ghp_|gho_|github_pat_|sk_|bearer\s+|whsec_[A-Za-z0-9+/=_-]{8,}|ck(?:[stihprl]|et|bg)_[A-Za-z0-9_-]{6,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_database_credentials',
   'culkibo_github_connect',
@@ -96,7 +101,9 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_shadow_replay',
   'culkibo_fleet_mesh',
   'culkibo_export_iac',
-  'culkibo_secret_lease'
+  'culkibo_secret_lease',
+  'culkibo_webhook_dlq',
+  'culkibo_s3_storage'
 ]);
 
 /** @type {Record<string, number>} */
@@ -107,12 +114,14 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas que también soportan `dryRun: true` (38 destructivas + 3 = 41). */
+/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (39 destructivas + 4 = 43). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment',
   'culkibo_heal_build_failure',
-  'culkibo_secret_lease'
+  'culkibo_secret_lease',
+  'culkibo_webhook_dlq',
+  'culkibo_brand_theme'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -171,7 +180,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_heal_build_failure',
     'culkibo_triage_playbook',
     'culkibo_drift_check',
-    'culkibo_export_iac'
+    'culkibo_export_iac',
+    'culkibo_webhook_dlq',
+    'culkibo_db_studio',
+    'culkibo_s3_storage'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -207,6 +219,11 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_cve_scan',
     'culkibo_drift_check',
     'culkibo_export_iac',
+    'culkibo_webhook_dlq',
+    'culkibo_db_studio',
+    'culkibo_s3_storage',
+    'culkibo_agency_ledger',
+    'culkibo_brand_theme',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -233,6 +250,7 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_fleet_mesh',
     'culkibo_set_domain_basic_auth',
     'culkibo_manage_webhook',
+    'culkibo_webhook_dlq',
     'culkibo_deploy_freeze',
     'culkibo_list_databases',
     'culkibo_database_list_backups',
@@ -241,7 +259,8 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_triage_playbook',
     'culkibo_verify_attestation',
     'culkibo_cve_scan',
-    'culkibo_secret_lease'
+    'culkibo_secret_lease',
+    'culkibo_brand_theme'
   ])
 });
 
@@ -314,7 +333,23 @@ const SEARCH_SYNONYMS = Object.freeze({
   opentofu: ['iac', 'terraform', 'hcl', 'compose', 'export'],
   iac: ['terraform', 'opentofu', 'hcl', 'compose', 'export'],
   lease: ['secret', 'breakglass', 'rotation', 'vault', 'ephemeral'],
-  triage: ['incident', 'heal', 'drift', 'cve', 'playbook', 'diagnose']
+  triage: ['incident', 'heal', 'drift', 'cve', 'playbook', 'diagnose'],
+  dlq: ['webhook', 'replay', 'outbound', 'event', 'rotate'],
+  webhook: ['dlq', 'replay', 'outbound', 'event', 'rotate', 'hook'],
+  studio: ['sql', 'redis', 'bloat', 'explain', 'database', 'postgres'],
+  sql: ['studio', 'database', 'postgres', 'explain', 'bloat'],
+  redis: ['studio', 'valkey', 'database', 'scan', 'cache'],
+  s3: ['storage', 'garage', 'rustfs', 'seaweedfs', 'minio', 'presign', 'sigv4', 'cors', 'lifecycle'],
+  garage: ['s3', 'storage', 'minio', 'presign', 'sigv4'],
+  rustfs: ['s3', 'storage', 'minio', 'presign', 'sigv4'],
+  seaweedfs: ['s3', 'storage', 'minio', 'presign', 'sigv4'],
+  minio: ['s3', 'storage', 'garage', 'rustfs', 'seaweedfs', 'presign'],
+  presign: ['s3', 'storage', 'sigv4', 'bucket'],
+  ledger: ['billing', 'quota', 'agency', 'csv', 'finops', 'usage', 'cost'],
+  billing: ['ledger', 'quota', 'agency', 'csv', 'finops', 'cost'],
+  quota: ['ledger', 'billing', 'agency', 'limit', 'tenant'],
+  brand: ['whitelabel', 'theme', 'logo', 'login', 'accent'],
+  whitelabel: ['brand', 'theme', 'logo', 'login', 'agency']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -475,7 +510,13 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_cve_scan: { minRole: 'viewer', scope: 'security:read', projectScoped: false },
   culkibo_drift_check: { minRole: 'developer', scope: 'deployments:read', projectScoped: true },
   culkibo_export_iac: { minRole: 'developer', scope: 'gitops:read', projectScoped: false, secretSensitive: true },
-  culkibo_secret_lease: { minRole: 'admin', scope: 'security:write', projectScoped: false, secretSensitive: true }
+  culkibo_secret_lease: { minRole: 'admin', scope: 'security:write', projectScoped: false, secretSensitive: true },
+  // MCP 2026 Cycle-9: Standard-Webhooks DLQ, Read-Only DB Studio, Post-MinIO S3, Agency Ledger & White-Label Brand (+5 = 130)
+  culkibo_webhook_dlq: { minRole: 'developer', scope: 'webhooks:write', projectScoped: false, secretSensitive: true },
+  culkibo_db_studio: { minRole: 'developer', scope: 'databases:read', projectScoped: true },
+  culkibo_s3_storage: { minRole: 'developer', scope: 'storage:read', projectScoped: false, secretSensitive: true },
+  culkibo_agency_ledger: { minRole: 'viewer', scope: 'observability:read', projectScoped: true },
+  culkibo_brand_theme: { minRole: 'viewer', scope: 'system:read', projectScoped: false }
 });
 
 /**
@@ -3574,6 +3615,148 @@ class McpServer extends EventEmitter {
             includeExpired: { type: 'boolean', description: 'Incluir leases caducados en action="list" (default false)' }
           }
         }
+      },
+
+      // --- MCP 2026 Cycle-9: Standard-Webhooks DLQ, Read-Only DB Studio, Post-MinIO S3, Agency Ledger & White-Label Brand (+5 = 130) ---
+      {
+        name: 'culkibo_webhook_dlq',
+        title: 'Gestionar bus Standard-Webhooks, DLQ y rotación dual-secret',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            entries: { type: 'array' },
+            subscriptions: { type: 'array' },
+            count: { type: 'integer' },
+            replayed: { type: 'boolean' },
+            rotated: { type: 'boolean' }
+          }
+        },
+        description: 'Inspecciona suscripciones Standard-Webhooks (sin secretos whsec_ en claro) y cola DLQ de entregas fallidas, o reintenta entregas (anti-SSRF en cada replay) y rota secretos duales con ventana de gracia (dryRun: true por defecto en replay/rotate_secret; resultados redactados en auditoría).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list_dlq', 'list_subscriptions', 'replay', 'rotate_secret'], description: 'Operación sobre Standard-Webhooks y DLQ (default "list_dlq")' },
+            dlqId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de entrada DLQ a reintentar (o "all" para reintentar todas las fallidas; requerido para action="replay")' },
+            subscriptionId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de suscripción para rotación dual-secret (requerido para action="rotate_secret")' },
+            limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Máximo de entradas DLQ a devolver (default 50)' },
+            status: { type: 'string', maxLength: 32, description: 'Filtro opcional de estado DLQ (ej. failed, replayed)' },
+            graceSec: { type: 'integer', minimum: 60, maximum: 604800, description: 'Ventana de gracia en segundos para el secreto secundario al rotar (default 86400)' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_db_studio',
+        title: 'Ejecutar DB Studio solo lectura (SQL / Redis / Bloat)',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            mode: { type: 'string' },
+            databaseId: { type: ['string', 'null'] },
+            readOnlyEnforced: { type: 'boolean' },
+            result: { type: 'object' }
+          }
+        },
+        description: 'DB Studio sin sidecars y estrictamente de solo lectura: valida y envuelve SQL en BEGIN TRANSACTION READ ONLY + timeout 5s + LIMIT <=200 (bloqueando DDL/DML/CTEs mutadoras/psql metacommands), inspecciona Redis/Valkey con allowlist segura (bloquea KEYS/FLUSHALL/EVAL/CONFIG) o diagnostica table bloat de PostgreSQL (ACL estricto por proyecto/BD).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            databaseId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de la base de datos gestionada (validado contra ACL del proyecto)' },
+            mode: { type: 'string', enum: ['sql', 'redis', 'bloat'], description: 'Modo de inspección: sql, redis o bloat (default "sql")' },
+            query: { type: 'string', minLength: 1, maxLength: 16384, description: 'Consulta SQL de solo lectura (SELECT/EXPLAIN/SHOW/WITH) para mode="sql"' },
+            maxRows: { type: 'integer', minimum: 1, maximum: 200, description: 'Límite máximo de filas (1..200, default 200)' },
+            argv: { description: 'Comando Redis/Valkey seguro como array de strings o cadena separada por espacios (ej. ["SCAN","0","COUNT","50"])' },
+            tableStats: { type: 'array', maxItems: 500, description: 'Estadísticas de tablas/índices PostgreSQL para mode="bloat"' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_s3_storage',
+        title: 'Orquestar S3 Post-MinIO (Garage/RustFS/SeaweedFS) y SigV4',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            presets: { type: 'array' },
+            preset: { type: ['object', 'null'] },
+            presigned: { type: ['object', 'null'] },
+            xml: { type: ['string', 'null'] }
+          }
+        },
+        description: 'Lista presets pineados 2026 Post-MinIO (Garage Rust CRDT, RustFS Apache-2.0, SeaweedFS) con red privada 127.0.0.1 por defecto, genera URLs prefirmadas AWS SigV4 (AWS4-HMAC-SHA256) en crypto puro sin deps y construye XML seguro de CORS (rechaza * + credentials) o Lifecycle (secretAccessKey y resultados siempre redactados en auditoría).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['presets', 'presign', 'cors_xml', 'lifecycle_xml'], description: 'Operación S3 (default "presets")' },
+            presetId: { type: 'string', enum: ['garage', 'rustfs', 'seaweedfs'], description: 'Preset concreto a consultar en action="presets"' },
+            endpoint: { type: 'string', maxLength: 512, description: 'URL endpoint S3 (ej. https://s3.acme.internal) para action="presign"' },
+            region: { type: 'string', maxLength: 64, description: 'Región SigV4 (default "us-east-1")' },
+            bucket: { type: 'string', maxLength: 64, description: 'Nombre del bucket S3 RFC-compliant' },
+            key: { type: 'string', maxLength: 1024, description: 'Clave de objeto S3 (sin traversal "..")' },
+            method: { type: 'string', enum: ['GET', 'PUT', 'HEAD', 'DELETE'], description: 'Método HTTP para presign (default "GET")' },
+            accessKeyId: { type: 'string', maxLength: 128, description: 'Access Key ID S3 para action="presign"' },
+            secretAccessKey: { type: 'string', maxLength: 256, description: 'Secret Access Key S3 (redactada automáticamente en auditoría)' },
+            expiresIn: { type: 'integer', minimum: 60, maximum: 604800, description: 'Validez de URL prefirmada en segundos (60..604800, default 900)' },
+            rules: { type: 'array', maxItems: 100, description: 'Reglas para action="cors_xml" o action="lifecycle_xml"' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_agency_ledger',
+        title: 'Consultar cuotas multi-tenant y ledger de facturación',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            ledger: { type: ['object', 'null'] },
+            csv: { type: ['string', 'null'] },
+            quotas: { type: 'array' },
+            check: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Calcula el ledger de uso facturable por proyecto/cliente (CPU-hrs, RAM GB-hrs, almacenamiento, ancho de banda y coste estimado USD), exporta CSV neutralizado contra inyección de fórmulas (=,+,-,@), lista cuotas multi-tenant o evalúa límites fail-closed (ACL estricto por tenant/proyecto, cero fugas cross-tenant).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['ledger', 'csv', 'list_quotas', 'check_quota'], description: 'Operación de cuotas/ledger (default "ledger")' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de proyecto opcional (obligatorio para action="check_quota"; validado por ACL)' },
+            periodDays: { type: 'integer', minimum: 1, maximum: 365, description: 'Ventana de facturación en días (1..365, default 30)' },
+            requested: { type: 'object', description: 'Recursos solicitados para action="check_quota" ({ containers, memoryMb, cpuCores, storageGb, bandwidthGbMo })' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_brand_theme',
+        title: 'Consultar o personalizar tema white-label de la instancia',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            updated: { type: 'boolean' },
+            brand: { type: 'object' }
+          }
+        },
+        description: 'Lee la configuración de marca white-label open-core (permitido a cualquier rol autenticado) o actualiza/restablece marca, color acento hex, logo HTTPS/SVG sanitizado y tagline con validación estricta anti-XSS/CSS-injection (solo admin/owner; dryRun: true por defecto en update/reset).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['get', 'update', 'reset'], description: 'Operación sobre marca white-label (default "get")' },
+            patch: {
+              type: 'object',
+              description: 'Campos a actualizar en action="update" ({ brandName, tagline, accentHex, logoUrl, supportUrl, hidePoweredBy })'
+            }
+          }
+        }
       }
     ];
 
@@ -5671,6 +5854,15 @@ class McpServer extends EventEmitter {
       }
     }
 
+    if (toolName === 'culkibo_brand_theme' && (args.action === 'update' || args.action === 'reset')) {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', `La acción '${args.action}' de culkibo_brand_theme requiere rol admin/owner sin restricción de proyectos.`, {
+          retryable: false,
+          remediation: 'Usa action: "get" para leer la marca actual o autentícate como admin/owner.'
+        });
+      }
+    }
+
     // Aislamiento de equipo en argumentos explícitos (teamId y serverId) antes de dryRun
     if (principal.teamId && args.teamId && String(args.teamId) !== principal.teamId) {
       throw new McpToolError('FORBIDDEN', 'No tienes acceso al equipo especificado.', {
@@ -6491,6 +6683,78 @@ class McpServer extends EventEmitter {
           reversible = true;
         } else {
           effects.push(`Consultará '${action}' de secret leases sin mutar estado.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_webhook_dlq': {
+        const action = String(args.action || 'list_dlq');
+        const graceSec = Math.min(604800, Math.max(60, Number(args.graceSec) || 86400));
+        Object.assign(target, {
+          action,
+          dlqId: args.dlqId || null,
+          subscriptionId: args.subscriptionId || null,
+          graceSec
+        });
+        if (action === 'replay') {
+          if (!args.dlqId) blockers.push('MISSING_DLQ_ID');
+          effects.push(`Reintentará la entrega DLQ '${args.dlqId || '?'}' re-validando DNS/SSRF antes de firmar con Standard-Webhooks.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else if (action === 'rotate_secret') {
+          if (!args.subscriptionId) blockers.push('MISSING_SUBSCRIPTION_ID');
+          effects.push(`Rotará el secreto whsec_ de la suscripción '${args.subscriptionId || '?'}' manteniendo el secreto previo activo durante ${graceSec}s de gracia dual-secret.`);
+          riskLevel = 'high';
+          reversible = true;
+        } else {
+          effects.push(`Consultará '${action}' de Standard-Webhooks sin mutar suscripciones ni disparar entregas.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_brand_theme': {
+        const action = String(args.action || 'get');
+        Object.assign(target, {
+          action,
+          patchKeys: args.patch && typeof args.patch === 'object' ? Object.keys(args.patch) : []
+        });
+        if (action === 'update') {
+          if (!args.patch || typeof args.patch !== 'object' || Array.isArray(args.patch)) {
+            blockers.push('MISSING_BRAND_PATCH');
+          } else {
+            const bt = lazySvc('brandThemeService');
+            if (bt && typeof bt.validateBrandPatch === 'function') {
+              try {
+                const validated = bt.validateBrandPatch(args.patch);
+                if (validated && validated.valid === false) {
+                  throw new McpToolError('INVALID_BRAND_PATCH', validated.error || 'Configuración de marca rechazada por validación anti-XSS/CSS.', {
+                    retryable: true,
+                    remediation: 'Usa accentHex #RRGGBB, supportUrl https:// y logoUrl https:// o data:image/svg+xml sin scripts ni handlers.'
+                  });
+                }
+                Object.assign(preview, { validatedPatch: validated });
+              } catch (e) {
+                if (e instanceof McpToolError) throw e;
+                throw new McpToolError('INVALID_BRAND_PATCH', e.message || 'Configuración de marca inválida.', {
+                  retryable: true,
+                  remediation: 'Corrige los campos rechazados (brandName, tagline, accentHex #RRGGBB, supportUrl https://, logoUrl seguro).'
+                });
+              }
+            }
+          }
+          effects.push('Actualizará la configuración de marca white-label (brand-theme.json) con validación estricta anti-XSS/CSS.');
+          riskLevel = 'low';
+          reversible = true;
+        } else if (action === 'reset') {
+          effects.push('Restablecerá la marca white-label a los valores por defecto de Culkibo.');
+          riskLevel = 'low';
+          reversible = true;
+        } else {
+          effects.push('Leerá la marca white-label actual sin mutar estado.');
           riskLevel = 'low';
           reversible = true;
         }
@@ -9401,6 +9665,421 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_webhook_dlq': {
+          const whBus = requireLazySvc('webhookEventBus', 'Standard-Webhooks Event Bus & DLQ');
+          const action = String(args.action || 'list_dlq');
+
+          if (action === 'list_dlq') {
+            const entries = whBus.listDlq({
+              limit: Math.min(200, Math.max(1, Number(args.limit) || 50)),
+              ...(args.status ? { status: String(args.status) } : {})
+            });
+            const list = Array.isArray(entries) ? entries : [];
+            res = {
+              action: 'list_dlq',
+              dryRun: false,
+              entries: list,
+              subscriptions: [],
+              count: list.length,
+              replayed: false,
+              rotated: false
+            };
+          } else if (action === 'list_subscriptions') {
+            const subs = whBus.listSubscriptions();
+            const list = Array.isArray(subs) ? subs : [];
+            res = {
+              action: 'list_subscriptions',
+              dryRun: false,
+              entries: [],
+              subscriptions: list,
+              count: list.length,
+              replayed: false,
+              rotated: false
+            };
+          } else if (action === 'replay') {
+            if (!args.dlqId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="replay" requiere dlqId (o "all").', {
+                retryable: true,
+                remediation: 'Lista la cola con culkibo_webhook_dlq({ action: "list_dlq" }) y pasa dlqId.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                action: 'replay',
+                dryRun: true,
+                dlqId: String(args.dlqId),
+                entries: [],
+                subscriptions: [],
+                count: 0,
+                replayed: false,
+                rotated: false,
+                wouldReplay: { dlqId: String(args.dlqId) }
+              };
+            } else {
+              try {
+                const replayRes = String(args.dlqId) === 'all'
+                  ? await whBus.replayAllFailed()
+                  : await whBus.replayDlqEntry(String(args.dlqId));
+                res = {
+                  action: 'replay',
+                  dryRun: false,
+                  dlqId: String(args.dlqId),
+                  entries: [],
+                  subscriptions: [],
+                  count: 0,
+                  replayed: Boolean(replayRes && replayRes.ok !== false && replayRes.delivered !== false),
+                  rotated: false,
+                  result: replayRes
+                };
+              } catch (e) {
+                throw new McpToolError(e.code || 'WEBHOOK_REPLAY_FAILED', e.message || 'No se pudo reintentar la entrega DLQ.', {
+                  retryable: true,
+                  remediation: 'Verifica que el dlqId exista y que la URL destino no apunte a direcciones internas bloqueadas por SSRF.'
+                });
+              }
+            }
+          } else {
+            // action === 'rotate_secret'
+            if (!args.subscriptionId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="rotate_secret" requiere subscriptionId.', {
+                retryable: true,
+                remediation: 'Consulta IDs con culkibo_webhook_dlq({ action: "list_subscriptions" }) y pasa subscriptionId.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const graceSec = Math.min(604800, Math.max(60, Number(args.graceSec) || 86400));
+            if (dryRun) {
+              res = {
+                action: 'rotate_secret',
+                dryRun: true,
+                subscriptionId: String(args.subscriptionId),
+                graceSec,
+                entries: [],
+                subscriptions: [],
+                count: 0,
+                replayed: false,
+                rotated: false,
+                wouldRotate: { subscriptionId: String(args.subscriptionId), graceSec }
+              };
+            } else {
+              try {
+                const rot = whBus.rotateSecret(String(args.subscriptionId), { graceSec });
+                res = {
+                  action: 'rotate_secret',
+                  dryRun: false,
+                  subscriptionId: String(args.subscriptionId),
+                  graceSec,
+                  entries: [],
+                  subscriptions: [],
+                  count: 0,
+                  replayed: false,
+                  rotated: Boolean(rot && rot.ok !== false),
+                  rotation: rot
+                };
+              } catch (e) {
+                throw new McpToolError(e.code || 'WEBHOOK_ROTATE_FAILED', e.message || 'No se pudo rotar el secreto del webhook.', {
+                  retryable: false,
+                  remediation: 'Comprueba que subscriptionId exista mediante action="list_subscriptions".'
+                });
+              }
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_db_studio': {
+          const dbStudio = requireLazySvc('dbStudioService', 'Read-Only Live DB Studio & Safe Redis Inspector');
+          const mode = String(args.mode || 'sql');
+          const db = args.databaseId ? databaseManager.list().find((d) => d.id === String(args.databaseId)) : null;
+          if (args.databaseId && !db) {
+            throw new McpToolError('DATABASE_NOT_FOUND', `Base de datos '${args.databaseId}' no encontrada.`, {
+              retryable: false,
+              remediation: 'Lista las bases de datos autorizadas con culkibo_list_databases.'
+            });
+          }
+          if (db && !principal.isSuperAdmin && !canAccessProject(principal, db.projectId)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a la base de datos '${db.id}'.`, {
+              retryable: false,
+              remediation: 'Usa un databaseId perteneciente a tus proyectos autorizados.'
+            });
+          }
+
+          if (mode === 'sql') {
+            if (!args.query || typeof args.query !== 'string') {
+              throw new McpToolError('MISSING_ARGUMENT', 'mode="sql" requiere una consulta SQL de solo lectura en query.', {
+                retryable: true,
+                remediation: 'Pasa una consulta SELECT, EXPLAIN, SHOW o WITH en el argumento query.'
+              });
+            }
+            try {
+              const out = await dbStudio.runReadOnlyQuery({
+                databaseId: db ? db.id : (args.databaseId ? String(args.databaseId) : 'studio'),
+                engine: db?.engine || 'postgres',
+                query: args.query,
+                maxRows: Math.min(200, Math.max(1, Number(args.maxRows) || 200))
+              });
+              if (out && out.ok === false) {
+                throw new McpToolError(out.code || 'SQL_WRITE_BLOCKED', out.error || out.message || 'Consulta SQL bloqueada por la puerta de solo lectura.', {
+                  retryable: false,
+                  remediation: 'Elimina cualquier sentencia de escritura, DDL/DML, comentario ofuscado, metacomando psql o sentencia apilada.'
+                });
+              }
+              res = {
+                ok: true,
+                mode: 'sql',
+                databaseId: db ? db.id : null,
+                readOnlyEnforced: true,
+                result: out
+              };
+            } catch (e) {
+              if (e instanceof McpToolError) throw e;
+              throw new McpToolError(e.code || 'SQL_WRITE_BLOCKED', e.message || 'Consulta SQL bloqueada por la puerta de solo lectura.', {
+                retryable: false,
+                remediation: 'Usa únicamente consultas SELECT, EXPLAIN, SHOW o WITH de solo lectura (LIMIT <= 200, sin sentencias apiladas).'
+              });
+            }
+          } else if (mode === 'redis') {
+            if (!args.argv || (typeof args.argv !== 'string' && !Array.isArray(args.argv))) {
+              throw new McpToolError('MISSING_ARGUMENT', 'mode="redis" requiere argv (ej. ["SCAN", "0", "COUNT", "50"] o "INFO memory").', {
+                retryable: true,
+                remediation: 'Pasa un comando seguro de solo lectura en argv (SCAN, TYPE, TTL, DBSIZE, INFO, GET, etc.).'
+              });
+            }
+            try {
+              const out = await dbStudio.runSafeRedisInspect({
+                databaseId: db ? db.id : (args.databaseId ? String(args.databaseId) : 'redis'),
+                argv: args.argv
+              });
+              if (out && out.ok === false) {
+                throw new McpToolError(out.code || 'REDIS_COMMAND_BLOCKED', out.error || out.message || 'Comando Redis bloqueado por política de solo lectura.', {
+                  retryable: false,
+                  remediation: 'Usa solo comandos de la allowlist segura (SCAN, TYPE, TTL, PTTL, DBSIZE, INFO, STRLEN, LLEN, HLEN, SCARD, ZCARD, GET).'
+                });
+              }
+              res = {
+                ok: true,
+                mode: 'redis',
+                databaseId: db ? db.id : null,
+                readOnlyEnforced: true,
+                result: out
+              };
+            } catch (e) {
+              if (e instanceof McpToolError) throw e;
+              throw new McpToolError(e.code || 'REDIS_COMMAND_BLOCKED', e.message || 'Comando Redis bloqueado por política de solo lectura.', {
+                retryable: false,
+                remediation: 'Evita KEYS/FLUSHALL/CONFIG/EVAL y utiliza SCAN (COUNT <= 100), INFO, DBSIZE, TTL o GET.'
+              });
+            }
+          } else {
+            const bloat = dbStudio.analyzePostgresBloat(Array.isArray(args.tableStats) ? args.tableStats : []);
+            res = {
+              ok: true,
+              mode: 'bloat',
+              databaseId: db ? db.id : null,
+              readOnlyEnforced: true,
+              result: bloat
+            };
+          }
+          break;
+        }
+
+        case 'culkibo_s3_storage': {
+          const s3Svc = requireLazySvc('objectStorageService', 'Post-MinIO S3 Storage Orchestrator & SigV4 Presigner');
+          const action = String(args.action || 'presets');
+
+          if (action === 'presets') {
+            if (args.presetId) {
+              const preset = s3Svc.getPreset(String(args.presetId));
+              if (!preset) {
+                throw new McpToolError('PRESET_NOT_FOUND', `Preset S3 desconocido: '${args.presetId}'.`, {
+                  retryable: true,
+                  remediation: 'Usa uno de los presets soportados: garage, rustfs o seaweedfs.'
+                });
+              }
+              res = { ok: true, action: 'presets', presets: [preset], preset, presigned: null, xml: null };
+            } else {
+              const presets = s3Svc.listPresets();
+              res = { ok: true, action: 'presets', presets: Array.isArray(presets) ? presets : [], preset: null, presigned: null, xml: null };
+            }
+          } else if (action === 'presign') {
+            if (!args.endpoint || !args.bucket || !args.key || !args.accessKeyId || !args.secretAccessKey) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="presign" requiere endpoint, bucket, key, accessKeyId y secretAccessKey.', {
+                retryable: true,
+                remediation: 'Proporciona endpoint, bucket, key, accessKeyId y secretAccessKey (nunca se registran secretos en auditoría).'
+              });
+            }
+            try {
+              const presigned = s3Svc.generatePresignedUrl({
+                endpoint: String(args.endpoint),
+                region: String(args.region || 'us-east-1'),
+                bucket: String(args.bucket),
+                key: String(args.key),
+                method: String(args.method || 'GET'),
+                accessKeyId: String(args.accessKeyId),
+                secretAccessKey: String(args.secretAccessKey),
+                expiresIn: args.expiresIn !== undefined ? Number(args.expiresIn) : 900
+              });
+              res = { ok: true, action: 'presign', presets: [], preset: null, presigned, xml: null };
+            } catch (e) {
+              throw new McpToolError(e.code || 'INVALID_S3_PRESIGN', e.message || 'Parámetros SigV4 inválidos.', {
+                retryable: true,
+                remediation: 'Valida bucket RFC, key sin "..", método GET/PUT/HEAD/DELETE y expiresIn entre 60 y 604800.'
+              });
+            }
+          } else if (action === 'cors_xml') {
+            try {
+              const out = s3Svc.buildBucketCorsXml(Array.isArray(args.rules) ? args.rules : []);
+              const xml = typeof out === 'string' ? out : String(out?.xml || '');
+              res = { ok: true, action: 'cors_xml', presets: [], preset: null, presigned: null, xml };
+            } catch (e) {
+              throw new McpToolError(e.code || 'INVALID_S3_CORS', e.message || 'Reglas CORS S3 inválidas.', {
+                retryable: true,
+                remediation: 'Proporciona orígenes/métodos válidos y nunca combines origen "*" con allowCredentials: true.'
+              });
+            }
+          } else {
+            // action === 'lifecycle_xml'
+            try {
+              const out = s3Svc.buildLifecycleXml(Array.isArray(args.rules) ? args.rules : []);
+              const xml = typeof out === 'string' ? out : String(out?.xml || '');
+              res = { ok: true, action: 'lifecycle_xml', presets: [], preset: null, presigned: null, xml };
+            } catch (e) {
+              throw new McpToolError(e.code || 'INVALID_S3_LIFECYCLE', e.message || 'Reglas Lifecycle S3 inválidas.', {
+                retryable: true,
+                remediation: 'Define reglas con id, prefix y expirationDays o abortMultipartDays positivos.'
+              });
+            }
+          }
+          break;
+        }
+
+        case 'culkibo_agency_ledger': {
+          const quotaSvc = requireLazySvc('quotaMeteringService', 'Agency Multi-Tenant Quotas & Billing Usage Ledger');
+          const action = String(args.action || 'ledger');
+          const allowedProjectIds = this._accessibleProjectIds(principal);
+
+          if (args.projectId && !principal.isSuperAdmin && !canAccessProject(principal, String(args.projectId))) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso al proyecto '${args.projectId}'.`, {
+              retryable: false,
+              remediation: 'Omite projectId o indica un proyecto autorizado desde culkibo_list_projects.'
+            });
+          }
+
+          const visibleProjects = projectManager.getAll().filter((p) => canAccessProject(principal, p.id, p));
+          const scopedProjects = args.projectId
+            ? visibleProjects.filter((p) => p.id === String(args.projectId))
+            : visibleProjects;
+          const visibleDbs = databaseManager.list().filter((d) => {
+            if (!principal.isSuperAdmin && !canAccessProject(principal, d.projectId)) return false;
+            if (args.projectId && d.projectId !== String(args.projectId)) return false;
+            return true;
+          });
+          const effectiveAllowed = args.projectId ? [String(args.projectId)] : allowedProjectIds;
+          const periodDays = Math.min(365, Math.max(1, Number(args.periodDays) || 30));
+
+          if (action === 'ledger' || action === 'csv') {
+            const ledger = quotaSvc.buildUsageLedger({
+              projects: scopedProjects,
+              databases: visibleDbs,
+              allowedProjectIds: effectiveAllowed,
+              periodDays
+            });
+            const csv = action === 'csv' ? quotaSvc.exportLedgerCsv(ledger) : null;
+            res = { ok: true, action, ledger, csv, quotas: [], check: null };
+          } else if (action === 'list_quotas') {
+            const qRes = quotaSvc.listQuotas({ allowedProjectIds: effectiveAllowed });
+            const quotasList = Array.isArray(qRes) ? qRes : (Array.isArray(qRes?.quotas) ? qRes.quotas : []);
+            res = { ok: true, action: 'list_quotas', ledger: null, csv: null, quotas: quotasList, defaults: qRes?.defaults || null, check: null };
+          } else {
+            // action === 'check_quota'
+            if (!args.projectId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="check_quota" requiere projectId.', {
+                retryable: true,
+                remediation: 'Pasa projectId obtenido de culkibo_list_projects junto con requested.'
+              });
+            }
+            const check = quotaSvc.checkQuotaAllowance(String(args.projectId), args.requested && typeof args.requested === 'object' ? args.requested : {});
+            res = { ok: true, action: 'check_quota', ledger: null, csv: null, quotas: [], check };
+          }
+          break;
+        }
+
+        case 'culkibo_brand_theme': {
+          const brandSvc = requireLazySvc('brandThemeService', 'Open-Core White-Label Brand & Custom Login Theme');
+          const action = String(args.action || 'get');
+
+          if (action === 'get') {
+            const brand = brandSvc.getBrand();
+            res = { action: 'get', dryRun: false, updated: false, brand };
+          } else if (action === 'update') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Actualizar la marca white-label requiere rol admin/owner sin restricción de proyectos.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner o usa action: "get".'
+              });
+            }
+            if (!args.patch || typeof args.patch !== 'object' || Array.isArray(args.patch)) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="update" requiere un objeto patch.', {
+                retryable: true,
+                remediation: 'Pasa patch con campos válidos ({ brandName, tagline, accentHex, logoUrl, supportUrl, hidePoweredBy }).'
+              });
+            }
+            try {
+              const validation = brandSvc.validateBrandPatch(args.patch);
+              if (validation && validation.valid === false) {
+                throw new McpToolError('INVALID_BRAND_PATCH', validation.error || 'Configuración de marca rechazada por validación anti-XSS/CSS.', {
+                  retryable: true,
+                  remediation: 'Usa accentHex #RRGGBB, supportUrl https:// y logoUrl https:// o data:image/svg+xml sanitizado.'
+                });
+              }
+            } catch (e) {
+              if (e instanceof McpToolError) throw e;
+              throw new McpToolError(e.code || 'INVALID_BRAND_PATCH', e.message || 'Configuración de marca inválida.', {
+                retryable: true,
+                remediation: 'Corrige los campos rechazados para cumplir las reglas estrictas anti-XSS y anti-CSS-injection.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                action: 'update',
+                dryRun: true,
+                updated: false,
+                brand: brandSvc.getBrand(),
+                previewPatch: args.patch
+              };
+            } else {
+              const actor = principal.email || principal.userId || principal.role || 'mcp-admin';
+              const brand = brandSvc.updateBrand(args.patch, { actor });
+              res = { action: 'update', dryRun: false, updated: true, brand };
+            }
+          } else {
+            // action === 'reset'
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Restablecer la marca white-label requiere rol admin/owner sin restricción de proyectos.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner o usa action: "get".'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                action: 'reset',
+                dryRun: true,
+                updated: false,
+                brand: brandSvc.getBrand(),
+                wouldResetToDefault: true
+              };
+            } else {
+              const actor = principal.email || principal.userId || principal.role || 'mcp-admin';
+              const brand = brandSvc.resetBrand({ actor });
+              res = { action: 'reset', dryRun: false, updated: true, brand };
+            }
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -10384,7 +11063,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 125 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 130 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

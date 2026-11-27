@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 125);
+    assert.strictEqual(demoJson.datasets.mcpTools, 130);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -688,6 +688,40 @@ async function testCliDx() {
     assert.ok(typeof cveJson.scannedComponents === 'number' && cveJson.scannedComponents > 0);
     assert.ok(cveJson.severityCounts && typeof cveJson.vulnerableCount === 'number');
     console.log(`  ✓ Pioneer CLI Cycle-8 verificado (culkibo export-iac ${iacJson.writtenFiles.length} archivos, culkibo cve-scan ${cveJson.scannedComponents} componentes)`);
+
+    // 13. Pioneer Cycle-9 CLI: `culkibo ledger [--days 30] [--csv|--json]` y `culkibo s3-presets [--json]`
+    const ledgerJsonCli = await runCli(['ledger', '--days', '30', '--json'], { env: isolatedEnv });
+    assert.strictEqual(ledgerJsonCli.status, 0, `culkibo ledger --json falló: ${ledgerJsonCli.stderr} ${ledgerJsonCli.stdout}`);
+    const ledgerJson = JSON.parse(ledgerJsonCli.stdout);
+    assert.strictEqual(ledgerJson.ok, true);
+    assert.strictEqual(ledgerJson.periodDays, 30);
+    assert.ok(Array.isArray(ledgerJson.entries) && ledgerJson.entries.length >= 1);
+    assert.ok(ledgerJson.totals && typeof ledgerJson.totals.estimatedCostUsd === 'number');
+
+    // Inject a formula-bearing project name in isolated dataRoot/projects.json to verify CSV formula neutralization via CLI
+    const curProjectsForCsv = JSON.parse(fs.readFileSync(projectsJsonPath, 'utf8'));
+    curProjectsForCsv.push({
+      id: 'proj_cli_csv_formula',
+      name: '=SUM(1,1)',
+      memoryMb: 256,
+      cpus: 0.5,
+      resources: []
+    });
+    fs.writeFileSync(projectsJsonPath, JSON.stringify(curProjectsForCsv, null, 2), 'utf8');
+
+    const ledgerCsvCli = await runCli(['ledger', '--days', '30', '--csv'], { env: isolatedEnv });
+    assert.strictEqual(ledgerCsvCli.status, 0, `culkibo ledger --csv falló: ${ledgerCsvCli.stderr} ${ledgerCsvCli.stdout}`);
+    assert.ok(ledgerCsvCli.stdout.includes('projectId') && ledgerCsvCli.stdout.includes('TOTAL'));
+    assert.ok(ledgerCsvCli.stdout.includes("'=SUM(1,1)"), 'culkibo ledger --csv debe neutralizar fórmulas =/+/-/@');
+
+    const s3PresetsCli = await runCli(['s3-presets', '--json'], { env: isolatedEnv });
+    assert.strictEqual(s3PresetsCli.status, 0, `culkibo s3-presets --json falló: ${s3PresetsCli.stderr} ${s3PresetsCli.stdout}`);
+    const s3PresetsJson = JSON.parse(s3PresetsCli.stdout);
+    assert.strictEqual(s3PresetsJson.ok, true);
+    assert.strictEqual(s3PresetsJson.count, 3);
+    assert.deepStrictEqual(s3PresetsJson.presets.map((p) => p.id).sort(), ['garage', 'rustfs', 'seaweedfs']);
+    assert.ok(s3PresetsJson.presets.every((p) => p.bindAddress === '127.0.0.1'));
+    console.log(`  ✓ Pioneer CLI Cycle-9 verificado (culkibo ledger --json/--csv formula-safe, culkibo s3-presets 3 engines Post-MinIO, culkibo demo 130 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

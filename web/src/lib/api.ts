@@ -4623,6 +4623,201 @@ export const api = {
       'Could not build DNS geo-failover plan'
     );
   },
+
+  // --- Cycle-9 Pioneer APIs (White-Label Brand, Standard-Webhooks DLQ, Read-Only DB Studio, Post-MinIO S3, Agency Quotas & Billing Ledger) ---
+
+  async getBrandTheme(): Promise<BrandThemeConfig> {
+    const res = await jsonOrThrow(await apiFetch(`${API_BASE}/brand`), 'Could not load brand theme');
+    return (res?.brand || res) as BrandThemeConfig;
+  },
+
+  async updateBrandTheme(patch: Partial<BrandThemeConfig>): Promise<BrandThemeConfig> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/brand`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      }),
+      'Could not update brand theme'
+    );
+    return (res?.brand || res) as BrandThemeConfig;
+  },
+
+  async resetBrandTheme(): Promise<BrandThemeConfig> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/brand/reset`, { method: 'POST' }),
+      'Could not reset brand theme'
+    );
+    return (res?.brand || res) as BrandThemeConfig;
+  },
+
+  async listOutboundWebhooks(): Promise<{ subscriptions: OutboundWebhookSubscription[] }> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/webhooks/outbound`),
+      'Could not load outbound webhook subscriptions'
+    );
+    const list = Array.isArray(res?.subscriptions) ? res.subscriptions : Array.isArray(res) ? res : [];
+    return { subscriptions: list };
+  },
+
+  async upsertOutboundWebhook(payload: {
+    id?: string;
+    url: string;
+    events?: string[];
+    description?: string;
+    enabled?: boolean;
+  }): Promise<{ subscription?: OutboundWebhookSubscription; secret?: string; secretPreview?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/webhooks/outbound`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not save outbound webhook subscription'
+    );
+  },
+
+  async rotateOutboundWebhookSecret(
+    subscriptionId: string,
+    opts: { graceSec?: number } = {}
+  ): Promise<WebhookSecretRotateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/webhooks/outbound/${encodeURIComponent(subscriptionId)}/rotate-secret`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      }),
+      'Could not rotate webhook dual-secret'
+    );
+  },
+
+  async listWebhookDlq(limit = 50): Promise<{ entries: WebhookDlqEntry[] }> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/webhooks/dlq?limit=${encodeURIComponent(String(limit))}`),
+      'Could not load webhook DLQ'
+    );
+    const entries = Array.isArray(res?.entries)
+      ? res.entries
+      : Array.isArray(res?.dlq)
+        ? res.dlq
+        : Array.isArray(res?.items)
+          ? res.items
+          : [];
+    return { entries };
+  },
+
+  async replayWebhookDlqEntry(dlqId: string): Promise<WebhookDlqReplayResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/webhooks/dlq/${encodeURIComponent(dlqId)}/replay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      }),
+      'Could not replay webhook DLQ entry'
+    );
+  },
+
+  async runDbStudioSql(
+    databaseId: string,
+    payload: { query: string; engine?: string; maxRows?: number }
+  ): Promise<DbStudioSqlResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${encodeURIComponent(databaseId)}/studio/sql`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Read-Only SQL gate rejected query'
+    );
+  },
+
+  async runDbStudioRedis(
+    databaseId: string,
+    payload: { argv: string[] | string }
+  ): Promise<DbStudioRedisResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${encodeURIComponent(databaseId)}/studio/redis`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Safe Redis inspector rejected command'
+    );
+  },
+
+  async runDbStudioBloat(
+    databaseId: string,
+    payload: { tableStats?: Array<Record<string, unknown>> } = {}
+  ): Promise<DbStudioBloatResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/${encodeURIComponent(databaseId)}/studio/bloat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not analyze Postgres table bloat'
+    );
+  },
+
+  async getStoragePresets(): Promise<{ presets: S3StoragePreset[] }> {
+    const res = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/storage/presets`),
+      'Could not load Post-MinIO S3 presets'
+    );
+    const presets = Array.isArray(res?.presets) ? res.presets : Array.isArray(res) ? res : [];
+    return { presets };
+  },
+
+  async generateS3PresignedUrl(payload: {
+    endpoint: string;
+    region?: string;
+    bucket: string;
+    key: string;
+    method?: 'GET' | 'PUT' | 'HEAD' | 'DELETE';
+    accessKeyId: string;
+    secretAccessKey: string;
+    expiresIn?: number;
+  }): Promise<S3PresignResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/storage/presign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not generate SigV4 presigned URL'
+    );
+  },
+
+  async getBillingLedger(periodDays = 30): Promise<BillingLedgerResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/billing/ledger?periodDays=${encodeURIComponent(String(periodDays))}`),
+      'Could not load Agency billing usage ledger'
+    );
+  },
+
+  async getBillingLedgerCsv(periodDays = 30): Promise<string> {
+    const res = await apiFetch(
+      `${API_BASE}/billing/ledger?format=csv&periodDays=${encodeURIComponent(String(periodDays))}`
+    );
+    if (!res.ok) {
+      let msg = 'Could not generate formula-safe CSV ledger';
+      try {
+        const d = await res.json();
+        if (d?.error) msg = String(d.error);
+      } catch {
+        // ignore non-json
+      }
+      throw new Error(msg);
+    }
+    return res.text();
+  },
+
+  async listTenantQuotas(): Promise<{ quotas: Record<string, TenantQuotaSpec> | TenantQuotaSpec[]; items?: TenantQuotaSpec[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/quotas`),
+      'Could not load tenant quotas'
+    );
+  },
 };
 
 // =====================================================================
@@ -5542,4 +5737,187 @@ export interface GeoFailoverPlanResult {
   summary?: string;
   steps?: string[];
   dnsPatch?: Record<string, unknown>;
+}
+
+// --- Cycle-9 Pioneer Types (White-Label Brand, Standard-Webhooks DLQ, DB Studio, Post-MinIO S3, Agency Quotas & Billing Ledger) ---
+
+export interface BrandThemeConfig {
+  brandName: string;
+  tagline: string;
+  accentHex: string;
+  logoUrl: string;
+  supportUrl: string;
+  hidePoweredBy: boolean;
+  updatedAt?: string | null;
+}
+
+export interface OutboundWebhookSubscription {
+  id: string;
+  url: string;
+  events: string[];
+  description?: string;
+  enabled: boolean;
+  secretPreview?: string;
+  maskedSecret?: string;
+  hasSecondarySecret?: boolean;
+  secondaryExpiresAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface WebhookSecretRotateResult {
+  ok?: boolean;
+  subscription?: OutboundWebhookSubscription;
+  secret?: string;
+  primarySecret?: string;
+  secretPreview?: string;
+  graceSec?: number;
+  secondaryExpiresAt?: string | null;
+}
+
+export interface WebhookDlqEntry {
+  id: string;
+  subscriptionId?: string;
+  url: string;
+  eventType: string;
+  status?: 'failed' | 'replayed' | 'pending' | string;
+  attempts?: number;
+  lastError?: string;
+  error?: string;
+  httpStatus?: number | null;
+  lastStatusCode?: number | null;
+  createdAt?: string;
+  replayedAt?: string | null;
+}
+
+export interface WebhookDlqReplayResult {
+  ok?: boolean;
+  replayed?: boolean;
+  delivered?: boolean;
+  entry?: WebhookDlqEntry;
+  error?: string;
+}
+
+export interface DbStudioSqlResult {
+  ok?: boolean;
+  dryRunPreview?: boolean;
+  readOnlyEnforced?: boolean;
+  engine?: string;
+  wrappedSql?: string;
+  sanitizedQuery?: string;
+  statementTimeoutMs?: number;
+  rowCap?: number;
+  rows?: Array<Record<string, unknown>>;
+  columns?: string[];
+  rowCount?: number;
+  durationMs?: number;
+  error?: string;
+}
+
+export interface DbStudioRedisResult {
+  ok?: boolean;
+  dryRunPreview?: boolean;
+  readOnlyEnforced?: boolean;
+  command?: string;
+  normalizedArgv?: string[];
+  clampedCount?: number | null;
+  countClamped?: boolean;
+  maxScanCount?: number;
+  result?: unknown;
+  output?: string;
+  error?: string;
+}
+
+export interface DbStudioBloatTable {
+  table?: string;
+  tableName?: string;
+  liveTuples?: number;
+  deadTuples?: number;
+  deadTupleRatio?: number;
+  deadPct?: number;
+  sizeBytes?: number;
+  recommendation?: string;
+}
+
+export interface DbStudioBloatResult {
+  ok?: boolean;
+  checkedTables: number;
+  bloatedTables?: DbStudioBloatTable[];
+  unusedIndexes?: Array<{ indexName?: string; tableName?: string; sizeBytes?: number; idxScan?: number }>;
+  recommendations?: Array<string | { message?: string; table?: string; action?: string }>;
+}
+
+export interface S3StoragePreset {
+  id: string;
+  name?: string;
+  label?: string;
+  image: string;
+  licence?: string;
+  license?: string;
+  bindAddress?: string;
+  defaultPort?: number;
+  s3Port?: number;
+  memoryMb?: number;
+  ramEstimateMb?: number;
+  summary?: string;
+  description?: string;
+  highlights?: string[];
+  region?: string;
+}
+
+export interface S3PresignResult {
+  ok?: boolean;
+  url: string;
+  method: string;
+  bucket: string;
+  key: string;
+  expiresIn: number;
+  expiresAt?: string;
+  algorithm?: string;
+  signature?: string;
+}
+
+export interface TenantQuotaSpec {
+  projectId?: string;
+  containers?: number;
+  memoryMb?: number;
+  cpuCores?: number;
+  storageGb?: number;
+  bandwidthGbMo?: number;
+  updatedAt?: string;
+}
+
+export interface BillingLedgerProjectRow {
+  projectId: string;
+  projectName?: string;
+  name?: string;
+  cpuHours: number;
+  ramGbHours: number;
+  storageGb: number;
+  bandwidthGb: number;
+  estimatedCostUsd: number;
+  containersCount?: number;
+  memoryMb?: number;
+  quota?: TenantQuotaSpec;
+  quotaUtilizationPct?: number;
+}
+
+export interface BillingLedgerResult {
+  ok?: boolean;
+  periodDays?: number;
+  generatedAt?: string;
+  currency?: string;
+  entries?: BillingLedgerProjectRow[];
+  projects?: BillingLedgerProjectRow[];
+  items?: BillingLedgerProjectRow[];
+  rows?: BillingLedgerProjectRow[];
+  totals?: {
+    totalProjects?: number;
+    totalDatabases?: number;
+    cpuHours?: number;
+    ramGbHours?: number;
+    storageGb?: number;
+    bandwidthGb?: number;
+    estimatedCostUsd?: number;
+  };
 }

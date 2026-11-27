@@ -1170,6 +1170,168 @@ function reqJson(port, method, pth, { token, body } = {}) {
     const badCaa = await reqJson(port, 'GET', '/api/domains/bad_host_no_dot/caa-preflight', { token: master });
     assert.strictEqual(badCaa.status, 400);
 
+    // Cycle-9 Lazy Routes: White-Label Brand, Standard-Webhooks + DLQ, Read-Only DB Studio & Redis, Post-MinIO S3 + SigV4, Agency Quotas & Billing Ledger + Live Cross-Tenant 403 (Dokploy CVE-2026-116068 / CVE-2026-127212)
+    const brandGet = await reqJson(port, 'GET', '/api/brand', { token: master });
+    assert.strictEqual(brandGet.status, 200, 'GET /api/brand failed: ' + brandGet.text);
+    assert.strictEqual(brandGet.json.brandName, 'Culkibo');
+
+    const brandXss = await reqJson(port, 'PUT', '/api/brand', {
+      token: master,
+      body: { logoUrl: 'javascript:alert(1)' }
+    });
+    assert.strictEqual(brandXss.status, 400, 'PUT /api/brand must reject javascript: XSS');
+
+    const brandPut = await reqJson(port, 'PUT', '/api/brand', {
+      token: master,
+      body: { brandName: 'Agency Cloud', accentHex: '#10b981', hidePoweredBy: true }
+    });
+    assert.strictEqual(brandPut.status, 200, 'PUT /api/brand failed: ' + brandPut.text);
+    assert.strictEqual(brandPut.json.brandName, 'Agency Cloud');
+    const brandReset = await reqJson(port, 'POST', '/api/brand/reset', { token: master, body: {} });
+    assert.strictEqual(brandReset.status, 200);
+    assert.strictEqual(brandReset.json.brandName, 'Culkibo');
+
+    const whCreate = await reqJson(port, 'POST', '/api/webhooks/outbound', {
+      token: master,
+      body: { url: 'https://hooks.example.test/culkibo', events: ['deploy.succeeded'], description: 'CI Hook' }
+    });
+    assert.strictEqual(whCreate.status, 201, 'POST /api/webhooks/outbound failed: ' + whCreate.text);
+    const subId = whCreate.json.id || (whCreate.json.subscription && whCreate.json.subscription.id);
+    assert.ok(subId, 'Webhook subscription id expected');
+    const whList = await reqJson(port, 'GET', '/api/webhooks/outbound', { token: master });
+    assert.strictEqual(whList.status, 200);
+    assert.ok(Array.isArray(whList.json.subscriptions) && whList.json.subscriptions.length >= 1);
+    const whRot = await reqJson(port, 'POST', '/api/webhooks/outbound/' + encodeURIComponent(subId) + '/rotate-secret', {
+      token: master,
+      body: { graceSec: 3600 }
+    });
+    assert.strictEqual(whRot.status, 200, 'POST rotate-secret failed: ' + whRot.text);
+    const dlqList = await reqJson(port, 'GET', '/api/webhooks/dlq', { token: master });
+    assert.strictEqual(dlqList.status, 200);
+    assert.ok(Array.isArray(dlqList.json.entries));
+
+    const sqlOk = await reqJson(port, 'POST', '/api/databases/db_sqlite_c2/studio/sql', {
+      token: master,
+      body: { engine: 'postgres', query: 'SELECT id, email FROM users' }
+    });
+    assert.strictEqual(sqlOk.status, 200, 'POST studio/sql failed: ' + sqlOk.text);
+    assert.strictEqual(sqlOk.json.readOnlyEnforced, true);
+    const sqlEvil = await reqJson(port, 'POST', '/api/databases/db_sqlite_c2/studio/sql', {
+      token: master,
+      body: { engine: 'postgres', query: 'SELECT 1; DROP TABLE users' }
+    });
+    assert.strictEqual(sqlEvil.status, 400, 'POST studio/sql must reject mutating SQL with 400');
+
+    const redisOk = await reqJson(port, 'POST', '/api/databases/db_sqlite_c2/studio/redis', {
+      token: master,
+      body: { argv: ['SCAN', '0', 'COUNT', '500'] }
+    });
+    assert.strictEqual(redisOk.status, 200, 'POST studio/redis failed: ' + redisOk.text);
+    assert.strictEqual(redisOk.json.readOnlyEnforced, true);
+    const redisEvil = await reqJson(port, 'POST', '/api/databases/db_sqlite_c2/studio/redis', {
+      token: master,
+      body: { argv: ['FLUSHALL'] }
+    });
+    assert.strictEqual(redisEvil.status, 400, 'POST studio/redis must reject FLUSHALL with 400');
+
+    const bloatRes = await reqJson(port, 'POST', '/api/databases/db_sqlite_c2/studio/bloat', {
+      token: master,
+      body: { tableStats: [{ table: 'orders', liveTuples: 1000, deadTuples: 400 }] }
+    });
+    assert.strictEqual(bloatRes.status, 200, 'POST studio/bloat failed: ' + bloatRes.text);
+    assert.strictEqual(bloatRes.json.checkedTables, 1);
+
+    const s3Presets = await reqJson(port, 'GET', '/api/storage/presets', { token: master });
+    assert.strictEqual(s3Presets.status, 200, 'GET /api/storage/presets failed: ' + s3Presets.text);
+    assert.ok(Array.isArray(s3Presets.json.presets) && s3Presets.json.presets.length >= 3);
+
+    const s3Presign = await reqJson(port, 'POST', '/api/storage/presign', {
+      token: master,
+      body: { endpoint: 'https://s3.example.test', bucket: 'backups-prod', key: 'db/snap.sql.gz', method: 'GET', accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', expiresIn: 900 }
+    });
+    assert.strictEqual(s3Presign.status, 200, 'POST /api/storage/presign failed: ' + s3Presign.text);
+    assert.ok(String(s3Presign.json.url || '').includes('X-Amz-Signature='));
+
+    const s3BadKey = await reqJson(port, 'POST', '/api/storage/presign', {
+      token: master,
+      body: { endpoint: 'https://s3.example.test', bucket: 'backups-prod', key: '../etc/passwd', accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', expiresIn: 900 }
+    });
+    assert.strictEqual(s3BadKey.status, 400, 'POST /api/storage/presign must reject ../ keys');
+
+    const s3BadTtl = await reqJson(port, 'POST', '/api/storage/presign', {
+      token: master,
+      body: { endpoint: 'https://s3.example.test', bucket: 'backups-prod', key: 'ok.txt', accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', expiresIn: 999999 }
+    });
+    assert.strictEqual(s3BadTtl.status, 400, 'POST /api/storage/presign must reject expiresIn > 604800');
+
+    const s3Cors = await reqJson(port, 'POST', '/api/storage/cors-xml', {
+      token: master,
+      body: { rules: [{ allowedOrigins: ['https://app.example.test'], allowedMethods: ['GET', 'PUT'] }] }
+    });
+    assert.strictEqual(s3Cors.status, 200, 'POST /api/storage/cors-xml failed: ' + s3Cors.text);
+    assert.ok(String(s3Cors.json.xml || '').includes('<CORSConfiguration'));
+
+    const s3Life = await reqJson(port, 'POST', '/api/storage/lifecycle-xml', {
+      token: master,
+      body: { rules: [{ id: 'expire-30d', prefix: 'tmp/', expirationDays: 30, abortMultipartDays: 7 }] }
+    });
+    assert.strictEqual(s3Life.status, 200, 'POST /api/storage/lifecycle-xml failed: ' + s3Life.text);
+    assert.ok(String(s3Life.json.xml || '').includes('<LifecycleConfiguration'));
+
+    const qPut = await reqJson(port, 'PUT', '/api/quotas/proj_c2_api', {
+      token: master,
+      body: { maxContainers: 4, maxMemoryMb: 2048, maxCpuCores: 2, maxStorageGb: 20, maxBandwidthGbMo: 250 }
+    });
+    assert.strictEqual(qPut.status, 200, 'PUT /api/quotas/:projectId failed: ' + qPut.text);
+    const qList = await reqJson(port, 'GET', '/api/quotas', { token: master });
+    assert.strictEqual(qList.status, 200);
+    assert.ok(Array.isArray(qList.json.quotas));
+    const qCheck = await reqJson(port, 'POST', '/api/quotas/proj_c2_api/check', {
+      token: master,
+      body: { containers: 10, memoryMb: 8192 }
+    });
+    assert.strictEqual(qCheck.status, 200);
+    assert.strictEqual(qCheck.json.allowed, false);
+
+    // CSV formula neutralization via live HTTP /api/billing/ledger?format=csv
+    projectManager.create({ id: 'proj_csv_evil', name: "=CMD|' /C calc'!A0" });
+    const ledJson = await reqJson(port, 'GET', '/api/billing/ledger', { token: master });
+    assert.strictEqual(ledJson.status, 200, 'GET /api/billing/ledger failed: ' + ledJson.text);
+    assert.ok(ledJson.json.totals);
+    const ledCsv = await reqJson(port, 'GET', '/api/billing/ledger?format=csv', { token: master });
+    assert.strictEqual(ledCsv.status, 200, 'GET /api/billing/ledger?format=csv failed: ' + ledCsv.text);
+    assert.ok(String(ledCsv.headers['content-type'] || '').includes('text/csv'));
+    assert.ok(ledCsv.text.includes("'=CMD|"), 'CSV ledger must neutralize leading = formula injection');
+
+    // Live Cross-Tenant 403 Enforcement (Dokploy CVE-2026-116068 & CVE-2026-127212)
+    const teamManager = require(path.join(ROOT_DIR, 'server/services/teamManager'));
+    const bootOwner = teamManager.bootstrapOwner({ email: 'c9-owner@example.test', password: 'OwnerPassword!2026' });
+    const ownerPrincipal = teamManager.verifySessionToken(bootOwner.sessionToken).principal;
+    const teamB = teamManager.createTeam(ownerPrincipal, { name: 'Tenant B Org' });
+    const invB = teamManager.createInvite(ownerPrincipal, { email: 'tenantb-dev@example.test', role: 'developer', teamId: teamB.id });
+    const accB = teamManager.acceptInvite({ token: invB.inviteToken, email: 'tenantb-dev@example.test', password: 'TenantBPassword!2026', name: 'TenantB Dev' });
+    const tenantBToken = accB.sessionToken;
+
+    const foreignQuotaPut = await reqJson(port, 'PUT', '/api/quotas/proj_c2_api', {
+      token: tenantBToken,
+      body: { maxMemoryMb: 99999 }
+    });
+    assert.strictEqual(foreignQuotaPut.status, 403, 'Foreign tenant PUT /api/quotas/:projectId MUST return 403 (CVE-2026-116068)');
+    const foreignQuotaCheck = await reqJson(port, 'POST', '/api/quotas/proj_c2_api/check', {
+      token: tenantBToken,
+      body: { memoryMb: 512 }
+    });
+    assert.strictEqual(foreignQuotaCheck.status, 403, 'Foreign tenant POST /api/quotas/:projectId/check MUST return 403');
+    const foreignLedger = await reqJson(port, 'GET', '/api/billing/ledger?projectId=proj_c2_api', {
+      token: tenantBToken
+    });
+    assert.strictEqual(foreignLedger.status, 403, 'Foreign tenant GET /api/billing/ledger?projectId=foreign MUST return 403 (CVE-2026-127212)');
+    const foreignStudio = await reqJson(port, 'POST', '/api/databases/db_sqlite_c2/studio/sql', {
+      token: tenantBToken,
+      body: { query: 'SELECT 1' }
+    });
+    assert.strictEqual(foreignStudio.status, 403, 'Foreign tenant POST /api/databases/:id/studio/sql MUST return 403');
+
     console.log('CYCLE2_HTTP_OK');
   } finally {
     await new Promise((r) => srv.close(r));
@@ -1985,6 +2147,154 @@ function reqJson(port, method, pth, { token, body } = {}) {
     }
   }
   console.log('  ✓ Cycle #8 CVEs (10a-10e): Dokploy CVE-2026-129315/133520, Runtipi CVE-2026-47277 & TOTP throttle, Dokku CVE-2026-54636 & Kamal #1790, Uptime Kuma #7704/#8193/#6519, WebAuthn/OSV/Lease');
+
+  // -------------------------------------------------------------------------
+  // 11. Cycle #9 CVE & PR Regressions (docs/COMPETITOR_RADAR_CYCLE8.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const {
+      WebhookEventBus,
+      signStandardWebhook,
+      verifyStandardWebhookSignature,
+      generateWebhookSecret
+    } = require('../server/services/webhookEventBus');
+    const {
+      generatePresignedUrl,
+      buildBucketCorsXml
+    } = require('../server/services/objectStorageService');
+    const {
+      validateReadOnlySql,
+      validateSafeRedisCommand
+    } = require('../server/services/dbStudioService');
+    const {
+      QuotaMeteringService,
+      escapeCsvCell,
+      exportLedgerCsv
+    } = require('../server/services/quotaMeteringService');
+    const {
+      BrandThemeService,
+      validateBrandPatch,
+      sanitizeBrandLogo
+    } = require('../server/services/brandThemeService');
+
+    const c9Tmp = makeTempDir('culkibo-c9-cve-');
+    try {
+      // 11a. Dokploy CVE-2026-116068 & CVE-2026-127212: Tenant ACL filtering + CSV formula neutralization
+      const qm = new QuotaMeteringService({ dataDir: c9Tmp });
+      qm.setQuota('proj_tenant_a', { memoryMb: 1024 });
+      qm.setQuota('proj_tenant_b', { memoryMb: 4096 });
+      const filteredQuotasRes = qm.listQuotas({ allowedProjectIds: ['proj_tenant_a'] });
+      const filteredQuotas = Array.isArray(filteredQuotasRes) ? filteredQuotasRes : filteredQuotasRes.quotas;
+      assert.strictEqual(filteredQuotas.length, 1);
+      assert.ok(filteredQuotas.every((q) => q.projectId === 'proj_tenant_a'), 'listQuotas must exclude foreign tenants');
+      const ledger = qm.buildUsageLedger({
+        projects: [
+          { id: 'proj_tenant_a', name: "=CMD|' /C calc'!A0", memoryMb: 512, cpus: 1 },
+          { id: 'proj_tenant_b', name: 'ForeignSecretApp', memoryMb: 2048, cpus: 2 }
+        ],
+        allowedProjectIds: ['proj_tenant_a']
+      });
+      const ledgerRows = ledger.entries || ledger.projects || [];
+      assert.strictEqual(ledgerRows.length, 1);
+      assert.strictEqual(ledgerRows[0].projectId, 'proj_tenant_a');
+      const csvOut = exportLedgerCsv(ledger);
+      assert.ok(!csvOut.includes('ForeignSecretApp'), 'Usage ledger must never leak foreign tenant apps');
+      assert.ok(escapeCsvCell("=CMD|' /C calc'!A0").startsWith("'") || escapeCsvCell("=CMD|' /C calc'!A0").startsWith("\"'"), 'CSV cell must neutralize leading = formula');
+      assert.ok(escapeCsvCell('+1+1').startsWith("'"));
+      assert.ok(escapeCsvCell('@SUM(A1)').startsWith("'"));
+
+      // 11b. Portainer CVE-2026-134756: Webhook SSRF block (send + DLQ replay) + dual-secret rotation + >300s replay rejection
+      const sec1 = generateWebhookSecret();
+      const sec2 = generateWebhookSecret();
+      const bodyStr = JSON.stringify({ event: 'deploy.succeeded' });
+      const nowSec = Math.floor(Date.now() / 1000);
+      const dualHeaders = signStandardWebhook({ msgId: 'msg_c9_1', timestampSec: nowSec, payload: bodyStr, secret: sec1, secondarySecret: sec2 });
+      assert.strictEqual(verifyStandardWebhookSignature(bodyStr, dualHeaders, [sec1], { nowSec }).valid, true);
+      assert.strictEqual(verifyStandardWebhookSignature(bodyStr, dualHeaders, [sec2], { nowSec }).valid, true);
+      const staleRes = verifyStandardWebhookSignature(bodyStr, dualHeaders, [sec1], { nowSec: nowSec + 400, toleranceSec: 300 });
+      assert.strictEqual(staleRes.valid, false, 'Timestamps > 300s must be rejected');
+
+      const whBus = new WebhookEventBus({ dataDir: c9Tmp });
+      const ssrfSubRes = whBus.upsertSubscription({ url: 'https://rebind.example.test/hook', events: ['*'] });
+      const ssrfSubId = ssrfSubRes.id || (ssrfSubRes.subscription && ssrfSubRes.subscription.id);
+      const ssrfDispatch = await whBus.dispatchEvent({
+        eventType: 'deploy.failed',
+        data: { id: 'd1' },
+        subscriptionId: ssrfSubId,
+        maxAttempts: 1,
+        dnsLookupImpl: async () => [{ address: '169.254.169.254', family: 4 }],
+        fetchImpl: async () => { throw new Error('fetch must NEVER be called for metadata IP'); }
+      });
+      assert.ok(ssrfDispatch.failedCount >= 1 || ssrfDispatch.blockedCount >= 1, 'Private/metadata DNS target must be blocked on dispatch');
+      const dlqEntries = whBus.listDlq({ limit: 10 });
+      assert.ok(dlqEntries.length >= 1, 'Blocked/failed delivery must be recorded in DLQ');
+      const replayBlocked = await whBus.replayDlqEntry(dlqEntries[0].id, {
+        dnsLookupImpl: async () => [{ address: '127.0.0.1', family: 4 }],
+        fetchImpl: async () => { throw new Error('fetch must NEVER be called for 127.0.0.1 on DLQ replay'); }
+      });
+      assert.strictEqual(replayBlocked.ok, false, 'DLQ replay must also block SSRF loopback/metadata IPs');
+
+      // 11c. Dokploy CVE-2026-24841: Read-Only SQL & Safe Redis Write-Guard
+      for (const badSql of [
+        'SELECT 1; DROP TABLE users',
+        "COPY users TO PROGRAM 'id'",
+        '\\! id',
+        'WITH x AS (DELETE FROM users RETURNING *) SELECT * FROM x'
+      ]) {
+        assert.throws(() => validateReadOnlySql(badSql), /solo lectura|prohibid|bloquead|mutat|stacked|multiple|invalid|not allowed|read-only|metacomm|backslash/i, `SQL guard must block: ${badSql}`);
+      }
+      const safeSql = validateReadOnlySql('SELECT id FROM users');
+      assert.ok(safeSql.wrappedSql.includes('BEGIN TRANSACTION READ ONLY'));
+      for (const badRedis of [['FLUSHALL'], ['EVAL', 'return 1', '0'], ['KEYS', '*'], ['CONFIG', 'GET', '*']]) {
+        assert.throws(() => validateSafeRedisCommand(badRedis), /permitid|prohibid|bloquead|denied|not allowed|unsafe|read-only/i, `Redis guard must block: ${badRedis[0]}`);
+      }
+      const safeRedis = validateSafeRedisCommand(['SCAN', '0', 'COUNT', '500']);
+      const safeRedisArgv = safeRedis.normalizedArgv || safeRedis.argv;
+      assert.ok(Number(safeRedisArgv[safeRedisArgv.indexOf('COUNT') + 1]) <= 100, 'SCAN COUNT must clamp <= 100');
+
+      // 11d. SigV4 Presigned URL & Bucket CORS Hardening
+      const signed = generatePresignedUrl({
+        endpoint: 'https://s3.example.test',
+        region: 'us-east-1',
+        bucket: 'culkibo-backups',
+        key: 'pg/2026.sql.gz',
+        method: 'GET',
+        accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+        secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        expiresIn: 900
+      });
+      assert.strictEqual(signed.ok, true);
+      assert.ok(signed.url.includes('X-Amz-Signature=') && signed.algorithm === 'AWS4-HMAC-SHA256');
+      assert.throws(() => generatePresignedUrl({
+        endpoint: 'https://s3.example.test',
+        bucket: 'culkibo-backups',
+        key: '../secret.txt',
+        accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+        secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        expiresIn: 900
+      }));
+      assert.throws(() => generatePresignedUrl({
+        endpoint: 'https://s3.example.test',
+        bucket: 'culkibo-backups',
+        key: 'ok.txt',
+        accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+        secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        expiresIn: 604801
+      }));
+      assert.throws(() => buildBucketCorsXml([{ allowedOrigins: ['*'], allowedMethods: ['GET'], allowCredentials: true }]));
+
+      // 11e. White-Label XSS / CSS Injection Guard (coolify#1744)
+      const bt = new BrandThemeService({ dataDir: c9Tmp });
+      assert.throws(() => sanitizeBrandLogo('javascript:alert(1)'));
+      assert.throws(() => sanitizeBrandLogo('data:image/svg+xml,<svg onload="alert(1)"><script>x</script></svg>'));
+      assert.throws(() => validateBrandPatch({ accentHex: '#fff; background:url(https://evil.test)' }));
+      const cleanBrand = bt.updateBrand({ brandName: 'Sovereign Host', accentHex: '#0ea5e9' });
+      assert.strictEqual(cleanBrand.brandName, 'Sovereign Host');
+    } finally {
+      fs.rmSync(c9Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #9 CVEs (11a-11e): Dokploy CVE-2026-116068/127212 tenant ACL+CSV, Portainer CVE-2026-134756 webhook SSRF+dual-secret, Dokploy CVE-2026-24841 SQL/Redis guard, SigV4+CORS, coolify#1744 White-Label XSS');
 
   console.log('✅ Suite #23 completada correctamente.\n');
 }

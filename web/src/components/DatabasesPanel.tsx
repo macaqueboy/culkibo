@@ -26,6 +26,13 @@ import {
   Stethoscope,
   Wrench,
   RotateCcw,
+  Terminal,
+  ShieldCheck,
+  HardDrive,
+  KeyRound,
+  ChevronDown,
+  ChevronUp,
+  Loader2,
 } from 'lucide-react';
 import {
   api,
@@ -35,10 +42,16 @@ import {
   type DbCredentials,
   type DbStorageConfig,
   type DbInspectResult,
+  type DbStudioSqlResult,
+  type DbStudioRedisResult,
+  type DbStudioBloatResult,
+  type S3StoragePreset,
+  type S3PresignResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
+import { useI18n } from '../lib/i18n';
 
 interface Props {
   projectId: string;
@@ -89,6 +102,7 @@ export const DatabasesPanel: React.FC<Props> = ({
   onOpenBackupSettings,
   onNotify,
 }) => {
+  const { t } = useI18n();
   const [databases, setDatabases] = useState<ManagedDatabase[]>([]);
   const [linkedIds, setLinkedIds] = useState<string[]>(linkedDatabaseIds);
   const [recentlyLinkedId, setRecentlyLinkedId] = useState<string | null>(null);
@@ -112,6 +126,38 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [confirmDelete, setConfirmDelete] = useState<{ db: ManagedDatabase; destroyData: boolean } | null>(null);
 
   const [storage, setStorage] = useState<DbStorageConfig>({ configured: false });
+
+  // Cycle-9 Read-Only Live DB Studio & Safe Redis Inspector
+  const [studioOpen, setStudioOpen] = useState(true);
+  const [studioTab, setStudioTab] = useState<'sql' | 'redis' | 'bloat'>('sql');
+  const [studioDbId, setStudioDbId] = useState<string>('');
+  const [sqlInput, setSqlInput] = useState('SELECT id, project, status, duration_ms, created_at FROM deployments ORDER BY created_at DESC LIMIT 20');
+  const [sqlResult, setSqlResult] = useState<DbStudioSqlResult | null>(null);
+  const [sqlError, setSqlError] = useState<string | null>(null);
+  const [redisInput, setRedisInput] = useState('SCAN 0 COUNT 50');
+  const [redisResult, setRedisResult] = useState<DbStudioRedisResult | null>(null);
+  const [redisError, setRedisError] = useState<string | null>(null);
+  const [bloatResult, setBloatResult] = useState<DbStudioBloatResult | null>(null);
+  const [bloatError, setBloatError] = useState<string | null>(null);
+  const [studioBusy, setStudioBusy] = useState<'sql' | 'redis' | 'bloat' | null>(null);
+
+  // Cycle-9 Post-MinIO S3 Storage (Garage / RustFS / SeaweedFS) & Pure-Crypto SigV4 Presigner
+  const [s3Presets, setS3Presets] = useState<S3StoragePreset[]>([]);
+  const [activePresetId, setActivePresetId] = useState<string>('garage');
+  const [presignForm, setPresignForm] = useState({
+    endpoint: 'http://127.0.0.1:3900',
+    region: 'garage',
+    bucket: 'culkibo-backups',
+    key: 'snapshots/acme-prod-2026.sql.gz',
+    method: 'GET' as 'GET' | 'PUT' | 'HEAD' | 'DELETE',
+    expiresIn: '900',
+    accessKeyId: 'GK_demo_access_key',
+    secretAccessKey: 'demo_secret_access_key_replace_me',
+  });
+  const [presignResult, setPresignResult] = useState<S3PresignResult | null>(null);
+  const [presignError, setPresignError] = useState<string | null>(null);
+  const [presignBusy, setPresignBusy] = useState(false);
+
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
     databasesRef.current = databases;
@@ -119,17 +165,23 @@ export const DatabasesPanel: React.FC<Props> = ({
 
   const load = useCallback(async () => {
     try {
-      const [dbs, eng, status, store] = await Promise.all([
+      const [dbs, eng, status, store, presetsRes] = await Promise.all([
         api.getDatabases(projectId),
-        api.getDbEngines(),
-        api.getDbDockerStatus(),
-        api.getDbStorage(),
+        api.getDbEngines().catch(() => ({ engines: [] })),
+        api.getDbDockerStatus().catch(() => ({ available: true, reason: null })),
+        api.getDbStorage().catch((): DbStorageConfig => ({ configured: false })),
+        api.getStoragePresets().catch(() => ({ presets: [] })),
       ]);
-      setDatabases(dbs.databases);
-      setEngines(eng.engines);
-      setDockerOk(status.available);
-      setDockerReason(status.reason);
-      setStorage(store);
+      const dbList = Array.isArray(dbs?.databases) ? dbs.databases : [];
+      setDatabases(dbList);
+      setEngines(Array.isArray(eng?.engines) ? eng.engines : []);
+      setDockerOk(Boolean(status?.available));
+      setDockerReason(status?.reason ?? null);
+      setStorage(store || { configured: false });
+      setS3Presets(Array.isArray(presetsRes?.presets) ? presetsRes.presets : []);
+      if (dbList.length > 0) {
+        setStudioDbId((prev) => prev || dbList[0].id);
+      }
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'Error al cargar las bases de datos', 'error');
     }
@@ -139,17 +191,23 @@ export const DatabasesPanel: React.FC<Props> = ({
     let active = true;
     Promise.all([
       api.getDatabases(projectId),
-      api.getDbEngines(),
-      api.getDbDockerStatus(),
-      api.getDbStorage(),
+      api.getDbEngines().catch(() => ({ engines: [] })),
+      api.getDbDockerStatus().catch(() => ({ available: true, reason: null })),
+      api.getDbStorage().catch((): DbStorageConfig => ({ configured: false })),
+      api.getStoragePresets().catch(() => ({ presets: [] })),
     ])
-      .then(([dbs, eng, status, store]) => {
+      .then(([dbs, eng, status, store, presetsRes]) => {
         if (!active) return;
-        setDatabases(dbs.databases);
-        setEngines(eng.engines);
-        setDockerOk(status.available);
-        setDockerReason(status.reason);
-        setStorage(store);
+        const dbList = Array.isArray(dbs?.databases) ? dbs.databases : [];
+        setDatabases(dbList);
+        setEngines(Array.isArray(eng?.engines) ? eng.engines : []);
+        setDockerOk(Boolean(status?.available));
+        setDockerReason(status?.reason ?? null);
+        setStorage(store || { configured: false });
+        setS3Presets(Array.isArray(presetsRes?.presets) ? presetsRes.presets : []);
+        if (dbList.length > 0) {
+          setStudioDbId((prev) => prev || dbList[0].id);
+        }
       })
       .catch((err) => {
         if (!active) return;
@@ -157,6 +215,93 @@ export const DatabasesPanel: React.FC<Props> = ({
       });
     return () => { active = false; };
   }, [projectId, onNotify]);
+
+  const handleRunStudioSql = async (queryOverride?: string) => {
+    const q = (queryOverride ?? sqlInput).trim();
+    if (!q) return;
+    if (queryOverride !== undefined) setSqlInput(queryOverride);
+    const targetDb = studioDbId || databases[0]?.id || 'db_pg_main';
+    setStudioBusy('sql');
+    setSqlError(null);
+    try {
+      const res = await api.runDbStudioSql(targetDb, { query: q, engine: 'postgres', maxRows: 200 });
+      setSqlResult(res);
+    } catch (err: unknown) {
+      setSqlResult(null);
+      setSqlError(err instanceof Error ? err.message : 'Read-Only SQL gate rejected query');
+    } finally {
+      setStudioBusy(null);
+    }
+  };
+
+  const handleRunStudioRedis = async (cmdOverride?: string) => {
+    const raw = (cmdOverride ?? redisInput).trim();
+    if (!raw) return;
+    if (cmdOverride !== undefined) setRedisInput(cmdOverride);
+    const targetDb = studioDbId || databases.find((d) => d.engine === 'valkey' || d.engine === 'redis')?.id || databases[0]?.id || 'db_valkey_cache';
+    setStudioBusy('redis');
+    setRedisError(null);
+    try {
+      const res = await api.runDbStudioRedis(targetDb, { argv: raw.split(/\s+/).filter(Boolean) });
+      setRedisResult(res);
+    } catch (err: unknown) {
+      setRedisResult(null);
+      setRedisError(err instanceof Error ? err.message : 'Safe Redis inspector rejected command');
+    } finally {
+      setStudioBusy(null);
+    }
+  };
+
+  const handleRunStudioBloat = async () => {
+    const targetDb = studioDbId || databases[0]?.id || 'db_pg_main';
+    setStudioBusy('bloat');
+    setBloatError(null);
+    try {
+      const res = await api.runDbStudioBloat(targetDb, {});
+      setBloatResult(res);
+    } catch (err: unknown) {
+      setBloatResult(null);
+      setBloatError(err instanceof Error ? err.message : 'Could not analyze Postgres table bloat');
+    } finally {
+      setStudioBusy(null);
+    }
+  };
+
+  const handleSelectS3Preset = (preset: S3StoragePreset) => {
+    setActivePresetId(preset.id);
+    const bind = preset.bindAddress || '127.0.0.1';
+    const port = preset.defaultPort || preset.s3Port || (preset.id === 'garage' ? 3900 : preset.id === 'seaweedfs' ? 8333 : 9000);
+    setPresignForm((prev) => ({
+      ...prev,
+      endpoint: `http://${bind}:${port}`,
+      region: preset.region || (preset.id === 'garage' ? 'garage' : 'us-east-1'),
+    }));
+  };
+
+  const handleGeneratePresign = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPresignBusy(true);
+    setPresignError(null);
+    try {
+      const res = await api.generateS3PresignedUrl({
+        endpoint: presignForm.endpoint.trim(),
+        region: presignForm.region.trim() || 'us-east-1',
+        bucket: presignForm.bucket.trim(),
+        key: presignForm.key.trim(),
+        method: presignForm.method,
+        expiresIn: Number(presignForm.expiresIn) || 900,
+        accessKeyId: presignForm.accessKeyId.trim() || 'GK_demo_access_key',
+        secretAccessKey: presignForm.secretAccessKey.trim() || 'demo_secret_access_key_replace_me',
+      });
+      setPresignResult(res);
+      onNotify('AWS SigV4 presigned URL generated locally (0 deps)', 'success');
+    } catch (err: unknown) {
+      setPresignResult(null);
+      setPresignError(err instanceof Error ? err.message : 'Could not generate SigV4 presigned URL');
+    } finally {
+      setPresignBusy(false);
+    }
+  };
 
   const needsHealthPoll = databases.some((d) => d.health === 'starting' || d.health === 'unknown');
   useEffect(() => {
@@ -435,13 +580,13 @@ export const DatabasesPanel: React.FC<Props> = ({
                   {isLinked ? <Unlink className="w-3.5 h-3.5" /> : <Link2 className="w-3.5 h-3.5" />}
                   <span>{isLinked ? 'Desvincular' : 'Enlazar al proyecto'}</span>
                 </button>
-                {db.exposure.enabled ? (
+                {db.exposure?.enabled ? (
                   <span className={`text-xs px-2 py-1 rounded-md font-mono flex items-center gap-1 tabular-nums ${
-                    db.exposure.bindAddress === '0.0.0.0'
+                    db.exposure?.bindAddress === '0.0.0.0'
                       ? 'bg-red-50 text-red-700 border border-red-200'
                       : 'bg-amber-50 text-amber-800 border border-amber-200'
                   }`}>
-                    <Globe className="w-3 h-3" /> {db.exposure.bindAddress}:{db.exposure.hostPort}
+                    <Globe className="w-3 h-3" /> {db.exposure?.bindAddress}:{db.exposure?.hostPort}
                   </span>
                 ) : (
                   <span className="text-xs px-2 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
@@ -848,6 +993,449 @@ export const DatabasesPanel: React.FC<Props> = ({
           </div>
         );
       })}
+
+      {/* Cycle-9: Read-Only Live DB Studio & Safe Redis Inspector */}
+      <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+        <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <Terminal className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.studioTitle')}</h3>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  <ShieldCheck className="w-3 h-3" />
+                  {t('db.studioPill')}
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.studioDesc')}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
+            {databases.length > 0 && (
+              <select
+                aria-label="Target database"
+                value={studioDbId || databases[0]?.id || ''}
+                onChange={(e) => setStudioDbId(e.target.value)}
+                className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-[11px] text-slate-800"
+              >
+                {databases.map((db) => (
+                  <option key={db.id} value={db.id}>
+                    {db.name} ({db.engine})
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              type="button"
+              onClick={() => setStudioOpen((v) => !v)}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+            >
+              {studioOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+              <span>{studioOpen ? 'Hide' : 'Open Studio'}</span>
+            </button>
+          </div>
+        </div>
+
+        {studioOpen && (
+          <div className="p-5 space-y-4">
+            <div className="inline-flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200">
+              {([
+                { id: 'sql', label: t('db.studioTabSql') },
+                { id: 'redis', label: t('db.studioTabRedis') },
+                { id: 'bloat', label: t('db.studioTabBloat') },
+              ] as const).map((tabItem) => (
+                <button
+                  key={tabItem.id}
+                  type="button"
+                  onClick={() => setStudioTab(tabItem.id)}
+                  className={`px-3 py-1.5 rounded-md font-medium transition-colors cursor-pointer ${
+                    studioTab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {tabItem.label}
+                </button>
+              ))}
+            </div>
+
+            {studioTab === 'sql' && (
+              <div className="space-y-3">
+                <textarea
+                  rows={3}
+                  value={sqlInput}
+                  onChange={(e) => setSqlInput(e.target.value)}
+                  spellCheck={false}
+                  aria-label="Read-only SQL query"
+                  className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white font-mono text-[11px] leading-relaxed text-slate-900"
+                />
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void handleRunStudioSql('SELECT id, project, status, duration_ms, created_at FROM deployments ORDER BY created_at DESC LIMIT 20')}
+                      className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-mono text-[10px] text-slate-700 cursor-pointer"
+                    >
+                      SELECT deployments
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleRunStudioSql('EXPLAIN SELECT id, status FROM deployments WHERE status = \'active\'')}
+                      className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-mono text-[10px] text-slate-700 cursor-pointer"
+                    >
+                      EXPLAIN plan
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleRunStudioSql('DROP TABLE deployments;')}
+                      className="px-2.5 py-1 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 font-mono text-[10px] text-red-700 cursor-pointer"
+                    >
+                      {t('db.studioTestBlock')}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={studioBusy !== null || !sqlInput.trim()}
+                    onClick={() => void handleRunStudioSql()}
+                    className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    {studioBusy === 'sql' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                    <span>{studioBusy === 'sql' ? t('db.studioRunning') : t('db.studioRunSql')}</span>
+                  </button>
+                </div>
+
+                {sqlError && (
+                  <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 flex items-start gap-2">
+                    <ShieldAlert className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <div className="font-semibold">Write / Destructive SQL Blocked</div>
+                      <div className="font-mono text-[11px]">{sqlError}</div>
+                    </div>
+                  </div>
+                )}
+
+                {sqlResult && (
+                  <div className="space-y-2.5">
+                    {sqlResult.wrappedSql && (
+                      <div className="p-3 rounded-xl bg-slate-950 text-emerald-300 border border-slate-800 font-mono text-[11px] overflow-x-auto">
+                        {sqlResult.wrappedSql}
+                      </div>
+                    )}
+                    {Array.isArray(sqlResult.rows) && sqlResult.rows.length > 0 && (
+                      <div className="border border-slate-200 rounded-xl overflow-x-auto bg-white">
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 border-b border-slate-200 text-[10px] font-mono uppercase text-slate-500">
+                              {(Array.isArray(sqlResult.columns) && sqlResult.columns.length > 0
+                                ? sqlResult.columns
+                                : Object.keys(sqlResult.rows[0] || {})
+                              ).map((col) => (
+                                <th key={col} className="py-2 px-3 whitespace-nowrap">{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 font-mono text-[11px] tabular-nums">
+                            {sqlResult.rows.slice(0, 20).map((row, rIdx) => {
+                              const cols = Array.isArray(sqlResult.columns) && sqlResult.columns.length > 0
+                                ? sqlResult.columns
+                                : Object.keys(row || {});
+                              return (
+                                <tr key={rIdx}>
+                                  {cols.map((col) => (
+                                    <td key={col} className="py-2 px-3 text-slate-700 whitespace-nowrap">
+                                      {row[col] == null ? 'NULL' : String(row[col])}
+                                    </td>
+                                  ))}
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {studioTab === 'redis' && (
+              <div className="space-y-3">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                  <input
+                    type="text"
+                    value={redisInput}
+                    onChange={(e) => setRedisInput(e.target.value)}
+                    placeholder="SCAN 0 COUNT 50"
+                    className="flex-1 px-3 py-2 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                  />
+                  <button
+                    type="button"
+                    disabled={studioBusy !== null || !redisInput.trim()}
+                    onClick={() => void handleRunStudioRedis()}
+                    className="culkibo-press inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50 shrink-0"
+                  >
+                    {studioBusy === 'redis' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                    <span>{studioBusy === 'redis' ? t('db.studioRunning') : t('db.studioRunRedis')}</span>
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {['SCAN 0 COUNT 50', 'INFO memory', 'DBSIZE'].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => void handleRunStudioRedis(preset)}
+                      className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-mono text-[10px] text-slate-700 cursor-pointer"
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => void handleRunStudioRedis('FLUSHALL')}
+                    className="px-2.5 py-1 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 font-mono text-[10px] text-red-700 cursor-pointer"
+                  >
+                    {t('db.studioTestFlush')}
+                  </button>
+                </div>
+
+                {redisError && (
+                  <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 flex items-start gap-2">
+                    <ShieldAlert className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+                    <div className="font-mono text-[11px]">{redisError}</div>
+                  </div>
+                )}
+
+                {redisResult && (
+                  <div className="p-3 rounded-xl bg-slate-950 text-emerald-300 border border-slate-800 font-mono text-[11px] space-y-1.5 overflow-x-auto">
+                    <div className="text-slate-400">
+                      argv: {(Array.isArray(redisResult.normalizedArgv) ? redisResult.normalizedArgv.join(' ') : redisResult.command) || 'OK'}
+                      {redisResult.clampedCount != null
+                        ? ` (COUNT clamped <= 100: ${redisResult.clampedCount})`
+                        : redisResult.countClamped
+                          ? ` (COUNT clamped <= ${redisResult.maxScanCount ?? 100})`
+                          : ''}
+                    </div>
+                    <pre className="whitespace-pre-wrap">
+                      {redisResult.output || (redisResult.result != null ? JSON.stringify(redisResult.result, null, 2) : 'Read-only preview validated')}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {studioTab === 'bloat' && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-slate-600">
+                    Detects dead-tuple ratios (&ge;20% or &ge;10k dead tuples) and zero-scan unused indexes.
+                  </span>
+                  <button
+                    type="button"
+                    disabled={studioBusy !== null}
+                    onClick={() => void handleRunStudioBloat()}
+                    className="culkibo-press inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    {studioBusy === 'bloat' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Stethoscope className="w-3.5 h-3.5" />}
+                    <span>{studioBusy === 'bloat' ? t('db.studioRunning') : t('db.studioRunBloat')}</span>
+                  </button>
+                </div>
+
+                {bloatError && (
+                  <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700">{bloatError}</div>
+                )}
+
+                {bloatResult && (
+                  <div className="space-y-2.5">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 tabular-nums">
+                      <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                        <span className="text-[10px] uppercase text-slate-400 block font-semibold">Tables Checked</span>
+                        <span className="font-mono text-sm font-semibold text-slate-900">{bloatResult.checkedTables ?? 0}</span>
+                      </div>
+                      <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200">
+                        <span className="text-[10px] uppercase text-amber-700 block font-semibold">Bloated Tables</span>
+                        <span className="font-mono text-sm font-semibold text-amber-800">
+                          {Array.isArray(bloatResult.bloatedTables) ? bloatResult.bloatedTables.length : 0}
+                        </span>
+                      </div>
+                      <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                        <span className="text-[10px] uppercase text-slate-400 block font-semibold">Recommendations</span>
+                        <span className="font-mono text-sm font-semibold text-slate-900">
+                          {Array.isArray(bloatResult.recommendations) ? bloatResult.recommendations.length : 0}
+                        </span>
+                      </div>
+                    </div>
+                    {Array.isArray(bloatResult.recommendations) && bloatResult.recommendations.length > 0 && (
+                      <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-1 text-[11px] text-slate-700">
+                        {bloatResult.recommendations.map((rec, i) => (
+                          <div key={i}>• {typeof rec === 'string' ? rec : (rec.message || rec.action || rec.table || 'Optimize table')}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* Cycle-9: Post-MinIO S3 Storage (Garage · RustFS · SeaweedFS) & Pure-Crypto SigV4 Presigner */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex items-start gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+            <HardDrive className="w-4 h-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="text-sm font-semibold text-slate-900">{t('db.s3Title')}</h3>
+              <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600">
+                127.0.0.1 Private Bridge · AWS4-HMAC-SHA256
+              </span>
+            </div>
+            <p className="text-slate-500 mt-0.5">{t('db.s3Desc')}</p>
+          </div>
+        </div>
+
+        {/* 3 Pinned 2026 MinIO-Replacement Preset Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {(s3Presets.length > 0
+            ? s3Presets
+            : [
+                { id: 'garage', name: 'Garage', label: 'Garage S3', image: 'dxflrs/garage:v1.0.1', licence: 'AGPL-3.0', bindAddress: '127.0.0.1', defaultPort: 3900, memoryMb: 40, region: 'garage', summary: 'Rust CRDT S3 (~40 MB RAM) built for multi-node WireGuard mesh.' },
+                { id: 'rustfs', name: 'RustFS', label: 'RustFS', image: 'rustfs/rustfs:1.0.0-alpha.45', licence: 'Apache-2.0', bindAddress: '127.0.0.1', defaultPort: 9000, memoryMb: 96, region: 'us-east-1', summary: 'Apache-2.0 high-throughput MinIO drop-in with ILM & Object Lock.' },
+                { id: 'seaweedfs', name: 'SeaweedFS', label: 'SeaweedFS', image: 'chrislusf/seaweedfs:3.85', licence: 'Apache-2.0', bindAddress: '127.0.0.1', defaultPort: 8333, memoryMb: 128, region: 'us-east-1', summary: 'Distributed Filer + S3 gateway for high-density blob workloads.' },
+              ]
+          ).map((preset) => {
+            const isSelected = activePresetId === preset.id;
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => handleSelectS3Preset(preset)}
+                className={`text-left p-3.5 rounded-xl border transition-colors cursor-pointer space-y-1.5 ${
+                  isSelected
+                    ? 'border-slate-900 bg-slate-50'
+                    : 'border-slate-200 bg-white hover:border-slate-300'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-sm text-slate-900">{preset.label || preset.name || preset.id}</span>
+                  <span className="px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px]">
+                    {preset.bindAddress || '127.0.0.1'}
+                  </span>
+                </div>
+                <div className="font-mono text-[11px] text-slate-600 truncate">{preset.image}</div>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  {preset.summary || preset.description || 'Pinned private-bridge S3 preset.'}
+                </p>
+                <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-1 tabular-nums">
+                  <span>{preset.licence || preset.license || 'OSS'}</span>
+                  <span>~{preset.memoryMb || preset.ramEstimateMb || 64} MB RAM</span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Pure-Crypto SigV4 Presigner Form */}
+        <form onSubmit={(e) => void handleGeneratePresign(e)} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+            <label className="block">
+              <span className="text-[11px] font-medium text-slate-600 block mb-1">S3 Endpoint</span>
+              <input
+                type="url"
+                required
+                value={presignForm.endpoint}
+                onChange={(e) => setPresignForm((p) => ({ ...p, endpoint: e.target.value }))}
+                className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-medium text-slate-600 block mb-1">Bucket</span>
+              <input
+                type="text"
+                required
+                value={presignForm.bucket}
+                onChange={(e) => setPresignForm((p) => ({ ...p, bucket: e.target.value }))}
+                className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-medium text-slate-600 block mb-1">Object Key</span>
+              <input
+                type="text"
+                required
+                value={presignForm.key}
+                onChange={(e) => setPresignForm((p) => ({ ...p, key: e.target.value }))}
+                className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">Method</span>
+                <select
+                  value={presignForm.method}
+                  onChange={(e) => setPresignForm((p) => ({ ...p, method: e.target.value as 'GET' | 'PUT' | 'HEAD' | 'DELETE' }))}
+                  className="w-full px-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                >
+                  <option value="GET">GET</option>
+                  <option value="PUT">PUT</option>
+                  <option value="HEAD">HEAD</option>
+                  <option value="DELETE">DELETE</option>
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-[11px] font-medium text-slate-600 block mb-1">TTL (sec)</span>
+                <input
+                  type="number"
+                  min={60}
+                  max={604800}
+                  value={presignForm.expiresIn}
+                  onChange={(e) => setPresignForm((p) => ({ ...p, expiresIn: e.target.value }))}
+                  className="w-full px-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 tabular-nums"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1">
+            <span className="text-[11px] text-slate-500 font-mono">
+              Region: {presignForm.region} · 60s–7d TTL cap · blocks ../ traversal
+            </span>
+            <button
+              type="submit"
+              disabled={presignBusy}
+              className="culkibo-press inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+            >
+              {presignBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+              <span>{presignBusy ? t('db.s3Presigning') : t('db.s3PresignBtn')}</span>
+            </button>
+          </div>
+        </form>
+
+        {presignError && (
+          <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 font-mono text-[11px]">
+            {presignError}
+          </div>
+        )}
+
+        {presignResult && (
+          <div className="p-3.5 rounded-xl bg-slate-950 text-emerald-300 border border-slate-800 space-y-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap text-[10px] font-mono text-slate-400">
+              <span>{presignResult.algorithm || 'AWS4-HMAC-SHA256'} · {presignResult.method} · TTL {presignResult.expiresIn}s</span>
+              <button
+                type="button"
+                onClick={() => void copy(presignResult.url, 'sigv4_url')}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 cursor-pointer"
+              >
+                {copied === 'sigv4_url' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                <span>{copied === 'sigv4_url' ? 'Copied' : 'Copy URL'}</span>
+              </button>
+            </div>
+            <div className="font-mono text-[11px] break-all leading-relaxed">{presignResult.url}</div>
+          </div>
+        )}
+      </section>
 
       {/* Franja compacta de Almacenamiento S3 / R2 global (configuración unificada en Ajustes → Backups y DR) */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">

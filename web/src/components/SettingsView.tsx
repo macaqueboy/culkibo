@@ -44,6 +44,8 @@ import {
   Moon,
   Monitor,
   Languages,
+  Palette,
+  Webhook,
 } from 'lucide-react';
 import {
   api,
@@ -74,6 +76,9 @@ import {
   type SecretRotationAuditResult,
   type CveScanResult,
   type IacExportResult,
+  type BrandThemeConfig,
+  type OutboundWebhookSubscription,
+  type WebhookDlqEntry,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -132,7 +137,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onRestoreChecklist,
 }) => {
   const { t, locale, setLocale } = useI18n();
-  const { theme, setTheme } = useTheme();
+  const { theme, setTheme, isDark } = useTheme();
   const [tab, setTabState] = useState<SettingsTab>(() => normalizeSettingsTab(initialTab));
   const setTab = (next: SettingsTab) => {
     setTabState(next);
@@ -278,6 +283,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [iacError, setIacError] = useState<string | null>(null);
   const [iacFileTab, setIacFileTab] = useState<string>('main.tf');
 
+  // Cycle-9 Open-Core White-Label Brand Engine & Standard-Webhooks Outbound + DLQ
+  const [brandForm, setBrandForm] = useState<BrandThemeConfig>({
+    brandName: 'Culkibo',
+    tagline: 'Ultra-lightweight self-hosted PaaS',
+    accentHex: '#6366f1',
+    logoUrl: '',
+    supportUrl: '',
+    hidePoweredBy: false,
+    updatedAt: null,
+  });
+  const [brandBusy, setBrandBusy] = useState<'save' | 'reset' | null>(null);
+  const [brandError, setBrandError] = useState<string | null>(null);
+
+  const [whSubs, setWhSubs] = useState<OutboundWebhookSubscription[]>([]);
+  const [whDlq, setWhDlq] = useState<WebhookDlqEntry[]>([]);
+  const [whNewUrl, setWhNewUrl] = useState('');
+  const [whNewDesc, setWhNewDesc] = useState('');
+  const [whBusyId, setWhBusyId] = useState<string | null>(null);
+  const [whRotatedSecret, setWhRotatedSecret] = useState<{ subId: string; secret: string; expiresAt?: string | null } | null>(null);
+  const [whError, setWhError] = useState<string | null>(null);
+
   useEffect(() => {
     if (tab !== 'security') return;
     let active = true;
@@ -285,11 +311,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       api.listPasskeys().catch(() => ({ passkeys: [] })),
       api.listSecretLeases().catch(() => ({ leases: [] })),
       api.getLatestCveScan().catch(() => null),
-    ]).then(([pkRes, leaseRes, latestCve]) => {
+      api.getBrandTheme().catch(() => null),
+      api.listOutboundWebhooks().catch(() => ({ subscriptions: [] })),
+      api.listWebhookDlq(50).catch(() => ({ entries: [] })),
+    ]).then(([pkRes, leaseRes, latestCve, brandRes, whSubRes, whDlqRes]) => {
       if (!active) return;
       setPasskeys(Array.isArray(pkRes?.passkeys) ? pkRes.passkeys : []);
       setSecretLeases(Array.isArray(leaseRes?.leases) ? leaseRes.leases : []);
       if (latestCve) setCveScan(latestCve);
+      if (brandRes && typeof brandRes.brandName === 'string') {
+        setBrandForm({
+          brandName: brandRes.brandName || 'Culkibo',
+          tagline: brandRes.tagline ?? '',
+          accentHex: /^#[0-9a-fA-F]{6}$/.test(brandRes.accentHex || '') ? brandRes.accentHex : '#6366f1',
+          logoUrl: brandRes.logoUrl ?? '',
+          supportUrl: brandRes.supportUrl ?? '',
+          hidePoweredBy: Boolean(brandRes.hidePoweredBy),
+          updatedAt: brandRes.updatedAt ?? null,
+        });
+      }
+      setWhSubs(Array.isArray(whSubRes?.subscriptions) ? whSubRes.subscriptions : []);
+      setWhDlq(Array.isArray(whDlqRes?.entries) ? whDlqRes.entries : []);
     });
     return () => { active = false; };
   }, [tab]);
@@ -1200,6 +1242,130 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  // --- Cycle-9 White-Label Brand & Standard-Webhooks DLQ Handlers ---
+  const handleSaveBrand = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBrandBusy('save');
+    setBrandError(null);
+    try {
+      const saved = await api.updateBrandTheme({
+        brandName: brandForm.brandName.trim(),
+        tagline: brandForm.tagline.trim(),
+        accentHex: brandForm.accentHex.trim(),
+        logoUrl: brandForm.logoUrl.trim(),
+        supportUrl: brandForm.supportUrl.trim(),
+        hidePoweredBy: brandForm.hidePoweredBy,
+      });
+      setBrandForm({
+        brandName: saved.brandName || brandForm.brandName,
+        tagline: saved.tagline ?? brandForm.tagline,
+        accentHex: saved.accentHex || brandForm.accentHex,
+        logoUrl: saved.logoUrl ?? brandForm.logoUrl,
+        supportUrl: saved.supportUrl ?? brandForm.supportUrl,
+        hidePoweredBy: Boolean(saved.hidePoweredBy),
+        updatedAt: saved.updatedAt ?? new Date().toISOString(),
+      });
+      onNotify?.(`White-label brand “${saved.brandName || brandForm.brandName}” saved`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not save white-label brand';
+      setBrandError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setBrandBusy(null);
+    }
+  };
+
+  const handleResetBrand = async () => {
+    setBrandBusy('reset');
+    setBrandError(null);
+    try {
+      const reset = await api.resetBrandTheme();
+      setBrandForm({
+        brandName: reset.brandName || 'Culkibo',
+        tagline: reset.tagline ?? 'Ultra-lightweight self-hosted PaaS',
+        accentHex: reset.accentHex || '#6366f1',
+        logoUrl: reset.logoUrl ?? '',
+        supportUrl: reset.supportUrl ?? '',
+        hidePoweredBy: Boolean(reset.hidePoweredBy),
+        updatedAt: reset.updatedAt ?? null,
+      });
+      onNotify?.('Brand theme restored to default Culkibo settings', 'info');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not reset brand theme';
+      setBrandError(msg);
+    } finally {
+      setBrandBusy(null);
+    }
+  };
+
+  const handleAddWebhookSub = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanUrl = whNewUrl.trim();
+    if (!cleanUrl) return;
+    setWhBusyId('create');
+    setWhError(null);
+    try {
+      const res = await api.upsertOutboundWebhook({
+        url: cleanUrl,
+        description: whNewDesc.trim() || undefined,
+        events: ['deploy.succeeded', 'deploy.failed', 'backup.verified'],
+        enabled: true,
+      });
+      const list = await api.listOutboundWebhooks().catch(() => ({ subscriptions: [] }));
+      setWhSubs(Array.isArray(list.subscriptions) ? list.subscriptions : []);
+      if (res.secret && res.subscription?.id) {
+        setWhRotatedSecret({ subId: res.subscription.id, secret: res.secret, expiresAt: null });
+      }
+      setWhNewUrl('');
+      setWhNewDesc('');
+      onNotify?.('Standard-Webhook subscription saved (whsec_ generated)', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not add outbound webhook';
+      setWhError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setWhBusyId(null);
+    }
+  };
+
+  const handleRotateWebhookSecret = async (subId: string) => {
+    setWhBusyId(`rot-${subId}`);
+    setWhError(null);
+    try {
+      const res = await api.rotateOutboundWebhookSecret(subId, { graceSec: 86400 });
+      const list = await api.listOutboundWebhooks().catch(() => ({ subscriptions: [] }));
+      setWhSubs(Array.isArray(list.subscriptions) ? list.subscriptions : []);
+      const sec = res.secret || res.primarySecret;
+      if (sec) {
+        setWhRotatedSecret({ subId, secret: sec, expiresAt: res.secondaryExpiresAt || null });
+      }
+      onNotify?.('Dual-secret rotated (previous secret stays valid for 24h grace window)', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not rotate webhook secret';
+      setWhError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setWhBusyId(null);
+    }
+  };
+
+  const handleReplayDlq = async (dlqId: string) => {
+    setWhBusyId(`rep-${dlqId}`);
+    setWhError(null);
+    try {
+      await api.replayWebhookDlqEntry(dlqId);
+      const refreshed = await api.listWebhookDlq(50).catch(() => ({ entries: [] }));
+      setWhDlq(Array.isArray(refreshed.entries) ? refreshed.entries : []);
+      onNotify?.('DLQ delivery replayed with fresh anti-SSRF DNS check', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not replay DLQ delivery';
+      setWhError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setWhBusyId(null);
+    }
+  };
+
   const handleRunSecretScan = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!scanInput.trim()) return;
@@ -1351,7 +1517,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <p className="text-slate-500 mt-0.5 leading-relaxed">{t('settings.sec2faDesc')}</p>
                   {identity && (
                     <div className="mt-1.5 text-[11px] text-slate-400 font-mono">
-                      Sesión actual: {identity.email || identity.name || 'Administrador local'} ({identity.role})
+                      {t('settings.secCurrentSession')} {identity.email || identity.name || (locale === 'es' ? 'Administrador local' : 'Local admin')} ({identity.role})
                     </div>
                   )}
                 </div>
@@ -1581,12 +1747,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         </span>
                         {prov.defaultRole && (
                           <span className="px-1.5 py-0.5 rounded bg-slate-50 border border-slate-200 text-[10px] text-slate-600">
-                            rol: {prov.defaultRole}
+                            {t('settings.secRole')}: {prov.defaultRole}
                           </span>
                         )}
                         {prov.enforceLocal2fa && (
                           <span className="px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-[10px] text-emerald-700">
-                            2FA local
+                            {t('settings.secLocal2fa')}
                           </span>
                         )}
                       </div>
@@ -1601,7 +1767,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           : 'bg-slate-100 text-slate-500 border-slate-200'
                       }`}
                     >
-                      {prov.enabled ? 'Activo' : 'Desactivado'}
+                      {prov.enabled ? t('settings.secActive') : t('settings.secInactive')}
                     </span>
                   </div>
                 ))}
@@ -1706,7 +1872,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             {securityAuditEntries.length > 0 && (
               <div className="border border-slate-200 rounded-xl overflow-hidden">
                 <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 font-medium text-slate-700 flex items-center justify-between">
-                  <span className="tabular-nums">Últimos eventos encadenados ({securityAuditEntries.length})</span>
+                  <span className="tabular-nums">{t('settings.secLatestChained')} ({securityAuditEntries.length})</span>
                   <span className="font-mono text-[10px] text-slate-400">SHA-256 append-only</span>
                 </div>
                 <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto">
@@ -1964,7 +2130,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            <div className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-xl bg-amber-50/60 border border-amber-200">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-xl bg-amber-50/70 border border-amber-200">
               <input
                 type="text"
                 value={breakGlassReason}
@@ -2085,9 +2251,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     <span className="text-[10px] uppercase text-slate-400 font-semibold block">Packages</span>
                     <span className="font-mono text-sm font-semibold text-slate-900">{cveScan.scannedPackages}</span>
                   </div>
-                  <div className="p-2.5 rounded-xl bg-red-50/70 border border-red-200">
-                    <span className="text-[10px] uppercase text-red-600 font-semibold block">Critical</span>
-                    <span className="font-mono text-sm font-semibold text-red-700">{cveScan.bySeverity?.critical ?? 0}</span>
+                  <div
+                    className={`p-2.5 rounded-xl border ${
+                      isDark
+                        ? 'bg-rose-950/30 border-rose-500/30 text-rose-200'
+                        : 'bg-red-50 border-red-200 text-red-700'
+                    }`}
+                  >
+                    <span className={`text-[10px] uppercase font-semibold block ${isDark ? 'text-rose-300' : 'text-red-700'}`}>
+                      Critical
+                    </span>
+                    <span className={`font-mono text-sm font-semibold ${isDark ? 'text-rose-200' : 'text-red-700'}`}>
+                      {cveScan.bySeverity?.critical ?? 0}
+                    </span>
                   </div>
                   <div className="p-2.5 rounded-xl bg-amber-50/70 border border-amber-200">
                     <span className="text-[10px] uppercase text-amber-700 font-semibold block">High</span>
@@ -2183,6 +2359,334 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               );
             })()}
+          </div>
+
+          {/* 9. Open-Core White-Label Brand & Custom Login Theme Engine */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Palette className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.brandTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Open-Core · 0 Paywall
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.brandDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={brandBusy !== null}
+                onClick={() => void handleResetBrand()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${brandBusy === 'reset' ? 'animate-spin' : ''}`} />
+                <span>{t('sec.brandReset')}</span>
+              </button>
+            </div>
+
+            {brandError && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{brandError}</span>
+              </div>
+            )}
+
+            {/* Live Brand Swatch Preview */}
+            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div
+                  className="w-9 h-9 rounded-lg flex items-center justify-center font-mono text-xs font-bold text-white shrink-0 shadow-xs"
+                  style={{
+                    backgroundColor: /^#[0-9a-fA-F]{6}$/.test(brandForm.accentHex) ? brandForm.accentHex : '#6366f1',
+                  }}
+                >
+                  {(brandForm.brandName || 'C').slice(0, 2).toUpperCase()}
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-semibold text-sm text-slate-900 truncate">{brandForm.brandName || 'Culkibo'}</span>
+                    <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-white border border-slate-200 text-slate-600">
+                      {brandForm.accentHex}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-500 truncate">{brandForm.tagline || 'Ultra-lightweight self-hosted PaaS'}</div>
+                </div>
+              </div>
+              <div className="text-[11px] text-slate-400 font-mono shrink-0">
+                {brandForm.hidePoweredBy ? t('sec.brandPreview') : `${t('sec.brandPreview')} · Powered by Culkibo`}
+              </div>
+            </div>
+
+            <form onSubmit={(e) => void handleSaveBrand(e)} className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="block">
+                <span className="font-medium text-slate-700 block mb-1">{t('sec.brandName')}</span>
+                <input
+                  type="text"
+                  maxLength={60}
+                  required
+                  value={brandForm.brandName}
+                  onChange={(e) => setBrandForm((prev) => ({ ...prev, brandName: e.target.value }))}
+                  placeholder="Acme Cloud PaaS"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-900"
+                />
+              </label>
+              <label className="block">
+                <span className="font-medium text-slate-700 block mb-1">{t('sec.brandAccent')}</span>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="color"
+                    aria-label="Accent color picker"
+                    value={/^#[0-9a-fA-F]{6}$/.test(brandForm.accentHex) ? brandForm.accentHex : '#6366f1'}
+                    onChange={(e) => setBrandForm((prev) => ({ ...prev, accentHex: e.target.value }))}
+                    className="w-10 h-9 p-0.5 rounded-lg border border-slate-200 bg-white cursor-pointer shrink-0"
+                  />
+                  <input
+                    type="text"
+                    value={brandForm.accentHex}
+                    onChange={(e) => setBrandForm((prev) => ({ ...prev, accentHex: e.target.value }))}
+                    placeholder="#6366f1"
+                    className="flex-1 px-3 py-2 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                  />
+                </div>
+              </label>
+              <label className="block sm:col-span-2">
+                <span className="font-medium text-slate-700 block mb-1">{t('sec.brandTagline')}</span>
+                <input
+                  type="text"
+                  maxLength={140}
+                  value={brandForm.tagline}
+                  onChange={(e) => setBrandForm((prev) => ({ ...prev, tagline: e.target.value }))}
+                  placeholder="Managed self-hosted cloud for agencies"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-900"
+                />
+              </label>
+              <label className="block">
+                <span className="font-medium text-slate-700 block mb-1">{t('sec.brandLogo')}</span>
+                <input
+                  type="text"
+                  value={brandForm.logoUrl}
+                  onChange={(e) => setBrandForm((prev) => ({ ...prev, logoUrl: e.target.value }))}
+                  placeholder="https://cdn.youragency.com/logo.svg"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                />
+              </label>
+              <label className="block">
+                <span className="font-medium text-slate-700 block mb-1">{t('sec.brandSupport')}</span>
+                <input
+                  type="text"
+                  value={brandForm.supportUrl}
+                  onChange={(e) => setBrandForm((prev) => ({ ...prev, supportUrl: e.target.value }))}
+                  placeholder="https://status.youragency.com"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+                />
+              </label>
+              <div className="sm:col-span-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+                <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={brandForm.hidePoweredBy}
+                    onChange={(e) => setBrandForm((prev) => ({ ...prev, hidePoweredBy: e.target.checked }))}
+                    className="rounded border-slate-300 accent-slate-900"
+                  />
+                  <span>{t('sec.brandHidePowered')}</span>
+                </label>
+                <button
+                  type="submit"
+                  disabled={brandBusy !== null}
+                  className="culkibo-press inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {brandBusy === 'save' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                  <span>{brandBusy === 'save' ? t('sec.brandSaving') : t('sec.brandSave')}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+
+          {/* 10. Standard-Webhooks Outbound & Dead-Letter Queue (DLQ) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Webhook className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.whTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                      standard-webhooks · whsec_ · Anti-SSRF
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.whDesc')}</p>
+                </div>
+              </div>
+            </div>
+
+            {whError && (
+              <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{whError}</span>
+              </div>
+            )}
+
+            <form onSubmit={(e) => void handleAddWebhookSub(e)} className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+              <input
+                type="url"
+                required
+                value={whNewUrl}
+                onChange={(e) => setWhNewUrl(e.target.value)}
+                placeholder="https://hooks.your-domain.com/culkibo"
+                className="sm:col-span-6 px-3 py-2 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+              <input
+                type="text"
+                value={whNewDesc}
+                onChange={(e) => setWhNewDesc(e.target.value)}
+                placeholder="Release pipeline listener"
+                className="sm:col-span-4 px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-900"
+              />
+              <button
+                type="submit"
+                disabled={whBusyId !== null}
+                className="sm:col-span-2 culkibo-press inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {whBusyId === 'create' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                <span>{whBusyId === 'create' ? t('sec.whAdding') : t('sec.whAddSub')}</span>
+              </button>
+            </form>
+
+            {whRotatedSecret && (
+              <div className="p-3 rounded-xl bg-slate-950 text-emerald-300 border border-slate-800 font-mono text-[11px] flex items-center justify-between gap-2">
+                <span className="truncate">
+                  New primary whsec_ (shown once): {whRotatedSecret.secret}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void copySecurityValue(whRotatedSecret.secret, 'wh_sec_once', 'Webhook secret')}
+                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 shrink-0 cursor-pointer"
+                >
+                  {copiedSecKey === 'wh_sec_once' ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            )}
+
+            {/* Outbound Subscriptions List */}
+            {whSubs.length === 0 ? (
+              <div className="text-slate-500">{t('sec.whSubsEmpty')}</div>
+            ) : (
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                {whSubs.map((sub) => (
+                  <div key={sub.id} className="px-4 py-3 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${sub.enabled ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                        <span className="font-mono font-semibold text-slate-900 truncate max-w-[300px] sm:max-w-[420px]">
+                          {sub.url}
+                        </span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600">
+                          {sub.secretPreview || sub.maskedSecret || 'whsec_••••••••'}
+                        </span>
+                        {sub.hasSecondarySecret && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 font-mono text-[10px]">
+                            Dual-Secret Grace
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-500">
+                        {sub.description && <span>{sub.description} ·</span>}
+                        {(Array.isArray(sub.events) ? sub.events : ['*']).slice(0, 4).map((ev) => (
+                          <span key={ev} className="px-1.5 py-0.5 rounded bg-slate-50 border border-slate-200 font-mono text-[10px] text-slate-600">
+                            {ev}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={whBusyId !== null}
+                      onClick={() => void handleRotateWebhookSecret(sub.id)}
+                      className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer shrink-0 disabled:opacity-50 self-start sm:self-center"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${whBusyId === `rot-${sub.id}` ? 'animate-spin' : ''}`} />
+                      <span>{whBusyId === `rot-${sub.id}` ? t('sec.whRotating') : t('sec.whRotate')}</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Dead-Letter Queue (DLQ) Table */}
+            <div className="border border-slate-200 rounded-xl overflow-hidden">
+              <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+                <span className="font-semibold text-slate-800 tabular-nums">
+                  {t('sec.whDlqTitle')} ({whDlq.length})
+                </span>
+                <span className="font-mono text-[10px] text-slate-400">DNS-Resolved Anti-SSRF Replay</span>
+              </div>
+              {whDlq.length === 0 ? (
+                <div className="p-4 text-center text-slate-500">{t('sec.whDlqEmpty')}</div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50/70 border-b border-slate-200 text-[10px] uppercase tracking-wider text-slate-500">
+                        <th className="py-2 px-3.5">Event</th>
+                        <th className="py-2 px-3">Destination</th>
+                        <th className="py-2 px-3">Status</th>
+                        <th className="py-2 px-3.5 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-[11px]">
+                      {whDlq.slice(0, 10).map((entry) => {
+                        const isReplayed = entry.status === 'replayed';
+                        return (
+                          <tr key={entry.id}>
+                            <td className="py-2.5 px-3.5 whitespace-nowrap">
+                              <div className="font-mono font-semibold text-slate-900">{entry.eventType}</div>
+                              <div className="text-[10px] text-slate-400 tabular-nums">
+                                {entry.attempts ?? 1}x · {formatSafeDate(entry.createdAt)}
+                              </div>
+                            </td>
+                            <td className="py-2.5 px-3 max-w-[240px]">
+                              <div className="font-mono text-slate-700 truncate">{entry.url}</div>
+                              {(entry.lastError || entry.error) && (
+                                <div className="text-[10px] text-red-700 truncate">{entry.lastError || entry.error}</div>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 whitespace-nowrap">
+                              <span
+                                className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-medium border ${
+                                  isReplayed
+                                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                    : 'bg-red-50 text-red-700 border-red-200'
+                                }`}
+                              >
+                                {isReplayed ? 'REPLAYED 200' : `HTTP ${entry.httpStatus || entry.lastStatusCode || 'ERR'}`}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3.5 text-right whitespace-nowrap">
+                              <button
+                                type="button"
+                                disabled={whBusyId !== null}
+                                onClick={() => void handleReplayDlq(entry.id)}
+                                className="culkibo-press inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                              >
+                                <Play className="w-3 h-3" />
+                                <span>{whBusyId === `rep-${entry.id}` ? t('sec.whReplaying') : t('sec.whReplay')}</span>
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -3293,23 +3797,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             )}
 
-            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-2 border-t border-slate-100">
               <button
                 type="button"
-                onClick={() => void handleTestNotifications()}
-                disabled={notifTesting}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 font-medium cursor-pointer disabled:opacity-50"
+                onClick={() => setTab('security')}
+                className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
               >
-                <Send className="w-3.5 h-3.5" />
-                <span>{notifTesting ? 'Enviando…' : 'Guardar y enviar prueba'}</span>
+                <Webhook className="w-3.5 h-3.5" />
+                <span>Standard-Webhooks (whsec_) &amp; DLQ Replay → Security</span>
               </button>
-              <button
-                type="submit"
-                disabled={notifBusy}
-                className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
-              >
-                {notifBusy ? 'Guardando…' : 'Guardar alertas'}
-              </button>
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleTestNotifications()}
+                  disabled={notifTesting}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>{notifTesting ? 'Enviando…' : 'Guardar y enviar prueba'}</span>
+                </button>
+                <button
+                  type="submit"
+                  disabled={notifBusy}
+                  className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {notifBusy ? 'Guardando…' : 'Guardar alertas'}
+                </button>
+              </div>
             </div>
           </form>
         )

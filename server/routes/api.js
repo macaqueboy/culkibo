@@ -92,6 +92,11 @@ function getSecretLeaseService() { return _lazyV2.lease || (_lazyV2.lease = requ
 function getCveDriftService() { return _lazyV2.cvedrift || (_lazyV2.cvedrift = require('../services/cveDriftService')); }
 function getDriftDetectorService() { return _lazyV2.drift || (_lazyV2.drift = require('../services/driftDetectorService')); }
 function getIacExporter() { return _lazyV2.iac || (_lazyV2.iac = require('../services/iacExporter')); }
+function getBrandThemeService() { return _lazyV2.brand || (_lazyV2.brand = require('../services/brandThemeService')); }
+function getWebhookEventBus() { return _lazyV2.whbus || (_lazyV2.whbus = require('../services/webhookEventBus')); }
+function getDbStudioService() { return _lazyV2.dbstudio || (_lazyV2.dbstudio = require('../services/dbStudioService')); }
+function getObjectStorageService() { return _lazyV2.s3 || (_lazyV2.s3 = require('../services/objectStorageService')); }
+function getQuotaMeteringService() { return _lazyV2.quotas || (_lazyV2.quotas = require('../services/quotaMeteringService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -7702,6 +7707,354 @@ router.get('/domains/:hostname/caa-preflight', async (req, res) => {
       echEnabled: req.query.ech === 'true' || req.query.ech === '1'
     });
     res.json({ ...caa, acmeProfileSpec });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #9 PIONEER LAZY ROUTES (White-Label Brand, Standard-Webhooks + DLQ, Read-Only DB Studio & Redis Inspector, Post-MinIO S3 + SigV4, Agency Quotas & Billing Ledger) ---
+
+/**
+ * Verificación estricta cross-tenant para Quotas / Billing / DB Studio (cierra Dokploy CVE-2026-116068 & CVE-2026-127212).
+ * Devuelve HTTP 403 ante cualquier intento de leer o mutar un proyecto/BD ajeno.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} projectId
+ * @param {string} [perm]
+ * @returns {boolean}
+ */
+function assertTenantProjectAccess403(req, res, projectId, perm = 'projects:read') {
+  const principal = getPrincipal(req);
+  if (principal.isSuperAdmin) return true;
+  const pid = String(projectId || '').trim();
+  const project = pid ? projectManager.getById(pid) : null;
+  const check = getTeamManager().authorizeProject(principal, pid, perm, project || null);
+  if (!check.allowed) {
+    res.status(403).json({
+      error: 'Acceso denegado: no tienes permisos sobre el proyecto o tenant solicitado',
+      code: 'CROSS_TENANT_FORBIDDEN'
+    });
+    return false;
+  }
+  return true;
+}
+
+// 1. Open-Core White-Label Brand & Custom Login Theme Engine (`coolify#1744`)
+router.get('/brand', (_req, res) => {
+  try {
+    res.json(getBrandThemeService().getBrand());
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/brand', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden actualizar la marca blanca', code: 'FORBIDDEN' });
+    }
+    const { actor } = getAuditActor(req);
+    const updated = getBrandThemeService().updateBrand(req.body || {}, { actor });
+    res.json(updated);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/brand/reset', certAndAdminLimiter, (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden restablecer la marca blanca', code: 'FORBIDDEN' });
+    }
+    const { actor } = getAuditActor(req);
+    const reset = getBrandThemeService().resetBrand({ actor });
+    res.json(reset);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Standard-Webhooks Outbound Event Bus + Dual-Secret Rotation + Anti-SSRF DLQ Replay
+router.get('/webhooks/outbound', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'listar suscripciones outbound de webhooks')) return;
+    res.json({ subscriptions: getWebhookEventBus().listSubscriptions() });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/webhooks/outbound', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'crear o actualizar suscripción webhook')) return;
+    const sub = getWebhookEventBus().upsertSubscription(req.body || {});
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(201).json(sub);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/webhooks/outbound/:id/rotate-secret', certAndAdminLimiter, (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'rotar secreto de webhook')) return;
+    const out = getWebhookEventBus().rotateSecret(req.params.id, req.body || {});
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/webhooks/outbound/dispatch', heavyOpLimiter, async (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'despachar evento webhook')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getWebhookEventBus().dispatchEvent({
+      eventType: body.eventType || 'custom.event',
+      data: body.data !== undefined ? body.data : {},
+      subscriptionId: body.subscriptionId || undefined,
+      maxAttempts: body.maxAttempts !== undefined ? Number(body.maxAttempts) : 2
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/webhooks/dlq', (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'consultar DLQ de webhooks')) return;
+    const entries = getWebhookEventBus().listDlq({
+      limit: req.query.limit ? Number(req.query.limit) : 50,
+      status: req.query.status ? String(req.query.status) : undefined
+    });
+    res.json({ entries });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/webhooks/dlq/:id/replay', heavyOpLimiter, async (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'reintentar entrada DLQ')) return;
+    const out = await getWebhookEventBus().replayDlqEntry(req.params.id, req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/webhooks/dlq/replay-all', heavyOpLimiter, async (req, res) => {
+  try {
+    if (denyProjectScopedToken(req, res, 'reintentar todas las entradas DLQ')) return;
+    const out = await getWebhookEventBus().replayAllFailed(req.body || {});
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Zero-Dep Read-Only Live DB Studio & Safe Redis Inspector (`Dokploy CVE-2026-24841`)
+/** @param {any} req @param {any} res */
+function resolveDbForStudio(req, res) {
+  const principal = getPrincipal(req);
+  const dbId = String(req.params.id || '').trim();
+  /** @type {any} */
+  let db = null;
+  try { db = databaseManager.get(dbId); } catch (e) { db = null; }
+
+  if (!principal.isSuperAdmin) {
+    if (!db) {
+      res.status(403).json({ error: 'Acceso denegado a la base de datos solicitada', code: 'CROSS_TENANT_FORBIDDEN' });
+      return { ok: false, db: null };
+    }
+    if (db.projectId) {
+      if (!assertTenantProjectAccess403(req, res, db.projectId, 'databases:read')) {
+        return { ok: false, db: null };
+      }
+    } else if (denyProjectScopedToken(req, res, 'bases de datos sin proyecto') || (principal.teamId && principal.teamId !== 'team_default')) {
+      if (!res.headersSent) {
+        res.status(403).json({ error: 'Acceso denegado a base de datos de otro tenant', code: 'CROSS_TENANT_FORBIDDEN' });
+      }
+      return { ok: false, db: null };
+    }
+  }
+  return { ok: true, db };
+}
+
+router.post('/databases/:id/studio/sql', heavyOpLimiter, async (req, res) => {
+  try {
+    const resolved = resolveDbForStudio(req, res);
+    if (!resolved.ok) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getDbStudioService().runReadOnlyQuery({
+      databaseId: req.params.id,
+      engine: (resolved.db && resolved.db.engine) || body.engine || 'postgres',
+      query: typeof body.query === 'string' ? body.query : (typeof body.sql === 'string' ? body.sql : ''),
+      maxRows: body.maxRows !== undefined ? Number(body.maxRows) : 200
+    });
+    res.json(out);
+  } catch (err) {
+    res.status(400).json({
+      error: (err && err.message) || 'Consulta SQL bloqueada por política de solo lectura',
+      ...(err && /** @type {any} */ (err).code ? { code: /** @type {any} */ (err).code } : {})
+    });
+  }
+});
+
+router.post('/databases/:id/studio/redis', heavyOpLimiter, async (req, res) => {
+  try {
+    const resolved = resolveDbForStudio(req, res);
+    if (!resolved.ok) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getDbStudioService().runSafeRedisInspect({
+      databaseId: req.params.id,
+      argv: body.argv !== undefined ? body.argv : body.command
+    });
+    res.json(out);
+  } catch (err) {
+    res.status(400).json({
+      error: (err && err.message) || 'Comando Redis bloqueado por política de solo lectura',
+      ...(err && /** @type {any} */ (err).code ? { code: /** @type {any} */ (err).code } : {})
+    });
+  }
+});
+
+router.post('/databases/:id/studio/bloat', (req, res) => {
+  try {
+    const resolved = resolveDbForStudio(req, res);
+    if (!resolved.ok) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const studio = getDbStudioService();
+    const bloat = studio.analyzePostgresBloat(Array.isArray(body.tableStats) ? body.tableStats : []);
+    const explainSummary = body.explainPlan ? studio.summarizeExplainPlan(body.explainPlan) : undefined;
+    res.json(explainSummary !== undefined ? { ...bloat, explainSummary } : bloat);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Post-MinIO S3 Storage Orchestrator (Garage / RustFS / SeaweedFS) & Pure-Crypto AWS SigV4 Presigner
+router.get('/storage/presets', (_req, res) => {
+  try {
+    res.json({ presets: getObjectStorageService().listPresets() });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/storage/presign', certAndAdminLimiter, (req, res) => {
+  try {
+    const out = getObjectStorageService().generatePresignedUrl(req.body || {});
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/storage/cors-xml', (req, res) => {
+  try {
+    const body = req.body;
+    const rules = Array.isArray(body) ? body : (Array.isArray(body && body.rules) ? body.rules : []);
+    const xml = getObjectStorageService().buildBucketCorsXml(rules);
+    res.json({ ok: true, xml });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/storage/lifecycle-xml', (req, res) => {
+  try {
+    const body = req.body;
+    const rules = Array.isArray(body) ? body : (Array.isArray(body && body.rules) ? body.rules : []);
+    const xml = getObjectStorageService().buildLifecycleXml(rules);
+    res.json({ ok: true, xml });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Agency Multi-Tenant Quotas & CSV-Safe Billing Usage Ledger (`Dokploy CVE-2026-116068`/`CVE-2026-127212`)
+/** @param {any} raw */
+function normalizeQuotaFields(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  /** @type {any} */
+  const out = { ...src };
+  if (out.containers === undefined && src.maxContainers !== undefined) out.containers = src.maxContainers;
+  if (out.memoryMb === undefined && src.maxMemoryMb !== undefined) out.memoryMb = src.maxMemoryMb;
+  if (out.cpuCores === undefined && src.maxCpuCores !== undefined) out.cpuCores = src.maxCpuCores;
+  if (out.storageGb === undefined && src.maxStorageGb !== undefined) out.storageGb = src.maxStorageGb;
+  if (out.bandwidthGbMo === undefined && src.maxBandwidthGbMo !== undefined) out.bandwidthGbMo = src.maxBandwidthGbMo;
+  return out;
+}
+
+router.get('/quotas', (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const out = getQuotaMeteringService().listQuotas({ allowedProjectIds });
+    res.json(Array.isArray(out) ? { ok: true, quotas: out } : out);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.put('/quotas/:projectId', certAndAdminLimiter, (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.projectId, 'projects:write')) return;
+    const out = getQuotaMeteringService().setQuota(req.params.projectId, normalizeQuotaFields(req.body));
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/quotas/:projectId/check', (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.projectId, 'projects:read')) return;
+    const out = getQuotaMeteringService().checkQuotaAllowance(req.params.projectId, normalizeQuotaFields(req.body));
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/billing/ledger', (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const requestedProjectId = req.query.projectId ? String(req.query.projectId).trim() : null;
+    if (requestedProjectId && allowedProjectIds !== null && !allowedProjectIds.includes(requestedProjectId)) {
+      return res.status(403).json({
+        error: 'Acceso denegado: no puedes consultar métricas ni facturación de otro tenant',
+        code: 'CROSS_TENANT_FORBIDDEN'
+      });
+    }
+    const allProjects = projectManager.getAll();
+    const filteredProjects = requestedProjectId
+      ? allProjects.filter((p) => p && p.id === requestedProjectId)
+      : allProjects;
+    const databases = databaseManager.list();
+    const periodDays = req.query.days !== undefined
+      ? Number(req.query.days)
+      : (req.query.periodDays !== undefined ? Number(req.query.periodDays) : 30);
+
+    const svc = getQuotaMeteringService();
+    const ledger = svc.buildUsageLedger({
+      projects: filteredProjects,
+      databases,
+      allowedProjectIds,
+      periodDays
+    });
+    if (String(req.query.format || '').trim().toLowerCase() === 'csv') {
+      const csv = svc.exportLedgerCsv(ledger);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="culkibo-usage-ledger.csv"');
+      return res.status(200).send(csv);
+    }
+    res.json(ledger);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

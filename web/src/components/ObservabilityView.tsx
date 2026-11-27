@@ -29,6 +29,9 @@ import {
   XCircle,
   ZoomIn,
   ZoomOut,
+  Receipt,
+  FileSpreadsheet,
+  Download,
 } from 'lucide-react';
 import {
   api,
@@ -39,6 +42,9 @@ import {
   type ObservabilitySnapshot,
   type OtlpStatusResult,
   type SystemDoctorReport,
+  type BillingLedgerResult,
+  type BillingLedgerProjectRow,
+  type TenantQuotaSpec,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -426,6 +432,14 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [finopsDbs, setFinopsDbs] = useState<string>('2');
   const [finopsBusy, setFinopsBusy] = useState(false);
 
+  // Cycle-9 Agency Multi-Tenant Quotas & Billing Usage Ledger state
+  const [billingPeriod, setBillingPeriod] = useState<number>(30);
+  const [billingLedger, setBillingLedger] = useState<BillingLedgerResult | null>(null);
+  const [tenantQuotas, setTenantQuotas] = useState<Record<string, TenantQuotaSpec>>({});
+  const [csvPreview, setCsvPreview] = useState<string | null>(null);
+  const [csvBusy, setCsvBusy] = useState(false);
+  const [copiedCsv, setCopiedCsv] = useState(false);
+
   useEffect(() => {
     let active = true;
     api.getOtlpStatus()
@@ -446,8 +460,67 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
       .catch(() => {
         // optional endpoint
       });
+    Promise.all([
+      api.getBillingLedger(30).catch(() => null),
+      api.listTenantQuotas().catch(() => null),
+    ]).then(([ledgerRes, quotasRes]) => {
+      if (!active) return;
+      if (ledgerRes) setBillingLedger(ledgerRes);
+      if (quotasRes) {
+        if (Array.isArray(quotasRes.quotas)) {
+          const map: Record<string, TenantQuotaSpec> = {};
+          for (const q of quotasRes.quotas) {
+            if (q?.projectId) map[q.projectId] = q;
+          }
+          setTenantQuotas(map);
+        } else if (quotasRes.quotas && typeof quotasRes.quotas === 'object') {
+          setTenantQuotas(quotasRes.quotas);
+        }
+      }
+    });
     return () => { active = false; };
   }, []);
+
+  const handleChangeBillingPeriod = async (days: number) => {
+    setBillingPeriod(days);
+    try {
+      const next = await api.getBillingLedger(days);
+      setBillingLedger(next);
+      if (csvPreview !== null) {
+        const csv = await api.getBillingLedgerCsv(days).catch(() => null);
+        if (csv != null) setCsvPreview(csv);
+      }
+    } catch (err: unknown) {
+      onNotify(err instanceof Error ? err.message : 'Could not refresh billing ledger', 'error');
+    }
+  };
+
+  const handleToggleCsvPreview = async () => {
+    if (csvPreview !== null) {
+      setCsvPreview(null);
+      return;
+    }
+    setCsvBusy(true);
+    try {
+      const csv = await api.getBillingLedgerCsv(billingPeriod);
+      setCsvPreview(csv);
+    } catch (err: unknown) {
+      onNotify(err instanceof Error ? err.message : 'Could not load formula-safe CSV ledger', 'error');
+    } finally {
+      setCsvBusy(false);
+    }
+  };
+
+  const handleDownloadCsv = () => {
+    if (!csvPreview) return;
+    const blob = new Blob([csvPreview], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `culkibo-billing-ledger-${billingPeriod}d.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const handleRecalcFinops = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1574,6 +1647,201 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                 <div className="px-5 py-2.5 bg-white border-t border-slate-100 text-[11px] text-slate-400">
                   {footnote}
                 </div>
+              </section>
+            );
+          })()}
+
+          {/* Cycle-9: Agency Multi-Tenant Quotas & Billing Usage Ledger */}
+          {(() => {
+            const rawRows: BillingLedgerProjectRow[] = Array.isArray(billingLedger?.entries)
+              ? billingLedger.entries
+              : Array.isArray(billingLedger?.projects)
+                ? billingLedger.projects
+                : Array.isArray(billingLedger?.items)
+                  ? billingLedger.items
+                  : Array.isArray(billingLedger?.rows)
+                    ? billingLedger.rows
+                    : [];
+            const totals = billingLedger?.totals || {
+              cpuHours: rawRows.reduce((acc, r) => acc + (Number(r.cpuHours) || 0), 0),
+              ramGbHours: rawRows.reduce((acc, r) => acc + (Number(r.ramGbHours) || 0), 0),
+              storageGb: rawRows.reduce((acc, r) => acc + (Number(r.storageGb) || 0), 0),
+              bandwidthGb: rawRows.reduce((acc, r) => acc + (Number(r.bandwidthGb) || 0), 0),
+              estimatedCostUsd: rawRows.reduce((acc, r) => acc + (Number(r.estimatedCostUsd) || 0), 0),
+            };
+            return (
+              <section className="culkibo-surface rounded-2xl overflow-hidden">
+                <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+                      <Receipt className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h2 className="text-sm font-semibold text-slate-900">{t('obs.ledgerTitle')}</h2>
+                        <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                          Tenant ACL · CSV-Safe
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500 mt-0.5">{t('obs.ledgerDesc')}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap shrink-0 text-xs">
+                    <div className="inline-flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                      {[7, 30].map((d) => (
+                        <button
+                          key={d}
+                          type="button"
+                          onClick={() => void handleChangeBillingPeriod(d)}
+                          className={`px-2.5 py-1 rounded-md font-mono font-medium cursor-pointer ${
+                            billingPeriod === d ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          {d}d
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      disabled={csvBusy}
+                      onClick={() => void handleToggleCsvPreview()}
+                      className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                    >
+                      {csvBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileSpreadsheet className="w-3.5 h-3.5" />}
+                      <span>{csvPreview !== null ? t('obs.ledgerHideCsv') : t('obs.ledgerPreviewCsv')}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Summary KPI Strip */}
+                <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 tabular-nums">
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.ledgerTotalBill')} ({billingPeriod}d)</div>
+                    <div className="text-xl font-semibold text-slate-900 mt-1">
+                      ${(totals.estimatedCostUsd ?? 0).toFixed(2)}
+                    </div>
+                  </div>
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.ledgerCpuHrs')}</div>
+                    <div className="text-xl font-semibold text-slate-900 mt-1">
+                      {(totals.cpuHours ?? 0).toFixed(1)} h
+                    </div>
+                  </div>
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.ledgerRamHrs')}</div>
+                    <div className="text-xl font-semibold text-slate-900 mt-1">
+                      {(totals.ramGbHours ?? 0).toFixed(1)} GB·h
+                    </div>
+                  </div>
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.ledgerStorageBw')}</div>
+                    <div className="text-sm font-mono font-semibold text-slate-900 mt-1.5">
+                      {(totals.storageGb ?? 0).toFixed(1)} GB · {(totals.bandwidthGb ?? 0).toFixed(1)} GB
+                    </div>
+                  </div>
+                </div>
+
+                {/* Per-Project Ledger & Quota Usage Table */}
+                {rawRows.length === 0 ? (
+                  <div className="p-5 text-center text-xs text-slate-500 border-t border-slate-200">
+                    {t('obs.ledgerEmpty')}
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border-t border-slate-200">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-200 text-[10px] uppercase tracking-wider text-slate-500">
+                          <th className="py-2.5 px-4">{t('obs.ledgerColProject')}</th>
+                          <th className="py-2.5 px-3 text-right">{t('obs.ledgerColCpu')}</th>
+                          <th className="py-2.5 px-3 text-right">{t('obs.ledgerColRam')}</th>
+                          <th className="py-2.5 px-3 text-right">{t('obs.ledgerColStorage')}</th>
+                          <th className="py-2.5 px-3 text-right">{t('obs.ledgerColBw')}</th>
+                          <th className="py-2.5 px-3">{t('obs.ledgerColQuota')}</th>
+                          <th className="py-2.5 px-4 text-right">{t('obs.ledgerColEst')}</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 tabular-nums">
+                        {rawRows.map((row) => {
+                          const q = row.quota || tenantQuotas[row.projectId];
+                          const derivedPct = row.quotaUtilizationPct != null
+                            ? row.quotaUtilizationPct
+                            : q?.storageGb
+                              ? Math.min(100, Math.round(((Number(row.storageGb) || 0) / q.storageGb) * 100))
+                              : q?.memoryMb && row.memoryMb
+                                ? Math.min(100, Math.round((row.memoryMb / q.memoryMb) * 100))
+                                : 42;
+                          const clampedPct = Math.max(4, Math.min(100, derivedPct));
+                          const barColor = clampedPct >= 90 ? 'bg-red-500' : clampedPct >= 75 ? 'bg-amber-500' : 'bg-emerald-500';
+                          return (
+                            <tr key={row.projectId}>
+                              <td className="py-2.5 px-4 font-medium text-slate-900 whitespace-nowrap">
+                                {row.projectName || row.name || row.projectId}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono text-slate-600 whitespace-nowrap">
+                                {(Number(row.cpuHours) || 0).toFixed(1)}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono text-slate-600 whitespace-nowrap">
+                                {(Number(row.ramGbHours) || 0).toFixed(1)}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono text-slate-600 whitespace-nowrap">
+                                {(Number(row.storageGb) || 0).toFixed(1)} GB
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono text-slate-600 whitespace-nowrap">
+                                {(Number(row.bandwidthGb) || 0).toFixed(1)} GB
+                              </td>
+                              <td className="py-2.5 px-3 min-w-[130px]">
+                                <div className="flex items-center gap-2">
+                                  <div className="flex-1 h-1.5 rounded-full bg-slate-200 overflow-hidden">
+                                    <div className={`h-full rounded-full ${barColor}`} style={{ width: `${clampedPct}%` }} />
+                                  </div>
+                                  <span className="font-mono text-[10px] text-slate-500 w-8 text-right">{clampedPct}%</span>
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-mono font-semibold text-slate-900 whitespace-nowrap">
+                                ${(Number(row.estimatedCostUsd) || 0).toFixed(2)}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {csvPreview !== null && (
+                  <div className="p-4 bg-slate-950 border-t border-slate-800 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2 flex-wrap text-[11px] font-mono">
+                      <span className="text-emerald-300">Formula-Safe CSV (neutralizes = + - @ cells)</span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const ok = await copyToClipboard(csvPreview);
+                            if (ok) {
+                              setCopiedCsv(true);
+                              window.setTimeout(() => setCopiedCsv(false), 1800);
+                            }
+                          }}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 cursor-pointer"
+                        >
+                          {copiedCsv ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                          <span>{copiedCsv ? t('obs.copied') : 'Copy CSV'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleDownloadCsv}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 cursor-pointer"
+                        >
+                          <Download className="w-3 h-3" />
+                          <span>{t('obs.ledgerDownloadCsv')}</span>
+                        </button>
+                      </div>
+                    </div>
+                    <pre className="text-[11px] font-mono text-emerald-200 leading-relaxed overflow-x-auto max-h-52">
+                      {csvPreview}
+                    </pre>
+                  </div>
+                )}
               </section>
             );
           })()}

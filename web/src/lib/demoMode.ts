@@ -91,6 +91,18 @@ interface DemoState {
   secretLeases: any[];
   maintenanceWindows: any[];
   incidents: any[];
+  brand: {
+    brandName: string;
+    tagline: string;
+    accentHex: string;
+    logoUrl: string;
+    supportUrl: string;
+    hidePoweredBy: boolean;
+    updatedAt: string | null;
+  };
+  webhookSubscriptions: any[];
+  webhookDlq: any[];
+  quotas: Record<string, { projectId: string; containers: number; memoryMb: number; cpuCores: number; storageGb: number; bandwidthGbMo: number }>;
 }
 
 function createInitialDemoState(): DemoState {
@@ -190,36 +202,58 @@ function createInitialDemoState(): DemoState {
         id: 'db_pg_main',
         name: 'acme-postgres-16',
         engine: 'postgresql',
+        engineLabel: 'PostgreSQL 16',
         version: '16-alpine',
         image: 'postgres:16-alpine',
         status: 'running',
+        health: 'healthy',
+        containerName: 'culkibo-db-pg-main',
+        networkName: 'culkibo-net-proj-acme-web',
+        connectionTemplate: 'postgresql://acme:••••••••@culkibo-db-pg-main:5432/acme_prod',
         host: '127.0.0.1',
         port: 5432,
         internalHost: 'culkibo-db-pg-main',
         internalPort: 5432,
         databaseName: 'acme_prod',
         username: 'acme',
+        memoryMb: 512,
         memoryLimitMb: 512,
+        cpus: 1,
         cpuLimit: 1,
         publicExposure: false,
+        exposure: { enabled: false, bindAddress: '127.0.0.1', hostPort: null },
+        schedule: { enabled: true, cron: '0 3 * * *', nextRunAt: nowIso(1000 * 60 * 60 * 8), lastRunAt: t3, lastStatus: 'ok' },
+        retention: { hourly: 6, daily: 7, weekly: 4 },
+        backupsCount: 2,
         createdAt: t3,
       },
       {
         id: 'db_valkey_cache',
         name: 'acme-valkey-8',
         engine: 'valkey',
+        engineLabel: 'Valkey 8 (Redis)',
         version: '8-alpine',
         image: 'valkey/valkey:8-alpine',
         status: 'running',
+        health: 'healthy',
+        containerName: 'culkibo-db-valkey',
+        networkName: 'culkibo-net-proj-acme-web',
+        connectionTemplate: 'redis://:••••••••@culkibo-db-valkey:6379/0',
         host: '127.0.0.1',
         port: 6379,
         internalHost: 'culkibo-db-valkey',
         internalPort: 6379,
         databaseName: '0',
         username: 'default',
+        memoryMb: 256,
         memoryLimitMb: 256,
+        cpus: 0.5,
         cpuLimit: 0.5,
         publicExposure: false,
+        exposure: { enabled: false, bindAddress: '127.0.0.1', hostPort: null },
+        schedule: { enabled: false, cron: '0 4 * * 0', nextRunAt: null, lastRunAt: null, lastStatus: null },
+        retention: { hourly: 0, daily: 7, weekly: 4 },
+        backupsCount: 1,
         createdAt: t3,
       },
     ],
@@ -616,6 +650,61 @@ function createInitialDemoState(): DemoState {
         updatedAt: t1,
       },
     ],
+    brand: {
+      brandName: 'Culkibo',
+      tagline: 'Ultra-lightweight self-hosted PaaS',
+      accentHex: '#6366f1',
+      logoUrl: '',
+      supportUrl: 'https://status.acme-demo.dev',
+      hidePoweredBy: false,
+      updatedAt: t2,
+    },
+    webhookSubscriptions: [
+      {
+        id: 'whsub_deploy_prod',
+        url: 'https://hooks.acme-demo.dev/culkibo/events',
+        events: ['deploy.succeeded', 'deploy.failed', 'backup.verified', 'cve.detected'],
+        description: 'Production Release & Security Event Bus',
+        enabled: true,
+        secretPreview: 'whsec_9kF2••••••••8mQ1',
+        hasSecondarySecret: false,
+        secondaryExpiresAt: null,
+        createdAt: t3,
+        updatedAt: t1,
+      },
+      {
+        id: 'whsub_billing_erp',
+        url: 'https://billing.acme-demo.dev/webhooks/usage',
+        events: ['quota.threshold', 'billing.snapshot'],
+        description: 'Agency Client ERP Metering Sink',
+        enabled: true,
+        secretPreview: 'whsec_4xP7••••••••2nR9',
+        hasSecondarySecret: true,
+        secondaryExpiresAt: nowIso(1000 * 60 * 60 * 18),
+        createdAt: t3,
+        updatedAt: t2,
+      },
+    ],
+    webhookDlq: [
+      {
+        id: 'dlq_demo_001',
+        subscriptionId: 'whsub_deploy_prod',
+        url: 'https://hooks.acme-demo.dev/culkibo/events',
+        eventType: 'deploy.succeeded',
+        status: 'failed',
+        attempts: 2,
+        httpStatus: 503,
+        lastStatusCode: 503,
+        lastError: 'Upstream returned HTTP 503 Service Unavailable (retry window exhausted)',
+        createdAt: t1,
+        replayedAt: null,
+      },
+    ],
+    quotas: {
+      proj_acme_web: { projectId: 'proj_acme_web', containers: 4, memoryMb: 1024, cpuCores: 2, storageGb: 25, bandwidthGbMo: 250 },
+      proj_edge_rust: { projectId: 'proj_edge_rust', containers: 2, memoryMb: 512, cpuCores: 1, storageGb: 10, bandwidthGbMo: 200 },
+      proj_ai_worker: { projectId: 'proj_ai_worker', containers: 2, memoryMb: 1024, cpuCores: 2, storageGb: 20, bandwidthGbMo: 100 },
+    },
   };
 }
 
@@ -1786,15 +1875,381 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ revoked: true, id });
   }
 
-  // --- Databases ---
+  // --- Databases & Cycle-9 Read-Only DB Studio + Post-MinIO S3 Storage ---
   if (pathname === '/api/databases' && method === 'GET') {
     return jsonResponse({ databases: s.databases });
+  }
+  if (pathname === '/api/databases/engines' && method === 'GET') {
+    return jsonResponse({
+      engines: [
+        { engine: 'postgresql', label: 'PostgreSQL 16', image: 'postgres:16-alpine', licence: 'PostgreSQL License' },
+        { engine: 'valkey', label: 'Valkey 8 (Redis)', image: 'valkey/valkey:8-alpine', licence: 'BSD-3-Clause' },
+        { engine: 'mysql', label: 'MySQL 8.4 LTS', image: 'mysql:8.4', licence: 'GPL-2.0' },
+        { engine: 'mariadb', label: 'MariaDB 11', image: 'mariadb:11.4', licence: 'GPL-2.0' },
+        { engine: 'mongodb', label: 'MongoDB 7', image: 'mongo:7.0', licence: 'SSPL' },
+      ],
+    });
   }
   if (pathname === '/api/databases/docker-status') {
     return jsonResponse({ available: true, version: '27.5.1', running: true });
   }
   if (pathname === '/api/databases/storage') {
     return jsonResponse({ configured: false });
+  }
+  if (pathname.match(/^\/api\/databases\/[^/]+\/backups$/) && method === 'GET') {
+    return jsonResponse({
+      backups: [
+        { id: 'bk_demo_1', createdAt: nowIso(-1000 * 60 * 60 * 6), sizeBytes: 18_420_112, trigger: 'scheduled', localAvailable: true, remoteAvailable: false },
+      ],
+    });
+  }
+  const dbStudioSqlMatch = pathname.match(/^\/api\/databases\/([^/]+)\/studio\/sql$/);
+  if (dbStudioSqlMatch && method === 'POST') {
+    const rawQuery = String(body.query || '').trim();
+    if (!rawQuery) {
+      return jsonResponse({ error: 'SQL query is required.' }, 400);
+    }
+    const stripped = rawQuery
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/--[^\n]*/g, ' ')
+      .trim();
+    const withoutTrailingSemi = stripped.replace(/;+$/, '');
+    if (/^\\[a-z!?]/i.test(rawQuery) || withoutTrailingSemi.includes(';')) {
+      return jsonResponse({ error: 'Blocked by Read-Only SQL Gate: stacked statements and psql metacommands are forbidden.' }, 400);
+    }
+    const forbiddenRe = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|COPY|CALL|DO|SET|RESET|VACUUM|ANALYZE|CLUSTER|REINDEX|ATTACH|DETACH|PRAGMA|MERGE|REPLACE|EXEC|EXECUTE|LOAD|LOCK|LISTEN|NOTIFY|PREPARE|DEALLOCATE|PG_TERMINATE_BACKEND|PG_READ_FILE|PG_LS_DIR|LO_IMPORT|LO_EXPORT)\b/i;
+    const hit = withoutTrailingSemi.match(forbiddenRe);
+    if (hit) {
+      return jsonResponse({ error: `Blocked by Read-Only SQL Gate: destructive/mutating keyword "${hit[1].toUpperCase()}" is forbidden.` }, 400);
+    }
+    if (!/^(SELECT|EXPLAIN|SHOW|WITH)\b/i.test(withoutTrailingSemi)) {
+      return jsonResponse({ error: 'Blocked by Read-Only SQL Gate: only SELECT, EXPLAIN, SHOW, or read-only WITH queries are allowed.' }, 400);
+    }
+    const hasLimit = /\bLIMIT\s+\d+/i.test(withoutTrailingSemi);
+    const cappedQuery = /^(SELECT|WITH)\b/i.test(withoutTrailingSemi) && !hasLimit
+      ? `${withoutTrailingSemi} LIMIT 200`
+      : withoutTrailingSemi;
+    return jsonResponse({
+      ok: true,
+      dryRunPreview: true,
+      readOnlyEnforced: true,
+      engine: String(body.engine || 'postgres'),
+      sanitizedQuery: cappedQuery,
+      wrappedSql: `BEGIN TRANSACTION READ ONLY; SET LOCAL statement_timeout = '5000ms'; ${cappedQuery}; ROLLBACK;`,
+      statementTimeoutMs: 5000,
+      rowCap: 200,
+      durationMs: 1.8,
+      columns: ['id', 'project', 'status', 'duration_ms', 'created_at'],
+      rowCount: 3,
+      rows: [
+        { id: 'dep_8c4f1a', project: 'acme-saas-web', status: 'active', duration_ms: 14200, created_at: nowIso(-1000 * 60 * 14) },
+        { id: 'dep_3e91b2', project: 'edge-api-rust', status: 'active', duration_ms: 11850, created_at: nowIso(-1000 * 60 * 48) },
+        { id: 'dep_71d2c0', project: 'ai-worker-py', status: 'active', duration_ms: 9410, created_at: nowIso(-1000 * 60 * 190) },
+      ],
+    });
+  }
+  const dbStudioRedisMatch = pathname.match(/^\/api\/databases\/([^/]+)\/studio\/redis$/);
+  if (dbStudioRedisMatch && method === 'POST') {
+    const tokens = Array.isArray(body.argv)
+      ? body.argv.map((x: unknown) => String(x)).filter(Boolean)
+      : String(body.argv || '').trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) {
+      return jsonResponse({ error: 'Redis command is required.' }, 400);
+    }
+    const cmd = tokens[0].toUpperCase();
+    const allowed = new Set(['SCAN', 'TYPE', 'TTL', 'PTTL', 'DBSIZE', 'INFO', 'STRLEN', 'LLEN', 'HLEN', 'SCARD', 'ZCARD', 'GET']);
+    if (!allowed.has(cmd)) {
+      return jsonResponse({ error: `Blocked by Safe Redis Gate: command "${cmd}" is disallowed (read-only allowlist only).` }, 400);
+    }
+    const normalized = [cmd, ...tokens.slice(1)];
+    let clampedCount: number | null = null;
+    if (cmd === 'SCAN') {
+      if (normalized.length === 1) normalized.push('0');
+      const countIdx = normalized.findIndex((t) => t.toUpperCase() === 'COUNT');
+      if (countIdx !== -1 && normalized[countIdx + 1]) {
+        const parsedCount = Math.max(1, Math.min(100, parseInt(normalized[countIdx + 1], 10) || 50));
+        normalized[countIdx + 1] = String(parsedCount);
+        clampedCount = parsedCount;
+      } else {
+        normalized.push('COUNT', '50');
+        clampedCount = 50;
+      }
+    }
+    const output = cmd === 'INFO'
+      ? '# Memory\nused_memory_human:18.42M\nused_memory_peak_human:24.10M\nmaxmemory_human:256.00M\nmem_fragmentation_ratio:1.08'
+      : cmd === 'DBSIZE'
+        ? '(integer) 1428'
+        : 'cursor: "0"\nkeys: ["session:usr_owner", "cache:catalog:v2", "ratelimit:edge:91.107.194.22", "queue:webhooks:pending"]';
+    return jsonResponse({
+      ok: true,
+      dryRunPreview: true,
+      readOnlyEnforced: true,
+      command: cmd,
+      normalizedArgv: normalized,
+      clampedCount,
+      output,
+    });
+  }
+  const dbStudioBloatMatch = pathname.match(/^\/api\/databases\/([^/]+)\/studio\/bloat$/);
+  if (dbStudioBloatMatch && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      checkedTables: 14,
+      bloatedTables: [
+        { tableName: 'webhook_deliveries', liveTuples: 48200, deadTuples: 16400, deadTupleRatio: 0.254, sizeBytes: 42_991_616, recommendation: 'Run VACUUM (ANALYZE) webhook_deliveries' },
+      ],
+      unusedIndexes: [
+        { indexName: 'idx_events_legacy_payload', tableName: 'audit_events', sizeBytes: 12_582_912, idxScan: 0 },
+      ],
+      recommendations: [
+        'Table "webhook_deliveries" has 25.4% dead tuples (16,400 dead) — schedule VACUUM (ANALYZE) during off-peak window.',
+        'Unused index "idx_events_legacy_payload" (12.0 MB, 0 scans) — safe candidate for DROP INDEX CONCURRENTLY.',
+      ],
+    });
+  }
+
+  if (pathname === '/api/storage/presets' && method === 'GET') {
+    return jsonResponse({
+      presets: [
+        {
+          id: 'garage',
+          name: 'Garage',
+          label: 'Garage S3 (Rust CRDT)',
+          image: 'dxflrs/garage:v1.0.1',
+          licence: 'AGPL-3.0',
+          bindAddress: '127.0.0.1',
+          defaultPort: 3900,
+          memoryMb: 40,
+          region: 'garage',
+          summary: 'Ultra-lightweight (~40 MB RAM) Rust geo-distributed S3 compatible with WireGuard mesh.',
+        },
+        {
+          id: 'rustfs',
+          name: 'RustFS',
+          label: 'RustFS (Apache-2.0 MinIO Drop-In)',
+          image: 'rustfs/rustfs:1.0.0-alpha.45',
+          licence: 'Apache-2.0',
+          bindAddress: '127.0.0.1',
+          defaultPort: 9000,
+          memoryMb: 96,
+          region: 'us-east-1',
+          summary: 'High-throughput Apache-2.0 drop-in MinIO replacement with ILM & Object Lock.',
+        },
+        {
+          id: 'seaweedfs',
+          name: 'SeaweedFS',
+          label: 'SeaweedFS Filer + S3',
+          image: 'chrislusf/seaweedfs:3.85',
+          licence: 'Apache-2.0',
+          bindAddress: '127.0.0.1',
+          defaultPort: 8333,
+          memoryMb: 128,
+          region: 'us-east-1',
+          summary: 'Distributed Filer + S3 gateway built for billions of blobs and fast tiering.',
+        },
+      ],
+    });
+  }
+  if (pathname === '/api/storage/presign' && method === 'POST') {
+    const bucket = String(body.bucket || '').trim();
+    const key = String(body.key || '').trim();
+    const expiresIn = Number(body.expiresIn ?? 900);
+    const httpMethod = String(body.method || 'GET').toUpperCase();
+    const endpoint = String(body.endpoint || 'http://127.0.0.1:3900').replace(/\/+$/, '');
+    const region = String(body.region || 'us-east-1').trim() || 'us-east-1';
+    const accessKeyId = String(body.accessKeyId || 'GK_demo_access_key').trim();
+    if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) {
+      return jsonResponse({ error: 'Invalid S3 bucket name (3-63 lowercase alphanumeric, dots, or hyphens).' }, 400);
+    }
+    if (!key || key.startsWith('/') || key.includes('..') || Array.from(key).some((ch) => ch.charCodeAt(0) < 32)) {
+      return jsonResponse({ error: 'Invalid object key: path traversal (".."), leading slash, and control chars are blocked.' }, 400);
+    }
+    if (!Number.isFinite(expiresIn) || expiresIn < 60 || expiresIn > 604800) {
+      return jsonResponse({ error: 'expiresIn must be between 60s and 604800s (7 days).' }, 400);
+    }
+    const dateStamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const amzDate = `${dateStamp}T120000Z`;
+    const fakeSig = '9a7c4e2b8f01d356a4c9e8d20f7b1a5c3e9d01f2a4b6c8d0e1f2a3b4c5d6e7f8';
+    const cred = encodeURIComponent(`${accessKeyId}/${dateStamp}/${region}/s3/aws4_request`);
+    const url = `${endpoint}/${bucket}/${key.split('/').map(encodeURIComponent).join('/')}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=${cred}&X-Amz-Date=${amzDate}&X-Amz-Expires=${expiresIn}&X-Amz-SignedHeaders=host&X-Amz-Signature=${fakeSig}`;
+    return jsonResponse({
+      ok: true,
+      url,
+      method: httpMethod,
+      bucket,
+      key,
+      expiresIn,
+      expiresAt: nowIso(expiresIn * 1000),
+      algorithm: 'AWS4-HMAC-SHA256',
+      signature: fakeSig,
+    });
+  }
+
+  // --- Cycle-9 White-Label Brand Engine, Standard-Webhooks DLQ & Agency Billing Ledger ---
+  if (pathname === '/api/brand') {
+    if (method === 'PUT' || method === 'POST') {
+      const nextName = body.brandName != null ? String(body.brandName).trim() : s.brand.brandName;
+      const nextTagline = body.tagline != null ? String(body.tagline).trim() : s.brand.tagline;
+      const nextAccent = body.accentHex != null ? String(body.accentHex).trim() : s.brand.accentHex;
+      const nextLogo = body.logoUrl != null ? String(body.logoUrl).trim() : s.brand.logoUrl;
+      const nextSupport = body.supportUrl != null ? String(body.supportUrl).trim() : s.brand.supportUrl;
+      if (!nextName || nextName.length > 60 || /[<>'"]/.test(nextName)) {
+        return jsonResponse({ error: 'Invalid brandName (1-60 chars, HTML/quote chars forbidden).' }, 400);
+      }
+      if (nextTagline.length > 140 || /[<>]/.test(nextTagline)) {
+        return jsonResponse({ error: 'Invalid tagline (max 140 chars, < and > forbidden).' }, 400);
+      }
+      if (!/^#[0-9a-fA-F]{6}$/.test(nextAccent)) {
+        return jsonResponse({ error: 'Invalid accentHex: strict #RRGGBB format required (CSS injection blocked).' }, 400);
+      }
+      if (nextSupport && !/^https:\/\//i.test(nextSupport)) {
+        return jsonResponse({ error: 'Invalid supportUrl: must start with https://' }, 400);
+      }
+      if (nextLogo && (!/^https:\/\//i.test(nextLogo) && !/^data:image\/svg\+xml/i.test(nextLogo) || /<script|on[a-z]+\s*=|foreignObject|javascript:|<iframe/i.test(nextLogo))) {
+        return jsonResponse({ error: 'Invalid logoUrl: unsafe URI or SVG payload rejected.' }, 400);
+      }
+      s.brand = {
+        brandName: nextName,
+        tagline: nextTagline,
+        accentHex: nextAccent,
+        logoUrl: nextLogo,
+        supportUrl: nextSupport,
+        hidePoweredBy: typeof body.hidePoweredBy === 'boolean' ? body.hidePoweredBy : s.brand.hidePoweredBy,
+        updatedAt: nowIso(),
+      };
+      return jsonResponse({ brand: s.brand, ...s.brand });
+    }
+    return jsonResponse({ brand: s.brand, ...s.brand });
+  }
+  if (pathname === '/api/brand/reset' && method === 'POST') {
+    s.brand = {
+      brandName: 'Culkibo',
+      tagline: 'Ultra-lightweight self-hosted PaaS',
+      accentHex: '#6366f1',
+      logoUrl: '',
+      supportUrl: '',
+      hidePoweredBy: false,
+      updatedAt: null,
+    };
+    return jsonResponse({ brand: s.brand, ...s.brand });
+  }
+
+  if (pathname === '/api/webhooks/outbound') {
+    if (method === 'POST') {
+      const urlStr = String(body.url || '').trim();
+      if (!/^https?:\/\//i.test(urlStr) || /127\.0\.0\.1|localhost|169\.254\.169\.254/i.test(urlStr)) {
+        return jsonResponse({ error: 'Webhook URL blocked by anti-SSRF guard (must be public HTTPS endpoint).' }, 400);
+      }
+      const rawSec = `whsec_${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 14)}`;
+      const sub = {
+        id: `whsub_${Date.now().toString(36)}`,
+        url: urlStr,
+        events: Array.isArray(body.events) && body.events.length > 0 ? body.events : ['*'],
+        description: String(body.description || 'Custom Standard-Webhook'),
+        enabled: body.enabled !== false,
+        secretPreview: `${rawSec.slice(0, 10)}••••••••${rawSec.slice(-4)}`,
+        hasSecondarySecret: false,
+        secondaryExpiresAt: null,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+      s.webhookSubscriptions = [sub, ...s.webhookSubscriptions];
+      return jsonResponse({ subscription: sub, secret: rawSec, secretPreview: sub.secretPreview }, 201);
+    }
+    return jsonResponse({ subscriptions: s.webhookSubscriptions });
+  }
+  const whRotateMatch = pathname.match(/^\/api\/webhooks\/outbound\/([^/]+)\/rotate-secret$/);
+  if (whRotateMatch && method === 'POST') {
+    const id = decodeURIComponent(whRotateMatch[1]);
+    const graceSec = Number(body.graceSec) || 86400;
+    const rawSec = `whsec_${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 14)}`;
+    const preview = `${rawSec.slice(0, 10)}••••••••${rawSec.slice(-4)}`;
+    const exp = nowIso(graceSec * 1000);
+    s.webhookSubscriptions = s.webhookSubscriptions.map((sub) =>
+      sub.id === id ? { ...sub, secretPreview: preview, hasSecondarySecret: true, secondaryExpiresAt: exp, updatedAt: nowIso() } : sub
+    );
+    const updated = s.webhookSubscriptions.find((sub) => sub.id === id);
+    return jsonResponse({ ok: true, subscription: updated, secret: rawSec, secretPreview: preview, graceSec, secondaryExpiresAt: exp });
+  }
+  if (pathname === '/api/webhooks/dlq' && method === 'GET') {
+    return jsonResponse({ entries: s.webhookDlq });
+  }
+  const whReplayMatch = pathname.match(/^\/api\/webhooks\/dlq\/([^/]+)\/replay$/);
+  if (whReplayMatch && method === 'POST') {
+    const id = decodeURIComponent(whReplayMatch[1]);
+    s.webhookDlq = s.webhookDlq.map((e) =>
+      e.id === id ? { ...e, status: 'replayed', httpStatus: 200, attempts: (e.attempts || 1) + 1, replayedAt: nowIso(), lastError: null } : e
+    );
+    const entry = s.webhookDlq.find((e) => e.id === id);
+    return jsonResponse({ ok: true, replayed: true, delivered: true, entry });
+  }
+
+  if (pathname === '/api/quotas' && method === 'GET') {
+    return jsonResponse({ quotas: s.quotas, items: Object.values(s.quotas) });
+  }
+  if (pathname === '/api/billing/ledger' && method === 'GET') {
+    const periodDays = Math.max(1, Math.min(365, Number(parsed.searchParams.get('periodDays')) || 30));
+    const scale = periodDays / 30;
+    const rows = [
+      {
+        projectId: 'proj_acme_web',
+        projectName: 'acme-saas-web',
+        cpuHours: Number((540 * scale).toFixed(1)),
+        ramGbHours: Number((360 * scale).toFixed(1)),
+        storageGb: 14.2,
+        bandwidthGb: Number((92.4 * scale).toFixed(1)),
+        estimatedCostUsd: Number((18.42 * scale).toFixed(2)),
+        containersCount: 2,
+        memoryMb: 512,
+        quota: s.quotas.proj_acme_web,
+        quotaUtilizationPct: 57,
+      },
+      {
+        projectId: 'proj_edge_rust',
+        projectName: 'edge-api-rust',
+        cpuHours: Number((288 * scale).toFixed(1)),
+        ramGbHours: Number((180 * scale).toFixed(1)),
+        storageGb: 4.8,
+        bandwidthGb: Number((64.1 * scale).toFixed(1)),
+        estimatedCostUsd: Number((9.85 * scale).toFixed(2)),
+        containersCount: 1,
+        memoryMb: 256,
+        quota: s.quotas.proj_edge_rust,
+        quotaUtilizationPct: 50,
+      },
+      {
+        projectId: 'proj_ai_worker',
+        projectName: 'ai-worker-py',
+        cpuHours: Number((412 * scale).toFixed(1)),
+        ramGbHours: Number((384 * scale).toFixed(1)),
+        storageGb: 16.5,
+        bandwidthGb: Number((28.0 * scale).toFixed(1)),
+        estimatedCostUsd: Number((14.60 * scale).toFixed(2)),
+        containersCount: 1,
+        memoryMb: 512,
+        quota: s.quotas.proj_ai_worker,
+        quotaUtilizationPct: 83,
+      },
+    ];
+    const totals = {
+      cpuHours: Number(rows.reduce((a, r) => a + r.cpuHours, 0).toFixed(1)),
+      ramGbHours: Number(rows.reduce((a, r) => a + r.ramGbHours, 0).toFixed(1)),
+      storageGb: Number(rows.reduce((a, r) => a + r.storageGb, 0).toFixed(1)),
+      bandwidthGb: Number(rows.reduce((a, r) => a + r.bandwidthGb, 0).toFixed(1)),
+      estimatedCostUsd: Number(rows.reduce((a, r) => a + r.estimatedCostUsd, 0).toFixed(2)),
+    };
+    if (parsed.searchParams.get('format') === 'csv') {
+      const csvLines = [
+        'project_id,project_name,cpu_hours,ram_gb_hours,storage_gb,bandwidth_gb,estimated_cost_usd',
+        ...rows.map((r) => `${r.projectId},${r.projectName},${r.cpuHours},${r.ramGbHours},${r.storageGb},${r.bandwidthGb},${r.estimatedCostUsd.toFixed(2)}`),
+        `TOTAL,ALL_PROJECTS,${totals.cpuHours},${totals.ramGbHours},${totals.storageGb},${totals.bandwidthGb},${totals.estimatedCostUsd.toFixed(2)}`,
+      ].join('\n');
+      return new Response(csvLines, {
+        status: 200,
+        headers: { 'Content-Type': 'text/csv; charset=utf-8' },
+      });
+    }
+    return jsonResponse({ ok: true, periodDays, currency: 'USD', generatedAt: nowIso(), entries: rows, projects: rows, totals });
   }
 
   // --- Catalog ---
@@ -1974,16 +2429,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (125 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (130 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 125 MCP tools on demand without bloating context (-84%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 130 MCP tools on demand without bloating context (-85%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_webhook_dlq', description: 'Manage Standard-Webhooks whsec_ subscriptions, dual-secret rotation & anti-SSRF DLQ replay', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_db_studio', description: 'Read-only SQL (BEGIN TRANSACTION READ ONLY) & safe Redis/Valkey inspector + Postgres bloat diagnostics', readOnly: true, profile: 'ops' },
+      { name: 'culkibo_s3_storage', description: 'Post-MinIO Garage/RustFS/SeaweedFS presets, pure-crypto AWS SigV4 presigned URLs & CORS/Lifecycle XML', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_agency_ledger', description: 'Multi-tenant Agency Quotas & CSV-formula-safe billing usage ledger with strict project ACL', readOnly: true, profile: 'ops' },
+      { name: 'culkibo_brand_theme', description: 'Open-Core White-Label brand & custom login theme engine with XSS/CSS-injection guard', readOnly: false, profile: 'ops' },
       { name: 'culkibo_triage_playbook', description: 'Autonomous multi-signal triage chaining incidents, Build Healer, Drift Check & SBOM CVE scan', readOnly: true, profile: 'ops' },
       { name: 'culkibo_cve_scan', description: 'Scan CycloneDX 1.6 SBOM against OSV.dev batch API with 24h cache & offline fallback', readOnly: true, profile: 'security' },
       { name: 'culkibo_drift_check', description: 'Detect live container/DB config drift vs declared state & generate PgBouncer smart pool presets', readOnly: true, profile: 'ops' },
@@ -1995,27 +2455,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 125 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 130 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 125, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 130, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_triage_playbook', status: 'ok', durationMs: 4, timestamp: nowIso(-60000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_export_iac', status: 'ok', durationMs: 2, timestamp: nowIso(-180000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_agency_ledger', status: 'ok', durationMs: 3, timestamp: nowIso(-60000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_db_studio', status: 'ok', durationMs: 2, timestamp: nowIso(-180000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 125,
-      profiles: { core: { count: 17, savedPct: 84 } },
+      totalTools: 130,
+      profiles: { core: { count: 17, savedPct: 85 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

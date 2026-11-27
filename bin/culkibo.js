@@ -50,7 +50,9 @@ const svc = {
   get buildHealerService() { return require('../server/services/buildHealerService'); },
   get fleetMeshService() { return require('../server/services/fleetMeshService'); },
   get iacExporter() { return require('../server/services/iacExporter'); },
-  get cveDriftService() { return require('../server/services/cveDriftService'); }
+  get cveDriftService() { return require('../server/services/cveDriftService'); },
+  get quotaMeteringService() { return require('../server/services/quotaMeteringService'); },
+  get objectStorageService() { return require('../server/services/objectStorageService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2873,15 +2875,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 125,
+            mcpTools: 130,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '125 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
-            'WebAuthn Passkeys, Secret Leases, OSV CVE Scan, Drift+PgBouncer, OpenTofu IaC, Mesh & Terminal'
+            '130 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
+            'WebAuthn Passkeys, Secret Leases, OSV CVE Scan, Read-Only DB Studio, Post-MinIO S3, Agency Ledger & White-Label Brand'
           ]
         };
       };
@@ -3386,6 +3388,89 @@ program
       console.log(`   Hallazgos:   ${vulnerableCount} (critical=${severityCounts.critical ?? 0}, high=${severityCounts.high ?? 0}, medium=${severityCounts.medium ?? 0}, low=${severityCounts.low ?? 0})`);
       if (report.cached) console.log(`   Caché:       hit (24h TTL)`);
       console.log('');
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-9 CLI: ledger (Agency Billing Usage) & s3-presets (Post-MinIO)
+// ===========================================================================
+
+program
+  .command('ledger')
+  .description('Agency Multi-Tenant Billing Usage Ledger: calcula consumo facturable por proyecto (JSON o CSV neutralizado contra fórmulas)')
+  .option('-d, --days <n>', 'Ventana de facturación en días (1..365)', '30')
+  .option('--csv', 'Exportar en formato CSV seguro contra inyección de fórmulas')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const periodDays = Math.min(365, Math.max(1, parseInt(String(options.days || '30'), 10) || 30));
+      const quotaSvc = svc.quotaMeteringService;
+      const projects = svc.projectManager.getAll();
+      const databases = svc.databaseManager.list();
+      const ledger = quotaSvc.buildUsageLedger({ projects, databases, periodDays });
+
+      if (options.csv) {
+        const csv = quotaSvc.exportLedgerCsv(ledger);
+        process.stdout.write(csv.endsWith('\n') ? csv : `${csv}\n`);
+        return;
+      }
+
+      const payload = {
+        ...ledger,
+        ok: true,
+        periodDays
+      };
+      if (isJsonMode(options)) return printJson(payload);
+
+      const rows = Array.isArray(ledger.entries) ? ledger.entries : (Array.isArray(ledger.projects) ? ledger.projects : []);
+      console.log(`\n\x1b[36m📊 Culkibo Agency Usage Ledger (${periodDays}d)\x1b[0m`);
+      if (rows.length > 0) {
+        console.table(rows.map((r) => ({
+          Project: r.projectName || r.projectId,
+          'CPU-hrs': r.cpuHours ?? 0,
+          'RAM GB-hrs': r.ramGbHours ?? 0,
+          'Storage GB': r.storageGb ?? 0,
+          'BW GB': r.bandwidthGb ?? 0,
+          'Est. USD': `$${Number(r.estimatedCostUsd ?? 0).toFixed(2)}`
+        })));
+      } else {
+        console.log('   Sin proyectos registrados en este periodo.');
+      }
+      if (ledger.totals) {
+        console.log(`   TOTAL (${periodDays}d): $${Number(ledger.totals.estimatedCostUsd ?? 0).toFixed(2)} USD\n`);
+      }
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('s3-presets')
+  .description('2026 Post-MinIO S3 Storage Orchestrator: muestra presets pineados (Garage, RustFS, SeaweedFS) con red privada 127.0.0.1')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const s3Svc = svc.objectStorageService;
+      const presets = s3Svc.listPresets();
+      const list = Array.isArray(presets) ? presets : [];
+      const payload = {
+        ok: true,
+        count: list.length,
+        presets: list
+      };
+      if (isJsonMode(options)) return printJson(payload);
+
+      console.log('\n\x1b[36m🗄️  Culkibo 2026 Post-MinIO S3 Presets (private 127.0.0.1 bind by default)\x1b[0m');
+      console.table(list.map((p) => ({
+        ID: p.id,
+        Engine: p.name,
+        Image: p.image,
+        Bind: p.bindAddress,
+        Port: p.s3Port,
+        RAM: `~${p.ramEstimateMb} MB`
+      })));
     } catch (err) {
       failCli(err, options);
     }
