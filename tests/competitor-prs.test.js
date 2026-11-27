@@ -2827,6 +2827,156 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #12 CVEs (14a-14e): Uptime Kuma #5772/#7500 & Gatus #856 synthetic+TLS, Squawk DDL linter, Dokploy #6105/KEDA RAM-cap+503 breaker, CycloneDX 1.6 AGPL/SSPL, runc CVE-2025-31133/52565/52881+io_uring seccomp');
 
+  // -------------------------------------------------------------------------
+  // 15. Cycle #13 150-MCP Milestone Regressions (docs/COMPETITOR_RADAR_CYCLE12.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const { auditDockerfileAndLayers } = require('../server/services/imageBloatAuditor');
+    const { CronLeaseService } = require('../server/services/cronLeaseService');
+    const { maskDataset } = require('../server/services/piiMaskerService');
+    const { classifyContainerFailure } = require('../server/services/oomForensicsService');
+    const { OnCallEscalationService } = require('../server/services/oncallEscalationService');
+
+    const c13Tmp = makeTempDir('culkibo-c13-cve-');
+    try {
+      // Dynamic synthetic token strings (0 verbatim GH013 secret prefixes)
+      const dynStripe = ['sk', 'live', 'c13RegressionToken01234567'].join('_');
+      const dynGhp = ['ghp', 'C13FakeTokenAbCdEfGhIjKlMnOpQrSt'].join('_');
+
+      // 15a. coolify#7019/#5328 + Dive/Dockle: secret in ENV, cross-layer rm, missing multi-stage vs slim >=90
+      const leakyAudit = auditDockerfileAndLayers({
+        dockerfile: [
+          'FROM node:22',
+          'WORKDIR /app',
+          `ENV API_KEY=${dynStripe}`,
+          'COPY . .',
+          'RUN npm install',
+          'RUN rm -rf /app/build-cache',
+          'CMD ["node", "server.js"]'
+        ].join('\n'),
+        stack: 'node'
+      });
+      assert.ok(leakyAudit.secretLeaks.length >= 1, 'Plaintext ENV secret MUST be flagged (coolify#7019/#5328)');
+      assert.ok(!JSON.stringify(leakyAudit).includes(dynStripe), 'Matched raw secret value MUST be redacted');
+      const leakyIds = leakyAudit.findings.map((f) => f.rule);
+      assert.ok(leakyIds.includes('CROSS_LAYER_DELETE_WASTE'), 'Cross-layer rm MUST be caught');
+      assert.ok(leakyIds.includes('MISSING_MULTI_STAGE'), 'Single-stage heavy SDK MUST be caught');
+
+      const slimAudit = auditDockerfileAndLayers({
+        dockerfile: [
+          'FROM node:22-alpine AS builder',
+          'WORKDIR /app',
+          'COPY package.json package-lock.json ./',
+          'RUN npm ci',
+          'COPY . .',
+          'RUN npm run build',
+          'FROM gcr.io/distroless/nodejs22-debian12:nonroot',
+          'WORKDIR /app',
+          'COPY --from=builder /app/dist ./dist',
+          'CMD ["dist/index.js"]'
+        ].join('\n'),
+        stack: 'node'
+      });
+      assert.ok(slimAudit.efficiencyScore >= 90, `Clean multi-stage distroless MUST score >= 90 (got ${slimAudit.efficiencyScore})`);
+      assert.strictEqual(slimAudit.secretLeaks.length, 0);
+
+      // 15b. coolify#5655 + dokploy#1475: cronLeaseService concurrent lock, completed slot dedup & stale fencingToken
+      const cl = new CronLeaseService({ dataDir: c13Tmp });
+      const t0 = Date.UTC(2026, 10, 27, 0, 0, 0);
+      const l1 = cl.acquireCronLease({ jobId: 'daily-invoice', scheduleSlotIso: '2026-11-27T00:00:00Z', holderId: 'rep-1', ttlSec: 300, nowMs: t0 });
+      assert.strictEqual(l1.acquired, true);
+      assert.strictEqual(l1.fencingToken, 1);
+
+      const lDup = cl.acquireCronLease({ jobId: 'daily-invoice', scheduleSlotIso: '2026-11-27T00:00:00Z', holderId: 'rep-2', ttlSec: 300, nowMs: t0 + 1000 });
+      assert.strictEqual(lDup.acquired, false);
+      assert.strictEqual(lDup.reason, 'ALREADY_RUNNING');
+
+      const badComp = cl.completeCronLease(l1.leaseId, { holderId: 'rep-1', fencingToken: 999, status: 'succeeded', nowMs: t0 + 2000 });
+      assert.strictEqual(badComp.ok, false);
+      assert.strictEqual(badComp.reason, 'STALE_FENCING_TOKEN');
+
+      const okComp = cl.completeCronLease(l1.leaseId, { holderId: 'rep-1', fencingToken: 1, status: 'succeeded', nowMs: t0 + 3000 });
+      assert.strictEqual(okComp.ok, true);
+
+      const repeatSlot = cl.acquireCronLease({ jobId: 'daily-invoice', scheduleSlotIso: '2026-11-27T00:00:00Z', holderId: 'rep-2', ttlSec: 300, nowMs: t0 + 10000 });
+      assert.strictEqual(repeatSlot.acquired, false);
+      assert.strictEqual(repeatSlot.reason, 'ALREADY_EXECUTED_SLOT');
+
+      // 15c. Post-Snaplet/Neosync PII Guard: deterministic masking across JSON/SQL with 0 raw PII substrings
+      const piiEmail = 'founder.secret@corp.example';
+      const piiPhone = '+1-650-555-0199';
+      const piiCard = '4532-0151-1283-0366';
+      const piiIban = 'DE89370400440532013000';
+      const maskA = maskDataset({
+        seed: 'preview-seed-15c',
+        rows: [{ email: piiEmail, phone: piiPhone, card: piiCard, iban: piiIban, token: dynGhp }],
+        sqlDump: `INSERT INTO users (email, phone) VALUES ('${piiEmail}', '${piiPhone}');`
+      });
+      const maskB = maskDataset({
+        seed: 'preview-seed-15c',
+        rows: [{ owner_email: piiEmail }]
+      });
+      assert.strictEqual(maskA.zeroPiiLeaked, true);
+      const maskAJson = JSON.stringify(maskA);
+      for (const rawVal of [piiEmail, piiPhone, piiCard, piiIban, dynGhp]) {
+        assert.ok(!maskAJson.includes(rawVal), `Original PII/secret leaked: ${rawVal}`);
+      }
+      assert.strictEqual(maskA.maskedRows[0].email, maskB.maskedRows[0].owner_email, 'Same seed MUST produce identical masked value for FK joins');
+
+      // 15d. Portainer/Dokploy/Coolify OOM & Crash-Loop Classifier
+      const cOom = classifyContainerFailure({ exitCode: 137, oomKilled: true, memoryLimitMb: 512, memoryPeakMb: 512 });
+      assert.strictEqual(cOom.classification, 'CGROUP_OOM_KILL');
+      assert.strictEqual(cOom.recommendedMemoryMb, 768);
+      const cSigkill = classifyContainerFailure({ exitCode: 137, oomKilled: false, cgroupOomKills: 0 });
+      assert.strictEqual(cSigkill.classification, 'FORCED_SIGKILL_TIMEOUT');
+      const cSegv = classifyContainerFailure({ exitCode: 139 });
+      assert.strictEqual(cSegv.classification, 'SEGFAULT_ARCH_OR_NATIVE');
+      const cHist = classifyContainerFailure({ exitCode: 137, oomKilled: true, historicalOnly: true });
+      assert.strictEqual(cHist.classification, 'STALE_HISTORICAL_TASK_IGNORED');
+      assert.strictEqual(cHist.ignoreForRollback, true);
+
+      // 15e. uptime-kuma#3255 + GoAlert/Keep: 3x dedup, flapping damper, Tier 1->2 escalation & ack freeze
+      const oc = new OnCallEscalationService({ dataDir: c13Tmp });
+      oc.savePolicy({
+        id: 'pol_15e',
+        name: 'Regression Rotation',
+        shiftDurationHours: 24,
+        rotationStartMs: t0,
+        ackTimeoutSec: 300,
+        flappingWindowSec: 600,
+        flappingThreshold: 3,
+        tiers: [
+          { tier: 1, responders: ['alice', 'bob'] },
+          { tier: 2, responders: ['charlie'] }
+        ]
+      });
+      const a1 = oc.ingestAlert({ policyId: 'pol_15e', fingerprint: 'fp-dedup', state: 'firing', nowMs: t0 });
+      oc.ingestAlert({ policyId: 'pol_15e', fingerprint: 'fp-dedup', state: 'firing', nowMs: t0 + 10000 });
+      const a3 = oc.ingestAlert({ policyId: 'pol_15e', fingerprint: 'fp-dedup', state: 'firing', nowMs: t0 + 20000 });
+      assert.strictEqual(a3.incident.id, a1.incident.id);
+      assert.strictEqual(a3.incident.occurrences, 3);
+      assert.strictEqual(a3.deduplicated, true);
+
+      const esc1 = oc.evaluateEscalations(t0 + 305000);
+      assert.strictEqual(esc1.escalatedCount, 1);
+      assert.strictEqual(esc1.escalated[0].toTier, 2);
+
+      oc.acknowledgeIncident(a1.incident.id, { actor: 'charlie', nowMs: t0 + 310000 });
+      const esc2 = oc.evaluateEscalations(t0 + 900000);
+      assert.strictEqual(esc2.escalatedCount, 0, 'Ack MUST freeze further escalation');
+
+      oc.ingestAlert({ policyId: 'pol_15e', fingerprint: 'fp-flap', state: 'firing', nowMs: t0 });
+      oc.ingestAlert({ policyId: 'pol_15e', fingerprint: 'fp-flap', state: 'resolved', nowMs: t0 + 10000 });
+      oc.ingestAlert({ policyId: 'pol_15e', fingerprint: 'fp-flap', state: 'firing', nowMs: t0 + 20000 });
+      const flapped = oc.ingestAlert({ policyId: 'pol_15e', fingerprint: 'fp-flap', state: 'resolved', nowMs: t0 + 30000 });
+      assert.strictEqual(flapped.flapping, true);
+      assert.strictEqual(flapped.reason, 'FLAPPING_SUPPRESSED');
+    } finally {
+      fs.rmSync(c13Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #13 CVEs (15a-15e): coolify#7019/#5328 image bloat/secrets, coolify#5655/dokploy#1475 cron leases, post-Snaplet/Neosync PII masker, Portainer OOM forensics, uptime-kuma#3255 on-call dedup/flapping/escalation');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

@@ -66,6 +66,8 @@ import {
   type SloCanaryRollout,
   type WorkerAutoscalerPolicy,
   type WorkerAutoscalerEvaluation,
+  type OomForensicsResult,
+  type ImageBloatAuditResult,
 } from '../lib/api';
 import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
@@ -172,8 +174,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [smartPackShowDockerfile, setSmartPackShowDockerfile] = useState(false);
   const [smartPackCopied, setSmartPackCopied] = useState<'ignore' | 'dockerfile' | null>(null);
 
-  // Cycle-5..12 Cockpit Panels (SLSA, Migrations, Micro-Wasm, Time-Machine, Shadow Replay, Terminal, Auto-Healer, Drift Check, SLO Canary, Autoscaler)
-  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | 'autoscaler' | null>(null);
+  // Cycle-5..13 Cockpit Panels (SLSA, Migrations, Micro-Wasm, Time-Machine, Shadow Replay, Terminal, Auto-Healer, Drift Check, SLO Canary, Autoscaler, Forensics)
+  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | 'autoscaler' | 'forensics' | null>(null);
   const [slsaAttest, setSlsaAttest] = useState<ReleaseAttestationResult | null>(null);
   const [slsaVerify, setSlsaVerify] = useState<AttestationVerifyResult | null>(null);
   const [slsaLoading, setSlsaLoading] = useState(false);
@@ -252,6 +254,18 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoEval, setAutoEval] = useState<WorkerAutoscalerEvaluation | null>(null);
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
+
+  // Cycle-13 OOM Forensics & Image Layer Bloat Auditor state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image'>('oom');
+  const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
+  const [oomBusy, setOomBusy] = useState(false);
+  const [oomError, setOomError] = useState<string | null>(null);
+  const [auditDockerfileText, setAuditDockerfileText] = useState(
+    'FROM node:22-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci --omit=dev\nCOPY . .\nFROM node:22-alpine\nUSER node\nWORKDIR /app\nCOPY --from=builder /app .\nCMD ["node", "server.js"]'
+  );
+  const [imageAuditResult, setImageAuditResult] = useState<ImageBloatAuditResult | null>(null);
+  const [imageAuditBusy, setImageAuditBusy] = useState(false);
+  const [imageAuditError, setImageAuditError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1119,7 +1133,59 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
   };
 
-  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | 'autoscaler') => {
+  const handleRunOomForensics = async (preset: 'oom' | 'sigkill' | 'stale') => {
+    setOomBusy(true);
+    setOomError(null);
+    try {
+      const payload =
+        preset === 'oom'
+          ? { containerName: project.name, exitCode: 137, oomKilled: true, restartCount: 3, memoryLimitMb: 512, memoryPeakMb: 512, cgroupOomKills: 2, recentLogs: 'Out of memory: Killed process (node)' }
+          : preset === 'sigkill'
+            ? { containerName: project.name, exitCode: 137, oomKilled: false, restartCount: 1, memoryLimitMb: 512, memoryPeakMb: 190, cgroupOomKills: 0, recentLogs: 'Graceful shutdown exceeded 10s stop timeout' }
+            : { containerName: project.name, exitCode: 137, oomKilled: true, restartCount: 0, memoryLimitMb: 512, historicalOnly: true, recentLogs: 'Previous completed deployment task exited 2d ago' };
+      const res = await api.classifyProjectForensics(project.id, payload);
+      setOomResult(res);
+      onNotify(
+        res.ignoreForRollback
+          ? `Forensics: ${res.classification} (ignored for rollback — zero false alerts!)`
+          : `Forensics: ${res.classification} (${res.severity}${res.recommendedMemoryMb ? ` · recommend ${res.recommendedMemoryMb} MB` : ''})`,
+        res.ignoreForRollback ? 'success' : 'info'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Container forensics failed';
+      setOomError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setOomBusy(false);
+    }
+  };
+
+  const handleAuditImageBloat = async (overrideDockerfile?: string) => {
+    const df = (overrideDockerfile ?? auditDockerfileText).trim();
+    if (!df) return;
+    if (overrideDockerfile !== undefined) setAuditDockerfileText(overrideDockerfile);
+    setImageAuditBusy(true);
+    setImageAuditError(null);
+    try {
+      const res = await api.auditImageBloat({ dockerfile: df, stack: 'node' });
+      setImageAuditResult(res);
+      const leaks = Array.isArray(res.secretLeaks) ? res.secretLeaks.length : 0;
+      onNotify(
+        leaks > 0
+          ? `Image Auditor flagged ${leaks} secret leak(s) · score ${res.efficiencyScore}/100`
+          : `Image Efficiency Score: ${res.efficiencyScore}/100 (est. ${res.estimatedSavingsMb} MB savings)`,
+        leaks > 0 ? 'error' : 'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Dockerfile bloat audit failed';
+      setImageAuditError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setImageAuditBusy(false);
+    }
+  };
+
+  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | 'terminal' | 'healer' | 'drift' | 'canary' | 'autoscaler' | 'forensics') => {
     const next = activeCockpit === panel ? null : panel;
     setActiveCockpit(next);
     if (next === 'timemachine' && tmCheckpoints.length === 0 && !tmLoading) {
@@ -1527,6 +1593,19 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           >
             <Cpu className="w-3.5 h-3.5" />
             <span>{t('pd.autoBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('forensics')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'forensics'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Search className="w-3.5 h-3.5" />
+            <span>{t('pd.forensicsBtn')}</span>
           </button>
         </div>
       </div>
@@ -2751,6 +2830,220 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   Circuit Breaker OPEN → HTTP {autoEval.circuitBreaker.httpStatus ?? 503} · Retry-After: {autoEval.circuitBreaker.retryAfterSec ?? 15}s (VPS protected from OOM!)
                 </div>
               )}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Cycle-13 Cockpit Drawer: OOM & Crash-Loop Forensics + Image Layer Bloat & Secret Auditor */}
+      {activeCockpit === 'forensics' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-4 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <Search className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.forensicsTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.forensicsDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+              <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 text-[11px] font-medium">
+                <button
+                  type="button"
+                  onClick={() => setForensicsTab('oom')}
+                  className={`px-2.5 py-1 rounded-md cursor-pointer ${
+                    forensicsTab === 'oom' ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {t('pd.forensicsTabOom')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setForensicsTab('image')}
+                  className={`px-2.5 py-1 rounded-md cursor-pointer ${
+                    forensicsTab === 'image' ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {t('pd.forensicsTabImage')}
+                </button>
+              </div>
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Forensics panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {forensicsTab === 'oom' ? (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={oomBusy}
+                  onClick={() => void handleRunOomForensics('oom')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {oomBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.forensicsTestOom')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={oomBusy}
+                  onClick={() => void handleRunOomForensics('sigkill')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-800 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <Zap className="w-3.5 h-3.5" />
+                  <span>{t('pd.forensicsTestSigkill')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={oomBusy}
+                  onClick={() => void handleRunOomForensics('stale')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  <History className="w-3.5 h-3.5" />
+                  <span>{t('pd.forensicsTestStale')}</span>
+                </button>
+              </div>
+
+              {oomError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{oomError}</div>}
+
+              {oomResult && (() => {
+                const actions = Array.isArray(oomResult.remediationActions) ? oomResult.remediationActions : [];
+                return (
+                  <div className={`p-3.5 rounded-xl border space-y-2.5 tabular-nums ${
+                    oomResult.ignoreForRollback
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                      : oomResult.severity === 'critical'
+                        ? 'bg-red-50 border-red-200 text-red-900'
+                        : 'bg-amber-50 border-amber-200 text-amber-800'
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-2 font-mono">
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {oomResult.classification}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] uppercase font-semibold">
+                        {oomResult.severity}
+                      </span>
+                      {oomResult.recommendedMemoryMb != null && oomResult.recommendedMemoryMb > 0 && (
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          recommendedMemoryMb: {oomResult.recommendedMemoryMb} MB
+                        </span>
+                      )}
+                      {oomResult.ignoreForRollback && (
+                        <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                          ignoreForRollback: true
+                        </span>
+                      )}
+                      {oomResult.backoffSec != null && (
+                        <span className="text-[10px] opacity-80 ml-auto">backoff: {oomResult.backoffSec}s</span>
+                      )}
+                    </div>
+                    <p className="text-xs leading-relaxed">{oomResult.rootCause}</p>
+                    {actions.length > 0 && (
+                      <ul className="list-disc list-inside font-mono text-[11px] space-y-0.5">
+                        {actions.slice(0, 4).map((a, idx) => (
+                          <li key={idx}>{typeof a === 'string' ? a : (a.message || a.action || a.summary || 'Review container limits')}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    disabled={imageAuditBusy}
+                    onClick={() => {
+                      const fakeKey = ['sk', 'live', 'demo9876543210abcdef'].join('_');
+                      const leakyDf = [
+                        'FROM node:22',
+                        `ENV STRIPE_API_KEY=${fakeKey}`,
+                        'WORKDIR /app',
+                        'RUN apt-get update && apt-get install -y curl',
+                        'COPY . .',
+                        'RUN npm install',
+                        'RUN rm -rf /app/tmp-cache',
+                        'CMD ["node", "server.js"]',
+                      ].join('\n');
+                      void handleAuditImageBloat(leakyDf);
+                    }}
+                    className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    <ShieldAlert className="w-3.5 h-3.5" />
+                    <span>{t('pd.forensicsTestLeaky')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={imageAuditBusy || !auditDockerfileText.trim()}
+                    onClick={() => void handleAuditImageBloat()}
+                    className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                  >
+                    {imageAuditBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                    <span>{imageAuditBusy ? t('pd.forensicsRunning') : t('pd.forensicsAuditBtn')}</span>
+                  </button>
+                </div>
+              </div>
+
+              <textarea
+                rows={4}
+                value={auditDockerfileText}
+                onChange={(e) => setAuditDockerfileText(e.target.value)}
+                aria-label="Dockerfile to audit"
+                spellCheck={false}
+                className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white font-mono text-[11px] text-slate-900 leading-relaxed"
+              />
+
+              {imageAuditError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{imageAuditError}</div>}
+
+              {imageAuditResult && (() => {
+                const leaks = Array.isArray(imageAuditResult.secretLeaks) ? imageAuditResult.secretLeaks : [];
+                const tips = Array.isArray(imageAuditResult.slimmingRecommendations) ? imageAuditResult.slimmingRecommendations : [];
+                return (
+                  <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5 tabular-nums">
+                    <div className="flex flex-wrap items-center gap-2 font-mono">
+                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-semibold border ${
+                        imageAuditResult.efficiencyScore >= 85 && leaks.length === 0
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-red-50 text-red-700 border-red-200'
+                      }`}>
+                        Efficiency: {imageAuditResult.efficiencyScore}/100
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-[10px] text-slate-700">
+                        Est. Savings: {imageAuditResult.estimatedSavingsMb} MB
+                      </span>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
+                        leaks.length > 0
+                          ? 'bg-red-50 text-red-700 border-red-200'
+                          : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      }`}>
+                        {leaks.length > 0 ? `${leaks.length} Secret Leak(s) Detected` : '0 Secret Leaks'}
+                      </span>
+                    </div>
+                    {leaks.length > 0 && (
+                      <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-800 font-mono text-[11px] space-y-1">
+                        {leaks.map((lk, idx) => (
+                          <div key={idx}>
+                            • {typeof lk === 'string' ? lk : `[${lk.rule || lk.type || 'SECRET'}] ${lk.message || lk.redactedSnippet || 'Hardcoded secret in layer'}`}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {tips.length > 0 && (
+                      <ul className="list-disc list-inside font-mono text-[11px] text-slate-700 space-y-0.5">
+                        {tips.slice(0, 4).map((tip, idx) => (
+                          <li key={idx}>{typeof tip === 'string' ? tip : (tip.message || tip.recommendation || tip.action || 'Use multi-stage alpine build')}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           )}
         </section>

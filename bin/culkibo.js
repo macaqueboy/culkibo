@@ -58,7 +58,9 @@ const svc = {
   get complianceBundleService() { return require('../server/services/complianceBundleService'); },
   get admissionPolicyService() { return require('../server/services/admissionPolicyService'); },
   get sqlMigrationLinter() { return require('../server/services/sqlMigrationLinter'); },
-  get licenseAuditorService() { return require('../server/services/licenseAuditorService'); }
+  get licenseAuditorService() { return require('../server/services/licenseAuditorService'); },
+  get imageBloatAuditor() { return require('../server/services/imageBloatAuditor'); },
+  get piiMaskerService() { return require('../server/services/piiMaskerService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2881,15 +2883,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 145,
+            mcpTools: 150,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '145 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
-            'Synthetic API/TLS Sentinel, SQL Migration Linter, KEDA OOM-Safe Autoscaler, SPDX License Audit & Tailored Seccomp'
+            '150 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks + Triage Playbook',
+            'Image Layer Bloat/Secret Auditor, Cron Fencing Leases, PR-Preview PII Masker, OOM Forensics & On-Call Router'
           ]
         };
       };
@@ -3826,6 +3828,125 @@ program
       console.log(`   Avisos:       ${Array.isArray(result.warnings) ? result.warnings.length : 0}`);
       console.log('');
       if (!compliant) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-13 CLI: audit-image (Layer Bloat/Secrets) & mask-pii (PR-Preview)
+// ===========================================================================
+
+program
+  .command('audit-image [dockerfilePath]')
+  .description('Image Layer Bloat & Secret-in-Layer Auditor (8 reglas Dive/Dockle/Hadolint): sale con código 1 si hay fugas de secretos o efficiencyScore < 50')
+  .option('-s, --stack <stack>', 'Stack destino para plantilla multi-stage: node | python | go | rust', 'node')
+  .option('--dockerfile <content>', 'Contenido inline del Dockerfile a auditar')
+  .option('--json', 'Salida JSON estructurada')
+  .action((dockerfilePath, options) => {
+    try {
+      const stack = String(options.stack || 'node').toLowerCase();
+      if (!['node', 'python', 'go', 'rust'].includes(stack)) {
+        throw new Error(`Stack inválido "${options.stack}". Usa: node | python | go | rust`);
+      }
+      let dockerfile = '';
+      /** @type {string | null} */
+      let sourceFile = null;
+      if (typeof options.dockerfile === 'string' && options.dockerfile.trim()) {
+        dockerfile = options.dockerfile;
+      } else {
+        const candidate = dockerfilePath ? path.resolve(String(dockerfilePath)) : path.resolve(process.cwd(), 'Dockerfile');
+        if (!fs.existsSync(candidate)) {
+          throw new Error(`Dockerfile no encontrado: ${candidate}`);
+        }
+        sourceFile = candidate;
+        dockerfile = fs.readFileSync(candidate, 'utf8');
+      }
+
+      const imgAud = svc.imageBloatAuditor;
+      const result = imgAud.auditDockerfileAndLayers({ dockerfile, stack });
+      const secretLeaksCount = Array.isArray(result?.secretLeaks) ? result.secretLeaks.length : 0;
+      const efficiencyScore = Number(result?.efficiencyScore ?? 0);
+      const passed = secretLeaksCount === 0 && efficiencyScore >= 50;
+      const payload = {
+        ...result,
+        ok: passed,
+        passed,
+        ...(sourceFile ? { file: sourceFile } : {})
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!passed) process.exitCode = 1;
+        return;
+      }
+
+      const badge = passed ? '\x1b[32mPASS ✅\x1b[0m' : '\x1b[31mFAIL ❌\x1b[0m';
+      console.log(`\n🐳 Culkibo Image Layer Bloat & Secret Auditor (${stack}) — [${badge}]`);
+      console.log(`   Efficiency:   ${efficiencyScore}/100 (ahorro est. ${result.estimatedSavingsMb ?? 0} MB)`);
+      console.log(`   Secret leaks: ${secretLeaksCount}`);
+      console.log(`   Findings:     ${Array.isArray(result.findings) ? result.findings.length : 0}`);
+      console.log('');
+      if (!passed) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('mask-pii [inputFile]')
+  .description('Deterministic PR-Preview DB PII Masker (Post-Snaplet/Neosync HMAC-SHA256) + pg_anonymizer SECURITY LABEL DDL')
+  .option('--sql <sql>', 'Dump o sentencia SQL inline a enmascarar')
+  .option('--seed <seed>', 'Semilla determinista HMAC-SHA256 (preserva FK joins)', 'culkibo-preview-seed')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    try {
+      const seed = String(options.seed || 'culkibo-preview-seed');
+      /** @type {{ rows?: any[], sqlDump?: string, seed: string, autoDetect: boolean }} */
+      const maskInput = { seed, autoDetect: true };
+      /** @type {string | null} */
+      let sourceFile = null;
+
+      if (typeof options.sql === 'string' && options.sql.trim()) {
+        maskInput.sqlDump = options.sql;
+      } else if (inputFile) {
+        sourceFile = path.resolve(String(inputFile));
+        if (!fs.existsSync(sourceFile)) {
+          throw new Error(`Archivo de entrada no encontrado: ${sourceFile}`);
+        }
+        const raw = fs.readFileSync(sourceFile, 'utf8');
+        const trimmed = raw.trim();
+        if (sourceFile.toLowerCase().endsWith('.json') || trimmed.startsWith('[') || trimmed.startsWith('{')) {
+          const parsed = JSON.parse(raw);
+          maskInput.rows = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.rows) ? parsed.rows : [parsed]);
+        } else {
+          maskInput.sqlDump = raw;
+        }
+      } else {
+        throw new Error('Proporciona un archivo <inputFile> (.json o .sql) o el flag --sql "<SQL>".');
+      }
+
+      const piiSvc = svc.piiMaskerService;
+      const result = piiSvc.maskDataset(maskInput);
+      const safe = Boolean(result && result.zeroPiiLeaked !== false);
+      const payload = {
+        ...result,
+        ok: safe,
+        ...(sourceFile ? { file: sourceFile } : {})
+      };
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!safe) process.exitCode = 1;
+        return;
+      }
+
+      const badge = safe ? '\x1b[32mZERO PII LEAKED ✅\x1b[0m' : '\x1b[31mPII DETECTED ❌\x1b[0m';
+      console.log(`\n🔒 Culkibo Deterministic PR-Preview PII Masker — [${badge}]`);
+      console.log(`   Masked items: ${result.maskedCount ?? 0}`);
+      console.log(`   Fields:       ${Array.isArray(result.fieldsMasked) ? result.fieldsMasked.join(', ') || '—' : '—'}`);
+      if (result.maskedSql) console.log(`\n${result.maskedSql}`);
+      if (result.pgAnonDdl) console.log(`\n-- pg_anonymizer DDL:\n${result.pgAnonDdl}`);
+      console.log('');
+      if (!safe) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
     }

@@ -111,6 +111,11 @@ function getWorkerAutoscalerService() { return _lazyV2.autoscaler || (_lazyV2.au
 function getSqlMigrationLinter() { return _lazyV2.sqllint || (_lazyV2.sqllint = require('../services/sqlMigrationLinter')); }
 function getLicenseAuditorService() { return _lazyV2.licenseaudit || (_lazyV2.licenseaudit = require('../services/licenseAuditorService')); }
 function getSeccompProfileService() { return _lazyV2.seccomp || (_lazyV2.seccomp = require('../services/seccompProfileService')); }
+function getImageBloatAuditor() { return _lazyV2.imgbloat || (_lazyV2.imgbloat = require('../services/imageBloatAuditor')); }
+function getCronLeaseService() { return _lazyV2.cronlease || (_lazyV2.cronlease = require('../services/cronLeaseService')); }
+function getPiiMaskerService() { return _lazyV2.piimask || (_lazyV2.piimask = require('../services/piiMaskerService')); }
+function getOomForensicsService() { return _lazyV2.oomforensics || (_lazyV2.oomforensics = require('../services/oomForensicsService')); }
+function getOncallEscalationService() { return _lazyV2.oncall || (_lazyV2.oncall = require('../services/oncallEscalationService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -8788,6 +8793,218 @@ router.post('/security/runc-audit', async (req, res) => {
     const doctor = require('../services/systemDoctor');
     const check = doctor.checkRuncRuntime();
     res.json({ ok: true, hostProbe: true, check, ...(check.metrics || {}) });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #13 150-MCP MILESTONE LAZY ROUTES (Image Bloat, Cron Leases, PII Masker, OOM Forensics, On-Call Escalation — 0 boot RAM impact) ---
+
+// 1. Container Image Layer Bloat & Secret-in-Layer Auditor (`coolify#7019`/`#5328`, Dive/Dockle/Hadolint)
+router.post('/build/image-audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getImageBloatAuditor().auditDockerfileAndLayers({
+      dockerfile: typeof body.dockerfile === 'string' ? body.dockerfile : '',
+      historyLayers: Array.isArray(body.historyLayers) ? body.historyLayers : [],
+      stack: typeof body.stack === 'string' ? body.stack : 'node'
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Distributed Cron Idempotency & Fencing-Token Lease Guard (`coolify#5655`, `dokploy#1475`)
+router.get('/crons/:id/leases', async (req, res) => {
+  try {
+    const raw = await getCronLeaseService().listCronLeases(req.params.id);
+    const leases = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.leases) ? raw.leases : []);
+    res.json({ ok: true, jobId: req.params.id, count: leases.length, leases });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/crons/:id/lease/acquire', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getCronLeaseService().acquireCronLease({
+      jobId: req.params.id,
+      scheduleSlotIso: typeof body.scheduleSlotIso === 'string' && body.scheduleSlotIso.trim()
+        ? body.scheduleSlotIso.trim()
+        : `${new Date().toISOString().slice(0, 16)}:00Z`,
+      holderId: typeof body.holderId === 'string' && body.holderId.trim() ? body.holderId.trim() : 'api-worker',
+      ttlSec: body.ttlSec !== undefined ? Number(body.ttlSec) : undefined,
+      nowMs: body.nowMs !== undefined ? Number(body.nowMs) : undefined
+    });
+    res.status(out && out.acquired ? 201 : 200).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/crons/:id/lease/renew', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const leaseId = typeof body.leaseId === 'string' ? body.leaseId.trim() : '';
+    if (!leaseId) return res.status(400).json({ error: 'Se requiere leaseId', code: 'INVALID_LEASE_ID' });
+    const out = await getCronLeaseService().renewCronLease(leaseId, {
+      holderId: typeof body.holderId === 'string' ? body.holderId : undefined,
+      extendSec: body.extendSec !== undefined ? Number(body.extendSec) : undefined,
+      nowMs: body.nowMs !== undefined ? Number(body.nowMs) : undefined
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/crons/:id/lease/complete', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const leaseId = typeof body.leaseId === 'string' ? body.leaseId.trim() : '';
+    if (!leaseId) return res.status(400).json({ error: 'Se requiere leaseId', code: 'INVALID_LEASE_ID' });
+    const out = await getCronLeaseService().completeCronLease(leaseId, {
+      holderId: typeof body.holderId === 'string' ? body.holderId : undefined,
+      fencingToken: body.fencingToken !== undefined ? Number(body.fencingToken) : undefined,
+      status: typeof body.status === 'string' ? body.status : 'succeeded',
+      nowMs: body.nowMs !== undefined ? Number(body.nowMs) : undefined
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. PR-Preview DB PII Masking & Anonymization Engine (Post-Snaplet / Post-Neosync + `pg_anonymizer` DDL)
+router.post('/databases/pii-mask', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getPiiMaskerService().maskDataset({
+      rows: Array.isArray(body.rows) ? body.rows : undefined,
+      sqlDump: typeof body.sqlDump === 'string' ? body.sqlDump : undefined,
+      seed: typeof body.seed === 'string' && body.seed.trim() ? body.seed : undefined,
+      rules: body.rules && typeof body.rules === 'object' ? body.rules : undefined,
+      autoDetect: body.autoDetect !== undefined ? Boolean(body.autoDetect) : true
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Container OOM-Kill Forensics & Crash-Loop Classifier (8 Failure Classes + Stale-Task Guard)
+router.post('/projects/:id/forensics/classify', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getOomForensicsService().classifyContainerFailure({
+      ...body,
+      projectId: req.params.id
+    });
+    res.json({ ...out, projectId: req.params.id });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Incident Deduplication, Flapping Damper & On-Call Escalation Router (`uptime-kuma#3255`, GoAlert/Keep DNA)
+router.get('/oncall/policies', async (req, res) => {
+  try {
+    const svc = getOncallEscalationService();
+    const raw = await svc.listPolicies();
+    const policies = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.policies) ? raw.policies : []);
+    const nowMs = req.query.nowMs !== undefined && Number.isFinite(Number(req.query.nowMs))
+      ? Number(req.query.nowMs)
+      : Date.now();
+    const enriched = policies.map((pol) => {
+      let currentOnCall = null;
+      try {
+        if (pol && pol.id && typeof svc.resolveCurrentOnCall === 'function') {
+          currentOnCall = svc.resolveCurrentOnCall(pol.id, nowMs);
+        }
+      } catch (e) {}
+      return { ...pol, currentOnCall };
+    });
+    res.json({ ok: true, count: enriched.length, policies: enriched });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/oncall/policies', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden gestionar políticas on-call', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'gestionar políticas de guardia on-call')) return;
+    const policy = await getOncallEscalationService().savePolicy(req.body || {});
+    res.status(201).json({ ok: true, policy });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/oncall/incidents', async (req, res) => {
+  try {
+    const allowedProjectIds = getAllowedProjectIds(req);
+    const activeOnly = req.query.activeOnly === 'true' || req.query.activeOnly === '1';
+    const raw = await getOncallEscalationService().listIncidents({ activeOnly });
+    const allInc = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.incidents) ? raw.incidents : []);
+    const incidents = allowedProjectIds === null
+      ? allInc
+      : allInc.filter((inc) => inc && (!inc.projectId || allowedProjectIds.includes(inc.projectId)));
+    res.json({ ok: true, count: incidents.length, incidents });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/oncall/ingest', heavyOpLimiter, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getOncallEscalationService().ingestAlert(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/oncall/incidents/:id/ack', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getOncallEscalationService();
+    const allRaw = await svc.listIncidents({ activeOnly: false });
+    const allInc = Array.isArray(allRaw) ? allRaw : (Array.isArray(allRaw && allRaw.incidents) ? allRaw.incidents : []);
+    const target = allInc.find((inc) => inc && inc.id === req.params.id);
+    if (target && target.projectId && !assertTenantProjectAccess403(req, res, target.projectId, 'projects:write')) return;
+    const { actor } = getAuditActor(req);
+    const actorLabel = (typeof body.actor === 'string' && body.actor.trim())
+      ? body.actor.trim()
+      : ((actor && (actor.email || actor.userId || actor.role)) || 'operator');
+    const out = await svc.acknowledgeIncident(req.params.id, {
+      actor: String(actorLabel),
+      nowMs: body.nowMs !== undefined ? Number(body.nowMs) : undefined
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/oncall/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const nowMs = body.nowMs !== undefined && Number.isFinite(Number(body.nowMs)) ? Number(body.nowMs) : Date.now();
+    const out = await getOncallEscalationService().evaluateEscalations(nowMs);
+    res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

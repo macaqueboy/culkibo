@@ -57,6 +57,9 @@ const testCycle11HttpE2E = require('./cycle11-http-e2e.test');
 const testSyntheticAndAutoscaler = require('./synthetic-and-autoscaler.test');
 const testSqllintLicenseSeccomp = require('./sqllint-license-seccomp.test');
 const testCycle12HttpE2E = require('./cycle12-http-e2e.test');
+const testCronLeaseAndOncall = require('./cron-lease-and-oncall.test');
+const testImagePiiOom = require('./image-pii-oom.test');
+const testCycle13HttpE2E = require('./cycle13-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -139,6 +142,9 @@ async function runAll() {
     { name: 'Synthetic Multi-Step API Flow Monitor, Live TLS/SNI Sentinel & KEDA Worker Autoscaler / Backpressure Breaker', fn: testSyntheticAndAutoscaler },
     { name: 'Zero-Downtime SQL DDL Linter (10 Rules), CycloneDX 1.6 SPDX License Auditor & Tailored Seccomp / runc CVE Guard', fn: testSqllintLicenseSeccomp },
     { name: 'Cycle #12 Reliability & Security Live Isolated HTTP E2E (All 5 API Families + RBAC/ACL + Seccomp/SSRF Guards)', fn: testCycle12HttpE2E },
+    { name: 'Distributed Cron Fencing-Token Lease Guard & On-Call Escalation Router / Flapping Damper', fn: testCronLeaseAndOncall },
+    { name: 'Container Image Bloat/Secret Auditor, Deterministic PR-Preview PII Masker & 8-Class OOM Forensics Classifier', fn: testImagePiiOom },
+    { name: 'Cycle #13 150-MCP Milestone Live Isolated HTTP E2E (All 5 API Families + RBAC/ACL + Zero-PII/Dedup Guards)', fn: testCycle13HttpE2E },
   ];
 
   for (const suite of suites) {

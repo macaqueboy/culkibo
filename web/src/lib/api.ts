@@ -5327,6 +5327,167 @@ export const api = {
       'runc CVE audit failed'
     );
   },
+
+  // --- Cycle-13: Image Bloat Auditor, Cron Fencing Leases, PII Masker, OOM Forensics, On-Call Escalation ---
+
+  async auditImageBloat(payload: {
+    dockerfile?: string;
+    historyLayers?: Array<Record<string, unknown>>;
+    stack?: string;
+  }): Promise<ImageBloatAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/build/image-audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Image bloat audit failed'
+    );
+  },
+
+  async listCronLeases(jobId: string): Promise<{ ok?: boolean; leases: CronLeaseRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/crons/${encodeURIComponent(jobId)}/leases`),
+      'Could not load cron fencing leases'
+    );
+  },
+
+  async acquireCronLease(
+    jobId: string,
+    payload: { scheduleSlotIso: string; holderId: string; ttlSec?: number }
+  ): Promise<CronLeaseAcquireResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/crons/${encodeURIComponent(jobId)}/lease/acquire`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not acquire cron lease'
+    );
+  },
+
+  async completeCronLease(
+    jobId: string,
+    payload: { leaseId: string; holderId: string; fencingToken: number; status?: 'succeeded' | 'failed' }
+  ): Promise<{ ok: boolean; reason?: string; lease?: CronLeaseRecord }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/crons/${encodeURIComponent(jobId)}/lease/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not complete cron lease'
+    );
+  },
+
+  async maskDatabasePii(payload: {
+    rows?: Array<Record<string, unknown>>;
+    sqlDump?: string;
+    seed?: string;
+    rules?: Record<string, string>;
+    autoDetect?: boolean;
+  }): Promise<PiiMaskResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/databases/pii-mask`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'PR-Preview PII masking failed'
+    );
+  },
+
+  async classifyProjectForensics(
+    projectId: string,
+    payload: {
+      containerName?: string;
+      exitCode: number;
+      oomKilled?: boolean;
+      restartCount?: number;
+      memoryLimitMb?: number;
+      memoryPeakMb?: number;
+      cgroupOomKills?: number;
+      recentLogs?: string;
+      healthStatus?: string;
+      uptimeSec?: number;
+      historicalOnly?: boolean;
+    }
+  ): Promise<OomForensicsResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/forensics/classify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Container forensics classification failed'
+    );
+  },
+
+  async listOncallPolicies(): Promise<{ ok?: boolean; policies: OncallPolicyRecord[]; currentOnCall?: Record<string, unknown> }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/oncall/policies`),
+      'Could not load on-call policies'
+    );
+  },
+
+  async saveOncallPolicy(payload: Partial<OncallPolicyRecord> & { name: string }): Promise<{ ok?: boolean; policy: OncallPolicyRecord }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/oncall/policies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not save on-call policy'
+    );
+  },
+
+  async listOncallIncidents(activeOnly = false): Promise<{ ok?: boolean; incidents: OncallIncidentRecord[] }> {
+    const qs = activeOnly ? '?activeOnly=1' : '';
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/oncall/incidents${qs}`),
+      'Could not load on-call incidents'
+    );
+  },
+
+  async ingestOncallAlert(payload: {
+    policyId: string;
+    fingerprint: string;
+    projectId?: string;
+    severity?: string;
+    title: string;
+    state?: 'firing' | 'resolved';
+  }): Promise<OncallIngestResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/oncall/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not ingest on-call alert'
+    );
+  },
+
+  async ackOncallIncident(incidentId: string, actor = 'owner@acme-demo.dev'): Promise<{ ok?: boolean; incident: OncallIncidentRecord }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/oncall/incidents/${encodeURIComponent(incidentId)}/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actor }),
+      }),
+      'Could not acknowledge incident'
+    );
+  },
+
+  async evaluateOncallEscalations(): Promise<{ ok?: boolean; escalated: Array<Record<string, unknown>>; incidents?: OncallIncidentRecord[] }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/oncall/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      }),
+      'Could not evaluate on-call escalations'
+    );
+  },
 };
 
 // =====================================================================
@@ -6922,4 +7083,116 @@ export interface RuncAuditResult {
   cves: string[];
   fixedIn?: string | null;
   message?: string;
+}
+
+// --- Cycle-13 Reliability, PII & Forensics Types ---
+
+export type ImageAuditFindingItem = string | {
+  rule?: string;
+  id?: string;
+  severity?: string;
+  line?: number;
+  message?: string;
+  fix?: string;
+  redactedSnippet?: string;
+  type?: string;
+};
+
+export interface ImageBloatAuditResult {
+  ok?: boolean;
+  efficiencyScore: number;
+  estimatedSavingsMb: number;
+  wastedBytes?: number;
+  secretLeaks?: ImageAuditFindingItem[];
+  findings?: ImageAuditFindingItem[];
+  slimmingRecommendations?: Array<string | { message?: string; recommendation?: string; action?: string; rule?: string }>;
+  multiStageTemplate?: string;
+}
+
+export interface CronLeaseRecord {
+  id: string;
+  jobId: string;
+  scheduleSlotIso: string;
+  holderId: string;
+  fencingToken: number;
+  status: 'active' | 'succeeded' | 'failed' | string;
+  acquiredAtMs?: number;
+  expiresAtMs?: number;
+  completedAtMs?: number;
+}
+
+export interface CronLeaseAcquireResult {
+  ok?: boolean;
+  acquired: boolean;
+  reason?: string;
+  lease?: CronLeaseRecord;
+  activeLease?: CronLeaseRecord;
+  completedLease?: CronLeaseRecord;
+}
+
+export interface PiiMaskResult {
+  ok?: boolean;
+  maskedRows?: Array<Record<string, unknown>>;
+  maskedSql?: string;
+  maskedCount: number;
+  fieldsMasked?: string[];
+  zeroPiiLeaked: boolean;
+  pgAnonDdl?: string;
+}
+
+export interface OomForensicsResult {
+  ok?: boolean;
+  classification: string;
+  severity: 'critical' | 'high' | 'medium' | 'info' | string;
+  confidence?: number;
+  rootCause: string;
+  ignoreForRollback: boolean;
+  recommendedMemoryMb?: number | null;
+  backoffSec?: number;
+  remediationActions?: Array<string | { message?: string; action?: string; summary?: string }>;
+}
+
+export interface OncallTier {
+  tier: number;
+  responders: string[];
+}
+
+export interface OncallPolicyRecord {
+  id: string;
+  name: string;
+  shiftDurationHours?: number;
+  rotationStartMs?: number;
+  ackTimeoutSec?: number;
+  flappingWindowSec?: number;
+  flappingThreshold?: number;
+  tiers: OncallTier[];
+  currentResponder?: string;
+  currentOnCall?: string | { responder?: string; primaryResponder?: string } | null;
+}
+
+export interface OncallIncidentRecord {
+  id: string;
+  policyId: string;
+  fingerprint: string;
+  projectId?: string;
+  severity: string;
+  title: string;
+  status: 'open' | 'firing' | 'acknowledged' | 'resolved' | 'flapping_suppressed' | string;
+  currentTier?: number;
+  assignedResponder?: string;
+  occurrences: number;
+  flapping?: boolean;
+  acknowledgedBy?: string | null;
+  acknowledgedAtMs?: number | null;
+  createdAtMs?: number;
+  updatedAtMs?: number;
+}
+
+export interface OncallIngestResult {
+  ok?: boolean;
+  incident: OncallIncidentRecord;
+  deduplicated?: boolean;
+  suppressed?: boolean;
+  flapping?: boolean;
+  reason?: string;
 }

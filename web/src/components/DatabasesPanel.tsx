@@ -51,6 +51,7 @@ import {
   type S3PresignResult,
   type DrDrillScorecard,
   type SqlMigrationLintResult,
+  type PiiMaskResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
@@ -175,6 +176,24 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [lintBusy, setLintBusy] = useState(false);
   const [lintError, setLintError] = useState<string | null>(null);
 
+  // Cycle-13 PR-Preview DB PII Masker (Post-Snaplet / Neosync)
+  const [piiInput, setPiiInput] = useState(
+    JSON.stringify(
+      [
+        { id: 101, full_name: 'Alice Martin', email: 'alice.martin@acme-corp.example', phone: '+1-415-555-0192', ssn: '123-45-6789', client_ip: '203.0.113.42' },
+        { id: 102, full_name: 'Carlos Vega', email: 'carlos.vega@acme-corp.example', phone: '+1-415-555-0198', ssn: '987-65-4321', client_ip: '198.51.100.77' },
+      ],
+      null,
+      2
+    )
+  );
+  const [piiSeed, setPiiSeed] = useState('culkibo-pr-418-seed');
+  const [piiResult, setPiiResult] = useState<PiiMaskResult | null>(null);
+  const [piiBusy, setPiiBusy] = useState(false);
+  const [piiError, setPiiError] = useState<string | null>(null);
+  const [piiShowDdl, setPiiShowDdl] = useState(false);
+  const [piiCopiedDdl, setPiiCopiedDdl] = useState(false);
+
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
     databasesRef.current = databases;
@@ -292,6 +311,37 @@ export const DatabasesPanel: React.FC<Props> = ({
       onNotify(msg, 'error');
     } finally {
       setLintBusy(false);
+    }
+  };
+
+  const handleMaskPreviewPii = async () => {
+    const raw = piiInput.trim();
+    if (!raw) return;
+    setPiiBusy(true);
+    setPiiError(null);
+    try {
+      let payload: { rows?: Array<Record<string, unknown>>; sqlDump?: string; seed: string; autoDetect: boolean };
+      if (raw.startsWith('[') || raw.startsWith('{')) {
+        const parsed = JSON.parse(raw);
+        const rows = Array.isArray(parsed) ? parsed : [parsed];
+        payload = { rows, seed: piiSeed.trim() || 'culkibo-preview-seed', autoDetect: true };
+      } else {
+        payload = { sqlDump: raw, seed: piiSeed.trim() || 'culkibo-preview-seed', autoDetect: true };
+      }
+      const res = await api.maskDatabasePii(payload);
+      setPiiResult(res);
+      onNotify(
+        res.zeroPiiLeaked
+          ? `PR-Preview PII Masked (${res.maskedCount} values · Zero PII Leaked)`
+          : `PII Masker completed with ${res.maskedCount} replacements`,
+        res.zeroPiiLeaked ? 'success' : 'info'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'PR-Preview PII masking failed';
+      setPiiError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setPiiBusy(false);
     }
   };
 
@@ -1729,6 +1779,127 @@ export const DatabasesPanel: React.FC<Props> = ({
                     <div key={idx} className="font-mono">→ {h}</div>
                   ))}
                 </div>
+              )}
+            </div>
+          );
+        })()}
+      </section>
+
+      {/* Cycle-13: PR-Preview DB PII Masker (Post-Snaplet / Neosync) */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <Lock className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.piiTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 font-mono text-[10px] font-semibold text-slate-700">
+                  HMAC-SHA256 · FK-Safe · pg_anonymizer
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.piiDesc')}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+            <input
+              type="text"
+              value={piiSeed}
+              onChange={(e) => setPiiSeed(e.target.value)}
+              aria-label="Deterministic masking seed"
+              placeholder="culkibo-preview-seed"
+              className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 w-44"
+            />
+            <button
+              type="button"
+              disabled={piiBusy || !piiInput.trim()}
+              onClick={() => void handleMaskPreviewPii()}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+            >
+              {piiBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+              <span>{piiBusy ? t('db.piiMasking') : t('db.piiMaskBtn')}</span>
+            </button>
+          </div>
+        </div>
+
+        <textarea
+          rows={4}
+          value={piiInput}
+          onChange={(e) => setPiiInput(e.target.value)}
+          aria-label="Sample JSON rows or SQL dump to mask"
+          spellCheck={false}
+          className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white font-mono text-[11px] text-slate-900 leading-relaxed"
+        />
+
+        {piiError && (
+          <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 shrink-0" />
+            <span>{piiError}</span>
+          </div>
+        )}
+
+        {piiResult && (() => {
+          const maskedFields = Array.isArray(piiResult.fieldsMasked) ? piiResult.fieldsMasked : [];
+          const previewText = piiResult.maskedSql
+            ? piiResult.maskedSql
+            : JSON.stringify(piiResult.maskedRows || [], null, 2);
+          return (
+            <div className="space-y-2.5 tabular-nums">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full font-mono text-[10px] font-semibold border ${
+                    piiResult.zeroPiiLeaked
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-amber-50 text-amber-800 border-amber-200'
+                  }`}>
+                    <CheckCircle2 className="w-3 h-3" />
+                    <span>{piiResult.zeroPiiLeaked ? t('db.piiZeroLeak') : 'Review Residual PII'}</span>
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700">
+                    maskedCount: {piiResult.maskedCount}
+                  </span>
+                  {maskedFields.slice(0, 6).map((f) => (
+                    <span key={f} className="px-2 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-600">
+                      {f}
+                    </span>
+                  ))}
+                </div>
+                {piiResult.pgAnonDdl && (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setPiiShowDdl((v) => !v)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                    >
+                      {piiShowDdl ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                      <span>{t('db.piiToggleDdl')}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void copyToClipboard(piiResult.pgAnonDdl || '');
+                        setPiiCopiedDdl(true);
+                        setTimeout(() => setPiiCopiedDdl(false), 1800);
+                        onNotify('pg_anonymizer SECURITY LABEL DDL copied', 'success');
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                    >
+                      {piiCopiedDdl ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                      <span>{t('db.piiCopyDdl')}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <pre className="p-3 rounded-xl bg-slate-950 text-emerald-300 font-mono text-[11px] leading-relaxed overflow-x-auto max-h-48 border border-slate-800">
+                {previewText}
+              </pre>
+
+              {piiShowDdl && piiResult.pgAnonDdl && (
+                <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 font-mono text-[11px] leading-relaxed overflow-x-auto max-h-40 border border-slate-800">
+                  {piiResult.pgAnonDdl}
+                </pre>
               )}
             </div>
           );

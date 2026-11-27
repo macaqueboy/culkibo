@@ -116,6 +116,9 @@ interface DemoState {
   volumeMigrations: any[];
   syntheticFlows: any[];
   autoscalerPolicies: Record<string, any>;
+  cronLeases: Record<string, any[]>;
+  oncallPolicies: any[];
+  oncallIncidents: any[];
 }
 
 function createInitialDemoState(): DemoState {
@@ -946,6 +949,57 @@ function createInitialDemoState(): DemoState {
         breakerRetryAfterSec: 15,
       },
     },
+    cronLeases: {
+      cron_billing_rollup: [
+        {
+          id: 'lease_demo_42',
+          jobId: 'cron_billing_rollup',
+          scheduleSlotIso: '2026-11-27T20:00:00.000Z',
+          holderId: 'worker-replica-a',
+          fencingToken: 42,
+          status: 'succeeded',
+          acquiredAtMs: Date.now() - 1800000,
+          expiresAtMs: Date.now() - 1500000,
+          completedAtMs: Date.now() - 1794000,
+        },
+      ],
+    },
+    oncallPolicies: [
+      {
+        id: 'pol_prod_primary',
+        name: 'Primary Production SRE Escalation',
+        shiftDurationHours: 24,
+        rotationStartMs: Date.now() - 1000 * 60 * 60 * 3,
+        ackTimeoutSec: 300,
+        flappingWindowSec: 600,
+        flappingThreshold: 3,
+        currentResponder: 'alice',
+        tiers: [
+          { tier: 1, responders: ['alice', 'bob'] },
+          { tier: 2, responders: ['charlie'] },
+          { tier: 3, responders: ['vp-eng'] },
+        ],
+      },
+    ],
+    oncallIncidents: [
+      {
+        id: 'ocinc_demo_1',
+        policyId: 'pol_prod_primary',
+        fingerprint: 'fp_pg_replica_lag',
+        projectId: 'proj_acme_web',
+        severity: 'high',
+        title: 'PostgreSQL Connection Pool Saturation (>82%)',
+        status: 'firing',
+        currentTier: 1,
+        assignedResponder: 'alice',
+        occurrences: 2,
+        flapping: false,
+        acknowledgedBy: null,
+        acknowledgedAtMs: null,
+        createdAtMs: Date.now() - 120000,
+        updatedAtMs: Date.now() - 30000,
+      },
+    ],
   };
 }
 
@@ -3301,6 +3355,315 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     });
   }
 
+  // --- Cycle-13: Image Bloat Auditor, Cron Fencing Leases, PII Masker, OOM Forensics, On-Call Escalation ---
+  if (pathname === '/api/build/image-audit' && method === 'POST') {
+    const df = String(body.dockerfile || '');
+    const secretLeaks: Array<{ rule: string; line: number; message: string; redactedSnippet: string }> = [];
+    const findings: Array<{ rule: string; severity: string; message: string }> = [];
+    const slimmingRecommendations: string[] = [];
+    const lines = df.split(/\r?\n/);
+    const secretPrefixRe = new RegExp(`${['sk', 'live', ''].join('_')}|${['ghp', ''].join('_')}|AKIA[0-9A-Z]{8}`, 'i');
+    lines.forEach((ln, idx) => {
+      if (/\b(?:ENV|ARG)\b.*(?:SECRET|TOKEN|PASSWORD|API_KEY|PRIVATE_KEY)/i.test(ln) || secretPrefixRe.test(ln)) {
+        secretLeaks.push({
+          rule: 'SECRET_IN_ENV_OR_ARG',
+          line: idx + 1,
+          message: `Hardcoded secret detected in ENV/ARG at line ${idx + 1} (value redacted; use BuildKit --mount=type=secret).`,
+          redactedSnippet: ln.replace(/=.+$/, '=[REDACTED]'),
+        });
+      }
+    });
+    if (/apt-get\s+install/i.test(df) && !/rm\s+-rf\s+\/var\/lib\/apt\/lists/i.test(df)) {
+      findings.push({ rule: 'UNDELETED_PACKAGE_CACHE', severity: 'medium', message: 'apt-get install leaves /var/lib/apt/lists cache in image layer.' });
+      slimmingRecommendations.push('Chain && rm -rf /var/lib/apt/lists/* inside the same RUN instruction (~45 MB saved).');
+    }
+    if (/^FROM\s+(?:node:22|python:3\.12|golang:1\.23|ubuntu)\s*$/im.test(df)) {
+      findings.push({ rule: 'HEAVY_BASE_IMAGE', severity: 'high', message: 'Full SDK base image used as final runtime stage.' });
+      slimmingRecommendations.push('Switch final stage to node:22-alpine or distroless (~280 MB saved).');
+    }
+    if (!/\bUSER\s+(?!root\b)\S+/i.test(df)) {
+      findings.push({ rule: 'MISSING_NON_ROOT_USER', severity: 'medium', message: 'Container runs as root; add USER node or USER 10001.' });
+      slimmingRecommendations.push('Add non-root USER directive before CMD/ENTRYPOINT.');
+    }
+    if (/\bRUN\s+rm\s+-rf\b/i.test(df)) {
+      findings.push({ rule: 'CROSS_LAYER_DELETE_WASTE', severity: 'medium', message: 'rm -rf in a separate RUN layer does not shrink prior image layers.' });
+      slimmingRecommendations.push('Remove temporary files in the same RUN layer or isolate them in a multi-stage builder.');
+    }
+    const penalty = secretLeaks.length * 30 + findings.length * 14;
+    const score = Math.max(8, Math.min(100, 100 - penalty));
+    const savingsMb = findings.length * 85 + secretLeaks.length * 12;
+    return jsonResponse({
+      ok: true,
+      efficiencyScore: score,
+      estimatedSavingsMb: savingsMb,
+      wastedBytes: savingsMb * 1024 * 1024,
+      secretLeaks,
+      findings,
+      slimmingRecommendations: slimmingRecommendations.length > 0 ? slimmingRecommendations : ['Multi-stage alpine/non-root Dockerfile already optimal (96/100).'],
+    });
+  }
+
+  const cronLeaseMatch = pathname.match(/^\/api\/crons\/([^/]+)\/(leases|lease\/acquire|lease\/complete)$/);
+  if (cronLeaseMatch) {
+    const jobId = decodeURIComponent(cronLeaseMatch[1]);
+    const action = cronLeaseMatch[2];
+    const list = s.cronLeases[jobId] || (s.cronLeases[jobId] = []);
+    if (action === 'leases' && method === 'GET') {
+      return jsonResponse({ ok: true, leases: list });
+    }
+    if (action === 'lease/acquire' && method === 'POST') {
+      const slot = String(body.scheduleSlotIso || new Date().toISOString());
+      const holderId = String(body.holderId || 'worker-1');
+      const doneSlot = list.find((l) => l.scheduleSlotIso === slot && l.status === 'succeeded');
+      if (doneSlot) {
+        return jsonResponse({ ok: true, acquired: false, reason: 'ALREADY_EXECUTED_SLOT', completedLease: doneSlot });
+      }
+      const running = list.find((l) => l.status === 'active' && (l.expiresAtMs || 0) > Date.now());
+      if (running) {
+        return jsonResponse({ ok: true, acquired: false, reason: 'ALREADY_RUNNING', activeLease: running });
+      }
+      const maxTok = list.reduce((m, l) => Math.max(m, Number(l.fencingToken || 0)), 42);
+      const created = {
+        id: `lease_demo_${maxTok + 1}`,
+        jobId,
+        scheduleSlotIso: slot,
+        holderId,
+        fencingToken: maxTok + 1,
+        status: 'active',
+        acquiredAtMs: Date.now(),
+        expiresAtMs: Date.now() + Number(body.ttlSec || 300) * 1000,
+      };
+      list.unshift(created);
+      return jsonResponse({ ok: true, acquired: true, lease: created });
+    }
+    if (action === 'lease/complete' && method === 'POST') {
+      const target = list.find((l) => l.id === body.leaseId);
+      if (!target) return jsonResponse({ ok: false, reason: 'LEASE_NOT_FOUND' });
+      if (Number(body.fencingToken) !== Number(target.fencingToken)) {
+        return jsonResponse({ ok: false, reason: 'STALE_FENCING_TOKEN' });
+      }
+      target.status = body.status || 'succeeded';
+      target.completedAtMs = Date.now();
+      return jsonResponse({ ok: true, lease: target });
+    }
+  }
+
+  if (pathname === '/api/databases/pii-mask' && method === 'POST') {
+    const seed = String(body.seed || 'culkibo-preview-seed');
+    const hash8 = (val: string) => {
+      let h = 2166136261;
+      const str = `${seed}:${val}`;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return (h >>> 0).toString(16).padStart(8, '0');
+    };
+    const fieldsSet = new Set<string>();
+    let maskedCount = 0;
+    const maskStr = (key: string, raw: string) => {
+      if (/@/.test(raw)) {
+        fieldsSet.add(key);
+        maskedCount += 1;
+        return `u_${hash8(raw)}@masked.invalid`;
+      }
+      if (/^\d{3}-\d{2}-\d{4}$/.test(raw)) {
+        fieldsSet.add(key);
+        maskedCount += 1;
+        return `000-00-${String(parseInt(hash8(raw).slice(0, 4), 16) % 9000 + 1000)}`;
+      }
+      if (/^\+?\d[\d\s-]{8,}$/.test(raw)) {
+        fieldsSet.add(key);
+        maskedCount += 1;
+        return `+1-555-${String(parseInt(hash8(raw).slice(0, 4), 16) % 9000 + 1000)}`;
+      }
+      if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(raw)) {
+        fieldsSet.add(key);
+        maskedCount += 1;
+        return `192.0.2.${(parseInt(hash8(raw).slice(0, 2), 16) % 250) + 1}`;
+      }
+      if (/name/i.test(key)) {
+        fieldsSet.add(key);
+        maskedCount += 1;
+        return `User_${hash8(raw).slice(0, 6)}`;
+      }
+      return raw;
+    };
+    if (Array.isArray(body.rows)) {
+      const maskedRows = body.rows.map((row: Record<string, unknown>) => {
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(row || {})) {
+          out[k] = typeof v === 'string' ? maskStr(k, v) : v;
+        }
+        return out;
+      });
+      const fieldsMasked = Array.from(fieldsSet);
+      const pgAnonDdl = [
+        'CREATE EXTENSION IF NOT EXISTS anon CASCADE;',
+        ...fieldsMasked.map((col) =>
+          `SECURITY LABEL FOR anon ON COLUMN public.users.${col} IS 'MASKED WITH FUNCTION anon.pseudo_email(${col})';`
+        ),
+      ].join('\n');
+      return jsonResponse({ ok: true, maskedRows, maskedCount, fieldsMasked, zeroPiiLeaked: true, pgAnonDdl });
+    }
+    const sqlDump = String(body.sqlDump || '');
+    const maskedSql = sqlDump
+      .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, (m) => {
+        maskedCount += 1;
+        fieldsSet.add('email');
+        return `u_${hash8(m)}@masked.invalid`;
+      })
+      .replace(/\b\d{3}-\d{2}-\d{4}\b/g, (m) => {
+        maskedCount += 1;
+        fieldsSet.add('ssn');
+        return `000-00-${String(parseInt(hash8(m).slice(0, 4), 16) % 9000 + 1000)}`;
+      });
+    return jsonResponse({
+      ok: true,
+      maskedSql,
+      maskedCount,
+      fieldsMasked: Array.from(fieldsSet),
+      zeroPiiLeaked: true,
+      pgAnonDdl: "CREATE EXTENSION IF NOT EXISTS anon CASCADE;\nSECURITY LABEL FOR anon ON COLUMN public.users.email IS 'MASKED WITH FUNCTION anon.pseudo_email(email)';",
+    });
+  }
+
+  const forensicsMatch = pathname.match(/^\/api\/projects\/([^/]+)\/forensics\/classify$/);
+  if (forensicsMatch && method === 'POST') {
+    const exitCode = Number(body.exitCode ?? 137);
+    const oomKilled = Boolean(body.oomKilled);
+    const cgroupOomKills = Number(body.cgroupOomKills ?? 0);
+    const restartCount = Number(body.restartCount ?? 0);
+    const memLim = Number(body.memoryLimitMb ?? 512) || 512;
+    const memPeak = Number(body.memoryPeakMb ?? memLim) || memLim;
+    const historicalOnly = Boolean(body.historicalOnly);
+    const backoffSec = Math.min(300, Math.pow(2, Math.min(8, restartCount)) * 5);
+
+    if (historicalOnly) {
+      return jsonResponse({
+        ok: true,
+        classification: 'STALE_HISTORICAL_TASK_IGNORED',
+        severity: 'info',
+        confidence: 0.99,
+        rootCause: 'Exit 137 originated from a historical stopped container task — active deployment replica is healthy.',
+        ignoreForRollback: true,
+        recommendedMemoryMb: null,
+        backoffSec: 0,
+        remediationActions: ['No rollback triggered (Portainer stale-task guard active).', 'Archive historical container metadata after retention window.'],
+      });
+    }
+    if (exitCode === 137 && (oomKilled || cgroupOomKills > 0)) {
+      const recMb = Math.ceil(Math.max(memLim, memPeak) * 1.5);
+      return jsonResponse({
+        ok: true,
+        classification: 'CGROUP_OOM_KILL',
+        severity: 'critical',
+        confidence: 0.98,
+        rootCause: `Linux cgroup OOM killer terminated process (exit 137, oomKilled=true, peak=${memPeak} MB / limit=${memLim} MB).`,
+        ignoreForRollback: false,
+        recommendedMemoryMb: recMb,
+        backoffSec,
+        remediationActions: [
+          `Raise container memory limit from ${memLim} MB to ${recMb} MB.`,
+          'Set NODE_OPTIONS=--max-old-space-size to 75% of cgroup limit to prevent native RSS spikes.',
+        ],
+      });
+    }
+    if (exitCode === 137) {
+      return jsonResponse({
+        ok: true,
+        classification: 'FORCED_SIGKILL_TIMEOUT',
+        severity: 'high',
+        confidence: 0.94,
+        rootCause: 'Exit 137 with oomKilled=false and 0 cgroup OOM kills — container ignored SIGTERM and was SIGKILLed after stop grace timeout.',
+        ignoreForRollback: false,
+        recommendedMemoryMb: null,
+        backoffSec,
+        remediationActions: [
+          'Attach a SIGTERM handler to close HTTP keep-alive & DB pools cleanly within stop_grace_period.',
+          'Use exec-form CMD ["node", "server.js"] instead of shell form so PID 1 receives SIGTERM.',
+        ],
+      });
+    }
+    return jsonResponse({
+      ok: true,
+      classification: exitCode === 139 ? 'SEGFAULT_ARCH_OR_NATIVE' : exitCode === 143 ? 'GRACEFUL_SIGTERM_EXITED' : 'HEALTHCHECK_CRASH_LOOP',
+      severity: exitCode === 143 ? 'info' : 'high',
+      confidence: 0.9,
+      rootCause: `Container exited with code ${exitCode}.`,
+      ignoreForRollback: exitCode === 143,
+      recommendedMemoryMb: null,
+      backoffSec,
+      remediationActions: ['Inspect structured container logs and verify healthcheck timeout/interval.'],
+    });
+  }
+
+  if (pathname === '/api/oncall/policies' && method === 'GET') {
+    return jsonResponse({ ok: true, policies: s.oncallPolicies });
+  }
+  if (pathname === '/api/oncall/policies' && method === 'POST') {
+    const pol = {
+      id: body.id || `pol_${Date.now()}`,
+      name: String(body.name || 'SRE Escalation Policy'),
+      shiftDurationHours: Number(body.shiftDurationHours || 24),
+      rotationStartMs: Date.now(),
+      ackTimeoutSec: Number(body.ackTimeoutSec || 300),
+      flappingWindowSec: Number(body.flappingWindowSec || 600),
+      flappingThreshold: Number(body.flappingThreshold || 3),
+      currentResponder: body.tiers?.[0]?.responders?.[0] || 'alice',
+      tiers: Array.isArray(body.tiers) ? body.tiers : [{ tier: 1, responders: ['alice', 'bob'] }],
+    };
+    s.oncallPolicies = [pol, ...s.oncallPolicies.filter((p) => p.id !== pol.id)];
+    return jsonResponse({ ok: true, policy: pol });
+  }
+  if (pathname === '/api/oncall/incidents' && method === 'GET') {
+    return jsonResponse({ ok: true, incidents: s.oncallIncidents });
+  }
+  if (pathname === '/api/oncall/ingest' && method === 'POST') {
+    const fp = String(body.fingerprint || 'fp_default');
+    const existing = s.oncallIncidents.find((i) => i.fingerprint === fp && i.status !== 'resolved');
+    if (existing) {
+      existing.occurrences = Number(existing.occurrences || 1) + 1;
+      existing.updatedAtMs = Date.now();
+      return jsonResponse({ ok: true, incident: existing, deduplicated: true, suppressed: true, flapping: false });
+    }
+    const created = {
+      id: `ocinc_${Date.now()}`,
+      policyId: String(body.policyId || 'pol_prod_primary'),
+      fingerprint: fp,
+      projectId: body.projectId || 'proj_edge_rust',
+      severity: String(body.severity || 'critical'),
+      title: String(body.title || 'Production Service Alert'),
+      status: 'firing',
+      currentTier: 1,
+      assignedResponder: 'alice',
+      occurrences: 1,
+      flapping: false,
+      acknowledgedBy: null,
+      acknowledgedAtMs: null,
+      createdAtMs: Date.now(),
+      updatedAtMs: Date.now(),
+    };
+    s.oncallIncidents.unshift(created);
+    return jsonResponse({ ok: true, incident: created, deduplicated: false, suppressed: false, flapping: false });
+  }
+  const ackMatch = pathname.match(/^\/api\/oncall\/incidents\/([^/]+)\/ack$/);
+  if (ackMatch && method === 'POST') {
+    const incId = decodeURIComponent(ackMatch[1]);
+    const target = s.oncallIncidents.find((i) => i.id === incId);
+    if (target) {
+      target.status = 'acknowledged';
+      target.acknowledgedBy = String(body.actor || 'owner@acme-demo.dev');
+      target.acknowledgedAtMs = Date.now();
+      target.updatedAtMs = Date.now();
+      return jsonResponse({ ok: true, incident: target });
+    }
+    return jsonResponse({ ok: true, incident: { id: incId, status: 'acknowledged', occurrences: 1, title: 'Incident', fingerprint: 'fp', policyId: 'pol_prod_primary', severity: 'high' } });
+  }
+  if (pathname === '/api/oncall/evaluate' && method === 'POST') {
+    return jsonResponse({ ok: true, escalated: [], incidents: s.oncallIncidents });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -3478,16 +3841,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (145 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (150 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 145 MCP tools on demand without bloating context (-88%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 150 MCP tools on demand without bloating context (-89%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_audit_image_bloat', description: '8-rule Dockerfile layer bloat & secret-in-layer auditor with efficiencyScore & multi-stage slimming tips', readOnly: true, profile: 'deploy' },
+      { name: 'culkibo_cron_lease', description: 'Distributed cron fencing-token lease guard blocking duplicate scheduled fires & concurrent overlaps', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_mask_preview_pii', description: 'Deterministic HMAC-SHA256 PR-Preview PII masker (FK-safe) + dalibo pg_anonymizer SECURITY LABEL DDL', readOnly: true, profile: 'security' },
+      { name: 'culkibo_oom_forensics', description: '8-class container exit-code & OOM-kill forensics classifier (137 OOM vs SIGKILL vs stale historical tasks)', readOnly: true, profile: 'ops' },
+      { name: 'culkibo_oncall_router', description: 'Tier 1->2->3 on-call escalation rotation with fingerprint dedup, flapping damper & instant ack', readOnly: false, profile: 'ops' },
       { name: 'culkibo_synthetic_sentinel', description: 'Synthetic multi-step API flow monitor (SSRF-guarded, zero-secret) & live uncached TLS/SNI drift sentinel', readOnly: false, profile: 'ops' },
       { name: 'culkibo_lint_sql_migration', description: '10-rule pure-JS zero-downtime SQL DDL linter catching lock/rewrite footguns before prod', readOnly: true, profile: 'deploy' },
       { name: 'culkibo_worker_autoscaler', description: 'OOM-safe KEDA queue/worker autoscaler with hysteresis, RAM ceiling & 503 Retry-After circuit breaker', readOnly: false, profile: 'ops' },
@@ -3519,27 +3887,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 145 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 150 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 145, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 150, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_lint_sql_migration', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_seccomp_profile', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_oom_forensics', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_audit_image_bloat', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 145,
-      profiles: { core: { count: 17, savedPct: 88 } },
+      totalTools: 150,
+      profiles: { core: { count: 17, savedPct: 89 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 145);
+    assert.strictEqual(demoJson.datasets.mcpTools, 150);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -873,7 +873,78 @@ async function testCliDx() {
     const licWarnJson = JSON.parse(licWarnCli.stdout);
     assert.strictEqual(licWarnJson.compliant, true);
     assert.ok(licWarnJson.warnings.length >= 2);
-    console.log(`  ✓ Pioneer CLI Cycle-12 verificado (culkibo lint-sql unsafe=1/safe=0, culkibo audit-licenses MIT=0/AGPL+SSPL=1/audit-only=0, culkibo demo 145 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-12 verificado (culkibo lint-sql unsafe=1/safe=0, culkibo audit-licenses MIT=0/AGPL+SSPL=1/audit-only=0)`);
+
+    // 17. Pioneer Cycle-13 CLI: `culkibo audit-image` (leaky exit 1 vs clean multi-stage exit 0) & `culkibo mask-pii` (deterministic zero-PII + pg_anonymizer DDL)
+    const fakeCliSecret = ['sk', 'live', 'cliauditcanary0123456789'].join('_');
+    const leakyDfPath = path.join(tmpRoot, 'Dockerfile.leaky');
+    fs.writeFileSync(
+      leakyDfPath,
+      `FROM node:22\nENV STRIPE_SECRET=${fakeCliSecret}\nCOPY . .\nRUN apt-get update && apt-get install -y curl\nRUN rm -rf /tmp/build\n`,
+      'utf8'
+    );
+    const imgFailCli = await runCli(['audit-image', leakyDfPath, '--stack', 'node', '--json'], { env: isolatedEnv });
+    assert.strictEqual(imgFailCli.status, 1, 'culkibo audit-image debe salir con código 1 ante secretos o efficiencyScore < 50');
+    const imgFailJson = JSON.parse(imgFailCli.stdout);
+    assert.strictEqual(imgFailJson.ok, false);
+    assert.ok(Array.isArray(imgFailJson.secretLeaks) && imgFailJson.secretLeaks.length >= 1);
+    assert.ok(!imgFailCli.stdout.includes(fakeCliSecret), 'culkibo audit-image jamás debe imprimir el secreto raw en stdout');
+
+    const slimDfPath = path.join(tmpRoot, 'Dockerfile.slim');
+    fs.writeFileSync(
+      slimDfPath,
+      [
+        'FROM node:22-alpine AS builder',
+        'WORKDIR /app',
+        'COPY package*.json ./',
+        'RUN npm ci',
+        'COPY . .',
+        'RUN npm run build',
+        'FROM gcr.io/distroless/nodejs22-debian12',
+        'WORKDIR /app',
+        'COPY --from=builder /app/dist ./dist',
+        'USER nonroot',
+        'CMD ["dist/index.js"]'
+      ].join('\n'),
+      'utf8'
+    );
+    const imgPassCli = await runCli(['audit-image', slimDfPath, '--stack', 'node', '--json'], { env: isolatedEnv });
+    assert.strictEqual(imgPassCli.status, 0, `culkibo audit-image slim falló: ${imgPassCli.stderr} ${imgPassCli.stdout}`);
+    const imgPassJson = JSON.parse(imgPassCli.stdout);
+    assert.strictEqual(imgPassJson.ok, true);
+    assert.strictEqual(imgPassJson.secretLeaks.length, 0);
+    assert.ok(imgPassJson.efficiencyScore >= 90);
+
+    // culkibo mask-pii: JSON file + SQL inline (deterministic FK join + zeroPiiLeaked + pg_anonymizer DDL)
+    const piiJsonPath = path.join(tmpRoot, 'prod-preview-sample.json');
+    fs.writeFileSync(
+      piiJsonPath,
+      JSON.stringify([
+        { id: 1, email: 'maria.garcia@prod-users.io', phone: '+1-415-555-9876' },
+        { id: 2, email: 'maria.garcia@prod-users.io', ip: '198.51.100.7' }
+      ], null, 2),
+      'utf8'
+    );
+    const piiJsonCli = await runCli(['mask-pii', piiJsonPath, '--seed', 'cli-seed-13', '--json'], { env: isolatedEnv });
+    assert.strictEqual(piiJsonCli.status, 0, `culkibo mask-pii JSON falló: ${piiJsonCli.stderr} ${piiJsonCli.stdout}`);
+    const piiOut = JSON.parse(piiJsonCli.stdout);
+    assert.strictEqual(piiOut.ok, true);
+    assert.strictEqual(piiOut.zeroPiiLeaked, true);
+    assert.strictEqual(piiOut.maskedRows[0].email, piiOut.maskedRows[1].email);
+    assert.ok(!piiJsonCli.stdout.includes('maria.garcia@prod-users.io'));
+    assert.ok(typeof piiOut.pgAnonDdl === 'string' && piiOut.pgAnonDdl.includes('SECURITY LABEL FOR anon'));
+
+    const piiSqlCli = await runCli([
+      'mask-pii',
+      '--sql', "INSERT INTO users (email, phone) VALUES ('bob.jones@prod-users.io', '+1-212-890-4321');",
+      '--seed', 'cli-seed-13',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(piiSqlCli.status, 0, `culkibo mask-pii --sql falló: ${piiSqlCli.stderr}`);
+    const piiSqlJson = JSON.parse(piiSqlCli.stdout);
+    assert.strictEqual(piiSqlJson.zeroPiiLeaked, true);
+    assert.ok(!piiSqlCli.stdout.includes('bob.jones@prod-users.io'));
+    console.log(`  ✓ Pioneer CLI Cycle-13 verificado (culkibo audit-image leaky=1/slim=0, culkibo mask-pii JSON+SQL zero-PII, culkibo demo 150 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

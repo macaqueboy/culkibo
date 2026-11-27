@@ -4098,6 +4098,29 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:write');
     }
 
+    // Cycle-13: Image Bloat/Secret Auditor, Distributed Cron Leases, PR-Preview PII Masker, OOM Forensics & On-Call Escalation Router
+    if (p === '/api/build/image-audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (/^\/api\/crons\/[^/]+\/leases$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (/^\/api\/crons\/[^/]+\/lease(?:\/|$)/.test(p)) {
+      return this.authorizeAction(principal, 'crons:write');
+    }
+    if (p === '/api/databases/pii-mask') {
+      return this.authorizeAction(principal, 'databases:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/forensics\/classify$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/oncall/policies') {
+      return this.authorizeAction(principal, isRead ? 'uptime:read' : 'team:write');
+    }
+    if (p === '/api/oncall/incidents' || p === '/api/oncall/ingest' || p === '/api/oncall/evaluate' || /^\/api\/oncall\/incidents\/[^/]+\/ack$/.test(p)) {
+      return this.authorizeAction(principal, isRead ? 'uptime:read' : 'uptime:write');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {
