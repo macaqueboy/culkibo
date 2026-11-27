@@ -3987,7 +3987,7 @@ export const api = {
     );
   },
 
-  // --- Cycle-2 Pioneer Controls (Fast Restart, SmartPack, EdgeTunnel, Edition) ---
+  // --- Cycle-2 & Cycle-3 Pioneer Controls (Fast Restart, SmartPack, DirectPush, EdgeTunnel, Stream, Edition) ---
 
   async fastRestartProject(
     projectId: string,
@@ -3999,14 +3999,19 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(opts),
       }),
-      'No se pudo reiniciar el contenedor con las nuevas variables'
+      'Could not restart container with updated environment variables'
     );
   },
 
   async getSmartPackPlan(payload: {
     dir?: string;
+    dirPath?: string;
     projectId?: string;
-    files?: string[];
+    files?: string[] | Record<string, string>;
+    containerPort?: number;
+    memoryMb?: number;
+    cpus?: number;
+    zstdChunked?: boolean;
   } = {}): Promise<SmartPackPlanResult> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/build/smartpack/plan`, {
@@ -4014,21 +4019,79 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       }),
-      'No se pudo generar el plan SmartPack'
+      'Could not generate SmartPack build plan'
+    );
+  },
+
+  async planDirectPush(payload: {
+    image: string;
+    serverId?: string;
+    sshHost?: string;
+    sshPort?: number;
+    sshUser?: string;
+    localPort?: number;
+    remotePort?: number;
+    direction?: 'push' | 'pull';
+    targetTag?: string;
+    projectId?: string;
+  }): Promise<DirectPushPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/deploy/direct-push/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not generate DirectPush SSH plan'
     );
   },
 
   async getEdgeTunnelStatus(): Promise<EdgeTunnelStatusResult> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/edge-tunnel/status`),
-      'No se pudo consultar el estado de EdgeTunnel'
+      'Could not query EdgeTunnel status'
+    );
+  },
+
+  async createEdgeTunnel(payload: {
+    name: string;
+    targetHost: string;
+    targetPort: number;
+    hostname?: string;
+  }): Promise<EdgeTunnelCreateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge-tunnel/tunnels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not create sovereign EdgeTunnel'
+    );
+  },
+
+  async revokeEdgeTunnel(id: string): Promise<{ revoked: boolean; id?: string }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge-tunnel/tunnels/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      }),
+      'Could not revoke EdgeTunnel'
+    );
+  },
+
+  async planCoolifyStream(payload: Record<string, unknown>): Promise<CoolifyStreamPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/import/coolify/stream-plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not generate Coolify volume & database stream plan'
     );
   },
 
   async getEditionStatus(): Promise<EditionStatusResult> {
     return jsonOrThrow(
       await apiFetch(`${API_BASE}/system/edition`),
-      'No se pudo consultar la edición de Culkibo'
+      'Could not query Culkibo edition'
     );
   },
 };
@@ -4294,7 +4357,7 @@ export interface SecretScanReport {
   findings: SecretScanFinding[];
 }
 
-// --- Cycle-2 Pioneer Types (Fast Restart, SmartPack, EdgeTunnel, Edition) ---
+// --- Cycle-2 & Cycle-3 Pioneer Types (Fast Restart, SmartPack, DirectPush, EdgeTunnel, Stream, Edition) ---
 
 export interface FastRestartResult {
   restarted: boolean;
@@ -4307,35 +4370,141 @@ export interface FastRestartResult {
   reason?: string | null;
 }
 
+export interface SmartPackCacheMount {
+  id: string;
+  target: string;
+  sharing?: string;
+}
+
+export interface SmartPackResourceLimits {
+  hostMemoryMb?: number;
+  hostCpus?: number;
+  buildMemoryMb?: number;
+  buildCpus?: number;
+  memory?: string;
+  cpus?: number | string;
+  maxParallelStages?: number;
+  reservedHeadroomMb?: number;
+  dockerBuildFlags?: string[];
+  zstdChunked?: boolean;
+  zstdChunkedFlags?: string[];
+}
+
+export interface SmartPackDockerignore {
+  implicit: boolean;
+  mergedWithExisting: boolean;
+  patterns: string[];
+  excludedCount: number;
+  content: string;
+}
+
 export interface SmartPackPlanResult {
+  schemaVersion?: string;
   stack: string;
+  label?: string;
   runtime?: string | null;
+  runtimeVersion?: string | null;
   packageManager?: string | null;
+  detectedSignals?: string[];
+  containerPort?: number | null;
+  port?: number | null;
+  baseImage?: string | null;
+  runtimeImage?: string | null;
+  aptPackages?: string[];
+  apkPackages?: string[];
+  cacheMounts?: Array<SmartPackCacheMount | string>;
   installCommand?: string | null;
   buildCommand?: string | null;
-  startCommand?: string | null;
-  port?: number | null;
-  cacheMounts?: string[];
-  packages?: string[];
+  startCommand?: string[] | string | null;
+  layers?: Array<{ index: number; name: string; from: string; stepCount: number; cached: boolean }>;
+  ociExport?: { zstdChunked: boolean; compression: string; flags: string[] };
   zstdChunked?: boolean;
-  dockerignore?: string[];
+  resourceLimits?: SmartPackResourceLimits | null;
   limits?: { memoryMb?: number; cpus?: number | string } | null;
+  dockerignore?: SmartPackDockerignore | string[];
+  warnings?: string[];
+  deterministicHash?: string;
   dockerfile?: string | null;
+}
+
+export interface DirectPushStep {
+  step: number;
+  id: string;
+  description: string;
+  bin: string;
+  argv: string[];
+  shell: boolean;
+  skippedForLocal?: boolean;
+}
+
+export interface DirectPushPlanResult {
+  schemaVersion: string;
+  protocol: string;
+  zeroRegistryRequired: boolean;
+  deltaTransfer: boolean;
+  shell: boolean;
+  direction: 'push' | 'pull';
+  serverId: string;
+  sourceImage: string;
+  repository: string;
+  tag: string;
+  targetImageRef: string;
+  tunnel: {
+    sshHost: string;
+    sshUser: string;
+    sshPort: number;
+    localPort: number;
+    remotePort: number;
+    loopbackOnly: boolean;
+    forwardFlag: string;
+  };
+  steps: DirectPushStep[];
+}
+
+export interface EdgeTunnelRecord {
+  id: string;
+  name: string;
+  hostname?: string | null;
+  targetHost: string;
+  targetPort: number;
+  tokenPreview?: string;
+  revoked?: boolean;
+  status?: 'connected' | 'offline' | 'revoked' | string;
+  connected?: boolean;
+  activeStreams?: number;
+  connectedAt?: string | null;
+  lastHeartbeatAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface EdgeTunnelStatusResult {
   enabled?: boolean;
+  protocol?: string;
+  totalTunnels?: number;
   activeTunnels?: number;
+  connectedTunnels?: number;
   connectedAgents?: number;
-  tunnels?: Array<{
-    id: string;
-    name: string;
-    hostname?: string | null;
-    targetHost?: string;
-    targetPort?: number;
-    connected?: boolean;
-    createdAt?: string;
-  }>;
+  activeStreams?: number;
+  totalRequestsForwarded?: number;
+  totalBytesIn?: number;
+  totalBytesOut?: number;
+  rejectedAuthCount?: number;
+  tunnels?: EdgeTunnelRecord[];
+}
+
+export interface EdgeTunnelCreateResult extends EdgeTunnelRecord {
+  token: string;
+}
+
+export interface CoolifyStreamPlanResult {
+  schemaVersion?: string;
+  totalStreams?: number;
+  databases?: Array<Record<string, unknown>>;
+  volumes?: Array<Record<string, unknown>>;
+  steps?: Array<Record<string, unknown>>;
+  warnings?: string[];
+  [key: string]: unknown;
 }
 
 export interface EditionStatusResult {

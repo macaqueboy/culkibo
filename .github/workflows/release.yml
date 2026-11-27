@@ -1,0 +1,108 @@
+name: Culkibo Release & Supply-Chain Provenance
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v1.2.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify, Generate CycloneDX 1.6 SBOM & Publish Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install root and web dependencies
+        run: |
+          npm ci
+          npm --prefix web ci
+
+      - name: Enforce runtime dependency invariants (ROOT_DEPS=6, COLLECTOR_DEPS=0)
+        run: |
+          node -e "
+            const rootDeps = Object.keys(require('./package.json').dependencies || {});
+            const collDeps = Object.keys(require('./telemetry-collector/package.json').dependencies || {});
+            if (rootDeps.length !== 6) throw new Error('ROOT_DEPS must be 6, got ' + rootDeps.length);
+            if (collDeps.length !== 0) throw new Error('COLLECTOR_DEPS must be 0, got ' + collDeps.length);
+            console.log({ rootDepsCount: rootDeps.length, collectorDepsCount: collDeps.length });
+          "
+
+      - name: Run full verification gates (shell-safety, typecheck, lint, build, test suite)
+        env:
+          DOCKER_BUILDKIT: '1'
+        run: |
+          node tests/shell-safety.test.js
+          npm run typecheck
+          npx tsc -p web/tsconfig.app.json --noEmit
+          npx --prefix web oxlint --deny-warnings
+          npm run web:build
+          node tests/run-all.js
+          node --disable-warning=ExperimentalWarning --test telemetry-collector/test/collector.test.js
+
+      - name: Generate CycloneDX 1.6 SBOM, SHA-256 Checksums & Provenance
+        run: |
+          mkdir -p dist-release
+          node scripts/release-provenance.js --out-dir dist-release --json
+          ls -la dist-release
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const sbom = JSON.parse(fs.readFileSync(path.join('dist-release', 'sbom.cdx.json'), 'utf8'));
+            if (sbom.bomFormat !== 'CycloneDX' || sbom.specVersion !== '1.6') {
+              throw new Error('Invalid CycloneDX 1.6 SBOM');
+            }
+            const checksums = fs.readFileSync(path.join('dist-release', 'CHECKSUMS.sha256'), 'utf8').trim();
+            if (!checksums) throw new Error('CHECKSUMS.sha256 is empty');
+            const prov = JSON.parse(fs.readFileSync(path.join('dist-release', 'provenance.json'), 'utf8'));
+            console.log('Verified release artifacts:', {
+              bomFormat: sbom.bomFormat,
+              specVersion: sbom.specVersion,
+              components: (sbom.components || []).length,
+              checksumLines: checksums.split(/\r?\n/).length,
+              provenanceKeys: Object.keys(prov)
+            });
+          "
+
+      - name: Upload release provenance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: culkibo-release-provenance-${{ github.ref_name }}
+          path: |
+            dist-release/sbom.cdx.json
+            dist-release/CHECKSUMS.sha256
+            dist-release/provenance.json
+
+      - name: Publish GitHub Release with SBOM & SHA-256 Checksums
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist-release/sbom.cdx.json
+            dist-release/CHECKSUMS.sha256
+            dist-release/provenance.json

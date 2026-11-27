@@ -26,6 +26,7 @@ import type { McpAuditEntry, RemoteAccessInfo } from '../lib/api';
 import { api, apiFetch } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n } from '../lib/i18n';
 import { HelpTip } from './HelpTip';
 
 type AgentCardId = 'antigravity' | 'claude-code' | 'cursor' | 'windsurf' | 'codex' | 'vscode' | 'claude-desktop';
@@ -60,40 +61,89 @@ interface McpAppResourceSpec {
   };
 }
 
-const FALLBACK_MCP_APPS: ReadonlyArray<McpAppResourceSpec> = [
-  {
-    uri: 'ui://culkibo/topology',
-    name: 'Culkibo Live Topology App',
-    title: 'Interactive Service, DB, Domain & Fleet Topology',
-    description: 'Mapa interactivo en vivo de dominios, proyectos, bases de datos y flota SSH con puente de diagnóstico y despliegue seguro.',
-    mimeType: 'text/html;profile=mcp-app',
-    _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
-  },
-  {
-    uri: 'ui://culkibo/incident-remediator',
-    name: 'Culkibo Incident Remediator App',
-    title: 'Live OOM/Crash Diagnostics & 2-Phase Safe Remediator',
-    description: 'Correlaciona OOMKilled, CrashLoop, logs y uptime con remediación interactiva en 2 fases (dryRun → confirmToken HMAC).',
-    mimeType: 'text/html;profile=mcp-app',
-    _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
-  },
-  {
-    uri: 'ui://culkibo/coolify-migration-diff',
-    name: 'Culkibo Coolify v4 Migration Diff App',
-    title: 'Coolify v4 Parity Score & Traefik → Caddy Edge Diff',
-    description: 'Visualiza el Parity Score de Coolify v4, traducción redactada de Magic Vars (${vault.*}) y diff Traefik → Caddy.',
-    mimeType: 'text/html;profile=mcp-app',
-    _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
-  },
-];
+/** Strips <script> blocks before passing HTML to <iframe sandbox=""> so Chromium emits 0 console notices. */
+function stripScriptsForSandbox(html: string): string {
+  if (!html) return '';
+  return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+}
 
-const PROFILE_OPTIONS: ReadonlyArray<{ id: McpProfile; label: string; short: string; hint: string }> = [
-  { id: 'core', label: 'Core (Recomendado)', short: 'Core', hint: '17 herramientas esenciales + culkibo_ship_and_verify + culkibo_search_tools (>81% ahorro)' },
-  { id: 'deploy', label: 'Deploy & CI/CD', short: 'Deploy', hint: 'Despliegues, Ship & Verify, Canary, Smoke, Previews, Freeze y Entornos' },
-  { id: 'ops', label: 'Ops & Self-Healing', short: 'Ops', hint: 'Diagnóstico autónomo, remediación, logs, Docker, Uptime y Smart Sleep' },
-  { id: 'security', label: 'Security & RBAC', short: 'Security', hint: 'Equipos, tokens, TLS/wildcard, Basic Auth, snapshots y System Doctor' },
-  { id: 'all', label: 'Todas', short: 'Todas', hint: 'Catálogo completo sin filtrado de perfil' },
-];
+function getFallbackMcpApps(isEn: boolean): ReadonlyArray<McpAppResourceSpec> {
+  return [
+    {
+      uri: 'ui://culkibo/topology',
+      name: 'Culkibo Live Topology App',
+      title: 'Interactive Service, DB, Domain & Fleet Topology',
+      description: isEn
+        ? 'Live interactive map of domains, projects, databases, and SSH fleet with safe diagnostics & deployment bridge.'
+        : 'Mapa interactivo en vivo de dominios, proyectos, bases de datos y flota SSH con puente de diagnóstico y despliegue seguro.',
+      mimeType: 'text/html;profile=mcp-app',
+      _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
+    },
+    {
+      uri: 'ui://culkibo/incident-remediator',
+      name: 'Culkibo Incident Remediator App',
+      title: 'Live OOM/Crash Diagnostics & 2-Phase Safe Remediator',
+      description: isEn
+        ? 'Correlates OOMKilled, CrashLoop, logs, and uptime with 2-phase interactive remediation (dryRun → HMAC confirmToken).'
+        : 'Correlaciona OOMKilled, CrashLoop, logs y uptime con remediación interactiva en 2 fases (dryRun → confirmToken HMAC).',
+      mimeType: 'text/html;profile=mcp-app',
+      _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
+    },
+    {
+      uri: 'ui://culkibo/coolify-migration-diff',
+      name: 'Culkibo Coolify v4 Migration Diff App',
+      title: 'Coolify v4 Parity Score & Traefik → Caddy Edge Diff',
+      description: isEn
+        ? 'Displays Coolify v4 Parity Score, redacted Magic Vars (${vault.*}) translation, and Traefik → Caddy edge diff.'
+        : 'Visualiza el Parity Score de Coolify v4, traducción redactada de Magic Vars (${vault.*}) y diff Traefik → Caddy.',
+      mimeType: 'text/html;profile=mcp-app',
+      _meta: { ui: { csp: { policy: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" }, prefersBorder: true, specVersion: '2026-01-26' } },
+    },
+  ];
+}
+
+function getProfileOptions(isEn: boolean): ReadonlyArray<{ id: McpProfile; label: string; short: string; hint: string }> {
+  return [
+    {
+      id: 'core',
+      label: isEn ? 'Core (Recommended)' : 'Core (Recomendado)',
+      short: 'Core',
+      hint: isEn
+        ? '17 essential tools + culkibo_ship_and_verify + culkibo_search_tools (>81% savings)'
+        : '17 herramientas esenciales + culkibo_ship_and_verify + culkibo_search_tools (>81% ahorro)',
+    },
+    {
+      id: 'deploy',
+      label: 'Deploy & CI/CD',
+      short: 'Deploy',
+      hint: isEn
+        ? 'Deployments, Ship & Verify, Canary, Smoke, Previews, Freeze & Environments'
+        : 'Despliegues, Ship & Verify, Canary, Smoke, Previews, Freeze y Entornos',
+    },
+    {
+      id: 'ops',
+      label: 'Ops & Self-Healing',
+      short: 'Ops',
+      hint: isEn
+        ? 'Autonomous diagnostics, remediation, logs, Docker, Uptime & Smart Sleep'
+        : 'Diagnóstico autónomo, remediación, logs, Docker, Uptime y Smart Sleep',
+    },
+    {
+      id: 'security',
+      label: 'Security & RBAC',
+      short: 'Security',
+      hint: isEn
+        ? 'Teams, tokens, TLS/wildcard, Basic Auth, snapshots & System Doctor'
+        : 'Equipos, tokens, TLS/wildcard, Basic Auth, snapshots y System Doctor',
+    },
+    {
+      id: 'all',
+      label: isEn ? 'All' : 'Todas',
+      short: isEn ? 'All' : 'Todas',
+      hint: isEn ? 'Full catalog without profile filtering' : 'Catálogo completo sin filtrado de perfil',
+    },
+  ];
+}
 
 const PROFILE_TOOL_SETS: Record<Exclude<McpProfile, 'all'>, ReadonlySet<string>> = {
   core: new Set([
@@ -130,117 +180,137 @@ const PROFILE_TOOL_SETS: Record<Exclude<McpProfile, 'all'>, ReadonlySet<string>>
   ]),
 };
 
-const CORE_PLAYBOOK_META: Record<string, { badge: string; tone: string; steps: string }> = {
-  deploy_safely: {
-    badge: 'Deploy',
-    tone: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-    steps: 'Secret scan → Ship & Verify → Smoke → Métricas',
-  },
-  migrate_from_coolify: {
-    badge: 'Migration',
-    tone: 'bg-sky-50 text-sky-700 border-sky-200',
-    steps: 'Scan Coolify → Magic vars & Traefik → Plan → Verify',
-  },
-  debug_production_crash: {
-    badge: 'Incident',
-    tone: 'bg-rose-50 text-rose-700 border-rose-200',
-    steps: 'Diagnose → Correlate OOM/Logs → Safe Remediate',
-  },
-  zero_downtime_db_upgrade: {
-    badge: 'Database',
-    tone: 'bg-amber-50 text-amber-800 border-amber-200',
-    steps: 'Backup + DR Drill → Clone/Pooler → Cutover',
-  },
-  security_audit_stack: {
-    badge: 'Security',
-    tone: 'bg-indigo-50 text-indigo-700 border-indigo-200',
-    steps: 'Audit Chain → Secret Scan → RBAC/2FA/OIDC → TLS',
-  },
-  setup_wildcard_tls_and_tunnel: {
-    badge: 'TLS / Edge',
-    tone: 'bg-cyan-50 text-cyan-800 border-cyan-200',
-    steps: 'Multi-DNS-01 *.dominio o Cloudflare CGNAT 0 puertos',
-  },
-  optimize_ram_and_costs: {
-    badge: 'FinOps',
-    tone: 'bg-teal-50 text-teal-800 border-teal-200',
-    steps: 'Cost Advisor → Smart Sleep → Right-Sizing',
-  },
-  disaster_recovery_drill: {
-    badge: 'DR Drill',
-    tone: 'bg-violet-50 text-violet-800 border-violet-200',
-    steps: 'AES-256-GCM Verify → Restore No Destructivo → RTO/RPO',
-  },
-};
+function getCorePlaybookMeta(isEn: boolean): Record<string, { badge: string; tone: string; steps: string }> {
+  return {
+    deploy_safely: {
+      badge: 'Deploy',
+      tone: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      steps: isEn ? 'Secret scan → Ship & Verify → Smoke → Metrics' : 'Secret scan → Ship & Verify → Smoke → Métricas',
+    },
+    migrate_from_coolify: {
+      badge: 'Migration',
+      tone: 'bg-sky-50 text-sky-700 border-sky-200',
+      steps: 'Scan Coolify → Magic vars & Traefik → Plan → Verify',
+    },
+    debug_production_crash: {
+      badge: 'Incident',
+      tone: 'bg-rose-50 text-rose-700 border-rose-200',
+      steps: 'Diagnose → Correlate OOM/Logs → Safe Remediate',
+    },
+    zero_downtime_db_upgrade: {
+      badge: 'Database',
+      tone: 'bg-amber-50 text-amber-800 border-amber-200',
+      steps: 'Backup + DR Drill → Clone/Pooler → Cutover',
+    },
+    security_audit_stack: {
+      badge: 'Security',
+      tone: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+      steps: 'Audit Chain → Secret Scan → RBAC/2FA/OIDC → TLS',
+    },
+    setup_wildcard_tls_and_tunnel: {
+      badge: 'TLS / Edge',
+      tone: 'bg-cyan-50 text-cyan-800 border-cyan-200',
+      steps: isEn ? 'Multi-DNS-01 *.domain or EdgeTunnel / CGNAT 0 open ports' : 'Multi-DNS-01 *.dominio o EdgeTunnel / CGNAT 0 puertos',
+    },
+    optimize_ram_and_costs: {
+      badge: 'FinOps',
+      tone: 'bg-teal-50 text-teal-800 border-teal-200',
+      steps: 'Cost Advisor → Smart Sleep → Right-Sizing',
+    },
+    disaster_recovery_drill: {
+      badge: 'DR Drill',
+      tone: 'bg-violet-50 text-violet-800 border-violet-200',
+      steps: isEn ? 'AES-256-GCM Verify → Non-Destructive Restore → RTO/RPO' : 'AES-256-GCM Verify → Restore No Destructivo → RTO/RPO',
+    },
+  };
+}
 
-const FALLBACK_PLAYBOOKS: ReadonlyArray<McpPromptSpec> = [
-  {
-    name: 'deploy_safely',
-    title: 'Deploy Safely',
-    description: 'Escaneo pre-despliegue de secretos, despliegue seguro con culkibo_ship_and_verify, smoke checks y verificación de métricas.',
-    arguments: [
-      { name: 'projectId', description: 'ID del proyecto', required: true },
-      { name: 'targetEnv', description: 'Entorno objetivo', required: false },
-    ],
-  },
-  {
-    name: 'migrate_from_coolify',
-    title: 'Migrate from Coolify',
-    description: 'Inventario read-only de Coolify, traducción de magic vars y Traefik a Caddy, plan e importación verificada.',
-    arguments: [
-      { name: 'coolifyUrl', description: 'URL de Coolify', required: true },
-      { name: 'targetServerId', description: 'Nodo destino', required: false },
-    ],
-  },
-  {
-    name: 'debug_production_crash',
-    title: 'Debug Production Crash',
-    description: 'Ejecuta culkibo_diagnose_incident, correlaciona OOM/logs/restarts y propone remediación segura con confirmToken.',
-    arguments: [
-      { name: 'projectId', description: 'ID del proyecto', required: false },
-      { name: 'hostname', description: 'Dominio afectado', required: false },
-    ],
-  },
-  {
-    name: 'zero_downtime_db_upgrade',
-    title: 'Zero-Downtime DB Upgrade',
-    description: 'Backup cifrado + verificación + ensayo DR, clon/pooler paralelo y cutover controlado.',
-    arguments: [
-      { name: 'databaseId', description: 'ID de la base de datos', required: true },
-      { name: 'targetVersion', description: 'Versión objetivo', required: false },
-    ],
-  },
-  {
-    name: 'security_audit_stack',
-    title: 'Security Audit Stack',
-    description: 'Verifica cadena hash de auditoría, escaneo de secretos, postura RBAC/2FA/OIDC y caducidad TLS.',
-    arguments: [{ name: 'scope', description: 'Alcance (instance o projectId)', required: false }],
-  },
-  {
-    name: 'setup_wildcard_tls_and_tunnel',
-    title: 'Setup Wildcard TLS & Tunnel',
-    description: 'Configura wildcard multi-DNS-01 o Cloudflare Tunnel CGNAT con cero puertos abiertos.',
-    arguments: [
-      { name: 'rootDomain', description: 'Dominio raíz', required: true },
-      { name: 'mode', description: 'dns01 | tunnel | hybrid', required: false },
-    ],
-  },
-  {
-    name: 'optimize_ram_and_costs',
-    title: 'Optimize RAM & Costs',
-    description: 'Combina Sleep Advisor, Cost Advisor y right-sizing de límites de contenedores.',
-    arguments: [{ name: 'monthlyServerCostEur', description: 'Coste VPS mensual (EUR)', required: false }],
-  },
-  {
-    name: 'disaster_recovery_drill',
-    title: 'Disaster Recovery Drill',
-    description: 'Verificación de backups AES-256-GCM y simulacro de restauración no destructivo con RTO/RPO.',
-    arguments: [
-      { name: 'databaseId', description: 'ID de BD', required: false },
-      { name: 'projectId', description: 'ID de proyecto', required: false },
-    ],
-  },
-];
+function getFallbackPlaybooks(isEn: boolean): ReadonlyArray<McpPromptSpec> {
+  return [
+    {
+      name: 'deploy_safely',
+      title: 'Deploy Safely',
+      description: isEn
+        ? 'Pre-deploy secret scan, safe deploy with culkibo_ship_and_verify, smoke checks, and metrics verification.'
+        : 'Escaneo pre-despliegue de secretos, despliegue seguro con culkibo_ship_and_verify, smoke checks y verificación de métricas.',
+      arguments: [
+        { name: 'projectId', description: isEn ? 'Project ID' : 'ID del proyecto', required: true },
+        { name: 'targetEnv', description: isEn ? 'Target environment' : 'Entorno objetivo', required: false },
+      ],
+    },
+    {
+      name: 'migrate_from_coolify',
+      title: 'Migrate from Coolify',
+      description: isEn
+        ? 'Read-only Coolify inventory, Magic Vars & Traefik-to-Caddy translation, migration plan, and verified import.'
+        : 'Inventario read-only de Coolify, traducción de magic vars y Traefik a Caddy, plan e importación verificada.',
+      arguments: [
+        { name: 'coolifyUrl', description: isEn ? 'Coolify URL' : 'URL de Coolify', required: true },
+        { name: 'targetServerId', description: isEn ? 'Target node' : 'Nodo destino', required: false },
+      ],
+    },
+    {
+      name: 'debug_production_crash',
+      title: 'Debug Production Crash',
+      description: isEn
+        ? 'Runs culkibo_diagnose_incident, correlates OOM/logs/restarts, and proposes safe remediation with confirmToken.'
+        : 'Ejecuta culkibo_diagnose_incident, correlaciona OOM/logs/restarts y propone remediación segura con confirmToken.',
+      arguments: [
+        { name: 'projectId', description: isEn ? 'Project ID' : 'ID del proyecto', required: false },
+        { name: 'hostname', description: isEn ? 'Affected domain' : 'Dominio afectado', required: false },
+      ],
+    },
+    {
+      name: 'zero_downtime_db_upgrade',
+      title: 'Zero-Downtime DB Upgrade',
+      description: isEn
+        ? 'Encrypted backup + verification + DR drill, parallel clone/pooler, and controlled cutover.'
+        : 'Backup cifrado + verificación + ensayo DR, clon/pooler paralelo y cutover controlado.',
+      arguments: [
+        { name: 'databaseId', description: isEn ? 'Database ID' : 'ID de la base de datos', required: true },
+        { name: 'targetVersion', description: isEn ? 'Target version' : 'Versión objetivo', required: false },
+      ],
+    },
+    {
+      name: 'security_audit_stack',
+      title: 'Security Audit Stack',
+      description: isEn
+        ? 'Verifies hash-chained audit log, secret scan, RBAC/2FA/OIDC posture, and TLS certificate expiry.'
+        : 'Verifica cadena hash de auditoría, escaneo de secretos, postura RBAC/2FA/OIDC y caducidad TLS.',
+      arguments: [{ name: 'scope', description: isEn ? 'Scope (instance or projectId)' : 'Alcance (instance o projectId)', required: false }],
+    },
+    {
+      name: 'setup_wildcard_tls_and_tunnel',
+      title: 'Setup Wildcard TLS & Tunnel',
+      description: isEn
+        ? 'Configures multi-DNS-01 wildcard TLS or sovereign CGNAT EdgeTunnel with zero open ports.'
+        : 'Configura wildcard multi-DNS-01 o EdgeTunnel / Cloudflare Tunnel CGNAT con cero puertos abiertos.',
+      arguments: [
+        { name: 'rootDomain', description: isEn ? 'Root domain' : 'Dominio raíz', required: true },
+        { name: 'mode', description: 'dns01 | tunnel | hybrid', required: false },
+      ],
+    },
+    {
+      name: 'optimize_ram_and_costs',
+      title: 'Optimize RAM & Costs',
+      description: isEn
+        ? 'Combines Sleep Advisor, Cost Advisor, and container memory/CPU right-sizing.'
+        : 'Combina Sleep Advisor, Cost Advisor y right-sizing de límites de contenedores.',
+      arguments: [{ name: 'monthlyServerCostEur', description: isEn ? 'Monthly VPS cost (EUR)' : 'Coste VPS mensual (EUR)', required: false }],
+    },
+    {
+      name: 'disaster_recovery_drill',
+      title: 'Disaster Recovery Drill',
+      description: isEn
+        ? 'Verifies AES-256-GCM encrypted backups and executes a non-destructive restore drill with RTO/RPO.'
+        : 'Verificación de backups AES-256-GCM y simulacro de restauración no destructivo con RTO/RPO.',
+      arguments: [
+        { name: 'databaseId', description: isEn ? 'DB ID' : 'ID de BD', required: false },
+        { name: 'projectId', description: isEn ? 'Project ID' : 'ID de proyecto', required: false },
+      ],
+    },
+  ];
+}
 
 function appendProfileToUrl(rawUrl: string, profile: McpProfile): string {
   if (!rawUrl || profile === 'all') return rawUrl;
@@ -267,7 +337,8 @@ function buildAgentSnippets(
   baseUrl: string,
   profile: McpProfile,
   profileStats: { count: number; total: number; savedPct: number },
-  baseConfigs: any
+  baseConfigs: any,
+  isEn: boolean
 ) {
   const endpoint = appendProfileToUrl(`${baseUrl}/api/mcp`, profile);
   const tokenPlaceholder = '${CULKIBO_TOKEN}';
@@ -299,17 +370,29 @@ function buildAgentSnippets(
     2
   );
 
-  const claudeMd = [
-    '<!-- culkibo-mcp-ops:start -->',
-    '## Culkibo AI-Native PaaS Operations (MCP 2026)',
-    '',
-    `- Endpoint MCP: \`${endpoint}\` (perfil \`${profile}\`: **${profileStats.count}/${profileStats.total || 111}** herramientas, **-${profileStats.savedPct}%** contexto).`,
-    '- Exporta `CULKIBO_TOKEN` en tu entorno local; nunca guardes tokens maestros en Git.',
-    '- Usa `culkibo_search_tools` para descubrir herramientas fuera del perfil activo bajo demanda.',
-    '- Usa `culkibo_ship_and_verify` (`dryRun: true` → `confirmToken` → `dryRun: false`) para desplegar con escaneo de secretos, smoke checks y auto-rollback.',
-    '- Usa `culkibo_diagnose_incident` + `culkibo_auto_remediate` para autocuración segura.',
-    '<!-- culkibo-mcp-ops:end -->',
-  ].join('\n');
+  const claudeMd = isEn
+    ? [
+        '<!-- culkibo-mcp-ops:start -->',
+        '## Culkibo AI-Native PaaS Operations (MCP 2026)',
+        '',
+        `- MCP Endpoint: \`${endpoint}\` (profile \`${profile}\`: **${profileStats.count}/${profileStats.total || 111}** tools, **-${profileStats.savedPct}%** context).`,
+        '- Export `CULKIBO_TOKEN` in your local shell; never commit master tokens to Git.',
+        '- Use `culkibo_search_tools` to discover tools outside the active profile on demand.',
+        '- Use `culkibo_ship_and_verify` (`dryRun: true` → `confirmToken` → `dryRun: false`) to deploy with secret scanning, smoke checks, and auto-rollback.',
+        '- Use `culkibo_diagnose_incident` + `culkibo_auto_remediate` for safe self-healing.',
+        '<!-- culkibo-mcp-ops:end -->',
+      ].join('\n')
+    : [
+        '<!-- culkibo-mcp-ops:start -->',
+        '## Culkibo AI-Native PaaS Operations (MCP 2026)',
+        '',
+        `- Endpoint MCP: \`${endpoint}\` (perfil \`${profile}\`: **${profileStats.count}/${profileStats.total || 111}** herramientas, **-${profileStats.savedPct}%** contexto).`,
+        '- Exporta `CULKIBO_TOKEN` en tu entorno local; nunca guardes tokens maestros en Git.',
+        '- Usa `culkibo_search_tools` para descubrir herramientas fuera del perfil activo bajo demanda.',
+        '- Usa `culkibo_ship_and_verify` (`dryRun: true` → `confirmToken` → `dryRun: false`) para desplegar con escaneo de secretos, smoke checks y auto-rollback.',
+        '- Usa `culkibo_diagnose_incident` + `culkibo_auto_remediate` para autocuración segura.',
+        '<!-- culkibo-mcp-ops:end -->',
+      ].join('\n');
 
   const claudeCodeCli = `claude mcp add --transport http culkibo "${endpoint}" --header "Authorization: Bearer ${tokenPlaceholder}"`;
 
@@ -407,7 +490,7 @@ function extractMcpErrorEnvelope(toolResult: any): { code?: string; message?: st
         const parsed = JSON.parse(firstText);
         if (parsed && typeof parsed === 'object') return parsed;
       } catch {
-        // Texto plano sin JSON estructurado
+        // Plain text without structured JSON
       }
     }
   }
@@ -421,24 +504,36 @@ function extractMcpErrorEnvelope(toolResult: any): { code?: string; message?: st
   return null;
 }
 
-function classifyMcpToolGroup(name: string): string {
+function classifyMcpToolGroup(name: string, isEn: boolean): string {
   const n = name.toLowerCase();
-  if (n.includes('ship_and_verify') || n.includes('export_agent_kit') || n.includes('smartpack') || n.includes('edge_tunnel')) return 'MCP 2026 Pioneer (Ship, SmartPack, EdgeTunnel & Kits)';
-  if (n.includes('diagnose_incident') || n.includes('auto_remediate') || n.includes('search_tools')) return 'Autocuración y Descubrimiento IA';
-  if (n.includes('fleet_')) return 'Flota Multi-Servidor (SSH)';
-  if (n.includes('rbac_') || n.includes('team_')) return 'Equipos, RBAC y Tokens';
-  if (n.includes('uptime_') || n.includes('status_page')) return 'Uptime y Páginas de Estado';
-  if (n.includes('gitops_') || n.includes('_env_')) return 'GitOps y Entornos';
-  if (n.includes('sleep_') || n.includes('cost_advisor')) return 'Smart Sleep y Cost Advisor';
-  if (n.includes('smoke_') || n.includes('canary_') || n.includes('freeze')) return 'Smoke Tests, Canary y Freeze';
+  if (n.includes('ship_and_verify') || n.includes('export_agent_kit') || n.includes('smartpack') || n.includes('edge_tunnel')) {
+    return 'MCP 2026 Pioneer (Ship, SmartPack, EdgeTunnel & Kits)';
+  }
+  if (n.includes('diagnose_incident') || n.includes('auto_remediate') || n.includes('search_tools')) {
+    return isEn ? 'Self-Healing & AI Discovery' : 'Autocuración y Descubrimiento IA';
+  }
+  if (n.includes('fleet_')) return isEn ? 'Multi-Server Fleet (SSH)' : 'Flota Multi-Servidor (SSH)';
+  if (n.includes('rbac_') || n.includes('team_')) return isEn ? 'Teams, RBAC & Tokens' : 'Equipos, RBAC y Tokens';
+  if (n.includes('uptime_') || n.includes('status_page')) return isEn ? 'Uptime & Status Pages' : 'Uptime y Páginas de Estado';
+  if (n.includes('gitops_') || n.includes('_env_')) return isEn ? 'GitOps & Environments' : 'GitOps y Entornos';
+  if (n.includes('sleep_') || n.includes('cost_advisor')) return isEn ? 'Smart Sleep & Cost Advisor' : 'Smart Sleep y Cost Advisor';
+  if (n.includes('smoke_') || n.includes('canary_') || n.includes('freeze')) return isEn ? 'Smoke Tests, Canary & Freeze' : 'Smoke Tests, Canary y Freeze';
   if (n.includes('sync') || n.includes('forge') || n.includes('merkle')) return 'Live Sync (The Forge)';
-  if (n.includes('domain') || n.includes('ssl') || n.includes('tls') || n.includes('caddy') || n.includes('ingress') || n.includes('wildcard') || n.includes('tunnel') || n.includes('cloudflare')) return 'Dominios, TLS y Caddy';
-  if (n.includes('database') || n.includes('_db') || n.includes('backup') || n.includes('snapshot') || n.includes('restore') || n.includes('s3')) return 'Bases de datos y Backups';
-  if (n.includes('catalog') || n.includes('service') || n.includes('install')) return 'Catálogo de servicios';
-  if (n.includes('deploy') || n.includes('rollback') || n.includes('cron') || n.includes('preview') || n.includes('runtime') || n.includes('container') || n.includes('traffic')) return 'Despliegues, Cron y Previews';
-  if (n.includes('wordpress') || n.includes('coolify') || n.includes('compose') || n.includes('import')) return 'Migradores e Importadores';
-  if (n.includes('project') || n.includes('env') || n.includes('webhook')) return 'Proyectos y Variables';
-  return 'Sistema, Métricas y Auditoría';
+  if (n.includes('domain') || n.includes('ssl') || n.includes('tls') || n.includes('caddy') || n.includes('ingress') || n.includes('wildcard') || n.includes('tunnel') || n.includes('cloudflare')) {
+    return isEn ? 'Domains, TLS & Caddy' : 'Dominios, TLS y Caddy';
+  }
+  if (n.includes('database') || n.includes('_db') || n.includes('backup') || n.includes('snapshot') || n.includes('restore') || n.includes('s3')) {
+    return isEn ? 'Databases & Backups' : 'Bases de datos y Backups';
+  }
+  if (n.includes('catalog') || n.includes('service') || n.includes('install')) return isEn ? 'Service Catalog' : 'Catálogo de servicios';
+  if (n.includes('deploy') || n.includes('rollback') || n.includes('cron') || n.includes('preview') || n.includes('runtime') || n.includes('container') || n.includes('traffic')) {
+    return isEn ? 'Deployments, Cron & Previews' : 'Despliegues, Cron y Previews';
+  }
+  if (n.includes('wordpress') || n.includes('coolify') || n.includes('compose') || n.includes('import')) {
+    return isEn ? 'Migrators & Importers' : 'Migradores e Importadores';
+  }
+  if (n.includes('project') || n.includes('env') || n.includes('webhook')) return isEn ? 'Projects & Variables' : 'Proyectos y Variables';
+  return isEn ? 'System, Metrics & Audit' : 'Sistema, Métricas y Auditoría';
 }
 
 function buildDefaultArgsFromSchema(spec: any): Record<string, unknown> {
@@ -460,7 +555,7 @@ function buildDefaultArgsFromSchema(spec: any): Record<string, unknown> {
     } else if (def?.type === 'object') {
       out[key] = {};
     } else {
-      out[key] = key.toLowerCase().includes('url') ? 'https://tuweb.com' : '';
+      out[key] = key.toLowerCase().includes('url') ? 'https://example.com' : '';
     }
   }
   return out;
@@ -486,7 +581,7 @@ async function callMcpModernRpc(method: string, params: Record<string, unknown> 
         _meta: {
           'io.modelcontextprotocol/protocolVersion': '2026-07-28',
           'io.modelcontextprotocol/clientCapabilities': {},
-          'io.modelcontextprotocol/clientInfo': { name: 'culkibo-web-dashboard', version: '1.1.0' },
+          'io.modelcontextprotocol/clientInfo': { name: 'culkibo-web-dashboard', version: '1.2.0' },
         },
       },
     }),
@@ -495,9 +590,17 @@ async function callMcpModernRpc(method: string, params: Record<string, unknown> 
 }
 
 export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'success' | 'error') => void }> = ({ onNotify }) => {
+  const { locale } = useI18n();
+  const isEn = locale === 'en';
+
+  const profileOptions = useMemo(() => getProfileOptions(isEn), [isEn]);
+  const corePlaybookMeta = useMemo(() => getCorePlaybookMeta(isEn), [isEn]);
+  const fallbackPlaybooks = useMemo(() => getFallbackPlaybooks(isEn), [isEn]);
+  const fallbackMcpApps = useMemo(() => getFallbackMcpApps(isEn), [isEn]);
+
   const [tools, setTools] = useState<any[]>([]);
-  const [prompts, setPrompts] = useState<McpPromptSpec[]>([...FALLBACK_PLAYBOOKS]);
-  const [mcpApps, setMcpApps] = useState<McpAppResourceSpec[]>([...FALLBACK_MCP_APPS]);
+  const [livePrompts, setLivePrompts] = useState<McpPromptSpec[] | null>(null);
+  const [liveMcpApps, setLiveMcpApps] = useState<McpAppResourceSpec[] | null>(null);
   const [activeAppUri, setActiveAppUri] = useState<string | null>(null);
   const [activeAppHtml, setActiveAppHtml] = useState<string>('');
   const [loadingApp, setLoadingApp] = useState(false);
@@ -525,6 +628,16 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
   const [confirmDestructive, setConfirmDestructive] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
+  const prompts = livePrompts && livePrompts.length > 0 ? livePrompts : fallbackPlaybooks;
+  const mcpApps = useMemo(() => {
+    if (!liveMcpApps || liveMcpApps.length === 0) return fallbackMcpApps;
+    // Use localized descriptions for known core MCP Apps when rendering in English so 0 Spanish strings leak
+    return liveMcpApps.map((app) => {
+      const fb = fallbackMcpApps.find((f) => f.uri === app.uri);
+      return fb && isEn ? { ...app, title: fb.title || app.title, description: fb.description } : app;
+    });
+  }, [liveMcpApps, fallbackMcpApps, isEn]);
+
   const loadMcpData = async () => {
     try {
       const [toolsRes, auditRes, cfgRes, remRes, promptsRes, resourcesRes] = await Promise.all([
@@ -539,14 +652,14 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       setAuditLog(auditRes.auditLog || []);
       setMcpConfig(cfgRes);
       setRemoteInfo(remRes);
-      const livePrompts = promptsRes?.result?.prompts;
-      if (Array.isArray(livePrompts) && livePrompts.length > 0) {
-        setPrompts(livePrompts);
+      const lp = promptsRes?.result?.prompts;
+      if (Array.isArray(lp) && lp.length > 0) {
+        setLivePrompts(lp);
       }
-      const liveResources = resourcesRes?.result?.resources;
-      if (Array.isArray(liveResources)) {
-        const uiApps = liveResources.filter((r: any) => typeof r?.uri === 'string' && r.uri.startsWith('ui://culkibo/'));
-        if (uiApps.length > 0) setMcpApps(uiApps);
+      const lr = resourcesRes?.result?.resources;
+      if (Array.isArray(lr)) {
+        const uiApps = lr.filter((r: any) => typeof r?.uri === 'string' && r.uri.startsWith('ui://culkibo/'));
+        if (uiApps.length > 0) setLiveMcpApps(uiApps);
       }
     } catch (e) {
       console.error(e);
@@ -569,14 +682,14 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
         setAuditLog(auditRes.auditLog || []);
         setMcpConfig(cfgRes);
         setRemoteInfo(remRes);
-        const livePrompts = promptsRes?.result?.prompts;
-        if (Array.isArray(livePrompts) && livePrompts.length > 0) {
-          setPrompts(livePrompts);
+        const lp = promptsRes?.result?.prompts;
+        if (Array.isArray(lp) && lp.length > 0) {
+          setLivePrompts(lp);
         }
-        const liveResources = resourcesRes?.result?.resources;
-        if (Array.isArray(liveResources)) {
-          const uiApps = liveResources.filter((r: any) => typeof r?.uri === 'string' && r.uri.startsWith('ui://culkibo/'));
-          if (uiApps.length > 0) setMcpApps(uiApps);
+        const lr = resourcesRes?.result?.resources;
+        if (Array.isArray(lr)) {
+          const uiApps = lr.filter((r: any) => typeof r?.uri === 'string' && r.uri.startsWith('ui://culkibo/'));
+          if (uiApps.length > 0) setLiveMcpApps(uiApps);
         }
       })
       .catch((e) => console.error(e));
@@ -603,12 +716,20 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       const res = await callMcpModernRpc('resources/read', { uri }, uri);
       const html = res?.result?.contents?.[0]?.text;
       if (typeof html === 'string' && html.trim()) {
-        setActiveAppHtml(html);
+        setActiveAppHtml(stripScriptsForSandbox(html));
       } else {
-        setActiveAppHtml('<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#475569">No se pudo cargar el recurso MCP App desde POST /api/mcp.</body></html>');
+        setActiveAppHtml(
+          isEn
+            ? '<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#475569">Could not load MCP App resource from POST /api/mcp.</body></html>'
+            : '<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#475569">No se pudo cargar el recurso MCP App desde POST /api/mcp.</body></html>'
+        );
       }
     } catch {
-      setActiveAppHtml('<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#b91c1c">Error leyendo el recurso MCP App.</body></html>');
+      setActiveAppHtml(
+        isEn
+          ? '<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#b91c1c">Error reading MCP App resource.</body></html>'
+          : '<!DOCTYPE html><html><body style="font-family:system-ui;padding:16px;color:#b91c1c">Error leyendo el recurso MCP App.</body></html>'
+      );
     } finally {
       setLoadingApp(false);
     }
@@ -636,12 +757,12 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
   const groupedTools = useMemo(() => {
     const map = new Map<string, any[]>();
     for (const t of filteredTools) {
-      const g = classifyMcpToolGroup(String(t.name || ''));
+      const g = classifyMcpToolGroup(String(t.name || ''), isEn);
       if (!map.has(g)) map.set(g, []);
       map.get(g)!.push(t);
     }
     return Array.from(map.entries());
-  }, [filteredTools]);
+  }, [filteredTools, isEn]);
 
   const handleSelectTool = (toolName: string) => {
     setSelectedTool(toolName);
@@ -678,7 +799,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
         setJsonError(null);
       }
     } catch {
-      // JSON en edición
+      // Editing JSON
     }
   };
 
@@ -688,7 +809,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     try {
       parsedArgs = JSON.parse(toolArgs || '{}');
     } catch (err: any) {
-      setJsonError(`JSON inválido: ${err.message}`);
+      setJsonError(isEn ? `Invalid JSON: ${err.message}` : `JSON inválido: ${err.message}`);
       return;
     }
     if (supportsDryRun && dryRunMode) {
@@ -708,7 +829,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       const res = await api.callMcpModern(effectiveToolName, parsedArgs);
       setToolResult(res);
     } catch (err: any) {
-      setToolResult({ error: err?.message || 'Error ejecutando la herramienta' });
+      setToolResult({ error: err?.message || (isEn ? 'Error running tool' : 'Error ejecutando la herramienta') });
     } finally {
       setExecuting(false);
     }
@@ -727,11 +848,15 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     }
   };
 
-  const copyText = async (text: string, key: string, label = 'Configuración copiada al portapapeles') => {
+  const copyText = async (
+    text: string,
+    key: string,
+    label = isEn ? 'Configuration copied to clipboard' : 'Configuración copiada al portapapeles'
+  ) => {
     if (!text) return;
     const ok = await copyToClipboard(text);
     if (!ok) {
-      onNotify?.('No se pudo copiar al portapapeles', 'error');
+      onNotify?.(isEn ? 'Failed to copy to clipboard' : 'No se pudo copiar al portapapeles', 'error');
       return;
     }
     setCopiedKey(key);
@@ -749,9 +874,11 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
       const txt = res?.result?.messages?.[0]?.content?.text;
       if (typeof txt === 'string' && txt.trim()) return txt;
     } catch {
-      // Fallback descriptivo si el servidor aún no soporta el playbook
+      // Fallback
     }
-    return `Ejecuta el playbook MCP "${prompt.name}" en Culkibo: ${prompt.description}`;
+    return isEn
+      ? `Run MCP playbook "${prompt.name}" on Culkibo: ${prompt.description}`
+      : `Ejecuta el playbook MCP "${prompt.name}" en Culkibo: ${prompt.description}`;
   };
 
   const handleOpenPlaybook = async (prompt: McpPromptSpec) => {
@@ -785,7 +912,11 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     const txt = activePlaybook?.name === prompt.name && playbookPreviewText
       ? playbookPreviewText
       : await fetchPlaybookText(prompt, argsToUse);
-    await copyText(txt, `playbook_${prompt.name}`, `Playbook "${prompt.name}" copiado al portapapeles`);
+    await copyText(
+      txt,
+      `playbook_${prompt.name}`,
+      isEn ? `Playbook "${prompt.name}" copied to clipboard` : `Playbook "${prompt.name}" copiado al portapapeles`
+    );
   };
 
   const baseConfigs = connectionScope === 'remote' && remoteInfo?.clientConfigs
@@ -811,8 +942,8 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
   );
 
   const snippets = useMemo(
-    () => buildAgentSnippets(baseOrigin, selectedProfile, profileStats, baseConfigs),
-    [baseOrigin, selectedProfile, profileStats, baseConfigs]
+    () => buildAgentSnippets(baseOrigin, selectedProfile, profileStats, baseConfigs, isEn),
+    [baseOrigin, selectedProfile, profileStats, baseConfigs, isEn]
   );
 
   const primaryAgentCards: ReadonlyArray<{
@@ -869,7 +1000,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     if (selectedAgent === 'antigravity') {
       return {
         title: 'Antigravity (.antigravity/mcp.json)',
-        subtitle: `Pega en .antigravity/mcp.json o ~/.gemini/antigravity/mcp_config.json (perfil ${selectedProfile}, cero secretos en claro):`,
+        subtitle: isEn
+          ? `Paste into .antigravity/mcp.json or ~/.gemini/antigravity/mcp_config.json (${selectedProfile} profile, zero plaintext secrets):`
+          : `Pega en .antigravity/mcp.json o ~/.gemini/antigravity/mcp_config.json (perfil ${selectedProfile}, cero secretos en claro):`,
         code: snippets.antigravity,
         cliInit: `culkibo agent-init antigravity --profile ${selectedProfile} --url "${baseOrigin}"`,
       };
@@ -881,10 +1014,16 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
           ? snippets.claudeMd
           : snippets.claudeCodeCli;
       const subtitle = claudeSubTab === 'mcp-json'
-        ? 'Coloca .mcp.json en la raíz de tu repo (compartible en Git gracias a ${CULKIBO_TOKEN}):'
+        ? (isEn
+            ? 'Place .mcp.json at your repo root (safe to commit in Git thanks to ${CULKIBO_TOKEN}):'
+            : 'Coloca .mcp.json en la raíz de tu repo (compartible en Git gracias a ${CULKIBO_TOKEN}):')
         : claudeSubTab === 'claude-md'
-          ? 'Añade este bloque a CLAUDE.md para que Claude Code domine Ship & Verify y los 8 playbooks:'
-          : 'Registra Culkibo desde terminal con un único comando:';
+          ? (isEn
+              ? 'Add this ops block to CLAUDE.md so Claude Code masters Ship & Verify and all 8 playbooks:'
+              : 'Añade este bloque a CLAUDE.md para que Claude Code domine Ship & Verify y los 8 playbooks:')
+          : (isEn
+              ? 'Register Culkibo from your terminal in a single command:'
+              : 'Registra Culkibo desde terminal con un único comando:');
       return {
         title: claudeSubTab === 'mcp-json' ? 'Claude Code (.mcp.json)' : claudeSubTab === 'claude-md' ? 'Claude Code (CLAUDE.md ops)' : 'Claude Code CLI',
         subtitle,
@@ -895,7 +1034,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     if (selectedAgent === 'cursor') {
       return {
         title: 'Cursor (.cursor/mcp.json)',
-        subtitle: `Pega en .cursor/mcp.json o ~/.cursor/mcp.json (Streamable HTTP 2026 · perfil ${selectedProfile}):`,
+        subtitle: isEn
+          ? `Paste into .cursor/mcp.json or ~/.cursor/mcp.json (Streamable HTTP 2026 · ${selectedProfile} profile):`
+          : `Pega en .cursor/mcp.json o ~/.cursor/mcp.json (Streamable HTTP 2026 · perfil ${selectedProfile}):`,
         code: snippets.cursor,
         cliInit: `culkibo agent-init cursor --profile ${selectedProfile} --url "${baseOrigin}"`,
       };
@@ -903,7 +1044,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     if (selectedAgent === 'windsurf') {
       return {
         title: 'Windsurf (.windsurf/mcp_config.json)',
-        subtitle: `Compatible con Windsurf Cascade (serverUrl Streamable HTTP · perfil ${selectedProfile}):`,
+        subtitle: isEn
+          ? `Compatible with Windsurf Cascade (Streamable HTTP serverUrl · ${selectedProfile} profile):`
+          : `Compatible con Windsurf Cascade (serverUrl Streamable HTTP · perfil ${selectedProfile}):`,
         code: snippets.windsurf,
         cliInit: `culkibo agent-init windsurf --profile ${selectedProfile} --url "${baseOrigin}"`,
       };
@@ -911,7 +1054,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     if (selectedAgent === 'codex') {
       return {
         title: 'OpenAI Codex CLI (.codex/config.toml)',
-        subtitle: `Añade a ~/.codex/config.toml o ejecuta: ${snippets.codexCliCmd}`,
+        subtitle: isEn
+          ? `Add to ~/.codex/config.toml or run: ${snippets.codexCliCmd}`
+          : `Añade a ~/.codex/config.toml o ejecuta: ${snippets.codexCliCmd}`,
         code: snippets.codexToml,
         cliInit: `culkibo agent-init codex --profile ${selectedProfile} --url "${baseOrigin}"`,
       };
@@ -919,24 +1064,30 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
     if (selectedAgent === 'vscode') {
       return {
         title: 'VS Code / GitHub Copilot (.vscode/mcp.json)',
-        subtitle: 'Crea o edita .vscode/mcp.json en tu workspace:',
+        subtitle: isEn
+          ? 'Create or edit .vscode/mcp.json in your workspace:'
+          : 'Crea o edita .vscode/mcp.json en tu workspace:',
         code: snippets.vscode,
         cliInit: `culkibo agent-init vscode --profile ${selectedProfile} --url "${baseOrigin}"`,
       };
     }
     return {
-      title: 'Claude Desktop (puente stdio con CULKIBO_MCP_PROFILE)',
-      subtitle: 'Usa el puente stdio oficial de Culkibo con filtrado de perfil en cliente/servidor:',
+      title: isEn
+        ? 'Claude Desktop (stdio bridge with CULKIBO_MCP_PROFILE)'
+        : 'Claude Desktop (puente stdio con CULKIBO_MCP_PROFILE)',
+      subtitle: isEn
+        ? 'Uses the official Culkibo stdio bridge with client/server profile filtering:'
+        : 'Usa el puente stdio oficial de Culkibo con filtrado de perfil en cliente/servidor:',
       code: snippets.claudeDesktop,
       cliInit: `CULKIBO_MCP_PROFILE=${selectedProfile} CULKIBO_API_URL="${baseOrigin}" culkibo mcp`,
     };
-  }, [selectedAgent, claudeSubTab, selectedProfile, snippets, baseOrigin]);
+  }, [selectedAgent, claudeSubTab, selectedProfile, snippets, baseOrigin, isEn]);
 
   const displayedPlaybooks = useMemo(() => {
     if (showAllPrompts) return prompts;
-    const coreOnly = prompts.filter((p) => Boolean(CORE_PLAYBOOK_META[p.name]));
+    const coreOnly = prompts.filter((p) => Boolean(corePlaybookMeta[p.name]));
     return coreOnly.length >= 8 ? coreOnly : prompts.slice(0, 8);
-  }, [prompts, showAllPrompts]);
+  }, [prompts, showAllPrompts, corePlaybookMeta]);
 
   const schemaProps = currentToolSpec?.inputSchema?.properties
     ? Object.entries(currentToolSpec.inputSchema.properties)
@@ -945,11 +1096,13 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
 
   return (
     <div className="space-y-5">
-      {/* Cabecera fuera de tarjeta */}
+      {/* Header */}
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
           <div className="flex items-center gap-2.5 flex-wrap">
-            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Agentes de IA (MCP)</h1>
+            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">
+              {isEn ? 'AI Agents (MCP)' : 'Agentes de IA (MCP)'}
+            </h1>
             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
               MCP {mcpConfig?.protocol?.current || '2026-07-28'}
@@ -959,41 +1112,56 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               3 MCP Apps · 8 playbooks
             </span>
             <HelpTip title="Model Context Protocol (MCP 2026 + MCP Apps)">
-              <p>Conecta Antigravity, Claude Code, Cursor, Windsurf o Codex CLI en 1 clic con perfiles de contexto (?profile=core ahorra &gt;81% de tokens) y cero secretos en claro.</p>
-              <p>Incluye {tools.length || 111} herramientas anotadas, 3 MCP Apps interactivas (ui://culkibo/*), Ship &amp; Verify autónomo con confirmToken, 7 recursos JSON en vivo y {prompts.length} playbooks.</p>
+              {isEn ? (
+                <>
+                  <p>Connect Antigravity, Claude Code, Cursor, Windsurf, or Codex CLI in 1 click with context profiles (?profile=core saves &gt;81% tokens) and zero plaintext secrets.</p>
+                  <p>Includes {tools.length || 111} annotated tools, 3 interactive MCP Apps (ui://culkibo/*), autonomous Ship &amp; Verify with confirmToken, 7 live JSON resources, and {prompts.length} playbooks.</p>
+                </>
+              ) : (
+                <>
+                  <p>Conecta Antigravity, Claude Code, Cursor, Windsurf o Codex CLI en 1 clic con perfiles de contexto (?profile=core ahorra &gt;81% de tokens) y cero secretos en claro.</p>
+                  <p>Incluye {tools.length || 111} herramientas anotadas, 3 MCP Apps interactivas (ui://culkibo/*), Ship &amp; Verify autónomo con confirmToken, 7 recursos JSON en vivo y {prompts.length} playbooks.</p>
+                </>
+              )}
             </HelpTip>
           </div>
           <p className="text-sm text-slate-500 mt-1">
-            PaaS nativo para IA: conecta tu agente en 1 clic, previsualiza MCP Apps interactivas (ext-apps 2026-01-26) y ejecuta despliegues verificados.
+            {isEn
+              ? 'AI-native PaaS: connect your agent in 1 click, preview interactive MCP Apps (ext-apps 2026-01-26), and run verified deployments.'
+              : 'PaaS nativo para IA: conecta tu agente en 1 clic, previsualiza MCP Apps interactivas (ext-apps 2026-01-26) y ejecuta despliegues verificados.'}
           </p>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
           <span className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white text-slate-700 border border-slate-200 tabular-nums">
-            {tools.length || 111} herramientas · {mcpApps.length} apps · {prompts.length} prompts
+            {tools.length || 111} {isEn ? 'tools' : 'herramientas'} · {mcpApps.length} apps · {prompts.length} prompts
           </span>
           <button
             type="button"
-            aria-label="Actualizar herramientas, playbooks y auditoría"
+            aria-label={isEn ? 'Refresh tools, playbooks, and audit log' : 'Actualizar herramientas, playbooks y auditoría'}
             onClick={() => void loadMcpData()}
             className="p-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 cursor-pointer"
-            title="Actualizar"
+            title={isEn ? 'Refresh' : 'Actualizar'}
           >
             <RefreshCw className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      {/* 1. Conecta tu agente de IA (1-Click Cards + Live ?profile= + Token-Savings Meter) */}
+      {/* 1. Connect your AI agent in 1 click */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
               <Zap className="w-4 h-4 text-emerald-600" />
-              1. Conecta tu agente de IA en 1 clic
+              {isEn ? '1. Connect your AI agent in 1 click' : '1. Conecta tu agente de IA en 1 clic'}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Todas las configuraciones usan <code className="font-mono text-slate-700">{'${CULKIBO_TOKEN}'}</code> y nunca incrustan tokens maestros en claro.
+              {isEn ? (
+                <>All configs use <code className="font-mono text-slate-700">{'${CULKIBO_TOKEN}'}</code> and never embed plaintext master tokens.</>
+              ) : (
+                <>Todas las configuraciones usan <code className="font-mono text-slate-700">{'${CULKIBO_TOKEN}'}</code> y nunca incrustan tokens maestros en claro.</>
+              )}
             </p>
           </div>
 
@@ -1015,7 +1183,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                 onClick={() => setConnectionScope('remote')}
                 className={`px-2.5 py-1 rounded-md font-medium cursor-pointer ${connectionScope === 'remote' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600'}`}
               >
-                Remoto (VPS)
+                {isEn ? 'Remote (VPS)' : 'Remoto (VPS)'}
               </button>
             </div>
           </div>
@@ -1025,8 +1193,10 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
         <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-              <span className="text-slate-600 font-medium mr-1">Perfil <code className="font-mono">?profile=</code></span>
-              {PROFILE_OPTIONS.map((p) => (
+              <span className="text-slate-600 font-medium mr-1">
+                {isEn ? 'Profile' : 'Perfil'} <code className="font-mono">?profile=</code>
+              </span>
+              {profileOptions.map((p) => (
                 <button
                   key={p.id}
                   type="button"
@@ -1049,11 +1219,11 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               </span>
               {profileStats.savedPct > 0 ? (
                 <span className="px-2 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
-                  -{profileStats.savedPct}% contexto ahorrado
+                  -{profileStats.savedPct}% {isEn ? 'context saved' : 'contexto ahorrado'}
                 </span>
               ) : (
                 <span className="px-2 py-0.5 rounded-full font-medium bg-amber-50 text-amber-800 border border-amber-200">
-                  Catálogo completo
+                  {isEn ? 'Full catalog' : 'Catálogo completo'}
                 </span>
               )}
             </div>
@@ -1070,14 +1240,14 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               <span>{snippets.endpoint}</span>
               <span className="tabular-nums">
                 {profileStats.fullTokens > 0
-                  ? `${(profileStats.estTokens / 1000).toFixed(1)}k / ${(profileStats.fullTokens / 1000).toFixed(1)}k tok estimados`
-                  : 'Listo con culkibo_search_tools bajo demanda'}
+                  ? `${(profileStats.estTokens / 1000).toFixed(1)}k / ${(profileStats.fullTokens / 1000).toFixed(1)}k ${isEn ? 'est. tokens' : 'tok estimados'}`
+                  : (isEn ? 'Ready with on-demand culkibo_search_tools' : 'Listo con culkibo_search_tools bajo demanda')}
               </span>
             </div>
           </div>
         </div>
 
-        {/* 5 Crisp 1-Click Agent Cards: Antigravity, Claude Code, Cursor, Windsurf, Codex CLI */}
+        {/* 5 Crisp 1-Click Agent Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
           {primaryAgentCards.map((card) => {
             const isSelected = selectedAgent === card.id;
@@ -1120,14 +1290,18 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
 
                 <div className="flex items-center justify-between gap-2 pt-1">
                   <span className={`text-[10px] inline-flex items-center gap-0.5 ${isSelected ? 'text-slate-300' : 'text-slate-500'}`}>
-                    Ver config <ChevronRight className="w-3 h-3" />
+                    {isEn ? 'View config' : 'Ver config'} <ChevronRight className="w-3 h-3" />
                   </span>
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       setSelectedAgent(card.id);
-                      void copyText(card.copyPayload, copyId, `Config de ${card.name} (${selectedProfile}) copiada`);
+                      void copyText(
+                        card.copyPayload,
+                        copyId,
+                        isEn ? `${card.name} (${selectedProfile}) config copied` : `Config de ${card.name} (${selectedProfile}) copiada`
+                      );
                     }}
                     className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium cursor-pointer transition-colors ${
                       isSelected
@@ -1136,7 +1310,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                     }`}
                   >
                     {copiedKey === copyId ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedKey === copyId ? 'Copiado' : '1-clic'}</span>
+                    <span>{copiedKey === copyId ? (isEn ? 'Copied' : 'Copiado') : (isEn ? '1-click' : '1-clic')}</span>
                   </button>
                 </div>
               </div>
@@ -1199,7 +1373,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-700 border border-slate-200 cursor-pointer"
               >
                 {copiedKey === `detail_${selectedAgent}_${claudeSubTab}` ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedKey === `detail_${selectedAgent}_${claudeSubTab}` ? 'Copiado' : 'Copiar'}</span>
+                <span>{copiedKey === `detail_${selectedAgent}_${claudeSubTab}` ? (isEn ? 'Copied' : 'Copiado') : (isEn ? 'Copy' : 'Copiar')}</span>
               </button>
             </div>
           </div>
@@ -1216,17 +1390,23 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
             </div>
             <button
               type="button"
-              onClick={() => void copyText(activeAgentDetail.cliInit, `cli_init_${selectedAgent}`, 'Comando culkibo agent-init copiado')}
+              onClick={() =>
+                void copyText(
+                  activeAgentDetail.cliInit,
+                  `cli_init_${selectedAgent}`,
+                  isEn ? 'culkibo agent-init command copied' : 'Comando culkibo agent-init copiado'
+                )
+              }
               className="inline-flex items-center gap-1 px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-[11px] font-sans text-white shrink-0 cursor-pointer"
             >
               {copiedKey === `cli_init_${selectedAgent}` ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-              <span>{copiedKey === `cli_init_${selectedAgent}` ? 'Copiado' : 'Copiar CLI'}</span>
+              <span>{copiedKey === `cli_init_${selectedAgent}` ? (isEn ? 'Copied' : 'Copiado') : (isEn ? 'Copy CLI' : 'Copiar CLI')}</span>
             </button>
           </div>
         </div>
       </div>
 
-      {/* 2. Galería de Interactive MCP Apps (ui://culkibo/* — ext-apps 2026-01-26) */}
+      {/* 2. Interactive MCP Apps Gallery (ui://culkibo/* — ext-apps 2026-01-26) */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
@@ -1238,7 +1418,11 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               </span>
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Tarjetas interactivas HTML (<code className="font-mono text-slate-700">text/html;profile=mcp-app</code>) con CSP estricta (<code className="font-mono text-slate-700">default-src &apos;none&apos;</code>) y 0 peticiones externas que Claude, Antigravity y Cursor renderizan inline.
+              {isEn ? (
+                <>Interactive HTML cards (<code className="font-mono text-slate-700">text/html;profile=mcp-app</code>) with strict CSP (<code className="font-mono text-slate-700">default-src &apos;none&apos;</code>) and 0 external requests rendered inline by Claude, Antigravity, and Cursor.</>
+              ) : (
+                <>Tarjetas interactivas HTML (<code className="font-mono text-slate-700">text/html;profile=mcp-app</code>) con CSP estricta (<code className="font-mono text-slate-700">default-src &apos;none&apos;</code>) y 0 peticiones externas que Claude, Antigravity y Cursor renderizan inline.</>
+              )}
             </p>
           </div>
           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium bg-slate-50 text-slate-600 border border-slate-200 shrink-0">
@@ -1288,15 +1472,15 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                     }`}
                   >
                     <Eye className="w-3 h-3" />
-                    <span>{isOpen ? 'Ocultar preview' : 'Previsualizar App'}</span>
+                    <span>{isOpen ? (isEn ? 'Hide preview' : 'Ocultar preview') : (isEn ? 'Preview App' : 'Previsualizar App')}</span>
                   </button>
                   <button
                     type="button"
-                    onClick={() => void copyText(app.uri, copyId, `URI ${app.uri} copiada`)}
+                    onClick={() => void copyText(app.uri, copyId, isEn ? `URI ${app.uri} copied` : `URI ${app.uri} copiada`)}
                     className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 cursor-pointer"
                   >
                     {copiedKey === copyId ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedKey === copyId ? 'Copiado' : 'Copiar URI'}</span>
+                    <span>{copiedKey === copyId ? (isEn ? 'Copied' : 'Copiado') : (isEn ? 'Copy URI' : 'Copiar URI')}</span>
                   </button>
                 </div>
               </div>
@@ -1320,19 +1504,23 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                 }}
                 className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[11px] text-white cursor-pointer"
               >
-                Cerrar
+                {isEn ? 'Close' : 'Cerrar'}
               </button>
             </div>
             {loadingApp ? (
               <div className="py-12 flex items-center justify-center gap-2 text-xs text-slate-500">
                 <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
-                <span>Cargando recurso MCP App desde POST /api/mcp (resources/read)…</span>
+                <span>
+                  {isEn
+                    ? 'Loading MCP App resource from POST /api/mcp (resources/read)…'
+                    : 'Cargando recurso MCP App desde POST /api/mcp (resources/read)…'}
+                </span>
               </div>
             ) : (
               <iframe
                 title={`Culkibo MCP App preview: ${activeAppUri}`}
                 sandbox=""
-                srcDoc={activeAppHtml}
+                srcDoc={stripScriptsForSandbox(activeAppHtml)}
                 className="w-full h-[420px] bg-white border-0 block"
               />
             )}
@@ -1340,16 +1528,18 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
         )}
       </div>
 
-      {/* 3. Galería interactiva de MCP Playbooks (prompts/list) */}
+      {/* 3. Interactive MCP Playbooks Gallery (prompts/list) */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
               <BookOpen className="w-4 h-4 text-indigo-600" />
-              3. Playbooks interactivos MCP (<code className="font-mono text-xs text-slate-600">prompts/list</code>)
+              {isEn ? '3. Interactive MCP Playbooks' : '3. Playbooks interactivos MCP'} (<code className="font-mono text-xs text-slate-600">prompts/list</code>)
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              8 flujos de ingeniería probados en batalla listos para invocar desde Claude Code, Antigravity, Cursor o copiar en 1 clic.
+              {isEn
+                ? '8 battle-tested engineering workflows ready to invoke from Claude Code, Antigravity, Cursor, or copy in 1 click.'
+                : '8 flujos de ingeniería probados en batalla listos para invocar desde Claude Code, Antigravity, Cursor o copiar en 1 clic.'}
             </p>
           </div>
 
@@ -1359,14 +1549,16 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               onClick={() => setShowAllPrompts((v) => !v)}
               className="px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 cursor-pointer"
             >
-              {showAllPrompts ? 'Ver solo 8 Playbooks Core' : `Ver todos (${prompts.length})`}
+              {showAllPrompts
+                ? (isEn ? 'Show Core 8 Playbooks' : 'Ver solo 8 Playbooks Core')
+                : (isEn ? `Show all (${prompts.length})` : `Ver todos (${prompts.length})`)}
             </button>
           </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
           {displayedPlaybooks.map((prompt) => {
-            const meta = CORE_PLAYBOOK_META[prompt.name];
+            const meta = corePlaybookMeta[prompt.name];
             const isActive = activePlaybook?.name === prompt.name;
             const copyKey = `playbook_${prompt.name}`;
             return (
@@ -1424,7 +1616,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                     className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-indigo-700 hover:bg-indigo-50 cursor-pointer"
                   >
                     <Eye className="w-3 h-3" />
-                    <span>Previsualizar</span>
+                    <span>{isEn ? 'Preview' : 'Previsualizar'}</span>
                   </button>
                   <button
                     type="button"
@@ -1432,7 +1624,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                     className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 cursor-pointer"
                   >
                     {copiedKey === copyKey ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedKey === copyKey ? 'Copiado' : 'Copiar'}</span>
+                    <span>{copiedKey === copyKey ? (isEn ? 'Copied' : 'Copiado') : (isEn ? 'Copy' : 'Copiar')}</span>
                   </button>
                 </div>
               </div>
@@ -1440,7 +1632,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
           })}
         </div>
 
-        {/* Drawer inline de previsualización en vivo de prompts/get */}
+        {/* Inline live preview drawer for prompts/get */}
         {activePlaybook && (
           <div className="p-4 rounded-xl bg-slate-50 border border-indigo-200 space-y-3">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -1458,14 +1650,18 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium cursor-pointer"
                 >
                   {copiedKey === `playbook_${activePlaybook.name}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedKey === `playbook_${activePlaybook.name}` ? 'Copiado' : 'Copiar playbook'}</span>
+                  <span>
+                    {copiedKey === `playbook_${activePlaybook.name}`
+                      ? (isEn ? 'Copied' : 'Copiado')
+                      : (isEn ? 'Copy playbook' : 'Copiar playbook')}
+                  </span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setActivePlaybook(null)}
                   className="px-2 py-1 rounded-lg bg-white hover:bg-slate-100 border border-slate-200 text-xs text-slate-600 cursor-pointer"
                 >
-                  Cerrar
+                  {isEn ? 'Close' : 'Cerrar'}
                 </button>
               </div>
             </div>
@@ -1492,26 +1688,30 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                   disabled={loadingPlaybook}
                   className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
                 >
-                  {loadingPlaybook ? 'Renderizando…' : 'Aplicar args'}
+                  {loadingPlaybook
+                    ? (isEn ? 'Rendering…' : 'Renderizando…')
+                    : (isEn ? 'Apply args' : 'Aplicar args')}
                 </button>
               </div>
             )}
 
             <pre className="p-3.5 rounded-xl bg-white border border-slate-200 text-xs font-mono text-slate-800 whitespace-pre-wrap leading-relaxed max-h-60 overflow-y-auto">
-              {loadingPlaybook ? 'Cargando playbook desde POST /api/mcp (prompts/get)…' : playbookPreviewText}
+              {loadingPlaybook
+                ? (isEn ? 'Loading playbook from POST /api/mcp (prompts/get)…' : 'Cargando playbook desde POST /api/mcp (prompts/get)…')
+                : playbookPreviewText}
             </pre>
           </div>
         )}
       </div>
 
-      {/* 4. Probador interactivo + 5. Registro de auditoría */}
+      {/* 4. Interactive Tool Tester + 5. Live Audit Log */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        {/* 4. Probador interactivo */}
+        {/* 4. Live tool tester */}
         <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
               <Terminal className="w-4 h-4 text-slate-600" />
-              4. Probar herramienta en vivo
+              {isEn ? '4. Live tool tester' : '4. Probar herramienta en vivo'}
             </h2>
             <span className="text-[11px] font-mono text-slate-400">POST /api/mcp</span>
           </div>
@@ -1523,13 +1723,17 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                 type="text"
                 value={toolSearch}
                 onChange={(e) => setToolSearch(e.target.value)}
-                placeholder="Filtrar herramientas (ej. ship, agent_kit, doctor, diagnose, domain…)"
+                placeholder={
+                  isEn
+                    ? 'Filter tools (e.g. ship, smartpack, tunnel, doctor, diagnose, domain…)'
+                    : 'Filtrar herramientas (ej. ship, agent_kit, doctor, diagnose, domain…)'
+                }
                 className="w-full pl-8 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-xs"
               />
             </div>
 
             <select
-              aria-label="Seleccionar herramienta MCP"
+              aria-label={isEn ? 'Select MCP tool' : 'Seleccionar herramienta MCP'}
               value={effectiveToolName}
               onChange={(e) => handleSelectTool(e.target.value)}
               className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
@@ -1552,12 +1756,12 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                   <div className="flex items-center gap-1.5">
                     {isReadOnly && (
                       <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
-                        Solo lectura
+                        {isEn ? 'Read-only' : 'Solo lectura'}
                       </span>
                     )}
                     {isDestructive && (
                       <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-red-50 text-red-700 border border-red-200">
-                        Acción destructiva
+                        {isEn ? 'Destructive action' : 'Acción destructiva'}
                       </span>
                     )}
                   </div>
@@ -1583,7 +1787,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
 
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-2 flex-wrap">
-                <label className="block text-xs font-medium text-slate-700">Argumentos (JSON)</label>
+                <label className="block text-xs font-medium text-slate-700">
+                  {isEn ? 'Arguments (JSON)' : 'Argumentos (JSON)'}
+                </label>
                 {supportsDryRun && (
                   <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-700 cursor-pointer select-none">
                     <input
@@ -1592,7 +1798,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                       onChange={(e) => handleToggleDryRun(e.target.checked)}
                       className="rounded border-slate-300 text-slate-900 focus:ring-slate-500 cursor-pointer"
                     />
-                    <span>Simular sin cambios (`dryRun`)</span>
+                    <span>{isEn ? 'Dry run without changes (dryRun)' : 'Simular sin cambios (`dryRun`)'}</span>
                   </label>
                 )}
               </div>
@@ -1608,7 +1814,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                       setDryRunMode(parsed.dryRun === true);
                     }
                   } catch {
-                    // JSON parcial mientras escribe
+                    // Partial JSON while typing
                   }
                 }}
                 rows={4}
@@ -1625,13 +1831,17 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
 
             {confirmDestructive && (
               <div role="alert" className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-2">
-                <span>Esta herramienta modifica o borra recursos reales. Pulsa de nuevo para confirmar.</span>
+                <span>
+                  {isEn
+                    ? 'This tool modifies or deletes live resources. Click again to confirm.'
+                    : 'Esta herramienta modifica o borra recursos reales. Pulsa de nuevo para confirmar.'}
+                </span>
                 <button
                   type="button"
                   onClick={() => setConfirmDestructive(false)}
                   className="text-slate-600 hover:text-slate-900 underline shrink-0 cursor-pointer"
                 >
-                  Cancelar
+                  {isEn ? 'Cancel' : 'Cancelar'}
                 </button>
               </div>
             )}
@@ -1649,10 +1859,12 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
               {executing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
               <span>
                 {executing
-                  ? 'Ejecutando…'
+                  ? (isEn ? 'Executing…' : 'Ejecutando…')
                   : confirmDestructive
-                    ? 'Confirmar y ejecutar acción destructiva'
-                    : (supportsDryRun && dryRunMode ? 'Previsualizar plan (dryRun)' : 'Ejecutar herramienta')}
+                    ? (isEn ? 'Confirm and execute destructive action' : 'Confirmar y ejecutar acción destructiva')
+                    : (supportsDryRun && dryRunMode
+                        ? (isEn ? 'Preview plan (dryRun)' : 'Previsualizar plan (dryRun)')
+                        : (isEn ? 'Run tool' : 'Ejecutar herramienta'))}
               </span>
             </button>
 
@@ -1665,7 +1877,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                   {remediation && (
                     <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 space-y-1">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <strong>Cómo solucionarlo:</strong>
+                        <strong>{isEn ? 'How to fix:' : 'Cómo solucionarlo:'}</strong>
                         {errEnv?.code && (
                           <span className="px-1.5 py-0.5 rounded bg-amber-100 border border-amber-300 font-mono text-[10px]">
                             {errEnv.code}
@@ -1673,7 +1885,7 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                         )}
                         {errEnv?.retryable !== undefined && (
                           <span className="px-1.5 py-0.5 rounded bg-white border border-amber-200 text-[10px]">
-                            {errEnv.retryable ? 'Reintentable' : 'No reintentable'}
+                            {errEnv.retryable ? (isEn ? 'Retryable' : 'Reintentable') : (isEn ? 'Non-retryable' : 'No reintentable')}
                           </span>
                         )}
                       </div>
@@ -1682,13 +1894,17 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                   )}
                   {typeof mintedToken === 'string' && mintedToken.startsWith('ckr_') && (
                     <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 flex items-center justify-between gap-2 flex-wrap">
-                      <span>Plan validado con token de confirmación de un solo uso (5 min).</span>
+                      <span>
+                        {isEn
+                          ? 'Plan validated with single-use confirmation token (5 min).'
+                          : 'Plan validado con token de confirmación de un solo uso (5 min).'}
+                      </span>
                       <button
                         type="button"
                         onClick={() => handleLoadConfirmToken(mintedToken)}
                         className="px-2.5 py-1 rounded-md bg-emerald-700 hover:bg-emerald-800 text-white font-medium text-[11px] cursor-pointer"
                       >
-                        Cargar confirmToken (dryRun: false)
+                        {isEn ? 'Load confirmToken (dryRun: false)' : 'Cargar confirmToken (dryRun: false)'}
                       </button>
                     </div>
                   )}
@@ -1701,17 +1917,21 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
           </div>
         </div>
 
-        {/* 5. Registro de auditoría en tiempo real */}
+        {/* 5. Live agent activity */}
         <div className="bg-white rounded-xl border border-slate-200 overflow-hidden flex flex-col">
           <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2">
               <Radio className="w-4 h-4 text-emerald-600" />
-              <h2 className="text-xs font-semibold text-slate-900">5. Actividad del agente en directo</h2>
+              <h2 className="text-xs font-semibold text-slate-900">
+                {isEn ? '5. Live agent activity' : '5. Actividad del agente en directo'}
+              </h2>
             </div>
             <div className="flex items-center gap-1.5 text-xs text-slate-500 tabular-nums">
               <Shield className="w-3.5 h-3.5 text-slate-400" />
               <span>
-                Secretos redactados · {auditLog.length} {auditLog.length === 1 ? 'llamada' : 'llamadas'}
+                {isEn
+                  ? `Redacted secrets · ${auditLog.length} ${auditLog.length === 1 ? 'call' : 'calls'}`
+                  : `Secretos redactados · ${auditLog.length} ${auditLog.length === 1 ? 'llamada' : 'llamadas'}`}
               </span>
             </div>
           </div>
@@ -1720,18 +1940,18 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-medium text-slate-500">
-                  <th className="py-2.5 px-3">Hora</th>
-                  <th className="py-2.5 px-3">Herramienta</th>
-                  <th className="py-2.5 px-3">Latencia</th>
-                  <th className="py-2.5 px-3">Estado</th>
-                  <th className="py-2.5 px-3">Resumen</th>
+                  <th className="py-2.5 px-3">{isEn ? 'Time' : 'Hora'}</th>
+                  <th className="py-2.5 px-3">{isEn ? 'Tool' : 'Herramienta'}</th>
+                  <th className="py-2.5 px-3">{isEn ? 'Latency' : 'Latencia'}</th>
+                  <th className="py-2.5 px-3">{isEn ? 'Status' : 'Estado'}</th>
+                  <th className="py-2.5 px-3">{isEn ? 'Summary' : 'Resumen'}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {auditLog.map((log) => (
                   <tr key={log.id} className="hover:bg-slate-50/70">
                     <td className="py-2.5 px-3 text-slate-500 font-mono tabular-nums whitespace-nowrap">
-                      {new Date(log.timestamp).toLocaleTimeString('es-ES')}
+                      {new Date(log.timestamp).toLocaleTimeString(isEn ? 'en-US' : 'es-ES')}
                     </td>
                     <td className="py-2.5 px-3 font-mono font-medium text-slate-900 whitespace-nowrap">{log.toolName}</td>
                     <td className="py-2.5 px-3 text-emerald-700 font-mono font-medium tabular-nums whitespace-nowrap">{log.durationMs} ms</td>
@@ -1754,7 +1974,9 @@ export const AiAgentHub: React.FC<{ onNotify?: (msg: string, type?: 'info' | 'su
                 {auditLog.length === 0 && (
                   <tr>
                     <td colSpan={5} className="py-10 text-center text-slate-500">
-                      Todavía no hay llamadas registradas. Conecta tu agente arriba o ejecuta una herramienta de prueba.
+                      {isEn
+                        ? 'No tool calls recorded yet. Connect your agent above or run a test tool.'
+                        : 'Todavía no hay llamadas registradas. Conecta tu agente arriba o ejecuta una herramienta de prueba.'}
                     </td>
                   </tr>
                 )}

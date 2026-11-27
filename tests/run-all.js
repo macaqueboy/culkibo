@@ -33,12 +33,14 @@ const testObservabilityAlerts = require('./observability-alerts.test');
 const testEditionAndBola = require('./edition-and-bola.test');
 const testSmartPackDirectPush = require('./smartpack-directpush.test');
 const testEdgeTunnelSnapStream = require('./edgetunnel-snapstream.test');
+const testCoolifyE2EReplay = require('./coolify-e2e-replay.test');
+const testReleaseAndMcpE2E = require('./release-and-mcp-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
 async function runAll() {
   console.log('\n======================================================');
-  console.log('🧪 RUNNING CULKIBO v1.1.0 FULL VERIFICATION SUITE');
+  console.log('🧪 RUNNING CULKIBO v1.2.0 FULL VERIFICATION SUITE');
   console.log('======================================================\n');
 
   let stopDaemon = null;
@@ -91,6 +93,8 @@ async function runAll() {
     { name: 'Edition Ed25519 Verifier, CronParser Anti-DoS, Project Secrets & BOLA/IDOR Closure', fn: testEditionAndBola },
     { name: 'SmartPack Build Intelligence, DirectPush OCI v2 & Edge/FD Hardening', fn: testSmartPackDirectPush },
     { name: 'Sovereign EdgeTunnel WS, SnapStream SQLite WAL-to-S3 & Preview DB Branching', fn: testEdgeTunnelSnapStream },
+    { name: 'Mock-Coolify v4 Full E2E Migration & Bundle Roundtrip Replay', fn: testCoolifyE2EReplay },
+    { name: 'Release Provenance (CycloneDX 1.6 SBOM / SHA-256) & External MCP Stdio E2E', fn: testReleaseAndMcpE2E },
   ];
 
   for (const suite of suites) {

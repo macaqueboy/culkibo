@@ -1,6 +1,6 @@
 {
   "name": "culkibo",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Orquestador cloud autohospedado para la era de los agentes de IA: recarga en caliente, SSL wildcard por Cloudflare y control nativo por MCP",
   "main": "server/index.js",
   "bin": {
@@ -20,7 +20,8 @@
     "bench": "node bench/route-swap.bench.js",
     "bench:sync": "node bench/live-sync.bench.js",
     "bench:control": "node bench/control-plane.bench.js",
-    "bench:all": "node bench/run-all.bench.js"
+    "bench:all": "node bench/run-all.bench.js",
+    "release:sbom": "node scripts/release-provenance.js"
   },
   "keywords": [
     "culkibo",

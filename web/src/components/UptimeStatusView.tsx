@@ -28,6 +28,7 @@ import {
   type Project,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n } from '../lib/i18n';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
 
@@ -62,6 +63,7 @@ function formatEur(val?: number | null): string {
 }
 
 export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) => {
+  const { t } = useI18n();
   const [tab, setTab] = useState<UptimeTab>('monitors');
   const [loading, setLoading] = useState(true);
   const [monitors, setMonitors] = useState<UptimeMonitor[]>([]);
@@ -556,12 +558,19 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-xs text-slate-500">
         <Loader2 className="w-4 h-4 animate-spin" />
-        <span>Cargando monitores, páginas de estado y asesor de costes…</span>
+        <span>{t('uptime.loading')}</span>
       </div>
     );
   }
 
   const origin = window.location.origin;
+
+  const localizedMonStatus = (status: string): string => {
+    if (status === 'up') return t('uptime.statusUp');
+    if (status === 'degraded') return t('uptime.statusDegraded');
+    if (status === 'down') return t('uptime.statusDown');
+    return t('uptime.statusPending');
+  };
 
   return (
     <div className="space-y-5">
@@ -569,35 +578,33 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Uptime, Estado y Ahorro</h1>
-            <HelpTip title="Monitorización nativa sin contenedores extra">
-              <p>Comprueba tus servicios cada 30–300 s con protección SSRF, publica páginas <code className="font-mono">/status/:slug</code> sin filtrar datos internos y suspende proyectos inactivos para liberar RAM.</p>
+            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('uptime.title')}</h1>
+            <HelpTip title="Built-in Synthetic Monitoring">
+              <p>Checks services every 30–300s with SSRF guard, publishes <code className="font-mono">/status/:slug</code> without leaking internal URLs, and hibernates idle projects.</p>
             </HelpTip>
           </div>
-          <p className="text-sm text-slate-500 mt-1 max-w-2xl">
-            Monitores sintéticos integrados, constructor de páginas públicas de estado y asesor de ahorro VPS con Scale-to-Zero.
-          </p>
+          <p className="text-sm text-slate-500 mt-1 max-w-2xl">{t('uptime.subtitle')}</p>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap shrink-0">
           <div className="inline-flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200 text-xs overflow-x-auto no-scrollbar max-w-full">
             {([
-              { id: 'monitors', label: `Monitores (${monitors.length})`, icon: Radio },
-              { id: 'pages', label: `Estado (${pages.length})`, icon: Globe },
-              { id: 'advisor', label: 'Ahorro y Reposo', icon: TrendingDown },
-            ] as const).map((t) => {
-              const Icon = t.icon;
+              { id: 'monitors', label: `${t('uptime.tabMonitors')} (${monitors.length})`, icon: Radio },
+              { id: 'pages', label: `${t('uptime.tabPages')} (${pages.length})`, icon: Globe },
+              { id: 'advisor', label: t('uptime.tabAdvisor'), icon: TrendingDown },
+            ] as const).map((tabItem) => {
+              const Icon = tabItem.icon;
               return (
                 <button
-                  key={t.id}
+                  key={tabItem.id}
                   type="button"
-                  onClick={() => setTab(t.id)}
+                  onClick={() => setTab(tabItem.id)}
                   className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                    tab === t.id ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                    tab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
-                  <span>{t.label}</span>
+                  <span>{tabItem.label}</span>
                 </button>
               );
             })}
@@ -610,25 +617,25 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
         <div className="space-y-4">
           <div className="bg-white border border-slate-200 rounded-xl grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-200">
             <div className="p-4">
-              <div className="text-xs text-slate-500">Monitores operativos</div>
+              <div className="text-xs text-slate-500">{t('uptime.kpiOperational')}</div>
               <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
                 {summary.upCount} <span className="text-sm font-normal text-slate-400">/ {monitors.length}</span>
               </div>
             </div>
             <div className="p-4">
-              <div className="text-xs text-slate-500">Disponibilidad media 24h</div>
+              <div className="text-xs text-slate-500">{t('uptime.kpiAvailability')}</div>
               <div className="text-xl font-semibold text-emerald-700 mt-1 tabular-nums">
                 {formatPct(summary.avgUptime)}
               </div>
             </div>
             <div className="p-4">
-              <div className="text-xs text-slate-500">Latencia media p95</div>
+              <div className="text-xs text-slate-500">{t('uptime.kpiLatency')}</div>
               <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
                 {formatMs(summary.avgP95)}
               </div>
             </div>
             <div className="p-4">
-              <div className="text-xs text-slate-500">Incidentes activos</div>
+              <div className="text-xs text-slate-500">{t('uptime.kpiIncidents')}</div>
               <div className={`text-xl font-semibold mt-1 tabular-nums ${summary.incidents > 0 ? 'text-red-600' : 'text-slate-900'}`}>
                 {summary.incidents}
               </div>
@@ -636,14 +643,12 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
           </div>
 
           <div className="flex items-center justify-between gap-2 flex-wrap">
-            <span className="text-xs text-slate-500">
-              Las alertas de caída y recuperación se envían automáticamente por los canales configurados en Ajustes.
-            </span>
+            <span className="text-xs text-slate-500">{t('uptime.alertHint')}</span>
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={() => void loadAll()}
-                aria-label="Actualizar monitores"
+                aria-label="Refresh monitors"
                 className="p-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 cursor-pointer"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
@@ -654,7 +659,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" />
-                <span>Añadir monitor</span>
+                <span>{t('uptime.addMonitor')}</span>
               </button>
             </div>
           </div>
@@ -662,16 +667,14 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
           {monitors.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-xl p-10 text-center space-y-3">
               <Activity className="w-8 h-8 text-slate-300 mx-auto" />
-              <div className="text-sm font-semibold text-slate-900">Aún no tienes monitores sintéticos</div>
-              <p className="text-xs text-slate-500 max-w-md mx-auto">
-                Vigila endpoints HTTPS, puertos TCP o proyectos desplegados en Culkibo sin levantar contenedores de terceros.
-              </p>
+              <div className="text-sm font-semibold text-slate-900">{t('uptime.emptyMonitorsTitle')}</div>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">{t('uptime.emptyMonitorsDesc')}</p>
               <button
                 type="button"
                 onClick={openNewMonitor}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 text-white text-xs font-medium cursor-pointer"
               >
-                <Plus className="w-3.5 h-3.5" /> Crear primer monitor
+                <Plus className="w-3.5 h-3.5" /> {t('uptime.createFirstMonitor')}
               </button>
             </div>
           ) : (
@@ -694,11 +697,11 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                           </span>
                           <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${st.badge}`}>
                             <span className={`w-1.5 h-1.5 rounded-full ${st.dot}`} />
-                            {st.label}
+                            {localizedMonStatus(mon.status)}
                           </span>
                         </div>
                         <div className="text-xs font-mono text-slate-500 truncate mt-0.5">
-                          {mon.url || mon.target || (mon.host ? `${mon.host}:${mon.port}` : mon.projectId || '—')} · cada {mon.intervalSec}s
+                          {mon.url || mon.target || (mon.host ? `${mon.host}:${mon.port}` : mon.projectId || '—')} · {mon.intervalSec}s
                         </div>
                       </div>
 
@@ -710,7 +713,7 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                           className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700 cursor-pointer disabled:opacity-50"
                         >
                           <RefreshCw className={`w-3.5 h-3.5 ${busyId === `chk-${mon.id}` ? 'animate-spin' : ''}`} />
-                          <span>Comprobar</span>
+                          <span>{t('uptime.checkNow')}</span>
                         </button>
                         <button
                           type="button"
@@ -814,9 +817,9 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
             <div className="flex items-start gap-2.5 min-w-0">
               <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
               <div>
-                <div className="font-semibold text-slate-900">Páginas públicas con privacidad estricta</div>
+                <div className="font-semibold text-slate-900">{t('uptime.pagesPrivacyTitle')}</div>
                 <p className="text-slate-500 mt-0.5">
-                  Accesibles en <code className="font-mono">/status/:slug</code> sin autenticación. Solo exponen nombres visibles, barras de disponibilidad e incidentes — nunca URLs internas, IPs ni trazas.
+                  Accessible at <code className="font-mono">/status/:slug</code> without auth. Exposes display names, uptime bars, and incidents only — never internal URLs or IPs.
                 </p>
               </div>
             </div>
@@ -826,14 +829,14 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 self-start sm:self-auto"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Nueva página de estado</span>
+              <span>{t('uptime.newPage')}</span>
             </button>
           </div>
 
           {pages.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-xl p-10 text-center space-y-3">
               <Globe className="w-8 h-8 text-slate-300 mx-auto" />
-              <div className="text-sm font-semibold text-slate-900">Sin páginas públicas configuradas</div>
+              <div className="text-sm font-semibold text-slate-900">{t('uptime.emptyPagesTitle')}</div>
               <p className="text-xs text-slate-500 max-w-md mx-auto">
                 Publica una página de estado profesional en segundos con insignia SVG incrustable para tu web o README.
               </p>
@@ -963,14 +966,14 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
             className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
           >
             <div>
-              <div className="font-semibold text-slate-900">Asesor de Coste VPS vs SaaS y Memoria RAM</div>
+              <div className="font-semibold text-slate-900">{t('uptime.advisorTitle')}</div>
               <p className="text-slate-500 mt-0.5">
-                Compara el coste mensual real de tu VPS frente a PaaS gestionados (Railway, Render, Fly) y detecta contenedores ociosos o con riesgo de OOM.
+                Compare your real monthly VPS cost against managed PaaS (Railway, Render, Fly) and detect idle containers or OOM risk.
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <label className="inline-flex items-center gap-1.5 text-slate-600">
-                <span>Coste VPS:</span>
+                <span>VPS:</span>
                 <input
                   type="number"
                   min={0}
@@ -979,14 +982,14 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
                   onChange={(e) => setVpsMonthlyEur(e.target.value)}
                   className="w-20 px-2.5 py-1.5 rounded-lg border border-slate-200 font-mono text-slate-900 tabular-nums"
                 />
-                <span>€/mes</span>
+                <span>€/mo</span>
               </label>
               <button
                 type="submit"
                 disabled={advisorBusy}
                 className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
               >
-                {advisorBusy ? 'Calculando…' : 'Recalcular'}
+                {advisorBusy ? '…' : t('uptime.advisorRecalc')}
               </button>
             </div>
           </form>
@@ -1004,42 +1007,42 @@ export const UptimeStatusView: React.FC<UptimeStatusViewProps> = ({ onNotify }) 
             return (
               <div className="bg-white border border-slate-200 rounded-xl grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-200">
                 <div className="p-4">
-                  <div className="text-xs text-slate-500">Ahorro mensual vs SaaS</div>
+                  <div className="text-xs text-slate-500">{t('uptime.advisorMonthlySavings')}</div>
                   <div className="text-xl font-semibold text-emerald-700 mt-1 tabular-nums">
                     {formatEur(monthlySavings)}
                   </div>
                   <div className="text-[11px] text-slate-400 mt-0.5 tabular-nums">
                     {annualSavings != null
-                      ? `${formatEur(annualSavings)} / año`
-                      : 'Cálculo en vivo'}
+                      ? `${formatEur(annualSavings)} / yr`
+                      : 'Live'}
                   </div>
                 </div>
                 <div className="p-4">
-                  <div className="text-xs text-slate-500">Equivalente en PaaS SaaS</div>
+                  <div className="text-xs text-slate-500">{t('uptime.advisorSaasEq')}</div>
                   <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
                     {formatEur(saasMonthly)}
                   </div>
                   <div className="text-[11px] text-slate-400 mt-0.5 tabular-nums">
-                    Frente a {formatEur(vpsEur)} en tu VPS
+                    vs {formatEur(vpsEur)} VPS
                   </div>
                 </div>
                 <div className="p-4">
-                  <div className="text-xs text-slate-500">RAM libre del servidor</div>
+                  <div className="text-xs text-slate-500">{t('uptime.advisorFreeRam')}</div>
                   <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
                     {freeRamMb != null ? `${Math.round(freeRamMb)} MB` : '—'}
                   </div>
                   <div className="text-[11px] text-slate-400 mt-0.5 tabular-nums">
                     {freePct != null && totalRamMb != null
-                      ? `${Math.round(freePct)}% libre de ${Math.round(totalRamMb)} MB`
-                      : 'Sin lectura'}
+                      ? `${Math.round(freePct)}% / ${Math.round(totalRamMb)} MB`
+                      : '—'}
                   </div>
                 </div>
                 <div className="p-4">
-                  <div className="text-xs text-slate-500">RAM recuperable</div>
+                  <div className="text-xs text-slate-500">{t('uptime.advisorReclaimable')}</div>
                   <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
                     {reclaimableRamMb != null ? `${Math.round(reclaimableRamMb)} MB` : '0 MB'}
                   </div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">Activando auto-reposo</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">Scale-to-Zero</div>
                 </div>
               </div>
             );

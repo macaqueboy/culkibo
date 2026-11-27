@@ -72,6 +72,7 @@ function getSmartPackBuilder() { return _lazyV2.smartpack || (_lazyV2.smartpack 
 function getDirectPushRegistry() { return _lazyV2.directpush || (_lazyV2.directpush = require('../services/directPushRegistry')); }
 function getEdgeTunnelService() { return _lazyV2.edgetunnel || (_lazyV2.edgetunnel = require('../services/edgeTunnelService')); }
 function getSqliteStreamBackup() { return _lazyV2.snapstream || (_lazyV2.snapstream = require('../services/sqliteStreamBackup')); }
+function getReleaseProvenance() { return _lazyV2.provenance || (_lazyV2.provenance = require('../../scripts/release-provenance')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -1668,6 +1669,27 @@ router.post('/import/coolify/verify', heavyOpLimiter, async (req, res) => {
   }
 });
 
+router.post('/import/coolify/stream-plan', heavyOpLimiter, (req, res) => {
+  try {
+    if (denyInstanceGlobalForTenant(req, res, 'generar plan de streaming de volúmenes y bases de datos Coolify')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const snapshot = (body.snapshot && typeof body.snapshot === 'object') ? body.snapshot : body;
+    const options = (body.options && typeof body.options === 'object')
+      ? body.options
+      : {
+          ...(body.sourceHost ? { sourceHost: body.sourceHost } : {}),
+          ...(body.sourceUser ? { sourceUser: body.sourceUser } : {}),
+          ...(body.targetHost ? { targetHost: body.targetHost } : {}),
+          ...(body.targetUser ? { targetUser: body.targetUser } : {}),
+          ...(body.helperImage ? { helperImage: body.helperImage } : {})
+        };
+    const plan = coolifyMigrator.buildVolumeAndDbStreamPlan(snapshot, options);
+    res.json(plan);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
 // --- PORTABLE STACK BUNDLES (.zip / .ckb.gz, zero-dep, AES-256-GCM Vault) ---
 const MAX_BUNDLE_BASE64_CHARS = 35 * 1024 * 1024;
 
@@ -2027,6 +2049,17 @@ router.get('/system/audit/verify', (req, res) => {
 });
 
 // --- OPEN-CORE EDITION & OFFLINE ED25519 LICENSE VERIFIER ---
+router.get('/system/sbom', (_req, res) => {
+  try {
+    const sbom = getReleaseProvenance().generateCycloneDxSbom();
+    res.setHeader('Content-Type', 'application/vnd.cyclonedx+json; charset=utf-8');
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.status(200).send(JSON.stringify(sbom, null, 2));
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
 router.get('/system/edition', (req, res) => {
   try {
     const includeCatalog = req.query.includeCatalog === '1' || req.query.includeCatalog === 'true';

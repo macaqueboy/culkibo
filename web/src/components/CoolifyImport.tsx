@@ -31,8 +31,10 @@ import {
   KeyRound,
   Activity,
   Copy,
+  HardDrive,
 } from 'lucide-react';
 import { api, apiFetch, type DomainItem } from '../lib/api';
+import { useI18n } from '../lib/i18n';
 
 interface CoolifyProject {
   uuid: string;
@@ -165,6 +167,54 @@ interface MigrationPlan {
   };
 }
 
+interface StreamCmdSpec {
+  program: string;
+  args: string[];
+}
+
+interface DbStreamEntry {
+  id: string;
+  name: string;
+  engine: string;
+  originalEngine?: string;
+  sourceContainer: string;
+  targetContainer: string;
+  authEnvNote: string;
+  sourceDump: StreamCmdSpec;
+  sshSourceDump?: StreamCmdSpec | null;
+  targetRestore: StreamCmdSpec;
+  verification: {
+    streamChecksumAlgorithm: string;
+    streamChecksumStep: string;
+    postRestoreCheck?: StreamCmdSpec;
+  };
+}
+
+interface VolStreamEntry {
+  volumeName: string;
+  targetVolumeName: string;
+  mountPath?: string | null;
+  ownerResource: string;
+  sourceArchive: StreamCmdSpec;
+  sshSourceArchive?: StreamCmdSpec | null;
+  targetExtract: StreamCmdSpec;
+  verification: {
+    algorithm: string;
+    streamChecksumStep: string;
+    targetHashCheck?: StreamCmdSpec;
+  };
+}
+
+interface StreamPlanResult {
+  ok: boolean;
+  zeroShell: boolean;
+  sourceHost?: string | null;
+  summary: { databases: number; volumes: number; totalSteps: number };
+  databaseStreams: DbStreamEntry[];
+  volumeStreams: VolStreamEntry[];
+  verificationChecklist?: string[];
+}
+
 interface ParsedBundlePreview {
   filename: string;
   format: 'zip' | 'ckb.gz';
@@ -186,11 +236,174 @@ interface ParsedBundlePreview {
 }
 
 type SourceMode = 'api' | 'offline' | 'bundle';
-type PreviewTab = 'resources' | 'magic' | 'traefik' | 'preflight';
+type PreviewTab = 'resources' | 'magic' | 'traefik' | 'stream' | 'preflight';
 
 // ---------------------------------------------------------------------------
-// Client-side helpers: Lightweight Parity Analyzer & Pure-TS ZIP Preview/Export
+// Client-side helpers: Lightweight Parity Analyzer, Stream Plan Fallback & ZIP
 // ---------------------------------------------------------------------------
+
+function formatArgvDisplay(cmd?: StreamCmdSpec | null): string {
+  if (!cmd) return '';
+  return [cmd.program, ...cmd.args].map((tok) => (/\s/.test(tok) ? `"${tok}"` : tok)).join(' ');
+}
+
+function buildFallbackStreamPlan(
+  resources: CoolifyResource[],
+  opts: { sourceHost?: string; sourceUser?: string; sourcePort?: string }
+): StreamPlanResult {
+  const host = opts.sourceHost?.trim() || null;
+  const user = opts.sourceUser?.trim() || 'root';
+  const port = opts.sourcePort?.trim() || '22';
+  const wrapSsh = (cmd: StreamCmdSpec): StreamCmdSpec | null =>
+    host
+      ? {
+          program: 'ssh',
+          args: ['-p', port, '-o', 'BatchMode=yes', '--', `${user}@${host}`, cmd.program, ...cmd.args],
+        }
+      : null;
+
+  const databaseStreams: DbStreamEntry[] = [];
+  const volumeStreams: VolStreamEntry[] = [];
+  const seenVols = new Set<string>();
+
+  for (const r of resources) {
+    const slug = r.name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'res';
+    if (r._resourceType === 'database') {
+      const eng = resolveDbEngineClient(r);
+      const srcC = r.uuid || `coolify_${slug}`;
+      const tgtC = `culkibo_db_${slug}`;
+      let sourceDump: StreamCmdSpec;
+      let targetRestore: StreamCmdSpec;
+      let postRestoreCheck: StreamCmdSpec;
+      let authEnvNote: string;
+
+      if (eng.engine === 'postgres' || eng.engine === 'pgvector' || eng.engine === 'timescaledb') {
+        sourceDump = { program: 'docker', args: ['exec', '-i', srcC, 'pg_dump', '-U', 'postgres', '-d', slug, '-F', 'c', '-b'] };
+        targetRestore = { program: 'docker', args: ['exec', '-i', tgtC, 'pg_restore', '-U', 'postgres', '-d', slug, '--clean', '--if-exists', '--no-owner'] };
+        postRestoreCheck = { program: 'docker', args: ['exec', tgtC, 'pg_isready', '-h', '127.0.0.1'] };
+        authEnvNote = 'PGPASSWORD inside container (0 passwords in argv)';
+      } else if (eng.engine === 'mysql' || eng.engine === 'mariadb') {
+        const dumpBin = eng.engine === 'mariadb' ? 'mariadb-dump' : 'mysqldump';
+        const restBin = eng.engine === 'mariadb' ? 'mariadb' : 'mysql';
+        sourceDump = { program: 'docker', args: ['exec', '-i', srcC, dumpBin, '-u', 'root', '--single-transaction', '--quick', slug] };
+        targetRestore = { program: 'docker', args: ['exec', '-i', tgtC, restBin, '-u', 'root', slug] };
+        postRestoreCheck = { program: 'docker', args: ['exec', tgtC, 'mysqladmin', 'ping', '-h', '127.0.0.1', '--silent'] };
+        authEnvNote = 'MYSQL_PWD / CULKIBO_MYSQL_PWD inside container';
+      } else if (eng.engine === 'mongodb') {
+        sourceDump = { program: 'docker', args: ['exec', '-i', srcC, 'mongodump', '--archive', '--gzip'] };
+        targetRestore = { program: 'docker', args: ['exec', '-i', tgtC, 'mongorestore', '--archive', '--gzip', '--drop'] };
+        postRestoreCheck = { program: 'docker', args: ['exec', tgtC, 'mongosh', '--quiet', '--eval', 'db.adminCommand({ ping: 1 }).ok'] };
+        authEnvNote = 'MONGO_INITDB_ROOT_* inside container';
+      } else if (eng.engine === 'valkey') {
+        sourceDump = { program: 'docker', args: ['exec', srcC, 'redis-cli', 'SAVE'] };
+        targetRestore = { program: 'docker', args: ['cp', `${srcC}:/data/dump.rdb`, '-'] };
+        postRestoreCheck = { program: 'docker', args: ['exec', tgtC, 'valkey-cli', 'DBSIZE'] };
+        authEnvNote = 'REDISCLI_AUTH inside container';
+      } else {
+        sourceDump = { program: 'docker', args: ['exec', srcC, 'clickhouse-client', '--query', 'SHOW TABLES'] };
+        targetRestore = { program: 'docker', args: ['exec', '-i', tgtC, 'clickhouse-client', '--database', 'default'] };
+        postRestoreCheck = { program: 'docker', args: ['exec', tgtC, 'clickhouse-client', '--query', 'SELECT count() FROM system.tables'] };
+        authEnvNote = 'CLICKHOUSE_PASSWORD inside container';
+      }
+
+      databaseStreams.push({
+        id: r.uuid,
+        name: r.name,
+        engine: eng.engine,
+        originalEngine: r.database_type || eng.engine,
+        sourceContainer: srcC,
+        targetContainer: tgtC,
+        authEnvNote,
+        sourceDump,
+        sshSourceDump: wrapSsh(sourceDump),
+        targetRestore,
+        verification: {
+          streamChecksumAlgorithm: 'sha256',
+          streamChecksumStep: 'Pipe stdout → Node crypto.createHash("sha256") PassThrough → target stdin',
+          postRestoreCheck,
+        },
+      });
+    }
+
+    const vols = r.local_persistent_volumes || r.persistent_volumes || r.volumes || [];
+    for (const v of vols) {
+      const volObj = v as Record<string, any>;
+      const volName = typeof v === 'string' ? v.split(':')[0] : String(volObj?.name || volObj?.source || '');
+      if (!volName || volName.startsWith('/') || seenVols.has(volName)) continue;
+      seenVols.add(volName);
+      const targetVol = `culkibo_mig_${volName}`;
+      const sourceArchive: StreamCmdSpec = {
+        program: 'docker',
+        args: ['run', '--rm', '-v', `${volName}:/src:ro`, 'alpine:3.20', 'tar', '-cf', '-', '-C', '/src', '.'],
+      };
+      const targetExtract: StreamCmdSpec = {
+        program: 'docker',
+        args: ['run', '--rm', '-i', '-v', `${targetVol}:/dst`, 'alpine:3.20', 'tar', '-xf', '-', '-C', '/dst'],
+      };
+      const targetHashCheck: StreamCmdSpec = {
+        program: 'docker',
+        args: ['run', '--rm', '-v', `${targetVol}:/dst:ro`, 'alpine:3.20', 'find', '/dst', '-type', 'f', '-exec', 'sha256sum', '{}', '+'],
+      };
+      volumeStreams.push({
+        volumeName: volName,
+        targetVolumeName: targetVol,
+        mountPath: typeof volObj?.mount_path === 'string' ? volObj.mount_path : null,
+        ownerResource: r.name,
+        sourceArchive,
+        sshSourceArchive: wrapSsh(sourceArchive),
+        targetExtract,
+        verification: {
+          algorithm: 'sha256',
+          streamChecksumStep: 'Compare SHA-256 tar digest in flight + file manifest checksums',
+          targetHashCheck,
+        },
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    zeroShell: true,
+    sourceHost: host,
+    summary: {
+      databases: databaseStreams.length,
+      volumes: volumeStreams.length,
+      totalSteps: databaseStreams.length + volumeStreams.length,
+    },
+    databaseStreams,
+    volumeStreams,
+  };
+}
+
+function formatStreamRunbookText(plan: StreamPlanResult, isEn: boolean): string {
+  const lines: string[] = [
+    isEn
+      ? '# Culkibo Zero-Shell Volume & SQL Live Transfer Runbook'
+      : '# Runbook Culkibo — Transferencia en Vivo de Volúmenes y SQL (Zero-Shell)',
+    `# Databases: ${plan.summary.databases} · Volumes: ${plan.summary.volumes} · Checksum: SHA-256`,
+    '',
+  ];
+  for (const db of plan.databaseStreams) {
+    lines.push(`## DB: ${db.name} (${db.engine})`);
+    lines.push(`# Auth: ${db.authEnvNote}`);
+    lines.push(`# Source dump:  ${formatArgvDisplay(db.sshSourceDump || db.sourceDump)}`);
+    lines.push(`# Target load:  ${formatArgvDisplay(db.targetRestore)}`);
+    if (db.verification.postRestoreCheck) {
+      lines.push(`# Verify check: ${formatArgvDisplay(db.verification.postRestoreCheck)}`);
+    }
+    lines.push('');
+  }
+  for (const vol of plan.volumeStreams) {
+    lines.push(`## Volume: ${vol.volumeName} → ${vol.targetVolumeName} (${vol.ownerResource})`);
+    lines.push(`# Source tar:   ${formatArgvDisplay(vol.sshSourceArchive || vol.sourceArchive)}`);
+    lines.push(`# Target tar:   ${formatArgvDisplay(vol.targetExtract)}`);
+    if (vol.verification.targetHashCheck) {
+      lines.push(`# SHA-256 verify: ${formatArgvDisplay(vol.verification.targetHashCheck)}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
 
 function crc32Bytes(data: Uint8Array): number {
   let crc = 0xffffffff;
@@ -263,7 +476,7 @@ function buildClientZipBlob(files: Record<string, string>): Blob {
 
 async function inflateRawBrowser(comp: Uint8Array): Promise<Uint8Array> {
   if (typeof DecompressionStream === 'undefined') {
-    throw new Error('Tu navegador no soporta DecompressionStream; usa el endpoint de backend para inspeccionar .zip comprimidos.');
+    throw new Error('DecompressionStream is unavailable in this browser.');
   }
   const ds = new DecompressionStream('deflate-raw');
   const writer = ds.writable.getWriter();
@@ -276,7 +489,7 @@ async function inflateRawBrowser(comp: Uint8Array): Promise<Uint8Array> {
 async function parseZipInBrowser(buf: ArrayBuffer): Promise<Record<string, string>> {
   const bytes = new Uint8Array(buf);
   const view = new DataView(buf);
-  if (bytes.length < 22) throw new Error('Archivo ZIP demasiado pequeño o corrupto');
+  if (bytes.length < 22) throw new Error('ZIP file is truncated or corrupt');
 
   let eocdPos = -1;
   const minPos = Math.max(0, bytes.length - 22 - 65535);
@@ -286,13 +499,13 @@ async function parseZipInBrowser(buf: ArrayBuffer): Promise<Record<string, strin
       break;
     }
   }
-  if (eocdPos === -1) throw new Error('Cabecera EOCD de ZIP no encontrada');
+  if (eocdPos === -1) throw new Error('ZIP End of Central Directory (EOCD) not found');
 
   const totalEntries = view.getUint16(eocdPos + 10, true);
   const cdSize = view.getUint32(eocdPos + 12, true);
   const cdOffset = view.getUint32(eocdPos + 16, true);
   if (totalEntries > 200 || cdOffset + cdSize > eocdPos) {
-    throw new Error('Archivo ZIP rechazado por límites de seguridad');
+    throw new Error('ZIP file rejected by security limits');
   }
 
   const dec = new TextDecoder('utf-8');
@@ -301,7 +514,7 @@ async function parseZipInBrowser(buf: ArrayBuffer): Promise<Record<string, strin
   let totalUncomp = 0;
 
   for (let i = 0; i < totalEntries; i++) {
-    if (view.getUint32(cursor, true) !== 0x02014b50) throw new Error('Central Directory inválido');
+    if (view.getUint32(cursor, true) !== 0x02014b50) throw new Error('Invalid Central Directory');
     const method = view.getUint16(cursor + 10, true);
     const compSize = view.getUint32(cursor + 20, true);
     const uncompSize = view.getUint32(cursor + 24, true);
@@ -314,11 +527,11 @@ async function parseZipInBrowser(buf: ArrayBuffer): Promise<Record<string, strin
     cursor += 46 + nameLen + extraLen + commentLen;
 
     if (name.includes('..') || name.startsWith('/') || name.includes('\\') || /^[A-Za-z]:/.test(name)) {
-      throw new Error(`Path traversal bloqueado en ZIP: ${name}`);
+      throw new Error(`Path traversal blocked in ZIP: ${name}`);
     }
     if (name.endsWith('/')) continue;
     if (uncompSize > 10 * 1024 * 1024 || totalUncomp + uncompSize > 25 * 1024 * 1024) {
-      throw new Error('Zip-bomb bloqueado en inspección local');
+      throw new Error('Zip-bomb blocked during local inspection');
     }
 
     const lfhNameLen = view.getUint16(lfhOffset + 26, true);
@@ -329,7 +542,7 @@ async function parseZipInBrowser(buf: ArrayBuffer): Promise<Record<string, strin
     let raw: Uint8Array;
     if (method === 0) raw = compSlice;
     else if (method === 8) raw = await inflateRawBrowser(compSlice);
-    else throw new Error(`Método ZIP no soportado: ${method}`);
+    else throw new Error(`Unsupported ZIP compression method: ${method}`);
 
     totalUncomp += raw.length;
     files[name] = dec.decode(raw);
@@ -359,11 +572,10 @@ function resolveDbEngineClient(r: CoolifyResource): { engine: string; label: str
   if (raw.includes('redis') || raw.includes('valkey')) return { engine: 'valkey', label: 'Valkey (Redis)', port: 6379 };
   if (raw.includes('mongo')) return { engine: 'mongodb', label: 'MongoDB', port: 27017 };
   if (raw.includes('clickhouse')) return { engine: 'clickhouse', label: 'ClickHouse', port: 8123 };
-  return { engine: r.database_type || 'database', label: r.database_type || 'Base de datos', port: 5432 };
+  return { engine: r.database_type || 'database', label: r.database_type || 'Database', port: 5432 };
 }
 
-/** Fallback local analyzer when previewing an offline JSON export (mirrors coolifyMigrator.buildMigrationPlan). */
-function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject[]): MigrationPlan {
+function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject[], isEn: boolean): MigrationPlan {
   const magicVariables: MagicVarPreview[] = [];
   const traefikTranslations: TraefikTranslationPreview[] = [];
   const crons: CronPreview[] = [];
@@ -386,7 +598,6 @@ function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject
     fileMountsCount += mounts;
     if (r.health_check_enabled || r.health_check_path) healthchecksCount++;
 
-    // Scan Magic Vars
     for (const ev of r.environment_variables || []) {
       const k = ev?.key || '';
       const v = String(ev?.value ?? '');
@@ -417,35 +628,38 @@ function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject
         });
       }
       if (/(secret|token|pass|key|dsn|database_url)/i.test(k) && v && !v.includes('${')) {
-        secretWarnings.push(`Variable sensible "${k}" en ${r.name}: migrar a \${vault.${k.toUpperCase()}}.`);
+        secretWarnings.push(
+          isEn
+            ? `Sensitive variable "${k}" in ${r.name}: migrate to \${vault.${k.toUpperCase()}}.`
+            : `Variable sensible "${k}" en ${r.name}: migrar a \${vault.${k.toUpperCase()}}.`
+        );
       }
     }
 
-    // Scan Traefik labels
     const rawLbl = String(r.custom_labels || '') + '\n' + String(r.docker_compose || r.docker_compose_raw || '');
     const traefikLines = rawLbl.split(/\r?\n/).filter((l) => /traefik\.http\./i.test(l));
     if (traefikLines.length > 0) {
       const rules: Array<{ source: string; target: string; summary: string }> = [];
       if (traefikLines.some((l) => /stripprefix/i.test(l))) {
-        rules.push({ source: 'traefik.middlewares.stripprefix', target: 'domain.pathRoutes', summary: 'Prefijo de ruta con stripPrefix nativo en Caddy' });
+        rules.push({ source: 'traefik.middlewares.stripprefix', target: 'domain.pathRoutes', summary: isEn ? 'Native Caddy stripPrefix path route' : 'Prefijo de ruta con stripPrefix nativo en Caddy' });
       }
       if (traefikLines.some((l) => /redirectregex/i.test(l))) {
-        rules.push({ source: 'traefik.middlewares.redirectregex', target: 'domain.pathRedirects', summary: 'Redirección regex/canónica validada en Caddy' });
+        rules.push({ source: 'traefik.middlewares.redirectregex', target: 'domain.pathRedirects', summary: isEn ? 'Validated regex/canonical redirect in Caddy' : 'Redirección regex/canónica validada en Caddy' });
       }
       if (traefikLines.some((l) => /accesscontrolallow/i.test(l))) {
-        rules.push({ source: 'traefik.middlewares.headers (CORS)', target: 'domain.cors', summary: 'Política CORS nativa' });
+        rules.push({ source: 'traefik.middlewares.headers (CORS)', target: 'domain.cors', summary: isEn ? 'Native CORS edge policy' : 'Política CORS nativa' });
       }
       if (traefikLines.some((l) => /sts(seconds|preload)/i.test(l))) {
-        rules.push({ source: 'traefik.middlewares.headers (HSTS)', target: 'domain.hstsPreload', summary: 'Cabecera HSTS / Preload' });
+        rules.push({ source: 'traefik.middlewares.headers (HSTS)', target: 'domain.hstsPreload', summary: isEn ? 'HSTS / Preload header' : 'Cabecera HSTS / Preload' });
       }
       if (traefikLines.some((l) => /forwardauth/i.test(l))) {
         rules.push({ source: 'traefik.middlewares.forwardauth', target: 'domain.forwardAuth', summary: 'ForwardAuth (Authelia/Authentik)' });
       }
       if (traefikLines.some((l) => /basicauth/i.test(l))) {
-        rules.push({ source: 'traefik.middlewares.basicauth', target: 'domain.basicAuth', summary: 'Basic Auth bcrypt en Caddy' });
+        rules.push({ source: 'traefik.middlewares.basicauth', target: 'domain.basicAuth', summary: isEn ? 'Bcrypt Basic Auth in Caddy' : 'Basic Auth bcrypt en Caddy' });
       }
       if (traefikLines.some((l) => /loadbalancer\.server\.port/i.test(l))) {
-        rules.push({ source: 'traefik.services.loadbalancer.port', target: 'domain.targetPort', summary: 'Puerto upstream detectado automáticamente' });
+        rules.push({ source: 'traefik.services.loadbalancer.port', target: 'domain.targetPort', summary: isEn ? 'Auto-detected upstream port' : 'Puerto upstream detectado automáticamente' });
       }
       traefikTranslations.push({
         resourceId: r.uuid,
@@ -458,7 +672,6 @@ function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject
       });
     }
 
-    // Crons
     for (const task of r.scheduled_tasks || []) {
       const cmd = String(task.command || '').trim();
       const hasShell = /[|;&`><]/.test(cmd);
@@ -468,12 +681,13 @@ function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject
         command: cmd,
         enabled: task.enabled !== false,
         valid: !hasShell,
-        warning: hasShell ? 'Usa sintaxis de shell; divídelo en comando directo o endpoint HTTP.' : null,
+        warning: hasShell
+          ? (isEn ? 'Uses shell syntax; split into direct argv command or HTTP cron endpoint.' : 'Usa sintaxis de shell; divídelo en comando directo o endpoint HTTP.')
+          : null,
         sourceResource: r.name,
       });
     }
 
-    // Databases
     if (r._resourceType === 'database') {
       const eng = resolveDbEngineClient(r);
       databases.push({
@@ -488,7 +702,6 @@ function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject
       });
     }
 
-    // Domains
     const firstPort = parseInt(String(r.ports_exposes || r.port || '3000').split(',')[0], 10) || 3000;
     for (const h of hosts) {
       if (!domains.some((d) => d.hostname === h)) {
@@ -534,21 +747,35 @@ function computeLocalPlan(resources: CoolifyResource[], projects: CoolifyProject
     vaultRefs: Array.from(vaultRefs).sort(),
     secretWarnings,
     warnings,
-    dnsCutoverChecklist: [
-      { step: 1, id: 'lower_ttl', title: 'Reducir TTL DNS a 60s', detail: 'Prepara una conmutación instantánea sin caché antigua.', required: domains.length > 0 },
-      { step: 2, id: 'populate_vault', title: `Cargar ${vaultRefs.size} secreto(s) en Vault AES-256-GCM`, detail: 'Culkibo inyecta los secretos sin escribir texto plano en Git ni discos.', required: vaultRefs.size > 0 },
-      { step: 3, id: 'sync_data', title: `Migrar ${dbsCount} BD(s) y ${volumesCount} volumen(es)`, detail: 'Vuelca PostgreSQL/MySQL/Valkey/ClickHouse y sincroniza volúmenes con rsync.', required: dbsCount > 0 || volumesCount > 0 },
-      { step: 4, id: 'smoke_verify', title: 'Verificar endpoints antes de mover DNS', detail: 'Usa curl --resolve contra la IP de Culkibo para validar HTTP 200 y TLS.', required: true },
-      { step: 5, id: 'dns_flip', title: 'Conmutación DNS Zero-Downtime', detail: 'Actualiza los registros A en Cloudflare o tu registrador.', required: domains.length > 0 },
-    ],
+    dnsCutoverChecklist: isEn
+      ? [
+          { step: 1, id: 'lower_ttl', title: 'Lower DNS TTL to 60s', detail: 'Prepares an instant cutover without stale DNS caches.', required: domains.length > 0 },
+          { step: 2, id: 'populate_vault', title: `Load ${vaultRefs.size} secret(s) into AES-256-GCM Vault`, detail: 'Culkibo injects secrets without writing plaintext to Git or disk.', required: vaultRefs.size > 0 },
+          { step: 3, id: 'sync_data', title: `Stream ${dbsCount} DB(s) & ${volumesCount} volume(s)`, detail: 'Stream PostgreSQL/MySQL/Valkey/ClickHouse and Docker volumes with SHA-256 verification.', required: dbsCount > 0 || volumesCount > 0 },
+          { step: 4, id: 'smoke_verify', title: 'Verify endpoints before flipping DNS', detail: 'Use curl --resolve against the Culkibo IP to validate HTTP 200 and TLS.', required: true },
+          { step: 5, id: 'dns_flip', title: 'Zero-Downtime DNS cutover', detail: 'Update A records via Cloudflare API or your DNS registrar.', required: domains.length > 0 },
+        ]
+      : [
+          { step: 1, id: 'lower_ttl', title: 'Reducir TTL DNS a 60s', detail: 'Prepara una conmutación instantánea sin caché antigua.', required: domains.length > 0 },
+          { step: 2, id: 'populate_vault', title: `Cargar ${vaultRefs.size} secreto(s) en Vault AES-256-GCM`, detail: 'Culkibo inyecta los secretos sin escribir texto plano en Git ni discos.', required: vaultRefs.size > 0 },
+          { step: 3, id: 'sync_data', title: `Migrar ${dbsCount} BD(s) y ${volumesCount} volumen(es)`, detail: 'Vuelca PostgreSQL/MySQL/Valkey/ClickHouse y sincroniza volúmenes con SHA-256.', required: dbsCount > 0 || volumesCount > 0 },
+          { step: 4, id: 'smoke_verify', title: 'Verificar endpoints antes de mover DNS', detail: 'Usa curl --resolve contra la IP de Culkibo para validar HTTP 200 y TLS.', required: true },
+          { step: 5, id: 'dns_flip', title: 'Conmutación DNS Zero-Downtime', detail: 'Actualiza los registros A en Cloudflare o tu registrador.', required: domains.length > 0 },
+        ],
     rollbackPlan: {
       sourceUntouched: true,
       estimatedRollbackSeconds: 30,
-      steps: [
-        'Tu instancia de Coolify v4 original NO se ha modificado (acceso estrictamente solo-lectura).',
-        'Mantén los contenedores de Coolify corriendo en paralelo 24-48 h tras el cutover.',
-        'Si detectas cualquier anomalía, apunta el registro A de vuelta a la IP de Coolify (~30 s en Cloudflare).',
-      ],
+      steps: isEn
+        ? [
+            'Your original Coolify v4 instance was NEVER modified (strictly read-only migration).',
+            'Keep Coolify containers running in parallel for 24–48 h after cutover.',
+            'If any issue occurs, point the A record back to the Coolify IP (~30 s on Cloudflare).',
+          ]
+        : [
+            'Tu instancia de Coolify v4 original NO se ha modificado (acceso estrictamente solo-lectura).',
+            'Mantén los contenedores de Coolify corriendo en paralelo 24-48 h tras el cutover.',
+            'Si detectas cualquier anomalía, apunta el registro A de vuelta a la IP de Coolify (~30 s en Cloudflare).',
+          ],
     },
   };
 }
@@ -562,6 +789,9 @@ export const CoolifyImport: React.FC<{
   onCancel: () => void;
   onNotify: (msg: string, type?: 'info' | 'success' | 'error') => void;
 }> = ({ onComplete, onCancel, onNotify }) => {
+  const { locale } = useI18n();
+  const isEn = locale === 'en';
+
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [sourceMode, setSourceMode] = useState<SourceMode>('api');
 
@@ -583,6 +813,13 @@ export const CoolifyImport: React.FC<{
   const [previewTab, setPreviewTab] = useState<PreviewTab>('resources');
   const [searchQuery, setSearchQuery] = useState('');
 
+  // Volume & SQL Live Transfer Stream Plan
+  const [streamSourceHost, setStreamSourceHost] = useState('');
+  const [streamSourceUser, setStreamSourceUser] = useState('root');
+  const [streamSourcePort, setStreamSourcePort] = useState('22');
+  const [streamPlan, setStreamPlan] = useState<StreamPlanResult | null>(null);
+  const [loadingStreamPlan, setLoadingStreamPlan] = useState(false);
+
   // Step 3: Results + Cutover + Smoke Verify + Rollback
   const [results, setResults] = useState<Record<string, any> | null>(null);
   const [importedDomains, setImportedDomains] = useState<DomainItem[]>([]);
@@ -597,8 +834,57 @@ export const CoolifyImport: React.FC<{
 
   const activePlan: MigrationPlan = useMemo(() => {
     if (serverPlan) return serverPlan;
-    return computeLocalPlan(allResources, projects);
-  }, [serverPlan, allResources, projects]);
+    return computeLocalPlan(allResources, projects, isEn);
+  }, [serverPlan, allResources, projects, isEn]);
+
+  const effectiveStreamPlan: StreamPlanResult = useMemo(() => {
+    if (streamPlan) return streamPlan;
+    const chosen = selected.size > 0 ? allResources.filter((r) => selected.has(r.uuid)) : allResources;
+    return buildFallbackStreamPlan(chosen, {
+      sourceHost: streamSourceHost,
+      sourceUser: streamSourceUser,
+      sourcePort: streamSourcePort,
+    });
+  }, [streamPlan, allResources, selected, streamSourceHost, streamSourceUser, streamSourcePort]);
+
+  const handleFetchStreamPlan = async () => {
+    setLoadingStreamPlan(true);
+    const chosen = selected.size > 0 ? allResources.filter((r) => selected.has(r.uuid)) : allResources;
+    const snapshot = {
+      apps: chosen.filter((r) => r._resourceType === 'app'),
+      databases: chosen.filter((r) => r._resourceType === 'database'),
+      services: chosen.filter((r) => r._resourceType === 'service'),
+      projects,
+    };
+    const options = {
+      sourceHost: streamSourceHost.trim() || undefined,
+      sourceUser: streamSourceUser.trim() || 'root',
+      sourcePort: Number(streamSourcePort) || 22,
+    };
+    try {
+      const res = await apiFetch('/api/import/coolify/stream-plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ snapshot, options }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setStreamPlan(data);
+        onNotify(
+          isEn
+            ? `Zero-shell stream plan generated (${data.summary?.databases || 0} DBs, ${data.summary?.volumes || 0} volumes)`
+            : `Plan de transferencia zero-shell generado (${data.summary?.databases || 0} BDs, ${data.summary?.volumes || 0} volúmenes)`,
+          'success'
+        );
+      } else {
+        setStreamPlan(buildFallbackStreamPlan(chosen, { sourceHost: streamSourceHost, sourceUser: streamSourceUser, sourcePort: streamSourcePort }));
+      }
+    } catch {
+      setStreamPlan(buildFallbackStreamPlan(chosen, { sourceHost: streamSourceHost, sourceUser: streamSourceUser, sourcePort: streamSourcePort }));
+    } finally {
+      setLoadingStreamPlan(false);
+    }
+  };
 
   // -------------------------------------------------------------------------
   // Step 1 Handlers
@@ -615,11 +901,12 @@ export const CoolifyImport: React.FC<{
       setAllResources(all);
       setProjects(res.projects || []);
       setServerPlan(res.plan || null);
+      setStreamPlan(null);
       setSelected(new Set(all.map((r) => r.uuid)));
       setPreviewTab('resources');
       setStep(2);
     } catch (e: any) {
-      onNotify(e?.message || 'Error al conectar con Coolify', 'error');
+      onNotify(e?.message || (isEn ? 'Failed to connect to Coolify' : 'Error al conectar con Coolify'), 'error');
     } finally {
       setLoading(false);
     }
@@ -648,17 +935,21 @@ export const CoolifyImport: React.FC<{
       }));
       const all = [...apps, ...dbs, ...svcs];
       if (all.length === 0) {
-        onNotify('El JSON no contiene apps, databases ni services de Coolify.', 'error');
+        onNotify(
+          isEn ? 'JSON contains no Coolify apps, databases, or services.' : 'El JSON no contiene apps, databases ni services de Coolify.',
+          'error'
+        );
         return;
       }
       setAllResources(all);
       setProjects(parsed.projects || []);
       setServerPlan(null);
+      setStreamPlan(null);
       setSelected(new Set(all.map((r) => r.uuid)));
       setPreviewTab('resources');
       setStep(2);
     } catch (err: any) {
-      onNotify(`JSON inválido: ${err?.message || 'revisa el formato'}`, 'error');
+      onNotify(isEn ? `Invalid JSON: ${err?.message || 'check format'}` : `JSON inválido: ${err?.message || 'revisa el formato'}`, 'error');
     }
   };
 
@@ -671,10 +962,11 @@ export const CoolifyImport: React.FC<{
       const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b;
       const isGz = bytes[0] === 0x1f && bytes[1] === 0x8b;
       if (!isZip && !isGz) {
-        throw new Error('Selecciona un archivo .zip o .ckb.gz válido generado por Culkibo.');
+        throw new Error(
+          isEn ? 'Select a valid .zip or .ckb.gz bundle exported by Culkibo.' : 'Selecciona un archivo .zip o .ckb.gz válido generado por Culkibo.'
+        );
       }
 
-      // Convert to base64 for optional backend Wave-2 bundle endpoints
       let bin = '';
       for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
       const rawBase64 = btoa(bin);
@@ -682,7 +974,7 @@ export const CoolifyImport: React.FC<{
       if (isZip) {
         const files = await parseZipInBrowser(ab);
         if (!files['manifest.json']) {
-          throw new Error('El archivo ZIP no contiene manifest.json de Culkibo.');
+          throw new Error(isEn ? 'ZIP archive does not contain a Culkibo manifest.json.' : 'El archivo ZIP no contiene manifest.json de Culkibo.');
         }
         const manifest = JSON.parse(files['manifest.json']);
         const bProjects = files['projects.json'] ? JSON.parse(files['projects.json']) : [];
@@ -700,9 +992,13 @@ export const CoolifyImport: React.FC<{
           culkiboYaml: files['culkibo.yaml'] || '',
           rawBase64,
         });
-        onNotify(`Bundle "${manifest.stackName || file.name}" inspeccionado (${bProjects.length} proyecto(s))`, 'success');
+        onNotify(
+          isEn
+            ? `Bundle "${manifest.stackName || file.name}" inspected (${bProjects.length} project(s))`
+            : `Bundle "${manifest.stackName || file.name}" inspeccionado (${bProjects.length} proyecto(s))`,
+          'success'
+        );
       } else {
-        // .ckb.gz: intentar backend /api/bundles/inspect (Wave-2) o DecompressionStream('gzip')
         let payload: any = null;
         if (typeof DecompressionStream !== 'undefined') {
           const ds = new DecompressionStream('gzip');
@@ -717,7 +1013,7 @@ export const CoolifyImport: React.FC<{
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ bundleBase64: rawBase64, passphrase: bundlePassphrase || undefined }),
           });
-          if (!res.ok) throw new Error('No se pudo inspeccionar el archivo .ckb.gz');
+          if (!res.ok) throw new Error(isEn ? 'Failed to inspect .ckb.gz archive' : 'No se pudo inspeccionar el archivo .ckb.gz');
           payload = await res.json();
         }
         const files = payload.files || {};
@@ -732,11 +1028,16 @@ export const CoolifyImport: React.FC<{
           culkiboYaml: files['culkibo.yaml'] || payload.culkiboYaml || '',
           rawBase64,
         });
-        onNotify(`Bundle .ckb.gz "${payload.manifest?.stackName || file.name}" verificado`, 'success');
+        onNotify(
+          isEn
+            ? `.ckb.gz bundle "${payload.manifest?.stackName || file.name}" verified`
+            : `Bundle .ckb.gz "${payload.manifest?.stackName || file.name}" verificado`,
+          'success'
+        );
       }
     } catch (err: any) {
       setParsedBundle(null);
-      onNotify(err?.message || 'Error al leer el bundle portátil', 'error');
+      onNotify(err?.message || (isEn ? 'Error reading portable bundle' : 'Error al leer el bundle portátil'), 'error');
     } finally {
       setLoading(false);
     }
@@ -746,7 +1047,6 @@ export const CoolifyImport: React.FC<{
     if (!parsedBundle) return;
     setLoading(true);
     try {
-      // Intenta primero el endpoint Wave-2 /api/bundles/import si está montado
       let importedViaApi = false;
       try {
         const res = await apiFetch('/api/bundles/import', {
@@ -772,7 +1072,7 @@ export const CoolifyImport: React.FC<{
           importedViaApi = true;
         }
       } catch {
-        // Fallback gracioso usando api.createProject si Wave-2 aún no está cableado
+        // Fallback using api.createProject
       }
 
       if (!importedViaApi) {
@@ -781,8 +1081,8 @@ export const CoolifyImport: React.FC<{
         for (const p of parsedBundle.projects) {
           try {
             await api.createProject({
-              name: String(p.name || 'Proyecto Bundle'),
-              description: String(p.description || `Restaurado desde ${parsedBundle.filename}`),
+              name: String(p.name || 'Bundle Project'),
+              description: String(p.description || `Restored from ${parsedBundle.filename}`),
               gitRepo: String(p.gitRepo || ''),
               gitBranch: String(p.gitBranch || 'main'),
               buildCommand: String(p.buildCommand || ''),
@@ -792,7 +1092,7 @@ export const CoolifyImport: React.FC<{
             } as any);
             count++;
           } catch (err: any) {
-            errs.push(`${String(p.name || 'Proyecto')}: ${err?.message || 'error'}`);
+            errs.push(`${String(p.name || 'Project')}: ${err?.message || 'error'}`);
           }
         }
         setResults({
@@ -803,7 +1103,11 @@ export const CoolifyImport: React.FC<{
           domainsLinked: 0,
           parityScore: 100,
           warnings: parsedBundle.manifest.vaultMode === 'encrypted'
-            ? ['Proyecto(s) creados vía API base; importa el sobre vault.enc.json desde CLI/Vault si requieres descifrar los secretos.']
+            ? [
+                isEn
+                  ? 'Project(s) created via base API; import vault.enc.json via CLI/Vault to decrypt secrets.'
+                  : 'Proyecto(s) creados vía API base; importa el sobre vault.enc.json desde CLI/Vault si requieres descifrar los secretos.',
+              ]
             : [],
           errors: errs,
         });
@@ -811,9 +1115,14 @@ export const CoolifyImport: React.FC<{
 
       await loadCutoverContext();
       setStep(3);
-      onNotify(`Bundle "${parsedBundle.manifest.stackName}" restaurado en Culkibo`, 'success');
+      onNotify(
+        isEn
+          ? `Bundle "${parsedBundle.manifest.stackName}" restored into Culkibo`
+          : `Bundle "${parsedBundle.manifest.stackName}" restaurado en Culkibo`,
+        'success'
+      );
     } catch (err: any) {
-      onNotify(err?.message || 'Error al importar bundle', 'error');
+      onNotify(err?.message || (isEn ? 'Failed to import bundle' : 'Error al importar bundle'), 'error');
     } finally {
       setLoading(false);
     }
@@ -827,8 +1136,8 @@ export const CoolifyImport: React.FC<{
     const groups = new Map<string, ProjectGroup>();
     const fallbackProject: CoolifyProject = {
       uuid: '_unassigned',
-      name: 'Sin proyecto asignado',
-      description: 'Recursos sin proyecto en Coolify',
+      name: isEn ? 'Unassigned project' : 'Sin proyecto asignado',
+      description: isEn ? 'Resources without a project in Coolify' : 'Recursos sin proyecto en Coolify',
     };
     const q = searchQuery.trim().toLowerCase();
 
@@ -843,7 +1152,7 @@ export const CoolifyImport: React.FC<{
       if (resource.environment?.project?.uuid) {
         projectKey = resource.environment.project.uuid;
         const match = projects.find((p) => p.uuid === projectKey);
-        project = match || { uuid: projectKey, name: resource.environment.project.name || 'Proyecto Coolify', description: '' };
+        project = match || { uuid: projectKey, name: resource.environment.project.name || 'Coolify Project', description: '' };
       } else if (resource.project_id && projects.length) {
         const match = projects.find((p) => p.id === resource.project_id || p.uuid === String(resource.project_id));
         if (match) {
@@ -863,7 +1172,7 @@ export const CoolifyImport: React.FC<{
       if (b.project.uuid === '_unassigned') return -1;
       return a.project.name.localeCompare(b.project.name);
     });
-  }, [allResources, projects, searchQuery]);
+  }, [allResources, projects, searchQuery, isEn]);
 
   const toggleResource = (uuid: string) =>
     setSelected((prev) => {
@@ -991,7 +1300,10 @@ export const CoolifyImport: React.FC<{
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    onNotify('Bundle portátil .zip generado (0 secretos en claro)', 'success');
+    onNotify(
+      isEn ? 'Portable .zip bundle generated (0 plaintext secrets)' : 'Bundle portátil .zip generado (0 secretos en claro)',
+      'success'
+    );
   };
 
   const handleImport = async () => {
@@ -1001,7 +1313,6 @@ export const CoolifyImport: React.FC<{
         const res = await api.importCoolify(apiUrl.trim(), apiToken.trim(), selectedApps, selectedDbs, selectedServices);
         setResults(res);
       } else {
-        // Offline JSON import using existing api.createProject gracefully
         const chosen = allResources.filter((r) => selected.has(r.uuid));
         let importedApps = 0;
         let importedDbs = 0;
@@ -1015,7 +1326,7 @@ export const CoolifyImport: React.FC<{
           try {
             await api.createProject({
               name: r.name,
-              description: `Importado offline desde Coolify (${r._resourceType})`,
+              description: `Imported offline from Coolify (${r._resourceType})`,
               gitRepo: r.git_repository || '',
               gitBranch: r.git_branch || 'main',
             } as any);
@@ -1044,7 +1355,7 @@ export const CoolifyImport: React.FC<{
       await loadCutoverContext();
       setStep(3);
     } catch (e: any) {
-      onNotify(e?.message || 'Error al importar desde Coolify', 'error');
+      onNotify(e?.message || (isEn ? 'Failed to import from Coolify' : 'Error al importar desde Coolify'), 'error');
     } finally {
       setLoading(false);
     }
@@ -1068,12 +1379,23 @@ export const CoolifyImport: React.FC<{
       if (res.ok) {
         const data = await res.json();
         setVerifyReport(data);
-        onNotify(data.cutoverReady ? 'Paridad verificada: listo para DNS cutover' : 'Algunos endpoints requieren atención', data.cutoverReady ? 'success' : 'error');
+        onNotify(
+          data.cutoverReady
+            ? (isEn ? 'Parity verified: ready for DNS cutover' : 'Paridad verificada: listo para DNS cutover')
+            : (isEn ? 'Some endpoints need attention' : 'Algunos endpoints requieren atención'),
+          data.cutoverReady ? 'success' : 'error'
+        );
       } else {
-        onNotify('Usa los comandos curl --resolve de abajo para verificar directamente contra la IP destino.', 'info');
+        onNotify(
+          isEn ? 'Use the curl --resolve commands below to verify directly against the target IP.' : 'Usa los comandos curl --resolve de abajo para verificar directamente contra la IP destino.',
+          'info'
+        );
       }
     } catch {
-      onNotify('Usa los comandos curl --resolve de abajo para verificar antes de mover DNS.', 'info');
+      onNotify(
+        isEn ? 'Use the curl --resolve commands below before moving DNS.' : 'Usa los comandos curl --resolve de abajo para verificar antes de mover DNS.',
+        'info'
+      );
     } finally {
       setVerifyingParity(false);
     }
@@ -1081,7 +1403,10 @@ export const CoolifyImport: React.FC<{
 
   const copyText = (text: string, label: string) => {
     if (navigator.clipboard) {
-      navigator.clipboard.writeText(text).then(() => onNotify(`${label} copiado`, 'success')).catch(() => {});
+      navigator.clipboard
+        .writeText(text)
+        .then(() => onNotify(isEn ? `${label} copied` : `${label} copiado`, 'success'))
+        .catch(() => {});
     }
   };
 
@@ -1090,9 +1415,9 @@ export const CoolifyImport: React.FC<{
   // -------------------------------------------------------------------------
 
   const typeConfig = {
-    app: { icon: Server, label: 'Aplicación', pill: 'bg-indigo-50 text-indigo-700 border-indigo-200' },
-    database: { icon: Database, label: 'Base de datos', pill: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
-    service: { icon: Box, label: 'Servicio Compose', pill: 'bg-amber-50 text-amber-800 border-amber-200' },
+    app: { icon: Server, label: isEn ? 'Application' : 'Aplicación', pill: 'bg-indigo-50 text-indigo-700 border-indigo-200' },
+    database: { icon: Database, label: isEn ? 'Database' : 'Base de datos', pill: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+    service: { icon: Box, label: isEn ? 'Compose Service' : 'Servicio Compose', pill: 'bg-amber-50 text-amber-800 border-amber-200' },
   };
 
   const getVolCount = (r: CoolifyResource) => r.local_persistent_volumes?.length || r.persistent_volumes?.length || r.volumes?.length || 0;
@@ -1144,7 +1469,7 @@ export const CoolifyImport: React.FC<{
                 {resource.build_pack}
               </span>
             )}
-            {statusRunning && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" title="En ejecución en Coolify" />}
+            {statusRunning && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" title={isEn ? 'Running on Coolify' : 'En ejecución en Coolify'} />}
           </div>
           <div className="flex items-center gap-2 mt-0.5 flex-wrap text-[11px] text-slate-500">
             {resource.fqdn && <span className="font-mono truncate max-w-[260px] text-slate-700">{resource.fqdn}</span>}
@@ -1178,6 +1503,129 @@ export const CoolifyImport: React.FC<{
     );
   };
 
+  const renderStreamTransferPanel = () => (
+    <div className="space-y-3">
+      <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2.5">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+            <HardDrive className="w-4 h-4 text-emerald-600" />
+            <span>{isEn ? 'Zero-Shell Volume & SQL Live Transfer' : 'Transferencia en Vivo de Volúmenes y SQL (Zero-Shell)'}</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              disabled={loadingStreamPlan}
+              onClick={() => void handleFetchStreamPlan()}
+              className="px-2.5 py-1 rounded-lg bg-white hover:bg-slate-100 border border-slate-200 text-[11px] font-medium text-slate-700 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              {loadingStreamPlan && <Loader2 className="w-3 h-3 animate-spin" />}
+              <span>{isEn ? 'Refresh Stream Plan' : 'Generar plan live'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => copyText(formatStreamRunbookText(effectiveStreamPlan, isEn), isEn ? 'Transfer runbook' : 'Runbook de transferencia')}
+              className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <Copy className="w-3 h-3" />
+              <span>{isEn ? 'Copy Runbook' : 'Copiar Runbook'}</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <input
+            type="text"
+            value={streamSourceHost}
+            onChange={(e) => setStreamSourceHost(e.target.value)}
+            placeholder={isEn ? 'Coolify VPS IP/host (optional SSH)' : 'IP/host del VPS Coolify (SSH opcional)'}
+            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono"
+          />
+          <input
+            type="text"
+            value={streamSourceUser}
+            onChange={(e) => setStreamSourceUser(e.target.value)}
+            placeholder="root"
+            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono"
+          />
+          <input
+            type="text"
+            value={streamSourcePort}
+            onChange={(e) => setStreamSourcePort(e.target.value)}
+            placeholder="22"
+            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono"
+          />
+        </div>
+        <p className="text-[11px] text-slate-500">
+          {isEn
+            ? 'Every pipeline uses strict docker/ssh arg arrays (shell: false), 0 passwords in argv, and in-flight SHA-256 verification.'
+            : 'Cada pipeline usa arrays de argumentos puros docker/ssh (shell: false), 0 contraseñas en argv y verificación SHA-256 en vuelo.'}
+        </p>
+      </div>
+
+      {effectiveStreamPlan.databaseStreams.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-[11px] font-semibold text-slate-700 uppercase tracking-wide">
+            {isEn ? `Database Streams (${effectiveStreamPlan.databaseStreams.length})` : `Streams de Bases de Datos (${effectiveStreamPlan.databaseStreams.length})`}
+          </div>
+          {effectiveStreamPlan.databaseStreams.map((db) => (
+            <div key={db.id} className="border border-slate-200 rounded-xl p-3 bg-white space-y-1.5 text-[11px]">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span className="font-semibold text-slate-900">{db.name}</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-mono text-[10px]">
+                    {db.engine}
+                  </span>
+                  <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-mono text-[10px]">
+                    SHA-256
+                  </span>
+                </div>
+              </div>
+              <div className="text-[10px] text-slate-500">{db.authEnvNote}</div>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-2 font-mono text-[10px] text-slate-700 space-y-1 overflow-x-auto">
+                <div><span className="text-slate-400">DUMP: </span>{formatArgvDisplay(db.sshSourceDump || db.sourceDump)}</div>
+                <div><span className="text-slate-400">LOAD: </span>{formatArgvDisplay(db.targetRestore)}</div>
+                {db.verification.postRestoreCheck && (
+                  <div><span className="text-emerald-600">CHK:  </span>{formatArgvDisplay(db.verification.postRestoreCheck)}</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {effectiveStreamPlan.volumeStreams.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-[11px] font-semibold text-slate-700 uppercase tracking-wide">
+            {isEn ? `Named Docker Volumes (${effectiveStreamPlan.volumeStreams.length})` : `Volúmenes Docker (${effectiveStreamPlan.volumeStreams.length})`}
+          </div>
+          {effectiveStreamPlan.volumeStreams.map((vol) => (
+            <div key={vol.volumeName} className="border border-slate-200 rounded-xl p-3 bg-white space-y-1.5 text-[11px]">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span className="font-mono font-semibold text-slate-900">{vol.volumeName} → {vol.targetVolumeName}</span>
+                <span className="text-[10px] text-slate-500">{vol.ownerResource}</span>
+              </div>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-2 font-mono text-[10px] text-slate-700 space-y-1 overflow-x-auto">
+                <div><span className="text-slate-400">TAR:  </span>{formatArgvDisplay(vol.sshSourceArchive || vol.sourceArchive)}</div>
+                <div><span className="text-slate-400">LOAD: </span>{formatArgvDisplay(vol.targetExtract)}</div>
+                {vol.verification.targetHashCheck && (
+                  <div><span className="text-emerald-600">SHA:  </span>{formatArgvDisplay(vol.verification.targetHashCheck)}</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {effectiveStreamPlan.databaseStreams.length === 0 && effectiveStreamPlan.volumeStreams.length === 0 && (
+        <div className="text-center py-8 text-xs text-slate-500 border border-dashed border-slate-200 rounded-xl">
+          {isEn
+            ? 'No stateful databases or named Docker volumes detected in the selected resources.'
+            : 'No se detectaron bases de datos ni volúmenes Docker con nombre en los recursos seleccionados.'}
+        </div>
+      )}
+    </div>
+  );
+
   const cutoverItems: CutoverStep[] = (results?.dnsCutoverChecklist as CutoverStep[] | undefined) || activePlan.dnsCutoverChecklist;
   const rollbackInfo = results?.rollbackPlan || activePlan.rollbackPlan;
 
@@ -1191,31 +1639,37 @@ export const CoolifyImport: React.FC<{
               <Download className="w-4 h-4" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h2 className="font-semibold text-base text-slate-900">Cabina de Migración Coolify v4 → Culkibo</h2>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="font-semibold text-base text-slate-900">
+                  {isEn ? 'Coolify v4 → Culkibo Migration Cockpit' : 'Cabina de Migración Coolify v4 → Culkibo'}
+                </h2>
                 <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
                   Zero-Downtime
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-0.5">
-                Traduce Magic Vars a Vault AES-256-GCM, etiquetas Traefik a Caddy nativo, 8 motores de BD, Crons y bundles portátiles <code className="font-mono">.zip</code>.
+                {isEn ? (
+                  <>Translates Magic Vars to AES-256-GCM Vault, Traefik labels to native Caddy edge, 8 DB engines, Crons, live SQL/Volume streaming &amp; portable <code className="font-mono">.zip</code> bundles.</>
+                ) : (
+                  <>Traduce Magic Vars a Vault AES-256-GCM, etiquetas Traefik a Caddy nativo, 8 motores de BD, Crons, streaming SQL/Volúmenes y bundles portátiles <code className="font-mono">.zip</code>.</>
+                )}
               </p>
             </div>
           </div>
           {step >= 2 && (
             <div className={`px-3 py-1.5 rounded-lg border text-xs font-semibold inline-flex items-center gap-1.5 tabular-nums ${parityColor}`}>
               <ShieldCheck className="w-4 h-4" />
-              <span>{results?.parityScore ?? activePlan.parityScore}% Paridad</span>
+              <span>{results?.parityScore ?? activePlan.parityScore}% {isEn ? 'Parity' : 'Paridad'}</span>
             </div>
           )}
         </div>
 
         {/* 3-Step Stepper */}
-        <ol className="grid grid-cols-3 gap-2" aria-label="Pasos de migración">
+        <ol className="grid grid-cols-3 gap-2" aria-label={isEn ? 'Migration steps' : 'Pasos de migración'}>
           {[
-            { num: 1 as const, label: '1. Conectar origen', sub: 'API, JSON o .zip' },
-            { num: 2 as const, label: '2. Paridad y Pre-Flight', sub: 'Magic Vars & Traefik' },
-            { num: 3 as const, label: '3. Migrar y Cutover DNS', sub: 'Smoke & Rollback' },
+            { num: 1 as const, label: isEn ? '1. Connect Source' : '1. Conectar origen', sub: isEn ? 'API, JSON or .zip' : 'API, JSON o .zip' },
+            { num: 2 as const, label: isEn ? '2. Parity & Pre-Flight' : '2. Paridad y Pre-Flight', sub: 'Magic Vars & Traefik' },
+            { num: 3 as const, label: isEn ? '3. Migrate & Cutover' : '3. Migrar y Cutover DNS', sub: 'Stream, Smoke & Rollback' },
           ].map((s) => {
             const isCurrent = step === s.num;
             const isDone = step > s.num;
@@ -1247,12 +1701,11 @@ export const CoolifyImport: React.FC<{
         {/* ================================================================= */}
         {step === 1 && (
           <div className="space-y-4">
-            {/* Source Mode Switcher */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               {[
-                { id: 'api' as const, title: 'API Coolify v4', desc: 'Conexión directa solo-lectura', icon: LinkIcon },
-                { id: 'offline' as const, title: 'Exportación JSON', desc: 'Pega snapshot sin red pública', icon: FileJson },
-                { id: 'bundle' as const, title: 'Bundle Portátil .zip', desc: 'Stack Culkibo autocontenido', icon: FileArchive },
+                { id: 'api' as const, title: isEn ? 'Coolify v4 API' : 'API Coolify v4', desc: isEn ? 'Read-only live connection' : 'Conexión directa solo-lectura', icon: LinkIcon },
+                { id: 'offline' as const, title: isEn ? 'Offline JSON Export' : 'Exportación JSON', desc: isEn ? 'Paste snapshot without network' : 'Pega snapshot sin red pública', icon: FileJson },
+                { id: 'bundle' as const, title: isEn ? 'Portable .zip Bundle' : 'Bundle Portátil .zip', desc: isEn ? 'Self-contained Culkibo stack' : 'Stack Culkibo autocontenido', icon: FileArchive },
               ].map((m) => {
                 const Icon = m.icon;
                 const active = sourceMode === m.id;
@@ -1288,12 +1741,17 @@ export const CoolifyImport: React.FC<{
                 <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs text-slate-600 flex items-start gap-2.5">
                   <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                   <div>
-                    <span className="font-semibold text-slate-900">100% solo-lectura en origen:</span> Culkibo nunca modifica ni detiene tus contenedores en Coolify. Genera tu token en{' '}
+                    <span className="font-semibold text-slate-900">
+                      {isEn ? '100% read-only on source:' : '100% solo-lectura en origen:'}
+                    </span>{' '}
+                    {isEn ? 'Culkibo never modifies or stops your Coolify containers. Generate a token in' : 'Culkibo nunca modifica ni detiene tus contenedores en Coolify. Genera tu token en'}{' '}
                     <span className="font-mono text-[11px] bg-white px-1.5 py-0.5 rounded border border-slate-200">Keys &amp; Tokens → API Tokens (read:all)</span>.
                   </div>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">URL de tu instancia Coolify v4</label>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    {isEn ? 'Coolify v4 Instance URL' : 'URL de tu instancia Coolify v4'}
+                  </label>
                   <div className="relative">
                     <LinkIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                     <input
@@ -1301,13 +1759,15 @@ export const CoolifyImport: React.FC<{
                       required
                       value={apiUrl}
                       onChange={(e) => setApiUrl(e.target.value)}
-                      placeholder="https://coolify.tudominio.com"
+                      placeholder="https://coolify.yourdomain.com"
                       className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono focus:outline-none focus:border-slate-400"
                     />
                   </div>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Token de API (Bearer)</label>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    {isEn ? 'API Token (Bearer)' : 'Token de API (Bearer)'}
+                  </label>
                   <div className="relative">
                     <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                     <input
@@ -1322,7 +1782,7 @@ export const CoolifyImport: React.FC<{
                 </div>
                 <div className="flex justify-end gap-2 pt-2">
                   <button type="button" onClick={onCancel} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
-                    Cancelar
+                    {isEn ? 'Cancel' : 'Cancelar'}
                   </button>
                   <button
                     type="submit"
@@ -1330,7 +1790,9 @@ export const CoolifyImport: React.FC<{
                     className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                   >
                     {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                    {loading ? 'Analizando paridad…' : 'Conectar y analizar paridad'}
+                    {loading
+                      ? (isEn ? 'Analyzing parity…' : 'Analizando paridad…')
+                      : (isEn ? 'Connect & Analyze Parity' : 'Conectar y analizar paridad')}
                     {!loading && <ArrowRight className="w-3.5 h-3.5" />}
                   </button>
                 </div>
@@ -1340,18 +1802,19 @@ export const CoolifyImport: React.FC<{
             {sourceMode === 'offline' && (
               <div className="space-y-3">
                 <p className="text-xs text-slate-600">
-                  Pega una exportación JSON de Coolify v4 (<code className="font-mono text-[11px] bg-slate-100 px-1 rounded">{'{ "projects": [...], "apps": [...], "databases": [...], "services": [...] }'}</code>) para ejecutar el análisis de paridad, Magic Vars y Traefik→Caddy completamente offline.
+                  {isEn ? 'Paste a Coolify v4 JSON export' : 'Pega una exportación JSON de Coolify v4'} (<code className="font-mono text-[11px] bg-slate-100 px-1 rounded">{'{ "projects": [...], "apps": [...], "databases": [...], "services": [...] }'}</code>){' '}
+                  {isEn ? 'to run parity analysis, Magic Vars, Traefik→Caddy, and SQL/Volume streaming completely offline.' : 'para ejecutar el análisis de paridad, Magic Vars y Traefik→Caddy completamente offline.'}
                 </p>
                 <textarea
                   rows={8}
                   value={offlineJson}
                   onChange={(e) => setOfflineJson(e.target.value)}
-                  placeholder='{"projects":[{"uuid":"p1","name":"Prod"}],"apps":[{"uuid":"a1","name":"API","fqdn":"https://api.ejemplo.com","environment_variables":[{"key":"DB_PASS","value":"${SERVICE_PASSWORD_64_DB}"}]}]}'
+                  placeholder='{"projects":[{"uuid":"p1","name":"Prod"}],"apps":[{"uuid":"a1","name":"API","fqdn":"https://api.example.com","environment_variables":[{"key":"DB_PASS","value":"${SERVICE_PASSWORD_64_DB}"}]}]}'
                   className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:bg-white focus:border-slate-400"
                 />
                 <div className="flex justify-end gap-2">
                   <button type="button" onClick={onCancel} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
-                    Cancelar
+                    {isEn ? 'Cancel' : 'Cancelar'}
                   </button>
                   <button
                     type="button"
@@ -1359,7 +1822,7 @@ export const CoolifyImport: React.FC<{
                     onClick={handleParseOfflineJson}
                     className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                   >
-                    <span>Analizar exportación JSON</span>
+                    <span>{isEn ? 'Analyze JSON Export' : 'Analizar exportación JSON'}</span>
                     <ArrowRight className="w-3.5 h-3.5" />
                   </button>
                 </div>
@@ -1381,10 +1844,14 @@ export const CoolifyImport: React.FC<{
                   />
                   <Upload className="w-7 h-7 text-slate-400 mx-auto mb-2" />
                   <p className="text-xs font-semibold text-slate-800">
-                    Arrastra o selecciona un Culkibo Portable Stack Bundle (<code className="font-mono">.zip</code> / <code className="font-mono">.ckb.gz</code>)
+                    {isEn ? 'Drop or select a Culkibo Portable Stack Bundle' : 'Arrastra o selecciona un Culkibo Portable Stack Bundle'} (<code className="font-mono">.zip</code> / <code className="font-mono">.ckb.gz</code>)
                   </p>
                   <p className="text-[11px] text-slate-500 mt-1">
-                    Incluye <code className="font-mono">culkibo.yaml</code>, proyectos, políticas Caddy, BDs, crons, MCP y sobre Vault AES-256-GCM.
+                    {isEn ? (
+                      <>Includes <code className="font-mono">culkibo.yaml</code>, projects, Caddy edge policies, DBs, crons, MCP config, and AES-256-GCM Vault envelope.</>
+                    ) : (
+                      <>Incluye <code className="font-mono">culkibo.yaml</code>, proyectos, políticas Caddy, BDs, crons, MCP y sobre Vault AES-256-GCM.</>
+                    )}
                   </p>
                 </div>
 
@@ -1403,22 +1870,24 @@ export const CoolifyImport: React.FC<{
                           ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
                           : 'bg-slate-100 text-slate-700 border-slate-200'
                       }`}>
-                        {parsedBundle.manifest.vaultMode === 'encrypted' ? 'Vault cifrado AES-256-GCM' : 'Vault redactado (0 secretos)'}
+                        {parsedBundle.manifest.vaultMode === 'encrypted'
+                          ? (isEn ? 'AES-256-GCM Encrypted Vault' : 'Vault cifrado AES-256-GCM')
+                          : (isEn ? 'Redacted Vault (0 secrets)' : 'Vault redactado (0 secretos)')}
                       </span>
                     </div>
 
                     <div className="grid grid-cols-4 gap-2 text-center text-xs tabular-nums">
                       <div className="bg-white border border-slate-200 rounded-lg p-2">
                         <div className="font-semibold text-slate-900">{parsedBundle.projects.length}</div>
-                        <div className="text-[10px] text-slate-500">Proyectos</div>
+                        <div className="text-[10px] text-slate-500">{isEn ? 'Projects' : 'Proyectos'}</div>
                       </div>
                       <div className="bg-white border border-slate-200 rounded-lg p-2">
                         <div className="font-semibold text-slate-900">{parsedBundle.domains.length}</div>
-                        <div className="text-[10px] text-slate-500">Dominios</div>
+                        <div className="text-[10px] text-slate-500">{isEn ? 'Domains' : 'Dominios'}</div>
                       </div>
                       <div className="bg-white border border-slate-200 rounded-lg p-2">
                         <div className="font-semibold text-slate-900">{parsedBundle.databases.length}</div>
-                        <div className="text-[10px] text-slate-500">Bases datos</div>
+                        <div className="text-[10px] text-slate-500">{isEn ? 'Databases' : 'Bases datos'}</div>
                       </div>
                       <div className="bg-white border border-slate-200 rounded-lg p-2">
                         <div className="font-semibold text-slate-900">{parsedBundle.crons.length}</div>
@@ -1428,12 +1897,14 @@ export const CoolifyImport: React.FC<{
 
                     {parsedBundle.manifest.vaultMode === 'encrypted' && (
                       <div>
-                        <label className="block text-[11px] font-medium text-slate-700 mb-1">Contraseña del Vault portátil (passphrase)</label>
+                        <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                          {isEn ? 'Portable Vault passphrase' : 'Contraseña del Vault portátil (passphrase)'}
+                        </label>
                         <input
                           type="password"
                           value={bundlePassphrase}
                           onChange={(e) => setBundlePassphrase(e.target.value)}
-                          placeholder="Introduce tu passphrase para descifrar vault.enc.json"
+                          placeholder={isEn ? 'Enter passphrase to decrypt vault.enc.json' : 'Introduce tu passphrase para descifrar vault.enc.json'}
                           className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono"
                         />
                       </div>
@@ -1443,7 +1914,7 @@ export const CoolifyImport: React.FC<{
 
                 <div className="flex justify-end gap-2">
                   <button type="button" onClick={onCancel} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
-                    Cancelar
+                    {isEn ? 'Cancel' : 'Cancelar'}
                   </button>
                   <button
                     type="button"
@@ -1452,7 +1923,7 @@ export const CoolifyImport: React.FC<{
                     className="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                   >
                     {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                    <span>Restaurar Bundle en 1 clic</span>
+                    <span>{isEn ? 'Restore Bundle in 1 Click' : 'Restaurar Bundle en 1 clic'}</span>
                   </button>
                 </div>
               </div>
@@ -1465,23 +1936,22 @@ export const CoolifyImport: React.FC<{
         {/* ================================================================= */}
         {step === 2 && (
           <div className="space-y-4">
-            {/* KPI Parity Strip */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 tabular-nums">
               <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
                 <div className="text-[10px] text-slate-500 flex items-center gap-1"><Server className="w-3 h-3" /> Apps / Compose</div>
                 <div className="text-sm font-semibold text-slate-900 mt-0.5">{selectedApps.length}/{totalApps} · {selectedServices.length}/{totalSvcs}</div>
               </div>
               <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                <div className="text-[10px] text-slate-500 flex items-center gap-1"><Database className="w-3 h-3" /> Bases de datos</div>
+                <div className="text-[10px] text-slate-500 flex items-center gap-1"><Database className="w-3 h-3" /> {isEn ? 'Databases' : 'Bases de datos'}</div>
                 <div className="text-sm font-semibold text-slate-900 mt-0.5">{selectedDbs.length}/{totalDbs}</div>
               </div>
               <div className="p-2.5 rounded-xl bg-violet-50/70 border border-violet-200">
                 <div className="text-[10px] text-violet-700 flex items-center gap-1"><Sparkles className="w-3 h-3" /> Magic Vars</div>
-                <div className="text-sm font-semibold text-violet-950 mt-0.5">{activePlan.summary.magicVarsTranslated} traducidas</div>
+                <div className="text-sm font-semibold text-violet-950 mt-0.5">{activePlan.summary.magicVarsTranslated} {isEn ? 'mapped' : 'traducidas'}</div>
               </div>
               <div className="p-2.5 rounded-xl bg-sky-50/70 border border-sky-200">
                 <div className="text-[10px] text-sky-700 flex items-center gap-1"><Layers className="w-3 h-3" /> Traefik → Caddy</div>
-                <div className="text-sm font-semibold text-sky-950 mt-0.5">{activePlan.summary.traefikRulesTranslated} reglas</div>
+                <div className="text-sm font-semibold text-sky-950 mt-0.5">{activePlan.summary.traefikRulesTranslated} {isEn ? 'rules' : 'reglas'}</div>
               </div>
               <div className="p-2.5 rounded-xl bg-emerald-50/70 border border-emerald-200 col-span-2 sm:col-span-1">
                 <div className="text-[10px] text-emerald-700 flex items-center gap-1"><Clock className="w-3 h-3" /> Crons / Vols</div>
@@ -1493,9 +1963,10 @@ export const CoolifyImport: React.FC<{
             <div className="flex items-center justify-between gap-2 border-b border-slate-200 pb-2 flex-wrap">
               <div className="flex gap-1 flex-wrap" role="tablist">
                 {[
-                  { id: 'resources' as const, label: `Recursos (${allResources.length})` },
+                  { id: 'resources' as const, label: `${isEn ? 'Resources' : 'Recursos'} (${allResources.length})` },
                   { id: 'magic' as const, label: `Magic Vars (${activePlan.magicVariables.length})` },
                   { id: 'traefik' as const, label: `Traefik→Caddy (${activePlan.summary.traefikRulesTranslated})` },
+                  { id: 'stream' as const, label: `${isEn ? 'Volume & SQL Transfer' : 'Volúmenes y SQL'} (${effectiveStreamPlan.summary.totalSteps})` },
                   { id: 'preflight' as const, label: `Pre-Flight (${activePlan.warnings.length + activePlan.secretWarnings.length})` },
                 ].map((t) => (
                   <button
@@ -1517,11 +1988,11 @@ export const CoolifyImport: React.FC<{
               {previewTab === 'resources' && (
                 <div className="flex items-center gap-2 text-xs">
                   <button type="button" onClick={selectAll} className="text-slate-700 hover:text-slate-900 font-medium underline cursor-pointer">
-                    Todo
+                    {isEn ? 'All' : 'Todo'}
                   </button>
                   <span className="text-slate-300">·</span>
                   <button type="button" onClick={deselectAll} className="text-slate-500 hover:text-slate-800 font-medium cursor-pointer">
-                    Ninguno
+                    {isEn ? 'None' : 'Ninguno'}
                   </button>
                 </div>
               )}
@@ -1537,7 +2008,7 @@ export const CoolifyImport: React.FC<{
                       type="text"
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="Filtrar por nombre, dominio, motor de BD o repo…"
+                      placeholder={isEn ? 'Filter by name, domain, DB engine, or repo…' : 'Filtrar por nombre, dominio, motor de BD o repo…'}
                       className="w-full pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs focus:outline-none focus:bg-white"
                     />
                   </div>
@@ -1557,7 +2028,7 @@ export const CoolifyImport: React.FC<{
                         <div className="flex items-center gap-3 px-4 py-2.5 bg-slate-50 border-b border-slate-200 select-none">
                           <button
                             type="button"
-                            aria-label={allInGroupSelected ? `Quitar selección de ${group.project.name}` : `Seleccionar todo ${group.project.name}`}
+                            aria-label={allInGroupSelected ? `Deselect ${group.project.name}` : `Select all ${group.project.name}`}
                             onClick={() => toggleProject(group)}
                             className={`w-4 h-4 flex items-center justify-center rounded border transition-colors shrink-0 cursor-pointer ${
                               allInGroupSelected
@@ -1593,7 +2064,7 @@ export const CoolifyImport: React.FC<{
                   })}
                   {projectGroups.length === 0 && (
                     <div className="text-center py-8 text-slate-500 text-xs">
-                      No se encontraron recursos con ese filtro.
+                      {isEn ? 'No resources matched this filter.' : 'No se encontraron recursos con ese filtro.'}
                     </div>
                   )}
                 </div>
@@ -1606,7 +2077,11 @@ export const CoolifyImport: React.FC<{
                 <div className="flex items-center gap-2 text-xs text-slate-600 bg-violet-50/60 border border-violet-200 rounded-lg p-3">
                   <Lock className="w-4 h-4 text-violet-700 shrink-0" />
                   <span>
-                    Vista previa 100% redactada: todos los secretos mágicos (<code className="font-mono">SERVICE_PASSWORD_*</code>, <code className="font-mono">SERVICE_BASE64_*</code>) se traducen a referencias nativas <code className="font-mono">{'${vault.*}'}</code> cifradas con AES-256-GCM.
+                    {isEn ? (
+                      <>100% redacted preview: all magic secrets (<code className="font-mono">SERVICE_PASSWORD_*</code>, <code className="font-mono">SERVICE_BASE64_*</code>) map to native <code className="font-mono">{'${vault.*}'}</code> encrypted with AES-256-GCM.</>
+                    ) : (
+                      <>Vista previa 100% redactada: todos los secretos mágicos (<code className="font-mono">SERVICE_PASSWORD_*</code>, <code className="font-mono">SERVICE_BASE64_*</code>) se traducen a referencias nativas <code className="font-mono">{'${vault.*}'}</code> cifradas con AES-256-GCM.</>
+                    )}
                   </span>
                 </div>
                 {activePlan.magicVariables.length > 0 ? (
@@ -1614,10 +2089,10 @@ export const CoolifyImport: React.FC<{
                     <table className="w-full text-left text-xs">
                       <thead className="bg-slate-50 border-b border-slate-200 text-[10px] uppercase tracking-wide text-slate-500">
                         <tr>
-                          <th className="px-3 py-2">Recurso / Env</th>
+                          <th className="px-3 py-2">{isEn ? 'Resource / Env' : 'Recurso / Env'}</th>
                           <th className="px-3 py-2">Coolify v4</th>
-                          <th className="px-3 py-2">Culkibo Nativo</th>
-                          <th className="px-3 py-2">Tipo</th>
+                          <th className="px-3 py-2">{isEn ? 'Culkibo Native' : 'Culkibo Nativo'}</th>
+                          <th className="px-3 py-2">{isEn ? 'Kind' : 'Tipo'}</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
@@ -1637,7 +2112,7 @@ export const CoolifyImport: React.FC<{
                                     ? 'bg-sky-50 text-sky-700 border border-sky-200'
                                     : 'bg-slate-100 text-slate-700'
                               }`}>
-                                {mv.kind === 'magic_secret' ? 'Vault' : mv.kind === 'magic_domain' ? 'Dominio' : 'Runtime'}
+                                {mv.kind === 'magic_secret' ? 'Vault' : mv.kind === 'magic_domain' ? (isEn ? 'Domain' : 'Dominio') : 'Runtime'}
                               </span>
                             </td>
                           </tr>
@@ -1647,7 +2122,11 @@ export const CoolifyImport: React.FC<{
                   </div>
                 ) : (
                   <div className="text-center py-8 text-xs text-slate-500 border border-dashed border-slate-200 rounded-xl">
-                    No se detectaron variables mágicas <code className="font-mono">${'{SERVICE_*}'}</code> / <code className="font-mono">${'{COOLIFY_*}'}</code> en los recursos actuales.
+                    {isEn ? (
+                      <>No <code className="font-mono">${'{SERVICE_*}'}</code> / <code className="font-mono">${'{COOLIFY_*}'}</code> magic variables detected.</>
+                    ) : (
+                      <>No se detectaron variables mágicas <code className="font-mono">${'{SERVICE_*}'}</code> / <code className="font-mono">${'{COOLIFY_*}'}</code> en los recursos actuales.</>
+                    )}
                   </div>
                 )}
               </div>
@@ -1662,7 +2141,9 @@ export const CoolifyImport: React.FC<{
                       <div className="flex items-center justify-between gap-2 flex-wrap">
                         <div className="text-xs font-semibold text-slate-900">{tr.resourceName}</div>
                         <span className="text-[10px] px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200 font-medium tabular-nums">
-                          {tr.translatedRules.length} reglas traducidas de {tr.labelCount} etiquetas
+                          {isEn
+                            ? `${tr.translatedRules.length} rules translated from ${tr.labelCount} labels`
+                            : `${tr.translatedRules.length} reglas traducidas de ${tr.labelCount} etiquetas`}
                         </span>
                       </div>
                       <div className="space-y-1.5">
@@ -1677,7 +2158,9 @@ export const CoolifyImport: React.FC<{
                       </div>
                       {tr.unsupportedLabels.length > 0 && (
                         <div className="text-[11px] bg-amber-50 text-amber-900 border border-amber-200 rounded-lg p-2.5">
-                          <div className="font-semibold mb-1">Etiquetas Traefik avanzadas para revisión manual:</div>
+                          <div className="font-semibold mb-1">
+                            {isEn ? 'Advanced Traefik labels for manual review:' : 'Etiquetas Traefik avanzadas para revisión manual:'}
+                          </div>
                           <ul className="font-mono text-[10px] space-y-0.5 list-disc pl-4">
                             {tr.unsupportedLabels.map((u, i) => <li key={i}>{u}</li>)}
                           </ul>
@@ -1687,19 +2170,28 @@ export const CoolifyImport: React.FC<{
                   ))
                 ) : (
                   <div className="text-center py-8 text-xs text-slate-500 border border-dashed border-slate-200 rounded-xl">
-                    No se detectaron etiquetas <code className="font-mono">traefik.http.*</code> personalizadas; Culkibo configurará HTTPS automático y cabeceras de seguridad en Caddy.
+                    {isEn ? (
+                      <>No custom <code className="font-mono">traefik.http.*</code> labels detected; Culkibo will configure automatic HTTPS and security headers in Caddy.</>
+                    ) : (
+                      <>No se detectaron etiquetas <code className="font-mono">traefik.http.*</code> personalizadas; Culkibo configurará HTTPS automático y cabeceras de seguridad en Caddy.</>
+                    )}
                   </div>
                 )}
               </div>
             )}
 
-            {/* TAB 4: PRE-FLIGHT & WARNINGS */}
+            {/* TAB 4: VOLUME & SQL LIVE TRANSFER */}
+            {previewTab === 'stream' && (
+              <div className="max-h-[380px] overflow-y-auto pr-1">{renderStreamTransferPanel()}</div>
+            )}
+
+            {/* TAB 5: PRE-FLIGHT & WARNINGS */}
             {previewTab === 'preflight' && (
               <div className="space-y-3 max-h-[380px] overflow-y-auto pr-1">
                 {activePlan.databases.length > 0 && (
                   <div className="border border-slate-200 rounded-xl p-3.5 space-y-2">
                     <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
-                      <Database className="w-3.5 h-3.5 text-emerald-600" /> Paridad de Bases de Datos ({activePlan.databases.length})
+                      <Database className="w-3.5 h-3.5 text-emerald-600" /> {isEn ? 'Database Parity' : 'Paridad de Bases de Datos'} ({activePlan.databases.length})
                     </div>
                     <div className="space-y-1.5">
                       {activePlan.databases.map((db) => (
@@ -1738,7 +2230,7 @@ export const CoolifyImport: React.FC<{
                 {(activePlan.secretWarnings.length > 0 || activePlan.warnings.length > 0) ? (
                   <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 space-y-1.5 text-xs text-amber-900">
                     <div className="font-semibold flex items-center gap-1.5">
-                      <AlertTriangle className="w-4 h-4 text-amber-600" /> Recomendaciones de seguridad y paridad
+                      <AlertTriangle className="w-4 h-4 text-amber-600" /> {isEn ? 'Security & parity advisories' : 'Recomendaciones de seguridad y paridad'}
                     </div>
                     <ul className="list-disc pl-4 space-y-1 text-[11px]">
                       {[...activePlan.secretWarnings, ...activePlan.warnings].map((w, i) => <li key={i}>{w}</li>)}
@@ -1747,7 +2239,7 @@ export const CoolifyImport: React.FC<{
                 ) : (
                   <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3.5 text-xs text-emerald-900 flex items-center gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                    <span>Pre-flight limpio: 0 bloqueantes detectados. Listo para migrar en 1 clic.</span>
+                    <span>{isEn ? 'Clean pre-flight: 0 blockers detected. Ready for 1-click migration.' : 'Pre-flight limpio: 0 bloqueantes detectados. Listo para migrar en 1 clic.'}</span>
                   </div>
                 )}
               </div>
@@ -1756,7 +2248,7 @@ export const CoolifyImport: React.FC<{
             {/* Footer Actions */}
             <div className="flex items-center justify-between gap-2 pt-3 border-t border-slate-200 flex-wrap">
               <button type="button" onClick={() => setStep(1)} className="px-3.5 py-2 text-slate-600 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs cursor-pointer">
-                Atrás
+                {isEn ? 'Back' : 'Atrás'}
               </button>
               <div className="flex items-center gap-2 flex-wrap">
                 <button
@@ -1766,7 +2258,7 @@ export const CoolifyImport: React.FC<{
                   className="px-3.5 py-2 text-slate-700 font-medium border border-slate-200 bg-white hover:bg-slate-50 rounded-lg text-xs inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                 >
                   <FileArchive className="w-3.5 h-3.5 text-slate-500" />
-                  <span>Exportar Bundle .zip</span>
+                  <span>{isEn ? 'Export .zip Bundle' : 'Exportar Bundle .zip'}</span>
                 </button>
                 <button
                   type="button"
@@ -1776,8 +2268,10 @@ export const CoolifyImport: React.FC<{
                 >
                   {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                   {loading
-                    ? 'Migrando stack…'
-                    : `Migrar ${selected.size} ${selected.size === 1 ? 'recurso' : 'recursos'} (Zero-Downtime)`}
+                    ? (isEn ? 'Migrating stack…' : 'Migrando stack…')
+                    : (isEn
+                        ? `Migrate ${selected.size} ${selected.size === 1 ? 'resource' : 'resources'} (Zero-Downtime)`
+                        : `Migrar ${selected.size} ${selected.size === 1 ? 'recurso' : 'recursos'} (Zero-Downtime)`)}
                 </button>
               </div>
             </div>
@@ -1785,19 +2279,20 @@ export const CoolifyImport: React.FC<{
         )}
 
         {/* ================================================================= */}
-        {/* STEP 3: MIGRATION SUMMARY + DNS CUTOVER CHECKLIST + ROLLBACK      */}
+        {/* STEP 3: MIGRATION SUMMARY + LIVE TRANSFER + DNS CUTOVER + ROLLBACK*/}
         {/* ================================================================= */}
         {step === 3 && results && (
           <div className="space-y-5">
-            {/* Completion Hero */}
             <div className="bg-emerald-50/60 border border-emerald-200 rounded-xl p-4 flex items-start gap-3">
               <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0 mt-0.5" />
               <div className="flex-1 min-w-0">
-                <h3 className="text-sm font-semibold text-slate-900">Migración completada sin tocar tu Coolify original</h3>
+                <h3 className="text-sm font-semibold text-slate-900">
+                  {isEn ? 'Migration complete — your original Coolify server is untouched' : 'Migración completada sin tocar tu Coolify original'}
+                </h3>
                 <p className="text-xs text-slate-600 mt-1 tabular-nums">
-                  Importados <strong>{results.importedApps || 0}</strong> apps, <strong>{results.importedDbs || 0}</strong> BDs, <strong>{results.importedServices || 0}</strong> servicios
+                  {isEn ? 'Imported' : 'Importados'} <strong>{results.importedApps || 0}</strong> apps, <strong>{results.importedDbs || 0}</strong> {isEn ? 'DBs' : 'BDs'}, <strong>{results.importedServices || 0}</strong> {isEn ? 'services' : 'servicios'}
                   {results.importedCrons ? <> · <strong>{results.importedCrons}</strong> crons</> : null}
-                  {results.traefikRulesApplied ? <> · <strong>{results.traefikRulesApplied}</strong> reglas Traefik→Caddy</> : null}
+                  {results.traefikRulesApplied ? <> · <strong>{results.traefikRulesApplied}</strong> Traefik→Caddy</> : null}
                   {results.magicVarsTranslated ? <> · <strong>{results.magicVarsTranslated}</strong> Magic Vars</> : null}.
                 </p>
               </div>
@@ -1806,7 +2301,7 @@ export const CoolifyImport: React.FC<{
             {Array.isArray(results.errors) && results.errors.length > 0 && (
               <div className="bg-red-50 text-red-800 p-3.5 rounded-xl text-xs border border-red-200">
                 <div className="font-semibold mb-1 flex items-center gap-1.5">
-                  <AlertCircle className="w-4 h-4" /> Errores parciales durante la importación:
+                  <AlertCircle className="w-4 h-4" /> {isEn ? 'Partial import errors:' : 'Errores parciales durante la importación:'}
                 </div>
                 <ul className="list-disc pl-4 space-y-0.5">
                   {results.errors.map((e: string, i: number) => <li key={i}>{e}</li>)}
@@ -1814,14 +2309,17 @@ export const CoolifyImport: React.FC<{
               </div>
             )}
 
+            {/* Volume & SQL Live Transfer in Step 3 */}
+            {renderStreamTransferPanel()}
+
             {/* Zero-Downtime Cutover Checklist */}
             <div className="border border-slate-200 rounded-xl p-4 space-y-2.5">
               <div className="flex items-center justify-between gap-2">
                 <h4 className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
-                  <Activity className="w-4 h-4 text-slate-600" /> Checklist de Cutover DNS (Zero-Downtime)
+                  <Activity className="w-4 h-4 text-slate-600" /> {isEn ? 'Zero-Downtime DNS Cutover Checklist' : 'Checklist de Cutover DNS (Zero-Downtime)'}
                 </h4>
                 <span className="text-[11px] text-slate-500 tabular-nums">
-                  {checkedCutover.size}/{cutoverItems.length} completados
+                  {checkedCutover.size}/{cutoverItems.length} {isEn ? 'completed' : 'completados'}
                 </span>
               </div>
               <div className="space-y-1.5">
@@ -1864,7 +2362,7 @@ export const CoolifyImport: React.FC<{
               <div className="border border-slate-200 rounded-xl p-4 space-y-2.5 bg-slate-50/50">
                 <div className="flex items-center justify-between gap-2 flex-wrap">
                   <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
-                    <Terminal className="w-4 h-4 text-slate-600" /> Verificación Smoke Pre-DNS (prueba Culkibo antes de mover tráfico)
+                    <Terminal className="w-4 h-4 text-slate-600" /> {isEn ? 'Pre-DNS Smoke Check (test Culkibo before flipping traffic)' : 'Verificación Smoke Pre-DNS (prueba Culkibo antes de mover tráfico)'}
                   </div>
                   <button
                     type="button"
@@ -1873,20 +2371,20 @@ export const CoolifyImport: React.FC<{
                     className="px-2.5 py-1 text-[11px] font-medium rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                   >
                     {verifyingParity && <Loader2 className="w-3 h-3 animate-spin" />}
-                    <span>Verificar paridad en vivo</span>
+                    <span>{isEn ? 'Run Live Parity Check' : 'Verificar paridad en vivo'}</span>
                   </button>
                 </div>
                 <div className="space-y-1.5">
                   {activePlan.domains.slice(0, 6).map((d) => {
-                    const cmd = `curl -fsS -I --resolve ${d.hostname}:443:${serverIp || '<IP_CULKIBO>'} https://${d.hostname}${d.healthPath || '/'}`;
+                    const cmd = `curl -fsS -I --resolve ${d.hostname}:443:${serverIp || '<CULKIBO_IP>'} https://${d.hostname}${d.healthPath || '/'}`;
                     return (
                       <div key={d.hostname} className="flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5">
                         <code className="text-[11px] font-mono text-slate-700 truncate">{cmd}</code>
                         <button
                           type="button"
-                          onClick={() => copyText(cmd, 'Comando curl')}
+                          onClick={() => copyText(cmd, isEn ? 'curl command' : 'Comando curl')}
                           className="p-1 text-slate-400 hover:text-slate-700 cursor-pointer shrink-0"
-                          title="Copiar comando"
+                          title={isEn ? 'Copy command' : 'Copiar comando'}
                         >
                           <Copy className="w-3.5 h-3.5" />
                         </button>
@@ -1896,7 +2394,7 @@ export const CoolifyImport: React.FC<{
                 </div>
                 {verifyReport && (
                   <div className={`text-xs p-2.5 rounded-lg border ${verifyReport.cutoverReady ? 'bg-emerald-50 border-emerald-200 text-emerald-900' : 'bg-amber-50 border-amber-200 text-amber-900'}`}>
-                    {verifyReport.recommendation} ({verifyReport.parityPercent}% paridad)
+                    {verifyReport.recommendation} ({verifyReport.parityPercent}% {isEn ? 'parity' : 'paridad'})
                   </div>
                 )}
               </div>
@@ -1907,7 +2405,9 @@ export const CoolifyImport: React.FC<{
               <div className="border border-slate-200 rounded-xl p-4 space-y-3">
                 <div className="flex items-center gap-2">
                   <Globe className="w-4 h-4 text-slate-600" />
-                  <h4 className="font-semibold text-xs text-slate-900">Conmutación de dominios ({importedDomains.length})</h4>
+                  <h4 className="font-semibold text-xs text-slate-900">
+                    {isEn ? 'Domain Cutover' : 'Conmutación de dominios'} ({importedDomains.length})
+                  </h4>
                 </div>
 
                 <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
@@ -1915,7 +2415,7 @@ export const CoolifyImport: React.FC<{
                     type="text"
                     value={serverIp}
                     onChange={(e) => setServerIp(e.target.value)}
-                    placeholder="IP del servidor Culkibo (ej. 203.0.113.10)"
+                    placeholder={isEn ? 'Culkibo Server IP (e.g. 203.0.113.10)' : 'IP del servidor Culkibo (ej. 203.0.113.10)'}
                     className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono"
                   />
                   <label className="flex items-center gap-2 text-xs text-slate-700 bg-slate-50 border border-slate-200 px-3 py-2 rounded-lg cursor-pointer">
@@ -1926,13 +2426,15 @@ export const CoolifyImport: React.FC<{
                       className="rounded border-slate-300 accent-slate-900"
                     />
                     <Cloud className="w-3.5 h-3.5 text-slate-500" />
-                    <span>Auto-DNS Cloudflare</span>
+                    <span>{isEn ? 'Cloudflare Auto-DNS' : 'Auto-DNS Cloudflare'}</span>
                   </label>
                 </div>
 
                 {useCloudflare && !cfAvailable && (
                   <p className="text-[11px] text-amber-800">
-                    Cloudflare no está configurado todavía en Ajustes → Integraciones; configura tu API Token para actualización automática.
+                    {isEn
+                      ? 'Cloudflare is not configured yet under Settings → Integrations; add your API Token for automatic updates.'
+                      : 'Cloudflare no está configurado todavía en Ajustes → Integraciones; configura tu API Token para actualización automática.'}
                   </p>
                 )}
 
@@ -1950,7 +2452,11 @@ export const CoolifyImport: React.FC<{
                               ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                               : 'bg-amber-50 text-amber-800 border-amber-200'
                           }`}>
-                            {isPending ? 'Pendiente DNS' : isActive ? 'Certificado activo' : 'SSL pendiente'}
+                            {isPending
+                              ? (isEn ? 'DNS Pending' : 'Pendiente DNS')
+                              : isActive
+                                ? (isEn ? 'Active SSL' : 'Certificado activo')
+                                : (isEn ? 'SSL Pending' : 'SSL pendiente')}
                           </span>
                         </div>
                         <button
@@ -1963,9 +2469,9 @@ export const CoolifyImport: React.FC<{
                               setImportedDomains(
                                 domainsRes.domains.filter((d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify')
                               );
-                              onNotify(`Dominio ${domain.hostname} actualizado`, 'success');
+                              onNotify(isEn ? `Domain ${domain.hostname} updated` : `Dominio ${domain.hostname} actualizado`, 'success');
                             } catch (e: any) {
-                              onNotify(e?.message || 'Error al migrar dominio', 'error');
+                              onNotify(e?.message || (isEn ? 'Failed to migrate domain' : 'Error al migrar dominio'), 'error');
                             } finally {
                               setMigratingDomains((prev) => {
                                 const n = new Set(prev);
@@ -1977,7 +2483,7 @@ export const CoolifyImport: React.FC<{
                           disabled={isMigrating || !isPending}
                           className="px-3 py-1 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer shrink-0"
                         >
-                          {isMigrating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : isPending ? 'Migrar DNS' : 'Listo'}
+                          {isMigrating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : isPending ? (isEn ? 'Flip DNS' : 'Migrar DNS') : (isEn ? 'Ready' : 'Listo')}
                         </button>
                       </div>
                     );
@@ -1997,9 +2503,9 @@ export const CoolifyImport: React.FC<{
                         setImportedDomains(
                           domainsRes.domains.filter((d) => d.sslStatus === 'pending_migration' || d.migrationSource === 'coolify')
                         );
-                        onNotify('Conmutación DNS por lote completada', 'success');
+                        onNotify(isEn ? 'Batch DNS cutover complete' : 'Conmutación DNS por lote completada', 'success');
                       } catch (e: any) {
-                        onNotify(e?.message || 'Error al migrar los dominios', 'error');
+                        onNotify(e?.message || (isEn ? 'Failed to migrate domains' : 'Error al migrar los dominios'), 'error');
                       } finally {
                         setMigratingDomains(new Set());
                         setLoading(false);
@@ -2009,7 +2515,7 @@ export const CoolifyImport: React.FC<{
                     className="bg-slate-900 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                   >
                     {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                    <span>Migrar todos los dominios</span>
+                    <span>{isEn ? 'Flip All Domains' : 'Migrar todos los dominios'}</span>
                   </button>
                 </div>
               </div>
@@ -2024,7 +2530,9 @@ export const CoolifyImport: React.FC<{
               >
                 <span className="flex items-center gap-2">
                   <RotateCcw className="w-3.5 h-3.5 text-emerald-600" />
-                  Red de Seguridad y Plan de Rollback Instantáneo (~{rollbackInfo.estimatedRollbackSeconds || 30}s)
+                  {isEn
+                    ? `Instant Rollback Safety Net (~${rollbackInfo.estimatedRollbackSeconds || 30}s)`
+                    : `Red de Seguridad y Plan de Rollback Instantáneo (~${rollbackInfo.estimatedRollbackSeconds || 30}s)`}
                 </span>
                 {showRollback ? <ChevronDown className="w-4 h-4 text-slate-400" /> : <ChevronRight className="w-4 h-4 text-slate-400" />}
               </button>
@@ -2045,14 +2553,14 @@ export const CoolifyImport: React.FC<{
                 className="px-3.5 py-2 text-slate-700 font-medium border border-slate-200 hover:bg-slate-50 rounded-lg text-xs inline-flex items-center gap-1.5 cursor-pointer"
               >
                 <FileArchive className="w-3.5 h-3.5 text-slate-500" />
-                <span>Guardar copia Bundle .zip</span>
+                <span>{isEn ? 'Download .zip Bundle' : 'Guardar copia Bundle .zip'}</span>
               </button>
               <button
                 type="button"
                 onClick={onComplete}
                 className="px-5 py-2 bg-slate-900 text-white rounded-lg text-xs font-medium hover:bg-slate-800 cursor-pointer"
               >
-                Finalizar e ir a proyectos
+                {isEn ? 'Finish & Go to Projects' : 'Finalizar e ir a proyectos'}
               </button>
             </div>
           </div>

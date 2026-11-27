@@ -11,6 +11,8 @@ import {
   Copy,
   Database,
   Globe,
+  Link2,
+  Loader2,
   Maximize2,
   Network,
   Plus,
@@ -34,6 +36,7 @@ import {
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
+import { useTheme } from '../lib/theme';
 
 interface ObservabilityViewProps {
   onNotify: (msg: string, type?: 'success' | 'info' | 'error') => void;
@@ -390,12 +393,15 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
 
   // Topology state (Spatial Pan/Zoom SVG Canvas)
   const { t } = useI18n();
+  const { isDark } = useTheme();
   const [topology, setTopology] = useState<TopologyGraph | null>(null);
   const [topologyLoading, setTopologyLoading] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [topoZoom, setTopoZoom] = useState<number>(1);
   const [topoPan, setTopoPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
+  const [linkTargetProjectId, setLinkTargetProjectId] = useState<string>('');
+  const [linkingDb, setLinkingDb] = useState(false);
   const topoDragRef = useRef<{ startX: number; startY: number; originX: number; originY: number; moved: boolean } | null>(null);
 
   const loadSnapshot = useCallback(async (fresh = false) => {
@@ -894,38 +900,59 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
     [topology, selectedNodeId]
   );
 
+  const projectNodes = useMemo(
+    () => (topology ? topology.nodes.filter((n) => n.kind === 'project') : []),
+    [topology]
+  );
+
+  const handleLinkDbToProject = async (dbNode: TopologyNode, targetProjNodeId: string) => {
+    const projNode = projectNodes.find((p) => p.id === targetProjNodeId);
+    if (!projNode) return;
+    const dbEntityId = dbNode.entityId || dbNode.id.replace(/^(?:db|database|cache|service)[:_-]/, '');
+    const projEntityId = projNode.entityId || projNode.id.replace(/^project[:_-]/, '');
+    setLinkingDb(true);
+    try {
+      await api.linkProjectDatabase(projEntityId, dbEntityId);
+      onNotify(t('topo.linkDbDone', { db: dbNode.label, project: projNode.label }), 'success');
+      setLinkTargetProjectId('');
+      await loadTopology();
+    } catch (e: unknown) {
+      onNotify(e instanceof Error ? e.message : 'Failed to link database to project', 'error');
+    } finally {
+      setLinkingDb(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Cabecera */}
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Métricas, Alertas y Topología</h1>
-          <p className="text-sm text-slate-500 mt-1">
-            Historial persistente 24h/7d, reglas proactivas con amortiguación, mapa de dependencias y Doctor 1-clic.
-          </p>
+          <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('obs.title')}</h1>
+          <p className="text-sm text-slate-500 mt-1">{t('obs.subtitle')}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="inline-flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200 text-xs">
             {([
-              { id: 'overview', label: 'Métricas y Doctor', icon: Activity },
-              { id: 'alerts', label: 'Alertas', icon: Bell, badge: activeAlerts.length },
-              { id: 'topology', label: 'Topología', icon: Network },
-            ] as const).map((t) => {
-              const Icon = t.icon;
+              { id: 'overview', label: t('obs.tabOverview'), icon: Activity },
+              { id: 'alerts', label: t('obs.tabAlerts'), icon: Bell, badge: activeAlerts.length },
+              { id: 'topology', label: t('obs.tabTopology'), icon: Network },
+            ] as const).map((tabItem) => {
+              const Icon = tabItem.icon;
               return (
                 <button
-                  key={t.id}
+                  key={tabItem.id}
                   type="button"
-                  onClick={() => setActiveTab(t.id)}
+                  onClick={() => setActiveTab(tabItem.id)}
                   className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                    activeTab === t.id ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                    activeTab === tabItem.id ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
-                  <span>{t.label}</span>
-                  {'badge' in t && t.badge > 0 && (
+                  <span>{tabItem.label}</span>
+                  {'badge' in tabItem && tabItem.badge > 0 && (
                     <span className="px-1.5 py-0.2 rounded-full bg-red-600 text-white text-[10px] font-semibold tabular-nums">
-                      {t.badge}
+                      {tabItem.badge}
                     </span>
                   )}
                 </button>
@@ -941,7 +968,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="inline-flex items-center gap-1 bg-white p-1 rounded-lg border border-slate-200 text-xs">
               {([
-                { id: 'live', label: '5m vivo' },
+                { id: 'live', label: t('obs.rangeLive') },
                 { id: '1h', label: '1h' },
                 { id: '24h', label: '24h' },
                 { id: '7d', label: '7d' },
@@ -970,7 +997,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                 }`}
               >
                 <span className={`w-1.5 h-1.5 rounded-full ${autoRefresh ? 'bg-emerald-400' : 'bg-slate-300'}`} />
-                {autoRefresh ? 'Auto 5 s' : 'Pausado'}
+                {autoRefresh ? t('obs.auto5s') : t('obs.paused')}
               </button>
               <button
                 type="button"
@@ -978,7 +1005,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                 className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer flex items-center gap-1.5"
               >
                 {copiedProm ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                {copiedProm ? 'Copiado' : 'Copiar Prometheus'}
+                {copiedProm ? t('obs.copied') : t('obs.copyProm')}
               </button>
               <button
                 type="button"
@@ -991,7 +1018,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                 className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-                Actualizar
+                {t('obs.refresh')}
               </button>
             </div>
           </div>
@@ -1004,7 +1031,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                 onClick={() => void loadSnapshot(true)}
                 className="text-xs font-medium underline hover:no-underline cursor-pointer"
               >
-                Reintentar
+                {t('obs.retry')}
               </button>
             </div>
           )}
@@ -1012,11 +1039,11 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
           {/* Fila 1: Recursos del host + tasa de error (persistidos 24h/7d) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <SparklineCard
-              title="CPU del servidor"
+              title={t('obs.kpiCpu')}
               value={loading ? '—' : String(procAny?.hostCpuPercent ?? history[history.length - 1]?.hostCpuPct ?? 0)}
               unit="%"
               detailLine={`${snapshot?.process?.hostCpus ?? 1} vCPU · Load ${snapshot?.process?.loadAvg?.[0] ?? 0}`}
-              footerLine={`Proceso daemon: ${snapshot?.process?.cpuPercent ?? 0}% CPU`}
+              footerLine={`Daemon: ${snapshot?.process?.cpuPercent ?? 0}% CPU`}
               points={history.map((h) => h.hostCpuPct ?? h.cpuPercent ?? 0)}
               timestamps={timestamps}
               markers={deployMarkers}
@@ -1024,18 +1051,18 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
               maxScale={100}
             />
             <SparklineCard
-              title="RAM real del host"
+              title={t('obs.kpiRam')}
               value={loading ? '—' : String(procAny?.hostMemoryUsedPct ?? history[history.length - 1]?.hostRamPct ?? 0)}
               unit="%"
               detailLine={
                 snapshot?.process
-                  ? `Usada ${snapshot.process.hostMemoryUsedMb} / ${snapshot.process.hostMemoryTotalMb} MB`
-                  : 'Midiendo MemAvailable'
+                  ? `${snapshot.process.hostMemoryUsedMb} / ${snapshot.process.hostMemoryTotalMb} MB`
+                  : 'MemAvailable'
               }
               footerLine={
                 snapshot?.process
-                  ? `Disponible: ${procAny?.hostMemoryAvailableMb ?? snapshot.process.hostMemoryFreeMb ?? 0} MB (${procAny?.hostMemorySource === 'proc_meminfo' ? 'MemAvailable' : 'SO'})`
-                  : 'Sin lectura'
+                  ? `Free: ${procAny?.hostMemoryAvailableMb ?? snapshot.process.hostMemoryFreeMb ?? 0} MB (${procAny?.hostMemorySource === 'proc_meminfo' ? 'MemAvailable' : 'OS'})`
+                  : '—'
               }
               points={history.map((h) => h.hostRamPct ?? 0)}
               timestamps={timestamps}
@@ -1044,26 +1071,26 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
               maxScale={100}
             />
             <SparklineCard
-              title="Disco del servidor"
+              title={t('obs.kpiDisk')}
               value={loading ? '—' : (procAny?.diskUsedPct != null ? String(procAny.diskUsedPct) : '—')}
               unit={procAny?.diskUsedPct != null ? '%' : undefined}
               detailLine={
                 procAny?.diskFreeGb != null
-                  ? `Libre: ${procAny.diskFreeGb} GB de ${procAny.diskTotalGb ?? '—'} GB`
-                  : 'Volumen de datos local'
+                  ? `Free: ${procAny.diskFreeGb} GB / ${procAny.diskTotalGb ?? '—'} GB`
+                  : 'Local data volume'
               }
-              footerLine="Alerta automática si > 85% usado"
+              footerLine="Auto-alert > 85%"
               points={history.map((h) => h.diskUsedPct ?? procAny?.diskUsedPct ?? 0)}
               timestamps={timestamps}
               accent={(procAny?.diskUsedPct ?? 0) > 85 ? 'amber' : 'ink'}
               maxScale={100}
             />
             <SparklineCard
-              title="Tasa de errores HTTP"
+              title={t('obs.kpiErrRate')}
               value={loading ? '—' : String(httpAny?.errorRatePct ?? 0)}
               unit="%"
               detailLine={`4xx: ${snapshot?.http?.status?.['4xx'] ?? 0} · 5xx: ${snapshot?.http?.status?.['5xx'] ?? 0}`}
-              footerLine={`5xx: ${httpAny?.error5xxRatePct ?? 0}% sobre ${snapshot?.http?.requestsTotal ?? 0} req`}
+              footerLine={`5xx: ${httpAny?.error5xxRatePct ?? 0}% / ${snapshot?.http?.requestsTotal ?? 0} req`}
               points={history.map((h) => h.errorRatePct ?? 0)}
               timestamps={timestamps}
               markers={deployMarkers}
@@ -1074,49 +1101,49 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
           {/* Fila 2: Plano de control (latencia, tráfico, RSS daemon, event loop) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <SparklineCard
-              title="Latencia HTTP (p95)"
+              title={t('obs.kpiLatency')}
               value={loading ? '—' : (snapshot?.http?.latencyMs?.p95 != null ? (snapshot.http.latencyMs.p95 < 10 ? snapshot.http.latencyMs.p95.toFixed(2) : snapshot.http.latencyMs.p95.toFixed(1)) : '0.00')}
               unit="ms"
               detailLine={`p50 ${formatMs(snapshot?.http?.latencyMs?.p50)} · p99 ${formatMs(snapshot?.http?.latencyMs?.p99)}`}
-              footerLine={`En curso: ${snapshot?.http?.inFlight ?? 0} · 2xx: ${snapshot?.http?.status?.['2xx'] ?? 0}`}
+              footerLine={`In-flight: ${snapshot?.http?.inFlight ?? 0} · 2xx: ${snapshot?.http?.status?.['2xx'] ?? 0}`}
               points={history.map((h) => h.p95Ms)}
               timestamps={timestamps}
               markers={deployMarkers}
               accent="amber"
             />
             <SparklineCard
-              title="Tráfico del panel"
+              title={t('obs.kpiTraffic')}
               value={loading ? '—' : (snapshot?.http?.rps?.rps10s ?? 0).toFixed(1)}
               unit="req/s"
-              detailLine={`${snapshot?.http?.requestsTotal ?? 0} peticiones totales registradas`}
-              footerLine={`1 s: ${(snapshot?.http?.rps?.rps1s ?? 0).toFixed(1)} · 60 s: ${(snapshot?.http?.rps?.rps60s ?? 0).toFixed(2)} req/s`}
+              detailLine={`${snapshot?.http?.requestsTotal ?? 0} total requests`}
+              footerLine={`1s: ${(snapshot?.http?.rps?.rps1s ?? 0).toFixed(1)} · 60s: ${(snapshot?.http?.rps?.rps60s ?? 0).toFixed(2)} req/s`}
               points={history.map((h) => h.rps)}
               timestamps={timestamps}
               markers={deployMarkers}
             />
             <SparklineCard
-              title="Memoria RSS del proceso"
+              title={t('obs.kpiRss')}
               value={loading ? '—' : String(snapshot?.process?.memoryMb ?? 0)}
               unit="MB"
-              detailLine={`Heap ${snapshot?.process?.heapUsedMb ?? 0} MB · Activo ${formatUptime(snapshot?.process?.uptimeSeconds ?? snapshot?.uptimeSeconds ?? 0)}`}
-              footerLine="Objetivo plano de control ≤ 60 MB en reposo"
+              detailLine={`Heap ${snapshot?.process?.heapUsedMb ?? 0} MB · Up ${formatUptime(snapshot?.process?.uptimeSeconds ?? snapshot?.uptimeSeconds ?? 0)}`}
+              footerLine="Target idle RSS ≤ 60 MB"
               points={history.map((h) => h.rssMb)}
               timestamps={timestamps}
               markers={deployMarkers}
             />
             <SparklineCard
-              title="Bucle de eventos (p95)"
+              title={t('obs.kpiEventLoop')}
               value={loading ? '—' : (snapshot?.eventLoop?.p95Ms != null ? snapshot.eventLoop.p95Ms.toFixed(1) : '0.0')}
               unit="ms"
               detailLine={
                 snapshot
-                  ? `${snapshot.bootMs != null ? `Arranque ${snapshot.bootMs} ms · ` : ''}${snapshot.process?.nodeVersion || 'Node.js'}`
-                  : 'Midiendo arranque'
+                  ? `${snapshot.bootMs != null ? `Boot ${snapshot.bootMs} ms · ` : ''}${snapshot.process?.nodeVersion || 'Node.js'}`
+                  : 'Measuring boot'
               }
               footerLine={
                 snapshot?.eventLoop?.utilizationRatio != null
-                  ? `Uso del bucle: ${(snapshot.eventLoop.utilizationRatio * 100).toFixed(1)}%`
-                  : 'Midiendo utilización'
+                  ? `Loop utilization: ${(snapshot.eventLoop.utilizationRatio * 100).toFixed(1)}%`
+                  : 'Measuring'
               }
               points={history.map((h) => h.elLagMs)}
               timestamps={timestamps}
@@ -1130,10 +1157,8 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
               <div className="flex items-center gap-2.5">
                 <Activity className="w-4 h-4 text-slate-700" />
                 <div>
-                  <h2 className="text-sm font-semibold text-slate-900">Diagnóstico del sistema</h2>
-                  <p className="text-xs text-slate-500">
-                    Comprueba entorno Node.js, Docker, Caddy, disco, MemAvailable, seguridad, TLS, copias y alertas.
-                  </p>
+                  <h2 className="text-sm font-semibold text-slate-900">{t('obs.doctorTitle')}</h2>
+                  <p className="text-xs text-slate-500">{t('obs.doctorDesc')}</p>
                 </div>
               </div>
               <div className="flex items-center gap-2.5">
@@ -1150,7 +1175,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                     {doctor.overall === 'ok' && <CheckCircle2 className="w-3.5 h-3.5" />}
                     {doctor.overall === 'warn' && <AlertTriangle className="w-3.5 h-3.5" />}
                     {doctor.overall === 'fail' && <ShieldAlert className="w-3.5 h-3.5" />}
-                    {doctor.summary.ok}/{doctor.checks.length} correctas · {doctor.durationMs} ms
+                    {doctor.summary.ok}/{doctor.checks.length} OK · {doctor.durationMs} ms
                   </span>
                 )}
                 <button
@@ -1241,8 +1266,8 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
 
             <section className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
               <div>
-                <h2 className="text-sm font-semibold text-slate-900">Plano de datos y tiempo real</h2>
-                <p className="text-xs text-slate-500 mt-0.5">WebSocket, Live Sync y conmutación atómica Caddy.</p>
+                <h2 className="text-sm font-semibold text-slate-900">{t('obs.dataPlaneTitle')}</h2>
+                <p className="text-xs text-slate-500 mt-0.5">{t('obs.dataPlaneDesc')}</p>
               </div>
               <dl className="space-y-2.5 text-xs">
                 <div className="flex items-center justify-between py-1.5 border-b border-slate-100">
@@ -1312,10 +1337,8 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
           <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
             <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
-                <h2 className="text-sm font-semibold text-slate-900">Reglas de alerta proactivas</h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Umbrales con amortiguación anti-picos, enfriamiento y notificación automática de recuperación por Telegram/Discord/Slack/Webhook.
-                </p>
+                <h2 className="text-sm font-semibold text-slate-900">{t('obs.alertsTitle')}</h2>
+                <p className="text-xs text-slate-500 mt-0.5">{t('obs.alertsDesc')}</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -1325,7 +1348,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                   className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 cursor-pointer flex items-center gap-1.5"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${alertBusy === 'eval' ? 'animate-spin' : ''}`} />
-                  Evaluar
+                  {t('obs.alertsEval')}
                 </button>
                 <button
                   type="button"
@@ -1333,7 +1356,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                   className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 cursor-pointer flex items-center gap-1.5"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  Nueva regla
+                  {t('obs.alertsNew')}
                 </button>
               </div>
             </div>
@@ -1534,7 +1557,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
               <div className="flex items-center gap-1.5 flex-wrap text-xs">
                 {topology && (
                   <span className="px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200 text-slate-700 font-mono tabular-nums">
-                    {topology.summary.totalNodes} nodes · {topology.summary.totalEdges} edges
+                    {topology.summary.totalNodes} {t('topo.nodes')} · {topology.summary.totalEdges} {t('topo.edges')}
                   </span>
                 )}
                 <div className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5">
@@ -1845,8 +1868,19 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                     </g>
                   </svg>
 
-                  {/* Bottom-left subtle canvas hint */}
-                  <div className="pointer-events-none absolute bottom-3 left-3 px-2.5 py-1 rounded-lg bg-white/85 border border-slate-200/80 text-[10px] text-slate-500 backdrop-blur-xs">
+                  {/* Bottom-left subtle canvas hint (high-contrast Obsidian Dark + Light safe) */}
+                  <div
+                    className={`pointer-events-none absolute bottom-3 left-3 px-2.5 py-1 rounded-lg border text-[10px] font-medium backdrop-blur-xs ${
+                      isDark
+                        ? 'bg-zinc-900/90 text-zinc-200 border-zinc-700'
+                        : 'bg-white/90 text-slate-600 border-slate-200'
+                    }`}
+                    style={
+                      isDark
+                        ? { backgroundColor: 'rgba(24, 24, 27, 0.92)', color: '#e4e4e7', borderColor: '#3f3f46' }
+                        : undefined
+                    }
+                  >
                     {t('topo.dragHint')}
                   </div>
                 </div>
@@ -1859,10 +1893,13 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                       {selectedNode && (
                         <button
                           type="button"
-                          onClick={() => setSelectedNodeId(null)}
+                          onClick={() => {
+                            setSelectedNodeId(null);
+                            setLinkTargetProjectId('');
+                          }}
                           className="text-[11px] text-slate-400 hover:text-slate-700 cursor-pointer"
                         >
-                          Clear
+                          {t('topo.clear')}
                         </button>
                       )}
                     </div>
@@ -1893,6 +1930,48 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                         {selectedNode.sublabel && (
                           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 font-mono text-[11px] text-slate-600">
                             {selectedNode.sublabel}
+                          </div>
+                        )}
+
+                        {/* Click-to-Link DB -> Project Env Injection */}
+                        {(selectedNode.kind === 'database' || selectedNode.kind === 'cache') && (
+                          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+                            <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-900">
+                              <Link2 className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                              <span>{t('topo.linkDbTitle')}</span>
+                            </div>
+                            <p className="text-[11px] text-slate-500 leading-snug">{t('topo.linkDbDesc')}</p>
+                            {projectNodes.length === 0 ? (
+                              <p className="text-[11px] text-slate-400 italic">{t('topo.linkDbNoProjects')}</p>
+                            ) : (
+                              <div className="space-y-2">
+                                <select
+                                  value={linkTargetProjectId}
+                                  onChange={(e) => setLinkTargetProjectId(e.target.value)}
+                                  className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-900"
+                                >
+                                  <option value="">{t('topo.linkDbSelect')}</option>
+                                  {projectNodes.map((proj) => (
+                                    <option key={proj.id} value={proj.id}>
+                                      {proj.label}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  disabled={!linkTargetProjectId || linkingDb}
+                                  onClick={() => void handleLinkDbToProject(selectedNode, linkTargetProjectId)}
+                                  className="culkibo-press w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-medium cursor-pointer disabled:opacity-50"
+                                >
+                                  {linkingDb ? (
+                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                  ) : (
+                                    <Link2 className="w-3 h-3" />
+                                  )}
+                                  <span>{linkingDb ? t('topo.linkDbLinking') : t('topo.linkDbBtn')}</span>
+                                </button>
+                              </div>
+                            )}
                           </div>
                         )}
 
@@ -1962,15 +2041,15 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                             <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.projects}</span>
                           </div>
                           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                            <span className="text-[10px] text-slate-400 block">Databases</span>
+                            <span className="text-[10px] text-slate-400 block">{t('topo.legendDb')}</span>
                             <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.databases}</span>
                           </div>
                           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                            <span className="text-[10px] text-slate-400 block">Domains</span>
+                            <span className="text-[10px] text-slate-400 block">{t('topo.legendDomain')}</span>
                             <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.domains}</span>
                           </div>
                           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                            <span className="text-[10px] text-slate-400 block">Servers</span>
+                            <span className="text-[10px] text-slate-400 block">{t('topo.legendServer')}</span>
                             <span className="font-mono text-sm font-semibold text-slate-900">{topology.summary.servers}</span>
                           </div>
                         </div>
@@ -1980,10 +2059,10 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
 
                   {/* Color Legend */}
                   <div className="pt-3 border-t border-slate-100 flex flex-wrap gap-x-3 gap-y-1.5 text-[10px] text-slate-500">
-                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500" />Domain</span>
-                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-500" />Project</span>
-                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-indigo-500" />Database</span>
-                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-500" />Server</span>
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500" />{t('topo.legendDomain')}</span>
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-500" />{t('topo.legendProject')}</span>
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-indigo-500" />{t('topo.legendDb')}</span>
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-500" />{t('topo.legendServer')}</span>
                   </div>
                 </aside>
               </div>

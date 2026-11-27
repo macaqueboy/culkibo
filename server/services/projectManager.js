@@ -57,14 +57,20 @@ function checkDiskHeadroom(targetDir, minFreeBytes = DEFAULT_MIN_DISK_FREE_BYTES
 
 class ProjectManager extends EventEmitter {
   /**
-   * @param {{ dataPath?: string | null, dataDir?: string | null, seedDemo?: boolean }} [opts]
+   * @param {{ dataPath?: string | null, dataDir?: string | null, seedDemo?: boolean, seedDefaults?: boolean }} [opts]
    */
   constructor(opts = {}) {
     super();
     this._explicitDataPath = opts.dataPath
       ? path.resolve(opts.dataPath)
       : (opts.dataDir ? path.join(path.resolve(opts.dataDir), 'projects.json') : null);
-    this._seedDemo = opts.seedDemo !== undefined ? Boolean(opts.seedDemo) : true;
+    const explicitSeed = opts.seedDemo !== undefined
+      ? opts.seedDemo
+      : (opts.seedDefaults !== undefined ? opts.seedDefaults : undefined);
+    const defaultSeed = process.env.CULKIBO_SEED_DEFAULTS === '0'
+      ? false
+      : !Boolean(process.env.CULKIBO_DATA_DIR);
+    this._seedDemo = explicitSeed !== undefined ? Boolean(explicitSeed) : defaultSeed;
     this.dataPath = this._explicitDataPath || resolveDefaultDataPath();
     this.projects = new Map();
     this.savingPromise = null;

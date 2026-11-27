@@ -337,7 +337,10 @@ class DomainManager {
     this.domainsFile = opts.domainsFile
       || (opts.dataDir ? path.join(path.resolve(opts.dataDir), 'domains.json') : null)
       || resolveDefaultDomainsFile();
-    this._seedDefaults = opts.seedDefaults !== undefined ? Boolean(opts.seedDefaults) : true;
+    const defaultSeed = process.env.CULKIBO_SEED_DEFAULTS === '0'
+      ? false
+      : !Boolean(process.env.CULKIBO_DATA_DIR);
+    this._seedDefaults = opts.seedDefaults !== undefined ? Boolean(opts.seedDefaults) : defaultSeed;
     this._customSslManager = opts.sslManager || null;
     this._customCloudflareService = opts.cloudflareService || null;
     this.ensureDirectory();

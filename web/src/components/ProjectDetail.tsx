@@ -36,8 +36,12 @@ import {
   KeyRound,
   Loader2,
   X,
+  Layers,
+  FileCode2,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
-import { api, type Project } from '../lib/api';
+import { api, type Project, type SmartPackPlanResult } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -134,6 +138,13 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [envSavedPendingRestart, setEnvSavedPendingRestart] = useState(false);
   const [fastRestarting, setFastRestarting] = useState(false);
   const [lastFastRestart, setLastFastRestart] = useState<{ durationMs: number | null } | null>(null);
+  const [smartPackOpen, setSmartPackOpen] = useState(false);
+  const [smartPackPlan, setSmartPackPlan] = useState<SmartPackPlanResult | null>(null);
+  const [smartPackLoading, setSmartPackLoading] = useState(false);
+  const [smartPackError, setSmartPackError] = useState<string | null>(null);
+  const [smartPackShowIgnore, setSmartPackShowIgnore] = useState(false);
+  const [smartPackShowDockerfile, setSmartPackShowDockerfile] = useState(false);
+  const [smartPackCopied, setSmartPackCopied] = useState<'ignore' | 'dockerfile' | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTabState] = useState<ProjectTabId>(() => normalizeProjectTab(initialTab));
@@ -542,32 +553,53 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     return JSON.stringify(currentObj) !== JSON.stringify(project.envVars || {});
   })();
 
+  const handleLoadSmartPack = async () => {
+    setSmartPackLoading(true);
+    setSmartPackError(null);
+    try {
+      const plan = await api.getSmartPackPlan({ projectId: project.id });
+      setSmartPackPlan(plan);
+    } catch (e: unknown) {
+      setSmartPackError(e instanceof Error ? e.message : 'SmartPack plan unavailable');
+    } finally {
+      setSmartPackLoading(false);
+    }
+  };
+
+  const handleToggleSmartPack = () => {
+    const next = !smartPackOpen;
+    setSmartPackOpen(next);
+    if (next && !smartPackPlan && !smartPackLoading) {
+      void handleLoadSmartPack();
+    }
+  };
+
   const tabGroups: Array<{
     group: string;
     items: Array<{ id: ProjectTabId; label: string; icon: React.ComponentType<{ className?: string }>; count?: number }>;
   }> = [
     {
-      group: 'Operación',
+      group: 'ops',
       items: [
-        { id: 'general', label: 'General', icon: LayoutGrid },
-        { id: 'deployments', label: 'Despliegues', icon: Rocket },
-        { id: 'live', label: 'En vivo', icon: Zap },
-        { id: 'logs', label: 'Registros', icon: ScrollText },
+        { id: 'general', label: t('pd.tabGeneral'), icon: LayoutGrid },
+        { id: 'deployments', label: t('pd.tabDeployments'), icon: Rocket },
+        { id: 'live', label: t('pd.tabLive'), icon: Zap },
+        { id: 'logs', label: t('pd.tabLogs'), icon: ScrollText },
       ],
     },
     {
-      group: 'Infraestructura',
+      group: 'infra',
       items: [
-        { id: 'domains', label: 'Dominios', icon: Globe, count: domainCount },
-        { id: 'databases', label: 'Bases de datos', icon: Database, count: dbCount },
-        { id: 'storage', label: 'Almacenamiento', icon: Box },
+        { id: 'domains', label: t('pd.tabDomains'), icon: Globe, count: domainCount },
+        { id: 'databases', label: t('pd.tabDatabases'), icon: Database, count: dbCount },
+        { id: 'storage', label: t('pd.tabStorage'), icon: Box },
       ],
     },
     {
-      group: 'Ajustes',
+      group: 'settings',
       items: [
-        { id: 'vars', label: 'Variables', icon: Variable, count: envCount },
-        { id: 'config', label: 'Configuración', icon: Settings },
+        { id: 'vars', label: t('pd.tabVars'), icon: Variable, count: envCount },
+        { id: 'config', label: t('pd.tabConfig'), icon: Settings },
       ],
     },
   ];
@@ -694,9 +726,22 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               disabled={loading}
               className="inline-flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
             >
-              <Play className="w-3.5 h-3.5" /> Iniciar local
+              <Play className="w-3.5 h-3.5" /> {t('pd.startLocal')}
             </button>
           )}
+
+          <button
+            type="button"
+            onClick={handleToggleSmartPack}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              smartPackOpen
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5" />
+            <span>{t('pd.smartpackBtn')}</span>
+          </button>
 
           {project.localRunning ? (
             <button
@@ -705,7 +750,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               disabled={loading}
               className="inline-flex items-center gap-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
             >
-              <Square className="w-3 h-3 fill-red-600 text-red-600" /> Detener
+              <Square className="w-3 h-3 fill-red-600 text-red-600" /> {t('pd.stop')}
             </button>
           ) : project.status !== 'active' ? (
             <button
@@ -714,7 +759,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               disabled={loading}
               className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
             >
-              <Power className="w-3.5 h-3.5 text-emerald-600" /> Activar
+              <Power className="w-3.5 h-3.5 text-emerald-600" /> {t('pd.activate')}
             </button>
           ) : null}
 
@@ -725,7 +770,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               rel="noreferrer"
               className="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-3 py-2 rounded-lg text-xs font-medium transition-colors"
             >
-              <Globe className="w-3.5 h-3.5 text-slate-500" /> Ver web
+              <Globe className="w-3.5 h-3.5 text-slate-500" /> {t('pd.openSite')}
             </a>
           )}
 
@@ -825,6 +870,199 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           </React.Fragment>
         ))}
       </div>
+
+      {/* Collapsible SmartPack Build-Plan Inspector */}
+      {smartPackOpen && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-4 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <Layers className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.smartpackTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.smartpackDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={smartPackLoading}
+                onClick={() => void handleLoadSmartPack()}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-medium cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${smartPackLoading ? 'animate-spin' : ''}`} />
+                <span>{smartPackLoading ? t('pd.smartpackInspecting') : t('pd.smartpackRefresh')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSmartPackOpen(false)}
+                aria-label="Close SmartPack Plan"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {smartPackLoading && !smartPackPlan && (
+            <div className="flex items-center gap-2 py-4 text-slate-500">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span>{t('pd.smartpackInspecting')}</span>
+            </div>
+          )}
+
+          {smartPackError && (
+            <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900">
+              {smartPackError}
+            </div>
+          )}
+
+          {smartPackPlan && (() => {
+            const zstdEnabled = smartPackPlan.ociExport?.zstdChunked ?? smartPackPlan.zstdChunked ?? true;
+            const memCap = smartPackPlan.resourceLimits?.memory ?? (smartPackPlan.resourceLimits?.buildMemoryMb ? `${smartPackPlan.resourceLimits.buildMemoryMb}m` : (smartPackPlan.limits?.memoryMb ? `${smartPackPlan.limits.memoryMb}m` : 'auto'));
+            const cpuCap = smartPackPlan.resourceLimits?.buildCpus ?? smartPackPlan.resourceLimits?.cpus ?? smartPackPlan.limits?.cpus ?? 'auto';
+            const ignoreObj = smartPackPlan.dockerignore && !Array.isArray(smartPackPlan.dockerignore)
+              ? smartPackPlan.dockerignore
+              : null;
+            const ignoreContent = ignoreObj
+              ? ignoreObj.content
+              : (Array.isArray(smartPackPlan.dockerignore) ? smartPackPlan.dockerignore.join('\n') : '');
+            const ignoreCount = ignoreObj
+              ? ignoreObj.excludedCount
+              : (Array.isArray(smartPackPlan.dockerignore) ? smartPackPlan.dockerignore.length : 0);
+            const startCmdStr = Array.isArray(smartPackPlan.startCommand)
+              ? smartPackPlan.startCommand.join(' ')
+              : (smartPackPlan.startCommand || '—');
+
+            return (
+              <div className="space-y-3.5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 tabular-nums">
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold block">Stack (18)</span>
+                    <div className="font-semibold text-slate-900 mt-0.5 truncate">{smartPackPlan.label || smartPackPlan.stack}</div>
+                    <div className="font-mono text-[11px] text-slate-500 mt-0.5">
+                      {smartPackPlan.packageManager || smartPackPlan.runtime || 'native'} · :{smartPackPlan.containerPort ?? smartPackPlan.port ?? 3000}
+                    </div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold block">{t('pd.smartpackHash')}</span>
+                    <div className="font-mono font-semibold text-slate-900 mt-0.5 truncate" title={smartPackPlan.deterministicHash || ''}>
+                      {smartPackPlan.deterministicHash ? `${smartPackPlan.deterministicHash.slice(0, 16)}…` : '—'}
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      {smartPackPlan.layers?.length ?? 1} stage{(smartPackPlan.layers?.length ?? 1) === 1 ? '' : 's'}
+                    </div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold block">{t('pd.smartpackCaps')}</span>
+                    <div className="font-mono font-semibold text-slate-900 mt-0.5">
+                      --memory {memCap} · --cpus {cpuCap}
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      {smartPackPlan.resourceLimits?.reservedHeadroomMb != null
+                        ? `${smartPackPlan.resourceLimits.reservedHeadroomMb} MB headroom`
+                        : 'VPS OOM guard'}
+                    </div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold block">{t('pd.smartpackOci')}</span>
+                    <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                      <span className={`px-2 py-0.5 rounded-md font-mono text-[10px] font-semibold border ${
+                        zstdEnabled
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-slate-100 text-slate-600 border-slate-200'
+                      }`}>
+                        {zstdEnabled ? 'zstd:chunked' : 'gzip'}
+                      </span>
+                      <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-mono text-[10px] text-slate-600">
+                        {ignoreCount} ignored
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-600">
+                  {smartPackPlan.buildCommand && (
+                    <span className="px-2 py-1 rounded-lg bg-slate-50 border border-slate-200 truncate max-w-full">
+                      build: {smartPackPlan.buildCommand}
+                    </span>
+                  )}
+                  <span className="px-2 py-1 rounded-lg bg-slate-50 border border-slate-200 truncate max-w-full">
+                    start: {startCmdStr}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {ignoreContent && (
+                    <button
+                      type="button"
+                      onClick={() => setSmartPackShowIgnore((v) => !v)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                    >
+                      {smartPackShowIgnore ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                      <span>{t('pd.smartpackShowIgnore')} ({ignoreCount})</span>
+                    </button>
+                  )}
+                  {smartPackPlan.dockerfile && (
+                    <button
+                      type="button"
+                      onClick={() => setSmartPackShowDockerfile((v) => !v)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                    >
+                      <FileCode2 className="w-3.5 h-3.5" />
+                      <span>{t('pd.smartpackShowDockerfile')}</span>
+                      {smartPackShowDockerfile ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                    </button>
+                  )}
+                  {ignoreContent && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const ok = await copyToClipboard(ignoreContent);
+                        if (!ok) return;
+                        setSmartPackCopied('ignore');
+                        window.setTimeout(() => setSmartPackCopied(null), 1600);
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                    >
+                      {smartPackCopied === 'ignore' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{smartPackCopied === 'ignore' ? t('pd.smartpackCopied') : t('pd.smartpackCopyIgnore')}</span>
+                    </button>
+                  )}
+                  {smartPackPlan.dockerfile && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const ok = await copyToClipboard(smartPackPlan.dockerfile || '');
+                        if (!ok) return;
+                        setSmartPackCopied('dockerfile');
+                        window.setTimeout(() => setSmartPackCopied(null), 1600);
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer"
+                    >
+                      {smartPackCopied === 'dockerfile' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{smartPackCopied === 'dockerfile' ? t('pd.smartpackCopied') : t('pd.smartpackCopyDockerfile')}</span>
+                    </button>
+                  )}
+                </div>
+
+                {smartPackShowIgnore && ignoreContent && (
+                  <pre className="p-3.5 rounded-xl bg-slate-950 text-slate-100 font-mono text-[11px] leading-relaxed max-h-48 overflow-auto border border-slate-800">
+                    {ignoreContent}
+                  </pre>
+                )}
+
+                {smartPackShowDockerfile && smartPackPlan.dockerfile && (
+                  <pre className="p-3.5 rounded-xl bg-slate-950 text-emerald-200 font-mono text-[11px] leading-relaxed max-h-64 overflow-auto border border-slate-800">
+                    {smartPackPlan.dockerfile}
+                  </pre>
+                )}
+              </div>
+            );
+          })()}
+        </section>
+      )}
 
       <div className="pt-1">
         {activeTab === 'live' && (

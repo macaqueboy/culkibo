@@ -22,6 +22,8 @@ import {
   CheckCircle2,
   Copy,
   Check,
+  Radio,
+  Terminal,
 } from 'lucide-react';
 import type {
   DomainItem,
@@ -32,9 +34,12 @@ import type {
   IngressCapabilities,
   DomainDiagnosisReport,
   Project,
+  EdgeTunnelStatusResult,
+  EdgeTunnelCreateResult,
 } from '../lib/api';
 import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n } from '../lib/i18n';
 import { DomainWizardModal } from './DomainWizardModal';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
@@ -69,11 +74,24 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
   wizardPreset = null,
   onClearWizardPreset,
 }) => {
+  const { t } = useI18n();
   const [domains, setDomains] = useState<DomainItem[]>([]);
   const [certs, setCerts] = useState<SslCertificate[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [ingress, setIngress] = useState<IngressStatus | null>(null);
   const [capabilities, setCapabilities] = useState<IngressCapabilities | null>(null);
+
+  // Sovereign EdgeTunnel (CGNAT) state
+  const [tunnelStatus, setTunnelStatus] = useState<EdgeTunnelStatusResult | null>(null);
+  const [tunnelName, setTunnelName] = useState('');
+  const [tunnelHost, setTunnelHost] = useState('127.0.0.1');
+  const [tunnelPort, setTunnelPort] = useState('3000');
+  const [tunnelHostname, setTunnelHostname] = useState('');
+  const [creatingTunnel, setCreatingTunnel] = useState(false);
+  const [revokingTunnelId, setRevokingTunnelId] = useState<string | null>(null);
+  const [createdTunnelSecret, setCreatedTunnelSecret] = useState<EdgeTunnelCreateResult | null>(null);
+  const [copiedTunnelCmd, setCopiedTunnelCmd] = useState(false);
+  const [tunnelError, setTunnelError] = useState<string | null>(null);
   const [probingTls, setProbingTls] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [startingCaddy, setStartingCaddy] = useState(false);
@@ -200,8 +218,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       api.getIngressStatus({ probe: false }).catch(() => null),
       projectId ? Promise.resolve(null) : api.getIngressCapabilities().catch(() => null),
       projectId ? Promise.resolve([]) : api.getProjects().catch(() => []),
+      projectId ? Promise.resolve(null) : api.getEdgeTunnelStatus().catch(() => null),
     ])
-      .then(([domRes, certRes, fastIng, capsRes, projList]) => {
+      .then(([domRes, certRes, fastIng, capsRes, projList, tunRes]) => {
         if (!active) return;
         const list = domRes.domains || [];
         setDomains(list);
@@ -212,6 +231,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
           setAcmeEmailInput(capsRes.acmeEmail || '');
         }
         if (Array.isArray(projList)) setProjects(projList);
+        if (tunRes) setTunnelStatus(tunRes);
         setLoading(false);
         if (list.length > 0) {
           setProbingTls(true);
@@ -524,6 +544,54 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
     }
   };
 
+  const handleCreateEdgeTunnel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const portNum = Number(tunnelPort);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return;
+    setCreatingTunnel(true);
+    setTunnelError(null);
+    try {
+      const created = await api.createEdgeTunnel({
+        name: tunnelName.trim() || `tunnel-${portNum}`,
+        targetHost: tunnelHost.trim() || '127.0.0.1',
+        targetPort: portNum,
+        hostname: tunnelHostname.trim() || undefined,
+      });
+      setCreatedTunnelSecret(created);
+      setTunnelName('');
+      setTunnelHostname('');
+      onNotify?.(`EdgeTunnel "${created.name}" created`, 'success');
+      const status = await api.getEdgeTunnelStatus().catch(() => null);
+      if (status) setTunnelStatus(status);
+    } catch (err: unknown) {
+      setTunnelError(err instanceof Error ? err.message : 'Failed to create EdgeTunnel');
+    } finally {
+      setCreatingTunnel(false);
+    }
+  };
+
+  const handleRevokeEdgeTunnel = async (id: string) => {
+    setRevokingTunnelId(id);
+    setTunnelError(null);
+    try {
+      await api.revokeEdgeTunnel(id);
+      if (createdTunnelSecret?.id === id) setCreatedTunnelSecret(null);
+      onNotify?.(`EdgeTunnel ${id} revoked`, 'info');
+      const status = await api.getEdgeTunnelStatus().catch(() => null);
+      if (status) setTunnelStatus(status);
+    } catch (err: unknown) {
+      setTunnelError(err instanceof Error ? err.message : 'Failed to revoke EdgeTunnel');
+    } finally {
+      setRevokingTunnelId(null);
+    }
+  };
+
+  const buildTunnelAgentCmd = (tun: EdgeTunnelCreateResult): string => {
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProto}//${window.location.host}/ws/edge-tunnel`;
+    return `culkibo tunnel-agent --url ${wsUrl} --id ${tun.id} --token ${tun.token} --target ${tun.targetHost}:${tun.targetPort}`;
+  };
+
   const scopedDomains = projectDomains
     ? domains.filter((d) => projectDomains.includes(d.hostname))
     : domains;
@@ -548,13 +616,11 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
           {projectId ? (
-            <h2 className="text-base font-semibold text-slate-900">Dominios y certificados HTTPS</h2>
+            <h2 className="text-base font-semibold text-slate-900">{t('domains.projectTitle')}</h2>
           ) : (
-            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Dominios y HTTPS</h1>
+            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('domains.title')}</h1>
           )}
-          <p className="text-sm text-slate-500 mt-1">
-            Conecta dominios propios, redirecciones <code className="font-mono text-xs">www</code>, múltiples comodines <code className="font-mono text-xs">*.tudominio.com</code> o certificados PEM/Origin CA en Caddy.
-          </p>
+          <p className="text-sm text-slate-500 mt-1">{t('domains.subtitle')}</p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -565,7 +631,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
               className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-medium cursor-pointer"
             >
               <Link2 className="w-3.5 h-3.5" />
-              <span>Vincular existente</span>
+              <span>{t('domains.linkExisting')}</span>
             </button>
           )}
 
@@ -579,7 +645,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
               className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-medium cursor-pointer"
             >
               <Upload className="w-3.5 h-3.5" />
-              <span>Subir PEM / Origin CA</span>
+              <span>{t('domains.uploadPem')}</span>
             </button>
           )}
 
@@ -593,7 +659,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>Conectar dominio</span>
+            <span>{t('domains.connect')}</span>
           </button>
 
           <button
@@ -639,8 +705,11 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
               <div>
                 <div className="font-semibold text-slate-900">
                   {ingress.available
-                    ? `Caddy${ingress.version && /^v?\d/i.test(ingress.version) ? ` ${ingress.version}` : ''} activo (${ingress.adminUrl})`
-                    : 'Caddy está detenido'}
+                    ? t('domains.caddyActive', {
+                        ver: ingress.version && /^v?\d/i.test(ingress.version) ? ` ${ingress.version}` : '',
+                        url: ingress.adminUrl || 'localhost:2019',
+                      })
+                    : t('domains.caddyStopped')}
                 </div>
                 <p className="text-slate-600 mt-0.5 max-w-2xl leading-relaxed">{ingress.message}</p>
                 {ingress.available && (
@@ -665,7 +734,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
                 >
                   {startingCaddy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-                  <span>{startingCaddy ? 'Activando…' : 'Activar Caddy'}</span>
+                  <span>{t('domains.activateCaddy')}</span>
                 </button>
               ) : (
                 <>
@@ -676,7 +745,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer disabled:opacity-50"
                   >
                     <ShieldCheck className={`w-3.5 h-3.5 ${auditingTls ? 'animate-pulse' : ''}`} />
-                    <span>{auditingTls ? 'Auditando TLS…' : 'Auditar TLS'}</span>
+                    <span>{t('domains.auditTls')}</span>
                   </button>
                   <button
                     type="button"
@@ -685,7 +754,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-medium cursor-pointer disabled:opacity-50"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
-                    <span>Reconciliar rutas</span>
+                    <span>{t('domains.reconcile')}</span>
                   </button>
                 </>
               )}
@@ -698,9 +767,9 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1 p-0.5 bg-slate-100 border border-slate-200 rounded-lg text-xs">
           {([
-            { id: 'all', label: `Todos (${scopedDomains.length})` },
-            { id: 'custom', label: `Propios (${customCount})` },
-            { id: 'wildcard', label: `Comodines (${wildcardCount})` },
+            { id: 'all', label: `${t('domains.filterAll')} (${scopedDomains.length})` },
+            { id: 'custom', label: `${t('domains.filterCustom')} (${customCount})` },
+            { id: 'wildcard', label: `${t('domains.filterWildcard')} (${wildcardCount})` },
             { id: 'sslip', label: `sslip.io (${sslipCount})` },
           ] as const).map((tab) => (
             <button
@@ -937,7 +1006,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                 <tr>
                   <td colSpan={6} className="py-10 text-center text-slate-500">
                     <div className="space-y-2.5">
-                      <p className="text-xs">No hay dominios configurados en esta vista.</p>
+                      <p className="text-xs">{t('domains.empty')}</p>
                       <button
                         type="button"
                         onClick={() => {
@@ -948,7 +1017,7 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                         className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 text-white text-xs font-medium cursor-pointer"
                       >
                         <Plus className="w-3.5 h-3.5" />
-                        <span>Conectar primer dominio</span>
+                        <span>{t('domains.connectFirst')}</span>
                       </button>
                     </div>
                   </td>
@@ -964,10 +1033,8 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
         <div className="p-5 rounded-xl bg-white border border-slate-200 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <h2 className="text-sm font-semibold text-slate-900">Políticas multi-comodín (*.dominio) y ACME</h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Culkibo persiste y aplica políticas DNS-01 simultáneas para todos tus dominios raíz al reiniciar Caddy.
-              </p>
+              <h2 className="text-sm font-semibold text-slate-900">{t('domains.wildcardTitle')}</h2>
+              <p className="text-xs text-slate-500 mt-0.5">{t('domains.wildcardDesc')}</p>
             </div>
             {capabilities && (
               <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium border self-start sm:self-auto ${
@@ -1083,6 +1150,169 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {/* Sovereign EdgeTunnel (CGNAT · Zero Cloudflare Lock-in) */}
+      {!projectId && (
+        <section className="p-5 rounded-2xl bg-white border border-slate-200 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                <Radio className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('domains.tunnelTitle')}</h2>
+                <p className="text-xs text-slate-500 mt-0.5">{t('domains.tunnelDesc')}</p>
+              </div>
+            </div>
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200 text-[11px] font-mono text-slate-700 tabular-nums self-start sm:self-auto">
+              <span className={`w-1.5 h-1.5 rounded-full ${(tunnelStatus?.connectedTunnels ?? 0) > 0 ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+              {t('domains.tunnelActiveLabel', {
+                connected: tunnelStatus?.connectedTunnels ?? tunnelStatus?.connectedAgents ?? 0,
+                active: tunnelStatus?.activeTunnels ?? 0,
+              })}
+            </span>
+          </div>
+
+          <form onSubmit={(e) => void handleCreateEdgeTunnel(e)} className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end text-xs">
+            <label className="sm:col-span-3 block">
+              <span className="text-slate-600 font-medium block mb-1">{t('domains.tunnelName')}</span>
+              <input
+                type="text"
+                value={tunnelName}
+                onChange={(e) => setTunnelName(e.target.value)}
+                placeholder="home-lab-api"
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-900"
+              />
+            </label>
+            <label className="sm:col-span-3 block">
+              <span className="text-slate-600 font-medium block mb-1">{t('domains.tunnelHost')}</span>
+              <input
+                type="text"
+                required
+                value={tunnelHost}
+                onChange={(e) => setTunnelHost(e.target.value)}
+                placeholder="127.0.0.1"
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="sm:col-span-2 block">
+              <span className="text-slate-600 font-medium block mb-1">{t('domains.tunnelPort')}</span>
+              <input
+                type="number"
+                min={1}
+                max={65535}
+                required
+                value={tunnelPort}
+                onChange={(e) => setTunnelPort(e.target.value)}
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 tabular-nums"
+              />
+            </label>
+            <label className="sm:col-span-2 block">
+              <span className="text-slate-600 font-medium block mb-1">{t('domains.tunnelHostname')}</span>
+              <input
+                type="text"
+                value={tunnelHostname}
+                onChange={(e) => setTunnelHostname(e.target.value)}
+                placeholder="app.example.com"
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <div className="sm:col-span-2">
+              <button
+                type="submit"
+                disabled={creatingTunnel}
+                className="culkibo-press w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {creatingTunnel ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                <span>{creatingTunnel ? t('domains.tunnelCreating') : t('domains.tunnelCreate')}</span>
+              </button>
+            </div>
+          </form>
+
+          {tunnelError && (
+            <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">{tunnelError}</div>
+          )}
+
+          {createdTunnelSecret && (
+            <div className="p-3.5 rounded-xl bg-slate-950 text-slate-100 border border-slate-800 space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-300">
+                  <Terminal className="w-3.5 h-3.5" />
+                  {t('domains.tunnelTokenOnce')}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const ok = await copyToClipboard(buildTunnelAgentCmd(createdTunnelSecret));
+                      if (!ok) return;
+                      setCopiedTunnelCmd(true);
+                      window.setTimeout(() => setCopiedTunnelCmd(false), 1800);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 text-[11px] font-medium cursor-pointer"
+                  >
+                    {copiedTunnelCmd ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    <span>{t('domains.tunnelCopyCmd')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCreatedTunnelSecret(null)}
+                    className="p-1 text-slate-400 hover:text-white cursor-pointer"
+                    aria-label="Close token banner"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+              <code className="block font-mono text-[11px] text-slate-200 break-all">
+                {buildTunnelAgentCmd(createdTunnelSecret)}
+              </code>
+            </div>
+          )}
+
+          {tunnelStatus && Array.isArray(tunnelStatus.tunnels) && tunnelStatus.tunnels.filter((tun) => !tun.revoked).length > 0 ? (
+            <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden text-xs">
+              {tunnelStatus.tunnels
+                .filter((tun) => !tun.revoked)
+                .map((tun) => (
+                  <div key={tun.id} className="px-3.5 py-2.5 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-slate-900">{tun.name}</span>
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium border ${
+                          tun.connected
+                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
+                        }`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${tun.connected ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                          {tun.connected ? 'connected' : 'waiting agent'}
+                        </span>
+                        {tun.hostname && (
+                          <span className="font-mono text-[11px] text-slate-600">{tun.hostname}</span>
+                        )}
+                      </div>
+                      <div className="font-mono text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                        {tun.id} → {tun.targetHost}:{tun.targetPort}
+                        {tun.tokenPreview ? ` · ${tun.tokenPreview}` : ''}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={revokingTunnelId === tun.id}
+                      onClick={() => void handleRevokeEdgeTunnel(tun.id)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-red-50 hover:border-red-200 text-slate-600 hover:text-red-700 font-medium cursor-pointer shrink-0 disabled:opacity-50"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>{t('domains.tunnelRevoke')}</span>
+                    </button>
+                  </div>
+                ))}
+            </div>
+          ) : (
+            <p className="text-xs text-slate-400">{t('domains.tunnelEmpty')}</p>
+          )}
+        </section>
       )}
 
       {/* Certificados PEM propios en disco (Origin CA / corporativos): solo se muestra si existen */}

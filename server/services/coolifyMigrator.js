@@ -334,9 +334,16 @@ function inspectComposeServices(composeText) {
 }
 
 class CoolifyMigrator {
-  async fetchFromApi(apiUrl, apiToken, endpoint) {
+  /**
+   * @param {string} apiUrl
+   * @param {string} apiToken
+   * @param {string} endpoint
+   * @param {{ allowLoopback?: boolean }} [opts]
+   */
+  async fetchFromApi(apiUrl, apiToken, endpoint, opts = {}) {
     try {
-      const { url: safeBase } = await assertSafeUrl(apiUrl, { blockSearchAndHash: true });
+      const allowLoopback = Boolean((opts && opts.allowLoopback) || process.env.CULKIBO_ALLOW_LOOPBACK_COOLIFY === '1');
+      const { url: safeBase } = await assertSafeUrl(apiUrl, { blockSearchAndHash: true, allowLoopback });
       const url = `${safeBase.origin}${safeBase.pathname.replace(/\/+$/, '')}${endpoint}`;
       const response = await safeFetch(url, {
         method: 'GET',
@@ -344,6 +351,7 @@ class CoolifyMigrator {
           'Authorization': `Bearer ${apiToken}`,
           'Accept': 'application/json'
         },
+        allowLoopback,
         maxRedirects: 0,
         maxBytes: 20 * 1024 * 1024,
         timeoutMs: 30000
@@ -374,8 +382,15 @@ class CoolifyMigrator {
     }
   }
 
-  async fetchListWithDetails(apiUrl, apiToken, endpoint, detailEndpointPrefix) {
-    const list = await this.fetchFromApi(apiUrl, apiToken, endpoint);
+  /**
+   * @param {string} apiUrl
+   * @param {string} apiToken
+   * @param {string} endpoint
+   * @param {string} detailEndpointPrefix
+   * @param {{ allowLoopback?: boolean }} [opts]
+   */
+  async fetchListWithDetails(apiUrl, apiToken, endpoint, detailEndpointPrefix, opts = {}) {
+    const list = await this.fetchFromApi(apiUrl, apiToken, endpoint, opts);
     if (!Array.isArray(list)) return [];
 
     const results = new Array(list.length);
@@ -390,14 +405,14 @@ class CoolifyMigrator {
           const safeUuid = encodeURIComponent(String(item.uuid || ''));
           const supportsTasks = detailEndpointPrefix === '/api/v1/applications' || detailEndpointPrefix === '/api/v1/services';
           const [details, envs, storages, scheduledTasks] = await Promise.all([
-            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}`),
-            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/envs`).catch((e) => {
+            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}`, opts),
+            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/envs`, opts).catch((e) => {
               if (e && (e.status === 401 || e.status === 403)) return { _authWarning: e.message };
               return [];
             }),
-            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/storages`).catch(() => null),
+            this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/storages`, opts).catch(() => null),
             supportsTasks
-              ? this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/scheduled-tasks`).catch(() => [])
+              ? this.fetchFromApi(apiUrl, apiToken, `${detailEndpointPrefix}/${safeUuid}/scheduled-tasks`, opts).catch(() => [])
               : Promise.resolve([])
           ]);
 
@@ -450,27 +465,32 @@ class CoolifyMigrator {
     return results.filter(Boolean);
   }
 
-  async fetchApplications(apiUrl, apiToken) {
-    return this.fetchListWithDetails(apiUrl, apiToken, '/api/v1/applications', '/api/v1/applications');
+  /** @param {string} apiUrl @param {string} apiToken @param {{ allowLoopback?: boolean }} [opts] */
+  async fetchApplications(apiUrl, apiToken, opts = {}) {
+    return this.fetchListWithDetails(apiUrl, apiToken, '/api/v1/applications', '/api/v1/applications', opts);
   }
 
-  async fetchDatabases(apiUrl, apiToken) {
-    return this.fetchListWithDetails(apiUrl, apiToken, '/api/v1/databases', '/api/v1/databases');
+  /** @param {string} apiUrl @param {string} apiToken @param {{ allowLoopback?: boolean }} [opts] */
+  async fetchDatabases(apiUrl, apiToken, opts = {}) {
+    return this.fetchListWithDetails(apiUrl, apiToken, '/api/v1/databases', '/api/v1/databases', opts);
   }
 
-  async fetchServices(apiUrl, apiToken) {
-    return this.fetchListWithDetails(apiUrl, apiToken, '/api/v1/services', '/api/v1/services');
+  /** @param {string} apiUrl @param {string} apiToken @param {{ allowLoopback?: boolean }} [opts] */
+  async fetchServices(apiUrl, apiToken, opts = {}) {
+    return this.fetchListWithDetails(apiUrl, apiToken, '/api/v1/services', '/api/v1/services', opts);
   }
 
-  async fetchProjects(apiUrl, apiToken) {
-    return this.fetchFromApi(apiUrl, apiToken, '/api/v1/projects');
+  /** @param {string} apiUrl @param {string} apiToken @param {{ allowLoopback?: boolean }} [opts] */
+  async fetchProjects(apiUrl, apiToken, opts = {}) {
+    return this.fetchFromApi(apiUrl, apiToken, '/api/v1/projects', opts);
   }
 
-  async previewMigration(apiUrl, apiToken) {
-    const apps = await this.fetchApplications(apiUrl, apiToken);
-    const databases = await this.fetchDatabases(apiUrl, apiToken);
-    const services = await this.fetchServices(apiUrl, apiToken);
-    const projects = await this.fetchProjects(apiUrl, apiToken);
+  /** @param {string} apiUrl @param {string} apiToken @param {{ allowLoopback?: boolean }} [opts] */
+  async previewMigration(apiUrl, apiToken, opts = {}) {
+    const apps = await this.fetchApplications(apiUrl, apiToken, opts);
+    const databases = await this.fetchDatabases(apiUrl, apiToken, opts);
+    const services = await this.fetchServices(apiUrl, apiToken, opts);
+    const projects = await this.fetchProjects(apiUrl, apiToken, opts);
     const plan = this.buildMigrationPlan({ apps, databases, services, projects });
     return {
       apps,
@@ -2005,13 +2025,14 @@ class CoolifyMigrator {
    * Planifica una migración conectándose en vivo a la API de Coolify v4.
    * @param {string} apiUrl
    * @param {string} apiToken
-   * @param {{ apps?: string[] | null, dbs?: string[] | null, services?: string[] | null }} [options]
+   * @param {{ apps?: string[] | null, dbs?: string[] | null, services?: string[] | null, allowLoopback?: boolean }} [options]
    */
   async planMigration(apiUrl, apiToken, options = {}) {
-    const apps = await this.fetchApplications(apiUrl, apiToken);
-    const databases = await this.fetchDatabases(apiUrl, apiToken);
-    const services = await this.fetchServices(apiUrl, apiToken);
-    const projects = await this.fetchProjects(apiUrl, apiToken);
+    const fetchOpts = { allowLoopback: Boolean(options && options.allowLoopback) };
+    const apps = await this.fetchApplications(apiUrl, apiToken, fetchOpts);
+    const databases = await this.fetchDatabases(apiUrl, apiToken, fetchOpts);
+    const services = await this.fetchServices(apiUrl, apiToken, fetchOpts);
+    const projects = await this.fetchProjects(apiUrl, apiToken, fetchOpts);
     return this.buildMigrationPlan(
       { apps, databases, services, projects },
       {
@@ -2023,9 +2044,14 @@ class CoolifyMigrator {
   }
 
   // ===========================================================================
-  // 5. EXECUTION ENGINE (`executeMigration`, `migrate`, `migrateFromSnapshot`)
+  // 5. EXECUTION ENGINE (`executeMigration`, `migrateFromCoolify`, `migrate`, `migrateFromSnapshot`)
   // ===========================================================================
 
+  /**
+   * @param {string} apiUrl
+   * @param {string} apiToken
+   * @param {Record<string, any>} [options]
+   */
   async executeMigration(apiUrl, apiToken, options = {}) {
     return this.migrate(
       apiUrl,
@@ -2038,6 +2064,16 @@ class CoolifyMigrator {
   }
 
   /**
+   * Alias de alto nivel para ejecutar una migración completa desde la API de Coolify v4.
+   * @param {string} apiUrl
+   * @param {string} apiToken
+   * @param {Record<string, any>} [options]
+   */
+  async migrateFromCoolify(apiUrl, apiToken, options = {}) {
+    return this.executeMigration(apiUrl, apiToken, options);
+  }
+
+  /**
    * @param {string} apiUrl
    * @param {string} apiToken
    * @param {string[] | null} [selectedApps]
@@ -2046,10 +2082,11 @@ class CoolifyMigrator {
    * @param {Record<string, any>} [extraOpts]
    */
   async migrate(apiUrl, apiToken, selectedApps = null, selectedDbs = null, selectedServices = null, extraOpts = {}) {
-    const apps = await this.fetchApplications(apiUrl, apiToken);
-    const databases = await this.fetchDatabases(apiUrl, apiToken);
-    const services = await this.fetchServices(apiUrl, apiToken);
-    const projects = await this.fetchProjects(apiUrl, apiToken);
+    const fetchOpts = { allowLoopback: Boolean(extraOpts && extraOpts.allowLoopback) };
+    const apps = await this.fetchApplications(apiUrl, apiToken, fetchOpts);
+    const databases = await this.fetchDatabases(apiUrl, apiToken, fetchOpts);
+    const services = await this.fetchServices(apiUrl, apiToken, fetchOpts);
+    const projects = await this.fetchProjects(apiUrl, apiToken, fetchOpts);
 
     return this.migrateFromSnapshot(
       { apps, databases, services, projects },
@@ -2602,6 +2639,7 @@ class CoolifyMigrator {
    *   dryRun?: boolean,
    *   targetIp?: string,
    *   timeoutMs?: number,
+   *   allowLoopback?: boolean,
    *   probeFn?: (url: string, opts: { hostHeader?: string, timeoutMs: number }) => Promise<{ ok: boolean, status: number, latencyMs: number, headers: Record<string, string>, bodySnippet?: string, error?: string }>
    * }} [opts]
    */
@@ -2609,6 +2647,7 @@ class CoolifyMigrator {
     const dryRun = Boolean(opts.dryRun);
     const timeoutMs = Math.min(30000, Math.max(1000, Number(opts.timeoutMs) || 8000));
     const targetIp = String(opts.targetIp || '').trim();
+    const allowLoopback = Boolean(opts.allowLoopback);
 
     /** @type {Array<{ name: string, hostname: string, sourceUrl: string, targetUrl: string, healthPath: string, expectedStatus: number[], expectedHeaders: string[], maxLatencyMs: number }>} */
     let checksSpec = [];
@@ -2684,6 +2723,7 @@ class CoolifyMigrator {
         const res = await safeFetch(targetUrl, {
           method: 'GET',
           headers,
+          allowLoopback,
           maxRedirects: 0,
           maxBytes: 256 * 1024,
           timeoutMs: pOpts.timeoutMs
@@ -2832,7 +2872,7 @@ class CoolifyMigrator {
       const magic = this.translateMagicVariables(envMap, { resourceName: app.name, fqdn: app.fqdn, hosts, gitBranch: app.git_branch });
       const traefik = this.parseTraefikLabels(app.custom_labels, { defaultHosts: hosts, composeYaml: app.docker_compose || '' });
       const firstPort = traefik.targetPort || parseInt(String(app.ports_exposes || app.port || '3000').split(',')[0], 10) || 3000;
-      const projId = String(app.project_id || app.uuid || 'coolify_app').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const projId = String(app.uuid || app.project_id || 'coolify_app').replace(/[^a-zA-Z0-9_-]/g, '_');
 
       projects.push({
         id: projId,
@@ -2870,7 +2910,7 @@ class CoolifyMigrator {
 
     for (const svc of services) {
       const hosts = this.parseFqdnHosts(svc.fqdn);
-      const projId = String(svc.project_id || svc.uuid || 'coolify_svc').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const projId = String(svc.uuid || svc.project_id || 'coolify_svc').replace(/[^a-zA-Z0-9_-]/g, '_');
       projects.push({
         id: projId,
         name: svc.name || 'Coolify Service',

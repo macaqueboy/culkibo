@@ -35,6 +35,7 @@ import {
 } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n } from '../lib/i18n';
 import { Modal } from './Modal';
 import { DomainWizardModal } from './DomainWizardModal';
 
@@ -57,11 +58,23 @@ function formatMemory(mb: number): string {
 }
 
 export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalogo', tabTrigger = 0 }) => {
+  const { t } = useI18n();
   const [tab, setTab] = useState<'catalogo' | 'instalados'>(initialTab);
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
   const [categories, setCategories] = useState<ServiceCategory[]>([]);
   const [installations, setInstallations] = useState<ServiceInstallation[]>([]);
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState(() => {
+    try {
+      const hint = window.sessionStorage.getItem('culkibo_catalog_search_hint');
+      if (hint) {
+        window.sessionStorage.removeItem('culkibo_catalog_search_hint');
+        return hint;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return '';
+  });
   const [category, setCategory] = useState<string | null>(null);
   const [ramFilter, setRamFilter] = useState<'all' | 'lightweight'>('all');
   const [loading, setLoading] = useState(true);
@@ -303,7 +316,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
     return (
       <div className="flex items-center gap-2 text-xs text-slate-500 py-16 justify-center">
         <Loader2 className="w-4 h-4 animate-spin" />
-        <span>Cargando catálogo…</span>
+        <span>{t('catalog.loading')}</span>
       </div>
     );
   }
@@ -314,10 +327,8 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
           <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
           <div className="text-xs">
-            <p className="font-semibold text-amber-900">Docker está detenido</p>
-            <p className="text-amber-800 mt-0.5">
-              Puedes explorar las {templates.length} plantillas del catálogo, pero instalar o arrancar servicios requiere tener Docker en marcha.
-            </p>
+            <p className="font-semibold text-amber-900">{t('catalog.dockerOffTitle')}</p>
+            <p className="text-amber-800 mt-0.5">{t('catalog.dockerOffDesc', { count: templates.length })}</p>
           </div>
         </div>
       )}
@@ -326,7 +337,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
           <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
           <div className="text-xs">
-            <p className="font-semibold text-amber-900">No se pudo cargar el catálogo</p>
+            <p className="font-semibold text-amber-900">{t('catalog.loadError')}</p>
             <p className="text-amber-800 mt-0.5">{loadError}</p>
           </div>
         </div>
@@ -336,32 +347,30 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2.5 flex-wrap">
-            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Catálogo de servicios</h1>
+            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('catalog.title')}</h1>
             <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-xs font-medium text-slate-700 tabular-nums">
-              {templates.length} plantillas · {categories.length} categorías
+              {t('catalog.badge', { templates: templates.length, categories: categories.length })}
             </span>
           </div>
-          <p className="text-sm text-slate-500 mt-1 max-w-2xl">
-            Servicios listos en un clic con versión fijada, límites de recursos, volumen persistente y secretos aleatorios.
-          </p>
+          <p className="text-sm text-slate-500 mt-1 max-w-2xl">{t('catalog.subtitle')}</p>
         </div>
         <div className="flex items-center gap-1.5 shrink-0 bg-slate-100 p-1 rounded-lg border border-slate-200 self-start lg:self-auto">
           {([
-            { id: 'catalogo', label: 'Catálogo', count: templates.length },
-            { id: 'instalados', label: 'Instalados', count: installations.length },
-          ] as const).map((t) => (
+            { id: 'catalogo', label: t('catalog.tabCatalog'), count: templates.length },
+            { id: 'instalados', label: t('catalog.tabInstalled'), count: installations.length },
+          ] as const).map((tabItem) => (
             <button
-              key={t.id}
+              key={tabItem.id}
               type="button"
-              onClick={() => setTab(t.id)}
+              onClick={() => setTab(tabItem.id)}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${
-                tab === t.id
+                tab === tabItem.id
                   ? 'bg-white text-slate-900 shadow-2xs'
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              <span>{t.label}</span>
-              <span className="text-[11px] tabular-nums text-slate-500">({t.count})</span>
+              <span>{tabItem.label}</span>
+              <span className="text-[11px] tabular-nums text-slate-500">({tabItem.count})</span>
             </button>
           ))}
         </div>
@@ -376,13 +385,13 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder={`Buscar entre ${templates.length} plantillas (nombre, categoría, etiqueta o imagen)…`}
+                  placeholder={t('catalog.searchPlaceholder', { count: templates.length })}
                   className="w-full pl-9 pr-8 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-900 placeholder:text-slate-400"
                 />
                 {query && (
                   <button
                     type="button"
-                    aria-label="Limpiar búsqueda"
+                    aria-label={t('catalog.clearFilters')}
                     onClick={() => setQuery('')}
                     className="p-1 text-slate-400 hover:text-slate-700 absolute right-2 top-1/2 -translate-y-1/2 cursor-pointer"
                   >
@@ -400,7 +409,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                     ramFilter === 'all' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Todos
+                  {t('catalog.ramAll')}
                 </button>
                 <button
                   type="button"
@@ -417,7 +426,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
             </div>
 
             {/* Píldoras horizontales desplazables para las 12 categorías */}
-            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1" role="tablist" aria-label="Categorías del catálogo">
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1" role="tablist" aria-label={t('catalog.title')}>
               <button
                 type="button"
                 role="tab"
@@ -427,7 +436,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                   category === null ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
                 }`}
               >
-                Todas ({templates.length})
+                {t('catalog.catAll')} ({templates.length})
               </button>
               {categories.map((c) => (
                 <button
@@ -448,7 +457,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
             {(query || category || ramFilter !== 'all') && (
               <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
                 <span className="tabular-nums">
-                  Mostrando <strong className="text-slate-900">{visible.length}</strong> de {templates.length} plantillas
+                  {t('catalog.showing', { visible: visible.length, total: templates.length })}
                 </span>
                 <button
                   type="button"
@@ -459,7 +468,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                   }}
                   className="text-slate-700 hover:text-slate-900 font-medium underline cursor-pointer"
                 >
-                  Limpiar filtros
+                  {t('catalog.clearFilters')}
                 </button>
               </div>
             )}
@@ -468,7 +477,7 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
           {visible.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-xl text-center py-12 px-4 text-xs text-slate-500 space-y-2.5">
               <p>
-                No hay servicios que coincidan con los filtros actuales{query ? ` («${query}»)` : ''}.
+                {t('catalog.emptyTitle')}{query ? ` (“${query}”)` : ''}.
               </p>
               <button
                 type="button"
@@ -479,71 +488,71 @@ export const ServiceCatalog: React.FC<Props> = ({ onNotify, initialTab = 'catalo
                 }}
                 className="px-3 py-1.5 rounded-lg bg-slate-900 text-white font-medium cursor-pointer"
               >
-                Ver todas las plantillas
+                {t('catalog.viewAll')}
               </button>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-              {visible.map((t) => (
+              {visible.map((tpl) => (
                 <article
-                  key={t.id}
+                  key={tpl.id}
                   className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col gap-3 hover:border-slate-300 transition-colors"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <h2 className="font-semibold text-sm text-slate-900 leading-tight">{t.name}</h2>
-                      <p className="text-xs text-slate-500 mt-0.5">{t.categoryLabel}</p>
+                      <h2 className="font-semibold text-sm text-slate-900 leading-tight">{tpl.name}</h2>
+                      <p className="text-xs text-slate-500 mt-0.5">{tpl.categoryLabel}</p>
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
-                      {t.sidecars.length > 0 && (
+                      {tpl.sidecars.length > 0 && (
                         <span className="text-[10px] font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-md px-1.5 py-0.5 tabular-nums">
-                          +{t.sidecars.length} aux
+                          +{tpl.sidecars.length} aux
                         </span>
                       )}
-                      {t.totalMemoryMb <= 512 && (
+                      {tpl.totalMemoryMb <= 512 && (
                         <span className="text-[10px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-1.5 py-0.5">
-                          Ligero
+                          {t('catalog.lightweight')}
                         </span>
                       )}
-                      {t.installedCount > 0 && (
+                      {tpl.installedCount > 0 && (
                         <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-2 py-0.5 tabular-nums">
-                          {t.installedCount} {t.installedCount === 1 ? 'instalado' : 'instalados'}
+                          {tpl.installedCount} {tpl.installedCount === 1 ? t('catalog.installedSingular') : t('catalog.installedPlural')}
                         </span>
                       )}
                     </div>
                   </div>
 
-                  <p className="text-xs text-slate-600 leading-relaxed flex-1">{t.summary}</p>
+                  <p className="text-xs text-slate-600 leading-relaxed flex-1">{tpl.summary}</p>
 
                   <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs text-slate-500 border-t border-slate-100 pt-3 tabular-nums">
                     <div className="flex items-center gap-1.5 min-w-0">
                       <HardDrive className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-                      <span className="truncate">{formatMemory(t.totalMemoryMb)}</span>
+                      <span className="truncate">{formatMemory(tpl.totalMemoryMb)}</span>
                     </div>
                     <div className="flex items-center gap-1.5 min-w-0">
                       <Cpu className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-                      <span className="truncate">{t.cpus} CPU</span>
+                      <span className="truncate">{tpl.cpus} CPU</span>
                     </div>
-                    {t.database && (
+                    {tpl.database && (
                       <div className="col-span-2 flex items-center gap-1.5 min-w-0 text-[11px]">
                         <Database className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-                        <span className="truncate">Incluye {t.database.engine} gestionada</span>
+                        <span className="truncate">{t('catalog.includesDb', { engine: tpl.database.engine })}</span>
                       </div>
                     )}
                     <div className="col-span-2 flex items-center gap-1.5 min-w-0">
                       <Package className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-                      <code className="font-mono text-[11px] truncate text-slate-500">{t.image}</code>
+                      <code className="font-mono text-[11px] truncate text-slate-500">{tpl.image}</code>
                     </div>
                   </dl>
 
                   <div className="flex items-center justify-between gap-3 pt-1">
-                    <span className="text-[11px] text-slate-400 truncate" title={t.licence}>{t.licence}</span>
+                    <span className="text-[11px] text-slate-400 truncate" title={tpl.licence}>{tpl.licence}</span>
                     <button
                       type="button"
-                      onClick={() => setChosen(t)}
-                      className="shrink-0 px-3.5 py-1.5 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 transition-colors cursor-pointer"
+                      onClick={() => setChosen(tpl)}
+                      className="culkibo-press shrink-0 px-3.5 py-1.5 rounded-lg text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 transition-colors cursor-pointer"
                     >
-                      Instalar
+                      {t('catalog.install')}
                     </button>
                   </div>
                 </article>

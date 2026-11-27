@@ -21,9 +21,11 @@ import {
   Box,
   Wrench,
   PauseCircle,
+  Rocket,
 } from 'lucide-react';
-import { api, type FleetServer, type FleetSshKey } from '../lib/api';
+import { api, type FleetServer, type FleetSshKey, type DirectPushPlanResult } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
+import { useI18n } from '../lib/i18n';
 import { Modal } from './Modal';
 import { HelpTip } from './HelpTip';
 
@@ -106,6 +108,7 @@ function barColor(pct: number): string {
 }
 
 export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
+  const { t } = useI18n();
   const [tab, setTab] = useState<FleetTab>('nodes');
   const [servers, setServers] = useState<FleetServerWithMaintenance[]>([]);
   const [keys, setKeys] = useState<FleetSshKey[]>([]);
@@ -113,6 +116,14 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+
+  // DirectPush (Zero-Registry SSH) modal state
+  const [directPushServer, setDirectPushServer] = useState<FleetServerWithMaintenance | null>(null);
+  const [directPushImage, setDirectPushImage] = useState('my-app:latest');
+  const [directPushPort, setDirectPushPort] = useState('5055');
+  const [directPushPlan, setDirectPushPlan] = useState<DirectPushPlanResult | null>(null);
+  const [directPushLoading, setDirectPushLoading] = useState(false);
+  const [directPushError, setDirectPushError] = useState<string | null>(null);
 
   const [probingId, setProbingId] = useState<string | null>(null);
   const [probingAll, setProbingAll] = useState(false);
@@ -418,14 +429,52 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
     return { online, cordoned, totalCpus, availRamMb, totalRamMb };
   }, [servers]);
 
+  const openDirectPushModal = (srv: FleetServerWithMaintenance) => {
+    setDirectPushServer(srv);
+    setDirectPushImage('my-app:latest');
+    setDirectPushPort('5055');
+    setDirectPushPlan(null);
+    setDirectPushError(null);
+  };
+
+  const handlePlanDirectPush = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!directPushServer || !directPushImage.trim()) return;
+    setDirectPushLoading(true);
+    setDirectPushError(null);
+    try {
+      const plan = await api.planDirectPush({
+        image: directPushImage.trim(),
+        serverId: directPushServer.id,
+        sshHost: directPushServer.host || undefined,
+        sshPort: directPushServer.port || 22,
+        sshUser: directPushServer.user || 'root',
+        localPort: Number(directPushPort) || 5055,
+      });
+      setDirectPushPlan(plan);
+    } catch (err: unknown) {
+      setDirectPushError(err instanceof Error ? err.message : 'DirectPush plan error');
+    } finally {
+      setDirectPushLoading(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-xs text-slate-500">
         <Loader2 className="w-4 h-4 animate-spin" />
-        <span>Cargando flota de servidores…</span>
+        <span>{t('fleet.loading')}</span>
       </div>
     );
   }
+
+  const localizedStatusLabel = (status: string): string => {
+    if (status === 'online') return t('fleet.statusOnline');
+    if (status === 'degraded') return t('fleet.statusDegraded');
+    if (status === 'offline') return t('fleet.statusOffline');
+    if (status === 'host_key_mismatch') return t('fleet.statusMismatch');
+    return t('fleet.statusUnknown');
+  };
 
   return (
     <div className="space-y-5">
@@ -433,15 +482,13 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Flota de servidores</h1>
-            <HelpTip title="Orquestación multi-VPS por túnel SSH">
-              <p>Culkibo se conecta a cada VPS mediante túneles SSH con huellas TOFU verificadas y llaves Ed25519 cifradas con AES-256-GCM.</p>
-              <p>Nunca expone el socket de Docker ni el API interno de Caddy a Internet.</p>
+            <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">{t('fleet.title')}</h1>
+            <HelpTip title="Multi-VPS SSH & DirectPush">
+              <p>Culkibo connects over SSH tunnels with TOFU host-key pinning and AES-256-GCM encrypted Ed25519 keys.</p>
+              <p>Docker socket and Caddy admin API are never exposed to the public internet.</p>
             </HelpTip>
           </div>
-          <p className="text-sm text-slate-500 mt-1 max-w-2xl">
-            Orquesta este nodo local y VPS remotos con métricas en vivo, verificación de huella SSH (TOFU) y bóveda de llaves cifrada.
-          </p>
+          <p className="text-sm text-slate-500 mt-1 max-w-2xl">{t('fleet.subtitle')}</p>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap shrink-0">
@@ -453,7 +500,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                 tab === 'nodes' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Nodos <span className="tabular-nums text-slate-400">({servers.length})</span>
+              {t('fleet.tabNodes')} <span className="tabular-nums text-slate-400">({servers.length})</span>
             </button>
             <button
               type="button"
@@ -463,7 +510,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
               }`}
             >
               <KeyRound className="w-3.5 h-3.5" />
-              <span>Llaves SSH</span>
+              <span>{t('fleet.tabKeys')}</span>
               <span className="tabular-nums text-slate-400">({keys.length})</span>
             </button>
           </div>
@@ -477,7 +524,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                 className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700 cursor-pointer disabled:opacity-50"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${probingAll ? 'animate-spin' : ''}`} />
-                <span>Sondear todos</span>
+                <span>{t('fleet.probeAll')}</span>
               </button>
               <button
                 type="button"
@@ -485,7 +532,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" />
-                <span>Añadir servidor</span>
+                <span>{t('fleet.addServer')}</span>
               </button>
             </>
           ) : (
@@ -495,7 +542,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Nueva llave SSH</span>
+              <span>{t('fleet.newKey')}</span>
             </button>
           )}
         </div>
@@ -505,8 +552,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3 text-xs">
           <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
           <div>
-            <p className="font-semibold text-amber-900">No se pudo actualizar la flota</p>
-            <p className="text-amber-800 mt-0.5">{loadError}</p>
+            <p className="font-semibold text-amber-900">{loadError}</p>
           </div>
         </div>
       )}
@@ -514,30 +560,30 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
       {/* KPIs */}
       <div className="bg-slate-200 border border-slate-200 rounded-xl overflow-hidden grid grid-cols-2 lg:grid-cols-4 gap-px">
         <div className="bg-white p-4">
-          <div className="text-xs text-slate-500">Nodos en línea</div>
+          <div className="text-xs text-slate-500">{t('fleet.kpiOnline')}</div>
           <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
             {kpis.online} <span className="text-sm font-normal text-slate-400">/ {servers.length}</span>
           </div>
           {kpis.cordoned > 0 && (
             <div className="text-[11px] text-amber-700 mt-0.5 tabular-nums">
-              {kpis.cordoned} en drenaje / mantenimiento
+              {kpis.cordoned} {t('fleet.filterMaintenance').toLowerCase()}
             </div>
           )}
         </div>
         <div className="bg-white p-4">
-          <div className="text-xs text-slate-500">Núcleos totales</div>
+          <div className="text-xs text-slate-500">{t('fleet.kpiCores')}</div>
           <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
             {kpis.totalCpus > 0 ? `${kpis.totalCpus} vCPU` : '—'}
           </div>
         </div>
         <div className="bg-white p-4">
-          <div className="text-xs text-slate-500">RAM disponible</div>
+          <div className="text-xs text-slate-500">{t('fleet.kpiRam')}</div>
           <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
             {kpis.totalRamMb > 0 ? `${formatMb(kpis.availRamMb)} / ${formatMb(kpis.totalRamMb)}` : '—'}
           </div>
         </div>
         <div className="bg-white p-4">
-          <div className="text-xs text-slate-500">Llaves en bóveda</div>
+          <div className="text-xs text-slate-500">{t('fleet.kpiKeys')}</div>
           <div className="text-xl font-semibold text-slate-900 mt-1 tabular-nums">
             {keys.length} <span className="text-xs font-normal text-slate-400">AES-256-GCM</span>
           </div>
@@ -553,17 +599,17 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Filtrar por nombre, host, región o etiqueta…"
+                placeholder={t('fleet.searchPlaceholder')}
                 className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-200 bg-white text-xs text-slate-900 placeholder:text-slate-400"
               />
             </div>
             <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar shrink-0">
               {([
-                { id: 'all', label: 'Todos' },
-                { id: 'online', label: 'En línea' },
-                { id: 'degraded', label: 'Alertas' },
-                { id: 'maintenance', label: 'Mantenimiento' },
-                { id: 'offline', label: 'Sin conexión' },
+                { id: 'all', label: t('fleet.filterAll') },
+                { id: 'online', label: t('fleet.filterOnline') },
+                { id: 'degraded', label: t('fleet.filterDegraded') },
+                { id: 'maintenance', label: t('fleet.filterMaintenance') },
+                { id: 'offline', label: t('fleet.filterOffline') },
               ] as const).map((f) => (
                 <button
                   key={f.id}
@@ -585,18 +631,16 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
             <div className="bg-white border border-slate-200 rounded-xl p-10 text-center space-y-3">
               <Server className="w-8 h-8 text-slate-300 mx-auto" />
               <div className="text-sm font-semibold text-slate-900">
-                {servers.length === 0 ? 'Aún no hay servidores registrados' : 'Ningún servidor coincide con el filtro'}
+                {servers.length === 0 ? t('fleet.emptyTitle') : t('fleet.emptyFiltered')}
               </div>
-              <p className="text-xs text-slate-500 max-w-md mx-auto">
-                Registra un VPS remoto por SSH para desplegar proyectos y servicios distribuidos con Docker y Caddy gestionados automáticamente.
-              </p>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">{t('fleet.emptyDesc')}</p>
               {servers.length === 0 && (
                 <button
                   type="button"
                   onClick={openAddServer}
                   className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 text-white text-xs font-medium cursor-pointer"
                 >
-                  <Plus className="w-3.5 h-3.5" /> Añadir primer servidor
+                  <Plus className="w-3.5 h-3.5" /> {t('fleet.addFirst')}
                 </button>
               )}
             </div>
@@ -633,7 +677,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                           <h2 className="text-sm font-semibold text-slate-900 truncate">{srv.name}</h2>
                           {isLocal && (
                             <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-[10px] font-medium text-slate-700">
-                              Nodo local
+                              {t('fleet.localNode')}
                             </span>
                           )}
                           {srv.region && (
@@ -663,7 +707,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
 
                       <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border shrink-0 ${st.badge}`}>
                         <span className={`w-1.5 h-1.5 rounded-full ${st.dot}`} />
-                        {st.label}
+                        {localizedStatusLabel(srv.status)}
                       </span>
                     </div>
 
@@ -823,7 +867,15 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                       <span className="text-[11px] text-slate-400 tabular-nums">
                         {srv.projectsCount != null ? `${srv.projectsCount} ${srv.projectsCount === 1 ? 'proyecto' : 'proyectos'}` : (metrics?.os || 'Listo')}
                       </span>
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                        <button
+                          type="button"
+                          onClick={() => openDirectPushModal(srv)}
+                          className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium cursor-pointer"
+                        >
+                          <Rocket className="w-3.5 h-3.5" />
+                          <span>{t('fleet.directPushBtn')}</span>
+                        </button>
                         <button
                           type="button"
                           onClick={() => void handleProbe(srv)}
@@ -831,7 +883,7 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
                           className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700 cursor-pointer disabled:opacity-50"
                         >
                           <RefreshCw className={`w-3.5 h-3.5 ${probingId === srv.id ? 'animate-spin' : ''}`} />
-                          <span>Sondear</span>
+                          <span>{t('fleet.probe')}</span>
                         </button>
                         {!isLocal && (
                           <>
@@ -870,9 +922,9 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <div>
-              <h2 className="text-sm font-semibold text-slate-900">Bóveda de llaves SSH (AES-256-GCM)</h2>
+              <h2 className="text-sm font-semibold text-slate-900">{t('fleet.vaultTitle')}</h2>
               <p className="text-xs text-slate-500">
-                Las claves privadas se cifran en reposo con AAD y nunca se devuelven por API. Copia la clave pública a <code className="font-mono">~/.ssh/authorized_keys</code> del VPS.
+                Private keys are encrypted at rest with AAD and never returned by API. Copy public key to <code className="font-mono">~/.ssh/authorized_keys</code>.
               </p>
             </div>
           </div>
@@ -1282,6 +1334,116 @@ export const FleetView: React.FC<FleetViewProps> = ({ onNotify }) => {
               Eliminar llave
             </button>
           </div>
+        </div>
+      </Modal>
+
+      {/* Modal: DirectPush (Zero-Registry SSH OCI v2 Layer-Delta) */}
+      <Modal
+        open={Boolean(directPushServer)}
+        onClose={() => setDirectPushServer(null)}
+        title={`${t('fleet.directPushTitle')}${directPushServer ? ` · ${directPushServer.name}` : ''}`}
+        subtitle={t('fleet.directPushSubtitle')}
+        maxWidthClass="max-w-2xl"
+      >
+        <div className="p-5 space-y-4 text-xs">
+          <form onSubmit={(e) => void handlePlanDirectPush(e)} className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+            <label className="sm:col-span-6 block">
+              <span className="font-medium text-slate-700 block mb-1">{t('fleet.directPushImage')}</span>
+              <input
+                type="text"
+                required
+                value={directPushImage}
+                onChange={(e) => setDirectPushImage(e.target.value)}
+                placeholder="my-app:latest"
+                className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white font-mono text-slate-900"
+              />
+            </label>
+            <label className="sm:col-span-3 block">
+              <span className="font-medium text-slate-700 block mb-1">{t('fleet.directPushPort')}</span>
+              <input
+                type="number"
+                min={1024}
+                max={65535}
+                value={directPushPort}
+                onChange={(e) => setDirectPushPort(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 tabular-nums"
+              />
+            </label>
+            <div className="sm:col-span-3">
+              <button
+                type="submit"
+                disabled={directPushLoading || !directPushImage.trim()}
+                className="culkibo-press w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {directPushLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Rocket className="w-3.5 h-3.5" />}
+                <span>{directPushLoading ? t('fleet.directPushPlanning') : t('fleet.directPushGenerate')}</span>
+              </button>
+            </div>
+          </form>
+
+          {directPushError && (
+            <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700">{directPushError}</div>
+          )}
+
+          {directPushPlan && (
+            <div className="space-y-3.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  {directPushPlan.protocol}
+                </span>
+                <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-slate-700 font-mono text-[10px]">
+                  shell: false
+                </span>
+                <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-slate-700 font-mono text-[10px] tabular-nums">
+                  127.0.0.1:{directPushPlan.tunnel.localPort} → {directPushPlan.tunnel.sshUser}@{directPushPlan.tunnel.sshHost}:{directPushPlan.tunnel.sshPort}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-950 text-slate-100 border border-slate-800 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold">
+                    {t('fleet.directPushCliLabel')}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copy(
+                        `culkibo pussh ${directPushPlan.sourceImage} --server ${directPushPlan.serverId}`,
+                        'dp-cli',
+                        'culkibo pussh copied'
+                      )
+                    }
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium cursor-pointer"
+                  >
+                    {copiedKey === 'dp-cli' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    <span>{t('fleet.directPushCopyCli')}</span>
+                  </button>
+                </div>
+                <code className="block font-mono text-[11px] text-emerald-300 break-all">
+                  culkibo pussh {directPushPlan.sourceImage} --server {directPushPlan.serverId}
+                </code>
+              </div>
+
+              <div className="space-y-2">
+                <div className="text-[11px] font-semibold text-slate-700">{t('fleet.directPushSteps')}</div>
+                {directPushPlan.steps.map((st) => (
+                  <div key={st.id} className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium text-slate-900">
+                        {st.step}. {st.description}
+                      </span>
+                      <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-500 shrink-0">
+                        {st.skippedForLocal ? 'local skip' : 'argv'}
+                      </span>
+                    </div>
+                    <code className="block font-mono text-[11px] text-slate-600 break-all">
+                      {[st.bin, ...st.argv].join(' ')}
+                    </code>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </Modal>
     </div>

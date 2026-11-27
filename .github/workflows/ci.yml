@@ -260,3 +260,87 @@ jobs:
           name: playwright-visual-qa
           path: /tmp/pw-qa-artifacts/*.png
           if-no-files-found: ignore
+
+  docker-smartpack-e2e:
+    name: Docker BuildKit SmartPack E2E & CycloneDX 1.6 SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Generate SmartPack build plan & Dockerfile for minimal Node app and build with BuildKit
+        env:
+          DOCKER_BUILDKIT: '1'
+        run: |
+          APP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$APP_DIR"' EXIT
+          cat > "$APP_DIR/package.json" <<'EOF'
+          {
+            "name": "culkibo-smartpack-smoke",
+            "version": "1.0.0",
+            "scripts": { "start": "node server.js" }
+          }
+          EOF
+          cat > "$APP_DIR/server.js" <<'EOF'
+          const http = require('http');
+          const port = Number(process.env.PORT || 3000);
+          http.createServer((_req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, builder: 'culkibo-smartpack' }));
+          }).listen(port, '0.0.0.0', () => console.log('listening:' + port));
+          EOF
+          node bin/culkibo.js smartpack "$APP_DIR" --dockerfile --write-ignore --json > "$APP_DIR/smartpack.json"
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const p = JSON.parse(fs.readFileSync(path.join(process.argv[1], 'smartpack.json'), 'utf8'));
+            if (!p.ok || p.stack !== 'node' || !p.dockerfile || !p.deterministicHash) {
+              console.error('Unexpected SmartPack payload:', p);
+              process.exit(1);
+            }
+            fs.writeFileSync(path.join(process.argv[1], 'Dockerfile'), p.dockerfile, 'utf8');
+            console.log('SmartPack verified:', { stack: p.stack, hash: p.deterministicHash, wroteIgnore: p.wroteIgnore, limits: p.resourceLimits });
+          " "$APP_DIR"
+          test -f "$APP_DIR/.dockerignore"
+          docker buildx build --load -t culkibo-smartpack-smoke:ci "$APP_DIR"
+          docker run --rm culkibo-smartpack-smoke:ci node -e "console.log('SMARTPACK_IMAGE_RUN_OK')"
+
+      - name: Verify CycloneDX 1.6 SBOM & SHA-256 Provenance generation (npm run release:sbom)
+        run: |
+          OUT_DIR="$(mktemp -d)"
+          trap 'rm -rf "$OUT_DIR"' EXIT
+          npm run release:sbom -- --out-dir "$OUT_DIR" --json
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const outDir = process.argv[1];
+            const sbom = JSON.parse(fs.readFileSync(path.join(outDir, 'sbom.cdx.json'), 'utf8'));
+            if (sbom.bomFormat !== 'CycloneDX' || sbom.specVersion !== '1.6' || !Array.isArray(sbom.components) || sbom.components.length === 0) {
+              throw new Error('Invalid CycloneDX 1.6 SBOM output');
+            }
+            const checksums = fs.readFileSync(path.join(outDir, 'CHECKSUMS.sha256'), 'utf8').trim();
+            if (!checksums || checksums.split(/\r?\n/).length < 5) {
+              throw new Error('CHECKSUMS.sha256 missing expected entries');
+            }
+            console.log('SBOM_AND_CHECKSUMS_OK:', {
+              bomFormat: sbom.bomFormat,
+              specVersion: sbom.specVersion,
+              components: sbom.components.length,
+              checksumFiles: checksums.split(/\r?\n/).length
+            });
+          " "$OUT_DIR"
+
