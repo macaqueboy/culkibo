@@ -23,6 +23,7 @@ import {
   ShieldAlert,
   SlidersHorizontal,
   Trash2,
+  TrendingDown,
   Wrench,
   X,
   XCircle,
@@ -33,6 +34,7 @@ import {
   api,
   apiFetch,
   type DoctorCheck,
+  type FinOpsReportResult,
   type ObservabilityHistoryPoint,
   type ObservabilitySnapshot,
   type OtlpStatusResult,
@@ -418,6 +420,12 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [otlpSaving, setOtlpSaving] = useState(false);
   const [otlpFlushing, setOtlpFlushing] = useState(false);
 
+  // Cycle-6 FinOps & Cloud Savings state
+  const [finops, setFinops] = useState<FinOpsReportResult | null>(null);
+  const [finopsApps, setFinopsApps] = useState<string>('3');
+  const [finopsDbs, setFinopsDbs] = useState<string>('2');
+  const [finopsBusy, setFinopsBusy] = useState(false);
+
   useEffect(() => {
     let active = true;
     api.getOtlpStatus()
@@ -431,8 +439,35 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
       .catch(() => {
         // optional endpoint
       });
+    api.getFinOpsReport()
+      .then((rep) => {
+        if (active && rep) setFinops(rep);
+      })
+      .catch(() => {
+        // optional endpoint
+      });
     return () => { active = false; };
   }, []);
+
+  const handleRecalcFinops = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFinopsBusy(true);
+    try {
+      const cmp = await api.compareCloudFinOps({
+        apps: Math.max(1, Number(finopsApps) || 3),
+        databases: Math.max(0, Number(finopsDbs) || 0),
+      });
+      setFinops((prev) => ({
+        ...(prev || {}),
+        ...cmp,
+        comparison: cmp,
+      }));
+    } catch (err: unknown) {
+      onNotify(err instanceof Error ? err.message : 'FinOps comparison error', 'error');
+    } finally {
+      setFinopsBusy(false);
+    }
+  };
 
   const handleSaveOtlp = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1380,14 +1415,14 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                   className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${doctorRunning ? 'animate-spin' : ''}`} />
-                  {doctorRunning ? 'Analizando…' : 'Ejecutar diagnóstico'}
+                  {doctorRunning ? '…' : t('obs.doctorRun')}
                 </button>
               </div>
             </div>
 
             <div className="divide-y divide-slate-200">
               {!doctor ? (
-                <div className="p-6 text-center text-sm text-slate-500">Ejecutando comprobaciones reales del servidor…</div>
+                <div className="p-6 text-center text-sm text-slate-500">…</div>
               ) : (
                 doctor.checks.map((check) => (
                   <div key={check.id} className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1422,11 +1457,132 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
             </div>
           </section>
 
+          {/* FinOps & Cloud Savings Calculator Card */}
+          {(() => {
+            const cmp = finops?.costComparison || finops?.comparison || finops?.cloudComparison || finops;
+            const annualUsd = cmp?.annualSavingsUsd ?? null;
+            const monthlySelfUsd = cmp?.monthlySelfHostedUsd ?? null;
+            const monthlyCloudUsd = cmp?.monthlyCloudUsd ?? null;
+            const pct = cmp?.savingsPct ?? null;
+            const vpsRaw = cmp?.recommendedVps;
+            const vpsLabel = typeof vpsRaw === 'string'
+              ? vpsRaw
+              : vpsRaw
+                ? (vpsRaw.plan
+                    ? `${vpsRaw.provider} ${vpsRaw.plan}`
+                    : `${vpsRaw.provider} ${vpsRaw.name || 'VPS'}${vpsRaw.vcpus && vpsRaw.ramGb ? ` (${vpsRaw.vcpus} vCPU · ${vpsRaw.ramGb} GB)` : ''}`)
+                : 'Hetzner CX32 (4 vCPU · 8 GB)';
+            const recs = finops?.recommendations || [];
+            const footnote = finops?.pricingFootnotes?.[0] || cmp?.pricingFootnotes?.[0] || cmp?.footnote || t('obs.finopsFootnote');
+            return (
+              <section className="culkibo-surface rounded-2xl overflow-hidden">
+                <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
+                      <TrendingDown className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h2 className="text-sm font-semibold text-slate-900">{t('obs.finopsTitle')}</h2>
+                        {pct != null && (
+                          <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[11px] font-mono font-semibold tabular-nums">
+                            -{pct}% vs Cloud PaaS
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-0.5">{t('obs.finopsDesc')}</p>
+                    </div>
+                  </div>
+                  <form onSubmit={(e) => void handleRecalcFinops(e)} className="flex items-center gap-2 text-xs flex-wrap shrink-0">
+                    <label className="inline-flex items-center gap-1.5 text-slate-600">
+                      <span>Apps</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={200}
+                        value={finopsApps}
+                        onChange={(e) => setFinopsApps(e.target.value)}
+                        className="w-16 px-2 py-1 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 tabular-nums"
+                      />
+                    </label>
+                    <label className="inline-flex items-center gap-1.5 text-slate-600">
+                      <span>DBs</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={50}
+                        value={finopsDbs}
+                        onChange={(e) => setFinopsDbs(e.target.value)}
+                        className="w-16 px-2 py-1 rounded-lg border border-slate-200 bg-white font-mono text-slate-900 tabular-nums"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      disabled={finopsBusy}
+                      className="culkibo-press px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                    >
+                      {finopsBusy ? '…' : t('obs.finopsRecalc')}
+                    </button>
+                  </form>
+                </div>
+
+                <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 tabular-nums">
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.finopsAnnual')}</div>
+                    <div className="text-xl font-semibold text-emerald-700 mt-1">
+                      {annualUsd != null ? `$${annualUsd.toLocaleString('en-US')}/yr` : '—'}
+                    </div>
+                  </div>
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.finopsSelfHosted')}</div>
+                    <div className="text-xl font-semibold text-slate-900 mt-1">
+                      {monthlySelfUsd != null ? `$${monthlySelfUsd}/mo` : '—'}
+                    </div>
+                  </div>
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.finopsCloud')}</div>
+                    <div className="text-xl font-semibold text-slate-900 mt-1">
+                      {monthlyCloudUsd != null ? `$${monthlyCloudUsd}/mo` : '—'}
+                    </div>
+                  </div>
+                  <div className="p-4">
+                    <div className="text-xs text-slate-500">{t('obs.finopsVps')}</div>
+                    <div className="text-xs font-mono font-semibold text-slate-900 mt-1.5 truncate" title={vpsLabel}>
+                      {vpsLabel}
+                    </div>
+                  </div>
+                </div>
+
+                {recs.length > 0 && (
+                  <div className="px-5 py-3 bg-slate-50 border-t border-slate-200 space-y-1.5 text-xs">
+                    {recs.slice(0, 3).map((rec, i) => {
+                      const recText = rec.title || (rec.projectName ? `${rec.projectName}: ${rec.message || rec.type || ''}` : (rec.message || rec.type || 'Right-size workload'));
+                      return (
+                        <div key={rec.id || `${rec.projectId || 'rec'}-${i}`} className="flex items-center justify-between gap-2 flex-wrap">
+                          <span className="font-medium text-slate-800">{recText}</span>
+                          {rec.reclaimableRamMb != null && rec.reclaimableRamMb > 0 && (
+                            <span className="px-2 py-0.5 rounded bg-white border border-slate-200 font-mono text-[11px] text-emerald-700 tabular-nums">
+                              +{rec.reclaimableRamMb} MB RAM
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="px-5 py-2.5 bg-white border-t border-slate-100 text-[11px] text-slate-400">
+                  {footnote}
+                </div>
+              </section>
+            );
+          })()}
+
           {/* Tabla de rutas activas + Live Sync / Caddy */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <section className="lg:col-span-2 bg-white border border-slate-200 rounded-xl overflow-hidden">
               <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
-                <h2 className="text-sm font-semibold text-slate-900">Rutas más activas</h2>
+                <h2 className="text-sm font-semibold text-slate-900">{t('obs.topRoutes')}</h2>
                 <span className="text-xs text-slate-500 font-mono">GET /metrics</span>
               </div>
               {!snapshot || !snapshot.http?.topRoutes?.length ? (

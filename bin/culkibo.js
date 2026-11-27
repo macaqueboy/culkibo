@@ -41,7 +41,12 @@ const svc = {
   get directPushRegistry() { return require('../server/services/directPushRegistry'); },
   get edgeTunnelService() { return require('../server/services/edgeTunnelService'); },
   get supplyChainAttestor() { return require('../server/services/supplyChainAttestor'); },
-  get releaseProvenance() { return require('../scripts/release-provenance'); }
+  get releaseProvenance() { return require('../scripts/release-provenance'); },
+  get shadowReplayService() { return require('../server/services/shadowReplayService'); },
+  get timeMachineService() { return require('../server/services/timeMachineService'); },
+  get finopsOptimizer() { return require('../server/services/finopsOptimizer'); },
+  get metricsCollector() { return require('../server/services/metricsCollector'); },
+  get sleepAdvisor() { return require('../server/services/sleepAdvisor'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2864,15 +2869,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 113,
+            mcpTools: 116,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '113 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'Spatial SVG Topology, SmartPack Build Intelligence & Coolify v4 100% Migration Preview'
+            '116 MCP tools + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'Spatial SVG Topology, SmartPack, Shadow Replay, Time-Machine & FinOps Savings'
           ]
         };
       };
@@ -2947,6 +2952,189 @@ program
       };
       process.once('SIGINT', stopDemo);
       process.once('SIGTERM', stopDemo);
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-6 CLI: timemachine (Whole-Stack Checkpoints) & finops (Savings)
+// ===========================================================================
+
+program
+  .command('timemachine <action> <projectId>')
+  .description('Whole-Stack Time-Machine: list | create | diff | restore checkpoints (Project + Domains + Crons)')
+  .option('--id <cpId>', 'ID del checkpoint objetivo (para restore)')
+  .option('--from <aId>', 'ID del checkpoint origen (para diff)')
+  .option('--to <bId>', 'ID del checkpoint destino (para diff)')
+  .option('-l, --label <label>', 'Etiqueta descriptiva al crear un checkpoint')
+  .option('-r, --reason <reason>', 'Motivo operativo al crear un checkpoint')
+  .option('--apply', 'Aplicar restauración real (por defecto restore corre en dry-run seguro)')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (action, projectId, options) => {
+    try {
+      const act = String(action || '').toLowerCase();
+      if (!['list', 'create', 'diff', 'restore'].includes(act)) {
+        throw new Error(`Acción inválida "${action}". Usa: list | create | diff | restore`);
+      }
+      const remote = getRemoteConfig(options);
+      if (remote.apiUrl) {
+        /** @type {any} */
+        let remoteRes;
+        if (act === 'list') {
+          remoteRes = await remoteApiRequest(remote, 'GET', `/api/projects/${encodeURIComponent(projectId)}/timemachine`);
+        } else if (act === 'create') {
+          remoteRes = await remoteApiRequest(remote, 'POST', `/api/projects/${encodeURIComponent(projectId)}/timemachine`, {
+            ...(options.label ? { label: String(options.label) } : {}),
+            ...(options.reason ? { reason: String(options.reason) } : {})
+          });
+        } else if (act === 'diff') {
+          if (!options.from || !options.to) throw new Error('diff requiere --from <aId> y --to <bId>.');
+          remoteRes = await remoteApiRequest(
+            remote,
+            'GET',
+            `/api/projects/${encodeURIComponent(projectId)}/timemachine/diff?from=${encodeURIComponent(options.from)}&to=${encodeURIComponent(options.to)}`
+          );
+        } else {
+          if (!options.id) throw new Error('restore requiere --id <cpId>.');
+          remoteRes = await remoteApiRequest(
+            remote,
+            'POST',
+            `/api/projects/${encodeURIComponent(projectId)}/timemachine/${encodeURIComponent(options.id)}/restore`,
+            { dryRun: !options.apply }
+          );
+        }
+        if (isJsonMode(options)) return printJson({ ok: true, action: act, projectId, ...remoteRes });
+        printJson(remoteRes);
+        return;
+      }
+
+      const tms = svc.timeMachineService;
+      if (act === 'list') {
+        const checkpoints = tms.listCheckpoints(projectId);
+        const payload = { ok: true, action: 'list', projectId, count: checkpoints.length, checkpoints };
+        if (isJsonMode(options)) return printJson(payload);
+        console.log(`\n\x1b[36m🕰️  Culkibo Time-Machine — ${projectId} (${checkpoints.length} checkpoints)\x1b[0m`);
+        if (checkpoints.length === 0) {
+          console.log('   (Sin checkpoints todavía. Ejecuta `culkibo timemachine create ' + projectId + ' --label pre-release`)\n');
+        } else {
+          console.table(checkpoints.map((c) => ({
+            ID: c.id,
+            Label: c.label || '—',
+            Image: c.state?.imageTag || '—',
+            EnvKeys: c.counts?.envVars ?? 0,
+            Domains: c.counts?.domains ?? 0,
+            CreatedAt: c.createdAt
+          })));
+        }
+      } else if (act === 'create') {
+        const checkpoint = tms.createCheckpoint(projectId, {
+          ...(options.label ? { label: String(options.label) } : {}),
+          ...(options.reason ? { reason: String(options.reason) } : {}),
+          actor: 'cli'
+        });
+        const payload = { ok: true, action: 'create', projectId, checkpoint };
+        if (isJsonMode(options)) return printJson(payload);
+        console.log(`\n\x1b[32m✅ Checkpoint Time-Machine creado:\x1b[0m ${checkpoint.id} (${checkpoint.label || 'manual'})\n`);
+      } else if (act === 'diff') {
+        if (!options.from || !options.to) {
+          throw new Error('diff requiere --from <aId> y --to <bId>.');
+        }
+        const diff = tms.diffCheckpoints(projectId, String(options.from), String(options.to));
+        const payload = { ok: true, action: 'diff', projectId, fromId: String(options.from), toId: String(options.to), diff };
+        if (isJsonMode(options)) return printJson(payload);
+        console.log(`\n\x1b[36m🔍 Time-Machine Diff (${options.from} → ${options.to})\x1b[0m`);
+        printJson(diff);
+      } else {
+        if (!options.id) {
+          throw new Error('restore requiere --id <cpId> (añade --apply para ejecutar restauración real).');
+        }
+        const dryRun = !options.apply;
+        const result = await tms.restoreCheckpoint(projectId, String(options.id), { dryRun, actor: 'cli' });
+        const payload = {
+          ...result,
+          ok: true,
+          action: 'restore',
+          projectId,
+          checkpointId: String(options.id),
+          dryRun
+        };
+        if (isJsonMode(options)) return printJson(payload);
+        if (dryRun) {
+          console.log(`\n\x1b[33m🧪 Time-Machine Restore Dry-Run (sin mutaciones)\x1b[0m — checkpoint ${options.id}`);
+          console.log('   Añade `--apply` para restaurar atómicamente Proyecto + Dominios + Crons (crea checkpoint de seguridad automático).\n');
+        } else {
+          console.log(`\n\x1b[32m✅ Time-Machine Restore completado:\x1b[0m ${projectId} → ${options.id}\n`);
+        }
+      }
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('finops')
+  .description('FinOps & Right-Sizing: analiza tus apps y calcula el ahorro anual honesto vs Vercel Pro, Railway, Render y Managed Postgres')
+  .option('--apps <n>', 'Número de aplicaciones para la comparativa Cloud vs Self-Hosted')
+  .option('--dbs <n>', 'Número de bases de datos gestionadas para la comparativa')
+  .option('--ram-mb <mb>', 'RAM media estimada por app en MB', '512')
+  .option('--bandwidth-gb <gb>', 'Tráfico mensual saliente estimado en GB', '250')
+  .option('--json', 'Salida JSON estructurada')
+  .action(async (options) => {
+    try {
+      const finops = svc.finopsOptimizer;
+      const projects = svc.projectManager.getAll();
+      const databases = svc.databaseManager.list();
+      const metricsHistory = typeof svc.metricsCollector.getHistory === 'function'
+        ? svc.metricsCollector.getHistory()
+        : [];
+      let sleepCandidates = [];
+      try {
+        if (typeof svc.sleepAdvisor.getSleepCandidates === 'function') {
+          sleepCandidates = svc.sleepAdvisor.getSleepCandidates({}) || [];
+        }
+      } catch (e) {}
+
+      const analysis = finops.analyzeFleetAndProjects({
+        projects,
+        databases,
+        metricsHistory,
+        sleepCandidates
+      });
+
+      const appsCount = options.apps !== undefined
+        ? Math.max(0, parseInt(String(options.apps), 10) || 0)
+        : Math.max(1, projects.length);
+      const dbsCount = options.dbs !== undefined
+        ? Math.max(0, parseInt(String(options.dbs), 10) || 0)
+        : databases.length;
+      const avgRamMbPerApp = Math.max(64, parseInt(String(options.ramMb || '512'), 10) || 512);
+      const monthlyBandwidthGb = Math.max(0, Number(options.bandwidthGb || 250) || 0);
+
+      const comparison = finops.compareCloudCosts({
+        apps: appsCount,
+        databases: dbsCount,
+        avgRamMbPerApp,
+        monthlyBandwidthGb
+      });
+
+      const payload = {
+        ok: true,
+        inputs: { apps: appsCount, databases: dbsCount, avgRamMbPerApp, monthlyBandwidthGb },
+        analysis,
+        comparison
+      };
+
+      if (isJsonMode(options)) return printJson(payload);
+
+      console.log(`\n\x1b[32m💰 Culkibo FinOps — Cloud vs Self-Hosted Savings (${appsCount} app(s), ${dbsCount} DB(s))\x1b[0m`);
+      console.log(`   Self-Hosted est.:  $${comparison.monthlySelfHostedUsd}/mo${comparison.recommendedVps?.name ? ` (${comparison.recommendedVps.provider} ${comparison.recommendedVps.name})` : ''}`);
+      console.log(`   Cloud PaaS est.:   $${comparison.monthlyCloudUsd}/mo (Vercel Pro / Railway / Render + Managed DB)`);
+      console.log(`   Annual savings:    \x1b[32m$${comparison.annualSavingsUsd}/yr (${comparison.savingsPct}% saved)\x1b[0m`);
+      if (Array.isArray(analysis?.recommendations) && analysis.recommendations.length > 0) {
+        console.log(`   Right-sizing tips: ${analysis.recommendations.length} recomendación(es) detectadas`);
+      }
+      console.log('');
     } catch (err) {
       failCli(err, options);
     }

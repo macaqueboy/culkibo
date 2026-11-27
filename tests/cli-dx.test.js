@@ -562,12 +562,65 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 113);
+    assert.strictEqual(demoJson.datasets.mcpTools, 116);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
     assert.strictEqual(JSON.parse(demoCustomPort.stdout).url, 'http://127.0.0.1:4044/?demo=1&lang=en&theme=dark');
     console.log(`  ✓ Pioneer CLI Cycle-4 verificado (culkibo verify SHA-256/SLSA-DSSE + tamper detect, culkibo demo --json en ${demoJson.bootMs} ms)`);
+
+    // 10. Pioneer Cycle-6 CLI: `culkibo finops --json` y `culkibo timemachine <list|create|diff|restore> --json`
+    const finopsCli = await runCli(['finops', '--apps', '5', '--dbs', '2', '--json'], { env: isolatedEnv });
+    assert.strictEqual(finopsCli.status, 0, `culkibo finops --json falló: ${finopsCli.stderr} ${finopsCli.stdout}`);
+    const finopsJson = JSON.parse(finopsCli.stdout);
+    assert.strictEqual(finopsJson.ok, true);
+    assert.strictEqual(finopsJson.inputs.apps, 5);
+    assert.strictEqual(finopsJson.inputs.databases, 2);
+    assert.ok(finopsJson.comparison && finopsJson.comparison.annualSavingsUsd > 0);
+    assert.ok(finopsJson.comparison.savingsPct > 0);
+    assert.ok(finopsJson.analysis && finopsJson.analysis.ok === true);
+
+    // Prepare isolated project in dataRoot/projects.json (matching CULKIBO_DATA_DIR) for CLI timemachine subcommands
+    const tmProjectId = 'proj_cli_tm_1';
+    const projectsJsonPath = path.join(dataRoot, 'projects.json');
+    const existingProjects = fs.existsSync(projectsJsonPath) ? JSON.parse(fs.readFileSync(projectsJsonPath, 'utf8')) : [];
+    const nextProjects = Array.isArray(existingProjects) ? existingProjects : [];
+    if (!nextProjects.some((p) => p && p.id === tmProjectId)) {
+      nextProjects.push({
+        id: tmProjectId,
+        name: 'CLI TimeMachine App',
+        description: 'v1 baseline',
+        memoryMb: 512,
+        envVars: { MODE: 'prod' },
+        resources: []
+      });
+      fs.writeFileSync(projectsJsonPath, JSON.stringify(nextProjects, null, 2), 'utf8');
+    }
+
+    const tmListEmpty = await runCli(['timemachine', 'list', tmProjectId, '--json'], { env: isolatedEnv });
+    assert.strictEqual(tmListEmpty.status, 0, `culkibo timemachine list falló: ${tmListEmpty.stderr} ${tmListEmpty.stdout}`);
+    const tmListEmptyJson = JSON.parse(tmListEmpty.stdout);
+    assert.strictEqual(tmListEmptyJson.ok, true);
+    assert.strictEqual(tmListEmptyJson.action, 'list');
+    assert.strictEqual(tmListEmptyJson.count, 0);
+
+    const tmCreate = await runCli(['timemachine', 'create', tmProjectId, '--label', 'cli-cp-1', '--json'], { env: isolatedEnv });
+    assert.strictEqual(tmCreate.status, 0, `culkibo timemachine create falló: ${tmCreate.stderr} ${tmCreate.stdout}`);
+    const tmCreateJson = JSON.parse(tmCreate.stdout);
+    assert.strictEqual(tmCreateJson.ok, true);
+    assert.ok(tmCreateJson.checkpoint && tmCreateJson.checkpoint.id.startsWith('tm_'));
+
+    const tmListOne = await runCli(['timemachine', 'list', tmProjectId, '--json'], { env: isolatedEnv });
+    assert.strictEqual(tmListOne.status, 0, tmListOne.stderr);
+    assert.strictEqual(JSON.parse(tmListOne.stdout).count, 1);
+
+    const tmRestoreDry = await runCli(['timemachine', 'restore', tmProjectId, '--id', tmCreateJson.checkpoint.id, '--json'], { env: isolatedEnv });
+    assert.strictEqual(tmRestoreDry.status, 0, `culkibo timemachine restore dry-run falló: ${tmRestoreDry.stderr} ${tmRestoreDry.stdout}`);
+    const tmRestoreDryJson = JSON.parse(tmRestoreDry.stdout);
+    assert.strictEqual(tmRestoreDryJson.ok, true);
+    assert.strictEqual(tmRestoreDryJson.dryRun, true);
+    assert.strictEqual(tmRestoreDryJson.restored, false);
+    console.log(`  ✓ Pioneer CLI Cycle-6 verificado (culkibo finops $${finopsJson.comparison.annualSavingsUsd}/yr, culkibo timemachine list/create/dryRun-restore)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

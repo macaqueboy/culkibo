@@ -84,6 +84,7 @@ interface DemoState {
   servers: any[];
   sshKeys: any[];
   installations: any[];
+  checkpoints: Record<string, any[]>;
 }
 
 function createInitialDemoState(): DemoState {
@@ -475,6 +476,36 @@ function createInitialDemoState(): DemoState {
         createdAt: t3,
       },
     ],
+    checkpoints: {
+      proj_acme_web: [
+        {
+          id: 'cp_demo_8c4f1a',
+          projectId: 'proj_acme_web',
+          label: 'Pre-v1.2.0 SmartPack cutover',
+          actor: 'claude-code',
+          sha256: '8c4f1a9e2b7d03f561a4c9e8d20f7b1a5c3e9d01f2a4b6c8d0e1f2a3b4c5d6e7',
+          imageTag: 'culkibo/acme-saas-web:sha-8c4f1a',
+          envCount: 5,
+          domainsCount: 2,
+          cronsCount: 1,
+          dbLinksCount: 2,
+          createdAt: t1,
+        },
+        {
+          id: 'cp_demo_5b12d0',
+          projectId: 'proj_acme_web',
+          label: 'Initial production release',
+          actor: 'pablo',
+          sha256: '5b12d04a7e9f12c384b6d0e1f3a5c7e90123456789abcdef0123456789abcdef',
+          imageTag: 'culkibo/acme-saas-web:sha-5b12d0',
+          envCount: 4,
+          domainsCount: 1,
+          cronsCount: 1,
+          dbLinksCount: 1,
+          createdAt: t3,
+        },
+      ],
+    },
   };
 }
 
@@ -861,9 +892,125 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       headers: { 'x-culkibo-runtime': 'micro-wasm-worker', 'content-type': 'application/json' },
       result: argVal * 2 + 1,
       body: JSON.stringify({ ok: true, input: argVal, output: argVal * 2 + 1, sandbox: 'worker_threads' }),
-      execMs: 0.63,
+      execMs: 0.56,
       memoryBytes: 65536,
       engine: 'node-webassembly-isolated',
+    });
+  }
+
+  // --- Cycle-6 Whole-Stack Time-Machine, Shadow Replay Gate & FinOps ---
+  const tmListMatch = pathname.match(/^\/api\/projects\/([^/]+)\/timemachine$/);
+  if (tmListMatch) {
+    const pid = decodeURIComponent(tmListMatch[1]);
+    const list = s.checkpoints[pid] || s.checkpoints.proj_acme_web || [];
+    if (method === 'POST') {
+      const proj = s.projects.find((p) => p.id === pid) || s.projects[0];
+      const envCount = Object.keys(proj?.envVars || {}).length;
+      const domainsCount = (proj?.domains || []).length;
+      const dbLinksCount = (proj?.linkedDatabaseIds || []).length;
+      const cp = {
+        id: `cp_${Date.now().toString(36)}`,
+        projectId: pid,
+        label: String(body.label || 'Manual whole-stack checkpoint'),
+        actor: String(body.actor || 'sandbox-user'),
+        sha256: `${Math.random().toString(16).slice(2, 18)}${'a4f9c2e1b8d0'.repeat(4)}`.slice(0, 64),
+        imageTag: proj?.resources?.[0]?.image || `culkibo/${pid}:latest`,
+        envCount,
+        domainsCount,
+        cronsCount: 1,
+        dbLinksCount,
+        counts: { envVars: envCount, domains: domainsCount, crons: 1, dbLinks: dbLinksCount },
+        createdAt: nowIso(),
+      };
+      s.checkpoints[pid] = [cp, ...list];
+      return jsonResponse({ checkpoint: cp, ...cp }, 201);
+    }
+    return jsonResponse({ checkpoints: list });
+  }
+  const tmRestoreMatch = pathname.match(/^\/api\/projects\/([^/]+)\/timemachine\/([^/]+)\/restore$/);
+  if (tmRestoreMatch && method === 'POST') {
+    const cpId = decodeURIComponent(tmRestoreMatch[2]);
+    return jsonResponse({
+      dryRun: body.dryRun !== false,
+      restored: body.dryRun === false,
+      checkpointId: cpId,
+      safetyCheckpointId: body.dryRun === false ? `cp_safety_${Date.now().toString(36)}` : null,
+      diff: { changed: true, imageChanged: true, envKeysAdded: [], envKeysRemoved: [], envKeysChanged: ['NEXT_PUBLIC_API_URL'], domainsChanged: false, cronsChanged: false },
+      mutations: ['Restore container image digest to checkpoint revision', 'Reconcile HMAC env fingerprint & Caddy HTTPS routes (0-downtime)'],
+    });
+  }
+  const srMatch = pathname.match(/^\/api\/projects\/([^/]+)\/shadow-replay$/);
+  if (srMatch && method === 'POST') {
+    return jsonResponse({
+      id: `sr_${Date.now().toString(36)}`,
+      pass: true,
+      verdict: 'PROMOTE',
+      blockers: [],
+      summary: {
+        totalRequests: 24,
+        baselineP95Ms: 14.2,
+        candidateP95Ms: 15.1,
+        baselineLatencyMs: { p50: 8.4, p95: 14.2, p99: 19.6, avg: 9.2 },
+        candidateLatencyMs: { p50: 8.8, p95: 15.1, p99: 20.4, avg: 9.7 },
+        latencyRatio: 1.06,
+        latencyRatioP95: 1.06,
+        delta5xx: 0,
+        statusMismatchPct: 0,
+        schemaDriftCount: 0,
+        breakingSchemaDriftCount: 0,
+      },
+      createdAt: nowIso(),
+    });
+  }
+  if (pathname === '/api/finops/report' || pathname === '/api/finops/compare') {
+    const apps = Number(body.apps) || s.projects.length;
+    const dbs = Number(body.databases) || s.databases.length;
+    const monthlyCloudUsd = Math.round(apps * 48 + dbs * 32 + 20);
+    const monthlySelfHostedUsd = apps + dbs <= 6 ? 8.29 : 17.99;
+    const monthlySavingsUsd = Math.round(Math.max(0, monthlyCloudUsd - monthlySelfHostedUsd) * 100) / 100;
+    const annualSavingsUsd = Math.round(monthlySavingsUsd * 12);
+    const savingsPct = monthlyCloudUsd > 0 ? Math.round((monthlySavingsUsd / monthlyCloudUsd) * 1000) / 10 : 0;
+    const footnote = 'Published standard cloud tiers (Vercel Pro, Railway, Render, Managed Postgres) vs Hetzner Cloud CX32.';
+    const comparison = {
+      monthlyCloudUsd,
+      monthlySelfHostedUsd,
+      monthlySavingsUsd,
+      annualSavingsUsd,
+      savingsPct,
+      recommendedVps: {
+        provider: 'Hetzner',
+        name: apps + dbs <= 6 ? 'CX32' : 'CX42',
+        plan: apps + dbs <= 6 ? 'CX32 (4 vCPU · 8 GB RAM)' : 'CX42 (8 vCPU · 16 GB RAM)',
+        vcpus: apps + dbs <= 6 ? 4 : 8,
+        ramGb: apps + dbs <= 6 ? 8 : 16,
+        monthlyUsd: monthlySelfHostedUsd,
+        totalMonthlyUsd: monthlySelfHostedUsd,
+      },
+      cloudBreakdown: [
+        { provider: 'Vercel Pro + Compute', monthlyUsd: Math.round(apps * 28 + 20) },
+        { provider: 'Railway / Render Workers', monthlyUsd: Math.round(apps * 20) },
+        { provider: 'Managed Postgres + Valkey', monthlyUsd: Math.round(dbs * 32) },
+      ],
+      footnote,
+      pricingFootnotes: [footnote],
+    };
+    return jsonResponse({
+      ...comparison,
+      costComparison: comparison,
+      comparison,
+      recommendations: [
+        {
+          id: 'fin_1',
+          projectId: 'proj_ai_worker',
+          projectName: 'ai-worker-py',
+          type: 'right_size_ram',
+          title: 'Right-size ai-worker-py memory cap (512 MB → 256 MB) + Scale-to-Zero',
+          message: 'Peak p95 RSS over 7d was 118 MB; enabling auto-sleep reclaims 256 MB RAM.',
+          detail: 'Peak p95 RSS over 7d was 118 MB; enabling auto-sleep reclaims 256 MB RAM.',
+          reclaimableRamMb: 256,
+          estimatedMonthlySavingsUsd: 18,
+        },
+      ],
     });
   }
   if (pathname.match(/^\/api\/projects\/[^/]+\/sync\/status$/)) {

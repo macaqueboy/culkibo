@@ -4190,6 +4190,92 @@ export const api = {
       'Could not invoke Micro-Wasm handler'
     );
   },
+
+  // --- Cycle-6 Cockpit Helpers (Whole-Stack Time-Machine, Shadow Replay Gate, FinOps) ---
+
+  async listTimeMachine(projectId: string): Promise<{ checkpoints: TimeMachineCheckpoint[] }> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/timemachine`),
+      'Could not load Time-Machine checkpoints'
+    );
+    return Array.isArray(data) ? { checkpoints: data } : { checkpoints: data?.checkpoints || [] };
+  },
+
+  async createTimeMachineCheckpoint(
+    projectId: string,
+    payload: { label?: string; actor?: string } = {}
+  ): Promise<TimeMachineCheckpoint> {
+    const data = await jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/timemachine`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not create Time-Machine checkpoint'
+    );
+    return data?.checkpoint || data;
+  },
+
+  async restoreTimeMachineCheckpoint(
+    projectId: string,
+    checkpointId: string,
+    opts: { dryRun?: boolean } = { dryRun: true }
+  ): Promise<TimeMachineRestoreResult> {
+    return jsonOrThrow(
+      await apiFetch(
+        `${API_BASE}/projects/${encodeURIComponent(projectId)}/timemachine/${encodeURIComponent(checkpointId)}/restore`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dryRun: opts.dryRun !== false }),
+        }
+      ),
+      'Could not run Time-Machine restore'
+    );
+  },
+
+  async runShadowReplay(
+    projectId: string,
+    payload: {
+      baselineUrl?: string;
+      candidateUrl?: string;
+      allowLoopback?: boolean;
+      requests?: Array<{ method?: string; path: string; headers?: Record<string, string>; body?: string }>;
+      gate?: { max5xxDelta?: number; maxLatencyRatio?: number; maxStatusMismatchPct?: number; failOnSchemaDrift?: boolean };
+    } = {}
+  ): Promise<ShadowReplayReport> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/shadow-replay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not execute Shadow Traffic Replay'
+    );
+  },
+
+  async getFinOpsReport(): Promise<FinOpsReportResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/finops/report`),
+      'Could not load FinOps savings report'
+    );
+  },
+
+  async compareCloudFinOps(payload: {
+    apps?: number;
+    databases?: number;
+    avgRamMbPerApp?: number;
+    monthlyBandwidthGb?: number;
+  }): Promise<FinOpsComparison> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/finops/compare`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Could not calculate cloud savings comparison'
+    );
+  },
 };
 
 // =====================================================================
@@ -4674,4 +4760,148 @@ export interface WasmInvokeResult {
   execMs: number;
   memoryBytes?: number;
   engine?: string;
+}
+
+export interface TimeMachineCheckpoint {
+  id: string;
+  projectId: string;
+  label?: string;
+  actor?: string;
+  sha256: string;
+  imageTag?: string | null;
+  envCount?: number;
+  domainsCount?: number;
+  cronsCount?: number;
+  dbLinksCount?: number;
+  counts?: { envVars?: number; envKeys?: number; domains?: number; crons?: number; dbLinks?: number; databases?: number };
+  state?: {
+    imageTag?: string | null;
+    envCount?: number;
+    domains?: unknown[];
+    crons?: unknown[];
+    dbLinks?: string[];
+  };
+  snapshot?: {
+    imageTag?: string | null;
+    envKeys?: string[];
+    domains?: unknown[];
+    crons?: unknown[];
+    linkedDatabaseIds?: string[];
+  };
+  createdAt: string;
+}
+
+export interface TimeMachineRestoreMutationsObject {
+  projectFields?: string[];
+  imageTagChanged?: boolean;
+  envKeysAdded?: string[];
+  envKeysRemoved?: string[];
+  envKeysChanged?: string[];
+  domainsToAdd?: string[];
+  domainsToRemove?: string[];
+  domainsToUpdate?: string[];
+  cronsToAdd?: string[];
+  cronsToRemove?: string[];
+  cronsToUpdate?: string[];
+}
+
+export interface TimeMachineRestoreResult {
+  dryRun: boolean;
+  restored?: boolean;
+  checkpointId: string;
+  safetyCheckpointId?: string | null;
+  summary?: string;
+  diff?: {
+    changed?: boolean;
+    imageChanged?: boolean;
+    imageTag?: { changed?: boolean };
+    configChanges?: Record<string, unknown>;
+    envKeysAdded?: string[];
+    envKeysRemoved?: string[];
+    envKeysChanged?: string[];
+    domainsChanged?: boolean;
+    cronsChanged?: boolean;
+  };
+  mutations?: string[] | TimeMachineRestoreMutationsObject;
+}
+
+export type ShadowReplayBlocker = string | {
+  code?: string;
+  message?: string;
+  actual?: number;
+  threshold?: number;
+};
+
+export interface ShadowReplayReport {
+  id?: string;
+  pass: boolean;
+  verdict: 'PROMOTE' | 'BLOCK_CUTOVER' | string;
+  blockers: ShadowReplayBlocker[];
+  summary: {
+    totalRequests: number;
+    baselineP95Ms?: number;
+    candidateP95Ms?: number;
+    baselineLatencyMs?: { p50?: number; p95?: number; p99?: number; avg?: number };
+    candidateLatencyMs?: { p50?: number; p95?: number; p99?: number; avg?: number };
+    latencyRatio?: number;
+    latencyRatioP95?: number;
+    delta5xx?: number;
+    statusMismatchPct?: number;
+    schemaDriftCount?: number;
+    breakingSchemaDriftCount?: number;
+  };
+  createdAt?: string;
+}
+
+export interface FinOpsRecommendation {
+  id?: string;
+  projectId?: string;
+  projectName?: string;
+  kind?: string;
+  type?: string;
+  severity?: string;
+  title?: string;
+  detail?: string;
+  message?: string;
+  currentMemoryMb?: number;
+  observedPeakRamMb?: number;
+  recommendedMemoryMb?: number;
+  reclaimableRamMb?: number;
+  estimatedMonthlySavingsUsd?: number;
+}
+
+export interface FinOpsComparison {
+  monthlyCloudUsd: number;
+  monthlySelfHostedUsd: number;
+  monthlySavingsUsd?: number;
+  annualSavingsUsd: number;
+  savingsPct: number;
+  recommendedVps?: {
+    provider: string;
+    name?: string;
+    plan?: string;
+    vcpus?: number;
+    ramGb?: number;
+    monthlyUsd: number;
+    totalMonthlyUsd?: number;
+    nodeCount?: number;
+  } | string;
+  cloudBreakdown?: Array<{ provider: string; label?: string; monthlyUsd: number }> | Record<string, number>;
+  providers?: Record<string, number>;
+  footnote?: string;
+  pricingFootnotes?: string[];
+}
+
+export interface FinOpsReportResult {
+  costComparison?: FinOpsComparison;
+  comparison?: FinOpsComparison;
+  cloudComparison?: FinOpsComparison;
+  monthlyCloudUsd?: number;
+  monthlySelfHostedUsd?: number;
+  annualSavingsUsd?: number;
+  savingsPct?: number;
+  recommendedVps?: FinOpsComparison['recommendedVps'];
+  recommendations?: FinOpsRecommendation[];
+  footnote?: string;
+  pricingFootnotes?: string[];
 }

@@ -80,6 +80,9 @@ function getOtlpExporter() { return _lazyV2.otlp || (_lazyV2.otlp = require('../
 function getSupplyChainAttestor() { return _lazyV2.attestor || (_lazyV2.attestor = require('../services/supplyChainAttestor')); }
 function getMigrationRunner() { return _lazyV2.migrations || (_lazyV2.migrations = require('../services/migrationRunner')); }
 function getWasmMicroRunner() { return _lazyV2.wasm || (_lazyV2.wasm = require('../services/wasmMicroRunner')); }
+function getShadowReplayService() { return _lazyV2.shadow || (_lazyV2.shadow = require('../services/shadowReplayService')); }
+function getTimeMachineService() { return _lazyV2.timemachine || (_lazyV2.timemachine = require('../services/timeMachineService')); }
+function getFinOpsOptimizer() { return _lazyV2.finops || (_lazyV2.finops = require('../services/finopsOptimizer')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -6866,6 +6869,157 @@ router.post('/projects/:id/wasm/invoke', heavyOpLimiter, async (req, res) => {
     }
     const result = await wasmRunner.invokeProject(project, body);
     res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #6 PIONEER LAZY ROUTES (Shadow Replay, Whole-Stack Time-Machine, FinOps Optimizer) ---
+
+router.post('/projects/:id/shadow-replay', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = await getShadowReplayService().runReplay({
+      ...body,
+      projectId: project.id
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/projects/:id/shadow-replay/history', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const replays = getShadowReplayService().listReplays(project.id);
+    res.json({ projectId: project.id, replays });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/projects/:id/timemachine', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const checkpoints = getTimeMachineService().listCheckpoints(project.id);
+    res.json({ projectId: project.id, checkpoints });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/timemachine', heavyOpLimiter, (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const principal = getPrincipal(req);
+    const checkpoint = getTimeMachineService().createCheckpoint(project.id, {
+      actor: principal.email || principal.kind || 'operator',
+      ...body
+    });
+    res.status(201).json(checkpoint);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/projects/:id/timemachine/diff', (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:read');
+    if (!project) return;
+    const fromId = String(req.query.from || '').trim();
+    const toId = String(req.query.to || '').trim();
+    if (!fromId || !toId) {
+      return res.status(400).json({ error: 'Indica los parámetros query `from` y `to` para comparar checkpoints' });
+    }
+    const diff = getTimeMachineService().diffCheckpoints(project.id, fromId, toId);
+    res.json(diff);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/timemachine/:checkpointId/restore', heavyOpLimiter, async (req, res) => {
+  try {
+    const project = assertProjectAccess(req, res, req.params.id, 'projects:write');
+    if (!project) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const principal = getPrincipal(req);
+    const dryRun = body.dryRun !== false;
+    const result = await getTimeMachineService().restoreCheckpoint(project.id, req.params.checkpointId, {
+      ...body,
+      dryRun,
+      actor: principal.email || principal.kind || 'operator'
+    });
+    res.json(result);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/finops/report', (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    const allProjects = projectManager.getAll();
+    const projects = principal.isSuperAdmin
+      ? allProjects
+      : getTeamManager().filterProjects(principal, allProjects, { redact: true });
+    const allowedIds = new Set(projects.map((p) => p.id));
+    const allDbs = databaseManager.list();
+    const databases = principal.isSuperAdmin
+      ? allDbs
+      : allDbs.filter((d) => d.projectId && allowedIds.has(d.projectId));
+
+    /** @type {any[]} */
+    let metricsHistorySamples = [];
+    try {
+      const mh = getMetricsHistory();
+      if (mh && typeof mh.getHistory === 'function') {
+        const h = mh.getHistory({ limit: 60 });
+        metricsHistorySamples = Array.isArray(h) ? h : (Array.isArray(h && h.samples) ? h.samples : []);
+      }
+    } catch (e) {}
+
+    /** @type {any[]} */
+    let sleepCandidates = [];
+    try {
+      const adv = getSleepAdvisor();
+      if (adv && typeof adv.analyze === 'function') {
+        const analysis = adv.analyze();
+        if (analysis && Array.isArray(analysis.recommendations)) {
+          sleepCandidates = principal.isSuperAdmin
+            ? analysis.recommendations
+            : analysis.recommendations.filter((r) => r && r.projectId && allowedIds.has(r.projectId));
+        }
+      }
+    } catch (e) {}
+
+    const report = getFinOpsOptimizer().analyzeFleetAndProjects({
+      projects,
+      databases,
+      metricsHistory: metricsHistorySamples,
+      sleepCandidates
+    });
+    res.json(report);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/finops/compare', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const finops = getFinOpsOptimizer();
+    const comparison = typeof finops.compareCloudCosts === 'function'
+      ? finops.compareCloudCosts(body)
+      : finops.analyzeFleetAndProjects(body);
+    res.json(comparison);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

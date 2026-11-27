@@ -37,6 +37,8 @@ const testCoolifyE2EReplay = require('./coolify-e2e-replay.test');
 const testReleaseAndMcpE2E = require('./release-and-mcp-e2e.test');
 const testOtlpAndSlsa = require('./otlp-and-slsa.test');
 const testMigrationsAndWasm = require('./migrations-and-wasm.test');
+const testShadowReplay = require('./shadow-replay.test');
+const testTimeMachineFinOps = require('./timemachine-finops.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -99,6 +101,8 @@ async function runAll() {
     { name: 'Release Provenance (CycloneDX 1.6 SBOM / SHA-256) & External MCP Stdio E2E', fn: testReleaseAndMcpE2E },
     { name: 'Zero-Dep OTLP/HTTP JSON Exporter & SLSA v1.1 Ed25519 DSSE Attestation', fn: testOtlpAndSlsa },
     { name: 'Atomic Single-Leader DB Migrations, Per-PR Schema Isolation & Micro-Wasm Edge Runtime', fn: testMigrationsAndWasm },
+    { name: 'Shadow Traffic Replay & Automatic Cutover Regression Gate', fn: testShadowReplay },
+    { name: 'Whole-Stack Time-Machine Checkpoints, Cloud-vs-Self-Hosted FinOps & Coolify v4 Parity', fn: testTimeMachineFinOps },
   ];
 
   for (const suite of suites) {

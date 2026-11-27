@@ -42,7 +42,10 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'edgeTunnelService',
   'topologyService',
   'supplyChainAttestor',
-  'otlpExporter'
+  'otlpExporter',
+  'shadowReplayService',
+  'timeMachineService',
+  'finopsOptimizer'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -82,7 +85,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_team_invite_member',
   'culkibo_rbac_manage_token',
   'culkibo_edge_tunnel',
-  'culkibo_otlp_status'
+  'culkibo_otlp_status',
+  'culkibo_shadow_replay'
 ]);
 
 /** @type {Record<string, number>} */
@@ -149,7 +153,9 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_deploy_freeze',
     'culkibo_env_list',
     'culkibo_env_promote',
-    'culkibo_verify_attestation'
+    'culkibo_verify_attestation',
+    'culkibo_shadow_replay',
+    'culkibo_time_machine'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -175,6 +181,9 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_uptime_list_monitors',
     'culkibo_status_page_manage',
     'culkibo_cost_advisor',
+    'culkibo_finops_report',
+    'culkibo_shadow_replay',
+    'culkibo_time_machine',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -251,7 +260,15 @@ const SEARCH_SYNONYMS = Object.freeze({
   tempo: ['otlp', 'observability', 'traces'],
   signoz: ['otlp', 'observability', 'traces', 'metrics'],
   honeycomb: ['otlp', 'observability', 'traces'],
-  traces: ['otlp', 'observability', 'metrics']
+  traces: ['otlp', 'observability', 'metrics'],
+  shadow: ['replay', 'canary', 'cutover', 'regression', 'traffic', 'baseline', 'candidate'],
+  replay: ['shadow', 'canary', 'cutover', 'regression', 'traffic'],
+  timemachine: ['checkpoint', 'snapshot', 'restore', 'diff', 'rollback', 'stack'],
+  checkpoint: ['timemachine', 'snapshot', 'restore', 'diff', 'rollback'],
+  finops: ['cost', 'savings', 'vercel', 'railway', 'render', 'vps', 'hetzner', 'rightsizing', 'advisor'],
+  savings: ['finops', 'cost', 'vercel', 'railway', 'render', 'vps', 'advisor'],
+  vercel: ['finops', 'cost', 'savings', 'compare'],
+  railway: ['finops', 'cost', 'savings', 'compare']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -397,7 +414,11 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_edge_tunnel: { minRole: 'admin', scope: 'ingress:write', projectScoped: false, secretSensitive: true },
   // MCP 2026 Cycle-4: SLSA v1.1 Attestation Verification & Native OTLP/HTTP Export (+2 = 113)
   culkibo_verify_attestation: { minRole: 'viewer', scope: 'security:read', projectScoped: true },
-  culkibo_otlp_status: { minRole: 'admin', scope: 'observability:write', projectScoped: false, secretSensitive: true }
+  culkibo_otlp_status: { minRole: 'admin', scope: 'observability:write', projectScoped: false, secretSensitive: true },
+  // MCP 2026 Cycle-6: Shadow Traffic Replay, Whole-Stack Time-Machine & FinOps Savings (+3 = 116)
+  culkibo_shadow_replay: { minRole: 'developer', scope: 'deployments:write', projectScoped: true, secretSensitive: true },
+  culkibo_time_machine: { minRole: 'developer', scope: 'deployments:write', projectScoped: true, secretSensitive: true },
+  culkibo_finops_report: { minRole: 'viewer', scope: 'advisor:read', projectScoped: false }
 });
 
 /**
@@ -3145,6 +3166,111 @@ class McpServer extends EventEmitter {
             serviceName: { type: 'string', minLength: 1, maxLength: 128, description: 'Nombre del servicio OTLP (resource attribute service.name)' },
             allowLoopback: { type: 'boolean', description: 'Permitir colector OTLP en loopback local (127.0.0.1/::1; metadatos cloud siempre bloqueados)' },
             timeoutMs: { type: 'integer', minimum: 200, maximum: 60000, description: 'Timeout HTTP del colector en milisegundos' }
+          }
+        }
+      },
+
+      // --- MCP 2026 Cycle-6: Shadow Traffic Replay, Whole-Stack Time-Machine & FinOps Savings (+3 -> 116) ---
+      {
+        name: 'culkibo_shadow_replay',
+        title: 'Shadow Traffic Replay y puerta de cutover',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            projectId: { type: ['string', 'null'] },
+            pass: { type: 'boolean' },
+            verdict: { type: 'string' },
+            blockers: { type: 'array' },
+            summary: { type: 'object' },
+            perRequest: { type: 'array' },
+            replays: { type: 'array' },
+            count: { type: 'number' }
+          }
+        },
+        description: 'Reproduce peticiones HTTP de forma concurrente contra baseline (producción) y candidate (canary/green), compara paridad de status, regresiones 5xx, deriva estructural JSON y ratio p95, y devuelve el veredicto de cutover PROMOTE o BLOCK_CUTOVER (o consulta historial).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['run', 'history'], description: 'Ejecutar replay comparativo ("run", default) o listar historial ("history")' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID de proyecto asociado (recomendado para ACL y trazabilidad)' },
+            baselineUrl: { type: 'string', maxLength: 512, description: 'URL origen baseline/producción (ej. http://127.0.0.1:4000)' },
+            candidateUrl: { type: 'string', maxLength: 512, description: 'URL origen candidate/canary (ej. http://127.0.0.1:4001)' },
+            requests: {
+              type: 'array',
+              maxItems: 100,
+              description: 'Peticiones HTTP a reproducir ([{ method, path, headers, body }])',
+              items: { type: 'object' }
+            },
+            thresholds: {
+              type: 'object',
+              description: 'Umbrales del Promotion Gate ({ max5xxDelta, maxLatencyRatio, maxStatusMismatchPct, failOnSchemaDrift })'
+            },
+            gate: {
+              type: 'object',
+              description: 'Alias de thresholds para configurar el Promotion Gate'
+            },
+            allowLoopback: { type: 'boolean', description: 'Permitir destinos loopback locales (127.0.0.1/::1; metadatos cloud siempre bloqueados)' },
+            timeoutMs: { type: 'integer', minimum: 200, maximum: 60000, description: 'Timeout HTTP por petición en ms' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_time_machine',
+        title: 'Checkpoints Time-Machine de stack completo',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            projectId: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            checkpoint: { type: 'object' },
+            checkpoints: { type: 'array' },
+            count: { type: 'number' },
+            diff: { type: 'object' },
+            restored: { type: 'boolean' },
+            safetyCheckpointId: { type: ['string', 'null'] }
+          }
+        },
+        description: 'Crea, lista, compara (diff estructural de imagen, claves env, dominios, crons y límites) o restaura atómicamente checkpoints Time-Machine de un stack completo. En action="restore", dryRun es true por defecto para exigir previsualización previa antes de aplicar.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'create', 'diff', 'restore'], description: 'Operación Time-Machine sobre el proyecto' },
+            projectId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del proyecto propietario del stack' },
+            label: { type: 'string', maxLength: 120, description: 'Etiqueta descriptiva opcional al crear checkpoint (action="create")' },
+            reason: { type: 'string', maxLength: 240, description: 'Motivo operativo opcional al crear checkpoint' },
+            checkpointId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del checkpoint objetivo para action="restore"' },
+            fromId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del checkpoint origen para action="diff"' },
+            toId: { type: 'string', minLength: 1, maxLength: 128, description: 'ID del checkpoint destino para action="diff"' }
+          },
+          required: ['action', 'projectId']
+        }
+      },
+      {
+        name: 'culkibo_finops_report',
+        title: 'Informe FinOps de ahorro Cloud vs Self-Hosted',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            analysis: { type: 'object' },
+            comparison: { type: 'object' },
+            scopedProjectsCount: { type: 'number' }
+          }
+        },
+        description: 'Analiza proyectos y bases de datos accesibles por RBAC para generar recomendaciones de right-sizing RAM/CPU, estimación mensual de VPS (Hetzner/DO/Vultr/OVH) y comparativa honesta de ahorro anual frente a Vercel Pro, Railway, Render y Managed Postgres.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['report', 'compare'], description: 'Analizar proyectos actuales ("report", default) o ejecutar calculadora pura ("compare")' },
+            apps: { type: 'integer', minimum: 0, maximum: 500, description: 'Número de aplicaciones para comparativa pura (compareCloudCosts)' },
+            databases: { type: 'integer', minimum: 0, maximum: 200, description: 'Número de bases de datos para comparativa pura' },
+            avgRamMbPerApp: { type: 'integer', minimum: 64, maximum: 65536, description: 'RAM media estimada por app en MB (default 512)' },
+            monthlyBandwidthGb: { type: 'number', minimum: 0, maximum: 1000000, description: 'Tráfico mensual saliente estimado en GB (default 250)' }
           }
         }
       }
@@ -5936,6 +6062,47 @@ class McpServer extends EventEmitter {
         break;
       }
 
+      case 'culkibo_time_machine': {
+        const action = String(args.action || 'list');
+        if (!project) throw projectNotFoundError(args.projectId);
+        Object.assign(target, {
+          action,
+          projectId: project.id,
+          projectName: project.name,
+          checkpointId: args.checkpointId || null,
+          fromId: args.fromId || null,
+          toId: args.toId || null
+        });
+        if (action === 'restore') {
+          if (!args.checkpointId) {
+            blockers.push('MISSING_CHECKPOINT_ID');
+          } else {
+            const tmSvc = lazySvc('timeMachineService');
+            if (tmSvc && typeof tmSvc.restoreCheckpoint === 'function') {
+              try {
+                const tmPreview = await tmSvc.restoreCheckpoint(project.id, String(args.checkpointId), { dryRun: true });
+                if (tmPreview && typeof tmPreview === 'object') Object.assign(preview, tmPreview);
+              } catch (e) {
+                blockers.push('CHECKPOINT_NOT_FOUND');
+                warnings.push(e.message);
+              }
+            }
+          }
+          effects.push(`Restaurará atómicamente el stack completo de '${project.name}' (Proyecto + Dominios + Crons) al checkpoint '${args.checkpointId || '?'}', creando antes un checkpoint de seguridad automático.`);
+          riskLevel = 'high';
+          reversible = true;
+        } else if (action === 'create') {
+          effects.push(`Creará un checkpoint Time-Machine de stack completo para '${project.name}'${args.label ? ` (${args.label})` : ''} sin almacenar secretos en claro.`);
+          riskLevel = 'low';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' de Time-Machine en solo lectura sobre '${project.name}'.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
       default: {
         Object.assign(target, redactForAudit(args));
         effects.push(`Ejecutará la herramienta destructiva '${toolName}' con los parámetros validados.`);
@@ -8055,6 +8222,204 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_shadow_replay': {
+          const sr = requireLazySvc('shadowReplayService', 'Shadow Traffic Replay & Cutover Gate');
+          const action = String(args.action || 'run');
+          if (action === 'history') {
+            let replays = sr.listReplays(args.projectId ? String(args.projectId) : undefined);
+            if (!principal.isSuperAdmin && !args.projectId) {
+              replays = replays.filter((r) => !r.projectId || canAccessProject(principal, r.projectId));
+            }
+            res = {
+              action: 'history',
+              projectId: args.projectId ? String(args.projectId) : null,
+              count: replays.length,
+              replays
+            };
+          } else {
+            if (!args.baselineUrl || !args.candidateUrl) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="run" requiere baselineUrl y candidateUrl.', {
+                retryable: true,
+                remediation: 'Indica baselineUrl (producción), candidateUrl (canary/green) y requests ([{ method, path }]).'
+              });
+            }
+            if (!Array.isArray(args.requests) || args.requests.length === 0) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="run" requiere un array requests con al menos 1 petición HTTP.', {
+                retryable: true,
+                remediation: 'Pasa requests: [{ method: "GET", path: "/health" }] para comparar baseline vs candidate.'
+              });
+            }
+            /** @type {any} */
+            let report;
+            try {
+              const gateOpts = (args.gate && typeof args.gate === 'object')
+                ? args.gate
+                : ((args.thresholds && typeof args.thresholds === 'object') ? args.thresholds : undefined);
+              report = await sr.runReplay({
+                ...(args.projectId ? { projectId: String(args.projectId) } : {}),
+                baselineUrl: String(args.baselineUrl),
+                candidateUrl: String(args.candidateUrl),
+                requests: args.requests,
+                ...(gateOpts ? { gate: gateOpts } : {}),
+                ...(args.allowLoopback !== undefined ? { allowLoopback: Boolean(args.allowLoopback) } : {}),
+                ...(args.timeoutMs !== undefined ? { timeoutMs: Number(args.timeoutMs) } : {})
+              });
+            } catch (e) {
+              throw new McpToolError('INVALID_ARGUMENT', e.message, {
+                retryable: true,
+                remediation: 'Verifica que baselineUrl/candidateUrl sean HTTP(S) válidos (metadatos cloud bloqueados; usa allowLoopback: true en hosts locales).'
+              });
+            }
+            res = {
+              action: 'run',
+              projectId: args.projectId ? String(args.projectId) : null,
+              ...report
+            };
+          }
+          break;
+        }
+
+        case 'culkibo_time_machine': {
+          const tms = requireLazySvc('timeMachineService', 'Whole-Stack Time-Machine');
+          const project = projectManager.getById(String(args.projectId || ''));
+          if (!project) throw projectNotFoundError(args.projectId);
+          const action = String(args.action || 'list');
+
+          if (action === 'list') {
+            const checkpoints = tms.listCheckpoints(project.id);
+            res = {
+              action: 'list',
+              projectId: project.id,
+              dryRun: false,
+              count: checkpoints.length,
+              checkpoints
+            };
+          } else if (action === 'create') {
+            const checkpoint = tms.createCheckpoint(project.id, {
+              ...(args.label ? { label: String(args.label) } : {}),
+              ...(args.reason ? { reason: String(args.reason) } : {}),
+              actor: principal.email || principal.userId || principal.role || 'mcp'
+            });
+            res = {
+              action: 'create',
+              projectId: project.id,
+              dryRun: false,
+              checkpoint
+            };
+          } else if (action === 'diff') {
+            if (!args.fromId || !args.toId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="diff" requiere fromId y toId.', {
+                retryable: true,
+                remediation: 'Consulta los IDs con culkibo_time_machine({ action: "list", projectId }) y pasa fromId y toId.'
+              });
+            }
+            /** @type {any} */
+            let diff;
+            try {
+              diff = tms.diffCheckpoints(project.id, String(args.fromId), String(args.toId));
+            } catch (e) {
+              throw new McpToolError('NOT_FOUND', e.message, {
+                retryable: false,
+                remediation: 'Verifica que ambos checkpoint IDs existan para este proyecto con action="list".'
+              });
+            }
+            res = {
+              action: 'diff',
+              projectId: project.id,
+              dryRun: false,
+              diff
+            };
+          } else {
+            // action === 'restore' — dryRun defaults to true unless explicitly set to false!
+            if (!args.checkpointId) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="restore" requiere checkpointId.', {
+                retryable: true,
+                remediation: 'Lista los checkpoints disponibles con culkibo_time_machine({ action: "list", projectId }) y pasa checkpointId.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            /** @type {any} */
+            let restoreRes;
+            try {
+              restoreRes = await tms.restoreCheckpoint(project.id, String(args.checkpointId), {
+                dryRun,
+                actor: principal.email || principal.userId || principal.role || 'mcp'
+              });
+            } catch (e) {
+              throw new McpToolError('NOT_FOUND', e.message, {
+                retryable: false,
+                remediation: 'Verifica el checkpointId con culkibo_time_machine({ action: "list", projectId }).'
+              });
+            }
+            res = {
+              ...restoreRes,
+              action: 'restore',
+              projectId: project.id,
+              dryRun,
+              restored: Boolean(!dryRun && restoreRes && restoreRes.restored !== false),
+              safetyCheckpointId: restoreRes?.safetyCheckpointId || restoreRes?.safetyCheckpoint?.id || null
+            };
+          }
+          break;
+        }
+
+        case 'culkibo_finops_report': {
+          const finops = requireLazySvc('finopsOptimizer', 'FinOps Cloud-vs-Self-Hosted Optimizer');
+          const action = String(args.action || 'report');
+          const allProjects = projectManager.getAll();
+          const scopedProjects = principal.isSuperAdmin
+            ? allProjects
+            : allProjects.filter((p) => canAccessProject(principal, p.id, p));
+          const allowedIds = new Set(scopedProjects.map((p) => p.id));
+          const allDbs = databaseManager.list();
+          const scopedDbs = principal.isSuperAdmin
+            ? allDbs
+            : allDbs.filter((d) => d.projectId && allowedIds.has(d.projectId));
+
+          const sa = lazySvc('sleepAdvisor');
+          let sleepCandidates = [];
+          try {
+            if (sa && typeof sa.getSleepCandidates === 'function') {
+              const rawCands = sa.getSleepCandidates(principal.isSuperAdmin ? {} : { projectIds: Array.from(allowedIds) });
+              sleepCandidates = Array.isArray(rawCands) ? rawCands : [];
+            }
+          } catch (e) {}
+
+          const metricsHistory = typeof metricsCollector.getHistory === 'function'
+            ? metricsCollector.getHistory()
+            : [];
+
+          const analysis = action === 'compare'
+            ? null
+            : finops.analyzeFleetAndProjects({
+                projects: scopedProjects,
+                databases: scopedDbs,
+                metricsHistory,
+                sleepCandidates
+              });
+
+          const hasCompareInputs = action === 'compare' || args.apps !== undefined || args.databases !== undefined || args.avgRamMbPerApp !== undefined || args.monthlyBandwidthGb !== undefined;
+          const comparison = hasCompareInputs
+            ? finops.compareCloudCosts({
+                apps: args.apps !== undefined ? Number(args.apps) : Math.max(1, scopedProjects.length),
+                databases: args.databases !== undefined ? Number(args.databases) : scopedDbs.length,
+                ...(args.avgRamMbPerApp !== undefined ? { avgRamMbPerApp: Number(args.avgRamMbPerApp) } : {}),
+                ...(args.monthlyBandwidthGb !== undefined ? { monthlyBandwidthGb: Number(args.monthlyBandwidthGb) } : {})
+              })
+            : (analysis?.costComparison || finops.compareCloudCosts({
+                apps: Math.max(1, scopedProjects.length),
+                databases: scopedDbs.length
+              }));
+
+          res = {
+            action,
+            scopedProjectsCount: scopedProjects.length,
+            ...(analysis ? { analysis } : {}),
+            comparison
+          };
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -9038,7 +9403,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 113 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 116 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

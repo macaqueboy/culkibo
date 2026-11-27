@@ -43,6 +43,8 @@ import {
   ShieldCheck,
   Terminal,
   Cpu as CpuIcon,
+  History,
+  GitCompare,
 } from 'lucide-react';
 import {
   api,
@@ -52,6 +54,9 @@ import {
   type AttestationVerifyResult,
   type MigrationPlanResult,
   type WasmInvokeResult,
+  type TimeMachineCheckpoint,
+  type TimeMachineRestoreResult,
+  type ShadowReplayReport,
 } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
@@ -157,8 +162,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [smartPackShowDockerfile, setSmartPackShowDockerfile] = useState(false);
   const [smartPackCopied, setSmartPackCopied] = useState<'ignore' | 'dockerfile' | null>(null);
 
-  // Cycle-5 Cockpit Panels (SLSA v1.1 Provenance, Atomic DB Migrations, Micro-Wasm)
-  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | null>(null);
+  // Cycle-5 & Cycle-6 Cockpit Panels (SLSA v1.1, Atomic DB Migrations, Micro-Wasm, Time-Machine, Shadow Replay)
+  const [activeCockpit, setActiveCockpit] = useState<'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow' | null>(null);
   const [slsaAttest, setSlsaAttest] = useState<ReleaseAttestationResult | null>(null);
   const [slsaVerify, setSlsaVerify] = useState<AttestationVerifyResult | null>(null);
   const [slsaLoading, setSlsaLoading] = useState(false);
@@ -173,6 +178,16 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [wasmResult, setWasmResult] = useState<WasmInvokeResult | null>(null);
   const [wasmLoading, setWasmLoading] = useState(false);
   const [wasmError, setWasmError] = useState<string | null>(null);
+
+  const [tmCheckpoints, setTmCheckpoints] = useState<TimeMachineCheckpoint[]>([]);
+  const [tmLoading, setTmLoading] = useState(false);
+  const [tmCreating, setTmCreating] = useState(false);
+  const [tmRestorePreview, setTmRestorePreview] = useState<TimeMachineRestoreResult | null>(null);
+  const [tmError, setTmError] = useState<string | null>(null);
+
+  const [shadowReport, setShadowReport] = useState<ShadowReplayReport | null>(null);
+  const [shadowLoading, setShadowLoading] = useState(false);
+  const [shadowError, setShadowError] = useState<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTabState] = useState<ProjectTabId>(() => normalizeProjectTab(initialTab));
@@ -648,8 +663,79 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
     }
   };
 
-  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm') => {
-    setActiveCockpit((prev) => (prev === panel ? null : panel));
+  const handleLoadTimeMachine = async () => {
+    setTmLoading(true);
+    setTmError(null);
+    try {
+      const res = await api.listTimeMachine(project.id);
+      setTmCheckpoints(res.checkpoints || []);
+    } catch (e: unknown) {
+      setTmError(e instanceof Error ? e.message : 'Time-Machine unavailable');
+    } finally {
+      setTmLoading(false);
+    }
+  };
+
+  const handleCreateCheckpoint = async () => {
+    setTmCreating(true);
+    setTmError(null);
+    try {
+      const cp = await api.createTimeMachineCheckpoint(project.id, {
+        label: `Manual checkpoint (${new Date().toLocaleTimeString(locale === 'es' ? 'es-ES' : 'en-US')})`,
+      });
+      setTmCheckpoints((prev) => [cp, ...prev.filter((x) => x.id !== cp.id)]);
+      onNotify(`Time-Machine checkpoint ${cp.id} captured`, 'success');
+    } catch (e: unknown) {
+      setTmError(e instanceof Error ? e.message : 'Could not create checkpoint');
+    } finally {
+      setTmCreating(false);
+    }
+  };
+
+  const handleDryRunRestore = async (checkpointId: string) => {
+    setTmLoading(true);
+    setTmError(null);
+    try {
+      const res = await api.restoreTimeMachineCheckpoint(project.id, checkpointId, { dryRun: true });
+      setTmRestorePreview(res);
+    } catch (e: unknown) {
+      setTmError(e instanceof Error ? e.message : 'Dry-run restore failed');
+    } finally {
+      setTmLoading(false);
+    }
+  };
+
+  const handleRunShadowReplay = async () => {
+    setShadowLoading(true);
+    setShadowError(null);
+    try {
+      const originFallback = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:4000';
+      const baselineUrl = project.citadelPort
+        ? `http://127.0.0.1:${project.citadelPort}`
+        : (project.forgePort ? `http://127.0.0.1:${project.forgePort}` : originFallback);
+      const candidateUrl = project.forgePort
+        ? `http://127.0.0.1:${project.forgePort}`
+        : baselineUrl;
+      const res = await api.runShadowReplay(project.id, {
+        baselineUrl,
+        candidateUrl,
+        allowLoopback: true,
+        requests: [{ method: 'GET', path: '/' }, { method: 'GET', path: '/health' }],
+      });
+      setShadowReport(res);
+    } catch (e: unknown) {
+      setShadowError(e instanceof Error ? e.message : 'Shadow Replay unavailable');
+    } finally {
+      setShadowLoading(false);
+    }
+  };
+
+  const toggleCockpit = (panel: 'slsa' | 'migration' | 'wasm' | 'timemachine' | 'shadow') => {
+    const next = activeCockpit === panel ? null : panel;
+    setActiveCockpit(next);
+    if (next === 'timemachine' && tmCheckpoints.length === 0 && !tmLoading) {
+      void handleLoadTimeMachine();
+    }
   };
 
   const tabGroups: Array<{
@@ -858,6 +944,32 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
           >
             <CpuIcon className="w-3.5 h-3.5" />
             <span>{t('pd.wasmBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('timemachine')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'timemachine'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <History className="w-3.5 h-3.5" />
+            <span>{t('pd.tmBtn')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleCockpit('shadow')}
+            className={`culkibo-press inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              activeCockpit === 'shadow'
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
+            }`}
+          >
+            <GitCompare className="w-3.5 h-3.5" />
+            <span>{t('pd.srBtn')}</span>
           </button>
 
           {project.localRunning ? (
@@ -1380,6 +1492,194 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
         </section>
       )}
 
+      {activeCockpit === 'timemachine' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-3.5 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <History className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.tmTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.tmDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={tmCreating}
+                onClick={() => void handleCreateCheckpoint()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {tmCreating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                <span>{tmCreating ? t('pd.tmCreating') : t('pd.tmCreate')}</span>
+              </button>
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Time-Machine panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {tmError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{tmError}</div>}
+
+          {tmCheckpoints.length === 0 ? (
+            <div className="text-slate-500 py-3">{tmLoading ? '…' : t('pd.tmEmpty')}</div>
+          ) : (
+            <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+              {tmCheckpoints.slice(0, 6).map((cp) => {
+                const envN = cp.counts?.envVars ?? cp.envCount ?? cp.counts?.envKeys ?? cp.state?.envCount ?? cp.snapshot?.envKeys?.length ?? 0;
+                const domN = cp.counts?.domains ?? cp.domainsCount ?? cp.state?.domains?.length ?? cp.snapshot?.domains?.length ?? 0;
+                const cronN = cp.counts?.crons ?? cp.cronsCount ?? cp.state?.crons?.length ?? cp.snapshot?.crons?.length ?? 0;
+                const imgLabel = cp.imageTag || cp.state?.imageTag || 'config';
+                return (
+                  <div key={cp.id} className="px-3.5 py-2.5 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-slate-900">{cp.label || cp.id}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-600 tabular-nums">
+                          sha256:{String(cp.sha256 || '').slice(0, 12)}
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-500 mt-0.5 tabular-nums">
+                        {envN} env · {domN} domains · {cronN} crons · {imgLabel}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={tmLoading}
+                      onClick={() => void handleDryRunRestore(cp.id)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium cursor-pointer shrink-0 disabled:opacity-50"
+                    >
+                      <History className="w-3 h-3" />
+                      <span>{t('pd.tmDryRun')}</span>
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {tmRestorePreview && (() => {
+            const mut = tmRestorePreview.mutations;
+            const mutationLines: string[] = Array.isArray(mut)
+              ? mut
+              : mut && typeof mut === 'object'
+                ? [
+                    mut.imageTagChanged ? 'Image revision tag will be reverted to checkpoint state' : null,
+                    mut.projectFields && mut.projectFields.length > 0 ? `Config fields: ${mut.projectFields.join(', ')}` : null,
+                    (mut.envKeysAdded?.length || mut.envKeysRemoved?.length || mut.envKeysChanged?.length)
+                      ? `Env HMAC reconciliation: +${mut.envKeysAdded?.length ?? 0} / -${mut.envKeysRemoved?.length ?? 0} / ~${mut.envKeysChanged?.length ?? 0}`
+                      : null,
+                    (mut.domainsToAdd?.length || mut.domainsToRemove?.length || mut.domainsToUpdate?.length)
+                      ? `Domains & Caddy edge: +${mut.domainsToAdd?.length ?? 0} / -${mut.domainsToRemove?.length ?? 0} / ~${mut.domainsToUpdate?.length ?? 0}`
+                      : null,
+                    (mut.cronsToAdd?.length || mut.cronsToRemove?.length || mut.cronsToUpdate?.length)
+                      ? `Crons: +${mut.cronsToAdd?.length ?? 0} / -${mut.cronsToRemove?.length ?? 0} / ~${mut.cronsToUpdate?.length ?? 0}`
+                      : null,
+                  ].filter((x): x is string => Boolean(x))
+                : [];
+            return (
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="font-semibold text-slate-900 flex items-center justify-between gap-2">
+                  <span>{t('pd.tmDryRunTitle')} · {tmRestorePreview.checkpointId}</span>
+                  <button type="button" onClick={() => setTmRestorePreview(null)} className="text-slate-400 hover:text-slate-700 cursor-pointer"><X className="w-3.5 h-3.5" /></button>
+                </div>
+                {mutationLines.length > 0 ? (
+                  <ul className="list-disc list-inside text-[11px] text-slate-600 space-y-0.5">
+                    {mutationLines.map((m, idx) => <li key={idx}>{m}</li>)}
+                  </ul>
+                ) : (
+                  <div className="font-mono text-[11px] text-slate-600">
+                    0 pending mutations — live stack already matches checkpoint SHA-256.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </section>
+      )}
+
+      {activeCockpit === 'shadow' && (
+        <section className="culkibo-surface rounded-2xl p-4 sm:p-5 space-y-3.5 text-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0">
+                <GitCompare className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{t('pd.srTitle')}</h2>
+                <p className="text-slate-500 mt-0.5">{t('pd.srDesc')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={shadowLoading}
+                onClick={() => void handleRunShadowReplay()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+              >
+                {shadowLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <GitCompare className="w-3.5 h-3.5" />}
+                <span>{shadowLoading ? t('pd.srRunning') : t('pd.srRun')}</span>
+              </button>
+              <button type="button" onClick={() => setActiveCockpit(null)} aria-label="Close Shadow Replay panel" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {shadowError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{shadowError}</div>}
+
+          {shadowReport && (() => {
+            const latRatio = shadowReport.summary.latencyRatioP95 ?? shadowReport.summary.latencyRatio;
+            const driftCount = shadowReport.summary.breakingSchemaDriftCount ?? shadowReport.summary.schemaDriftCount ?? 0;
+            return (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-mono font-semibold border ${
+                    shadowReport.pass || shadowReport.verdict === 'PROMOTE'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-red-50 text-red-700 border-red-200'
+                  }`}>
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>{shadowReport.verdict}</span>
+                  </span>
+                  <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                    {shadowReport.summary.totalRequests} requests replayed
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 tabular-nums">
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase text-slate-400 font-semibold block">p95 Latency Ratio</span>
+                    <span className="font-mono text-sm font-semibold text-slate-900 block mt-0.5">
+                      {latRatio != null ? `${latRatio.toFixed(2)}x` : '1.00x'}
+                    </span>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase text-slate-400 font-semibold block">5xx Delta</span>
+                    <span className={`font-mono text-sm font-semibold block mt-0.5 ${(shadowReport.summary.delta5xx ?? 0) > 0 ? 'text-red-600' : 'text-emerald-700'}`}>
+                      +{shadowReport.summary.delta5xx ?? 0}
+                    </span>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] uppercase text-slate-400 font-semibold block">JSON Schema Drift</span>
+                    <span className={`font-mono text-sm font-semibold block mt-0.5 ${driftCount > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>
+                      {driftCount === 0 ? '0 drifts (clean)' : `${driftCount} drift(s)`}
+                    </span>
+                  </div>
+                </div>
+                {Array.isArray(shadowReport.blockers) && shadowReport.blockers.length > 0 && (
+                  <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 space-y-1">
+                    {shadowReport.blockers.map((b, i) => (
+                      <div key={i}>• {typeof b === 'string' ? b : (b.message || b.code || 'Cutover blocked')}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </section>
+      )}
+
       <div className="pt-1">
         {activeTab === 'live' && (
           <LiveForgePanel projectId={project.id} projectName={project.name} onNotify={onNotify} />
@@ -1391,13 +1691,13 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
                 <div className="flex items-center justify-between gap-2">
                   <div>
-                    <h2 className="text-sm font-semibold text-slate-900">¿Cómo quieres arrancar este proyecto?</h2>
-                    <p className="text-xs text-slate-500 mt-0.5">Elige según estés probando en tu equipo o publicando en un servidor.</p>
+                    <h2 className="text-sm font-semibold text-slate-900">{t('pd.ovStartTitle')}</h2>
+                    <p className="text-xs text-slate-500 mt-0.5">{t('pd.ovStartDesc')}</p>
                   </div>
                   <HelpTip title="Local vs Docker vs Live Sync" align="right">
-                    <p><strong>Vista previa local:</strong> corre directo en tu ordenador sin Docker, ideal para probar rápido.</p>
-                    <p><strong>Desplegar con Docker:</strong> crea un contenedor aislado con cero cortes y rollback automático.</p>
-                    <p><strong>Live Sync:</strong> sincroniza tu editor en milisegundos sin hacer git push.</p>
+                    <p><strong>Local:</strong> {t('pd.ovStartLocalDesc')}</p>
+                    <p><strong>Docker:</strong> {t('pd.ovStartDockerDesc')}</p>
+                    <p><strong>Live Sync:</strong> {t('pd.ovStartLiveDesc')}</p>
                   </HelpTip>
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
@@ -1408,9 +1708,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     className="p-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-left transition-colors cursor-pointer disabled:opacity-50"
                   >
                     <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
-                      <Play className="w-3.5 h-3.5 text-slate-700" /> Iniciar en local
+                      <Play className="w-3.5 h-3.5 text-slate-700" /> {t('pd.ovStartLocal')}
                     </div>
-                    <p className="text-[11px] text-slate-500 mt-1">Arranca rápido en localhost sin necesitar Docker.</p>
+                    <p className="text-[11px] text-slate-500 mt-1">{t('pd.ovStartLocalDesc')}</p>
                   </button>
                   <button
                     type="button"
@@ -1418,9 +1718,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     className="p-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-left transition-colors cursor-pointer"
                   >
                     <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
-                      <Rocket className="w-3.5 h-3.5 text-slate-700" /> Desplegar con Docker
+                      <Rocket className="w-3.5 h-3.5 text-slate-700" /> {t('pd.ovStartDocker')}
                     </div>
-                    <p className="text-[11px] text-slate-500 mt-1">Compila imagen, verifica salud y publica detrás de Caddy.</p>
+                    <p className="text-[11px] text-slate-500 mt-1">{t('pd.ovStartDockerDesc')}</p>
                   </button>
                   <button
                     type="button"
@@ -1428,9 +1728,9 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     className="p-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-left transition-colors cursor-pointer"
                   >
                     <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
-                      <FolderOpen className="w-3.5 h-3.5 text-slate-700" /> Conectar carpeta / Live Sync
+                      <FolderOpen className="w-3.5 h-3.5 text-slate-700" /> {t('pd.ovStartLive')}
                     </div>
-                    <p className="text-[11px] text-slate-500 mt-1">Sincroniza cambios desde tu editor en menos de 10 ms.</p>
+                    <p className="text-[11px] text-slate-500 mt-1">{t('pd.ovStartLiveDesc')}</p>
                   </button>
                 </div>
               </div>
@@ -1442,10 +1742,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 <div className="px-5 py-3.5 border-b border-slate-200 flex justify-between items-center bg-slate-50/70 gap-2 flex-wrap">
                   <h2 className="font-semibold text-sm text-slate-900 flex items-center gap-2">
                     <Box className="w-4 h-4 text-slate-600" />
-                    Recursos y entornos
-                    <HelpTip title="Desarrollo y Producción">
-                      <p><strong>Desarrollo (The Forge):</strong> vista previa local rápida o sincronizada en vivo mientras editas.</p>
-                      <p><strong>Producción (The Citadel):</strong> contenedor Docker estable publicado por Caddy con HTTPS automático.</p>
+                    {t('pd.ovResourcesTitle')}
+                    <HelpTip title={t('pd.ovResourcesTitle')}>
+                      <p><strong>{t('pd.ovDev')} (The Forge):</strong> {t('pd.ovDevEnvDesc')}</p>
+                      <p><strong>{t('pd.ovProd')} (The Citadel):</strong> {t('pd.ovProdEnvDesc')}</p>
                     </HelpTip>
                   </h2>
                   <div className="flex items-center gap-2">
@@ -1454,7 +1754,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                       onClick={() => setActiveTab('databases')}
                       className="text-xs font-medium text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1 cursor-pointer"
                     >
-                      <Database className="w-3.5 h-3.5" /> Añadir BD
+                      <Database className="w-3.5 h-3.5" /> {t('pd.ovAddDb')}
                     </button>
                     {onOpenCatalog && (
                       <button
@@ -1462,7 +1762,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                         onClick={onOpenCatalog}
                         className="text-xs font-medium text-slate-700 hover:text-slate-900 bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1 cursor-pointer"
                       >
-                        <Plus className="w-3.5 h-3.5" /> Catálogo
+                        <Plus className="w-3.5 h-3.5" /> {t('pd.ovCatalog')}
                       </button>
                     )}
                   </div>
@@ -1480,7 +1780,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                             <div className="min-w-0">
                               <div className="text-sm font-medium text-slate-900 truncate">{res.name}</div>
                               <div className="text-xs text-slate-500">
-                                {res.type} · <span className="font-mono">{res.image || 'proceso local'}</span>
+                                {res.type} · <span className="font-mono">{res.image || t('pd.ovLocalProc')}</span>
                               </div>
                             </div>
                           </div>
@@ -1501,7 +1801,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                                 : 'bg-slate-100 text-slate-600 border-slate-200'
                             }`}>
                               <span className={`w-1.5 h-1.5 rounded-full ${isResActive ? 'bg-emerald-500' : 'bg-slate-400'}`} />
-                              {isResActive ? 'Activo' : 'Detenido'}
+                              {isResActive ? t('pd.ovActive') : t('pd.ovStopped')}
                             </span>
                             <span className="text-slate-400 font-mono tabular-nums">
                               {Array.isArray(res.ports) ? res.ports.join(', ') : (res.ports || res.port || '—')}
@@ -1518,8 +1818,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                             <Cpu className="w-4 h-4" />
                           </div>
                           <div>
-                            <div className="text-sm font-medium text-slate-900">Entorno de desarrollo</div>
-                            <div className="text-xs text-slate-500">Vista previa local y sincronización en vivo</div>
+                            <div className="text-sm font-medium text-slate-900">{t('pd.ovDevEnv')}</div>
+                            <div className="text-xs text-slate-500">{t('pd.ovDevEnvDesc')}</div>
                           </div>
                         </div>
                         <div className="flex items-center gap-3 text-xs">
@@ -1529,7 +1829,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                               : 'bg-slate-100 text-slate-600 border-slate-200'
                           }`}>
                             <span className={`w-1.5 h-1.5 rounded-full ${project.localRunning ? 'bg-emerald-500' : 'bg-slate-400'}`} />
-                            {project.localRunning ? 'En ejecución' : 'Detenido'}
+                            {project.localRunning ? t('pd.ovRunning') : t('pd.ovStopped')}
                           </span>
                           <span className="text-slate-400 font-mono tabular-nums">:{project.localPort || project.forgePort}</span>
                         </div>
@@ -1541,8 +1841,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                             <Server className="w-4 h-4" />
                           </div>
                           <div>
-                            <div className="text-sm font-medium text-slate-900">Entorno de producción</div>
-                            <div className="text-xs text-slate-500">Contenedor Docker aislado detrás de Caddy</div>
+                            <div className="text-sm font-medium text-slate-900">{t('pd.ovProdEnv')}</div>
+                            <div className="text-xs text-slate-500">{t('pd.ovProdEnvDesc')}</div>
                           </div>
                         </div>
                         <div className="flex items-center gap-3 text-xs">
@@ -1553,8 +1853,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                           }`}>
                             <span className={`w-1.5 h-1.5 rounded-full ${project.lastDeployedAt && project.status === 'active' ? 'bg-emerald-500' : 'bg-slate-400'}`} />
                             {project.lastDeployedAt
-                              ? (project.status === 'active' ? 'Desplegado' : 'Detenido')
-                              : 'Sin desplegar'}
+                              ? (project.status === 'active' ? t('pd.ovDeployed') : t('pd.ovStopped'))
+                              : t('pd.ovNotDeployed')}
                           </span>
                           <span className="text-slate-400 font-mono tabular-nums">:{project.citadelPort}</span>
                         </div>
@@ -1568,12 +1868,12 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
             <div className="space-y-5">
               <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
                 <h2 className="font-semibold text-sm text-slate-900 flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-slate-600" /> Reparto de tráfico
+                  <Activity className="w-4 h-4 text-slate-600" /> {t('pd.ovTrafficTitle')}
                 </h2>
                 <div className="space-y-3 text-xs">
                   <div>
                     <div className="flex justify-between mb-1.5">
-                      <span className="text-slate-600">Desarrollo</span>
+                      <span className="text-slate-600">{t('pd.ovDev')}</span>
                       <span className="font-mono font-semibold text-slate-900 tabular-nums">{project.trafficSplit?.forge || 0}%</span>
                     </div>
                     <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
@@ -1582,7 +1882,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   </div>
                   <div>
                     <div className="flex justify-between mb-1.5">
-                      <span className="text-slate-600">Producción</span>
+                      <span className="text-slate-600">{t('pd.ovProd')}</span>
                       <span className="font-mono font-semibold text-slate-900 tabular-nums">{project.trafficSplit?.citadel || 0}%</span>
                     </div>
                     <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
@@ -1596,14 +1896,14 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     onClick={() => setActiveTab('deployments')}
                     className="w-full py-2 bg-slate-900 text-white rounded-lg text-xs font-medium hover:bg-slate-800 transition-colors cursor-pointer"
                   >
-                    Publicar a producción →
+                    {t('pd.ovPublishProd')}
                   </button>
                   <button
                     type="button"
                     onClick={() => setActiveTab('live')}
                     className="w-full py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-lg text-xs font-medium transition-colors cursor-pointer"
                   >
-                    Abrir sincronización en vivo
+                    {t('pd.ovOpenLive')}
                   </button>
                 </div>
               </div>
@@ -1611,14 +1911,14 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
               <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-3">
                 <div className="flex items-center justify-between">
                   <h2 className="font-semibold text-sm text-slate-900 flex items-center gap-2">
-                    <Globe className="w-4 h-4 text-slate-500" /> Dominios
+                    <Globe className="w-4 h-4 text-slate-500" /> {t('pd.ovDomainsTitle')}
                   </h2>
                   <button
                     type="button"
                     onClick={() => setActiveTab('domains')}
                     className="text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
                   >
-                    Gestionar →
+                    {t('pd.ovManage')}
                   </button>
                 </div>
                 {project.domains && project.domains.length > 0 ? (
@@ -1629,7 +1929,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                         <div className="flex items-center gap-1 shrink-0">
                           <button
                             type="button"
-                            aria-label={`Copiar ${d}`}
+                            aria-label={`Copy ${d}`}
                             onClick={() => void copyValue(d)}
                             className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
                           >
@@ -1639,7 +1939,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                             href={`https://${d}`}
                             target="_blank"
                             rel="noreferrer"
-                            aria-label={`Abrir ${d}`}
+                            aria-label={`Open ${d}`}
                             className="p-1 text-slate-500 hover:text-slate-900 rounded"
                           >
                             <Globe className="w-3.5 h-3.5" />
@@ -1650,7 +1950,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   </div>
                 ) : (
                   <div className="text-xs text-slate-500 p-4 bg-slate-50 border border-slate-200 rounded-lg text-center">
-                    Sin dominios vinculados todavía.
+                    {t('pd.ovNoDomains')}
                   </div>
                 )}
               </div>

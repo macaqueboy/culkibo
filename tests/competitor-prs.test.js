@@ -948,6 +948,72 @@ function reqJson(port, method, pth, { token, body } = {}) {
     assert.strictEqual(schemaIso.status, 200, 'POST schema-isolation failed: ' + schemaIso.text);
     assert.strictEqual(schemaIso.json.schemaName, 'pr_42');
 
+    // Cycle-6 Lazy Routes: Shadow Replay, Whole-Stack Time-Machine, FinOps Optimizer
+    const tmCreate1 = await reqJson(port, 'POST', '/api/projects/proj_c2_api/timemachine', {
+      token: master,
+      body: { label: 'pre-release-1' }
+    });
+    assert.strictEqual(tmCreate1.status, 201, 'POST timemachine #1 failed: ' + tmCreate1.text);
+    const cp1Id = tmCreate1.json.id || (tmCreate1.json.checkpoint && tmCreate1.json.checkpoint.id);
+    assert.ok(cp1Id, 'Expected checkpoint id from POST /timemachine');
+
+    projectManager.update('proj_c2_api', { memoryMb: 2048 });
+    const tmCreate2 = await reqJson(port, 'POST', '/api/projects/proj_c2_api/timemachine', {
+      token: master,
+      body: { label: 'post-scale-2' }
+    });
+    assert.strictEqual(tmCreate2.status, 201, 'POST timemachine #2 failed: ' + tmCreate2.text);
+    const cp2Id = tmCreate2.json.id || (tmCreate2.json.checkpoint && tmCreate2.json.checkpoint.id);
+
+    const tmList = await reqJson(port, 'GET', '/api/projects/proj_c2_api/timemachine', { token: master });
+    assert.strictEqual(tmList.status, 200);
+    assert.ok(Array.isArray(tmList.json.checkpoints) && tmList.json.checkpoints.length >= 2);
+
+    const tmDiff = await reqJson(port, 'GET', '/api/projects/proj_c2_api/timemachine/diff?from=' + encodeURIComponent(cp1Id) + '&to=' + encodeURIComponent(cp2Id), { token: master });
+    assert.strictEqual(tmDiff.status, 200, 'GET timemachine/diff failed: ' + tmDiff.text);
+
+    const tmRestoreDry = await reqJson(port, 'POST', '/api/projects/proj_c2_api/timemachine/' + encodeURIComponent(cp1Id) + '/restore', {
+      token: master,
+      body: { dryRun: true }
+    });
+    assert.strictEqual(tmRestoreDry.status, 200, 'POST timemachine restore dryRun failed: ' + tmRestoreDry.text);
+    assert.strictEqual(tmRestoreDry.json.dryRun, true);
+
+    const finRep = await reqJson(port, 'GET', '/api/finops/report', { token: master });
+    assert.strictEqual(finRep.status, 200, 'GET /api/finops/report failed: ' + finRep.text);
+    const finCmp = await reqJson(port, 'POST', '/api/finops/compare', {
+      token: master,
+      body: { apps: 4, databases: 2 }
+    });
+    assert.strictEqual(finCmp.status, 200, 'POST /api/finops/compare failed: ' + finCmp.text);
+
+    const srSrv = await new Promise((resolve) => {
+      const s = http.createServer((_rq, rs) => {
+        rs.writeHead(200, { 'Content-Type': 'application/json' });
+        rs.end(JSON.stringify({ ok: true, status: 'healthy' }));
+      });
+      s.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    try {
+      const srPort = srSrv.address().port;
+      const srRes = await reqJson(port, 'POST', '/api/projects/proj_c2_api/shadow-replay', {
+        token: master,
+        body: {
+          baselineOrigin: 'http://127.0.0.1:' + srPort,
+          candidateOrigin: 'http://127.0.0.1:' + srPort,
+          allowLoopback: true,
+          requests: [{ method: 'GET', path: '/health' }]
+        }
+      });
+      assert.strictEqual(srRes.status, 200, 'POST shadow-replay failed: ' + srRes.text);
+      assert.strictEqual(srRes.json.verdict, 'PROMOTE');
+      const srHist = await reqJson(port, 'GET', '/api/projects/proj_c2_api/shadow-replay/history', { token: master });
+      assert.strictEqual(srHist.status, 200);
+      assert.ok(Array.isArray(srHist.json.replays) && srHist.json.replays.length >= 1);
+    } finally {
+      await new Promise((r) => srSrv.close(r));
+    }
+
     console.log('CYCLE2_HTTP_OK');
   } finally {
     await new Promise((r) => srv.close(r));
@@ -1330,7 +1396,7 @@ function reqJson(port, method, pth, { token, body } = {}) {
     }
   }
 
-  // 8f. Clean English default local node name in ServerFleetManager
+  // 8f. Clean English default local node name in ServerFleetManager + Cycle-6 container graceful stop-timeout & bounded log rotation
   {
     const fleetTmp = makeTempDir('culkibo-fleet-name-');
     try {
@@ -1340,8 +1406,91 @@ function reqJson(port, method, pth, { token, body } = {}) {
     } finally {
       fs.rmSync(fleetTmp, { recursive: true, force: true });
     }
+
+    // Cycle-6: --stop-timeout (default 30s, clamped 5..300s) & bounded --log-opt max-size/max-file anti-disk-fill guard
+    const dmLife = new DeployManager();
+    dmLife.saveStore = () => {};
+    const defArgs = dmLife.runArgs({
+      containerName: 'c_life_def',
+      imageTag: 'culkibo/life:v1',
+      hostPort: 23500,
+      containerPort: 3000
+    });
+    const defJoined = defArgs.join(' ');
+    assert.ok(defJoined.includes('--stop-timeout 30'), 'runArgs debe fijar --stop-timeout 30 por defecto');
+    assert.ok(defJoined.includes('--log-driver json-file'), 'runArgs debe fijar --log-driver json-file');
+    assert.ok(defJoined.includes('--log-opt max-size=10m'), 'runArgs debe acotar log max-size=10m por defecto');
+    assert.ok(defJoined.includes('--log-opt max-file=3'), 'runArgs debe acotar log max-file=3 por defecto');
+
+    const customArgs = dmLife.runArgs({
+      containerName: 'c_life_custom',
+      imageTag: 'culkibo/life:v2',
+      hostPort: 23501,
+      containerPort: 3000,
+      stopGracePeriodSec: 90,
+      logMaxSizeMb: 25,
+      logMaxFiles: 5
+    });
+    const customJoined = customArgs.join(' ');
+    assert.ok(customJoined.includes('--stop-timeout 90'));
+    assert.ok(customJoined.includes('--log-opt max-size=25m'));
+    assert.ok(customJoined.includes('--log-opt max-file=5'));
+
+    // Bounds clamping: out-of-range values clamped safely (5..300s, 1..500m, 1..20 files)
+    const clampedLow = dmLife.runArgs({
+      containerName: 'c_life_lo',
+      imageTag: 'culkibo/life:v3',
+      hostPort: 23502,
+      containerPort: 3000,
+      stopGracePeriodSec: 1,
+      logMaxSizeMb: 0,
+      logMaxFiles: 0
+    }).join(' ');
+    assert.ok(clampedLow.includes('--stop-timeout 5'));
+    assert.ok(clampedLow.includes('--log-opt max-size=1m'));
+    assert.ok(clampedLow.includes('--log-opt max-file=1'));
+
+    const clampedHigh = dmLife.runArgs({
+      containerName: 'c_life_hi',
+      imageTag: 'culkibo/life:v4',
+      hostPort: 23503,
+      containerPort: 3000,
+      stopGracePeriodSec: 9999,
+      logMaxSizeMb: 9999,
+      logMaxFiles: 999
+    }).join(' ');
+    assert.ok(clampedHigh.includes('--stop-timeout 300'));
+    assert.ok(clampedHigh.includes('--log-opt max-size=500m'));
+    assert.ok(clampedHigh.includes('--log-opt max-file=20'));
+
+    // Graceful cutover drain passes `docker stop -t <sec>`
+    /** @type {string[] | null} */
+    let capturedStopArgs = null;
+    dmLife.runDocker = async (args) => {
+      if (args[0] === 'stop') capturedStopArgs = args;
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    dmLife.store = {
+      proj_life: {
+        current: { containerName: 'c_new_active' },
+        previous: { containerName: 'c_old_grace' },
+        history: []
+      }
+    };
+    dmLife.pruneOldReleases = async () => ({ removed: [], removedImages: [], keep: 2 });
+    const keepLoop = setInterval(() => {}, 50);
+    try {
+      await dmLife.drainAndRetire(
+        { projectId: 'proj_life', logLines: [] },
+        { containerName: 'c_old_grace', serverId: 'local' },
+        { drainTimeoutMs: 5, stopGracePeriodSec: 45 }
+      );
+    } finally {
+      clearInterval(keepLoop);
+    }
+    assert.deepStrictEqual(capturedStopArgs, ['stop', '-t', '45', 'c_old_grace'], 'drainAndRetire debe pasar docker stop -t <sec>');
   }
-  console.log('  ✓ Wave-3 CVEs (8a-8f): culkibo.protected+BuildKit cap, stale lock PID/TTL reap, GitOps symlink+commitSha, webhook replay/no-204/redact, OIDC JWKS SWR y Local Server (Primary)');
+  console.log('  ✓ Wave-3 & Cycle-6 CVEs (8a-8f): culkibo.protected+BuildKit cap, stale lock PID/TTL reap, GitOps symlink+commitSha, webhook replay/no-204/redact, OIDC JWKS SWR, --stop-timeout, bounded log rotation y Local Server (Primary)');
 
   console.log('✅ Suite #23 completada correctamente.\n');
 }

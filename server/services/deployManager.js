@@ -246,7 +246,10 @@ const DEFAULTS = {
   // (issue #8627): allí el contenedor viejo muere a la vez que se recarga el
   // proxy, y las peticiones en vuelo se convierten en 502/503.
   drainTimeoutMs: 30000,
-  stopGraceSeconds: 10,
+  stopGraceSeconds: 30,
+  stopGracePeriodSec: 30,
+  logMaxSizeMb: 10,
+  logMaxFiles: 3,
   memoryMb: 1024,
   cpus: '1.0',
   pidsLimit: 512,
@@ -2991,6 +2994,7 @@ class DeployManager extends EventEmitter {
    * @param {{containerName: string, imageTag: string, hostPort: number, containerPort: number,
    *   envNames?: string[], envFile?: string | null, network?: string | null, memoryMb?: number, cpus?: string | number,
    *   pidsLimit?: number, healthCmd?: string | null, healthStartPeriodSec?: number, healthRetries?: number,
+   *   stopGracePeriodSec?: number, logMaxSizeMb?: number, logMaxFiles?: number,
    *   labels?: Record<string, any>, protectedContainer?: boolean, sleeping?: boolean}} spec
    * @returns {string[]}
    */
@@ -3008,10 +3012,16 @@ class DeployManager extends EventEmitter {
     healthCmd = null,
     healthStartPeriodSec = DEFAULTS.healthStartPeriodSec,
     healthRetries = DEFAULTS.healthRetries,
+    stopGracePeriodSec = DEFAULTS.stopGracePeriodSec,
+    logMaxSizeMb = DEFAULTS.logMaxSizeMb,
+    logMaxFiles = DEFAULTS.logMaxFiles,
     labels = {},
     protectedContainer = false,
     sleeping = false
   }) {
+    const safeStopTimeout = sanitizeBoundedInt(stopGracePeriodSec, DEFAULTS.stopGracePeriodSec, 5, 300);
+    const safeLogMaxSizeMb = sanitizeBoundedInt(logMaxSizeMb, DEFAULTS.logMaxSizeMb, 1, 500);
+    const safeLogMaxFiles = sanitizeBoundedInt(logMaxFiles, DEFAULTS.logMaxFiles, 1, 20);
     const args = [
       'run', '-d',
       '--init',
@@ -3019,6 +3029,8 @@ class DeployManager extends EventEmitter {
       // Reinicio ante caída del proceso o del host. Sin esto no es un servicio
       // de producción, es un proceso que casualmente está vivo.
       '--restart', 'unless-stopped',
+      // Gracia explícita SIGTERM→SIGKILL (5..300s, default 30s) para no truncar transacciones HTTP/BD
+      '--stop-timeout', String(safeStopTimeout),
       // El contenedor solo debe ser alcanzable por el proxy y por la sonda de
       // salud del daemon; nunca directamente desde internet.
       '-p', `127.0.0.1:${hostPort}:${containerPort}`,
@@ -3034,8 +3046,8 @@ class DeployManager extends EventEmitter {
       // Sin esto el log JSON de un contenedor hablador llena el disco del VPS;
       // fijar --log-driver json-file evita fallos en hosts con journald/syslog (Dokku #4388).
       '--log-driver', 'json-file',
-      '--log-opt', 'max-size=10m',
-      '--log-opt', 'max-file=3'
+      '--log-opt', `max-size=${safeLogMaxSizeMb}m`,
+      '--log-opt', `max-file=${safeLogMaxFiles}`
     ];
 
     if (network) args.push('--network', network);
@@ -4808,6 +4820,25 @@ class DeployManager extends EventEmitter {
             10
           );
 
+          const stopGracePeriodSec = sanitizeBoundedInt(
+            options.stopGracePeriodSec !== undefined ? options.stopGracePeriodSec : project.stopGracePeriodSec,
+            opts.stopGracePeriodSec,
+            5,
+            300
+          );
+          const logMaxSizeMb = sanitizeBoundedInt(
+            options.logMaxSizeMb !== undefined ? options.logMaxSizeMb : project.logMaxSizeMb,
+            opts.logMaxSizeMb,
+            1,
+            500
+          );
+          const logMaxFiles = sanitizeBoundedInt(
+            options.logMaxFiles !== undefined ? options.logMaxFiles : project.logMaxFiles,
+            opts.logMaxFiles,
+            1,
+            20
+          );
+
           const runArgs = this.runArgs({
             containerName: deployment.containerName,
             imageTag: deployment.imageTag,
@@ -4822,6 +4853,9 @@ class DeployManager extends EventEmitter {
             healthCmd: strategy.injectHealthcheck ? this.healthCommandFor(strategy) : null,
             healthStartPeriodSec,
             healthRetries,
+            stopGracePeriodSec,
+            logMaxSizeMb,
+            logMaxFiles,
             labels: {
               'culkibo.managed': 'true',
               'com.culkibo.project': safeSlug(project.id),
@@ -5690,9 +5724,13 @@ class DeployManager extends EventEmitter {
 
     await this._withRemoteDockerEnv(retiringServerId, {}, async (remoteDockerHost) => {
       const env = remoteDockerHost ? { ...process.env, DOCKER_HOST: remoteDockerHost } : undefined;
+      const rawGrace = opts && opts.stopGracePeriodSec !== undefined
+        ? opts.stopGracePeriodSec
+        : (opts && opts.stopGraceSeconds !== undefined ? opts.stopGraceSeconds : DEFAULTS.stopGracePeriodSec);
+      const graceSec = sanitizeBoundedInt(rawGrace, DEFAULTS.stopGracePeriodSec, 0, 300);
       const stop = await this.runDocker(
-        ['stop', '--time', String(opts.stopGraceSeconds), retiringName],
-        { timeoutMs: (opts.stopGraceSeconds + 20) * 1000, env }
+        ['stop', '-t', String(graceSec), retiringName],
+        { timeoutMs: (graceSec + 20) * 1000, env }
       );
       if (stop.code === 0) {
         this.log(deployment, 'INFO', `Versión anterior detenida: ${retiringName} (se conserva para el rollback)`);
@@ -6464,7 +6502,13 @@ class DeployManager extends EventEmitter {
         try {
           await this._withRouteTarget(targetServerId, fleet, ({ adminUrl }) => caddyManager.removeRoute(projectId, { adminUrl }));
         } catch (e) {}
-        const res = await this.runDocker(['stop', '--time', String(DEFAULTS.stopGraceSeconds), state.current.containerName], { timeoutMs: 40000, env });
+        const stopGraceSec = sanitizeBoundedInt(
+          (projectOrId && typeof projectOrId === 'object' ? projectOrId.stopGracePeriodSec : undefined),
+          DEFAULTS.stopGracePeriodSec,
+          5,
+          300
+        );
+        const res = await this.runDocker(['stop', '-t', String(stopGraceSec), state.current.containerName], { timeoutMs: (stopGraceSec + 20) * 1000, env });
         if (res.code === 0) {
           state.current.status = 'detenido';
           state.current.protected = true;
@@ -6588,6 +6632,9 @@ class DeployManager extends EventEmitter {
    *   healthTimeoutMs?: number,
    *   healthIntervalMs?: number,
    *   drainTimeoutMs?: number,
+   *   stopGracePeriodSec?: number,
+   *   logMaxSizeMb?: number,
+   *   logMaxFiles?: number,
    *   actor?: string,
    *   actorIp?: string | null
    * }} [options]
@@ -6747,6 +6794,7 @@ class DeployManager extends EventEmitter {
             fs.writeFileSync(envFile, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
           }
 
+          const projCfg = (projectOrId && typeof projectOrId === 'object') ? projectOrId : null;
           const runArgs = this.runArgs({
             containerName: nextName,
             imageTag: current.imageTag,
@@ -6758,6 +6806,9 @@ class DeployManager extends EventEmitter {
             memoryMb: safeMemMb,
             cpus: safeCpus,
             pidsLimit: opts.pidsLimit,
+            stopGracePeriodSec: options.stopGracePeriodSec !== undefined ? options.stopGracePeriodSec : (projCfg ? projCfg.stopGracePeriodSec : undefined),
+            logMaxSizeMb: options.logMaxSizeMb !== undefined ? options.logMaxSizeMb : (projCfg ? projCfg.logMaxSizeMb : undefined),
+            logMaxFiles: options.logMaxFiles !== undefined ? options.logMaxFiles : (projCfg ? projCfg.logMaxFiles : undefined),
             labels: {
               'culkibo.managed': 'true',
               'com.culkibo.project': safeSlug(projectId),

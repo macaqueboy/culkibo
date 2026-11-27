@@ -20,6 +20,7 @@
 const os = require('os');
 const pkg = require('../package.json');
 const mcpServer = require('../server/services/mcpServer');
+const { WasmMicroRunner, buildMinimalHttpTestWasm } = require('../server/services/wasmMicroRunner');
 const runControlPlane = require('./control-plane.bench');
 const runLiveSync = require('./live-sync.bench');
 const runRouteSwap = require('./route-swap.bench');
@@ -118,6 +119,57 @@ function measureMcpProfileSavings() {
 }
 
 /**
+ * Live-measures isolated Micro-Wasm execution inside a dedicated `worker_threads` sandbox
+ * (1 cold compile + 20 warm cached invocations) using `buildMinimalHttpTestWasm()`.
+ */
+async function measureMicroWasm() {
+  const runner = new WasmMicroRunner();
+  const wasmBytes = buildMinimalHttpTestWasm();
+  try {
+    const cold = await runner.invoke({ wasmBytes, input: 21 });
+    /** @type {number[]} */
+    const warmExecs = [];
+    /** @type {number[]} */
+    const warmWalls = [];
+    const iterations = 20;
+    for (let i = 0; i < iterations; i++) {
+      const res = await runner.invoke({ wasmBytes, input: 21 + i });
+      warmExecs.push(Number(res.execMs));
+      warmWalls.push(Number(res.wallMs));
+    }
+    const sortedExec = [...warmExecs].sort((a, b) => a - b);
+    const sortedWall = [...warmWalls].sort((a, b) => a - b);
+    const pct = (/** @type {number[]} */ arr, /** @type {number} */ p) => {
+      if (arr.length === 0) return 0;
+      const idx = Math.max(0, Math.min(arr.length - 1, Math.ceil((p / 100) * arr.length) - 1));
+      return Number(arr[idx].toFixed(3));
+    };
+    return {
+      sandboxed: true,
+      iterations,
+      resultCheck: cold.result,
+      memoryBytes: cold.memoryBytes,
+      coldExecMs: Number(cold.execMs),
+      coldWallMs: Number(cold.wallMs),
+      warmExecMs: {
+        min: sortedExec[0] ?? 0,
+        p50: pct(sortedExec, 50),
+        p95: pct(sortedExec, 95),
+        max: sortedExec[sortedExec.length - 1] ?? 0
+      },
+      warmWallMs: {
+        min: sortedWall[0] ?? 0,
+        p50: pct(sortedWall, 50),
+        p95: pct(sortedWall, 95),
+        max: sortedWall[sortedWall.length - 1] ?? 0
+      }
+    };
+  } finally {
+    await runner.shutdown();
+  }
+}
+
+/**
  * Formats an honest Markdown side-by-side comparison table separating Culkibo's
  * live-measured values from competitors' published/documented architecture baselines.
  */
@@ -126,6 +178,7 @@ function buildMarkdownTable(culkibo, mcpStats) {
   const sync = culkibo.liveSync;
   const swap = culkibo.routeSwap;
   const sub = culkibo.subsystems;
+  const wasm = culkibo.microWasm || null;
 
   const coreProfile = mcpStats.profiles.core || { tools: 0, savedPct: 0, estTokens: 0 };
   const allProfile = mcpStats.profiles.all || { tools: mcpStats.totalTools, estTokens: 0 };
@@ -154,6 +207,10 @@ function buildMarkdownTable(culkibo, mcpStats) {
     ? `warm p50 **${cp.catalogLoad.warmP50Ms} ms** (cold ${cp.catalogLoad.coldRawMs} ms · ${(cp.catalogLoad.rawBytes / 1024).toFixed(1)} KB → ${(cp.catalogLoad.brotliBytes / 1024).toFixed(1)} KB br, -${cp.catalogLoad.brotliSavedPct}%)`
     : 'N/A';
 
+  const wasmCell = wasm
+    ? `warm p50 **${wasm.warmExecMs.p50} ms** / p95 **${wasm.warmExecMs.p95} ms** (cold ${wasm.coldExecMs} ms · wall p50 ${wasm.warmWallMs.p50} ms · ${Math.round((wasm.memoryBytes || 65536) / 1024)} KiB RAM)`
+    : 'N/A';
+
   const lines = [
     '### Culkibo Live Measured Metrics (100% Real, Unadjusted)',
     '',
@@ -167,6 +224,7 @@ function buildMarkdownTable(culkibo, mcpStats) {
     `| **Express Multi-Tenant RBAC HTTP (500 req / 25w)** | ${rbacExpressCell} | Measured live |`,
     `| **Catalog Load (\`GET /api/catalog\`)** | ${catalogCell} | Measured live |`,
     `| **Live Sync 2.0 Delta Apply (Path B)** | ${liveSyncCell} | Measured live |`,
+    `| **Micro-Wasm Edge Runtime (Isolated \`worker_threads\`)** | ${wasmCell} | Measured live (\`WebAssembly\`) |`,
     `| **Caddy Atomic Route Swap** | ${routeSwapCell} | Measured live / Caddy Admin API |`,
     `| **MCP \`${mcpStats.protocolVersion}\` Profile Token Savings** | **-${coreProfile.savedPct}%** (\`?profile=core\`: ${coreProfile.tools}/${allProfile.tools} tools, ~${coreProfile.estTokens.toLocaleString('en-US')} vs ~${allProfile.estTokens.toLocaleString('en-US')} tokens) | Measured live |`,
     `| **Runtime Dependencies & Shell Safety** | **${Object.keys(pkg.dependencies || {}).length} npm deps** · **0** unauthorized shell constructions | Verified by CI |`,
@@ -203,6 +261,7 @@ async function run({ silent = false, results = null } = {}) {
   const liveSync = (results && results.liveSync) || await runLiveSync({ silent: true });
   const routeSwap = (results && results.routeSwap) || await runRouteSwap({ silent: true });
   const subsystems = (results && results.subsystems) || await runSubsystems({ silent: true });
+  const microWasm = (results && results.microWasm) || await measureMicroWasm();
 
   const mcpProfiles = measureMcpProfileSavings();
   const culkiboSnapshot = {
@@ -226,6 +285,7 @@ async function run({ silent = false, results = null } = {}) {
     liveSyncApplyP50Ms: liveSync?.serverApplyMs?.p50 ?? null,
     liveSyncEndToEndP50Ms: liveSync?.endToEndMs?.p50 ?? null,
     liveSyncBrotliSavedPct: liveSync?.burst100FilesBrotli?.brotliSavedPct ?? null,
+    microWasm,
     routeSwapP50Ms: routeSwap && !routeSwap.skipped ? routeSwap.p50Ms : null,
     routeSwapSkipped: Boolean(!routeSwap || routeSwap.skipped),
     runtimeDependencies: Object.keys(pkg.dependencies || {}).length,
@@ -233,7 +293,7 @@ async function run({ silent = false, results = null } = {}) {
   };
 
   const markdownTable = buildMarkdownTable(
-    { controlPlane, liveSync, routeSwap, subsystems },
+    { controlPlane, liveSync, routeSwap, subsystems, microWasm },
     mcpProfiles
   );
 
@@ -257,11 +317,17 @@ async function run({ silent = false, results = null } = {}) {
 if (require.main === module) {
   const asJson = process.argv.includes('--json');
   const asMarkdown = process.argv.includes('--markdown');
+  const origLog = console.log;
+  if (asJson || asMarkdown) {
+    console.log = () => {};
+  }
   run({ silent: asJson || asMarkdown }).then((res) => {
+    console.log = origLog;
     if (asJson) process.stdout.write(JSON.stringify(res, null, 2) + '\n');
     else if (asMarkdown) process.stdout.write(res.markdownTable + '\n');
     process.exit(0);
   }).catch((err) => {
+    console.log = origLog;
     console.error('❌ Fallo en bench/competitor-comparison.bench.js:', err);
     process.exit(1);
   });
@@ -270,4 +336,5 @@ if (require.main === module) {
 module.exports = run;
 module.exports.DOCUMENTED_COMPETITORS = DOCUMENTED_COMPETITORS;
 module.exports.measureMcpProfileSavings = measureMcpProfileSavings;
+module.exports.measureMicroWasm = measureMicroWasm;
 module.exports.buildMarkdownTable = buildMarkdownTable;

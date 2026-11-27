@@ -630,7 +630,9 @@ class CoolifyMigrator {
    *   uuid?: string,
    *   projectUuid?: string,
    *   environmentName?: string,
-   *   dockerCompose?: string
+   *   dockerCompose?: string,
+   *   teamSharedEnvs?: Record<string, string>,
+   *   projectSharedEnvs?: Record<string, string>
    * }} [context]
    */
   translateMagicVariables(envVars, context = {}) {
@@ -840,7 +842,39 @@ class CoolifyMigrator {
       });
     };
 
-    const sourceMap = envVars && typeof envVars === 'object' ? envVars : {};
+    // Precedencia de 3 niveles de Coolify v4: team_shared < project_shared < resource_env
+    const teamLayer = context.teamSharedEnvs && typeof context.teamSharedEnvs === 'object' ? context.teamSharedEnvs : null;
+    const projectLayer = context.projectSharedEnvs && typeof context.projectSharedEnvs === 'object' ? context.projectSharedEnvs : null;
+    const resourceLayer = envVars && typeof envVars === 'object' ? envVars : {};
+    /** @type {Record<string, string>} */
+    const sourceMap = {};
+    /** @type {Record<string, 'team_shared' | 'project_shared' | 'resource_env'>} */
+    const keySourceTier = {};
+    /** @type {Array<{ key: string, winnerTier: 'team_shared' | 'project_shared' | 'resource_env', overriddenTiers: string[] }>} */
+    const envOverrides = [];
+
+    const applyEnvTier = (layer, tier) => {
+      if (!layer) return;
+      for (const [k, v] of Object.entries(layer)) {
+        if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+        const prev = keySourceTier[k];
+        if (prev && prev !== tier) {
+          const existing = envOverrides.find((o) => o.key === k);
+          if (existing) {
+            if (!existing.overriddenTiers.includes(prev)) existing.overriddenTiers.push(prev);
+            existing.winnerTier = tier;
+          } else {
+            envOverrides.push({ key: k, winnerTier: tier, overriddenTiers: [prev] });
+          }
+        }
+        sourceMap[k] = v == null ? '' : String(v);
+        keySourceTier[k] = tier;
+      }
+    };
+    applyEnvTier(teamLayer, 'team_shared');
+    applyEnvTier(projectLayer, 'project_shared');
+    applyEnvTier(resourceLayer, 'resource_env');
+
     for (const [k, rawV] of Object.entries(sourceMap)) {
       if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
       const valStr = rawV == null ? '' : String(rawV);
@@ -873,6 +907,14 @@ class CoolifyMigrator {
       redactedPreviewEnv,
       translatedCompose,
       magicVarsFound,
+      envPrecedence: {
+        tiersApplied: ['team_shared', 'project_shared', 'resource_env'],
+        teamCount: teamLayer ? Object.keys(teamLayer).length : 0,
+        projectCount: projectLayer ? Object.keys(projectLayer).length : 0,
+        resourceCount: Object.keys(resourceLayer).length,
+        keySourceTier,
+        overrides: envOverrides
+      },
       vaultRefs: Array.from(vaultRefs).sort(),
       secretWarnings,
       unmappedMagicVars
@@ -1559,6 +1601,137 @@ class CoolifyMigrator {
   // ===========================================================================
 
   /**
+   * Resuelve el mapa de variables compartidas de 3 niveles de Coolify v4
+   * (`team_shared < project_shared < resource_env`) para un recurso dado.
+   * @param {any} snapshot
+   * @param {any} res
+   */
+  _resolveThreeTierSharedEnvs(snapshot, res) {
+    /** @type {Record<string, string>} */
+    const teamSharedEnvs = {};
+    /** @type {Record<string, string>} */
+    const projectSharedEnvs = {};
+
+    const projId = String(
+      (res && res.environment && res.environment.project && (res.environment.project.uuid || res.environment.project.id))
+      || (res && res.project_id)
+      || ''
+    );
+
+    const addEnvList = (list, target) => {
+      if (!list) return;
+      if (Array.isArray(list)) {
+        for (const ev of list) {
+          if (!ev || !ev.key || FORBIDDEN_PROTO_KEYS.has(ev.key)) continue;
+          target[ev.key] = String(ev.value ?? '');
+        }
+      } else if (typeof list === 'object') {
+        for (const [k, v] of Object.entries(list)) {
+          if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+          target[k] = String(v ?? '');
+        }
+      }
+    };
+
+    // Tier 1: team_shared (snapshot.teamSharedEnvs o items sin project_id / scope==='team' en snapshot.sharedEnvs)
+    addEnvList(snapshot && snapshot.teamSharedEnvs, teamSharedEnvs);
+    const rawShared = snapshot && snapshot.sharedEnvs;
+    if (Array.isArray(rawShared)) {
+      for (const ev of rawShared) {
+        if (!ev || !ev.key || FORBIDDEN_PROTO_KEYS.has(ev.key)) continue;
+        const scope = String(ev.scope || ev.type || '').toLowerCase();
+        const evProjId = ev.project_id != null ? String(ev.project_id) : (ev.project_uuid ? String(ev.project_uuid) : '');
+        if (scope === 'project' || evProjId) {
+          if (!evProjId || (projId && evProjId === projId)) {
+            projectSharedEnvs[ev.key] = String(ev.value ?? '');
+          }
+        } else {
+          teamSharedEnvs[ev.key] = String(ev.value ?? '');
+        }
+      }
+    } else if (rawShared && typeof rawShared === 'object') {
+      addEnvList(rawShared.team, teamSharedEnvs);
+      addEnvList(rawShared.project, projectSharedEnvs);
+      if (projId && rawShared.projectsById && rawShared.projectsById[projId]) {
+        addEnvList(rawShared.projectsById[projId], projectSharedEnvs);
+      }
+    }
+
+    // Tier 2: project_shared (snapshot.projectSharedEnvs, project.shared_environment_variables, res.project_shared_envs)
+    const projSharedRaw = snapshot && snapshot.projectSharedEnvs;
+    if (Array.isArray(projSharedRaw)) {
+      for (const ev of projSharedRaw) {
+        if (!ev || !ev.key || FORBIDDEN_PROTO_KEYS.has(ev.key)) continue;
+        const evProjId = ev.project_id != null ? String(ev.project_id) : (ev.project_uuid ? String(ev.project_uuid) : '');
+        if (!evProjId || (projId && evProjId === projId)) {
+          projectSharedEnvs[ev.key] = String(ev.value ?? '');
+        }
+      }
+    } else if (projSharedRaw && typeof projSharedRaw === 'object') {
+      if (projId && projSharedRaw[projId]) {
+        addEnvList(projSharedRaw[projId], projectSharedEnvs);
+      } else {
+        // Mapa directo key->value si no está anidado por projectId
+        const looksFlat = Object.values(projSharedRaw).every((v) => typeof v === 'string' || typeof v === 'number');
+        if (looksFlat) addEnvList(projSharedRaw, projectSharedEnvs);
+      }
+    }
+
+    const projects = Array.isArray(snapshot && snapshot.projects) ? snapshot.projects : [];
+    if (projId && projects.length > 0) {
+      const matchedProj = projects.find((p) => String(p.uuid || p.id || '') === projId);
+      if (matchedProj) {
+        addEnvList(matchedProj.shared_environment_variables || matchedProj.sharedEnvs, projectSharedEnvs);
+      }
+    }
+    if (res && res.project_shared_envs) {
+      addEnvList(res.project_shared_envs, projectSharedEnvs);
+    }
+
+    return { teamSharedEnvs, projectSharedEnvs };
+  }
+
+  /**
+   * Extrae la referencia de servidor origen de Coolify v4 (`serverUuid`) y sugiere
+   * un destino en la flota de Culkibo (`fleetTargetHint`).
+   * @param {any} res
+   * @param {any[]} serversCatalog
+   * @param {Record<string, string>} serverMap
+   */
+  _resolveServerMapping(res, serversCatalog = [], serverMap = {}) {
+    const destServer = (res && res.destination && res.destination.server) || (res && res.server) || null;
+    const rawUuid = (destServer && (destServer.uuid || destServer.id))
+      || (res && (res.server_uuid || res.serverUuid || (res.destination && res.destination.server_uuid) || res.server_id))
+      || null;
+    const serverUuid = rawUuid ? String(rawUuid).trim() : null;
+    const catalogHit = serverUuid
+      ? serversCatalog.find((s) => String(s.uuid || s.id || '') === serverUuid)
+      : null;
+    const serverName = String(
+      (destServer && destServer.name)
+      || (catalogHit && catalogHit.name)
+      || (res && res.server_name)
+      || (serverUuid ? `coolify-server-${slugify(serverUuid).slice(0, 16)}` : 'localhost')
+    );
+    const serverIp = String((destServer && destServer.ip) || (catalogHit && catalogHit.ip) || '').trim() || null;
+    const isLocalDefault = !serverUuid
+      || /^(localhost|127\.0\.0\.1|0)$/i.test(serverUuid)
+      || Boolean((destServer && destServer.is_localhost) || (catalogHit && catalogHit.is_localhost));
+
+    const explicitTarget = serverUuid && serverMap[serverUuid] ? String(serverMap[serverUuid]) : null;
+    const fleetTargetHint = explicitTarget
+      || (isLocalDefault ? 'local' : `fleet_${slugify(serverName || serverUuid || 'node').replace(/-/g, '_')}`);
+
+    return {
+      serverUuid,
+      serverName,
+      serverIp,
+      isLocalDefault,
+      fleetTargetHint
+    };
+  }
+
+  /**
    * Construye un informe determinista de paridad y pre-vuelo a partir de un snapshot
    * de Coolify v4 (API en vivo o JSON offline) sin mutar ningún estado ni filtrar secretos.
    *
@@ -1567,12 +1740,16 @@ class CoolifyMigrator {
    *   databases?: any[],
    *   services?: any[],
    *   projects?: any[],
-   *   sharedEnvs?: any[]
+   *   sharedEnvs?: any[] | { team?: any, project?: any, projectsById?: Record<string, any> },
+   *   teamSharedEnvs?: any[] | Record<string, string>,
+   *   projectSharedEnvs?: any[] | Record<string, any>,
+   *   servers?: any[]
    * }} snapshot
    * @param {{
    *   selectedApps?: string[] | null,
    *   selectedDbs?: string[] | null,
-   *   selectedServices?: string[] | null
+   *   selectedServices?: string[] | null,
+   *   serverMap?: Record<string, string>
    * }} [options]
    */
   buildMigrationPlan(snapshot, options = {}) {
@@ -1585,19 +1762,37 @@ class CoolifyMigrator {
     /** @type {any[]} */
     const projects = Array.isArray(snapshot && snapshot.projects) ? (snapshot.projects || []) : [];
     /** @type {any[]} */
-    const sharedEnvs = Array.isArray(snapshot && snapshot.sharedEnvs) ? (snapshot.sharedEnvs || []) : [];
+    const serversCatalog = Array.isArray(snapshot && snapshot.servers) ? (snapshot.servers || []) : [];
+    const serverMap = (options && options.serverMap && typeof options.serverMap === 'object') ? options.serverMap : {};
 
     const appsToPlan = Array.isArray(options.selectedApps) ? apps.filter((a) => options.selectedApps && options.selectedApps.includes(a.uuid)) : apps;
     const dbsToPlan = Array.isArray(options.selectedDbs) ? databases.filter((d) => options.selectedDbs && options.selectedDbs.includes(d.uuid)) : databases;
     const svcsToPlan = Array.isArray(options.selectedServices) ? services.filter((s) => options.selectedServices && options.selectedServices.includes(s.uuid)) : services;
 
-    /** @type {Record<string, string>} */
-    const sharedEnvMap = {};
-    for (const ev of sharedEnvs) {
-      if (ev && ev.key && !FORBIDDEN_PROTO_KEYS.has(ev.key)) {
-        sharedEnvMap[ev.key] = ev.value ?? '';
+    /** @type {Map<string, { coolifyServerUuid: string | null, coolifyServerName: string, coolifyServerIp: string | null, culkiboFleetTarget: string, isLocalDefault: boolean, resourceIds: string[], resourceCount: number }>} */
+    const serverMappingIndex = new Map();
+    const recordServerMapping = (res, resId) => {
+      const sm = this._resolveServerMapping(res, serversCatalog, serverMap);
+      const mapKey = sm.serverUuid || 'local';
+      let entry = serverMappingIndex.get(mapKey);
+      if (!entry) {
+        entry = {
+          coolifyServerUuid: sm.serverUuid,
+          coolifyServerName: sm.serverName,
+          coolifyServerIp: sm.serverIp,
+          culkiboFleetTarget: sm.fleetTargetHint,
+          isLocalDefault: sm.isLocalDefault,
+          resourceIds: [],
+          resourceCount: 0
+        };
+        serverMappingIndex.set(mapKey, entry);
       }
-    }
+      if (resId && !entry.resourceIds.includes(String(resId))) {
+        entry.resourceIds.push(String(resId));
+        entry.resourceCount = entry.resourceIds.length;
+      }
+      return sm;
+    };
 
     /** @type {any[]} */
     const magicVariables = [];
@@ -1648,35 +1843,40 @@ class CoolifyMigrator {
     };
 
     const extractEnvMaps = (res) => {
+      const { teamSharedEnvs, projectSharedEnvs } = this._resolveThreeTierSharedEnvs(snapshot, res);
       /** @type {Record<string, string>} */
-      const runtime = { ...sharedEnvMap };
+      const resourceOnly = {};
       /** @type {Record<string, string>} */
       const preview = {};
       if (Array.isArray(res.environment_variables)) {
         for (const ev of res.environment_variables) {
           if (!ev || !ev.key || FORBIDDEN_PROTO_KEYS.has(ev.key)) continue;
           if (ev.is_preview) preview[ev.key] = ev.value ?? '';
-          else runtime[ev.key] = ev.value ?? '';
+          else resourceOnly[ev.key] = ev.value ?? '';
         }
       }
-      return { runtime, preview };
+      const runtime = { ...teamSharedEnvs, ...projectSharedEnvs, ...resourceOnly };
+      return { runtime, resourceOnly, teamSharedEnvs, projectSharedEnvs, preview };
     };
 
     // 1. Plan Apps
     for (const app of appsToPlan) {
       const hosts = this.parseFqdnHosts(app.fqdn);
-      const { runtime, preview } = extractEnvMaps(app);
+      const { runtime, resourceOnly, teamSharedEnvs, projectSharedEnvs, preview } = extractEnvMaps(app);
+      const serverInfo = recordServerMapping(app, app.uuid);
       const firstPort = parseInt(String(app.ports_exposes || app.port || '').split(',')[0], 10);
       const defaultPort = Number.isInteger(firstPort) && firstPort > 0 && firstPort < 65536 ? firstPort : 3000;
 
-      const magic = this.translateMagicVariables(runtime, {
+      const magic = this.translateMagicVariables(resourceOnly, {
         resourceName: app.name || app.uuid,
         fqdn: app.fqdn,
         hosts,
         gitBranch: app.git_branch || 'main',
         uuid: app.uuid,
         projectUuid: app.project_id ? String(app.project_id) : undefined,
-        dockerCompose: app.docker_compose || app.docker_compose_raw || ''
+        dockerCompose: app.docker_compose || app.docker_compose_raw || '',
+        teamSharedEnvs,
+        projectSharedEnvs
       });
       const traefik = this.parseTraefikLabels(app.custom_labels, {
         defaultPort,
@@ -1745,12 +1945,16 @@ class CoolifyMigrator {
         volumesCount: vols,
         fileMountsCount: mounts,
         hasHealthcheck: hasHealth,
+        serverUuid: serverInfo.serverUuid,
+        fleetTargetHint: serverInfo.fleetTargetHint,
+        envPrecedence: magic.envPrecedence,
         redactedEnvPreview: magic.redactedPreviewEnv
       });
     }
 
     // 2. Plan Databases
     for (const db of dbsToPlan) {
+      const serverInfo = recordServerMapping(db, db.uuid);
       const resolved = this.resolveDatabaseEngine(db);
       const catalog = DB_ENGINE_CATALOG[/** @type {keyof typeof DB_ENGINE_CATALOG} */ (resolved.engine)] || {
         engine: resolved.engine,
@@ -1797,6 +2001,8 @@ class CoolifyMigrator {
         volumesCount: vols,
         parity: catalog.parity,
         note: resolved.note,
+        serverUuid: serverInfo.serverUuid,
+        fleetTargetHint: serverInfo.fleetTargetHint,
         dumpCommand: catalog.dumpHint({ slug: dbSlug, user: dbUser, dbName }),
         restoreCommand: catalog.restoreHint({ slug: dbSlug, user: dbUser, dbName })
       });
@@ -1808,6 +2014,8 @@ class CoolifyMigrator {
         name: db.name || 'Coolify DB',
         engine: catalog.engine,
         originalType: resolved.originalType,
+        serverUuid: serverInfo.serverUuid,
+        fleetTargetHint: serverInfo.fleetTargetHint,
         volumesCount: vols,
         fileMountsCount: mounts
       });
@@ -1815,6 +2023,7 @@ class CoolifyMigrator {
 
     // 3. Plan Services (Multi-container Compose stacks)
     for (const svc of svcsToPlan) {
+      const serverInfo = recordServerMapping(svc, svc.uuid);
       const composeRaw = maybeDecodeBase64Text(svc.docker_compose || svc.docker_compose_raw || '');
       const subServices = inspectComposeServices(composeRaw);
       /** @type {Record<string, { host: string, url: string }>} */
@@ -1831,15 +2040,17 @@ class CoolifyMigrator {
         }
       }
       const uniqueHosts = Array.from(new Set(svcHosts));
-      const { runtime } = extractEnvMaps(svc);
+      const { resourceOnly, teamSharedEnvs, projectSharedEnvs } = extractEnvMaps(svc);
 
-      const magic = this.translateMagicVariables(runtime, {
+      const magic = this.translateMagicVariables(resourceOnly, {
         resourceName: svc.name || svc.uuid,
         fqdn: svc.fqdn || (uniqueHosts[0] ? `https://${uniqueHosts[0]}` : ''),
         hosts: uniqueHosts,
         serviceHostMap,
         uuid: svc.uuid,
-        dockerCompose: composeRaw
+        dockerCompose: composeRaw,
+        teamSharedEnvs,
+        projectSharedEnvs
       });
       const traefik = this.parseTraefikLabels(svc.custom_labels, {
         defaultPort: 3000,
@@ -1901,6 +2112,9 @@ class CoolifyMigrator {
         cronsCount: taskPlan.crons.length,
         volumesCount: vols,
         fileMountsCount: mounts,
+        serverUuid: serverInfo.serverUuid,
+        fleetTargetHint: serverInfo.fleetTargetHint,
+        envPrecedence: magic.envPrecedence,
         redactedEnvPreview: magic.redactedPreviewEnv
       });
     }
@@ -2013,6 +2227,8 @@ class CoolifyMigrator {
       magicVariables,
       traefikTranslations,
       crons,
+      serverMappings: Array.from(serverMappingIndex.values()),
+      multiServerDetected: serverMappingIndex.size > 1,
       vaultRefs: Array.from(allVaultRefs).sort(),
       secretWarnings: Array.from(new Set(secretWarnings)),
       warnings: Array.from(new Set(warnings)),
@@ -2102,11 +2318,12 @@ class CoolifyMigrator {
   /**
    * Ejecuta la migración completa desde un snapshot de Coolify v4 (API o JSON offline).
    *
-   * @param {{ apps?: any[], databases?: any[], services?: any[], projects?: any[], sharedEnvs?: any[] }} snapshot
+   * @param {{ apps?: any[], databases?: any[], services?: any[], projects?: any[], sharedEnvs?: any[] | Record<string, any>, teamSharedEnvs?: any[] | Record<string, string>, projectSharedEnvs?: any[] | Record<string, any>, servers?: any[] }} snapshot
    * @param {{
    *   selectedApps?: string[] | null,
    *   selectedDbs?: string[] | null,
    *   selectedServices?: string[] | null,
+   *   serverMap?: Record<string, string>,
    *   syncCrons?: boolean,
    *   projectManager?: any,
    *   domainManager?: any,
@@ -2127,13 +2344,14 @@ class CoolifyMigrator {
     /** @type {any[]} */
     const projects = Array.isArray(snapshot && snapshot.projects) ? (snapshot.projects || []) : [];
     /** @type {any[]} */
-    const sharedEnvs = Array.isArray(snapshot && snapshot.sharedEnvs) ? (snapshot.sharedEnvs || []) : [];
+    const serversCatalog = Array.isArray(snapshot && snapshot.servers) ? (snapshot.servers || []) : [];
+    const serverMap = (options && options.serverMap && typeof options.serverMap === 'object') ? options.serverMap : {};
 
     const selectedApps = options.selectedApps !== undefined ? options.selectedApps : null;
     const selectedDbs = options.selectedDbs !== undefined ? options.selectedDbs : null;
     const selectedServices = options.selectedServices !== undefined ? options.selectedServices : null;
 
-    const plan = this.buildMigrationPlan(snapshot, { selectedApps, selectedDbs, selectedServices });
+    const plan = this.buildMigrationPlan(snapshot, { selectedApps, selectedDbs, selectedServices, serverMap });
 
     const results = {
       importedApps: 0,
@@ -2145,7 +2363,8 @@ class CoolifyMigrator {
       magicVarsTranslated: plan.summary.magicVarsTranslated,
       vaultRefs: plan.vaultRefs,
       parityScore: plan.parityScore,
-      createdProjects: /** @type {Array<{ id: string, name: string, domains: string[] }>} */ ([]),
+      serverMappings: plan.serverMappings,
+      createdProjects: /** @type {Array<{ id: string, name: string, domains: string[], fleetTargetHint?: string }>} */ ([]),
       dnsCutoverChecklist: plan.dnsCutoverChecklist,
       rollbackPlan: plan.rollbackPlan,
       warnings: [...plan.warnings],
@@ -2156,14 +2375,6 @@ class CoolifyMigrator {
     const appsToImport = Array.isArray(selectedApps) ? apps.filter(app => selectedApps.includes(app.uuid)) : apps;
     const dbsToImport = Array.isArray(selectedDbs) ? databases.filter(db => selectedDbs.includes(db.uuid)) : databases;
     const servicesToImport = Array.isArray(selectedServices) ? services.filter(svc => selectedServices.includes(svc.uuid)) : services;
-
-    /** @type {Record<string, string>} */
-    const sharedEnvMap = {};
-    for (const ev of sharedEnvs) {
-      if (ev && ev.key && !FORBIDDEN_PROTO_KEYS.has(ev.key)) {
-        sharedEnvMap[ev.key] = ev.value ?? '';
-      }
-    }
 
     const culkiboProjects = new Map();
 
@@ -2209,8 +2420,9 @@ class CoolifyMigrator {
     };
 
     const extractCommonFields = (res) => {
+      const { teamSharedEnvs, projectSharedEnvs } = this._resolveThreeTierSharedEnvs(snapshot, res);
       /** @type {Record<string, string>} */
-      const envVars = { ...sharedEnvMap };
+      const resourceOnlyEnv = {};
       /** @type {Record<string, string>} */
       const previewEnvVars = {};
       if (res.environment_variables && Array.isArray(res.environment_variables)) {
@@ -2219,10 +2431,12 @@ class CoolifyMigrator {
           if (ev.is_preview) {
             previewEnvVars[ev.key] = ev.value ?? '';
           } else {
-            envVars[ev.key] = ev.value ?? '';
+            resourceOnlyEnv[ev.key] = ev.value ?? '';
           }
         });
       }
+      const envVars = { ...teamSharedEnvs, ...projectSharedEnvs, ...resourceOnlyEnv };
+      const serverInfo = this._resolveServerMapping(res, serversCatalog, serverMap);
 
       const volumes = res.local_persistent_volumes || res.persistent_volumes || res.volumes || [];
       const fileMounts = res.local_file_volumes || res.file_volumes || [];
@@ -2252,7 +2466,7 @@ class CoolifyMigrator {
         custom_labels: res.custom_labels
       };
 
-      return { envVars, previewEnvVars, volumes, fileMounts, resourceLimits, healthCheck, networkConfig };
+      return { envVars, resourceOnlyEnv, teamSharedEnvs, projectSharedEnvs, previewEnvVars, serverInfo, volumes, fileMounts, resourceLimits, healthCheck, networkConfig };
     };
 
     // 1. Migrate Apps
@@ -2263,14 +2477,16 @@ class CoolifyMigrator {
         const firstPort = parseInt(String(app.ports_exposes || app.port || '').split(',')[0], 10);
         const validFirstPort = Number.isInteger(firstPort) && firstPort > 0 && firstPort < 65536 ? firstPort : null;
 
-        const magic = this.translateMagicVariables(common.envVars, {
+        const magic = this.translateMagicVariables(common.resourceOnlyEnv, {
           resourceName: app.name || app.uuid,
           fqdn: app.fqdn,
           hosts,
           gitBranch: app.git_branch || 'main',
           uuid: app.uuid,
           projectUuid: app.project_id ? String(app.project_id) : undefined,
-          dockerCompose: app.docker_compose || app.docker_compose_raw || ''
+          dockerCompose: app.docker_compose || app.docker_compose_raw || '',
+          teamSharedEnvs: common.teamSharedEnvs,
+          projectSharedEnvs: common.projectSharedEnvs
         });
         const traefik = this.parseTraefikLabels(app.custom_labels, {
           defaultPort: validFirstPort || 3000,
@@ -2334,6 +2550,15 @@ class CoolifyMigrator {
           proj.cpus = Number(app.limits_cpus);
           proj.cpuLimit = Number(app.limits_cpus);
         }
+        if (!proj.coolifyServerUuid && common.serverInfo.serverUuid) {
+          proj.coolifyServerUuid = common.serverInfo.serverUuid;
+        }
+        if (!proj.fleetTargetHint && common.serverInfo.fleetTargetHint) {
+          proj.fleetTargetHint = common.serverInfo.fleetTargetHint;
+          if (!proj.serverId && /^[a-z0-9_-]{1,64}$/.test(common.serverInfo.fleetTargetHint)) {
+            proj.serverId = common.serverInfo.fleetTargetHint;
+          }
+        }
 
         // Auto-generar Smoke Test nativo de Culkibo desde el healthcheck de Coolify
         if (app.health_check_path && String(app.health_check_path).startsWith('/')) {
@@ -2384,6 +2609,8 @@ class CoolifyMigrator {
           deployCommands: deployCommands,
           gitDetails: gitDetails,
           scheduledTasks: taskPlan.crons,
+          serverUuid: common.serverInfo.serverUuid,
+          fleetTargetHint: common.serverInfo.fleetTargetHint,
           ports: app.ports_exposes || app.ports_mappings || app.port || '',
           status: this.normalizeCoolifyStatus(app.status),
           rawMeta: sanitizeCoolifyMeta(app)
@@ -2463,13 +2690,15 @@ class CoolifyMigrator {
         }
         const uniqueSvcHosts = Array.from(new Set(svcHosts));
 
-        const magic = this.translateMagicVariables(common.envVars, {
+        const magic = this.translateMagicVariables(common.resourceOnlyEnv, {
           resourceName: svc.name || svc.uuid,
           fqdn: svc.fqdn || (uniqueSvcHosts[0] ? `https://${uniqueSvcHosts[0]}` : ''),
           hosts: uniqueSvcHosts,
           serviceHostMap,
           uuid: svc.uuid,
-          dockerCompose: composeRaw
+          dockerCompose: composeRaw,
+          teamSharedEnvs: common.teamSharedEnvs,
+          projectSharedEnvs: common.projectSharedEnvs
         });
         const traefik = this.parseTraefikLabels(svc.custom_labels, {
           defaultPort: 3000,
