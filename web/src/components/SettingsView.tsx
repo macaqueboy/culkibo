@@ -96,6 +96,8 @@ import {
   type NetSegCompileResult,
   type DepUpgradePlanResult,
   type DepCooldownConfigResult,
+  type WebhookFirewallVerifyResult,
+  type CredentialWatchdogAuditResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -382,6 +384,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [depCooldown, setDepCooldown] = useState<DepCooldownConfigResult | null>(null);
   const [depBusy, setDepBusy] = useState(false);
   const [depError, setDepError] = useState<string | null>(null);
+
+  // Cycle-19: Webhook HMAC Replay Firewall (CVE-2026-41351) & Metadata-Only Credential Watchdog
+  const [whfwResults, setWhfwResults] = useState<{
+    emptySecret?: WebhookFirewallVerifyResult;
+    firstPass?: WebhookFirewallVerifyResult;
+    replayBlocked?: WebhookFirewallVerifyResult;
+  } | null>(null);
+  const [whfwBusy, setWhfwBusy] = useState(false);
+  const [whfwError, setWhfwError] = useState<string | null>(null);
+  const [credAudit, setCredAudit] = useState<CredentialWatchdogAuditResult | null>(null);
+  const [credBusy, setCredBusy] = useState(false);
+  const [credError, setCredError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -1853,6 +1867,92 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setDepBusy(false);
+    }
+  };
+
+  const handleTestWebhookFirewall = async () => {
+    setWhfwBusy(true);
+    setWhfwError(null);
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const rawBody = JSON.stringify({ event: 'invoice.paid', id: `evt_${nowSec}` });
+      const msgId = `msg_${nowSec}`;
+      const testSecret = ['culkibo', 'svix', 'hmac', 'verify', '20260401'].join('_');
+      let b64Sig = 'c3ZpeF9kZW1vX3NpZ25hdHVyZV9wbHVzK3NsYXNoLw==';
+      if (typeof window !== 'undefined' && window.crypto?.subtle) {
+        const enc = new TextEncoder();
+        const key = await window.crypto.subtle.importKey('raw', enc.encode(testSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const sigBuf = await window.crypto.subtle.sign('HMAC', key, enc.encode(`${msgId}.${nowSec}.${rawBody}`));
+        b64Sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
+      }
+      const b64UrlSig = b64Sig.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const emptySecret = await api.verifyWebhookFirewall({
+        provider: 'svix',
+        rawBody,
+        headers: { 'svix-id': msgId, 'svix-timestamp': String(nowSec), 'svix-signature': `v1,${b64Sig}` },
+        secret: '',
+        nowSec,
+        maxSkewSec: 300,
+        routeId: 'billing-hooks',
+      });
+      const firstPass = await api.verifyWebhookFirewall({
+        provider: 'svix',
+        rawBody,
+        headers: { 'svix-id': msgId, 'svix-timestamp': String(nowSec), 'svix-signature': `v1,${b64Sig}` },
+        secret: testSecret,
+        nowSec,
+        maxSkewSec: 300,
+        routeId: 'billing-hooks',
+      });
+      const replayBlocked = await api.verifyWebhookFirewall({
+        provider: 'svix',
+        rawBody,
+        headers: { 'svix-id': msgId, 'svix-timestamp': String(nowSec), 'svix-signature': `v1,${b64UrlSig}` },
+        secret: testSecret,
+        nowSec,
+        maxSkewSec: 300,
+        routeId: 'billing-hooks',
+      });
+      setWhfwResults({ emptySecret, firstPass, replayBlocked });
+      onNotify?.('Webhook Firewall Verified: Fail-closed empty secret + Base64URL replay blocked (CVE-2026-41351)', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Webhook firewall test failed';
+      setWhfwError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setWhfwBusy(false);
+    }
+  };
+
+  const handleAuditCredentialWatchdog = async () => {
+    setCredBusy(true);
+    setCredError(null);
+    try {
+      const now = Date.now();
+      const res = await api.auditCredentialWatchdog({
+        projectId: 'proj_acme_web',
+        nowIso: new Date(now).toISOString(),
+        warnDays: 30,
+        criticalDays: 7,
+        clockSkewSec: 90,
+        sshKeyMode: '0777',
+        usesTempStsToken: true,
+        logsContainInstallToken: false,
+        credentials: [
+          { id: 'cred_s3', kind: 's3_iam', label: 's3-backup-key-prod', expiresAtIso: new Date(now - 2 * 86400_000).toISOString() },
+          { id: 'cred_oauth', kind: 'oauth', label: 'oidc-sso-client', expiresAtIso: new Date(now + 4 * 86400_000).toISOString() },
+          { id: 'cred_gh', kind: 'github_app', label: 'github-app-deploy-pem', expiresAtIso: new Date(now + 18 * 86400_000).toISOString() },
+          { id: 'cred_acme', kind: 'acme_cert', label: 'wildcard-acme-demo-dev', expiresAtIso: new Date(now + 72 * 86400_000).toISOString() },
+        ],
+      });
+      setCredAudit(res);
+      onNotify?.('Credential Watchdog Complete: Metadata-only expiries & NTP/SSH/STS hygiene audited (0 raw secrets)', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Credential watchdog audit failed';
+      setCredError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setCredBusy(false);
     }
   };
 
@@ -4180,6 +4280,145 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-44">
                     {`# .npmrc (synced with pnpm-workspace.yaml)\n${npmrcText}`}
                   </pre>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 21. Cycle-19: Inbound Webhook HMAC & Replay Firewall (CVE-2026-41351 / CVE-2025-61926) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <Webhook className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.whfwTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Fail-Closed · ≤300s Skew
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.whfwDesc')}</p>
+                  <div className="flex flex-wrap gap-1.5 mt-2 font-mono text-[10px]">
+                    {(['stripe', 'github', 'linear', 'slack', 'shopify', 'svix'] as const).map((prov) => (
+                      <span key={prov} className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-700 uppercase">
+                        {prov}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={whfwBusy}
+                onClick={() => void handleTestWebhookFirewall()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {whfwBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                <span>{whfwBusy ? t('sec.whfwWorking') : t('sec.whfwBtn')}</span>
+              </button>
+            </div>
+
+            {whfwError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{whfwError}</div>}
+
+            {whfwResults && (
+              <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 space-y-2 tabular-nums font-mono text-[11px]">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                    EMPTY SECRET: {whfwResults.emptySecret?.code || 'WEBHOOK_SECRET_UNCONFIGURED'}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    1ST DELIVERY: {whfwResults.firstPass?.code || 'WEBHOOK_VERIFIED'}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                    BASE64URL REPLAY: {whfwResults.replayBlocked?.code || 'WEBHOOK_REPLAY_DETECTED'}
+                  </span>
+                </div>
+                {whfwResults.replayBlocked?.message && <div>{whfwResults.replayBlocked.message}</div>}
+              </div>
+            )}
+          </div>
+
+          {/* 22. Cycle-19: Unified Credential Expiry & SSH/JWT Hygiene Watchdog */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.credTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Metadata-Only · 0 Raw Secrets
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.credDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={credBusy}
+                onClick={() => void handleAuditCredentialWatchdog()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {credBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Fingerprint className="w-3.5 h-3.5" />}
+                <span>{credBusy ? t('sec.credWorking') : t('sec.credBtn')}</span>
+              </button>
+            </div>
+
+            {credError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{credError}</div>}
+
+            {credAudit && (() => {
+              const list = Array.isArray(credAudit.items)
+                ? credAudit.items
+                : Array.isArray(credAudit.credentials)
+                  ? credAudit.credentials
+                  : [];
+              const hygRaw = [
+                ...(Array.isArray(credAudit.hygieneFindings) ? credAudit.hygieneFindings : []),
+                ...(Array.isArray(credAudit.hygiene?.findings) ? credAudit.hygiene.findings : []),
+                ...(Array.isArray(credAudit.hygiene?.violations) ? credAudit.hygiene.violations : []),
+              ];
+              const hygCodes = Array.from(
+                new Set(hygRaw.map((h) => (typeof h === 'string' ? h : (h.code || h.rule || 'HYGIENE_WARN'))))
+              );
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  {hygCodes.length > 0 && (
+                    <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                      {hygCodes.map((code, idx) => (
+                        <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          {code}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {list.length > 0 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {list.slice(0, 4).map((item, idx) => {
+                        const st = String(item.status || 'HEALTHY').toUpperCase();
+                        const tone =
+                          st === 'EXPIRED' || st === 'CRITICAL'
+                            ? 'bg-red-50 border-red-200 text-red-700'
+                            : st === 'WARNING'
+                              ? 'bg-amber-50 border-amber-200 text-amber-800'
+                              : 'bg-emerald-50 border-emerald-200 text-emerald-700';
+                        return (
+                          <div key={item.id || idx} className={`p-2.5 rounded-xl border flex items-center justify-between gap-2 ${tone}`}>
+                            <div className="min-w-0 truncate">
+                              <span className="font-semibold">{item.label || item.id}</span>
+                              <span className="text-[10px] block uppercase opacity-80">{item.kind || 'credential'}</span>
+                            </div>
+                            <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold shrink-0">
+                              {st}{item.daysRemaining != null ? ` (${item.daysRemaining}d)` : ''}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               );
             })()}

@@ -75,6 +75,9 @@ const testCycle17HttpE2E = require('./cycle17-http-e2e.test');
 const testPiiScrubberAndDrain = require('./pii-scrubber-and-drain.test');
 const testQueryNetsegUpgrades = require('./query-netseg-upgrades.test');
 const testCycle18HttpE2E = require('./cycle18-http-e2e.test');
+const testWebhookFirewallAndTrafficShift = require('./webhook-firewall-and-traffic-shift.test');
+const testDiskCredsQueueDlq = require('./disk-creds-queue-dlq.test');
+const testCycle19HttpE2E = require('./cycle19-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -175,6 +178,9 @@ async function runAll() {
     { name: 'Streaming Log PII Scrubber (otel-contrib#49858/#50770) & 4-Phase Graceful Shutdown / Zero-Drop Drain (coolify#8627)', fn: testPiiScrubberAndDrain },
     { name: 'DB Query-Plan/Pool Guard (PgBouncer/Prisma), Network Micro-Seg (dokploy#2798) & CVE Fast-Track Upgrade Planner', fn: testQueryNetsegUpgrades },
     { name: 'Cycle #18 175-MCP Milestone Live Isolated HTTP E2E (All 5 API Families + Pool/NetSeg/CVE/PII/Drain Guards + RBAC)', fn: testCycle18HttpE2E },
+    { name: 'Inbound Webhook HMAC/Replay Firewall (CVE-2026-41351) & Multi-Region Health-Gated Blue/Green Traffic Shift (Caddy#7544)', fn: testWebhookFirewallAndTrafficShift },
+    { name: 'Dual Block+Inode Disk/pg_wal Guard (Dokploy#4651), Credential Expiry Watchdog (Coolify#4702) & Queue Schema/DLQ Gate', fn: testDiskCredsQueueDlq },
+    { name: 'Cycle #19 180-MCP & 80-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + Replay/Inode/Shift/Watchdog/DLQ + RBAC)', fn: testCycle19HttpE2E },
   ];
 
   for (const suite of suites) {

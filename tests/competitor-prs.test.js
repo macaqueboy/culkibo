@@ -3676,6 +3676,107 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #18 CVEs (20a-20e): PgBouncer/Prisma query+pool guard, dokploy#2798/#2987 network micro-seg, pnpm/Renovate CVE fast-track, otel-contrib#49858/#50770 PII scrubber, coolify#8627 4-phase graceful drain');
 
+  // -------------------------------------------------------------------------
+  // 21. Cycle #19 Webhook Firewall, Disk/Inode Guard, Multi-Region Shift, Credential Watchdog & Queue Schema/DLQ Regressions (docs/COMPETITOR_RADAR_CYCLE18.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const { WebhookFirewallService } = require('../server/services/webhookFirewallService');
+    const diskGuard = require('../server/services/diskPressureGuardService');
+    const { RegionTrafficShiftService } = require('../server/services/regionTrafficShiftService');
+    const credWatchdog = require('../server/services/credentialExpiryWatchdogService');
+    const queueDlq = require('../server/services/queueSchemaDlqService');
+
+    const c19Tmp = makeTempDir('culkibo-c19-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c19Tmp;
+    try {
+      // 21a. Webhook Firewall (CVE-2026-41351 / CVE-2025-61926): empty secret fails closed, >300s skew rejects, Base64URL replay rejects
+      const whFw = new WebhookFirewallService({ dataDir: c19Tmp });
+      const nowSec = 1764290000;
+      const body21a = '{"event":"paid"}';
+      const dynWhSecret = ['c19', 'cve21a', 'strong', 'secret', '77'].join('-');
+      assert.strictEqual(whFw.verifyInboundWebhook({ provider: 'svix', rawBody: body21a, headers: {}, secret: '', nowSec }).code, 'WEBHOOK_SECRET_UNCONFIGURED');
+      const sigBuf = crypto.createHmac('sha256', Buffer.from(dynWhSecret, 'utf8')).update('id_21a.' + nowSec + '.' + body21a).digest();
+      const sigB64 = sigBuf.toString('base64');
+      const sigB64Url = sigB64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      assert.strictEqual(whFw.verifyInboundWebhook({
+        provider: 'svix', rawBody: body21a, secret: dynWhSecret, nowSec,
+        headers: { 'svix-id': 'id_old', 'svix-timestamp': String(nowSec - 400), 'svix-signature': 'v1,' + sigB64 }
+      }).code, 'CLOCK_SKEW_EXCEEDED');
+      assert.strictEqual(whFw.verifyInboundWebhook({
+        provider: 'svix', rawBody: body21a, secret: dynWhSecret, nowSec, routeId: 'r21a',
+        headers: { 'svix-id': 'id_21a', 'svix-timestamp': String(nowSec), 'svix-signature': 'v1,' + sigB64 }
+      }).verified, true);
+      const replay21a = whFw.verifyInboundWebhook({
+        provider: 'svix', rawBody: body21a, secret: dynWhSecret, nowSec: nowSec + 2, routeId: 'r21a',
+        headers: { 'svix-id': 'id_21a', 'svix-timestamp': String(nowSec), 'svix-signature': 'v1,' + sigB64Url }
+      });
+      assert.strictEqual(replay21a.verified, false);
+      assert.strictEqual(replay21a.code, 'WEBHOOK_REPLAY_DETECTED');
+
+      // 21b. Disk & Inode Guard (Dokploy#4651/#2702): 35% block / 96% inodes + 2 inactive replication slots -> INODE_EXHAUSTION_CRITICAL + PG_WAL_SLOT_RUNAWAY
+      const dp21b = diskGuard.evaluateDiskPressure({ nodeId: 'n_21b', blockUsedPct: 35, inodeUsedPct: 96, inactiveReplicationSlots: 2, pgWalGb: 10, persist: false });
+      assert.ok(dp21b.alertCodes.includes('INODE_EXHAUSTION_CRITICAL'));
+      assert.ok(dp21b.alertCodes.includes('PG_WAL_SLOT_RUNAWAY'));
+      const quota21b = diskGuard.generateDaemonLogQuotaConfig();
+      assert.strictEqual(quota21b.config['log-opts']['max-size'], '10m');
+      assert.strictEqual(quota21b.config['log-opts']['max-file'], '3');
+      assert.strictEqual(diskGuard.planPressureRemediation({ evaluation: dp21b }).dryRun, true);
+
+      // 21c. Region Traffic Shift (Caddy#7544/#6393): 0 healthyEndpoints / health_port 302 -> UNHEALTHY_TARGET_REGION; healthy plan renders Caddy sticky cookie + health_uri + lb_try_duration
+      const shiftSvc = new RegionTrafficShiftService({ dataDir: c19Tmp });
+      const badShift = shiftSvc.evaluateTrafficShift({
+        projectId: 'proj_21c',
+        targetGreenWeightPct: 50,
+        regions: [{ id: 'us-east', role: 'green', healthyEndpoints: 0, probeStatus: 302, healthPort: 8081 }]
+      });
+      assert.strictEqual(badShift.allowed, false);
+      assert.strictEqual(badShift.code, 'UNHEALTHY_TARGET_REGION');
+      const okPlan21c = shiftSvc.planBlueGreenShift({ projectId: 'proj_21c', currentBlueWeightPct: 100, stepPct: 25, stickyMaxAgeSec: 600 });
+      assert.strictEqual(okPlan21c.dryRun, true);
+      assert.strictEqual(okPlan21c.stickyCookiePolicy.maxAgeSec, 600);
+      assert.ok(okPlan21c.caddyBlock.caddyfile.includes('lb_policy cookie') && okPlan21c.caddyBlock.caddyfile.includes('health_uri') && okPlan21c.caddyBlock.caddyfile.includes('lb_try_duration'));
+
+      // 21d. Credential Watchdog (Coolify#4702 / Dokploy#2913/#5618): EXPIRED S3 + CRITICAL 5d OAuth + hygiene checks + 0 raw secrets stored
+      const fakeSecret21d = ['raw', 'secret', 'never', 'stored', '21d'].join('-');
+      const reg21d = credWatchdog.registerCredentialMetadata({ id: 'c_s3', projectId: 'proj_21d', kind: 's3_iam', expiresAtIso: '2026-11-20T00:00:00Z', secret: fakeSecret21d, dryRun: false });
+      assert.ok(!JSON.stringify(reg21d).includes(fakeSecret21d));
+      credWatchdog.registerCredentialMetadata({ id: 'c_oa', projectId: 'proj_21d', kind: 'oauth', expiresAtIso: '2026-12-03T00:00:00Z', dryRun: false });
+      const aud21d = credWatchdog.auditCredentialExpiries({ projectId: 'proj_21d', nowIso: '2026-11-28T00:00:00Z' });
+      assert.strictEqual(aud21d.counts.EXPIRED, 1);
+      assert.strictEqual(aud21d.counts.CRITICAL, 1);
+      const hyg21d = credWatchdog.checkSshAndJwtHygiene({ clockSkewSec: 90, sshKeyMode: '0777', usesTempStsToken: true });
+      assert.ok(hyg21d.findingCodes.includes('CLOCK_SKEW_JWT_FAILURE'));
+      assert.ok(hyg21d.findingCodes.includes('INSECURE_SSH_KEY_MODE'));
+      assert.ok(hyg21d.findingCodes.includes('EPHEMERAL_BACKUP_CREDENTIAL'));
+
+      // 21e. Queue Schema & DLQ (Kafka KIP-1034 / BullMQ v6): REQUIRED_FIELD_ADDED_NO_DEFAULT vs optional defaulted; DLQ_SCHEMA_DEADLOCK + breaker at >=5
+      const schBad = queueDlq.checkEventSchemaEvolution({
+        format: 'jsonschema',
+        compatibilityMode: 'BACKWARD',
+        baseSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+        nextSchema: { type: 'object', properties: { id: { type: 'string' }, region: { type: 'string' } }, required: ['id', 'region'] }
+      });
+      assert.strictEqual(schBad.compatible, false);
+      assert.ok(schBad.breakingChanges.some((c) => c.code === 'REQUIRED_FIELD_ADDED_NO_DEFAULT'));
+      const schOk = queueDlq.checkEventSchemaEvolution({
+        format: 'jsonschema',
+        compatibilityMode: 'BACKWARD',
+        baseSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+        nextSchema: { type: 'object', properties: { id: { type: 'string' }, region: { type: 'string', default: 'eu' } }, required: ['id', 'region'] }
+      });
+      assert.strictEqual(schOk.compatible, true);
+      const circ21e = queueDlq.evaluatePoisonPillCircuit({ queueName: 'q_21e', dlqRawPassthrough: false, consecutivePoisonCount: 5 });
+      assert.strictEqual(circ21e.circuitOpen, true);
+      assert.ok(circ21e.findingCodes.includes('DLQ_SCHEMA_DEADLOCK'));
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c19Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #19 CVEs (21a-21e): CVE-2026-41351 webhook replay firewall, dokploy#4651 inode/pg_wal guard, caddy#7544/#6393 region shift, coolify#4702 cred watchdog, Kafka KIP-1034 queue schema+DLQ');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

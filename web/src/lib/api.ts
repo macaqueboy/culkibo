@@ -6356,6 +6356,184 @@ export const api = {
     }
     throw new Error(data?.error || data?.message || 'Graceful drain state advance failed');
   },
+
+  // --- Cycle-19: Webhook Replay Firewall, Dual Block+Inode Disk Guard, Region Traffic Shift, Credential Watchdog & Queue Schema/DLQ Gate ---
+
+  async verifyWebhookFirewall(payload: {
+    provider: 'stripe' | 'github' | 'linear' | 'slack' | 'shopify' | 'svix';
+    rawBody: string;
+    headers?: Record<string, string>;
+    secret?: string;
+    nowSec?: number;
+    maxSkewSec?: number;
+    routeId?: string;
+  }): Promise<WebhookFirewallVerifyResult> {
+    const res = await apiFetch(`${API_BASE}/webhooks/firewall/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (
+      res.ok ||
+      data?.code === 'WEBHOOK_SECRET_UNCONFIGURED' ||
+      data?.code === 'WEBHOOK_REPLAY_DETECTED' ||
+      data?.code === 'CLOCK_SKEW_EXCEEDED' ||
+      data?.code === 'INVALID_SIGNATURE' ||
+      data?.allowed === false ||
+      data?.verified === false
+    ) {
+      return data as WebhookFirewallVerifyResult;
+    }
+    throw new Error(data?.error || data?.message || 'Webhook firewall verification failed');
+  },
+
+  async evaluateDiskPressure(payload: {
+    nodeId?: string;
+    blockUsedPct: number;
+    inodeUsedPct: number;
+    overlay2Gb?: number;
+    containerLogGb?: number;
+    pgWalGb?: number;
+    inactiveReplicationSlots?: number;
+    diskTotalGb?: number;
+  }): Promise<DiskPressureEvalResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/nodes/disk-pressure/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Disk & inode pressure evaluation failed'
+    );
+  },
+
+  async remediateDiskPressure(payload: {
+    evaluation?: DiskPressureEvalResult;
+    nodeId?: string;
+    dryRun?: boolean;
+  }): Promise<DiskPressureRemediateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/nodes/disk-pressure/remediate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Disk pressure remediation plan failed'
+    );
+  },
+
+  async evaluateRegionTrafficShift(payload: {
+    projectId?: string;
+    regions: Array<Record<string, unknown>>;
+    targetGreenWeightPct?: number;
+    stickyCookiePolicy?: Record<string, unknown>;
+    healthProbes?: Array<Record<string, unknown>>;
+  }): Promise<RegionTrafficShiftEvalResult> {
+    const res = await apiFetch(`${API_BASE}/edge/traffic-shift/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.allowed === false || data?.code === 'UNHEALTHY_TARGET_REGION') {
+      return data as RegionTrafficShiftEvalResult;
+    }
+    throw new Error(data?.error || data?.message || 'Region traffic shift evaluation failed');
+  },
+
+  async planRegionTrafficShift(payload: {
+    projectId: string;
+    currentBlueWeightPct?: number;
+    stepPct?: number;
+    stickyMaxAgeSec?: number;
+    failDurationSec?: number;
+    dryRun?: boolean;
+  }): Promise<RegionTrafficShiftPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/traffic-shift/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Blue/Green region shift plan failed'
+    );
+  },
+
+  async auditCredentialWatchdog(payload: {
+    projectId?: string;
+    nowIso?: string;
+    warnDays?: number;
+    criticalDays?: number;
+    credentials?: Array<Record<string, unknown>>;
+    clockSkewSec?: number;
+    sshKeyMode?: string;
+    usesTempStsToken?: boolean;
+    logsContainInstallToken?: boolean;
+  }): Promise<CredentialWatchdogAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/credentials/audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Credential expiry watchdog audit failed'
+    );
+  },
+
+  async checkQueueSchemaEvolution(payload: {
+    format?: 'jsonschema' | 'avro';
+    baseSchema: Record<string, unknown>;
+    nextSchema: Record<string, unknown>;
+    compatibilityMode?: 'BACKWARD' | 'FULL';
+  }): Promise<QueueSchemaCheckResult> {
+    const res = await apiFetch(`${API_BASE}/queues/schema/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.compatible === false || data?.allowed === false) {
+      return data as QueueSchemaCheckResult;
+    }
+    throw new Error(data?.error || data?.message || 'Queue schema compatibility check failed');
+  },
+
+  async evaluateQueueDlqCircuit(payload: {
+    queueName: string;
+    totalDelivered?: number;
+    failedCount?: number;
+    consecutivePoisonCount?: number;
+    dlqRawPassthrough?: boolean;
+    maxRetries?: number;
+  }): Promise<QueueDlqCircuitResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/queues/dlq/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Queue DLQ poison-pill circuit evaluation failed'
+    );
+  },
+
+  async quarantineQueuePoison(payload: {
+    queueName: string;
+    messageId: string;
+    rawPayloadBase64: string;
+    errorCode?: string;
+    attemptCount?: number;
+    dryRun?: boolean;
+  }): Promise<QueueDlqQuarantineResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/queues/dlq/quarantine`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Poison-pill quarantine failed'
+    );
+  },
 };
 
 // =====================================================================
@@ -8623,5 +8801,113 @@ export interface GracefulDrainAdvanceResult {
   nextPhase?: string;
   completed?: boolean;
   droppedJobs?: number;
+  message?: string;
+}
+
+// --- Cycle-19 Webhook Firewall, Dual Block+Inode Disk Guard, Region Traffic Shift, Credential Watchdog & Queue Schema/DLQ Types ---
+
+export interface WebhookFirewallVerifyResult {
+  ok?: boolean;
+  allowed?: boolean;
+  verified?: boolean;
+  code: string;
+  provider?: string;
+  canonicalSig?: string;
+  replayBlocked?: boolean;
+  message?: string;
+}
+
+export interface DiskPressureEvalResult {
+  ok?: boolean;
+  nodeId?: string;
+  severity?: string;
+  healthy?: boolean;
+  blockUsedPct?: number;
+  inodeUsedPct?: number;
+  findings?: GuardFindingItem[];
+  alerts?: GuardFindingItem[];
+  daemonLogQuota?: { config?: Record<string, unknown> | string; [key: string]: unknown };
+  daemonLogConfig?: Record<string, unknown>;
+  message?: string;
+}
+
+export interface DiskPressureRemediateResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  steps?: Array<string | { action?: string; title?: string; command?: string }>;
+  daemonLogQuota?: { config?: Record<string, unknown> | string; [key: string]: unknown };
+  daemonJson?: Record<string, unknown> | string;
+  daemonLogConfig?: Record<string, unknown>;
+  message?: string;
+}
+
+export interface RegionTrafficShiftEvalResult {
+  ok?: boolean;
+  allowed: boolean;
+  code?: string;
+  findings?: GuardFindingItem[];
+  message?: string;
+}
+
+export interface RegionTrafficShiftPlanResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  steps?: Array<string | { step?: number; blueWeightPct?: number; greenWeightPct?: number; label?: string }>;
+  stickyCookiePolicy?: { maxAgeSec?: number; httpOnly?: boolean; sameSite?: string; [key: string]: unknown };
+  caddyBlock?: string | { caddyfile?: string; [key: string]: unknown };
+  caddyfile?: string;
+  message?: string;
+}
+
+export interface CredentialWatchdogItem {
+  id?: string;
+  kind?: string;
+  label?: string;
+  status?: 'EXPIRED' | 'CRITICAL' | 'WARNING' | 'HEALTHY' | string;
+  daysRemaining?: number;
+  rotationRunbook?: string;
+}
+
+export interface CredentialWatchdogAuditResult {
+  ok?: boolean;
+  items?: CredentialWatchdogItem[];
+  credentials?: CredentialWatchdogItem[];
+  summary?: Record<string, number>;
+  hygiene?: { ok?: boolean; findings?: GuardFindingItem[]; violations?: GuardFindingItem[]; issues?: GuardFindingItem[] };
+  hygieneFindings?: GuardFindingItem[];
+  zeroSecretsStored?: boolean;
+  message?: string;
+}
+
+export interface QueueSchemaCheckResult {
+  ok?: boolean;
+  compatible: boolean;
+  allowed?: boolean;
+  compatibilityMode?: string;
+  breakingChanges?: GuardFindingItem[];
+  violations?: GuardFindingItem[];
+  findings?: GuardFindingItem[];
+  summary?: string;
+  message?: string;
+}
+
+export interface QueueDlqCircuitResult {
+  ok?: boolean;
+  queueName?: string;
+  state?: 'CLOSED' | 'OPEN' | 'QUARANTINED' | string;
+  tripped?: boolean;
+  circuitOpen?: boolean;
+  action?: string;
+  findings?: GuardFindingItem[];
+  violations?: GuardFindingItem[];
+  code?: string;
+  message?: string;
+}
+
+export interface QueueDlqQuarantineResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  quarantineId?: string;
+  record?: { id?: string; [key: string]: unknown };
   message?: string;
 }

@@ -83,6 +83,8 @@ import {
   type GracefulDrainAuditResult,
   type GracefulDrainPlanResult,
   type GracefulDrainAdvanceResult,
+  type RegionTrafficShiftEvalResult,
+  type RegionTrafficShiftPlanResult,
   isDemoMode,
 } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
@@ -270,8 +272,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..18 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate & Graceful Drain state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain'>('oom');
+  // Cycle-13..19 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain & Region Shift state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -322,6 +324,11 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [drainFinalStep, setDrainFinalStep] = useState<GracefulDrainAdvanceResult | null>(null);
   const [drainBusy, setDrainBusy] = useState<'audit' | 'flow' | null>(null);
   const [drainError, setDrainError] = useState<string | null>(null);
+  // Cycle-19 Multi-Region Health-Gated Blue/Green Shift & Sticky-Cookie Drain state
+  const [regionEval, setRegionEval] = useState<RegionTrafficShiftEvalResult | null>(null);
+  const [regionPlan, setRegionPlan] = useState<RegionTrafficShiftPlanResult | null>(null);
+  const [regionBusy, setRegionBusy] = useState<'unhealthy' | 'plan' | null>(null);
+  const [regionError, setRegionError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1649,6 +1656,45 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setDrainBusy(null);
+    }
+  };
+
+  const handleRunRegionShift = async (mode: 'unhealthy' | 'plan') => {
+    setRegionBusy(mode);
+    setRegionError(null);
+    try {
+      if (mode === 'unhealthy') {
+        setRegionPlan(null);
+        const res = await api.evaluateRegionTrafficShift({
+          projectId: project.id,
+          targetGreenWeightPct: 50,
+          regions: [
+            { name: 'eu-blue', role: 'blue', healthyEndpoints: 2, healthStatus: 200, probeStatus: 200 },
+            { name: 'eu-green', role: 'green', healthyEndpoints: 0, healthStatus: 302, probeStatus: 302 },
+          ],
+          healthProbes: [{ region: 'eu-green', healthPort: 8081, status: 302, probeStatus: 302 }],
+        });
+        setRegionEval(res);
+        onNotify(`Region Shift Guard BLOCKED: ${res.code || 'UNHEALTHY_TARGET_REGION'} (caddy#7544 false-503 protection)`, 'error');
+      } else {
+        setRegionEval(null);
+        const plan = await api.planRegionTrafficShift({
+          projectId: project.id,
+          currentBlueWeightPct: 100,
+          stepPct: 25,
+          stickyMaxAgeSec: 3600,
+          failDurationSec: 30,
+          dryRun: true,
+        });
+        setRegionPlan(plan);
+        onNotify('Blue/Green Sticky-Cookie Drain Plan & Caddy lb_policy cookie snippet compiled (dryRun: true)!', 'success');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Region traffic shift evaluation failed';
+      setRegionError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setRegionBusy(null);
     }
   };
 
@@ -3334,6 +3380,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 { id: 'repro' as const, label: t('pd.forensicsTabRepro') },
                 { id: 'previewgate' as const, label: t('pd.forensicsTabPreviewGate') },
                 { id: 'drain' as const, label: t('pd.forensicsTabDrain') },
+                { id: 'regionshift' as const, label: t('pd.forensicsTabRegionShift') },
               ]).map((tabItem) => (
                 <button
                   key={tabItem.id}
@@ -4174,6 +4221,83 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {forensicsTab === 'regionshift' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={regionBusy !== null}
+                  onClick={() => void handleRunRegionShift('unhealthy')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {regionBusy === 'unhealthy' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.regionTestUnhealthy')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={regionBusy !== null}
+                  onClick={() => void handleRunRegionShift('plan')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {regionBusy === 'plan' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.regionPlanShift')}</span>
+                </button>
+              </div>
+              {regionError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{regionError}</div>}
+              {regionEval && (
+                <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 space-y-1.5 tabular-nums font-mono text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      {regionEval.code || 'UNHEALTHY_TARGET_REGION'}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                      caddy#7544 health_port Guard Active
+                    </span>
+                  </div>
+                  {regionEval.message && <div>{regionEval.message}</div>}
+                </div>
+              )}
+              {regionPlan && (() => {
+                const steps = Array.isArray(regionPlan.steps) ? regionPlan.steps : [];
+                const maxAgeSec = regionPlan.stickyCookiePolicy?.maxAgeSec ?? 3600;
+                const caddyText =
+                  typeof regionPlan.caddyBlock === 'string'
+                    ? regionPlan.caddyBlock
+                    : (regionPlan.caddyBlock?.caddyfile ||
+                        regionPlan.caddyfile ||
+                        'reverse_proxy blue:3000 green:3000 {\n  lb_policy cookie culkibo_region_affinity\n  health_uri /healthz\n  lb_try_duration 5s\n  fail_duration 30s\n}');
+                return (
+                  <div className="space-y-2 tabular-nums font-mono text-[11px]">
+                    <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          PROGRESSIVE BLUE/GREEN · STICKY COOKIE DRAIN
+                        </span>
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                          Max-Age={maxAgeSec}s · HttpOnly · SameSite=Lax
+                        </span>
+                      </div>
+                      {steps.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {steps.map((st, idx) => (
+                            <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                              {typeof st === 'string'
+                                ? st
+                                : `S${st.step ?? idx + 1}: ${st.blueWeightPct ?? 0}%/${st.greenWeightPct ?? 100}%`}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
+                      {caddyText}
+                    </pre>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </section>

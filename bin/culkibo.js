@@ -70,7 +70,9 @@ const svc = {
   get reproducibleBuildService() { return require('../server/services/reproducibleBuildService'); },
   get resourceRightsizerService() { return require('../server/services/resourceRightsizerService'); },
   get queryPlanGuardService() { return require('../server/services/queryPlanGuardService'); },
-  get logPiiScrubberService() { return require('../server/services/logPiiScrubberService'); }
+  get logPiiScrubberService() { return require('../server/services/logPiiScrubberService'); },
+  get diskPressureGuardService() { return require('../server/services/diskPressureGuardService'); },
+  get credentialExpiryWatchdogService() { return require('../server/services/credentialExpiryWatchdogService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2893,15 +2895,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 175,
+            mcpTools: 180,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '175 MCP tools (-91.6% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'DB Query/Pool Guard, Network Micro-Seg, Dep Upgrade Cooldown, Stream PII Scrubber & 4-Phase Graceful Drain'
+            '180 MCP tools (-91.9% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'Webhook HMAC/Replay Firewall, Dual Block+Inode Disk Guard, Multi-Region Shift, Credential Watchdog & Queue DLQ Gate'
           ]
         };
       };
@@ -4587,6 +4589,161 @@ program
       failCli(err, options);
     } finally {
       try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (e) {}
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-19 CLI: disk-guard (df -h + df -ih + pg_wal) & cred-watchdog
+// ===========================================================================
+
+program
+  .command('disk-guard [inputFile]')
+  .description('Dual Block + Inode & pg_wal Disk-Pressure Guard (Dokploy#4651/#2702): sale con código 1 en estado CRITICAL sin mutar data/')
+  .option('--node <id>', 'Identificador del nodo', 'local')
+  .option('--block-pct <n>', 'Porcentaje de bloques usados (df -h)')
+  .option('--inode-pct <n>', 'Porcentaje de inodos usados (df -ih)')
+  .option('--overlay2-gb <n>', 'Tamaño de Docker overlay2 en GB')
+  .option('--log-gb <n>', 'Tamaño de logs JSON de contenedores en GB')
+  .option('--pg-wal-gb <n>', 'Tamaño de segmentos pg_wal de Postgres en GB')
+  .option('--inactive-slots <n>', 'Número de slots de replicación Postgres inactivos')
+  .option('--disk-gb <n>', 'Capacidad total del disco en GB')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    try {
+      const diskGuardSvc = svc.diskPressureGuardService;
+      /** @type {Record<string, any>} */
+      let fileData = {};
+      if (inputFile) {
+        const resolved = path.resolve(String(inputFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Archivo de telemetría de disco no encontrado: ${resolved}`);
+        }
+        fileData = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+      }
+
+      const report = diskGuardSvc.evaluateDiskPressure({
+        nodeId: String(options.node && options.node !== 'local' ? options.node : (fileData.nodeId || options.node || 'local')),
+        blockUsedPct: options.blockPct !== undefined ? Number(options.blockPct) : Number(fileData.blockUsedPct ?? 0),
+        inodeUsedPct: options.inodePct !== undefined ? Number(options.inodePct) : Number(fileData.inodeUsedPct ?? 0),
+        overlay2Gb: options.overlay2Gb !== undefined ? Number(options.overlay2Gb) : Number(fileData.overlay2Gb ?? 0),
+        containerLogGb: options.logGb !== undefined ? Number(options.logGb) : Number(fileData.containerLogGb ?? 0),
+        pgWalGb: options.pgWalGb !== undefined ? Number(options.pgWalGb) : Number(fileData.pgWalGb ?? 0),
+        inactiveReplicationSlots: options.inactiveSlots !== undefined ? Number(options.inactiveSlots) : Number(fileData.inactiveReplicationSlots ?? 0),
+        diskTotalGb: options.diskGb !== undefined ? Number(options.diskGb) : Number(fileData.diskTotalGb ?? 100),
+        persist: false
+      });
+
+      const safe = Boolean(report && report.safe !== false && report.status !== 'CRITICAL');
+      const payload = {
+        ...report,
+        ok: safe
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!safe) process.exitCode = 1;
+        return;
+      }
+
+      const badge = safe ? '\x1b[32mHEALTHY ✅\x1b[0m' : '\x1b[31mCRITICAL ❌\x1b[0m';
+      console.log(`\n💾 Culkibo Dual Block+Inode Disk-Pressure Guard (${report.nodeId}) — [${badge}]`);
+      console.log(`   Block (df -h): ${report.blockUsedPct}% · Inodes (df -ih): ${report.inodeUsedPct}% · pg_wal: ${report.pgWalGb} GB (${report.inactiveReplicationSlots} inactive slots)`);
+      console.log(`   Alerts:        ${report.alertCodes.length > 0 ? report.alertCodes.join(', ') : 'none'}`);
+      console.log('');
+      if (!safe) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('cred-watchdog [inputFile]')
+  .description('Credential Expiry & NTP/SSH/STS Hygiene Watchdog (solo metadatos, cero secretos): sale con código 1 si hay expiración crítica o fallo de higiene')
+  .option('--warn-days <n>', 'Umbral de advertencia en días', '30')
+  .option('--critical-days <n>', 'Umbral crítico en días', '7')
+  .option('--now <iso>', 'Timestamp ISO de referencia para evaluación determinista')
+  .option('--expires <iso>', 'Fecha ISO de expiración para comprobar una credencial rápida por flag')
+  .option('--kind <kind>', 'Tipo de credencial para --expires (github_app|oauth|s3_iam|db_cert|ssh_key|acme_cert|api_key)', 'api_key')
+  .option('--label <label>', 'Etiqueta de credencial para --expires', 'cli-credential')
+  .option('--clock-skew <sec>', 'Deriva de reloj NTP del host en segundos')
+  .option('--ssh-mode <mode>', 'Modo POSIX de clave SSH privada (ej. 0600, 0777)')
+  .option('--temp-sts', 'Señalar uso de token STS efímero en backups programados')
+  .option('--install-token-leak', 'Señalar fuga de token de instalación en logs de build')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    try {
+      const credWatchSvc = svc.credentialExpiryWatchdogService;
+      /** @type {any[]} */
+      let credentials = [];
+      /** @type {Record<string, any>} */
+      let fileHygiene = {};
+      /** @type {string | undefined} */
+      let fileNowIso;
+
+      if (inputFile) {
+        const resolved = path.resolve(String(inputFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Archivo de metadatos de credenciales no encontrado: ${resolved}`);
+        }
+        const parsed = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+        if (Array.isArray(parsed)) {
+          credentials = parsed;
+        } else if (parsed && typeof parsed === 'object') {
+          if (Array.isArray(parsed.credentials)) credentials = parsed.credentials;
+          if (parsed.hygiene && typeof parsed.hygiene === 'object') fileHygiene = parsed.hygiene;
+          if (typeof parsed.nowIso === 'string') fileNowIso = parsed.nowIso;
+        }
+      }
+
+      if (typeof options.expires === 'string' && options.expires.trim()) {
+        credentials = [
+          ...credentials,
+          {
+            id: 'cli-inline',
+            kind: String(options.kind || 'api_key'),
+            label: String(options.label || 'cli-credential'),
+            expiresAtIso: options.expires.trim()
+          }
+        ];
+      }
+
+      const audit = credWatchSvc.auditCredentialExpiries({
+        credentials,
+        ...(options.now || fileNowIso ? { nowIso: String(options.now || fileNowIso) } : {}),
+        warnDays: Number(options.warnDays ?? 30),
+        criticalDays: Number(options.criticalDays ?? 7)
+      });
+
+      const hygiene = credWatchSvc.checkSshAndJwtHygiene({
+        clockSkewSec: options.clockSkew !== undefined ? Number(options.clockSkew) : Number(fileHygiene.clockSkewSec ?? 0),
+        sshKeyMode: options.sshMode !== undefined ? String(options.sshMode) : String(fileHygiene.sshKeyMode ?? '0600'),
+        usesTempStsToken: Boolean(options.tempSts || fileHygiene.usesTempStsToken),
+        logsContainInstallToken: Boolean(options.installTokenLeak || fileHygiene.logsContainInstallToken)
+      });
+
+      const ok = Boolean(audit.healthy && hygiene.safe);
+      const payload = {
+        ok,
+        healthy: audit.healthy,
+        hygieneSafe: hygiene.safe,
+        audit,
+        hygiene
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mHEALTHY ✅\x1b[0m' : '\x1b[31mACTION REQUIRED ❌\x1b[0m';
+      console.log(`\n🔐 Culkibo Credential Expiry & Hygiene Watchdog (Metadata-Only) — [${badge}]`);
+      console.log(`   Expiries: EXPIRED=${audit.counts.EXPIRED} CRITICAL=${audit.counts.CRITICAL} WARNING=${audit.counts.WARNING} HEALTHY=${audit.counts.HEALTHY}`);
+      console.log(`   Hygiene:  ${hygiene.findingCodes.length > 0 ? hygiene.findingCodes.join(', ') : 'clean'}`);
+      console.log('');
+      if (!ok) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
     }
   });
 

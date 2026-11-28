@@ -141,6 +141,11 @@ function getNetSegCompilerService() { return _lazyV2.netseg || (_lazyV2.netseg =
 function getDepUpgradePlannerService() { return _lazyV2.depupgrade || (_lazyV2.depupgrade = require('../services/depUpgradePlannerService')); }
 function getLogPiiScrubberService() { return _lazyV2.piiscrubber || (_lazyV2.piiscrubber = require('../services/logPiiScrubberService')); }
 function getGracefulDrainService() { return _lazyV2.gracefuldrain || (_lazyV2.gracefuldrain = require('../services/gracefulDrainService')); }
+function getWebhookFirewallService() { return _lazyV2.whfirewall || (_lazyV2.whfirewall = require('../services/webhookFirewallService')); }
+function getDiskPressureGuardService() { return _lazyV2.diskguard || (_lazyV2.diskguard = require('../services/diskPressureGuardService')); }
+function getRegionTrafficShiftService() { return _lazyV2.regionshift || (_lazyV2.regionshift = require('../services/regionTrafficShiftService')); }
+function getCredentialExpiryWatchdogService() { return _lazyV2.credwatchdog || (_lazyV2.credwatchdog = require('../services/credentialExpiryWatchdogService')); }
+function getQueueSchemaDlqService() { return _lazyV2.queuedlq || (_lazyV2.queuedlq = require('../services/queueSchemaDlqService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -10299,6 +10304,257 @@ router.post('/deploys/drain/:drainId/advance', certAndAdminLimiter, async (req, 
     res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #19 MILESTONE LAZY ROUTES (180 MCP Tools -91.9%+ Core & 80 Suites — 0 boot RAM impact) ---
+
+// 1. Inbound Webhook Signature Replay & Clock-Skew Firewall (`CVE-2026-41351`, `CVE-2025-61926`)
+router.get('/webhooks/firewall/stats', async (req, res) => {
+  try {
+    const routeId = typeof req.query.routeId === 'string' && req.query.routeId.trim()
+      ? req.query.routeId.trim()
+      : undefined;
+    const out = await getWebhookFirewallService().inspectReplayCache(routeId);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/webhooks/firewall/verify', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getWebhookFirewallService().verifyInboundWebhook(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/webhooks/firewall/policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden configurar políticas del firewall de webhooks', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'configurar políticas globales del firewall de webhooks')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const routeId = typeof body.routeId === 'string' && body.routeId.trim() ? body.routeId.trim() : 'default';
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const policyPayload = body.policy && typeof body.policy === 'object'
+      ? { ...body.policy, dryRun }
+      : { ...body, dryRun };
+    const out = await getWebhookFirewallService().upsertWebhookFirewallPolicy(routeId, policyPayload);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Container Disk-Pressure, `overlay2` Bloat & Inode Exhaustion Guard (`Dokploy#4651`/`#2702`/`#2494`)
+router.get('/nodes/disk-pressure/reports', async (req, res) => {
+  try {
+    const nodeId = typeof req.query.nodeId === 'string' && req.query.nodeId.trim()
+      ? req.query.nodeId.trim()
+      : undefined;
+    const svc = getDiskPressureGuardService();
+    const raw = await svc.listDiskPressureReports(nodeId);
+    const reports = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.reports) ? raw.reports : []);
+    const daemonLogQuota = await svc.generateDaemonLogQuotaConfig();
+    res.json({ ok: true, nodeId: nodeId || null, count: reports.length, reports, daemonLogQuota });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/nodes/disk-pressure/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getDiskPressureGuardService();
+    const evaluation = await svc.evaluateDiskPressure(body);
+    const daemonLogQuota = await svc.generateDaemonLogQuotaConfig(body.logQuotaOpts || undefined);
+    res.json({
+      ...(evaluation && typeof evaluation === 'object' ? evaluation : { ok: true, evaluation }),
+      daemonLogQuota
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/nodes/disk-pressure/remediate', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden ejecutar remediación de presión de disco/inodos', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'ejecutar remediación de disco global en nodos')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const svc = getDiskPressureGuardService();
+    const evaluation = body.evaluation && typeof body.evaluation === 'object'
+      ? body.evaluation
+      : await svc.evaluateDiskPressure(body);
+    const out = await svc.planPressureRemediation({ evaluation, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Multi-Region Health-Gated Blue/Green Shift & Sticky-Session Drain (`Caddy#7544`/`#6393`)
+router.get('/edge/traffic-shift/history', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getRegionTrafficShiftService().listTrafficShifts(projectId);
+    const history = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.history) ? raw.history : []);
+    res.json({ ok: true, projectId: projectId || null, count: history.length, history });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/traffic-shift/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getRegionTrafficShiftService().evaluateTrafficShift(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/traffic-shift/plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden planificar cambios de tráfico multi-región', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const svc = getRegionTrafficShiftService();
+    const plan = await svc.planBlueGreenShift({ ...body, dryRun });
+    let caddyBlock = null;
+    try {
+      caddyBlock = await svc.renderCaddyStickyFailoverBlock(body.caddyConfig || body);
+    } catch (e) {}
+    res.json({
+      ...(plan && typeof plan === 'object' ? plan : { ok: true, plan }),
+      ...(caddyBlock ? { caddyBlock } : {})
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Unified Credential, OAuth, GitHub App & API-Key Expiry Watchdog (`Coolify#4702`, `Dokploy#2913`/`#5618` — metadata only!)
+router.get('/security/credentials/watchdog', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const svc = getCredentialExpiryWatchdogService();
+    const raw = await svc.listTrackedCredentials(projectId);
+    const credentials = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.credentials) ? raw.credentials : []);
+    const audit = await svc.auditCredentialExpiries({ projectId });
+    res.json({ ok: true, projectId: projectId || null, count: credentials.length, credentials, audit });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/credentials/register', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden registrar metadatos de expiración de credenciales', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getCredentialExpiryWatchdogService().registerCredentialMetadata({ ...body, dryRun });
+    res.status(dryRun ? 200 : 201).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/credentials/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getCredentialExpiryWatchdogService();
+    const hasHygieneFields = body.clockSkewSec !== undefined
+      || body.sshKeyMode !== undefined
+      || body.usesTempStsToken !== undefined
+      || body.logsContainInstallToken !== undefined;
+    const expiryAudit = await svc.auditCredentialExpiries(body);
+    const hygiene = hasHygieneFields ? await svc.checkSshAndJwtHygiene(body) : null;
+    res.json({
+      ...(expiryAudit && typeof expiryAudit === 'object' ? expiryAudit : { ok: true, audit: expiryAudit }),
+      ...(hygiene ? { hygiene } : {})
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Event-Bus / Queue Schema Evolution & Poison-Pill DLQ Gate (Kafka KIP-1034, BullMQ v6, RabbitMQ Quorum DLX)
+router.post('/queues/schema/check', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getQueueSchemaDlqService().checkEventSchemaEvolution(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/queues/dlq/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getQueueSchemaDlqService().evaluatePoisonPillCircuit(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/queues/dlq/quarantine', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden enviar mensajes poison-pill a cuarentena DLQ', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getQueueSchemaDlqService().quarantinePoisonMessage({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.get('/queues/dlq/list', async (req, res) => {
+  try {
+    const queueName = typeof req.query.queueName === 'string' && req.query.queueName.trim()
+      ? req.query.queueName.trim()
+      : undefined;
+    const raw = await getQueueSchemaDlqService().listDlqQuarantine(queueName);
+    const items = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.items) ? raw.items : []);
+    res.json({ ok: true, queueName: queueName || null, count: items.length, items });
+  } catch (err) {
+    sendServiceError(err, res, 500);
   }
 });
 

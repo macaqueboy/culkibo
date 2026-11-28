@@ -4871,6 +4871,226 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     });
   }
 
+  // --- Cycle-19 Webhook HMAC Firewall, Dual Disk+Inode Guard, Region Traffic Shift, Credential Watchdog & Queue Schema/DLQ Gate ---
+  if (pathname === '/api/webhooks/firewall/verify' && method === 'POST') {
+    const provider = String(body.provider || 'svix');
+    const secret = String(body.secret || '').trim();
+    const hdrs = (body.headers && typeof body.headers === 'object' ? body.headers : {}) as Record<string, string>;
+    if (!secret || secret.length < 8) {
+      return jsonResponse({
+        ok: false,
+        allowed: false,
+        verified: false,
+        code: 'WEBHOOK_SECRET_UNCONFIGURED',
+        provider,
+        message: 'Fail-closed (CVE-2025-61926): webhook secret is empty or below minimum entropy.',
+      });
+    }
+    const rawSig = String(hdrs['svix-signature'] || hdrs['x-hub-signature-256'] || hdrs['stripe-signature'] || '');
+    const canonSig = rawSig.replace(/^v1,/, '').replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+    const replayKey = `${provider}:${String(hdrs['svix-id'] || 'msg')}:${canonSig}`;
+    const seen = ((s as any)._webhookReplaySeen ||= new Set<string>()) as Set<string>;
+    if (seen.has(replayKey)) {
+      return jsonResponse({
+        ok: false,
+        allowed: false,
+        verified: false,
+        replayBlocked: true,
+        code: 'WEBHOOK_REPLAY_DETECTED',
+        provider,
+        canonicalSig: canonSig.slice(0, 18),
+        message: 'CVE-2026-41351 blocked: Base64URL-reencoded replay matched canonical signature already processed.',
+      });
+    }
+    seen.add(replayKey);
+    return jsonResponse({
+      ok: true,
+      allowed: true,
+      verified: true,
+      replayBlocked: false,
+      code: 'WEBHOOK_VERIFIED',
+      provider,
+      canonicalSig: canonSig.slice(0, 18),
+      message: `${provider} raw-body HMAC verified within <=300s skew window and recorded in monotonic replay cache.`,
+    });
+  }
+
+  if (pathname === '/api/nodes/disk-pressure/evaluate' && method === 'POST') {
+    const blockPct = Number(body.blockUsedPct ?? 35);
+    const inodePct = Number(body.inodeUsedPct ?? 96);
+    const inactiveSlots = Number(body.inactiveReplicationSlots ?? 2);
+    const logGb = Number(body.containerLogGb ?? 18);
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (inodePct >= 85) {
+      findings.push({ code: 'INODE_EXHAUSTION_CRITICAL', severity: 'critical', message: `Inode utilization at ${inodePct}% (df -ih) despite ${blockPct}% block usage — imminent ENOSPC.` });
+    }
+    if (blockPct >= 85) {
+      findings.push({ code: 'BLOCK_PRESSURE_CRITICAL', severity: 'critical', message: `Block storage utilization at ${blockPct}% (df -h).` });
+    }
+    if (inactiveSlots > 0 || Number(body.pgWalGb ?? 0) >= 10) {
+      findings.push({ code: 'PG_WAL_SLOT_RUNAWAY', severity: 'high', message: `${inactiveSlots} inactive Postgres replication slot(s) retaining ${body.pgWalGb ?? 24} GB pg_wal.` });
+    }
+    if (logGb >= 5) {
+      findings.push({ code: 'UNROTATED_DOCKER_LOGS', severity: 'high', message: `Unrotated container json-file logs consuming ${logGb} GB.` });
+    }
+    return jsonResponse({
+      ok: true,
+      nodeId: String(body.nodeId || 'vps-eu-01'),
+      severity: findings.length > 0 ? 'critical' : 'ok',
+      healthy: findings.length === 0,
+      blockUsedPct: blockPct,
+      inodeUsedPct: inodePct,
+      findings,
+      daemonLogConfig: { 'log-driver': 'json-file', 'log-opts': { 'max-size': '10m', 'max-file': '3' } },
+      message: findings.length > 0 ? `${findings.length} critical disk/inode pressure hazard(s) detected.` : 'Node block & inode pressure healthy.',
+    });
+  }
+
+  if (pathname === '/api/nodes/disk-pressure/remediate' && method === 'POST') {
+    const daemonJson = { 'log-driver': 'json-file', 'log-opts': { 'max-size': '10m', 'max-file': '3' }, 'storage-driver': 'overlay2' };
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      daemonJson,
+      daemonLogConfig: daemonJson,
+      steps: [
+        'Apply /etc/docker/daemon.json json-file max-size: 10m, max-file: 3 log rotation quota',
+        'Drop inactive Postgres replication slots retaining orphaned pg_wal segments',
+        'Prune dangling overlay2 build layers & small temp inode churn',
+      ],
+      message: 'Dry-run remediation plan generated with zero destructive host changes.',
+    });
+  }
+
+  if (pathname === '/api/edge/traffic-shift/evaluate' && method === 'POST') {
+    const regions = Array.isArray(body.regions) ? body.regions : [];
+    const unhealthy = regions.find((r: any) => Number(r?.healthyEndpoints ?? 1) === 0 || Number(r?.healthStatus ?? 200) !== 200);
+    if (unhealthy) {
+      return jsonResponse({
+        ok: false,
+        allowed: false,
+        code: 'UNHEALTHY_TARGET_REGION',
+        findings: [{ code: 'UNHEALTHY_TARGET_REGION', severity: 'critical', message: `Target region "${unhealthy.name || 'eu-green'}" has 0 healthy endpoints or non-200 health_port probe (caddy#7544 guard).` }],
+        message: 'Traffic shift blocked: target green region failed active health probe verification.',
+      });
+    }
+    return jsonResponse({ ok: true, allowed: true, code: 'TRAFFIC_SHIFT_READY', findings: [], message: 'All target region endpoints passed 200 OK health_port probes.' });
+  }
+
+  if (pathname === '/api/edge/traffic-shift/plan' && method === 'POST') {
+    const maxAge = Number(body.stickyMaxAgeSec ?? 3600);
+    const failDur = Number(body.failDurationSec ?? 30);
+    const caddyBlock = [
+      'reverse_proxy blue-eu:3000 green-eu:3000 {',
+      '  lb_policy cookie culkibo_region_affinity {',
+      `    max_age ${maxAge}s`,
+      '    http_only true',
+      '    same_site lax',
+      '  }',
+      '  health_uri /healthz',
+      '  health_status 200',
+      '  lb_try_duration 5s',
+      `  fail_duration ${failDur}s`,
+      '}',
+    ].join('\n');
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      steps: [
+        { step: 1, blueWeightPct: 100, greenWeightPct: 0, label: 'Warm green & verify 200 health_uri' },
+        { step: 2, blueWeightPct: 75, greenWeightPct: 25, label: 'Shift 25% new sessions (preserve sticky cookies)' },
+        { step: 3, blueWeightPct: 50, greenWeightPct: 50, label: 'Verify p99 & error budget at 50/50' },
+        { step: 4, blueWeightPct: 0, greenWeightPct: 100, label: 'Drain remaining blue cookies & complete cutover' },
+      ],
+      stickyCookiePolicy: { maxAgeSec: maxAge, httpOnly: true, sameSite: 'Lax' },
+      caddyBlock,
+      caddyfile: caddyBlock,
+      message: 'Progressive Blue/Green sticky-cookie shift plan ready (dryRun: true).',
+    });
+  }
+
+  if (pathname === '/api/security/credentials/audit' && method === 'POST') {
+    const hygieneFindings: Array<{ code: string; severity: string; message: string }> = [];
+    if (Number(body.clockSkewSec ?? 0) > 30) {
+      hygieneFindings.push({ code: 'CLOCK_SKEW_JWT_FAILURE', severity: 'critical', message: `Host NTP drift ${body.clockSkewSec}s > 30s breaks GitHub App JWT exp (coolify#4702).` });
+    }
+    if (body.sshKeyMode && String(body.sshKeyMode) !== '0600' && String(body.sshKeyMode) !== '600') {
+      hygieneFindings.push({ code: 'INSECURE_SSH_KEY_MODE', severity: 'high', message: `SSH private key mode ${body.sshKeyMode} rejected — enforce chmod 0600 (dokploy#2913).` });
+    }
+    if (body.usesTempStsToken) {
+      hygieneFindings.push({ code: 'EPHEMERAL_BACKUP_CREDENTIAL', severity: 'high', message: 'Scheduled DB backup uses short-lived STS token — configure scoped IAM role.' });
+    }
+    const items = [
+      { id: 'cred_s3', kind: 's3_iam', label: 's3-backup-key-prod', status: 'EXPIRED', daysRemaining: -2, rotationRunbook: 'Rotate S3 IAM access key in Garage/R2 & re-test backup.' },
+      { id: 'cred_oauth', kind: 'oauth', label: 'oidc-sso-client', status: 'CRITICAL', daysRemaining: 4, rotationRunbook: 'Rotate OIDC client secret in Authentik/Okta before expiry.' },
+      { id: 'cred_gh', kind: 'github_app', label: 'github-app-deploy-pem', status: 'WARNING', daysRemaining: 18, rotationRunbook: 'Generate secondary GitHub App PEM and roll over cleanly.' },
+      { id: 'cred_acme', kind: 'acme_cert', label: 'wildcard-acme-demo-dev', status: 'HEALTHY', daysRemaining: 72, rotationRunbook: 'Auto-renews via Caddy DNS-01 at 30d remaining.' },
+    ];
+    return jsonResponse({
+      ok: true,
+      zeroSecretsStored: true,
+      items,
+      credentials: items,
+      summary: { EXPIRED: 1, CRITICAL: 1, WARNING: 1, HEALTHY: 1 },
+      hygiene: { ok: hygieneFindings.length === 0, findings: hygieneFindings },
+      hygieneFindings,
+      message: 'Metadata-only audit complete (0 raw secrets persisted).',
+    });
+  }
+
+  if (pathname === '/api/queues/schema/check' && method === 'POST') {
+    const baseReq: string[] = Array.isArray(body.baseSchema?.required) ? body.baseSchema.required : [];
+    const nextReq: string[] = Array.isArray(body.nextSchema?.required) ? body.nextSchema.required : [];
+    const nextProps = (body.nextSchema?.properties || {}) as Record<string, any>;
+    const violations: Array<{ code: string; severity: string; message: string }> = [];
+    for (const f of nextReq) {
+      if (!baseReq.includes(f) && nextProps[f]?.default === undefined) {
+        violations.push({ code: 'REQUIRED_FIELD_ADDED_NO_DEFAULT', severity: 'critical', message: `Breaking BACKWARD change: required field "${f}" added without default value.` });
+      }
+    }
+    const compatible = violations.length === 0;
+    return jsonResponse({
+      ok: true,
+      compatible,
+      allowed: compatible,
+      compatibilityMode: String(body.compatibilityMode || 'BACKWARD'),
+      violations,
+      findings: violations,
+      message: compatible ? 'Event schema evolution is BACKWARD-compatible with queued jobs.' : `Blocked: ${violations.length} breaking schema evolution violation(s).`,
+    });
+  }
+
+  if (pathname === '/api/queues/dlq/evaluate' && method === 'POST') {
+    const rawPass = body.dlqRawPassthrough !== false;
+    const poisonCount = Number(body.consecutivePoisonCount ?? 0);
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (!rawPass) {
+      findings.push({ code: 'DLQ_SCHEMA_DEADLOCK', severity: 'critical', message: 'DLQ re-validates broken payloads (dlqRawPassthrough: false) — enable opaque raw passthrough (Kafka KIP-1034).' });
+    }
+    const tripped = poisonCount >= 5;
+    if (tripped) {
+      findings.push({ code: 'POISON_PILL_CIRCUIT_OPEN', severity: 'high', message: `${poisonCount} consecutive poison messages tripped quarantine circuit breaker.` });
+    }
+    return jsonResponse({
+      ok: true,
+      queueName: String(body.queueName || 'orders.events'),
+      state: tripped ? 'QUARANTINED' : 'CLOSED',
+      tripped,
+      findings,
+      code: !rawPass ? 'DLQ_SCHEMA_DEADLOCK' : tripped ? 'POISON_PILL_CIRCUIT_OPEN' : 'CIRCUIT_CLOSED',
+      message: findings.length === 0 ? 'Queue DLQ raw-passthrough healthy and circuit closed.' : findings.map((f) => f.code).join(' · '),
+    });
+  }
+
+  if (pathname === '/api/queues/dlq/quarantine' && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      quarantineId: `dlq_${Date.now().toString(36)}`,
+      message: `Quarantined poison message ${String(body.messageId || 'msg_409')} safely as opaque base64 (dryRun: true).`,
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -5048,16 +5268,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (175 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (180 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 175 MCP tools on demand without bloating context (-92%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 180 MCP tools on demand without bloating context (-92%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_webhook_firewall', description: 'Fail-closed raw-body HMAC webhook firewall across 6 providers with <=300s clock-skew & Base64URL replay dedup (CVE-2026-41351)', readOnly: false, profile: 'security' },
+      { name: 'culkibo_disk_pressure_guard', description: 'Dual block (df -h) + inode (df -ih), overlay2 & Postgres pg_wal slot guard with /etc/docker/daemon.json log quotas (dokploy#4651)', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_region_traffic_shift', description: 'Multi-region health-gated Blue/Green shift & sticky-cookie drain controller emitting Caddy lb_policy cookie + health_uri (caddy#7544)', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_credential_watchdog', description: 'Metadata-only expiry watchdog across S3/OAuth/GitHub App/SSH/ACME keys + NTP JWT skew & 0600 mode checks (coolify#4702)', readOnly: false, profile: 'security' },
+      { name: 'culkibo_queue_dlq_gate', description: 'JSON-Schema/Avro BACKWARD/FULL evolution gate, raw-passthrough DLQ_SCHEMA_DEADLOCK guard & poison-pill quarantine breaker (KIP-1034)', readOnly: false, profile: 'ops' },
       { name: 'culkibo_query_plan_guard', description: 'Postgres EXPLAIN JSON regression guard (Seq Scan, >10x skew, Disk sort), N+1 trace & PgBouncer/Prisma 7 pool budget auditor', readOnly: false, profile: 'ops' },
       { name: 'culkibo_netseg_policy', description: 'Container network micro-segmentation compiler isolating internal: true app_internal & per-DB data_<db> networks (dokploy#2798)', readOnly: false, profile: 'security' },
       { name: 'culkibo_dep_upgrade_plan', description: 'CVE fast-track & transitive cooldown dependency upgrade planner emitting synced .npmrc + pnpm-workspace.yaml', readOnly: false, profile: 'security' },
@@ -5119,26 +5344,26 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 175 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 180 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 175, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 180, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_query_plan_guard', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_log_pii_scrubber', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_webhook_firewall', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_disk_pressure_guard', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 175,
+      totalTools: 180,
       profiles: { core: { count: 17, savedPct: 92 } },
     });
   }

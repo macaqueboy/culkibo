@@ -3985,6 +3985,17 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, isRead ? 'secrets:read' : 'environments:write');
     }
 
+    // Cycle-19: Metadata-only Credential Expiry Watchdog (0 secrets stored — MUST precede generic /credentials/ secrets guard!)
+    if (p === '/api/security/credentials/watchdog') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/security/credentials/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/security/credentials/register') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+
     // Rutas de secretos / credenciales / exec -> bloqueadas para `viewer` y tokens solo-lectura en mutaciones
     if (/\/credentials(?:\/|$)/.test(p) || /\/secrets(?:\/|$)/.test(p)) {
       return this.authorizeAction(principal, isRead ? 'secrets:read' : 'projects:write');
@@ -4311,6 +4322,44 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:write');
     }
     if (p === '/api/deploys/drain/plans') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
+    // Cycle-19: Webhook Firewall, Disk/Inode Guard, Multi-Region Traffic Shift & Queue Schema/DLQ Gate
+    if (p === '/api/webhooks/firewall/policy') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/webhooks/firewall/verify') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/webhooks/firewall/stats') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/nodes/disk-pressure/remediate') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/nodes/disk-pressure/evaluate') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/nodes/disk-pressure/reports') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/edge/traffic-shift/plan') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/edge/traffic-shift/evaluate') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/edge/traffic-shift/history') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/queues/dlq/quarantine') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/queues/schema/check' || p === '/api/queues/dlq/evaluate') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/queues/dlq/list') {
       return this.authorizeAction(principal, 'projects:read');
     }
 

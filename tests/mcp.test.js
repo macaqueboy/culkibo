@@ -191,6 +191,9 @@ async function testMcp() {
   // 29. MCP 2026 Cycle-18 (175 MCP Tools -91.6% Core!): DB Query-Plan/Pool Guard, Network Micro-Segmentation, Dep Upgrade Planner, Streaming Log PII Scrubber & 4-Phase Graceful Drain
   await testMcp2026Cycle18QueryNetsegDepPiiDrain();
 
+  // 30. MCP 2026 Cycle-19 Milestone (180 MCP Tools -91.9%+ Core!): Webhook Firewall, Disk/Inode Pressure Guard, Multi-Region Traffic Shift, Credential Expiry Watchdog & Queue Schema/DLQ Gate
+  await testMcp2026Cycle19WebhookDiskRegionCredQueue();
+
   console.log('✅ All MCP tests passed!\n');
 }
 
@@ -201,9 +204,9 @@ async function testMcp() {
  */
 async function testToolAnnotations() {
   const tools = mcpServer.getToolsDefinition();
-  assert.strictEqual(tools.length, 175, 'El catálogo MCP 2026 debe tener exactamente 175 herramientas anotadas');
+  assert.strictEqual(tools.length, 180, 'El catálogo MCP 2026 debe tener exactamente 180 herramientas anotadas');
   const uniqueNames = new Set(tools.map(t => t.name));
-  assert.strictEqual(uniqueNames.size, 175, 'No puede haber nombres de herramientas duplicados');
+  assert.strictEqual(uniqueNames.size, 180, 'No puede haber nombres de herramientas duplicados');
 
   for (const tool of tools) {
     assert.ok(tool.title, `${tool.name} debe declarar title`);
@@ -227,10 +230,10 @@ async function testToolAnnotations() {
   const dryRunCount = tools.filter(t => Boolean(t.inputSchema?.properties?.dryRun)).length;
   const outputSchemaCount = tools.filter(t => Boolean(t.outputSchema)).length;
   assert.strictEqual(roCount, 73, `Se esperaban 73 herramientas RO, hay ${roCount}`);
-  assert.strictEqual(mutCount, 102, `Se esperaban 102 herramientas mutadoras, hay ${mutCount}`);
+  assert.strictEqual(mutCount, 107, `Se esperaban 107 herramientas mutadoras, hay ${mutCount}`);
   assert.strictEqual(destCount, 44, `Se esperaban 44 herramientas destructivas, hay ${destCount}`);
-  assert.strictEqual(dryRunCount, 73, `Se esperaban 73 herramientas con dryRun, hay ${dryRunCount}`);
-  assert.ok(outputSchemaCount >= 128, `Se esperaban >=128 herramientas con outputSchema, hay ${outputSchemaCount}`);
+  assert.strictEqual(dryRunCount, 78, `Se esperaban 78 herramientas con dryRun, hay ${dryRunCount}`);
+  assert.ok(outputSchemaCount >= 133, `Se esperaban >=133 herramientas con outputSchema, hay ${outputSchemaCount}`);
 
   const byName = Object.fromEntries(tools.map(t => [t.name, t]));
   const mustMutate = [
@@ -441,7 +444,7 @@ async function testStreamableHttpTransport() {
     );
     const list = await listRes.json();
     assert.strictEqual(list.result.resultType, 'complete');
-    assert.strictEqual(list.result.tools.length, 175);
+    assert.strictEqual(list.result.tools.length, 180);
 
     // 7b. ?profile=core reduce el tamaño/tokens de tools/list en >=80% y mantiene callable herramientas descubiertas.
     const coreListRes = await fetch(`${endpoint}?profile=core`, {
@@ -770,7 +773,7 @@ async function testMcpV2Capabilities() {
       principal: { userId: 'usr_viewer_1', role: 'viewer', teamId: 'team_default', projectIds: [projA.id], scopes: ['*'] }
     };
     const viewerTools = mcpServer.getToolsForPrincipal(viewerAuth);
-    assert.ok(viewerTools.length > 0 && viewerTools.length < 175);
+    assert.ok(viewerTools.length > 0 && viewerTools.length < 180);
     assert.ok(viewerTools.every(t => t.annotations.readOnlyHint === true), 'viewer solo puede ver herramientas readOnly');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_database_credentials'), 'viewer NO puede ver culkibo_database_credentials');
     assert.ok(!viewerTools.some(t => t.name === 'culkibo_rbac_list_tokens'), 'viewer NO puede ver culkibo_rbac_list_tokens');
@@ -778,7 +781,7 @@ async function testMcpV2Capabilities() {
     // Serialized tools cache isolation
     const pubBuf = mcpServer.getToolsSerialized();
     const privBuf = mcpServer.getToolsSerialized(viewerAuth);
-    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 175);
+    assert.strictEqual(JSON.parse(pubBuf.toString('utf8')).count, 180);
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).cacheScope, 'private');
     assert.strictEqual(JSON.parse(privBuf.toString('utf8')).count, viewerTools.length);
 
@@ -844,7 +847,7 @@ async function testMcpV2Capabilities() {
     const whoamiSuper = await mcpServer.executeTool('culkibo_rbac_whoami', {});
     assert.strictEqual(whoamiSuper.isError, false);
     assert.strictEqual(whoamiSuper.structuredContent.isSuperAdmin, true);
-    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 175);
+    assert.strictEqual(whoamiSuper.structuredContent.allowedToolsCount, 180);
 
     const whoamiViewer = await mcpServer.executeTool('culkibo_rbac_whoami', {}, { auth: viewerAuth });
     assert.strictEqual(whoamiViewer.isError, false);
@@ -1074,7 +1077,7 @@ async function testMcpV21Superpowers() {
   let match;
   const caseRe = /case\s+'(culkibo_[a-z0-9_]+)'\s*:/g;
   while ((match = caseRe.exec(switchBlock))) caseNames.add(match[1]);
-  assert.strictEqual(caseNames.size, 175, `Todos los 175 tools deben tener handler en switch (hay ${caseNames.size})`);
+  assert.strictEqual(caseNames.size, 180, `Todos los 180 tools deben tener handler en switch (hay ${caseNames.size})`);
   for (const t of tools) {
     assert.ok(caseNames.has(t.name), `Falta case para ${t.name}`);
   }
@@ -1173,7 +1176,12 @@ async function testMcpV21Superpowers() {
     netSegSvc: require('../server/services/netSegCompilerService'),
     depSvc: require('../server/services/depUpgradePlannerService'),
     scrubSvc: require('../server/services/logPiiScrubberService'),
-    drainSvc: require('../server/services/gracefulDrainService')
+    drainSvc: require('../server/services/gracefulDrainService'),
+    whFwSvc: require('../server/services/webhookFirewallService'),
+    diskGuardSvc: require('../server/services/diskPressureGuardService'),
+    regionShiftSvc: require('../server/services/regionTrafficShiftService'),
+    credWatchSvc: require('../server/services/credentialExpiryWatchdogService'),
+    queueDlqSvc: require('../server/services/queueSchemaDlqService')
   };
   const missingCalls = [];
   const callRe = /\b([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\(/g;
@@ -1200,7 +1208,7 @@ async function testMcpV21Superpowers() {
     const subset = mcpServer.getToolsForPrincipal(null, { profile: prof });
     assert.ok(subset.length > 0, `El perfil ${prof} debe devolver herramientas`);
   }
-  console.log('  ✓ Auditoría automatizada de 175 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
+  console.log('  ✓ Auditoría automatizada de 180 herramientas: 0 métodos inexistentes, 0 raw errors, 7 destructiveHints y 5 perfiles verificados');
 
   // 2. culkibo_search_tools (meta-discovery + aislamiento RBAC)
   const searchSuper = await mcpServer.executeTool('culkibo_search_tools', { query: 'postgres backup', limit: 5 });
@@ -2384,7 +2392,7 @@ async function testMcp2026Cycle4TasksElicitationAndTools() {
   const coreTools = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
   const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
   const savedPct = Math.round((1 - coreBytes / fullBytes) * 1000) / 10;
-  assert.strictEqual(mcpServer.getToolsDefinition().length, 175);
+  assert.strictEqual(mcpServer.getToolsDefinition().length, 180);
   assert.ok(savedPct >= 80, `?profile=core debe ahorrar >=80% tokens sobre 160 tools (actual: ${savedPct}%)`);
   console.log(`  ✓ ?profile=core sobre 160 tools: ${coreTools.length}/160 herramientas (-${savedPct}% bytes/tokens)`);
 }
@@ -2628,7 +2636,7 @@ async function testMcp2026Cycle6ShadowTimeMachineFinOps() {
     const coreSubset = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const coreBytes = Buffer.byteLength(JSON.stringify(coreSubset), 'utf8');
     const pctSaved = Math.round((1 - coreBytes / allBytes) * 1000) / 10;
-    assert.strictEqual(mcpServer.getToolsDefinition().length, 175);
+    assert.strictEqual(mcpServer.getToolsDefinition().length, 180);
     assert.strictEqual(coreSubset.length, 17);
     assert.ok(pctSaved >= 83, `?profile=core debe ahorrar >=83% tokens en 160 tools (actual: ${pctSaved}%)`);
     console.log(`  ✓ ?profile=core sobre 160 tools: ${coreSubset.length}/160 herramientas (-${pctSaved}% bytes/tokens)`);
@@ -2857,7 +2865,7 @@ async function testMcp2026Cycle7HealerMeshTimelineShield() {
     const allTools = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const coreTools = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const savedPct = Math.round((1 - Buffer.byteLength(JSON.stringify(coreTools), 'utf8') / Buffer.byteLength(JSON.stringify(allTools), 'utf8')) * 1000) / 10;
-    assert.strictEqual(allTools.length, 175);
+    assert.strictEqual(allTools.length, 180);
     assert.strictEqual(coreTools.length, 17);
     assert.ok(savedPct > 83, `?profile=core debe superar 83% de ahorro en 160 tools (actual: ${savedPct}%)`);
     console.log(`  ✓ Catálogo Cycle-7 verificado: 160 tools exactas, ?profile=core 17/160 (-${savedPct}% tokens/bytes)`);
@@ -3064,7 +3072,7 @@ async function testMcp2026Cycle8TriageCveDriftIacLease() {
     const all130 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved130Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all130), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all130.length, 175);
+    assert.strictEqual(all130.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved130Pct >= 84, `?profile=core debe ahorrar >=84% tokens en 160 tools (actual: ${saved130Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-8 verificado: 160 tools exactas, ?profile=core 17/160 (-${saved130Pct}% tokens/bytes)`);
@@ -3404,7 +3412,7 @@ async function testMcp2026Cycle9WebhooksDbS3LedgerBrand() {
     const all130 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved130Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all130), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all130.length, 175);
+    assert.strictEqual(all130.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved130Pct >= 85, `?profile=core debe ahorrar >=85% tokens en 160 tools (actual: ${saved130Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-9 verificado: 160 tools exactas, ?profile=core 17/160 (-${saved130Pct}% tokens/bytes)`);
@@ -3766,7 +3774,7 @@ async function testMcp2026Cycle10DrCanaryAiBuilderLogs() {
     const all135 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved135Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all135), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all135.length, 175);
+    assert.strictEqual(all135.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved135Pct >= 86, `?profile=core debe ahorrar >=86% tokens en 160 tools (actual: ${saved135Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-10 Milestone verificado: 160 tools exactas, ?profile=core 17/160 (-${saved135Pct}% tokens/bytes)`);
@@ -4061,7 +4069,7 @@ async function testMcp2026Cycle11AdmissionComplianceVolumeEdgePosture() {
     const all140 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved140Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all140), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all140.length, 175);
+    assert.strictEqual(all140.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved140Pct >= 87, `?profile=core debe ahorrar >=87% tokens en 160 tools (actual: ${saved140Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-11 Milestone verificado: 160 tools exactas, ?profile=core 17/160 (-${saved140Pct}% tokens/bytes)`);
@@ -4407,7 +4415,7 @@ async function testMcp2026Cycle12SyntheticSqlAutoscalerLicenseSeccomp() {
     const all145 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved145Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all145), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all145.length, 175);
+    assert.strictEqual(all145.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved145Pct >= 88, `?profile=core debe ahorrar >=88% tokens en 160 tools (actual: ${saved145Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-12 Milestone verificado: 160 tools exactas, ?profile=core 17/160 (-${saved145Pct}% tokens/bytes)`);
@@ -4777,7 +4785,7 @@ async function testMcp2026Cycle13BloatLeasePiiOomOncall() {
     const all150 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved150Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all150), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all150.length, 175);
+    assert.strictEqual(all150.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved150Pct >= 88.5, `?profile=core debe ahorrar >=88.5% tokens en 160 tools (actual: ${saved150Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-13 Milestone verificado: 160 tools exactas, ?profile=core 17/160 (-${saved150Pct}% tokens/bytes)`);
@@ -5081,7 +5089,7 @@ async function testMcp2026Cycle14EgressReplicaSecretMultiarchChaos() {
     const all155 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved155Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all155), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all155.length, 175);
+    assert.strictEqual(all155.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved155Pct >= 89, `?profile=core debe ahorrar >=89% tokens en 160 tools (actual: ${saved155Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-14 verificado: 160 tools exactas, ?profile=core 17/160 (-${saved155Pct}% tokens/bytes)`);
@@ -5417,7 +5425,7 @@ async function testMcp2026Cycle15MtlsFlagsRatelimitAnomalyPromotion() {
     const all160 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved160Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all160), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all160.length, 175);
+    assert.strictEqual(all160.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved160Pct >= 90, `?profile=core debe alcanzar >=90% de ahorro en 165 tools (actual: ${saved160Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-15 verificado: 165 tools exactas, ?profile=core 17/165 (-${saved160Pct}% tokens/bytes)`);
@@ -5830,7 +5838,7 @@ async function testMcp2026Cycle16ContractOciStreamDnsReaper() {
     const all165 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved165Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all165), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all165.length, 175);
+    assert.strictEqual(all165.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved165Pct >= 90.5, `?profile=core debe superar 90.5% de ahorro en 170 tools (actual: ${saved165Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-16 verificado: 170 tools exactas, ?profile=core 17/170 (-${saved165Pct}% tokens/bytes)`);
@@ -6192,7 +6200,7 @@ async function testMcp2026Cycle17ReproPreviewCacheRightsizePostmortem() {
     const all170 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved170Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all170), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all170.length, 175);
+    assert.strictEqual(all170.length, 180);
     assert.strictEqual(core17.length, 17);
     assert.ok(saved170Pct >= 91.0, `?profile=core debe alcanzar >=91.0% de ahorro en 175 tools (actual: ${saved170Pct}%)`);
     console.log(`  ✓ Catálogo Cycle-17 verificado: 175 tools exactas, ?profile=core 17/175 (-${saved170Pct}% tokens/bytes)`);
@@ -6493,10 +6501,447 @@ async function testMcp2026Cycle18QueryNetsegDepPiiDrain() {
     const all175 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
     const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
     const saved175Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all175), 'utf8')) * 1000) / 10;
-    assert.strictEqual(all175.length, 175);
+    assert.strictEqual(all175.length, 180);
     assert.strictEqual(core17.length, 17);
-    assert.ok(saved175Pct >= 91.5, `?profile=core debe superar 91.5% de ahorro en 175 tools (actual: ${saved175Pct}%)`);
-    console.log(`  ✓ Catálogo Cycle-18 (175 MCP Tools!) verificado: 175 tools exactas, ?profile=core 17/175 (-${saved175Pct}% tokens/bytes)`);
+    assert.ok(saved175Pct >= 91.5, `?profile=core debe superar 91.5% de ahorro en 180 tools (actual: ${saved175Pct}%)`);
+    console.log(`  ✓ Catálogo Cycle-18 verificado: 180 tools exactas, ?profile=core 17/180 (-${saved175Pct}% tokens/bytes)`);
+  } finally {
+    projectManager.delete(projA.id);
+    projectManager.delete(projB.id);
+    await projectManager.flushToDisk();
+    if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+    else process.env.CULKIBO_DATA_DIR = prevDataDir;
+    try { fs.rmSync(tmpDataRoot, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+/**
+ * MCP 2026 Cycle-19 Milestone (180 MCP Tools -91.9%+ Core Savings!):
+ *   1. culkibo_webhook_firewall (CVE-2026-41351 Base64->Base64URL replay + CVE-2025-61926 fail-closed secret + clock skew)
+ *   2. culkibo_disk_pressure_guard (Dokploy#4651/#2702 low-GB 96% inode starvation + pg_wal + daemon.json + dryRun: true)
+ *   3. culkibo_region_traffic_shift (Caddy#7544/#6393 UNHEALTHY_TARGET_REGION + sticky cookie drain + lb_policy cookie)
+ *   4. culkibo_credential_watchdog (Coolify#4702/Dokploy#2913 metadata-only 0 secrets + NTP/SSH/STS/log hygiene)
+ *   5. culkibo_queue_dlq_gate (Kafka KIP-1034/BullMQ v6 schema evolution + DLQ_SCHEMA_DEADLOCK + poison-pill quarantine)
+ */
+async function testMcp2026Cycle19WebhookDiskRegionCredQueue() {
+  const crypto = require('crypto');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const projectManager = require('../server/services/projectManager');
+  const prevDataDir = process.env.CULKIBO_DATA_DIR;
+  const tmpDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'culkibo-mcp-c19-'));
+  process.env.CULKIBO_DATA_DIR = tmpDataRoot;
+
+  const projA = projectManager.create({
+    name: 'Cycle19 Tenant A',
+    memoryMb: 1024,
+    teamId: 'team_default'
+  });
+  const projB = projectManager.create({
+    name: 'Cycle19 Foreign Tenant B',
+    memoryMb: 1024,
+    teamId: 'team_default'
+  });
+  await projectManager.flushToDisk();
+
+  const scopedDevAuth = {
+    method: 'token',
+    kind: 'token',
+    userId: 'dev-c19',
+    role: 'developer',
+    scopes: ['projects:read', 'security:write', 'docker:write', 'domains:write', 'deployments:write'],
+    projectIds: [projA.id],
+    teamId: null,
+    isSuperAdmin: false
+  };
+
+  try {
+    // 1. culkibo_webhook_firewall
+    const whNoSecret = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'verify',
+      projectId: projA.id,
+      routeId: 'hooks-stripe',
+      provider: 'stripe',
+      rawBody: '{"id":"evt_1"}',
+      headers: {},
+      secret: ''
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(whNoSecret.isError, false);
+    assert.strictEqual(whNoSecret.structuredContent.ok, false);
+    assert.strictEqual(whNoSecret.structuredContent.result.code, 'WEBHOOK_SECRET_UNCONFIGURED');
+
+    const nowSec = 1790000000;
+    const svixKeyRaw = Buffer.from('culkibo-c19-svix-signing-key-32b', 'utf8');
+    const svixSecret = 'whsec_' + svixKeyRaw.toString('base64');
+    const svixBody = JSON.stringify({ type: 'deploy.succeeded', id: 'dep_c19' });
+    const svixMsgId = 'msg_c19_replay_1';
+    const svixDigest = crypto.createHmac('sha256', svixKeyRaw).update(`${svixMsgId}.${nowSec}.${svixBody}`).digest();
+    const svixB64 = svixDigest.toString('base64');
+    const svixB64Url = svixB64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    // Clock-skew rejected
+    const whSkew = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'verify',
+      projectId: projA.id,
+      routeId: 'hooks-svix',
+      provider: 'svix',
+      rawBody: svixBody,
+      headers: { 'svix-id': 'msg_old', 'svix-timestamp': String(nowSec - 900), 'svix-signature': `v1,${svixB64}` },
+      secret: svixSecret,
+      nowSec,
+      maxSkewSec: 300
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(whSkew.structuredContent.result.code, 'CLOCK_SKEW_EXCEEDED');
+
+    // First delivery accepted
+    const whFirst = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'verify',
+      projectId: projA.id,
+      routeId: 'hooks-svix',
+      provider: 'svix',
+      rawBody: svixBody,
+      headers: { 'svix-id': svixMsgId, 'svix-timestamp': String(nowSec), 'svix-signature': `v1,${svixB64}` },
+      secret: svixSecret,
+      nowSec
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(whFirst.isError, false);
+    assert.strictEqual(whFirst.structuredContent.ok, true);
+    assert.strictEqual(whFirst.structuredContent.result.code, 'WEBHOOK_VERIFIED');
+
+    // Re-encoded Base64URL replay blocked (CVE-2026-41351)
+    const whReplay = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'verify',
+      projectId: projA.id,
+      routeId: 'hooks-svix',
+      provider: 'svix',
+      rawBody: svixBody,
+      headers: { 'svix-id': svixMsgId, 'svix-timestamp': String(nowSec), 'svix-signature': `v1,${svixB64Url}` },
+      secret: svixSecret,
+      nowSec
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(whReplay.structuredContent.ok, false);
+    assert.strictEqual(whReplay.structuredContent.result.code, 'WEBHOOK_REPLAY_DETECTED');
+
+    // RBAC & anti-IDOR on webhook firewall
+    const whDeniedPol = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'set_policy',
+      routeId: 'hooks-svix',
+      provider: 'svix',
+      maxSkewSec: 180
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(whDeniedPol.isError, true);
+    assert.strictEqual(JSON.parse(whDeniedPol.content[0].text).code, 'FORBIDDEN');
+
+    const whForeign = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'stats',
+      projectId: projB.id
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(whForeign.isError, true);
+    assert.strictEqual(JSON.parse(whForeign.content[0].text).code, 'FORBIDDEN');
+
+    const whPolDry = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'set_policy',
+      routeId: 'hooks-svix',
+      provider: 'svix',
+      maxSkewSec: 180
+    });
+    assert.strictEqual(whPolDry.isError, false);
+    assert.strictEqual(whPolDry.structuredContent.dryRun, true);
+
+    const whPolLive = await mcpServer.executeTool('culkibo_webhook_firewall', {
+      action: 'set_policy',
+      routeId: 'hooks-svix',
+      provider: 'svix',
+      maxSkewSec: 180,
+      dryRun: false
+    });
+    assert.strictEqual(whPolLive.isError, false);
+    assert.strictEqual(whPolLive.structuredContent.dryRun, false);
+
+    const whStats = await mcpServer.executeTool('culkibo_webhook_firewall', { action: 'stats', routeId: 'hooks-svix' });
+    assert.strictEqual(whStats.isError, false);
+    assert.ok(whStats.structuredContent.result.policyCount >= 1);
+    assert.ok(whStats.structuredContent.result.replayEntryCount >= 1);
+    assert.ok(!JSON.stringify(whStats).includes(svixSecret), 'stats jamás debe exponer el secreto de webhook');
+    console.log('  ✓ culkibo_webhook_firewall verificado (fail-closed, clock-skew, CVE-2026-41351 Base64URL replay & RBAC)');
+
+    // 2. culkibo_disk_pressure_guard
+    const diskEval = await mcpServer.executeTool('culkibo_disk_pressure_guard', {
+      action: 'evaluate',
+      projectId: projA.id,
+      nodeId: 'vps-eu-1',
+      blockUsedPct: 35,
+      inodeUsedPct: 96,
+      overlay2Gb: 45,
+      containerLogGb: 12,
+      pgWalGb: 22,
+      inactiveReplicationSlots: 2,
+      diskTotalGb: 100
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(diskEval.isError, false);
+    assert.strictEqual(diskEval.structuredContent.ok, false);
+    assert.strictEqual(diskEval.structuredContent.result.status, 'CRITICAL');
+    assert.ok(diskEval.structuredContent.result.alertCodes.includes('INODE_EXHAUSTION_CRITICAL'));
+    assert.ok(diskEval.structuredContent.result.alertCodes.includes('PG_WAL_SLOT_RUNAWAY'));
+    assert.strictEqual(diskEval.structuredContent.result.daemonLogQuota.config['log-opts']['max-size'], '10m');
+    assert.strictEqual(diskEval.structuredContent.result.daemonLogQuota.config['log-opts']['max-file'], '3');
+
+    const diskDenied = await mcpServer.executeTool('culkibo_disk_pressure_guard', {
+      action: 'remediate',
+      nodeId: 'vps-eu-1',
+      inodeUsedPct: 96
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(diskDenied.isError, true);
+    assert.strictEqual(JSON.parse(diskDenied.content[0].text).code, 'FORBIDDEN');
+
+    const diskForeign = await mcpServer.executeTool('culkibo_disk_pressure_guard', {
+      action: 'reports',
+      projectId: projB.id
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(diskForeign.isError, true);
+    assert.strictEqual(JSON.parse(diskForeign.content[0].text).code, 'FORBIDDEN');
+
+    const diskRemDry = await mcpServer.executeTool('culkibo_disk_pressure_guard', {
+      action: 'remediate',
+      evaluation: diskEval.structuredContent.result
+    });
+    assert.strictEqual(diskRemDry.isError, false);
+    assert.strictEqual(diskRemDry.structuredContent.dryRun, true);
+    assert.ok(diskRemDry.structuredContent.result.actionCount >= 2);
+
+    const diskReports = await mcpServer.executeTool('culkibo_disk_pressure_guard', { action: 'reports', nodeId: 'vps-eu-1' });
+    assert.strictEqual(diskReports.isError, false);
+    assert.ok(diskReports.structuredContent.reports.length >= 1);
+    console.log('  ✓ culkibo_disk_pressure_guard verificado (96% inodes a 35% GB, PG_WAL_SLOT_RUNAWAY, daemon.json y dryRun)');
+
+    // 3. culkibo_region_traffic_shift
+    const shiftBlocked = await mcpServer.executeTool('culkibo_region_traffic_shift', {
+      action: 'evaluate',
+      projectId: projA.id,
+      targetGreenWeightPct: 50,
+      regions: [
+        { id: 'eu-west', role: 'blue', healthyEndpoints: 3, totalEndpoints: 3, errorRatePct: 0.1, probeStatus: 200 },
+        { id: 'us-east', role: 'green', healthyEndpoints: 0, totalEndpoints: 3, errorRatePct: 0.0, probeStatus: 302, healthPort: 8081 }
+      ]
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(shiftBlocked.isError, false);
+    assert.strictEqual(shiftBlocked.structuredContent.ok, false);
+    assert.strictEqual(shiftBlocked.structuredContent.result.code, 'UNHEALTHY_TARGET_REGION');
+
+    const shiftCaddy = await mcpServer.executeTool('culkibo_region_traffic_shift', {
+      action: 'render_caddy',
+      projectId: projA.id,
+      cookieName: 'ck_region',
+      stickyMaxAgeSec: 900,
+      healthUri: '/healthz',
+      healthPort: 8081
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(shiftCaddy.isError, false);
+    assert.ok(shiftCaddy.structuredContent.result.caddyfile.includes('lb_policy cookie ck_region'));
+    assert.ok(shiftCaddy.structuredContent.result.caddyfile.includes('health_uri /healthz'));
+    assert.ok(shiftCaddy.structuredContent.result.caddyfile.includes('lb_try_duration 5s'));
+
+    const shiftDenied = await mcpServer.executeTool('culkibo_region_traffic_shift', {
+      action: 'plan',
+      projectId: projA.id
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(shiftDenied.isError, true);
+    assert.strictEqual(JSON.parse(shiftDenied.content[0].text).code, 'FORBIDDEN');
+
+    const shiftPlanDry = await mcpServer.executeTool('culkibo_region_traffic_shift', {
+      action: 'plan',
+      projectId: projA.id,
+      currentBlueWeightPct: 100,
+      stepPct: 25,
+      stickyMaxAgeSec: 900
+    });
+    assert.strictEqual(shiftPlanDry.isError, false);
+    assert.strictEqual(shiftPlanDry.structuredContent.dryRun, true);
+    assert.strictEqual(shiftPlanDry.structuredContent.result.steps.length, 4);
+
+    const shiftPlanLive = await mcpServer.executeTool('culkibo_region_traffic_shift', {
+      action: 'plan',
+      projectId: projA.id,
+      currentBlueWeightPct: 100,
+      stepPct: 50,
+      stickyMaxAgeSec: 900,
+      dryRun: false
+    });
+    assert.strictEqual(shiftPlanLive.isError, false);
+    assert.strictEqual(shiftPlanLive.structuredContent.dryRun, false);
+
+    const shiftHist = await mcpServer.executeTool('culkibo_region_traffic_shift', { action: 'history', projectId: projA.id });
+    assert.strictEqual(shiftHist.isError, false);
+    assert.ok(shiftHist.structuredContent.shifts.length >= 1);
+    console.log('  ✓ culkibo_region_traffic_shift verificado (UNHEALTHY_TARGET_REGION, Caddy sticky/health_port y plan progresivo)');
+
+    // 4. culkibo_credential_watchdog
+    const credDenied = await mcpServer.executeTool('culkibo_credential_watchdog', {
+      action: 'register',
+      projectId: projA.id,
+      kind: 's3_iam',
+      expiresAtIso: '2026-10-01T00:00:00Z'
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(credDenied.isError, true);
+    assert.strictEqual(JSON.parse(credDenied.content[0].text).code, 'FORBIDDEN');
+
+    const credForeign = await mcpServer.executeTool('culkibo_credential_watchdog', {
+      action: 'list',
+      projectId: projB.id
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(credForeign.isError, true);
+    assert.strictEqual(JSON.parse(credForeign.content[0].text).code, 'FORBIDDEN');
+
+    const ephemeralSecretVal = 'ephemeral-never-persist-' + Date.now();
+    const credRegDry = await mcpServer.executeTool('culkibo_credential_watchdog', {
+      action: 'register',
+      projectId: projA.id,
+      id: 'cred-s3-expired',
+      kind: 's3_iam',
+      label: 'S3 Backup Key',
+      expiresAtIso: '2026-10-01T00:00:00Z',
+      secret: ephemeralSecretVal
+    });
+    assert.strictEqual(credRegDry.isError, false);
+    assert.strictEqual(credRegDry.structuredContent.dryRun, true);
+    assert.ok(credRegDry.structuredContent.result.strippedSecretFields.includes('secret'));
+    assert.ok(!JSON.stringify(credRegDry).includes(ephemeralSecretVal), 'credential_watchdog jamás debe devolver secretos');
+
+    await mcpServer.executeTool('culkibo_credential_watchdog', {
+      action: 'register',
+      projectId: projA.id,
+      id: 'cred-s3-expired',
+      kind: 's3_iam',
+      label: 'S3 Backup Key',
+      expiresAtIso: '2026-10-01T00:00:00Z',
+      dryRun: false
+    });
+    await mcpServer.executeTool('culkibo_credential_watchdog', {
+      action: 'register',
+      projectId: projA.id,
+      id: 'cred-oauth-crit',
+      kind: 'oauth',
+      label: 'OAuth App',
+      expiresAtIso: '2026-12-03T00:00:00Z',
+      dryRun: false
+    });
+
+    const credAudit = await mcpServer.executeTool('culkibo_credential_watchdog', {
+      action: 'audit',
+      projectId: projA.id,
+      nowIso: '2026-11-28T00:00:00Z'
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(credAudit.isError, false);
+    assert.strictEqual(credAudit.structuredContent.ok, false);
+    assert.strictEqual(credAudit.structuredContent.result.counts.EXPIRED, 1);
+    assert.strictEqual(credAudit.structuredContent.result.counts.CRITICAL, 1);
+
+    const credHyg = await mcpServer.executeTool('culkibo_credential_watchdog', {
+      action: 'hygiene_check',
+      projectId: projA.id,
+      clockSkewSec: 90,
+      sshKeyMode: '0777',
+      usesTempStsToken: true,
+      logsContainInstallToken: true
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(credHyg.isError, false);
+    assert.strictEqual(credHyg.structuredContent.ok, false);
+    const hygCodes = new Set(credHyg.structuredContent.result.findingCodes);
+    assert.ok(hygCodes.has('CLOCK_SKEW_JWT_FAILURE'));
+    assert.ok(hygCodes.has('INSECURE_SSH_KEY_MODE'));
+    assert.ok(hygCodes.has('EPHEMERAL_BACKUP_CREDENTIAL'));
+    assert.ok(hygCodes.has('BUILD_LOG_INSTALL_TOKEN_LEAK'));
+
+    const credList = await mcpServer.executeTool('culkibo_credential_watchdog', { action: 'list', projectId: projA.id });
+    assert.strictEqual(credList.structuredContent.credentials.length, 2);
+    console.log('  ✓ culkibo_credential_watchdog verificado (0 secretos, EXPIRED/CRITICAL y 4 checks de higiene NTP/SSH/STS)');
+
+    // 5. culkibo_queue_dlq_gate
+    const baseEvSchema = { type: 'object', properties: { orderId: { type: 'string' } }, required: ['orderId'] };
+    const breakEvSchema = { type: 'object', properties: { orderId: { type: 'string' }, tenantId: { type: 'string' } }, required: ['orderId', 'tenantId'] };
+    const safeEvSchema = { type: 'object', properties: { orderId: { type: 'string' }, tenantId: { type: 'string', default: 'public' } }, required: ['orderId', 'tenantId'] };
+
+    const qBreak = await mcpServer.executeTool('culkibo_queue_dlq_gate', {
+      action: 'check_schema',
+      projectId: projA.id,
+      format: 'jsonschema',
+      baseSchema: baseEvSchema,
+      nextSchema: breakEvSchema,
+      compatibilityMode: 'BACKWARD'
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(qBreak.isError, false);
+    assert.strictEqual(qBreak.structuredContent.ok, false);
+    assert.strictEqual(qBreak.structuredContent.result.breakingChanges[0].code, 'REQUIRED_FIELD_ADDED_NO_DEFAULT');
+
+    const qSafe = await mcpServer.executeTool('culkibo_queue_dlq_gate', {
+      action: 'check_schema',
+      projectId: projA.id,
+      format: 'jsonschema',
+      baseSchema: baseEvSchema,
+      nextSchema: safeEvSchema,
+      compatibilityMode: 'BACKWARD'
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(qSafe.isError, false);
+    assert.strictEqual(qSafe.structuredContent.ok, true);
+
+    const qCircuit = await mcpServer.executeTool('culkibo_queue_dlq_gate', {
+      action: 'evaluate_circuit',
+      projectId: projA.id,
+      queueName: 'orders-events',
+      totalDelivered: 20,
+      failedCount: 6,
+      consecutivePoisonCount: 6,
+      dlqRawPassthrough: false
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(qCircuit.isError, false);
+    assert.strictEqual(qCircuit.structuredContent.ok, false);
+    assert.strictEqual(qCircuit.structuredContent.result.circuitOpen, true);
+    assert.ok(qCircuit.structuredContent.result.findingCodes.includes('DLQ_SCHEMA_DEADLOCK'));
+    assert.ok(qCircuit.structuredContent.result.findingCodes.includes('POISON_PILL_CIRCUIT_OPEN'));
+
+    const qDenied = await mcpServer.executeTool('culkibo_queue_dlq_gate', {
+      action: 'quarantine',
+      queueName: 'orders-events',
+      messageId: 'msg-bad-1',
+      rawPayloadBase64: Buffer.from('{broken-json', 'utf8').toString('base64')
+    }, { auth: scopedDevAuth });
+    assert.strictEqual(qDenied.isError, true);
+    assert.strictEqual(JSON.parse(qDenied.content[0].text).code, 'FORBIDDEN');
+
+    const qQuarDry = await mcpServer.executeTool('culkibo_queue_dlq_gate', {
+      action: 'quarantine',
+      queueName: 'orders-events',
+      messageId: 'msg-bad-1',
+      rawPayloadBase64: Buffer.from('{broken-json', 'utf8').toString('base64')
+    });
+    assert.strictEqual(qQuarDry.isError, false);
+    assert.strictEqual(qQuarDry.structuredContent.dryRun, true);
+    assert.strictEqual(qQuarDry.structuredContent.result.persisted, false);
+
+    const qQuarLive = await mcpServer.executeTool('culkibo_queue_dlq_gate', {
+      action: 'quarantine',
+      queueName: 'orders-events',
+      messageId: 'msg-bad-1',
+      rawPayloadBase64: Buffer.from('{broken-json', 'utf8').toString('base64'),
+      dryRun: false
+    });
+    assert.strictEqual(qQuarLive.isError, false);
+    assert.strictEqual(qQuarLive.structuredContent.result.persisted, true);
+
+    const qList = await mcpServer.executeTool('culkibo_queue_dlq_gate', { action: 'list', queueName: 'orders-events' });
+    assert.strictEqual(qList.structuredContent.items.length, 1);
+    assert.strictEqual(qList.structuredContent.items[0].rawPassthrough, true);
+    console.log('  ✓ culkibo_queue_dlq_gate verificado (REQUIRED_FIELD_ADDED_NO_DEFAULT, DLQ_SCHEMA_DEADLOCK y cuarentena opaca)');
+
+    // 6. Final Cycle-19 Milestone assertion: exact 180 tools & ?profile=core 17/180 >=91.9% token savings!
+    const all180 = mcpServer.getToolsForPrincipal(null, { profile: 'all' });
+    const core17 = mcpServer.getToolsForPrincipal(null, { profile: 'core' });
+    const saved180Pct = Math.round((1 - Buffer.byteLength(JSON.stringify(core17), 'utf8') / Buffer.byteLength(JSON.stringify(all180), 'utf8')) * 1000) / 10;
+    assert.strictEqual(all180.length, 180);
+    assert.strictEqual(core17.length, 17);
+    assert.ok(saved180Pct >= 91.9, `?profile=core debe alcanzar >=91.9% de ahorro en 180 tools (actual: ${saved180Pct}%)`);
+    console.log(`  ✓ Catálogo Cycle-19 Milestone (180 MCP Tools!) verificado: 180 tools exactas, ?profile=core 17/180 (-${saved180Pct}% tokens/bytes)`);
   } finally {
     projectManager.delete(projA.id);
     projectManager.delete(projB.id);

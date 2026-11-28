@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 175);
+    assert.strictEqual(demoJson.datasets.mcpTools, 180);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1214,7 +1214,80 @@ async function testCliDx() {
     assert.strictEqual(scrubJson.scrubbed.attributes.userEmail, '[REDACTED:EMAIL]');
     assert.ok(scrubJson.scrubbed.span.events[0].attributes.note.includes('[REDACTED:PCI_PAN]'));
     assert.ok(scrubJson.redactedBytes > 0);
-    console.log(`  ✓ Pioneer CLI Cycle-18 verificado (culkibo pool-audit fail=1/safe=0, culkibo scrub-pii Luhn+OTLP 0 raw PII, culkibo demo 175 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-18 verificado (culkibo pool-audit fail=1/safe=0, culkibo scrub-pii Luhn+OTLP 0 raw PII)`);
+
+    // 23. Pioneer Cycle-19 Milestone CLI: `culkibo disk-guard` (critical exit 1 vs healthy exit 0) & `culkibo cred-watchdog` (expired/hygiene exit 1 vs healthy exit 0, 0 raw secrets)
+    const diskCritCli = await runCli([
+      'disk-guard',
+      '--node', 'vps-eu-1',
+      '--block-pct', '35',
+      '--inode-pct', '96',
+      '--pg-wal-gb', '18',
+      '--inactive-slots', '2',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(diskCritCli.status, 1, 'culkibo disk-guard debe salir con código 1 en estado CRITICAL');
+    const diskCritJson = JSON.parse(diskCritCli.stdout);
+    assert.strictEqual(diskCritJson.ok, false);
+    assert.strictEqual(diskCritJson.status, 'CRITICAL');
+    assert.ok(diskCritJson.alertCodes.includes('INODE_EXHAUSTION_CRITICAL'));
+    assert.ok(diskCritJson.alertCodes.includes('PG_WAL_SLOT_RUNAWAY'));
+    assert.strictEqual(diskCritJson.daemonLogQuota.config['log-opts']['max-size'], '10m');
+
+    const diskOkCli = await runCli([
+      'disk-guard',
+      '--node', 'vps-eu-1',
+      '--block-pct', '35',
+      '--inode-pct', '28',
+      '--pg-wal-gb', '1',
+      '--inactive-slots', '0',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(diskOkCli.status, 0, `culkibo disk-guard sano falló: ${diskOkCli.stderr} ${diskOkCli.stdout}`);
+    const diskOkJson = JSON.parse(diskOkCli.stdout);
+    assert.strictEqual(diskOkJson.ok, true);
+    assert.strictEqual(diskOkJson.status, 'HEALTHY');
+
+    const credMetaFile = path.join(tmpRoot, 'cred-watchdog-c19.json');
+    fs.writeFileSync(credMetaFile, JSON.stringify({
+      nowIso: '2026-11-28T00:00:00Z',
+      credentials: [
+        { id: 's3-old', kind: 's3_iam', label: 'Expired S3', expiresAtIso: '2026-10-15T00:00:00Z' },
+        { id: 'oauth-soon', kind: 'oauth', label: 'Critical OAuth', expiresAtIso: '2026-12-02T00:00:00Z' }
+      ]
+    }, null, 2), 'utf8');
+    const credFailCli = await runCli([
+      'cred-watchdog',
+      credMetaFile,
+      '--clock-skew', '90',
+      '--ssh-mode', '0777',
+      '--temp-sts',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(credFailCli.status, 1, 'culkibo cred-watchdog debe salir con código 1 ante expiración crítica o fallo de higiene');
+    const credFailJson = JSON.parse(credFailCli.stdout);
+    assert.strictEqual(credFailJson.ok, false);
+    assert.strictEqual(credFailJson.audit.counts.EXPIRED, 1);
+    assert.strictEqual(credFailJson.audit.counts.CRITICAL, 1);
+    assert.ok(credFailJson.hygiene.findingCodes.includes('CLOCK_SKEW_JWT_FAILURE'));
+    assert.ok(credFailJson.hygiene.findingCodes.includes('INSECURE_SSH_KEY_MODE'));
+    assert.ok(credFailJson.hygiene.findingCodes.includes('EPHEMERAL_BACKUP_CREDENTIAL'));
+
+    const credOkCli = await runCli([
+      'cred-watchdog',
+      '--now', '2026-11-28T00:00:00Z',
+      '--expires', '2027-06-01T00:00:00Z',
+      '--kind', 'db_cert',
+      '--clock-skew', '2',
+      '--ssh-mode', '0600',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(credOkCli.status, 0, `culkibo cred-watchdog sano falló: ${credOkCli.stderr} ${credOkCli.stdout}`);
+    const credOkJson = JSON.parse(credOkCli.stdout);
+    assert.strictEqual(credOkJson.ok, true);
+    assert.strictEqual(credOkJson.healthy, true);
+    assert.strictEqual(credOkJson.hygieneSafe, true);
+    console.log(`  ✓ Pioneer CLI Cycle-19 Milestone verificado (culkibo disk-guard crit=1/ok=0, culkibo cred-watchdog fail=1/ok=0, culkibo demo 180 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {
