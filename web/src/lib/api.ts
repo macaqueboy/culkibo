@@ -6534,6 +6534,172 @@ export const api = {
       'Poison-pill quarantine failed'
     );
   },
+
+  // --- Cycle-20: Proxy Trust & Smuggling Guard, Valkey Guard, EOL Base Hardener (copa), WORM Backup KEK Rotation & MCPoison Guard ---
+
+  async evaluateProxyTrust(payload: {
+    remoteIp: string;
+    method?: string;
+    headers?: Record<string, string>;
+    hasBody?: boolean;
+    upstreamHttpVersion?: string;
+    trustedProxyCidrs?: string[];
+    authCopyHeaders?: string[];
+  }): Promise<ProxyTrustEvalResult> {
+    const res = await apiFetch(`${API_BASE}/edge/proxy-trust/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.allowed === false || data?.blocked === true) {
+      return data as ProxyTrustEvalResult;
+    }
+    throw new Error(data?.error || data?.message || 'Proxy trust evaluation failed');
+  },
+
+  async auditValkeyGuard(payload: {
+    projectId?: string;
+    workload?: 'queue' | 'cache' | 'session';
+    hostRamMb?: number;
+    maxmemoryMb?: number;
+    evictionPolicy?: string;
+    overcommitMemory?: number;
+    thpEnabled?: string;
+    appendonly?: boolean;
+    noTtlPct?: number;
+    topKeyTrafficPct?: number;
+  }): Promise<ValkeyGuardAuditResult> {
+    const res = await apiFetch(`${API_BASE}/db/valkey-guard/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as ValkeyGuardAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'Valkey guard audit failed');
+  },
+
+  async auditBaseHardener(payload: {
+    projectId?: string;
+    dockerfile: string;
+    trivySummary?: Record<string, unknown>;
+    readOnlyRootfs?: boolean;
+  }): Promise<BaseHardenerAuditResult> {
+    const res = await apiFetch(`${API_BASE}/builds/base-hardener/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as BaseHardenerAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'Base image hardening audit failed');
+  },
+
+  async planCopaThinPatch(payload: {
+    imageRef: string;
+    osCves?: string[] | number;
+    dryRun?: boolean;
+  }): Promise<CopaThinPatchResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/builds/base-hardener/copa-plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Copa thin-patch planning failed'
+    );
+  },
+
+  async auditWormBackupPolicy(payload: {
+    bucket?: string;
+    objectLockMode?: string;
+    retentionDays?: number;
+    streamingPipeNoMd5?: boolean;
+    resticLocksInWormPrefix?: boolean;
+    keyEscrowVerified?: boolean;
+  }): Promise<WormBackupAuditResult> {
+    const res = await apiFetch(`${API_BASE}/backups/worm-crypto/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as WormBackupAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'WORM backup policy audit failed');
+  },
+
+  async rotateWormBackupKek(payload: {
+    envelope?: Record<string, unknown>;
+    oldKekHex?: string;
+    newKekHex?: string;
+    newKekVersion?: number;
+    dryRun?: boolean;
+  }): Promise<WormKekRotateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/backups/worm-crypto/rotate-kek`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Envelope KEK rotation failed'
+    );
+  },
+
+  async pinMcpManifest(payload: {
+    serverId: string;
+    tools: Array<Record<string, unknown>>;
+    approver?: string;
+    dryRun?: boolean;
+  }): Promise<McpPoisonPinResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/mcp/poison-guard/pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'MCP manifest pin failed'
+    );
+  },
+
+  async verifyMcpManifest(payload: {
+    serverId: string;
+    tools: Array<Record<string, unknown>>;
+    pinnedHashes?: Record<string, string>;
+  }): Promise<McpPoisonVerifyResult> {
+    const res = await apiFetch(`${API_BASE}/mcp/poison-guard/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.valid === false || data?.blocked === true || data?.code === 'MCP_RUG_PULL_DETECTED') {
+      return data as McpPoisonVerifyResult;
+    }
+    throw new Error(data?.error || data?.message || 'MCP manifest verification failed');
+  },
+
+  async scanMcpToolPoisoning(payload: {
+    text: string;
+    source?: string;
+  }): Promise<McpPoisonScanResult> {
+    const res = await apiFetch(`${API_BASE}/mcp/poison-guard/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.clean === false || data?.blocked === true || data?.poisoned === true) {
+      return data as McpPoisonScanResult;
+    }
+    throw new Error(data?.error || data?.message || 'MCP poisoning scan failed');
+  },
 };
 
 // =====================================================================
@@ -8909,5 +9075,101 @@ export interface QueueDlqQuarantineResult {
   dryRun?: boolean;
   quarantineId?: string;
   record?: { id?: string; [key: string]: unknown };
+  message?: string;
+}
+
+// --- Cycle-20 Proxy Trust Guard, Valkey Guard, Base Image Hardener (copa), WORM Backup Crypto & MCPoison Guard Types ---
+
+export interface ProxyTrustEvalResult {
+  ok?: boolean;
+  allowed?: boolean;
+  blocked?: boolean;
+  findings?: GuardFindingItem[];
+  strippedHeaders?: string[];
+  trustedClientIp?: string;
+  caddyfile?: string;
+  caddyBlock?: string | { caddyfile?: string; [key: string]: unknown };
+  message?: string;
+}
+
+export interface ValkeyGuardAuditResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  valkeyConf?: string | Record<string, unknown>;
+  sysctlSnippet?: string;
+  message?: string;
+}
+
+export interface BaseHardenerAuditResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  recommendedBase?: string;
+  recommendedDockerfile?: string | Record<string, unknown>;
+  message?: string;
+}
+
+export interface CopaThinPatchResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  imageRef?: string;
+  patchedImageRef?: string;
+  osCves?: number;
+  copaCommandArgv?: string[];
+  message?: string;
+}
+
+export interface WormBackupAuditResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  findings?: GuardFindingItem[];
+  message?: string;
+}
+
+export interface WormKekRotateResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  previousKekVersion?: number;
+  newKekVersion?: number;
+  kekVersion?: number;
+  reuploadBytes?: number;
+  envelope?: Record<string, unknown>;
+  message?: string;
+}
+
+export interface McpPoisonPinResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  serverId?: string;
+  manifestHash?: string;
+  toolHashes?: Record<string, string>;
+  message?: string;
+}
+
+export interface McpPoisonVerifyResult {
+  ok?: boolean;
+  valid?: boolean;
+  verified?: boolean;
+  blocked?: boolean;
+  code?: string;
+  driftedTools?: Array<string | { name?: string; code?: string; reason?: string }>;
+  findings?: GuardFindingItem[];
+  message?: string;
+}
+
+export interface McpPoisonScanResult {
+  ok?: boolean;
+  clean?: boolean;
+  poisoned?: boolean;
+  blocked?: boolean;
+  code?: string;
+  findings?: GuardFindingItem[];
+  unicodeTagCount?: number;
   message?: string;
 }

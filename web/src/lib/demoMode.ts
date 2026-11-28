@@ -5091,6 +5091,229 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     });
   }
 
+  // --- Cycle-20 Proxy Trust Guard, Valkey Guard, EOL Base Hardener (copa), WORM Backup Crypto & MCPoison Guard ---
+  if (pathname === '/api/edge/proxy-trust/evaluate' && method === 'POST') {
+    const hdrs = (body.headers && typeof body.headers === 'object' ? body.headers : {}) as Record<string, string>;
+    const keys = Object.keys(hdrs);
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    const strippedHeaders: string[] = [];
+    for (const k of keys) {
+      if (/^x[-_.](remote|authenticated)[-_.]user$/i.test(k)) {
+        strippedHeaders.push(k);
+      }
+    }
+    if (strippedHeaders.length > 0) {
+      findings.push({ code: 'FORWARD_AUTH_SPOOF_BLOCKED', severity: 'critical', message: `Untrusted client forged forward_auth identity headers (${strippedHeaders.join(', ')}) — CVE-2026-30851 blocked.` });
+    }
+    if (Object.entries(hdrs).some(([k, v]) => k.toLowerCase() === 'upgrade' && String(v).toLowerCase() === 'h2c')) {
+      findings.push({ code: 'H2C_SMUGGLE_BLOCKED', severity: 'critical', message: 'Cleartext Upgrade: h2c smuggling blocked (CVE-2026-88008).' });
+    }
+    if (String(body.method || '').toUpperCase() === 'CONNECT' && body.hasBody) {
+      findings.push({ code: 'CONNECT_DESYNC_BLOCKED', severity: 'critical', message: 'HTTP/1.1 CONNECT with body blocked (CVE-2026-71324 keep-alive desync).' });
+    }
+    if (keys.some((k) => k.toLowerCase() === 'content-length') && keys.some((k) => k.toLowerCase() === 'transfer-encoding')) {
+      findings.push({ code: 'TE_CL_SMUGGLE', severity: 'critical', message: 'Dual Content-Length + Transfer-Encoding smuggling payload rejected.' });
+    }
+    const caddyfile = [
+      'servers {',
+      '  trusted_proxies static 10.0.0.0/8 127.0.0.1/32',
+      '  trusted_proxies_strict',
+      '}',
+      'request_header -X-Remote-User -X_Remote_User -X.Authenticated.User -Upgrade',
+    ].join('\n');
+    return jsonResponse({
+      ok: true,
+      allowed: findings.length === 0,
+      blocked: findings.length > 0,
+      findings,
+      strippedHeaders,
+      trustedClientIp: String(body.remoteIp || '203.0.113.55'),
+      caddyfile,
+      message: findings.length > 0 ? `Blocked ${findings.length} proxy smuggling / spoof vector(s).` : 'Request passed proxy trust boundary.',
+    });
+  }
+
+  if (pathname === '/api/db/valkey-guard/audit' && method === 'POST') {
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (Number(body.overcommitMemory ?? 1) !== 1) {
+      findings.push({ code: 'BGSAVE_FORK_OOM_RISK', severity: 'critical', message: 'vm.overcommit_memory != 1 causes BGSAVE fork() write halts.' });
+    }
+    if (String(body.thpEnabled || 'never') !== 'never') {
+      findings.push({ code: 'THP_COW_AMPLIFICATION', severity: 'high', message: 'Transparent Huge Pages enabled — doubles CoW RAM during RDB snapshots.' });
+    }
+    if (Number(body.maxmemoryMb ?? 1024) > Number(body.hostRamMb ?? 4096) * 0.75) {
+      findings.push({ code: 'INSUFFICIENT_FORK_HEADROOM', severity: 'high', message: 'maxmemory exceeds 75% of host RAM (leaving <25% BGSAVE fork headroom).' });
+    }
+    if (String(body.workload || 'cache') === 'queue' && String(body.evictionPolicy || 'noeviction') !== 'noeviction') {
+      findings.push({ code: 'QUEUE_SILENT_JOB_EVICTION', severity: 'critical', message: 'BullMQ/queue workload with allkeys-lru silently evicts queued jobs!' });
+    }
+    if (Number(body.noTtlPct ?? 0) > 40) {
+      findings.push({ code: 'NO_TTL_KEY_BLOAT', severity: 'medium', message: `${body.noTtlPct}% keys have no TTL.` });
+    }
+    if (Number(body.topKeyTrafficPct ?? 0) > 20) {
+      findings.push({ code: 'HOT_KEY_SKEW', severity: 'medium', message: `Single hot key accounts for ${body.topKeyTrafficPct}% traffic.` });
+    }
+    const maxMemSafe = Math.round(Number(body.hostRamMb ?? 4096) * 0.6);
+    const valkeyConf = [
+      `maxmemory ${maxMemSafe}mb`,
+      `maxmemory-policy ${String(body.workload || 'queue') === 'queue' ? 'noeviction' : 'allkeys-lfu'}`,
+      'appendonly yes',
+      'appendfsync everysec',
+      'stop-writes-on-bgsave-error yes',
+    ].join('\n');
+    const sysctlSnippet = 'vm.overcommit_memory = 1\n# echo never > /sys/kernel/mm/transparent_hugepage/enabled';
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length === 0 ? 'SAFE' : 'BLOCKED',
+      findings,
+      valkeyConf,
+      sysctlSnippet,
+      message: findings.length === 0 ? 'Valkey persistence, kernel CoW & eviction policy verified safe.' : `Blocked ${findings.length} Valkey OOM / eviction hazard(s).`,
+    });
+  }
+
+  if (pathname === '/api/builds/base-hardener/audit' && method === 'POST') {
+    const df = String(body.dockerfile || '');
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (/FROM\s+(?:node:(?:16|18)|python:3\.(?:8|9)|debian:(?:buster|bullseye)|alpine:3\.18|ubuntu:20\.04)/i.test(df)) {
+      findings.push({ code: 'EOL_BASE_IMAGE', severity: 'critical', message: 'End-of-Life base image detected (no upstream OS CVE patches).' });
+    }
+    if (!/@sha256:[a-f0-9]{64}/i.test(df)) {
+      findings.push({ code: 'UNPINNED_BASE_TAG', severity: 'high', message: 'Base image lacks immutable @sha256:<64hex> digest pin.' });
+    }
+    if (/USER\s+(?:root|0)\b/i.test(df) || !/USER\s+(?!root\b|0\b)\S+/i.test(df)) {
+      findings.push({ code: 'ROOT_USER_FINAL_STAGE', severity: 'high', message: 'Final container stage runs as root — switch to non-root UID 65532.' });
+    }
+    if (body.readOnlyRootfs === false) {
+      findings.push({ code: 'WRITABLE_ROOTFS_RISK', severity: 'medium', message: 'Enable read_only: true root filesystem in runtime spec.' });
+    }
+    const recommendedBase = 'cgr.dev/chainguard/node@sha256:9f84b2c1e0d3a7f6543210fedcba9876543210fedcba9876543210fedcba9876';
+    const recommendedDockerfile = [
+      `FROM ${recommendedBase}`,
+      'WORKDIR /app',
+      'USER 65532',
+      'COPY --from=builder --chown=65532:65532 /app /app',
+      'CMD ["server.js"]',
+    ].join('\n');
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length === 0 ? 'HARDENED' : 'BLOCKED',
+      findings,
+      recommendedBase,
+      recommendedDockerfile,
+      message: findings.length === 0 ? 'Digest-pinned Wolfi/Distroless non-root UID 65532 verified.' : `Flagged ${findings.length} base-image hardening risk(s).`,
+    });
+  }
+
+  if (pathname === '/api/builds/base-hardener/copa-plan' && method === 'POST') {
+    const imageRef = String(body.imageRef || 'ghcr.io/acme/web:1.2.0');
+    const cveCount = Array.isArray(body.osCves) ? body.osCves.length : Number(body.osCves ?? 4);
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      imageRef,
+      patchedImageRef: `${imageRef}-patched`,
+      osCves: cveCount,
+      copaCommandArgv: ['copa', 'patch', '-i', imageRef, '-r', 'trivy-report.json', '-t', '1.2.0-patched', '--addr', 'tcp://127.0.0.1:8888'],
+      message: `CNCF copa thin BuildKit patch plan ready for ${cveCount} OS CVE(s) without full rebuild (dryRun: true).`,
+    });
+  }
+
+  if (pathname === '/api/backups/worm-crypto/audit' && method === 'POST') {
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (body.streamingPipeNoMd5) {
+      findings.push({ code: 'MISSING_CONTENT_MD5_WORM', severity: 'critical', message: 'Streaming mc pipe lacks Content-MD5 — rejected by S3 Object Lock (coolify#12211).' });
+    }
+    if (body.resticLocksInWormPrefix) {
+      findings.push({ code: 'WORM_LOCK_PREFIX_CONFLICT', severity: 'high', message: 'Restic locks/ prefix inside WORM bucket prevents lock deletion (restic#5411).' });
+    }
+    if (body.keyEscrowVerified === false) {
+      findings.push({ code: 'APP_KEY_ESCROW_MISSING', severity: 'critical', message: 'APP_KEY escrow unverified — restored snapshots risk being unreadable.' });
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      findings,
+      message: findings.length === 0 ? 'S3 WORM Object-Lock & key escrow policy verified.' : `Flagged ${findings.length} WORM backup compliance hazard(s).`,
+    });
+  }
+
+  if (pathname === '/api/backups/worm-crypto/rotate-kek' && method === 'POST') {
+    const nextVer = Number(body.newKekVersion ?? 2);
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      previousKekVersion: Math.max(1, nextVer - 1),
+      newKekVersion: nextVer,
+      kekVersion: nextVer,
+      reuploadBytes: 0,
+      envelope: { alg: 'aes-256-gcm', kekVersion: nextVer, wrappedDekSha256: 'sha256:e4f2a8b9c1d30765', rawKeyPersisted: false },
+      message: `AES-256-GCM envelope DEK rotated v${Math.max(1, nextVer - 1)} → v${nextVer} in <1ms with 0 B archive re-upload (dryRun: true).`,
+    });
+  }
+
+  if (pathname === '/api/mcp/poison-guard/pin' && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      serverId: String(body.serverId || 'culkibo-mcp'),
+      manifestHash: 'sha256:8f4d2a1c9e0b7351a4c6e8f0123456789abcdef0123456789abcdef012345678',
+      toolHashes: { culkibo_list_projects: 'sha256:4a9c1e7b2d5f0831' },
+      message: 'Canonical SHA-256 MCP tool manifest pinned (dryRun: true).',
+    });
+  }
+
+  if (pathname === '/api/mcp/poison-guard/verify' && method === 'POST') {
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    const mutated = tools.some((t: any) => String(t?.description || '').includes('mutated') || String(t?.description || '').includes('exfil'));
+    if (mutated) {
+      return jsonResponse({
+        ok: false,
+        valid: false,
+        verified: false,
+        blocked: true,
+        code: 'MCP_RUG_PULL_DETECTED',
+        driftedTools: [{ name: String(tools[0]?.name || 'culkibo_list_projects'), code: 'MCP_RUG_PULL_DETECTED', reason: 'Post-approval 1-char tool description drift invalidated SHA-256 pin (CVE-2025-54136).' }],
+        findings: [{ code: 'MCP_RUG_PULL_DETECTED', severity: 'critical', message: 'CVE-2025-54136 blocked: tool metadata mutated after manifest approval.' }],
+        message: 'MCPoison rug-pull blocked: SHA-256 tool manifest digest mismatch.',
+      });
+    }
+    return jsonResponse({ ok: true, valid: true, verified: true, blocked: false, code: 'MANIFEST_VERIFIED', driftedTools: [], findings: [], message: 'All MCP tool hashes match pinned manifest.' });
+  }
+
+  if (pathname === '/api/mcp/poison-guard/scan' && method === 'POST') {
+    const txt = String(body.text || '');
+    const hasTag = /<IMPORTANT>|ignore previous instructions|\.ssh\/id_rsa/i.test(txt);
+    let unicodeTagCount = 0;
+    for (const ch of txt) {
+      const cp = ch.codePointAt(0) || 0;
+      if (cp >= 0xe0000 && cp <= 0xe007f) unicodeTagCount += 1;
+    }
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (hasTag || unicodeTagCount > 0) {
+      findings.push({
+        code: 'MCP_TOOL_POISONING_DETECTED',
+        severity: 'critical',
+        message: `Detected covert prompt-injection directive and ${unicodeTagCount} invisible Unicode Tag rune(s) (U+E0000..U+E007F).`,
+      });
+    }
+    return jsonResponse({
+      ok: true,
+      clean: findings.length === 0,
+      poisoned: findings.length > 0,
+      blocked: findings.length > 0,
+      code: findings.length > 0 ? 'MCP_TOOL_POISONING_DETECTED' : 'CLEAN',
+      unicodeTagCount,
+      findings,
+      message: findings.length > 0 ? findings[0].message : 'No tool poisoning directives or invisible Unicode tags detected.',
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -5268,16 +5491,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (180 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (185 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 180 MCP tools on demand without bloating context (-92%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 185 MCP tools on demand without bloating context (-93%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_proxy_trust_guard', description: 'Reverse-proxy trust boundary & smuggling guard blocking CVE-2026-30851 forward_auth spoofing, h2c & CONNECT desync', readOnly: false, profile: 'security' },
+      { name: 'culkibo_valkey_guard', description: 'Valkey/Redis BGSAVE fork CoW, THP, queue/cache eviction & hot-key auditor emitting hardened valkey.conf + sysctl', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_base_image_hardener', description: 'EOL base-image detector, Wolfi/Distroless UID 65532 advisor & CNCF copa thin BuildKit OS CVE patch planner', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_worm_backup_crypto', description: 'S3 WORM Object-Lock Content-MD5/restic-locks verifier & zero-reupload AES-256-GCM envelope DEK/KEK rotation', readOnly: false, profile: 'security' },
+      { name: 'culkibo_mcp_poison_guard', description: 'Zero-Trust CVE-2025-54136 MCPoison SHA-256 tool manifest pinner, rug-pull blocker & invisible Unicode Tag scanner', readOnly: false, profile: 'security' },
       { name: 'culkibo_webhook_firewall', description: 'Fail-closed raw-body HMAC webhook firewall across 6 providers with <=300s clock-skew & Base64URL replay dedup (CVE-2026-41351)', readOnly: false, profile: 'security' },
       { name: 'culkibo_disk_pressure_guard', description: 'Dual block (df -h) + inode (df -ih), overlay2 & Postgres pg_wal slot guard with /etc/docker/daemon.json log quotas (dokploy#4651)', readOnly: false, profile: 'ops' },
       { name: 'culkibo_region_traffic_shift', description: 'Multi-region health-gated Blue/Green shift & sticky-cookie drain controller emitting Caddy lb_policy cookie + health_uri (caddy#7544)', readOnly: false, profile: 'deploy' },
@@ -5344,27 +5572,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 180 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 185 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 180, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 185, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_webhook_firewall', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_disk_pressure_guard', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_proxy_trust_guard', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_mcp_poison_guard', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 180,
-      profiles: { core: { count: 17, savedPct: 92 } },
+      totalTools: 185,
+      profiles: { core: { count: 17, savedPct: 93 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

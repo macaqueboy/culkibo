@@ -72,7 +72,9 @@ const svc = {
   get queryPlanGuardService() { return require('../server/services/queryPlanGuardService'); },
   get logPiiScrubberService() { return require('../server/services/logPiiScrubberService'); },
   get diskPressureGuardService() { return require('../server/services/diskPressureGuardService'); },
-  get credentialExpiryWatchdogService() { return require('../server/services/credentialExpiryWatchdogService'); }
+  get credentialExpiryWatchdogService() { return require('../server/services/credentialExpiryWatchdogService'); },
+  get baseImageHardenerService() { return require('../server/services/baseImageHardenerService'); },
+  get mcpPoisonGuardService() { return require('../server/services/mcpPoisonGuardService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2895,15 +2897,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 180,
+            mcpTools: 185,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '180 MCP tools (-91.9% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'Webhook HMAC/Replay Firewall, Dual Block+Inode Disk Guard, Multi-Region Shift, Credential Watchdog & Queue DLQ Gate'
+            '185 MCP tools (-92.5%+ core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'Proxy Trust Smuggling Guard, Valkey Fork Guard, EOL/Copa Hardener, WORM KEK Rotation & MCPoison Rug-Pull Guard'
           ]
         };
       };
@@ -4744,6 +4746,211 @@ program
       if (!ok) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-20 CLI: base-harden (EOL/Wolfi/copa) & mcp-poison-check
+// ===========================================================================
+
+program
+  .command('base-harden [dockerfile]')
+  .description('EOL Base-Image, CNCF copa & Distroless/Wolfi Hardener: sale con código 1 ante bases EOL, USER root, tags sin @sha256 o rootfs escribible')
+  .option('--dockerfile <str>', 'Contenido inline de Dockerfile a auditar')
+  .option('--image <ref>', 'Referencia rápida de imagen base (genera FROM <ref>)')
+  .option('--writable-rootfs', 'Indicar que el contenedor corre con rootfs escribible (readOnlyRootfs=false)')
+  .option('--critical-cves <n>', 'Número de CVEs críticos de OS (Trivy)', '0')
+  .option('--high-cves <n>', 'Número de CVEs altos de OS (Trivy)', '0')
+  .option('--json', 'Salida JSON estructurada')
+  .action((dockerfileArg, options) => {
+    try {
+      const hardenerSvc = svc.baseImageHardenerService;
+      /** @type {string} */
+      let dockerfileContent = '';
+      /** @type {boolean} */
+      let readOnlyRootfs = !options.writableRootfs;
+      /** @type {any} */
+      let trivySummary = null;
+
+      if (typeof options.dockerfile === 'string' && options.dockerfile.length > 0) {
+        dockerfileContent = options.dockerfile;
+      } else if (typeof options.image === 'string' && options.image.trim()) {
+        dockerfileContent = `FROM ${options.image.trim()}\n`;
+      } else if (dockerfileArg) {
+        const resolved = path.resolve(String(dockerfileArg));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Dockerfile o JSON no encontrado: ${resolved}`);
+        }
+        const raw = fs.readFileSync(resolved, 'utf8');
+        if (resolved.toLowerCase().endsWith('.json')) {
+          const parsed = JSON.parse(raw);
+          dockerfileContent = typeof parsed.dockerfile === 'string' ? parsed.dockerfile : '';
+          if (parsed.readOnlyRootfs !== undefined && !options.writableRootfs) {
+            readOnlyRootfs = Boolean(parsed.readOnlyRootfs);
+          }
+          if (parsed.trivySummary && typeof parsed.trivySummary === 'object') {
+            trivySummary = parsed.trivySummary;
+          }
+        } else {
+          dockerfileContent = raw;
+        }
+      } else {
+        throw new Error('Proporciona un archivo <dockerfile>, --dockerfile "<contenido>" o --image "<ref>".');
+      }
+
+      const crit = Number(options.criticalCves || 0);
+      const high = Number(options.highCves || 0);
+      if (!trivySummary && (crit > 0 || high > 0)) {
+        trivySummary = { criticalOsCves: crit, highOsCves: high };
+      }
+
+      const report = hardenerSvc.auditDockerfileHardening({
+        dockerfile: dockerfileContent,
+        trivySummary,
+        readOnlyRootfs,
+        persist: false
+      });
+
+      const safe = Boolean(report && report.safe === true);
+      const payload = {
+        ...report,
+        ok: safe
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!safe) process.exitCode = 1;
+        return;
+      }
+
+      const badge = safe ? '\x1b[32mHARDENED ✅\x1b[0m' : '\x1b[31mACTION REQUIRED ❌\x1b[0m';
+      console.log(`\n🛡️  Culkibo Base-Image Hardener (${report.finalBaseImage || 'n/a'}) — [${badge}]`);
+      console.log(`   Findings:         ${report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
+      console.log(`   Recommended base: ${report.recommendedBase}`);
+      console.log('');
+      if (!safe) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('mcp-poison-check [manifestFile]')
+  .description('Zero-Trust MCPoison Rug-Pull & Tool-Poisoning Scanner (CVE-2025-54136): sale con código 1 si detecta rug-pull, prompt injection o runas Unicode Tag')
+  .option('--text <str>', 'Texto o descripción de herramienta MCP a escanear')
+  .option('--pin-file <path>', 'Manifiesto JSON aprobado de referencia para detectar deriva post-aprobación (MCP_RUG_PULL_DETECTED)')
+  .option('--server-id <id>', 'Identificador del servidor MCP', 'cli-server')
+  .option('--role <role>', 'Rol del agente opcional para auditoría de alcance (viewer|developer|admin)')
+  .option('--json', 'Salida JSON estructurada')
+  .action((manifestFile, options) => {
+    const osMod = require('os');
+    const scratchDir = fs.mkdtempSync(path.join(osMod.tmpdir(), 'culkibo-cli-mcppoison-'));
+    try {
+      const poisonMod = svc.mcpPoisonGuardService;
+      const poisonInst = typeof poisonMod.McpPoisonGuardService === 'function'
+        ? new poisonMod.McpPoisonGuardService({ dataDir: scratchDir })
+        : poisonMod;
+
+      const serverId = String(options.serverId || 'cli-server').trim() || 'cli-server';
+      /** @type {any[]} */
+      let liveTools = [];
+      /** @type {any[] | null} */
+      let baselineTools = null;
+      /** @type {string | null} */
+      let rawText = typeof options.text === 'string' && options.text.length > 0 ? options.text : null;
+
+      if (manifestFile) {
+        const resolved = path.resolve(String(manifestFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Manifiesto MCP no encontrado: ${resolved}`);
+        }
+        const parsed = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+        if (Array.isArray(parsed)) {
+          liveTools = parsed;
+        } else if (parsed && typeof parsed === 'object') {
+          if (Array.isArray(parsed.tools)) liveTools = parsed.tools;
+          if (Array.isArray(parsed.pinnedTools)) baselineTools = parsed.pinnedTools;
+          if (!rawText && typeof parsed.text === 'string') rawText = parsed.text;
+        }
+      }
+
+      if (options.pinFile) {
+        const resolvedPin = path.resolve(String(options.pinFile));
+        if (!fs.existsSync(resolvedPin)) {
+          throw new Error(`Archivo de pin MCP no encontrado: ${resolvedPin}`);
+        }
+        const parsedPin = JSON.parse(fs.readFileSync(resolvedPin, 'utf8'));
+        baselineTools = Array.isArray(parsedPin)
+          ? parsedPin
+          : (parsedPin && Array.isArray(parsedPin.tools) ? parsedPin.tools : []);
+      }
+
+      if (!rawText && liveTools.length === 0) {
+        throw new Error('Proporciona un archivo <manifestFile> con herramientas MCP o el flag --text "<texto>".');
+      }
+
+      const scan = poisonInst.scanToolPoisoning({
+        ...(rawText ? { text: rawText } : {}),
+        ...(liveTools.length > 0 ? { tools: liveTools } : {}),
+        source: serverId
+      });
+
+      /** @type {any} */
+      let verify = null;
+      if (Array.isArray(baselineTools) && baselineTools.length > 0) {
+        const pinRes = poisonInst.pinToolManifest({
+          serverId,
+          tools: baselineTools,
+          approver: 'cli-pin',
+          dryRun: false
+        });
+        verify = pinRes.blocked
+          ? { ok: true, verified: false, blocked: true, code: pinRes.code, serverId, driftedTools: [], poisonFindings: pinRes.findings || [] }
+          : poisonInst.verifyToolManifest({ serverId, tools: liveTools });
+      }
+
+      /** @type {any} */
+      let scopeAudit = null;
+      if (options.role && liveTools.length > 0) {
+        scopeAudit = poisonInst.auditAgentToolScope({
+          role: String(options.role),
+          requestedTools: liveTools.map((t) => String((t && t.name) || '')).filter(Boolean)
+        });
+      }
+
+      const blocked = Boolean(scan.blocked || (verify && verify.blocked) || (scopeAudit && scopeAudit.blocked));
+      const code = verify && verify.blocked
+        ? verify.code
+        : (scan.blocked ? scan.code : (scopeAudit && scopeAudit.blocked ? scopeAudit.code : 'CLEAN'));
+
+      const payload = {
+        ok: !blocked,
+        blocked,
+        code,
+        serverId,
+        scan,
+        ...(verify ? { verify } : {}),
+        ...(scopeAudit ? { scopeAudit } : {})
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (blocked) process.exitCode = 1;
+        return;
+      }
+
+      const badge = !blocked ? '\x1b[32mVERIFIED CLEAN ✅\x1b[0m' : `\x1b[31mBLOCKED (${code}) ❌\x1b[0m`;
+      console.log(`\n🔒 Culkibo Zero-Trust MCPoison Guard (${serverId}) — [${badge}]`);
+      console.log(`   Poison findings: ${scan.findingCount} (invisible Unicode tags: ${scan.invisibleTagCount})`);
+      if (verify) {
+        console.log(`   Manifest drift:  ${verify.driftedTools ? verify.driftedTools.length : 0} drifted tool(s)`);
+      }
+      console.log('');
+      if (blocked) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    } finally {
+      try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (e) {}
     }
   });
 

@@ -78,6 +78,9 @@ const testCycle18HttpE2E = require('./cycle18-http-e2e.test');
 const testWebhookFirewallAndTrafficShift = require('./webhook-firewall-and-traffic-shift.test');
 const testDiskCredsQueueDlq = require('./disk-creds-queue-dlq.test');
 const testCycle19HttpE2E = require('./cycle19-http-e2e.test');
+const testProxyTrustAndMcpPoison = require('./proxy-trust-and-mcp-poison.test');
+const testValkeyHardenerWorm = require('./valkey-hardener-worm.test');
+const testCycle20HttpE2E = require('./cycle20-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -181,6 +184,9 @@ async function runAll() {
     { name: 'Inbound Webhook HMAC/Replay Firewall (CVE-2026-41351) & Multi-Region Health-Gated Blue/Green Traffic Shift (Caddy#7544)', fn: testWebhookFirewallAndTrafficShift },
     { name: 'Dual Block+Inode Disk/pg_wal Guard (Dokploy#4651), Credential Expiry Watchdog (Coolify#4702) & Queue Schema/DLQ Gate', fn: testDiskCredsQueueDlq },
     { name: 'Cycle #19 180-MCP & 80-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + Replay/Inode/Shift/Watchdog/DLQ + RBAC)', fn: testCycle19HttpE2E },
+    { name: 'Reverse-Proxy Trust Boundary / Smuggling Guard (CVE-2026-30851) & MCP Rug-Pull / Tool-Poisoning Guard (CVE-2025-54136)', fn: testProxyTrustAndMcpPoison },
+    { name: 'Valkey/Redis Kernel & Eviction Guard, EOL Base-Image / Copa Distroless Hardener & WORM Backup AES-256-GCM KEK Rotation', fn: testValkeyHardenerWorm },
+    { name: 'Cycle #20 185-MCP & 83-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + Trust/Valkey/Copa/WORM/MCPoison + RBAC)', fn: testCycle20HttpE2E },
   ];
 
   for (const suite of suites) {

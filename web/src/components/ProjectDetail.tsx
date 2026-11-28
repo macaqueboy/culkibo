@@ -85,6 +85,8 @@ import {
   type GracefulDrainAdvanceResult,
   type RegionTrafficShiftEvalResult,
   type RegionTrafficShiftPlanResult,
+  type BaseHardenerAuditResult,
+  type CopaThinPatchResult,
   isDemoMode,
 } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
@@ -272,8 +274,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..19 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain & Region Shift state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift'>('oom');
+  // Cycle-13..20 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain, Region Shift & Base Hardener state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift' | 'basehardener'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -329,6 +331,11 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [regionPlan, setRegionPlan] = useState<RegionTrafficShiftPlanResult | null>(null);
   const [regionBusy, setRegionBusy] = useState<'unhealthy' | 'plan' | null>(null);
   const [regionError, setRegionError] = useState<string | null>(null);
+  // Cycle-20 EOL Base-Image, CNCF copa & Wolfi/Distroless Hardener state
+  const [baseAudit, setBaseAudit] = useState<BaseHardenerAuditResult | null>(null);
+  const [copaPlan, setCopaPlan] = useState<CopaThinPatchResult | null>(null);
+  const [baseBusy, setBaseBusy] = useState<'bad' | 'good' | null>(null);
+  const [baseError, setBaseError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1695,6 +1702,46 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setRegionBusy(null);
+    }
+  };
+
+  const handleRunBaseHardener = async (mode: 'bad' | 'good') => {
+    setBaseBusy(mode);
+    setBaseError(null);
+    try {
+      const sha64 = '9f84b2c1e0d3a7f6543210fedcba9876543210fedcba9876543210fedcba9876';
+      if (mode === 'bad') {
+        setCopaPlan(null);
+        const res = await api.auditBaseHardener({
+          projectId: project.id,
+          dockerfile: 'FROM node:18\nWORKDIR /app\nCOPY . .\nUSER root\nCMD ["node", "server.js"]',
+          readOnlyRootfs: false,
+        });
+        setBaseAudit(res);
+        onNotify('Base Hardener BLOCKED: EOL_BASE_IMAGE (node:18) + UNPINNED_BASE_TAG + ROOT_USER_FINAL_STAGE!', 'error');
+      } else {
+        const [audRes, planRes] = await Promise.all([
+          api.auditBaseHardener({
+            projectId: project.id,
+            dockerfile: `FROM cgr.dev/chainguard/node@sha256:${sha64}\nWORKDIR /app\nUSER 65532\nCOPY --from=builder /app /app\nCMD ["server.js"]`,
+            readOnlyRootfs: true,
+          }),
+          api.planCopaThinPatch({
+            imageRef: `ghcr.io/acme/${project.name}:1.2.0`,
+            osCves: ['CVE-2026-0001', 'CVE-2026-0002', 'CVE-2026-0003', 'CVE-2026-0004'],
+            dryRun: true,
+          }),
+        ]);
+        setBaseAudit(audRes);
+        setCopaPlan(planRes);
+        onNotify('Wolfi Digest Verified (UID 65532) & CNCF copa Thin-Patch Plan Ready (dryRun: true)!', 'success');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Base hardener audit failed';
+      setBaseError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setBaseBusy(null);
     }
   };
 
@@ -3381,6 +3428,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 { id: 'previewgate' as const, label: t('pd.forensicsTabPreviewGate') },
                 { id: 'drain' as const, label: t('pd.forensicsTabDrain') },
                 { id: 'regionshift' as const, label: t('pd.forensicsTabRegionShift') },
+                { id: 'basehardener' as const, label: t('pd.forensicsTabBaseHardener') },
               ]).map((tabItem) => (
                 <button
                   key={tabItem.id}
@@ -4295,6 +4343,72 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
                       {caddyText}
                     </pre>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'basehardener' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={baseBusy !== null}
+                  onClick={() => void handleRunBaseHardener('bad')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {baseBusy === 'bad' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.baseTestBad')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={baseBusy !== null}
+                  onClick={() => void handleRunBaseHardener('good')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {baseBusy === 'good' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.baseTestGood')}</span>
+                </button>
+              </div>
+              {baseError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{baseError}</div>}
+              {baseAudit && (() => {
+                const rawFinds = Array.isArray(baseAudit.findings) ? baseAudit.findings : [];
+                const codes = Array.from(new Set(rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'EOL_BASE_IMAGE')))));
+                const isSafe = codes.length === 0 && baseAudit.safe !== false && !baseAudit.blocked;
+                const recDf =
+                  typeof baseAudit.recommendedDockerfile === 'string'
+                    ? baseAudit.recommendedDockerfile
+                    : baseAudit.recommendedDockerfile
+                      ? JSON.stringify(baseAudit.recommendedDockerfile, null, 2)
+                      : '';
+                const copaCmd = Array.isArray(copaPlan?.copaCommandArgv) ? copaPlan.copaCommandArgv.join(' ') : '';
+                return (
+                  <div className="space-y-2 tabular-nums font-mono text-[11px]">
+                    <div className={`p-3.5 rounded-xl border space-y-2 ${
+                      isSafe
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        : 'bg-red-50 border-red-200 text-red-700'
+                    }`}>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          {isSafe ? 'HARDENED · WOLFI NON-ROOT UID 65532' : `BLOCKED · ${codes.length} BASE HAZARD(S)`}
+                        </span>
+                        {codes.map((c, idx) => (
+                          <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                            {c}
+                          </span>
+                        ))}
+                      </div>
+                      {baseAudit.recommendedBase && (
+                        <div className="text-[10px] truncate">recommended: {baseAudit.recommendedBase}</div>
+                      )}
+                    </div>
+                    {(copaCmd || recDf) && (
+                      <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
+                        {copaCmd ? `# CNCF copa thin BuildKit patch (dryRun: true)\n${copaCmd}` : recDf}
+                      </pre>
+                    )}
                   </div>
                 );
               })()}

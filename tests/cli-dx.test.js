@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 180);
+    assert.strictEqual(demoJson.datasets.mcpTools, 185);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1287,7 +1287,54 @@ async function testCliDx() {
     assert.strictEqual(credOkJson.ok, true);
     assert.strictEqual(credOkJson.healthy, true);
     assert.strictEqual(credOkJson.hygieneSafe, true);
-    console.log(`  ✓ Pioneer CLI Cycle-19 Milestone verificado (culkibo disk-guard crit=1/ok=0, culkibo cred-watchdog fail=1/ok=0, culkibo demo 180 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-19 Milestone verificado (culkibo disk-guard crit=1/ok=0, culkibo cred-watchdog fail=1/ok=0)`);
+
+    // 24. Pioneer Cycle-20 CLI: `culkibo base-harden` (EOL/root/unpinned exit 1 vs hardened Wolfi exit 0) & `culkibo mcp-poison-check` (rug-pull + Unicode Tag exit 1 vs clean exit 0)
+    const eolDockerFile = path.join(tmpRoot, 'Dockerfile.eol');
+    fs.writeFileSync(eolDockerFile, 'FROM node:18\nUSER root\nCMD ["node", "index.js"]\n', 'utf8');
+    const hardenFailCli = await runCli(['base-harden', eolDockerFile, '--writable-rootfs', '--json'], { env: isolatedEnv });
+    assert.strictEqual(hardenFailCli.status, 1, 'culkibo base-harden debe salir con código 1 ante EOL/USER root/unpinned');
+    const hardenFailJson = JSON.parse(hardenFailCli.stdout);
+    assert.strictEqual(hardenFailJson.ok, false);
+    assert.ok(hardenFailJson.findingCodes.includes('EOL_BASE_IMAGE'));
+    assert.ok(hardenFailJson.findingCodes.includes('ROOT_USER_FINAL_STAGE'));
+    assert.ok(hardenFailJson.findingCodes.includes('UNPINNED_BASE_TAG'));
+
+    const safeDockerFile = path.join(tmpRoot, 'Dockerfile.safe');
+    fs.writeFileSync(safeDockerFile, `FROM cgr.dev/chainguard/node:latest@sha256:${'a'.repeat(64)}\nUSER 65532\n`, 'utf8');
+    const hardenOkCli = await runCli(['base-harden', safeDockerFile, '--json'], { env: isolatedEnv });
+    assert.strictEqual(hardenOkCli.status, 0, `culkibo base-harden endurecido falló: ${hardenOkCli.stderr} ${hardenOkCli.stdout}`);
+    const hardenOkJson = JSON.parse(hardenOkCli.stdout);
+    assert.strictEqual(hardenOkJson.ok, true);
+    assert.strictEqual(hardenOkJson.status, 'HARDENED');
+
+    const pinFile = path.join(tmpRoot, 'mcp-pin-c20.json');
+    const liveRugFile = path.join(tmpRoot, 'mcp-live-rug-c20.json');
+    const liveCleanFile = path.join(tmpRoot, 'mcp-live-clean-c20.json');
+    const baseManifest = {
+      tools: [{ name: 'list_projects', description: 'List projects safely', inputSchema: { type: 'object' } }]
+    };
+    fs.writeFileSync(pinFile, JSON.stringify(baseManifest, null, 2), 'utf8');
+    fs.writeFileSync(liveCleanFile, JSON.stringify(baseManifest, null, 2), 'utf8');
+    fs.writeFileSync(liveRugFile, JSON.stringify({
+      tools: [{ name: 'list_projects', description: 'List projects safely.', inputSchema: { type: 'object' } }]
+    }, null, 2), 'utf8');
+
+    const rugCli = await runCli(['mcp-poison-check', liveRugFile, '--pin-file', pinFile, '--json'], { env: isolatedEnv });
+    assert.strictEqual(rugCli.status, 1, 'culkibo mcp-poison-check debe salir con código 1 ante MCP_RUG_PULL_DETECTED');
+    assert.strictEqual(JSON.parse(rugCli.stdout).code, 'MCP_RUG_PULL_DETECTED');
+
+    const invisibleRuneText = `Safe description ${String.fromCodePoint(0xE0001, 0xE0049, 0xE0047)}`;
+    const tagCli = await runCli(['mcp-poison-check', '--text', invisibleRuneText, '--json'], { env: isolatedEnv });
+    assert.strictEqual(tagCli.status, 1, 'culkibo mcp-poison-check debe salir con código 1 ante runas Unicode Tag U+E0000..U+E007F');
+    const tagJson = JSON.parse(tagCli.stdout);
+    assert.strictEqual(tagJson.code, 'MCP_TOOL_POISONING_DETECTED');
+    assert.ok(tagJson.scan.invisibleTagCount >= 3);
+
+    const poisonOkCli = await runCli(['mcp-poison-check', liveCleanFile, '--pin-file', pinFile, '--json'], { env: isolatedEnv });
+    assert.strictEqual(poisonOkCli.status, 0, `culkibo mcp-poison-check limpio falló: ${poisonOkCli.stderr} ${poisonOkCli.stdout}`);
+    assert.strictEqual(JSON.parse(poisonOkCli.stdout).ok, true);
+    console.log(`  ✓ Pioneer CLI Cycle-20 verificado (culkibo base-harden fail=1/ok=0, culkibo mcp-poison-check rug-pull+Unicode=1/clean=0, culkibo demo 185 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

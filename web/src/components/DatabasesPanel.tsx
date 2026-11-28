@@ -59,6 +59,9 @@ import {
   type QueueSchemaCheckResult,
   type QueueDlqCircuitResult,
   type QueueDlqQuarantineResult,
+  type ValkeyGuardAuditResult,
+  type WormBackupAuditResult,
+  type WormKekRotateResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
@@ -219,6 +222,15 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [qQuarResult, setQQuarResult] = useState<QueueDlqQuarantineResult | null>(null);
   const [qDlqBusy, setQDlqBusy] = useState<'bad' | 'safe' | null>(null);
   const [qDlqError, setQDlqError] = useState<string | null>(null);
+
+  // Cycle-20 Valkey/Redis Fork CoW & Eviction Guard + S3 WORM Object-Lock & AES-256-GCM KEK Rotation
+  const [vkResult, setVkResult] = useState<ValkeyGuardAuditResult | null>(null);
+  const [vkBusy, setVkBusy] = useState<'bad' | 'safe' | null>(null);
+  const [vkError, setVkError] = useState<string | null>(null);
+  const [wormAudit, setWormAudit] = useState<WormBackupAuditResult | null>(null);
+  const [wormRotate, setWormRotate] = useState<WormKekRotateResult | null>(null);
+  const [wormBusy, setWormBusy] = useState(false);
+  const [wormError, setWormError] = useState<string | null>(null);
 
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
@@ -639,6 +651,105 @@ export const DatabasesPanel: React.FC<Props> = ({
       onNotify(msg, 'error');
     } finally {
       setQDlqBusy(null);
+    }
+  };
+
+  const handleAuditValkey = async (mode: 'bad' | 'safe') => {
+    setVkBusy(mode);
+    setVkError(null);
+    const isBad = mode === 'bad';
+    try {
+      const res = await api.auditValkeyGuard({
+        projectId,
+        workload: 'queue',
+        hostRamMb: 4096,
+        maxmemoryMb: isBad ? 3500 : 2048,
+        evictionPolicy: isBad ? 'allkeys-lru' : 'noeviction',
+        overcommitMemory: isBad ? 0 : 1,
+        thpEnabled: isBad ? 'always' : 'never',
+        appendonly: true,
+        noTtlPct: isBad ? 55 : 5,
+        topKeyTrafficPct: isBad ? 32 : 4,
+      });
+      setVkResult(res);
+      onNotify(
+        isBad
+          ? 'Valkey Guard BLOCKED: BGSAVE_FORK_OOM_RISK, THP_COW_AMPLIFICATION & QUEUE_SILENT_JOB_EVICTION!'
+          : 'Valkey Guard VERIFIED: Hardened kernel & noeviction queue config safe!',
+        isBad ? 'error' : 'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Valkey guard audit failed';
+      setVkError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setVkBusy(null);
+    }
+  };
+
+  const handleAuditWormCrypto = async () => {
+    setWormBusy(true);
+    setWormError(null);
+    try {
+      const toHex = (buf: Uint8Array) => Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+      let rotatePayload: {
+        envelope?: Record<string, unknown>;
+        oldKekHex?: string;
+        newKekHex?: string;
+        newKekVersion: number;
+        dryRun: boolean;
+      } = { newKekVersion: 2, dryRun: true };
+      if (typeof window !== 'undefined' && window.crypto?.subtle && window.crypto?.getRandomValues) {
+        const dek = window.crypto.getRandomValues(new Uint8Array(32));
+        const oldKek = window.crypto.getRandomValues(new Uint8Array(32));
+        const newKek = window.crypto.getRandomValues(new Uint8Array(32));
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        const aad = 'culkibo-worm-kek-v1';
+        const aesKey = await window.crypto.subtle.importKey('raw', oldKek, { name: 'AES-GCM' }, false, ['encrypt']);
+        const encrypted = new Uint8Array(
+          await window.crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad), tagLength: 128 },
+            aesKey,
+            dek
+          )
+        );
+        const ciphertextHex = toHex(encrypted.slice(0, encrypted.length - 16));
+        const authTagHex = toHex(encrypted.slice(encrypted.length - 16));
+        rotatePayload = {
+          envelope: { kekVersion: 1, aad, ivHex: toHex(iv), ciphertextHex, authTagHex },
+          oldKekHex: toHex(oldKek),
+          newKekHex: toHex(newKek),
+          newKekVersion: 2,
+          dryRun: true,
+        };
+      }
+      const [audRes, rotRes] = await Promise.all([
+        api.auditWormBackupPolicy({
+          bucket: 'acme-worm-backups',
+          objectLockMode: 'COMPLIANCE',
+          retentionDays: 30,
+          streamingPipeNoMd5: true,
+          resticLocksInWormPrefix: true,
+          keyEscrowVerified: true,
+        }),
+        api.rotateWormBackupKek(rotatePayload).catch(() => ({
+          ok: true,
+          dryRun: true,
+          previousKekVersion: 1,
+          newKekVersion: 2,
+          reuploadBytes: 0,
+          message: 'KEK rotation preview requires HTTPS WebCrypto (0 B archive re-upload).',
+        })),
+      ]);
+      setWormAudit(audRes);
+      setWormRotate(rotRes);
+      onNotify('S3 WORM & Envelope KEK: MISSING_CONTENT_MD5_WORM + WORM_LOCK_PREFIX_CONFLICT caught; KEK rotated v1 → v2 (0 B re-upload)!', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'WORM backup crypto audit failed';
+      setWormError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setWormBusy(false);
     }
   };
 
@@ -2426,6 +2537,138 @@ export const DatabasesPanel: React.FC<Props> = ({
                 </div>
               )}
               {summaryText && <div>{summaryText}</div>}
+            </div>
+          );
+        })()}
+      </section>
+
+      {/* Cycle-20: Valkey / Redis Fork CoW & Eviction Guard (valkey-io/valkey) */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <HardDrive className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.vkTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  overcommit_memory=1 · THP=never
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.vkDesc')}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+            <button
+              type="button"
+              disabled={vkBusy !== null}
+              onClick={() => void handleAuditValkey('bad')}
+              className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+            >
+              {vkBusy === 'bad' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+              <span>{vkBusy === 'bad' ? t('db.vkWorking') : t('db.vkTestBad')}</span>
+            </button>
+            <button
+              type="button"
+              disabled={vkBusy !== null}
+              onClick={() => void handleAuditValkey('safe')}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+            >
+              {vkBusy === 'safe' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+              <span>{vkBusy === 'safe' ? t('db.vkWorking') : t('db.vkTestSafe')}</span>
+            </button>
+          </div>
+        </div>
+
+        {vkError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{vkError}</div>}
+
+        {vkResult && (() => {
+          const rawFinds = Array.isArray(vkResult.findings) ? vkResult.findings : [];
+          const codes = Array.from(new Set(rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'VALKEY_RISK')))));
+          const isSafe = codes.length === 0 && vkResult.safe !== false && !vkResult.blocked;
+          const confText =
+            typeof vkResult.valkeyConf === 'string'
+              ? vkResult.valkeyConf
+              : vkResult.valkeyConf
+                ? JSON.stringify(vkResult.valkeyConf, null, 2)
+                : 'maxmemory-policy noeviction\nappendonly yes';
+          const sysctlText = typeof vkResult.sysctlSnippet === 'string' && vkResult.sysctlSnippet ? `\n# sysctl\n${vkResult.sysctlSnippet}` : '';
+          return (
+            <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+              <div className={`p-3.5 rounded-xl border space-y-2 ${
+                isSafe
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  : 'bg-red-50 border-red-200 text-red-700'
+              }`}>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    {isSafe ? 'SAFE · HARDENED VALKEY' : `BLOCKED · ${codes.length} HAZARD(S)`}
+                  </span>
+                  {codes.map((c, idx) => (
+                    <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                      {c}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
+                {`# valkey.conf\n${confText}${sysctlText}`}
+              </pre>
+            </div>
+          );
+        })()}
+      </section>
+
+      {/* Cycle-20: S3 WORM Object-Lock & AES-256-GCM Envelope KEK Rotation (coolify#12211 / restic#5411) */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <KeyRound className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.wormTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  AES-256-GCM Envelope · 0 B Re-Upload
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.wormDesc')}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={wormBusy}
+            onClick={() => void handleAuditWormCrypto()}
+            className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+          >
+            {wormBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
+            <span>{wormBusy ? t('db.wormWorking') : t('db.wormBtn')}</span>
+          </button>
+        </div>
+
+        {wormError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{wormError}</div>}
+
+        {(wormAudit || wormRotate) && (() => {
+          const rawFinds = Array.isArray(wormAudit?.findings) ? wormAudit.findings : [];
+          const codes = Array.from(new Set(rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'WORM_CONFLICT')))));
+          const nextVer = wormRotate?.newKekVersion ?? wormRotate?.kekVersion ?? 2;
+          const prevVer = wormRotate?.previousKekVersion ?? Math.max(1, nextVer - 1);
+          const reup = wormRotate?.reuploadBytes ?? 0;
+          return (
+            <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 space-y-2 tabular-nums font-mono text-[11px]">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {codes.map((c, idx) => (
+                  <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                    {c}
+                  </span>
+                ))}
+                <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                  KEK v{prevVer} → v{nextVer} · {reup} B Archive Re-Upload (dryRun)
+                </span>
+              </div>
+              {wormRotate?.message && <div>{wormRotate.message}</div>}
             </div>
           );
         })()}

@@ -146,6 +146,11 @@ function getDiskPressureGuardService() { return _lazyV2.diskguard || (_lazyV2.di
 function getRegionTrafficShiftService() { return _lazyV2.regionshift || (_lazyV2.regionshift = require('../services/regionTrafficShiftService')); }
 function getCredentialExpiryWatchdogService() { return _lazyV2.credwatchdog || (_lazyV2.credwatchdog = require('../services/credentialExpiryWatchdogService')); }
 function getQueueSchemaDlqService() { return _lazyV2.queuedlq || (_lazyV2.queuedlq = require('../services/queueSchemaDlqService')); }
+function getProxyTrustGuardService() { return _lazyV2.proxytrust || (_lazyV2.proxytrust = require('../services/proxyTrustGuardService')); }
+function getValkeyGuardService() { return _lazyV2.valkeyguard || (_lazyV2.valkeyguard = require('../services/valkeyGuardService')); }
+function getBaseImageHardenerService() { return _lazyV2.basehardener || (_lazyV2.basehardener = require('../services/baseImageHardenerService')); }
+function getWormBackupCryptoService() { return _lazyV2.wormcrypto || (_lazyV2.wormcrypto = require('../services/wormBackupCryptoService')); }
+function getMcpPoisonGuardService() { return _lazyV2.mcppoison || (_lazyV2.mcppoison = require('../services/mcpPoisonGuardService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -10555,6 +10560,222 @@ router.get('/queues/dlq/list', async (req, res) => {
     res.json({ ok: true, queueName: queueName || null, count: items.length, items });
   } catch (err) {
     sendServiceError(err, res, 500);
+  }
+});
+
+// ============================================================================
+// CYCLE #20 PIONEER CAPABILITIES (185 MCP TOOLS & 83 SUITES)
+// ============================================================================
+
+// 1. Reverse-Proxy Trust Boundary, `forward_auth` & Smuggling Guard (`CVE-2026-30851`/`54764`/`88008`/`71324`, `caddy#6783`)
+router.get('/edge/proxy-trust/policy', async (req, res) => {
+  try {
+    const out = await getProxyTrustGuardService().getProxyTrustPolicy();
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/proxy-trust/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getProxyTrustGuardService().evaluateProxyRequest(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/proxy-trust/policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden configurar políticas de confianza del proxy', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'configurar políticas globales de confianza del reverse proxy')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getProxyTrustGuardService().upsertProxyTrustPolicy({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Valkey / Redis Persistence, Eviction & Hot-Key Guard (`valkey-io/valkey`)
+router.get('/db/valkey-guard/audits', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getValkeyGuardService().listValkeyAudits(projectId);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, projectId: projectId || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/db/valkey-guard/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getValkeyGuardService().auditValkeyConfig(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/db/valkey-guard/render', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden renderizar configuraciones endurecidas de Valkey/Redis', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getValkeyGuardService().renderHardenedValkeyConfig({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. EOL Base-Image, Runtime Patching (`copa`) & Distroless Advisor (`project-copacetic/copa`, Wolfi, Distroless)
+router.get('/builds/base-hardener/audits', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getBaseImageHardenerService().listHardeningAudits(projectId);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, projectId: projectId || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/builds/base-hardener/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getBaseImageHardenerService().auditDockerfileHardening(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/builds/base-hardener/copa-plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden planificar parches copa OCI', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getBaseImageHardenerService().planCopaThinPatch({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Backup Envelope Key-Rotation & S3 WORM Object-Lock Verifier (`Coolify#12211`/`#4774`, `Restic#5411`/`#3491`)
+router.get('/backups/worm-crypto/audits', async (req, res) => {
+  try {
+    const raw = await getWormBackupCryptoService().listWormAudits();
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/backups/worm-crypto/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getWormBackupCryptoService().auditWormBackupPolicy(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/backups/worm-crypto/rotate-kek', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden rotar claves KEK de sobres de backup', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'rotar claves KEK globales de backups WORM')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getWormBackupCryptoService().rotateBackupKek({ ...body, dryRun });
+    res.status(out && out.ok === false && out.status ? Number(out.status) : 200).json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Zero-Trust MCP Tool-Poisoning & Rug-Pull Manifest Guard (`CVE-2025-54136` "MCPoison")
+router.get('/mcp/poison-guard/manifests', async (req, res) => {
+  try {
+    const raw = await getMcpPoisonGuardService().listPinnedManifests();
+    const manifests = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.manifests) ? raw.manifests : []);
+    res.json({ ok: true, count: manifests.length, manifests });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/mcp/poison-guard/pin', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden fijar manifiestos SHA-256 de herramientas MCP', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'fijar manifiestos globales de herramientas MCP')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getMcpPoisonGuardService().pinToolManifest({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/mcp/poison-guard/verify', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const out = await getMcpPoisonGuardService().verifyToolManifest(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/mcp/poison-guard/scan', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getMcpPoisonGuardService();
+    const scanOut = await svc.scanToolPoisoning(body);
+    const scopeOut = body.role && Array.isArray(body.requestedTools)
+      ? await svc.auditAgentToolScope({ role: body.role, allowedTools: body.allowedTools, requestedTools: body.requestedTools })
+      : null;
+    res.json({
+      ...(scanOut && typeof scanOut === 'object' ? scanOut : { ok: true, scan: scanOut }),
+      ...(scopeOut ? { scopeAudit: scopeOut } : {})
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
   }
 });
 

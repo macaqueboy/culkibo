@@ -4363,6 +4363,50 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:read');
     }
 
+    // Cycle-20: Proxy Trust & Smuggling Guard, Valkey Guard, Base Image Hardener, WORM Backup Crypto & MCP Poison Guard
+    if (p === '/api/edge/proxy-trust/policy') {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'team:write');
+    }
+    if (p === '/api/edge/proxy-trust/evaluate') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/db/valkey-guard/render') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/db/valkey-guard/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/db/valkey-guard/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/builds/base-hardener/copa-plan') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/builds/base-hardener/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/builds/base-hardener/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/backups/worm-crypto/rotate-kek') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/backups/worm-crypto/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/backups/worm-crypto/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/mcp/poison-guard/pin') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/mcp/poison-guard/verify' || p === '/api/mcp/poison-guard/scan') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/mcp/poison-guard/manifests') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {
