@@ -4413,6 +4413,236 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     });
   }
 
+  // --- Cycle-17 VPA Rightsizer, Blameless Postmortem, Surrogate Edge Cache, Build Repro & Preview Gate ---
+  if (pathname === '/api/finops/rightsize/analyze' && method === 'POST') {
+    const oomCount = Number(body.oomCount || 0);
+    const currentMem = Number(body.currentMemoryMb || 2048);
+    const currentCpu = Number(body.currentCpuCores || 2);
+    const svc = String(body.serviceName || 'acme-saas-web');
+    const isOom = oomCount > 0;
+    const recMem = isOom ? Math.ceil(currentMem * 1.5) : 494;
+    const recCpu = isOom ? Math.max(currentCpu, 1) : 0.4;
+    const reclaimableMb = isOom ? 0 : Math.max(0, currentMem - recMem);
+    const wastePct = isOom ? 0 : Number(((reclaimableMb / Math.max(1, currentMem)) * 100).toFixed(1));
+    const yaml = [
+      'services:',
+      `  ${svc}:`,
+      '    deploy:',
+      '      resources:',
+      '        limits:',
+      `          memory: "${recMem}M"`,
+      `          cpus: "${recCpu.toFixed(3)}"`,
+      '        reservations:',
+      `          memory: "${Math.ceil(recMem * 0.5)}M"`,
+      `          cpus: "${(recCpu * 0.5).toFixed(3)}"`,
+    ].join('\n');
+    return jsonResponse({
+      ok: true,
+      projectId: String(body.projectId || 'proj_acme_web'),
+      serviceName: svc,
+      serviceType: String(body.serviceType || 'app'),
+      action: isOom ? 'UPSCALE_OOM' : 'SHRINK',
+      oomCount,
+      headroomPct: 25,
+      sampleCount: Array.isArray(body.samples) ? body.samples.length : 12,
+      currentMemoryMb: currentMem,
+      currentCpuCores: currentCpu,
+      p50: { memoryMb: isOom ? 488 : 358, cpuCores: isOom ? 0.74 : 0.26 },
+      p95: { memoryMb: isOom ? 510 : 394, cpuCores: isOom ? 0.8 : 0.32 },
+      p99: { memoryMb: isOom ? 515 : 394, cpuCores: isOom ? 0.8 : 0.32 },
+      p95MemoryMb: isOom ? 510 : 394,
+      p99MemoryMb: isOom ? 515 : 394,
+      recommendedMemoryMb: recMem,
+      recommendedCpuCores: recCpu,
+      reclaimableMb,
+      wastePct,
+      composePatch: { ok: true, serviceName: svc, yaml },
+      patchYaml: yaml,
+    });
+  }
+
+  if (pathname === '/api/finops/rightsize/patch' && method === 'POST') {
+    const rec = body.recommendation || {};
+    const svc = String(rec.serviceName || 'acme-saas-web');
+    const mem = Number(rec.recommendedMemoryMb || 494);
+    const cpu = Number(rec.recommendedCpuCores || 0.4);
+    const yaml = [
+      'services:',
+      `  ${svc}:`,
+      '    deploy:',
+      '      resources:',
+      '        limits:',
+      `          memory: "${mem}M"`,
+      `          cpus: "${cpu.toFixed(3)}"`,
+      '        reservations:',
+      `          memory: "${Math.ceil(mem * 0.5)}M"`,
+      `          cpus: "${(cpu * 0.5).toFixed(3)}"`,
+    ].join('\n');
+    return jsonResponse({ ok: true, dryRun: body.dryRun !== false, serviceName: svc, yaml, patchYaml: yaml });
+  }
+
+  if (pathname === '/api/incidents/postmortems/correlate' && method === 'POST') {
+    const incId = String(body.incidentId || 'inc_pm_demo');
+    const projId = String(body.projectId || 'proj_acme_web');
+    const unverifiedNotes = Array.isArray(body.chatNotes)
+      ? body.chatNotes.map((n: any, idx: number) => ({ id: `note_${idx + 1}`, author: n?.author || 'ops-slack', text: String(n?.text || n || ''), verified: false }))
+      : [{ id: 'note_1', author: 'ops-slack', text: 'Unverified chat hunch (excluded from root-cause scoring)', verified: false }];
+    const verifiedEvents = [
+      { specversion: '1.0', id: 'dep_v2_4_1', category: 'deploy', type: 'culkibo.deploy.completed', time: nowIso(-240_000), summary: 'Deploy release v2.4.1 (unbounded in-memory image cache)' },
+      { specversion: '1.0', id: 'oom_137', category: 'oom', type: 'culkibo.runtime.oom', time: nowIso(0), summary: 'Container acme-saas-web OOMKilled (exit 137, cgroup peak 512/512 MB)' },
+      { specversion: '1.0', id: 'al_5xx', category: 'alert', type: 'culkibo.alert.event', time: nowIso(35_000), summary: 'HTTP 5xx rate breached 2.5% SLO threshold' },
+      { specversion: '1.0', id: 'rb_v2_4_0', category: 'rollback', type: 'culkibo.canary.rollback', time: nowIso(180_000), summary: 'Auto-rollback canary traffic 100% → v2.4.0 (0% 5xx restored)' },
+    ];
+    const markdown = [
+      `# Blameless Postmortem: ${incId} (${projId})`,
+      '',
+      '- **Probable Contributing Factor:** Deploy release v2.4.1 occurred 4m (240s) before OOMKilled exit 137 (**98% confidence**)',
+      '- **MTTD:** 35s | **MTTR:** 180s | **Verified CloudEvents:** 4',
+      `- **Isolated Unverified Chat Notes:** ${unverifiedNotes.length} (strictly excluded from root-cause scoring)`,
+      '',
+      '## Verified Timeline (CloudEvents v1.0)',
+      ...verifiedEvents.map((e) => `- \`${e.time}\` [${e.category}] ${e.summary}`),
+      '',
+      '## Systemic Action Items',
+      '- [P1 · platform-sre] Apply VPA-Lite OOM +50% memory headroom recommendation.',
+      '- [P1 · release-engineering] Enforce pre-merge preview smoke-gate & automatic canary rollback.',
+    ].join('\n');
+    return jsonResponse({
+      ok: true,
+      incidentId: incId,
+      projectId: projId,
+      mttdSec: 35,
+      mttrSec: 180,
+      confidence: 0.98,
+      probableRootCause: {
+        eventId: 'dep_v2_4_1',
+        category: 'deploy',
+        summary: 'Deploy release v2.4.1 (unbounded in-memory image cache)',
+        confidence: 0.98,
+        evidence: 'deploy occurred 4m (240s) before first verified failure followed by OOM and canary rollback.',
+      },
+      verifiedEvents,
+      unverifiedNotes,
+      markdown,
+    });
+  }
+
+  if (pathname === '/api/edge/cache/coalesce' && method === 'POST') {
+    const cc = String(body.cacheControl || 'public, max-age=60').toLowerCase();
+    const isPrivate = cc.includes('private') || cc.includes('no-store');
+    return jsonResponse({
+      ok: true,
+      cacheKey: String(body.cacheKey || '/api/v1/account/billing'),
+      coalesced: !isPrivate && Number(body.inFlightCount || 1) > 1,
+      reason: isPrivate ? 'PRIVATE_OR_NO_STORE_BYPASS' : 'SINGLEFLIGHT_COALESCED',
+      maxWaitMs: isPrivate ? 0 : Math.min(5000, Number(body.backendTimeoutMs || 5000)),
+      boundedWaitMs: isPrivate ? 0 : Math.min(5000, Number(body.backendTimeoutMs || 5000)),
+      swrFallback: !isPrivate,
+      safeForSharedCache: !isPrivate,
+    });
+  }
+
+  if (pathname === '/api/edge/cache/purge' && method === 'POST') {
+    const tags = Array.isArray(body.tags) ? body.tags.map(String).filter((x: string) => x.trim() && x !== 'SURROGATE_') : ['product:42', 'pricing'];
+    const providers = Array.isArray(body.providers) && body.providers.length > 0 ? body.providers : ['caddy', 'cloudflare', 'fastly'];
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      tags,
+      providers,
+      invalidatedCount: 4,
+      invalidatedKeys: ['/products/42', '/api/products/42', '/pricing', '/api/pricing'],
+      globalBucketAvoided: true,
+      globalSurrogateBucketUsed: false,
+      providerPlans: [
+        { provider: 'caddy', method: 'PURGE', endpoint: '/souin-api/souin', header: 'Surrogate-Key', headerValue: tags.join(' '), avoidsSilent204: true, tags },
+        { provider: 'cloudflare', method: 'POST', endpoint: '/client/v4/zones/{zone_id}/purge_cache', header: 'Cache-Tag', avoidsSilent204: true, tags },
+        { provider: 'fastly', method: 'POST', endpoint: '/service/{service_id}/purge', header: 'Surrogate-Key', headerValue: tags.join(' '), avoidsSilent204: true, tags },
+      ],
+    });
+  }
+
+  if (pathname === '/api/builds/reproducibility/audit' && method === 'POST') {
+    const df = String(body.dockerfile || '');
+    const args = (body.buildArgs && typeof body.buildArgs === 'object' ? body.buildArgs : {}) as Record<string, string>;
+    const violations: Array<{ code: string; severity: string; message: string }> = [];
+    if (/syntax=docker\/dockerfile:\d+(?!.*@sha256:)/i.test(df)) {
+      violations.push({ code: 'UNPINNED_FRONTEND', severity: 'high', message: 'BuildKit # syntax= frontend lacks @sha256:<64hex> pin (moby/buildkit#4762).' });
+    }
+    if (/curl\s+[^|\n]+\|\s*(?:sh|bash)/i.test(df)) {
+      violations.push({ code: 'PIPE_TO_SHELL', severity: 'critical', message: 'Non-deterministic curl | sh download detected in RUN layer.' });
+    }
+    if (!args.SOURCE_DATE_EPOCH && !/SOURCE_DATE_EPOCH/i.test(df)) {
+      violations.push({ code: 'MISSING_SOURCE_DATE_EPOCH', severity: 'medium', message: 'Missing SOURCE_DATE_EPOCH build arg for deterministic layer timestamps.' });
+    }
+    if (/FROM\s+[^\s]+:latest\b/i.test(df)) {
+      violations.push({ code: 'UNPINNED_BASE_IMAGE', severity: 'high', message: 'Mutable :latest base image prevents bit-identical rebuilds.' });
+    }
+    const reproducible = violations.length === 0;
+    return jsonResponse({
+      ok: true,
+      reproducible,
+      score: Math.max(0, 100 - violations.length * 25),
+      violations,
+      message: reproducible
+        ? 'Dockerfile verified reproducible: digest-pinned frontend/base, lockfile ci, and SOURCE_DATE_EPOCH locked.'
+        : `Blocked: ${violations.length} build reproducibility violation(s) detected.`,
+    });
+  }
+
+  if (pathname === '/api/builds/reproducibility/cache-plan' && method === 'POST') {
+    const pid = String(body.projectId || 'proj_acme_web').replace(/[^a-zA-Z0-9_-]/g, '-');
+    const branch = String(body.branch || 'main').replace(/[^a-zA-Z0-9_-]/g, '-');
+    const hash = String(body.lockfileHash || 'a1b2c3d4e5f6').slice(0, 12);
+    const epoch = Number(body.sourceDateEpoch || 1735689600);
+    return jsonResponse({
+      ok: true,
+      cacheMountArg: `--mount=type=cache,id=culkibo-${pid}-${branch}-${hash},sharing=locked,target=/root/.npm`,
+      sourceDateEpoch: epoch,
+      diffIdCheckEnabled: true,
+      buildxFlags: ['--build-arg', `SOURCE_DATE_EPOCH=${epoch}`, '--output', `type=image,rewrite-timestamp=true`],
+    });
+  }
+
+  const pgateMatch = pathname.match(/^\/api\/projects\/([^/]+)\/preview-gates\/evaluate$/);
+  if (pgateMatch && method === 'POST') {
+    const prNumber = Number(body.prNumber || 142);
+    const commitSha = String(body.commitSha || 'deadbeef1234567890abcdef1234567890abcdef');
+    const isFork = Boolean(body.isFork);
+    const approved = Boolean(body.maintainerApproved);
+    if (isFork && !approved) {
+      return jsonResponse({
+        ok: false,
+        allowed: false,
+        state: 'pending',
+        code: 'FORK_APPROVAL_REQUIRED',
+        prNumber,
+        commitSha,
+        context: 'culkibo/preview-gate',
+        message: `PR #${prNumber} from external fork requires maintainer approval pinned strictly to commit ${commitSha.slice(0, 10)} before exposing preview secrets.`,
+      });
+    }
+    return jsonResponse({
+      ok: true,
+      allowed: true,
+      state: 'success',
+      code: 'PREVIEW_GATE_PASSED',
+      prNumber,
+      commitSha,
+      context: 'culkibo/preview-gate',
+      signature: 'hmac-sha256:9f84b2c1e0d3a7f6543210fedcba9876543210fedcba9876543210fedcba9876',
+      signedCommitStatus: {
+        context: 'culkibo/preview-gate',
+        state: 'success',
+        target_url: `https://pr-${prNumber}.acme-demo.dev`,
+        description: `4/4 preview smoke, migration & contract checks passed for ${commitSha.slice(0, 10)}`,
+        algorithm: 'hmac-sha256',
+        signature: '9f84b2c1e0d3a7f6543210fedcba9876543210fedcba9876543210fedcba9876',
+      },
+      message: `All preview checks passed and commit status signed for ${commitSha.slice(0, 10)}.`,
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -4590,16 +4820,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (165 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (170 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 165 MCP tools on demand without bloating context (-91%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 170 MCP tools on demand without bloating context (-91%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_build_reproducibility', description: 'BuildKit reproducible Dockerfile/lockfile auditor & lockfile-scoped isolated cache planner (moby/buildkit#4762)', readOnly: true, profile: 'deploy' },
+      { name: 'culkibo_preview_gate', description: 'PR-Preview fork-approval SHA-pinned gate, composite smoke verifier & HMAC-SHA256 commit status reporter', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_edge_cache_purge', description: 'Surrogate-Key multi-edge cache invalidation (Caddy/Cloudflare/Fastly) & private/no-store stampede coalescer (souin#884/#850)', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_resource_rightsize', description: 'VPA-Lite P95/P99 container resource rightsizer with Compose deploy.resources patches & +50% OOM upscale lock (dokploy#4050)', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_incident_postmortem', description: 'Blameless incident timeline correlator (CloudEvents v1.0, MTTD/MTTR, isolated unverifiedNotes[], Markdown export)', readOnly: false, profile: 'ops' },
       { name: 'culkibo_api_contract_gate', description: 'Zero-dep OpenAPI/JSON-Schema/GraphQL breaking-change diff & MISSING-VERSION-BUMP SemVer gate', readOnly: false, profile: 'deploy' },
       { name: 'culkibo_verify_oci_signature', description: 'Pure-Node Ed25519/ECDSA Sigstore v0.3 + DSSE SLSA v1.1 Rekor v2 verifier (CVE-2026-22703)', readOnly: false, profile: 'security' },
       { name: 'culkibo_stream_flood_guard', description: 'Edge WS/SSE per-IP flood cap (429/1013), Slowloris shedding & 101 hop-by-hop scrubber (CVE-2026-55458)', readOnly: false, profile: 'ops' },
@@ -4651,26 +4886,26 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 165 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 170 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 165, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 170, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_verify_oci_signature', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_api_contract_gate', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_resource_rightsize', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_incident_postmortem', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 165,
+      totalTools: 170,
       profiles: { core: { count: 17, savedPct: 91 } },
     });
   }

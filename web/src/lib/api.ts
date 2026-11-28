@@ -5985,6 +5985,153 @@ export const api = {
       'Orphan resource reap failed'
     );
   },
+
+  // --- Cycle-17: VPA Rightsizer, Blameless Postmortem, Surrogate Edge Cache, Build Repro & Preview Gate ---
+
+  async analyzeResourceRightsize(payload: {
+    projectId: string;
+    serviceName?: string;
+    serviceType?: 'app' | 'database';
+    currentMemoryMb: number;
+    currentCpuCores: number;
+    samples: Array<{ memoryMb: number; cpuCores: number }>;
+    oomCount?: number;
+    headroomPct?: number;
+  }): Promise<ResourceRightsizeResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/finops/rightsize/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Resource rightsizing analysis failed'
+    );
+  },
+
+  async buildRightsizePatch(payload: {
+    recommendation: ResourceRightsizeResult;
+    dryRun?: boolean;
+  }): Promise<{ ok?: boolean; dryRun?: boolean; yaml?: string; patchYaml?: string; patch?: Record<string, unknown> }> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/finops/rightsize/patch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Compose resource patch generation failed'
+    );
+  },
+
+  async correlateIncidentPostmortem(payload: {
+    incidentId: string;
+    projectId: string;
+    windowStart?: string;
+    windowEnd?: string;
+    deploys?: Array<Record<string, unknown>>;
+    oomEvents?: Array<Record<string, unknown>>;
+    canaryRollbacks?: Array<Record<string, unknown>>;
+    alerts?: Array<Record<string, unknown>>;
+    driftEvents?: Array<Record<string, unknown>>;
+    chatNotes?: Array<Record<string, unknown>>;
+  }): Promise<PostmortemCorrelateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/incidents/postmortems/correlate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Postmortem timeline correlation failed'
+    );
+  },
+
+  async evaluateEdgeCacheCoalesce(payload: {
+    cacheKey: string;
+    inFlightCount?: number;
+    backendTimeoutMs?: number;
+    cacheControl?: string;
+  }): Promise<EdgeCacheCoalesceResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/cache/coalesce`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Edge cache coalescing evaluation failed'
+    );
+  },
+
+  async purgeEdgeCacheByTags(payload: {
+    tags: string[];
+    providers?: string[];
+    dryRun?: boolean;
+  }): Promise<EdgeCachePurgeResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/edge/cache/purge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Surrogate-key edge cache purge failed'
+    );
+  },
+
+  async auditBuildReproducibility(payload: {
+    projectId?: string;
+    dockerfile: string;
+    lockfileJson?: Record<string, unknown> | null;
+    buildArgs?: Record<string, string>;
+    cachePolicy?: Record<string, unknown>;
+    gitSources?: string[];
+  }): Promise<BuildReproAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/builds/reproducibility/audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Build reproducibility audit failed'
+    );
+  },
+
+  async planIsolatedBuildCache(payload: {
+    projectId: string;
+    branch?: string;
+    lockfileHash?: string;
+    sourceDateEpoch?: number;
+    dryRun?: boolean;
+  }): Promise<BuildCachePlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/builds/reproducibility/cache-plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Isolated build cache planning failed'
+    );
+  },
+
+  async evaluatePreviewGate(
+    projectId: string,
+    payload: {
+      prNumber: number;
+      commitSha: string;
+      isFork?: boolean;
+      maintainerApproved?: boolean;
+      checks?: Record<string, unknown>;
+      signStatus?: boolean;
+    }
+  ): Promise<PreviewGateEvalResult> {
+    const res = await apiFetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/preview-gates/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.code === 'FORK_APPROVAL_REQUIRED' || data?.allowed === false) {
+      return data as PreviewGateEvalResult;
+    }
+    throw new Error(data?.error || data?.message || 'Preview gate evaluation failed');
+  },
 };
 
 // =====================================================================
@@ -8019,5 +8166,106 @@ export interface OrphanReapResult {
   protectedCount?: number;
   reclaimableBytes?: number;
   actions?: Array<string | { id?: string; kind?: string; action?: string; name?: string }>;
+  message?: string;
+}
+
+// --- Cycle-17 VPA Rightsizer, Blameless Postmortem, Surrogate Edge Cache, Build Repro & Preview Gate Types ---
+
+export interface ResourceRightsizeResult {
+  ok?: boolean;
+  projectId?: string;
+  serviceName?: string;
+  serviceType?: string;
+  action: 'SHRINK' | 'UPSCALE_OOM' | 'UPSCALE' | 'HOLD' | 'KEEP' | 'INSUFFICIENT_SAMPLES' | string;
+  currentMemoryMb?: number;
+  currentCpuCores?: number;
+  recommendedMemoryMb?: number;
+  recommendedCpuCores?: number;
+  p50?: { memoryMb?: number; cpuCores?: number };
+  p95?: { memoryMb?: number; cpuCores?: number };
+  p99?: { memoryMb?: number; cpuCores?: number };
+  p95MemoryMb?: number;
+  p99MemoryMb?: number;
+  reclaimableMb?: number;
+  wastePct?: number;
+  oomCount?: number;
+  headroomPct?: number;
+  composePatch?: { yaml?: string; patch?: Record<string, unknown>; [key: string]: unknown };
+  patchYaml?: string;
+  yaml?: string;
+  message?: string;
+}
+
+export interface PostmortemCorrelateResult {
+  ok?: boolean;
+  incidentId?: string;
+  projectId?: string;
+  probableRootCause?: string | { summary?: string; confidence?: number; category?: string; evidence?: string; eventType?: string; source?: string };
+  confidence?: number;
+  mttdSec?: number;
+  mttrSec?: number;
+  verifiedEvents?: Array<Record<string, unknown>>;
+  unverifiedNotes?: Array<Record<string, unknown>>;
+  markdown?: string;
+  actionItems?: Array<string | { id?: string; priority?: string; ownerRole?: string; action?: string }>;
+}
+
+export interface EdgeCacheCoalesceResult {
+  ok?: boolean;
+  cacheKey?: string;
+  coalesced: boolean;
+  reason: string;
+  maxWaitMs?: number;
+  boundedWaitMs?: number;
+  backendTimeoutMs?: number;
+  swrFallback?: boolean;
+  safeForSharedCache?: boolean;
+}
+
+export interface EdgeCachePurgeResult {
+  ok?: boolean;
+  dryRun: boolean;
+  tags?: string[];
+  providers?: string[];
+  invalidatedCount?: number;
+  invalidatedKeys?: string[];
+  globalBucketAvoided?: boolean;
+  globalSurrogateBucketUsed?: boolean;
+  providerPlans?: Array<string | { provider?: string; method?: string; endpoint?: string; action?: string; header?: string; headerValue?: string; avoidsSilent204?: boolean; tags?: string[] }>;
+}
+
+export interface BuildReproAuditResult {
+  ok?: boolean;
+  reproducible: boolean;
+  score?: number;
+  violations?: Array<string | { code?: string; rule?: string; severity?: string; message?: string }>;
+  message?: string;
+}
+
+export interface BuildCachePlanResult {
+  ok?: boolean;
+  cacheMountArg?: string;
+  sourceDateEpoch?: number;
+  diffIdCheckEnabled?: boolean;
+  buildxFlags?: string[];
+}
+
+export interface PreviewGateEvalResult {
+  ok?: boolean;
+  allowed: boolean;
+  state: 'success' | 'pending' | 'failure' | string;
+  code?: string;
+  prNumber?: number;
+  commitSha?: string;
+  context?: string;
+  signedCommitStatus?: {
+    context?: string;
+    state?: string;
+    target_url?: string;
+    description?: string;
+    signature?: string;
+    algorithm?: string;
+  };
+  signature?: string;
   message?: string;
 }

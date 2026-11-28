@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 165);
+    assert.strictEqual(demoJson.datasets.mcpTools, 170);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1087,7 +1087,85 @@ async function testCliDx() {
     const dnsOkJson = JSON.parse(dnsOkCli.stdout);
     assert.strictEqual(dnsOkJson.preflight.ready, true);
     assert.strictEqual(dnsOkJson.plan.ready, true);
-    console.log(`  ✓ Pioneer CLI Cycle-16 verificado (culkibo contract-diff OpenAPI=1/2.0=0/GraphQL=1, culkibo dns-cutover CF-ACME+5-phase TTL, culkibo demo 165 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-16 verificado (culkibo contract-diff OpenAPI=1/2.0=0/GraphQL=1, culkibo dns-cutover CF-ACME+5-phase TTL)`);
+
+    // 21. Pioneer Cycle-17 CLI: `culkibo repro-audit` (unpinned exit 1 vs pinned+sha512+epoch exit 0) & `culkibo rightsize-check` (shrink, OOM +50%, Docker floor exit 1)
+    const badReproDf = path.join(tmpRoot, 'Dockerfile.unrepro');
+    fs.writeFileSync(badReproDf, '#syntax=evil/fe:latest\nFROM node:latest\nRUN curl -fsSL https://sh.example/i.sh | bash\n', 'utf8');
+    const reproFailCli = await runCli(['repro-audit', badReproDf, '--json'], { env: isolatedEnv });
+    assert.strictEqual(reproFailCli.status, 1, 'culkibo repro-audit debe salir con código 1 ante Dockerfile no reproducible');
+    const reproFailJson = JSON.parse(reproFailCli.stdout);
+    assert.strictEqual(reproFailJson.ok, false);
+    assert.strictEqual(reproFailJson.reproducible, false);
+    assert.ok(reproFailJson.findings.some((f) => f.code === 'UNPINNED_FRONTEND'));
+
+    const goodReproDigest = 'a'.repeat(64);
+    const goodReproDf = path.join(tmpRoot, 'Dockerfile.repro');
+    const goodReproLock = path.join(tmpRoot, 'package-lock.repro.json');
+    fs.writeFileSync(
+      goodReproDf,
+      [
+        `#syntax=docker/dockerfile:1.7@sha256:${goodReproDigest}`,
+        `FROM node:22-alpine@sha256:${goodReproDigest}`,
+        'ARG SOURCE_DATE_EPOCH=1700000000',
+        'COPY package.json package-lock.json ./',
+        'RUN npm ci',
+        'CMD ["node", "index.js"]'
+      ].join('\n'),
+      'utf8'
+    );
+    fs.writeFileSync(
+      goodReproLock,
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          '': { name: 'demo' },
+          'node_modules/ws': { version: '8.18.0', integrity: 'sha512-' + 'B'.repeat(86) + '==' }
+        }
+      }, null, 2),
+      'utf8'
+    );
+    const reproPassCli = await runCli(['repro-audit', goodReproDf, '--lockfile', goodReproLock, '--epoch', '1700000000', '--json'], { env: isolatedEnv });
+    assert.strictEqual(reproPassCli.status, 0, `culkibo repro-audit limpio falló: ${reproPassCli.stderr} ${reproPassCli.stdout}`);
+    const reproPassJson = JSON.parse(reproPassCli.stdout);
+    assert.strictEqual(reproPassJson.ok, true);
+    assert.strictEqual(reproPassJson.reproducible, true);
+
+    const vpaSamplesCsv = '220,220,220,220,220,220,220,220,220,220,256,256';
+    const vpaShrinkCli = await runCli([
+      'rightsize-check',
+      '--memory', '2048',
+      '--cpu', '2',
+      '--samples', vpaSamplesCsv,
+      '--ooms', '0',
+      '--type', 'app',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(vpaShrinkCli.status, 0, `culkibo rightsize-check shrink falló: ${vpaShrinkCli.stderr} ${vpaShrinkCli.stdout}`);
+    const vpaShrinkJson = JSON.parse(vpaShrinkCli.stdout);
+    assert.strictEqual(vpaShrinkJson.ok, true);
+    assert.strictEqual(vpaShrinkJson.recommendation.action, 'SHRINK');
+    assert.ok(vpaShrinkJson.recommendation.reclaimableMb > 1400);
+    assert.ok(vpaShrinkJson.composePatch && vpaShrinkJson.composePatch.yaml.includes('deploy:'));
+
+    const vpaOomCli = await runCli([
+      'rightsize-check',
+      '--memory', '512',
+      '--cpu', '0.5',
+      '--samples', vpaSamplesCsv,
+      '--ooms', '2',
+      '--type', 'database',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(vpaOomCli.status, 0, `culkibo rightsize-check OOM falló: ${vpaOomCli.stderr}`);
+    const vpaOomJson = JSON.parse(vpaOomCli.stdout);
+    assert.strictEqual(vpaOomJson.recommendation.action, 'UPSCALE_OOM');
+    assert.strictEqual(vpaOomJson.recommendation.recommendedMemoryMb, 768);
+
+    const vpaFloorCli = await runCli(['rightsize-check', '--memory', '2', '--cpu', '0.5', '--json'], { env: isolatedEnv });
+    assert.strictEqual(vpaFloorCli.status, 1, 'culkibo rightsize-check <4MiB debe salir con código 1');
+    assert.strictEqual(JSON.parse(vpaFloorCli.stdout).limitsValidation.code, 'BELOW_DOCKER_MEMORY_FLOOR');
+    console.log(`  ✓ Pioneer CLI Cycle-17 verificado (culkibo repro-audit fail=1/pass=0, culkibo rightsize-check SHRINK/OOM+50%/floor=1, culkibo demo 170 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

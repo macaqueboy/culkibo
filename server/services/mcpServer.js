@@ -91,7 +91,12 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'ociSignatureVerifier',
   'streamFloodGuardService',
   'dnsCutoverService',
-  'orphanReaperService'
+  'orphanReaperService',
+  'reproducibleBuildService',
+  'previewGateService',
+  'edgeCacheService',
+  'resourceRightsizerService',
+  'postmortemCorrelatorService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -143,7 +148,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_audit_image_bloat',
   'culkibo_mask_preview_pii',
   'culkibo_secret_gate',
-  'culkibo_mtls_mesh'
+  'culkibo_mtls_mesh',
+  'culkibo_preview_gate'
 ]);
 
 /** @type {Record<string, number>} */
@@ -154,7 +160,7 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (42 destructivas + 21 = 63). */
+/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (43 destructivas + 25 = 68). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment',
@@ -181,7 +187,12 @@ const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_verify_oci_signature',
   'culkibo_stream_flood_guard',
   'culkibo_dns_cutover_plan',
-  'culkibo_orphan_reaper'
+  'culkibo_orphan_reaper',
+  'culkibo_build_reproducibility',
+  'culkibo_preview_gate',
+  'culkibo_edge_cache_purge',
+  'culkibo_resource_rightsize',
+  'culkibo_incident_postmortem'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -263,7 +274,11 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_digest_promotion',
     'culkibo_api_contract_gate',
     'culkibo_verify_oci_signature',
-    'culkibo_dns_cutover_plan'
+    'culkibo_dns_cutover_plan',
+    'culkibo_build_reproducibility',
+    'culkibo_preview_gate',
+    'culkibo_edge_cache_purge',
+    'culkibo_resource_rightsize'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -332,6 +347,9 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_stream_flood_guard',
     'culkibo_dns_cutover_plan',
     'culkibo_orphan_reaper',
+    'culkibo_edge_cache_purge',
+    'culkibo_resource_rightsize',
+    'culkibo_incident_postmortem',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -385,7 +403,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_runtime_anomaly',
     'culkibo_verify_oci_signature',
     'culkibo_stream_flood_guard',
-    'culkibo_orphan_reaper'
+    'culkibo_orphan_reaper',
+    'culkibo_build_reproducibility',
+    'culkibo_preview_gate',
+    'culkibo_incident_postmortem'
   ])
 });
 
@@ -542,7 +563,14 @@ const SEARCH_SYNONYMS = Object.freeze({
   slowloris: ['stream', 'flood', 'websocket', 'sse', 'backpressure', 'edge'],
   cutover: ['dns', 'ttl', 'cloudflare', 'acme', 'soa', 'domain', 'migration'],
   orphan: ['reaper', 'preview', 'gc', 'prune', 'volume', 'container', 'cleanup'],
-  reaper: ['orphan', 'preview', 'gc', 'prune', 'volume', 'container', 'cleanup']
+  reaper: ['orphan', 'preview', 'gc', 'prune', 'volume', 'container', 'cleanup'],
+  reproducible: ['build', 'buildkit', 'cache', 'lockfile', 'sha512', 'epoch', 'poisoning'],
+  lockfile: ['reproducible', 'build', 'sha512', 'integrity', 'npm', 'supply'],
+  surrogate: ['cache', 'purge', 'edge', 'souin', 'cloudflare', 'fastly', 'stampede', 'coalesce'],
+  purge: ['cache', 'surrogate', 'edge', 'invalidate', 'cloudflare', 'fastly'],
+  rightsize: ['vpa', 'goldilocks', 'memory', 'ram', 'cpu', 'finops', 'oom', 'limits'],
+  vpa: ['rightsize', 'goldilocks', 'memory', 'ram', 'cpu', 'finops', 'oom'],
+  postmortem: ['incident', 'timeline', 'blameless', 'mttd', 'mttr', 'correlate', 'sre', 'rca']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -751,7 +779,13 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_verify_oci_signature: { minRole: 'developer', scope: 'security:write', projectScoped: false },
   culkibo_stream_flood_guard: { minRole: 'developer', scope: 'domains:write', projectScoped: true },
   culkibo_dns_cutover_plan: { minRole: 'developer', scope: 'domains:write', projectScoped: false },
-  culkibo_orphan_reaper: { minRole: 'developer', scope: 'docker:write', projectScoped: false }
+  culkibo_orphan_reaper: { minRole: 'developer', scope: 'docker:write', projectScoped: false },
+  // MCP 2026 Cycle-17 Milestone (170 MCP Tools -91.1% Core!): Build Reproducibility, Preview Smoke-Gate, Surrogate-Key Edge Cache, VPA-Lite Rightsizer & Blameless Postmortem (+5 = 170)
+  culkibo_build_reproducibility: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
+  culkibo_preview_gate: { minRole: 'developer', scope: 'previews:write', projectScoped: true, secretSensitive: true },
+  culkibo_edge_cache_purge: { minRole: 'developer', scope: 'domains:write', projectScoped: false },
+  culkibo_resource_rightsize: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
+  culkibo_incident_postmortem: { minRole: 'developer', scope: 'observability:write', projectScoped: true }
 });
 
 /**
@@ -5100,6 +5134,177 @@ class McpServer extends EventEmitter {
             dryRun: { type: 'boolean', description: 'En reap y set_policy es true por defecto; pasa dryRun: false para aplicar.' }
           }
         }
+      },
+      // --- MCP 2026 Cycle-17 Milestone (170 MCP Tools -91.1% Core!): Build Repro & Cache Isolation, Preview Smoke-Gate, Surrogate-Key Edge Cache, VPA-Lite Rightsizer & Blameless Postmortem (+5 = 170) ---
+      {
+        name: 'culkibo_build_reproducibility',
+        title: 'Auditar builds reproducibles, integridad lockfile SHA-512 y aislamiento BuildKit',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            audits: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Verificador reproducible de builds y prevención de envenenamiento de caché BuildKit (CVE-2026-93318/33747/93326/133630): exige SOURCE_DATE_EPOCH, bloquea frontends #syntax sin pinear, curl|bash, fugas .git/config y lockfiles sin sha512-, y genera planes de caché aislada con DiffID. cache_plan exige admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['audit', 'verify_lockfile', 'cache_plan', 'list'], description: 'Operación de reproducibilidad de build (default "audit")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto opcional (validado por ACL si se proporciona)' },
+            dockerfile: { type: 'string', maxLength: 200000, description: 'Contenido Dockerfile a auditar' },
+            lockfileJson: { description: 'Objeto JSON o string package-lock.json para auditar integridad sha512-' },
+            buildArgs: { type: 'object', description: 'Build args (incl. SOURCE_DATE_EPOCH)' },
+            cachePolicy: { type: 'object', description: 'Política de caché BuildKit opcional' },
+            gitSources: { type: 'array', description: 'Orígenes Git para validar política de URLs (CVE-2026-93326)' },
+            branch: { type: 'string', maxLength: 128, description: 'Rama Git para cache_plan (default "main")' },
+            lockfileHash: { type: 'string', maxLength: 128, description: 'Hash del lockfile para cache_plan' },
+            sourceDateEpoch: { type: 'integer', minimum: 0, description: 'SOURCE_DATE_EPOCH entero para cache_plan' },
+            dryRun: { type: 'boolean', description: 'En cache_plan es true por defecto; pasa dryRun: false para aplicar/persistir.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_preview_gate',
+        title: 'Evaluar puerta de merge PR-Preview, aprobar forks por SHA y firmar Commit Status',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: 'string' },
+            gates: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Puerta sintética de merge para PR Previews (coolify#1671/#7155, dokploy#5856/#6010): bloquea forks sin aprobación ligada al commitSha exacto (FORK_APPROVAL_REQUIRED), agrega salud HTTP/migraciones/contratos/smoke y emite GitHub Commit Status firmado HMAC-SHA256. ACL estricto por proyecto; approve_fork exige admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['evaluate', 'approve_fork', 'build_status', 'list'], description: 'Operación de preview merge gate (default "list")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID del proyecto objetivo (obligatorio; ACL estricto)' },
+            prNumber: { type: 'integer', minimum: 1, description: 'Número del Pull Request' },
+            commitSha: { type: 'string', maxLength: 64, description: 'SHA de commit exacto (vincula aprobaciones fork)' },
+            isFork: { type: 'boolean', description: 'True si el PR proviene de un fork externo' },
+            maintainerApproved: { type: 'boolean', description: 'True si ya cuenta con aprobación explícita' },
+            checks: { type: 'object', description: 'Resultados de checks (health, migrations, contract, smoke)' },
+            approver: { type: 'string', maxLength: 128, description: 'Actor admin que aprueba el fork PR' },
+            repo: { type: 'string', maxLength: 200, description: 'Repositorio GitHub (owner/repo) para build_status' },
+            context: { type: 'string', maxLength: 128, description: 'Contexto GitHub Commit Status (default "culkibo/preview-gate")' },
+            evaluation: { type: 'object', description: 'Resultado previo de evaluatePreviewGate para build_status' },
+            signingKey: { type: 'string', maxLength: 512, description: 'Clave HMAC opcional (redactada automáticamente en auditoría)' },
+            dryRun: { type: 'boolean', description: 'En approve_fork es true por defecto; pasa dryRun: false para persistir.' }
+          },
+          required: ['projectId']
+        }
+      },
+      {
+        name: 'culkibo_edge_cache_purge',
+        title: 'Coordinar purga por Surrogate-Key multi-edge y coalescing anti-stampede',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Coordinador de caché Edge por Surrogate-Key y coalescing singleflight (cura darkweak/souin#884 sin bucket global SURROGATE_ OOM y #850 con timeout acotado y bypass automático en Cache-Control: private|no-store): purga tags verificados en Caddy/Souin, Cloudflare y Fastly. purge exige admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list_tags', 'purge', 'coalesce', 'render_policy'], description: 'Operación sobre Edge Surrogate Cache (default "list_tags")' },
+            tags: { type: 'array', items: { type: 'string' }, description: 'Lista de Surrogate-Keys a purgar (para action="purge")' },
+            providers: { type: 'array', items: { type: 'string' }, description: 'Proveedores destino (caddy, cloudflare, fastly; default ["caddy"])' },
+            cacheKey: { type: 'string', maxLength: 512, description: 'Clave de caché para action="coalesce"' },
+            inFlightCount: { type: 'integer', minimum: 0, description: 'Peticiones concurrentes en vuelo para coalesce' },
+            backendTimeoutMs: { type: 'integer', minimum: 50, maximum: 60000, description: 'Timeout máximo de líder singleflight en ms (default 5000)' },
+            cacheControl: { type: 'string', maxLength: 256, description: 'Cabecera Cache-Control observada (private/no-store fuerza bypass)' },
+            policy: { type: 'object', description: 'Política de caché para action="render_policy"' },
+            dryRun: { type: 'boolean', description: 'En purge es true por defecto; pasa dryRun: false para evictar tags.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_resource_rightsize',
+        title: 'Recomendar right-sizing VPA-Lite P95/P99 con guardia OOM +50% y parches Compose',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            recommendations: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Recomendador VPA-Lite estilo Goldilocks/K8s-1.35 (dokploy#4050/#927/#903): calcula P50/P95/P99 (>=10 muestras), aplica +50% upscale obligatorio si oomCount>0 (jamás encoge servicios con OOM), valida suelos Docker (>=4MiB RAM, >=0.001 CPU) y emite parches Compose deploy.resources para apps y BDs. build_patch exige admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['analyze', 'build_patch', 'validate_limits', 'list'], description: 'Operación de rightsizing VPA-Lite (default "list")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto opcional (validado por ACL si se aporta)' },
+            serviceName: { type: 'string', maxLength: 128, description: 'Nombre del servicio (default "app")' },
+            serviceType: { type: 'string', enum: ['app', 'database', 'worker'], description: 'Tipo de servicio (default "app"; database usa +35% headroom)' },
+            currentMemoryMb: { type: 'number', minimum: 0, description: 'Memoria actual asignada en MB' },
+            currentCpuCores: { type: 'number', minimum: 0, description: 'CPUs actuales asignadas' },
+            samples: { type: 'array', description: 'Muestras de telemetría (>=10 muestras de memoria/CPU)' },
+            oomCount: { type: 'integer', minimum: 0, description: 'Número de OOM kills recientes (>0 fuerza +50% upscale)' },
+            headroomPct: { type: 'number', minimum: 0, maximum: 200, description: 'Margen de seguridad opcional %' },
+            memoryMb: { type: 'number', description: 'Memoria en MB para validate_limits' },
+            cpuCores: { type: 'number', description: 'Cores CPU para validate_limits' },
+            recommendation: { type: 'object', description: 'Recomendación previa para action="build_patch"' },
+            dryRun: { type: 'boolean', description: 'En build_patch es true por defecto; pasa dryRun: false para emitir/persistir.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_incident_postmortem',
+        title: 'Correlacionar timeline CloudEvents y generar postmortems SRE sin culpas',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            postmortems: { type: 'array' },
+            markdown: { type: ['string', 'null'] },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Correlador autónomo de postmortems SRE sin culpas (IncidentFox/OpenSRE): fusiona deploys, OOM forensics, rollbacks SLO, alertas y drift en timeline CloudEvents con confianza T-15m, calcula MTTD/MTTR exactos, aísla estrictamente chatNotes en unverifiedNotes[] y exporta Markdown blameless. generate exige admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['correlate', 'generate', 'export_md', 'list'], description: 'Operación de postmortem SRE (default "list")' },
+            incidentId: { type: 'string', maxLength: 128, description: 'ID del incidente' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto asociado (validado por ACL si se aporta)' },
+            windowStart: { type: 'string', maxLength: 64, description: 'Inicio ISO de la ventana del incidente' },
+            windowEnd: { type: 'string', maxLength: 64, description: 'Fin ISO de la ventana del incidente' },
+            deploys: { type: 'array', description: 'Eventos de despliegue en la ventana' },
+            oomEvents: { type: 'array', description: 'Eventos forenses OOM' },
+            canaryRollbacks: { type: 'array', description: 'Eventos de rollback canario SLO' },
+            alerts: { type: 'array', description: 'Alertas firing/resolved' },
+            driftEvents: { type: 'array', description: 'Eventos de drift de configuración' },
+            chatNotes: { type: 'array', description: 'Notas especulativas de chat (siempre aisladas en unverifiedNotes[])' },
+            correlation: { type: 'object', description: 'Correlación previa para action="generate"' },
+            postmortem: { type: 'object', description: 'Postmortem previo para action="export_md"' },
+            dryRun: { type: 'boolean', description: 'En generate es true por defecto (persist: false); pasa dryRun: false para guardar.' }
+          }
+        }
       }
     ];
 
@@ -7341,6 +7546,51 @@ class McpServer extends EventEmitter {
       }
     }
 
+    if (toolName === 'culkibo_build_reproducibility' && args.action === 'cache_plan') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Generar o persistir planes de caché aislada BuildKit (cache_plan) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "audit", "verify_lockfile" o "list", o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_preview_gate' && args.action === 'approve_fork') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Aprobar Pull Requests de forks externos (approve_fork) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "evaluate", "build_status" o "list", o solicita aprobación a un admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_edge_cache_purge' && args.action === 'purge') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Purgar Surrogate-Keys en caché Edge (purge) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "list_tags", "coalesce" o "render_policy", o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_resource_rightsize' && args.action === 'build_patch') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Generar/aplicar parches Compose de rightsizing (build_patch) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "analyze", "validate_limits" o "list", o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_incident_postmortem' && args.action === 'generate') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Generar y persistir postmortems SRE (generate) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "correlate", "export_md" o "list", o autentícate como admin/owner.'
+        });
+      }
+    }
+
     // Aislamiento de equipo en argumentos explícitos (teamId y serverId) antes de dryRun
     if (principal.teamId && args.teamId && String(args.teamId) !== principal.teamId) {
       throw new McpToolError('FORBIDDEN', 'No tienes acceso al equipo especificado.', {
@@ -8676,6 +8926,86 @@ class McpServer extends EventEmitter {
           reversible = true;
         } else {
           effects.push(`Ejecutará '${action}' del Orphan PR-Preview Auto-Reaper en modo solo lectura.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_build_reproducibility': {
+        const action = String(args.action || 'audit');
+        Object.assign(target, { action, projectId: args.projectId || null, branch: args.branch || 'main' });
+        if (action === 'cache_plan') {
+          if (!args.projectId) blockers.push('MISSING_PROJECT_ID');
+          effects.push(`Compilará plan de caché BuildKit aislada (--mount=type=cache,sharing=locked + DiffID) para '${args.projectId || '?'}' rama '${args.branch || 'main'}'.`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' de verificación de builds reproducibles sin mutar estado.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_preview_gate': {
+        const action = String(args.action || 'list');
+        Object.assign(target, { action, projectId: args.projectId || null, prNumber: args.prNumber || null, commitSha: args.commitSha || null });
+        if (action === 'approve_fork') {
+          if (!args.projectId) blockers.push('MISSING_PROJECT_ID');
+          if (!args.prNumber) blockers.push('MISSING_PR_NUMBER');
+          if (!args.commitSha) blockers.push('MISSING_COMMIT_SHA');
+          effects.push(`Aprobará el fork PR #${args.prNumber || '?'} de '${args.projectId || '?'}' estrictamente fijado al SHA '${args.commitSha || '?'}'.`);
+          riskLevel = 'high';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' de la puerta de merge PR-Preview sobre '${args.projectId || '?'}'.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_edge_cache_purge': {
+        const action = String(args.action || 'list_tags');
+        Object.assign(target, { action, tags: Array.isArray(args.tags) ? args.tags : [], providers: Array.isArray(args.providers) ? args.providers : ['caddy'] });
+        if (action === 'purge') {
+          if (!Array.isArray(args.tags) || args.tags.length === 0) blockers.push('MISSING_SURROGATE_TAGS');
+          effects.push(`Purgará ${Array.isArray(args.tags) ? args.tags.length : 0} Surrogate-Key(s) en ${(Array.isArray(args.providers) ? args.providers : ['caddy']).join(', ')}.`);
+          riskLevel = 'medium';
+          reversible = false;
+        } else {
+          effects.push(`Ejecutará '${action}' de Surrogate-Key Edge Cache sin evictar entradas.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_resource_rightsize': {
+        const action = String(args.action || 'list');
+        Object.assign(target, { action, projectId: args.projectId || null, serviceName: args.serviceName || 'app', serviceType: args.serviceType || 'app' });
+        if (action === 'build_patch') {
+          effects.push(`Generará parche Compose deploy.resources (limits + reservations) para '${args.serviceName || 'app'}' (${args.serviceType || 'app'}).`);
+          riskLevel = 'medium';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' de análisis VPA-Lite sin modificar contenedores.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_incident_postmortem': {
+        const action = String(args.action || 'list');
+        Object.assign(target, { action, incidentId: args.incidentId || null, projectId: args.projectId || null });
+        if (action === 'generate') {
+          effects.push(`Generará y almacenará postmortem SRE sin culpas para incidente '${args.incidentId || '?'}' aislando chatNotes en unverifiedNotes[].`);
+          riskLevel = 'low';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' del correlador de postmortems CloudEvents en modo solo lectura.`);
           riskLevel = 'low';
           reversible = true;
         }
@@ -14296,6 +14626,337 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_build_reproducibility': {
+          const reproSvc = requireLazySvc('reproducibleBuildService', 'Reproducible Build & Build-Cache Poisoning Verifier');
+          const action = String(args.action || 'audit');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a las auditorías de build del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado de culkibo_list_projects.'
+            });
+          }
+          if (action === 'verify_lockfile') {
+            if (!args.lockfileJson) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="verify_lockfile" requiere lockfileJson.', {
+                retryable: true,
+                remediation: 'Pasa lockfileJson (objeto JSON o texto de package-lock.json).'
+              });
+            }
+            const out = reproSvc.verifyLockfileIntegrity(args.lockfileJson);
+            res = { ok: Boolean(out && out.valid !== false && out.ok !== false), action: 'verify_lockfile', dryRun: false, projectId: pid, audits: [], result: out };
+          } else if (action === 'cache_plan') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Planificar caché aislada BuildKit requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const planOut = reproSvc.buildIsolatedCachePlan({
+              projectId: pid || 'default',
+              branch: args.branch ? String(args.branch) : 'main',
+              lockfileHash: args.lockfileHash ? String(args.lockfileHash) : 'default',
+              sourceDateEpoch: args.sourceDateEpoch !== undefined ? Number(args.sourceDateEpoch) : 1700000000
+            });
+            res = {
+              ok: Boolean(planOut && planOut.ok !== false),
+              action: 'cache_plan',
+              dryRun,
+              projectId: pid || 'default',
+              audits: [],
+              result: dryRun ? { ...planOut, applied: false } : { ...planOut, applied: true }
+            };
+          } else if (action === 'list') {
+            const rawAudits = reproSvc.listBuildAudits(pid || undefined);
+            const audits = Array.isArray(rawAudits) ? rawAudits : (Array.isArray(rawAudits?.audits) ? rawAudits.audits : []);
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, audits, result: { count: audits.length } };
+          } else {
+            // action === 'audit'
+            const out = reproSvc.auditBuildReproducibility({
+              ...(pid ? { projectId: pid } : {}),
+              dockerfile: typeof args.dockerfile === 'string' ? args.dockerfile : '',
+              lockfileJson: args.lockfileJson || null,
+              buildArgs: args.buildArgs && typeof args.buildArgs === 'object' ? args.buildArgs : {},
+              cachePolicy: args.cachePolicy && typeof args.cachePolicy === 'object' ? args.cachePolicy : {},
+              gitSources: Array.isArray(args.gitSources) ? args.gitSources : []
+            });
+            res = { ok: Boolean(out && out.reproducible === true), action: 'audit', dryRun: false, projectId: pid, audits: [], result: out };
+          }
+          break;
+        }
+
+        case 'culkibo_preview_gate': {
+          const pgSvc = requireLazySvc('previewGateService', 'Preview Synthetic Smoke-Gate & Signed Commit-Status Reporter');
+          const action = String(args.action || 'list');
+          const pid = String(args.projectId || '').trim();
+          if (!pid) {
+            throw new McpToolError('MISSING_ARGUMENT', 'culkibo_preview_gate requiere projectId.', {
+              retryable: true,
+              remediation: 'Indica projectId obtenido de culkibo_list_projects.'
+            });
+          }
+          if (!principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a las puertas de PR-Preview del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'evaluate') {
+            if (!args.prNumber || !args.commitSha) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="evaluate" requiere prNumber y commitSha.', {
+                retryable: true,
+                remediation: 'Pasa projectId, prNumber, commitSha y checks.'
+              });
+            }
+            const out = pgSvc.evaluatePreviewGate({
+              projectId: pid,
+              prNumber: Number(args.prNumber),
+              commitSha: String(args.commitSha),
+              isFork: Boolean(args.isFork),
+              maintainerApproved: Boolean(args.maintainerApproved),
+              checks: args.checks && typeof args.checks === 'object' ? args.checks : {}
+            });
+            res = { ok: Boolean(out && out.allowed === true), action: 'evaluate', dryRun: false, projectId: pid, gates: [], result: out };
+          } else if (action === 'approve_fork') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Aprobar fork PRs requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            if (!args.prNumber || !args.commitSha) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="approve_fork" requiere prNumber y commitSha.', {
+                retryable: true,
+                remediation: 'Pasa projectId, prNumber y commitSha exacto a aprobar.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+              res = {
+                ok: true,
+                action: 'approve_fork',
+                dryRun: true,
+                projectId: pid,
+                gates: [],
+                result: { approved: false, wouldApprove: { projectId: pid, prNumber: Number(args.prNumber), commitSha: String(args.commitSha) } }
+              };
+            } else {
+              const out = pgSvc.approveForkPreview({
+                projectId: pid,
+                prNumber: Number(args.prNumber),
+                commitSha: String(args.commitSha),
+                approver: String(args.approver || principal.email || principal.userId || 'admin')
+              });
+              res = { ok: Boolean(out && out.ok !== false), action: 'approve_fork', dryRun: false, projectId: pid, gates: [], result: out };
+            }
+          } else if (action === 'build_status') {
+            if (!args.repo || !args.commitSha) {
+              throw new McpToolError('MISSING_ARGUMENT', 'action="build_status" requiere repo y commitSha.', {
+                retryable: true,
+                remediation: 'Pasa repo ("owner/repo"), commitSha y evaluation.'
+              });
+            }
+            const evaluation = args.evaluation && typeof args.evaluation === 'object'
+              ? args.evaluation
+              : pgSvc.evaluatePreviewGate({
+                  projectId: pid,
+                  prNumber: Number(args.prNumber || 1),
+                  commitSha: String(args.commitSha),
+                  isFork: Boolean(args.isFork),
+                  maintainerApproved: Boolean(args.maintainerApproved),
+                  checks: args.checks && typeof args.checks === 'object' ? args.checks : {}
+                });
+            const out = pgSvc.buildSignedCommitStatus({
+              repo: String(args.repo),
+              commitSha: String(args.commitSha),
+              context: args.context ? String(args.context) : 'culkibo/preview-gate',
+              evaluation,
+              ...(args.signingKey ? { signingKey: String(args.signingKey) } : {})
+            });
+            res = { ok: true, action: 'build_status', dryRun: false, projectId: pid, gates: [], result: out };
+          } else {
+            // action === 'list'
+            const rawG = pgSvc.listPreviewGates(pid);
+            const gates = Array.isArray(rawG) ? rawG : (Array.isArray(rawG?.gates) ? rawG.gates : []);
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, gates, result: { count: gates.length } };
+          }
+          break;
+        }
+
+        case 'culkibo_edge_cache_purge': {
+          const cacheSvc = requireLazySvc('edgeCacheService', 'Surrogate-Key Edge Cache & Stampede Coalescing Coordinator');
+          const action = String(args.action || 'list_tags');
+          if (action === 'purge') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Purgar Surrogate-Keys en Edge Cache requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const out = cacheSvc.purgeBySurrogateKey({
+              tags: Array.isArray(args.tags) ? args.tags.map(String) : [],
+              providers: Array.isArray(args.providers) && args.providers.length > 0 ? args.providers.map(String) : ['caddy'],
+              dryRun
+            });
+            res = { ok: Boolean(out && out.ok !== false), action: 'purge', dryRun, result: out };
+          } else if (action === 'coalesce') {
+            const out = cacheSvc.evaluateCoalescing({
+              cacheKey: String(args.cacheKey || 'GET:/'),
+              inFlightCount: args.inFlightCount !== undefined ? Number(args.inFlightCount) : 1,
+              backendTimeoutMs: args.backendTimeoutMs !== undefined ? Number(args.backendTimeoutMs) : 5000,
+              cacheControl: typeof args.cacheControl === 'string' ? args.cacheControl : 'public, max-age=60'
+            });
+            res = { ok: true, action: 'coalesce', dryRun: false, result: out };
+          } else if (action === 'render_policy') {
+            const out = cacheSvc.renderCacheControlPolicy(args.policy && typeof args.policy === 'object' ? args.policy : {});
+            res = { ok: true, action: 'render_policy', dryRun: false, result: out };
+          } else {
+            // action === 'list_tags'
+            const rawTags = cacheSvc.listEdgeCacheTags();
+            const tags = Array.isArray(rawTags) ? rawTags : (Array.isArray(rawTags?.tags) ? rawTags.tags : []);
+            res = { ok: true, action: 'list_tags', dryRun: false, result: { tags, count: tags.length } };
+          }
+          break;
+        }
+
+        case 'culkibo_resource_rightsize': {
+          const vpaSvc = requireLazySvc('resourceRightsizerService', 'Container Resource Rightsizing & VPA-Lite Recommender');
+          const action = String(args.action || 'list');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a las recomendaciones VPA del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'validate_limits') {
+            const out = vpaSvc.validateDockerLimits({
+              memoryMb: args.memoryMb !== undefined ? Number(args.memoryMb) : Number(args.currentMemoryMb ?? 512),
+              cpuCores: args.cpuCores !== undefined ? Number(args.cpuCores) : Number(args.currentCpuCores ?? 0.5)
+            });
+            res = { ok: Boolean(out && out.valid === true), action: 'validate_limits', dryRun: false, projectId: pid, recommendations: [], result: out };
+          } else if (action === 'analyze') {
+            const out = vpaSvc.recommendContainerResources({
+              projectId: pid || 'default',
+              serviceName: args.serviceName ? String(args.serviceName) : 'app',
+              serviceType: args.serviceType ? String(args.serviceType) : 'app',
+              currentMemoryMb: Number(args.currentMemoryMb ?? 512),
+              currentCpuCores: Number(args.currentCpuCores ?? 1),
+              samples: Array.isArray(args.samples) ? args.samples : [],
+              oomCount: args.oomCount !== undefined ? Number(args.oomCount) : 0,
+              ...(args.headroomPct !== undefined ? { headroomPct: Number(args.headroomPct) } : {})
+            });
+            res = { ok: Boolean(out && out.ok !== false), action: 'analyze', dryRun: false, projectId: pid, recommendations: [], result: out };
+          } else if (action === 'build_patch') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Emitir parches Compose de rightsizing requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const rec = args.recommendation && typeof args.recommendation === 'object'
+              ? args.recommendation
+              : vpaSvc.recommendContainerResources({
+                  projectId: pid || 'default',
+                  serviceName: args.serviceName ? String(args.serviceName) : 'app',
+                  serviceType: args.serviceType ? String(args.serviceType) : 'app',
+                  currentMemoryMb: Number(args.currentMemoryMb ?? 512),
+                  currentCpuCores: Number(args.currentCpuCores ?? 1),
+                  samples: Array.isArray(args.samples) ? args.samples : [],
+                  oomCount: args.oomCount !== undefined ? Number(args.oomCount) : 0
+                });
+            const patch = vpaSvc.buildComposeResourcePatch(rec);
+            res = { ok: Boolean(patch && patch.ok !== false), action: 'build_patch', dryRun, projectId: pid, recommendations: [], result: { ...patch, applied: !dryRun } };
+          } else {
+            // action === 'list'
+            const rawRecs = vpaSvc.listRecommendations(pid || undefined);
+            const recommendations = Array.isArray(rawRecs) ? rawRecs : (Array.isArray(rawRecs?.recommendations) ? rawRecs.recommendations : []);
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, recommendations, result: { count: recommendations.length } };
+          }
+          break;
+        }
+
+        case 'culkibo_incident_postmortem': {
+          const pmSvc = requireLazySvc('postmortemCorrelatorService', 'Automated Blameless Incident Postmortem & Timeline Correlator');
+          const action = String(args.action || 'list');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a los postmortems del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'correlate') {
+            const corr = pmSvc.correlateIncidentTimeline({
+              incidentId: String(args.incidentId || `inc_${Date.now()}`),
+              projectId: pid || 'default',
+              windowStart: args.windowStart ? String(args.windowStart) : undefined,
+              windowEnd: args.windowEnd ? String(args.windowEnd) : undefined,
+              deploys: Array.isArray(args.deploys) ? args.deploys : [],
+              oomEvents: Array.isArray(args.oomEvents) ? args.oomEvents : [],
+              canaryRollbacks: Array.isArray(args.canaryRollbacks) ? args.canaryRollbacks : [],
+              alerts: Array.isArray(args.alerts) ? args.alerts : [],
+              driftEvents: Array.isArray(args.driftEvents) ? args.driftEvents : [],
+              chatNotes: Array.isArray(args.chatNotes) ? args.chatNotes : []
+            });
+            res = { ok: true, action: 'correlate', dryRun: false, projectId: pid, postmortems: [], markdown: null, result: corr };
+          } else if (action === 'generate') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Generar y persistir postmortems SRE requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const corr = args.correlation && typeof args.correlation === 'object'
+              ? args.correlation
+              : pmSvc.correlateIncidentTimeline({
+                  incidentId: String(args.incidentId || `inc_${Date.now()}`),
+                  projectId: pid || 'default',
+                  windowStart: args.windowStart ? String(args.windowStart) : undefined,
+                  windowEnd: args.windowEnd ? String(args.windowEnd) : undefined,
+                  deploys: Array.isArray(args.deploys) ? args.deploys : [],
+                  oomEvents: Array.isArray(args.oomEvents) ? args.oomEvents : [],
+                  canaryRollbacks: Array.isArray(args.canaryRollbacks) ? args.canaryRollbacks : [],
+                  alerts: Array.isArray(args.alerts) ? args.alerts : [],
+                  driftEvents: Array.isArray(args.driftEvents) ? args.driftEvents : [],
+                  chatNotes: Array.isArray(args.chatNotes) ? args.chatNotes : []
+                });
+            const pm = pmSvc.generateBlamelessPostmortem(corr, { persist: !dryRun });
+            res = { ok: true, action: 'generate', dryRun, projectId: pid, postmortems: [], markdown: null, result: pm };
+          } else if (action === 'export_md') {
+            const pmObj = args.postmortem && typeof args.postmortem === 'object'
+              ? args.postmortem
+              : pmSvc.generateBlamelessPostmortem(
+                  args.correlation && typeof args.correlation === 'object'
+                    ? args.correlation
+                    : pmSvc.correlateIncidentTimeline({
+                        incidentId: String(args.incidentId || `inc_${Date.now()}`),
+                        projectId: pid || 'default',
+                        deploys: Array.isArray(args.deploys) ? args.deploys : [],
+                        oomEvents: Array.isArray(args.oomEvents) ? args.oomEvents : [],
+                        canaryRollbacks: Array.isArray(args.canaryRollbacks) ? args.canaryRollbacks : [],
+                        alerts: Array.isArray(args.alerts) ? args.alerts : [],
+                        driftEvents: Array.isArray(args.driftEvents) ? args.driftEvents : [],
+                        chatNotes: Array.isArray(args.chatNotes) ? args.chatNotes : []
+                      }),
+                  { persist: false }
+                );
+            const md = pmSvc.exportPostmortemMarkdown(pmObj);
+            const mdText = typeof md === 'string' ? md : String(md?.markdown || '');
+            res = { ok: true, action: 'export_md', dryRun: false, projectId: pid, postmortems: [], markdown: mdText, result: typeof md === 'string' ? { length: md.length } : md };
+          } else {
+            // action === 'list'
+            const rawPms = pmSvc.listPostmortems(pid || undefined);
+            const postmortems = Array.isArray(rawPms) ? rawPms : (Array.isArray(rawPms?.postmortems) ? rawPms.postmortems : []);
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, postmortems, markdown: null, result: { count: postmortems.length } };
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -15279,7 +15940,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 165 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), Policy-as-Code Admission de 10 reglas CIS/PSS (culkibo_admission_check), expedientes SOC2/ISO27001/GDPR firmados Ed25519 (culkibo_compliance_bundle), planificador de migración stateful cross-VPS en 4 fases (culkibo_volume_migrate), Geo-Routing y A/B sticky en Caddy v2.11 (culkibo_edge_experiment), scorecard ejecutivo de seguridad (culkibo_security_posture), flujos sintéticos multi-paso y sonda TLS/SNI (culkibo_synthetic_sentinel), linter SQL zero-downtime de 10 reglas DDL (culkibo_lint_sql_migration), autoscaler de workers OOM-safe y circuit breaker 503 (culkibo_worker_autoscaler), auditor de licencias SPDX CycloneDX 1.6 (culkibo_audit_licenses), perfiles OCI seccomp mínimos y guardia runc CVE (culkibo_seccomp_profile), auditor de bloat/secretos en capas OCI (culkibo_audit_image_bloat), leases distribuidos de Cron con fencing tokens (culkibo_cron_lease), enmascarador determinista PII para PR-Preview + pg_anonymizer (culkibo_mask_preview_pii), clasificador forense OOM/Exit-Code de 8 clases (culkibo_oom_forensics), enrutador On-Call con dedup y amortiguación de flapping (culkibo_oncall_router), auditor de egress y drift DOCKER-USER/nftables (culkibo_egress_firewall), failover Blue/Green de réplicas DB con fencing anti split-brain (culkibo_replica_failover), puerta pre-despliegue de secretos por entropía de Shannon (culkibo_secret_gate), planificador multi-arch amd64/arm64 OCI (culkibo_multiarch_planner), simulador Chaos Engineering GameDay con auto-abort (culkibo_chaos_gameday), CA Zero-Trust SPIFFE-Lite mTLS (culkibo_mtls_mesh), Feature Flags con kill-switch instantáneo (culkibo_feature_flags), escudo Edge API Rate-Limit RPM+TPM anti Denial-of-Wallet (culkibo_api_ratelimit), detector Falco-Lite de anomalías/cryptominers (culkibo_runtime_anomaly), promociones GitOps inmutables @sha256: con control dual (culkibo_digest_promotion), puerta de drift de contratos OpenAPI/JSON-Schema/GraphQL (culkibo_api_contract_gate), verificador pure-Node OCI/SLSA Rekor v1/v2 (culkibo_verify_oci_signature), guardia Edge WS/SSE anti-flood/Slowloris/101 (culkibo_stream_flood_guard), planificador zero-downtime DNS cutover y detector proxy Cloudflare ACME (culkibo_dns_cutover_plan), auto-reaper de previews PR huérfanos y volúmenes fugados (culkibo_orphan_reaper), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 170 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), Policy-as-Code Admission de 10 reglas CIS/PSS (culkibo_admission_check), expedientes SOC2/ISO27001/GDPR firmados Ed25519 (culkibo_compliance_bundle), planificador de migración stateful cross-VPS en 4 fases (culkibo_volume_migrate), Geo-Routing y A/B sticky en Caddy v2.11 (culkibo_edge_experiment), scorecard ejecutivo de seguridad (culkibo_security_posture), flujos sintéticos multi-paso y sonda TLS/SNI (culkibo_synthetic_sentinel), linter SQL zero-downtime de 10 reglas DDL (culkibo_lint_sql_migration), autoscaler de workers OOM-safe y circuit breaker 503 (culkibo_worker_autoscaler), auditor de licencias SPDX CycloneDX 1.6 (culkibo_audit_licenses), perfiles OCI seccomp mínimos y guardia runc CVE (culkibo_seccomp_profile), auditor de bloat/secretos en capas OCI (culkibo_audit_image_bloat), leases distribuidos de Cron con fencing tokens (culkibo_cron_lease), enmascarador determinista PII para PR-Preview + pg_anonymizer (culkibo_mask_preview_pii), clasificador forense OOM/Exit-Code de 8 clases (culkibo_oom_forensics), enrutador On-Call con dedup y amortiguación de flapping (culkibo_oncall_router), auditor de egress y drift DOCKER-USER/nftables (culkibo_egress_firewall), failover Blue/Green de réplicas DB con fencing anti split-brain (culkibo_replica_failover), puerta pre-despliegue de secretos por entropía de Shannon (culkibo_secret_gate), planificador multi-arch amd64/arm64 OCI (culkibo_multiarch_planner), simulador Chaos Engineering GameDay con auto-abort (culkibo_chaos_gameday), CA Zero-Trust SPIFFE-Lite mTLS (culkibo_mtls_mesh), Feature Flags con kill-switch instantáneo (culkibo_feature_flags), escudo Edge API Rate-Limit RPM+TPM anti Denial-of-Wallet (culkibo_api_ratelimit), detector Falco-Lite de anomalías/cryptominers (culkibo_runtime_anomaly), promociones GitOps inmutables @sha256: con control dual (culkibo_digest_promotion), puerta de drift de contratos OpenAPI/JSON-Schema/GraphQL (culkibo_api_contract_gate), verificador pure-Node OCI/SLSA Rekor v1/v2 (culkibo_verify_oci_signature), guardia Edge WS/SSE anti-flood/Slowloris/101 (culkibo_stream_flood_guard), planificador zero-downtime DNS cutover y detector proxy Cloudflare ACME (culkibo_dns_cutover_plan), auto-reaper de previews PR huérfanos y volúmenes fugados (culkibo_orphan_reaper), verificador de builds reproducibles y caché BuildKit aislada (culkibo_build_reproducibility), puerta sintética de merge PR-Preview con Commit Status firmado (culkibo_preview_gate), purga multi-edge por Surrogate-Key y coalescing anti-stampede (culkibo_edge_cache_purge), recomendador VPA-Lite P95/P99 con guardia OOM +50% (culkibo_resource_rightsize), correlador autónomo de postmortems SRE sin culpas (culkibo_incident_postmortem), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

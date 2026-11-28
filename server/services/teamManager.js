@@ -4226,6 +4226,50 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:read');
     }
 
+    // Cycle-17: Build Reproducibility, Preview Smoke-Gate, Surrogate Edge Cache, VPA-Lite Rightsizer & Blameless Postmortem Correlator
+    if (p === '/api/builds/reproducibility/cache-plan') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/builds/reproducibility/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/builds/reproducibility/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (/^\/api\/projects\/[^/]+\/preview-gates\/approve-fork$/.test(p)) {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/preview-gates\/evaluate$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (/^\/api\/projects\/[^/]+\/preview-gates$/.test(p)) {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/edge/cache/purge') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/edge/cache/coalesce') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/edge/cache/tags') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/finops/rightsize/patch') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/finops/rightsize/analyze') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/finops/rightsize/recommendations') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/incidents/postmortems') {
+      return this.authorizeAction(principal, isRead ? 'projects:read' : 'team:write');
+    }
+    if (p === '/api/incidents/postmortems/correlate') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

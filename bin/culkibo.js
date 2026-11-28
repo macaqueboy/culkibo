@@ -66,7 +66,9 @@ const svc = {
   get runtimeAnomalyService() { return require('../server/services/runtimeAnomalyService'); },
   get digestPromotionService() { return require('../server/services/digestPromotionService'); },
   get apiContractGateService() { return require('../server/services/apiContractGateService'); },
-  get dnsCutoverService() { return require('../server/services/dnsCutoverService'); }
+  get dnsCutoverService() { return require('../server/services/dnsCutoverService'); },
+  get reproducibleBuildService() { return require('../server/services/reproducibleBuildService'); },
+  get resourceRightsizerService() { return require('../server/services/resourceRightsizerService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2889,15 +2891,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 165,
+            mcpTools: 170,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '165 MCP tools (-90.6% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'API Contract Gate, OCI/SLSA Rekor Verifier, WS/SSE 101 Flood Guard, DNS Cutover & Orphan PR Reaper'
+            '170 MCP tools (-91.1% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'Build Repro Verifier, Preview Smoke-Gate, Surrogate Edge Cache, VPA-Lite Rightsizer & Blameless Postmortem'
           ]
         };
       };
@@ -4295,6 +4297,163 @@ program
         console.log(`     ${ph.phase}. ${ph.title} (wait=${ph.waitSec}s)`);
       }
       console.log('');
+    } catch (err) {
+      failCli(err, options);
+    } finally {
+      try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (e) {}
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-17 CLI: repro-audit (BuildKit/Lockfile) & rightsize-check (VPA-Lite)
+// ===========================================================================
+
+program
+  .command('repro-audit [dockerfilePath]')
+  .description('Reproducible Build & Build-Cache Poisoning Auditor (SOURCE_DATE_EPOCH, #syntax pin, SHA-512 lockfile): sale con código 1 si no es reproducible')
+  .option('--lockfile <path>', 'Ruta opcional a package-lock.json para verificar integridad sha512-')
+  .option('--epoch <int>', 'Valor entero SOURCE_DATE_EPOCH (si se pasa como build-arg)')
+  .option('--json', 'Salida JSON estructurada')
+  .action((dockerfilePath, options) => {
+    const osMod = require('os');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    const scratchDir = fs.mkdtempSync(path.join(osMod.tmpdir(), 'culkibo-cli-repro-'));
+    try {
+      process.env.CULKIBO_DATA_DIR = scratchDir;
+      const dfPath = path.resolve(String(dockerfilePath || 'Dockerfile'));
+      if (!fs.existsSync(dfPath)) {
+        throw new Error(`Dockerfile no encontrado: ${dfPath}`);
+      }
+      const dockerfile = fs.readFileSync(dfPath, 'utf8');
+      let lockfileJson = null;
+      if (options.lockfile) {
+        const lfPath = path.resolve(String(options.lockfile));
+        if (!fs.existsSync(lfPath)) {
+          throw new Error(`Lockfile no encontrado: ${lfPath}`);
+        }
+        lockfileJson = JSON.parse(fs.readFileSync(lfPath, 'utf8'));
+      }
+      /** @type {Record<string, any>} */
+      const buildArgs = {};
+      if (options.epoch !== undefined) {
+        const parsedEpoch = Number(options.epoch);
+        if (!Number.isInteger(parsedEpoch) || parsedEpoch < 0) {
+          throw new Error(`--epoch debe ser un entero >= 0 (recibido "${options.epoch}")`);
+        }
+        buildArgs.SOURCE_DATE_EPOCH = String(parsedEpoch);
+      }
+
+      const reproSvc = svc.reproducibleBuildService;
+      const result = reproSvc.auditBuildReproducibility({
+        dockerfile,
+        lockfileJson,
+        buildArgs
+      });
+      const reproducible = Boolean(result && result.reproducible);
+      const payload = {
+        ...result,
+        ok: reproducible,
+        dockerfilePath: dfPath
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!reproducible) process.exitCode = 1;
+        return;
+      }
+
+      const badge = reproducible ? '\x1b[32mREPRODUCIBLE ✅\x1b[0m' : '\x1b[31mNON-REPRODUCIBLE ❌\x1b[0m';
+      console.log(`\n🔒 Culkibo Build Reproducibility Audit — [${badge}]`);
+      console.log(`   Dockerfile:  ${dfPath}`);
+      console.log(`   Findings:    ${Array.isArray(result.findings) ? result.findings.length : 0}`);
+      console.log('');
+      if (!reproducible) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (e) {}
+    }
+  });
+
+program
+  .command('rightsize-check')
+  .description('VPA-Lite Container Resource Rightsizer & Docker Floor Validator (P50/P95/P99 + OOM +50% upscale + Compose patch)')
+  .option('--memory <mb>', 'Memoria actual asignada en MB', '1024')
+  .option('--cpu <cores>', 'Cores CPU actuales asignados', '1')
+  .option('--samples <csv>', 'Lista CSV de muestras RAM en MB (mín. 10 muestras)')
+  .option('--ooms <n>', 'Número de OOM-kills recientes (>0 fuerza +50% upscale)', '0')
+  .option('--type <kind>', 'Tipo de servicio: app | database', 'app')
+  .option('--service <name>', 'Nombre de servicio para el parche Compose', 'app')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    const osMod = require('os');
+    const scratchDir = fs.mkdtempSync(path.join(osMod.tmpdir(), 'culkibo-cli-vpa-'));
+    try {
+      const vpaMod = svc.resourceRightsizerService;
+      const vpaInst = typeof vpaMod.ResourceRightsizerService === 'function'
+        ? new vpaMod.ResourceRightsizerService({ dataDir: scratchDir })
+        : vpaMod;
+
+      const currentMemoryMb = Number(options.memory ?? 1024);
+      const currentCpuCores = Number(options.cpu ?? 1);
+      const oomCount = Math.max(0, Math.round(Number(options.ooms ?? 0) || 0));
+      const serviceType = String(options.type || 'app').trim().toLowerCase() === 'database' ? 'database' : 'app';
+      const serviceName = String(options.service || (serviceType === 'database' ? 'postgres' : 'app')).trim();
+
+      const limitsValidation = vpaInst.validateDockerLimits({
+        memoryMb: currentMemoryMb,
+        cpuCores: currentCpuCores
+      });
+
+      const samples = typeof options.samples === 'string' && options.samples.trim()
+        ? options.samples.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0)
+        : [];
+
+      const recommendation = samples.length > 0
+        ? vpaInst.recommendContainerResources({
+            projectId: 'cli-rightsize',
+            serviceName,
+            serviceType,
+            currentMemoryMb,
+            currentCpuCores,
+            samples,
+            oomCount,
+            persist: false
+          })
+        : null;
+
+      const composePatch = recommendation && recommendation.ok
+        ? vpaInst.buildComposeResourcePatch(recommendation)
+        : null;
+
+      const ok = Boolean(limitsValidation.valid && (!recommendation || recommendation.ok));
+      const payload = {
+        ok,
+        serviceName,
+        serviceType,
+        limitsValidation,
+        recommendation,
+        composePatch
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!limitsValidation.valid) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mVALID ✅\x1b[0m' : '\x1b[31mINVALID ❌\x1b[0m';
+      console.log(`\n📊 Culkibo VPA-Lite Resource Rightsizer (${serviceName}/${serviceType}) — [${badge}]`);
+      console.log(`   Docker Floors:  ${limitsValidation.code}`);
+      if (recommendation && recommendation.ok) {
+        console.log(`   Action:         ${recommendation.action} (${currentMemoryMb}MB → ${recommendation.recommendedMemoryMb}MB, reclaimable=${recommendation.reclaimableMb}MB, waste=${recommendation.wastePct}%)`);
+      } else if (recommendation && !recommendation.ok) {
+        console.log(`   Status:         ${recommendation.code}`);
+      }
+      console.log('');
+      if (!limitsValidation.valid) process.exitCode = 1;
     } catch (err) {
       failCli(err, options);
     } finally {

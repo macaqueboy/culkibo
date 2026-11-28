@@ -43,6 +43,7 @@ import {
   type OtlpStatusResult,
   type SystemDoctorReport,
   type BillingLedgerResult,
+  type ResourceRightsizeResult,
   type BillingLedgerProjectRow,
   type TenantQuotaSpec,
 } from '../lib/api';
@@ -404,7 +405,7 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   });
 
   // Topology state (Spatial Pan/Zoom SVG Canvas)
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { isDark } = useTheme();
   const [topology, setTopology] = useState<TopologyGraph | null>(null);
   const [topologyLoading, setTopologyLoading] = useState(false);
@@ -439,6 +440,12 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [csvPreview, setCsvPreview] = useState<string | null>(null);
   const [csvBusy, setCsvBusy] = useState(false);
   const [copiedCsv, setCopiedCsv] = useState(false);
+
+  // Cycle-17 VPA-Lite Container Resource Rightsizer (dokploy#4050 / #903)
+  const [vpaResult, setVpaResult] = useState<ResourceRightsizeResult | null>(null);
+  const [vpaPatchYaml, setVpaPatchYaml] = useState<string | null>(null);
+  const [vpaBusy, setVpaBusy] = useState<'shrink' | 'oom' | null>(null);
+  const [vpaError, setVpaError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -520,6 +527,48 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
     a.download = `culkibo-billing-ledger-${billingPeriod}d.csv`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const handleRunVpaRightsize = async (mode: 'shrink' | 'oom') => {
+    setVpaBusy(mode);
+    setVpaError(null);
+    try {
+      const isOom = mode === 'oom';
+      const samples = isOom
+        ? Array.from({ length: 12 }, (_, i) => ({ memoryMb: 460 + i * 5, cpuCores: 0.72 + (i % 3) * 0.04 }))
+        : Array.from({ length: 12 }, (_, i) => ({ memoryMb: 340 + (i % 4) * 18, cpuCores: 0.24 + (i % 3) * 0.04 }));
+      const analysis = await api.analyzeResourceRightsize({
+        projectId: isOom ? 'proj_ai_worker' : 'proj_acme_web',
+        serviceName: isOom ? 'ai-worker-py' : 'acme-saas-web',
+        serviceType: 'app',
+        currentMemoryMb: isOom ? 512 : 2048,
+        currentCpuCores: isOom ? 1 : 2,
+        samples,
+        oomCount: isOom ? 2 : 0,
+      });
+      setVpaResult(analysis);
+      const patchRes = await api.buildRightsizePatch({ recommendation: analysis, dryRun: true }).catch(() => null);
+      const yaml =
+        patchRes?.yaml ||
+        patchRes?.patchYaml ||
+        (analysis.composePatch && typeof analysis.composePatch.yaml === 'string' ? analysis.composePatch.yaml : null) ||
+        analysis.patchYaml ||
+        analysis.yaml ||
+        (patchRes?.patch ? JSON.stringify(patchRes.patch, null, 2) : null);
+      setVpaPatchYaml(yaml);
+      onNotify(
+        isOom
+          ? `VPA OOM Safety Lock: ${analysis.action} -> ${analysis.recommendedMemoryMb ?? 768} MB (+50% headroom)`
+          : `VPA Rightsizer: ${analysis.action} reclaims ${analysis.reclaimableMb ?? 0} MB (${analysis.wastePct ?? 0}% waste)`,
+        isOom ? 'info' : 'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'VPA rightsizing failed';
+      setVpaError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setVpaBusy(null);
+    }
   };
 
   const handleRecalcFinops = async (e: React.FormEvent) => {
@@ -1846,6 +1895,98 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
             );
           })()}
 
+          {/* Cycle-17: VPA-Lite Container Resource Rightsizer (dokploy#4050 / #903) */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+                  <SlidersHorizontal className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('obs.vpaTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      P95/P99 · ≥4 MiB / 0.001 CPU
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('obs.vpaDesc')}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  disabled={vpaBusy !== null}
+                  onClick={() => void handleRunVpaRightsize('shrink')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {vpaBusy === 'shrink' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <TrendingDown className="w-3.5 h-3.5" />}
+                  <span>{vpaBusy === 'shrink' ? t('obs.vpaWorking') : t('obs.vpaShrinkBtn')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={vpaBusy !== null}
+                  onClick={() => void handleRunVpaRightsize('oom')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-amber-200 bg-amber-50 hover:bg-slate-100 text-amber-800 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {vpaBusy === 'oom' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{vpaBusy === 'oom' ? t('obs.vpaWorking') : t('obs.vpaOomBtn')}</span>
+                </button>
+              </div>
+            </div>
+
+            {vpaError && (
+              <div className="p-3 m-4 rounded-lg bg-red-50 border border-red-200 text-red-700">{vpaError}</div>
+            )}
+
+            {vpaResult && (() => {
+              const isOomUpscale = vpaResult.action === 'UPSCALE_OOM' || (vpaResult.oomCount ?? 0) > 0;
+              const p95Mem = vpaResult.p95?.memoryMb ?? vpaResult.p95MemoryMb;
+              const p99Mem = vpaResult.p99?.memoryMb ?? vpaResult.p99MemoryMb;
+              return (
+                <div className="p-4 space-y-3 font-mono text-[11px] tabular-nums">
+                  <div className={`p-3.5 rounded-xl border space-y-2 ${
+                    isOomUpscale
+                      ? 'bg-amber-50 border-amber-200 text-amber-800'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {vpaResult.action}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {vpaResult.serviceName || 'app'}: {vpaResult.currentMemoryMb ?? 0} MB → {vpaResult.recommendedMemoryMb ?? 0} MB
+                      </span>
+                      {isOomUpscale ? (
+                        <span className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                          OOM Safety Lock ({vpaResult.oomCount ?? 1} kills · +50% upscale, never shrinks)
+                        </span>
+                      ) : (
+                        <>
+                          <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                            reclaimable: {vpaResult.reclaimableMb ?? 0} MB
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                            waste: {vpaResult.wastePct ?? 0}%
+                          </span>
+                        </>
+                      )}
+                      {p95Mem != null && (
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                          P95 {p95Mem} MB{p99Mem != null ? ` / P99 ${p99Mem} MB` : ''}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {vpaPatchYaml && (
+                    <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
+                      {vpaPatchYaml}
+                    </pre>
+                  )}
+                </div>
+              );
+            })()}
+          </section>
+
           {/* Tabla de rutas activas + Live Sync / Caddy */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <section className="lg:col-span-2 bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -1854,15 +1995,17 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                 <span className="text-xs text-slate-500 font-mono">GET /metrics</span>
               </div>
               {!snapshot || !snapshot.http?.topRoutes?.length ? (
-                <div className="p-6 text-sm text-slate-500 text-center">Sin tráfico registrado todavía.</div>
+                <div className="p-6 text-sm text-slate-500 text-center">
+                  {locale === 'es' ? 'Sin tráfico registrado todavía.' : 'No traffic recorded yet.'}
+                </div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse">
                     <thead>
                       <tr className="border-b border-slate-200 text-[11px] uppercase tracking-wider text-slate-500">
-                        <th className="py-2.5 px-3 sm:px-5 font-medium">Ruta</th>
+                        <th className="py-2.5 px-3 sm:px-5 font-medium">{locale === 'es' ? 'Ruta' : 'Route'}</th>
                         <th className="py-2.5 px-2 sm:px-4 font-medium text-right">Req</th>
-                        <th className="py-2.5 px-2 sm:px-4 font-medium text-right">Media</th>
+                        <th className="py-2.5 px-2 sm:px-4 font-medium text-right">{locale === 'es' ? 'Media' : 'Avg'}</th>
                         <th className="py-2.5 px-3 sm:px-5 font-medium text-right">Err</th>
                       </tr>
                     </thead>
@@ -1890,29 +2033,31 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
               </div>
               <dl className="space-y-2.5 text-xs">
                 <div className="flex items-center justify-between py-1.5 border-b border-slate-100">
-                  <dt className="text-slate-500">Paneles conectados (WS)</dt>
+                  <dt className="text-slate-500">{locale === 'es' ? 'Paneles conectados (WS)' : 'Connected dashboards (WS)'}</dt>
                   <dd className="font-mono font-medium text-slate-900 tabular-nums">{snapshot?.websocket?.telemetryClients ?? 0}</dd>
                 </div>
                 <div className="flex items-center justify-between py-1.5 border-b border-slate-100">
-                  <dt className="text-slate-500">Agentes Live Sync</dt>
+                  <dt className="text-slate-500">{locale === 'es' ? 'Agentes Live Sync' : 'Live Sync agents'}</dt>
                   <dd className="font-mono font-medium text-slate-900 tabular-nums">{snapshot?.websocket?.syncClients ?? 0}</dd>
                 </div>
                 <div className="flex items-center justify-between py-1.5 border-b border-slate-100">
-                  <dt className="text-slate-500">Cambios aplicados / volumen</dt>
+                  <dt className="text-slate-500">{locale === 'es' ? 'Cambios aplicados / volumen' : 'Applied changes / volume'}</dt>
                   <dd className="font-mono font-medium text-slate-900 tabular-nums">
                     {snapshot?.liveSync?.framesApplied ?? 0} · {formatBytes(snapshot?.liveSync?.bytesSynced ?? 0)}
                   </dd>
                 </div>
                 <div className="flex items-center justify-between py-1.5 border-b border-slate-100">
-                  <dt className="text-slate-500">Latencia Live Sync (p50 / p95)</dt>
+                  <dt className="text-slate-500">{locale === 'es' ? 'Latencia Live Sync (p50 / p95)' : 'Live Sync latency (p50 / p95)'}</dt>
                   <dd className="font-mono font-medium text-slate-900 tabular-nums">
                     {formatMs(snapshot?.liveSync?.applyLatencyMs?.p50)} / {formatMs(snapshot?.liveSync?.applyLatencyMs?.p95)}
                   </dd>
                 </div>
                 <div className="flex items-center justify-between py-1.5">
-                  <dt className="text-slate-500">Caddy ({snapshot?.caddy?.managedRoutes ?? 0} rutas)</dt>
+                  <dt className="text-slate-500">
+                    Caddy ({snapshot?.caddy?.managedRoutes ?? 0} {locale === 'es' ? 'rutas' : 'routes'})
+                  </dt>
                   <dd className="font-mono font-medium text-slate-900 tabular-nums">
-                    {snapshot?.caddy?.swapsTotal ?? 0} cambios ({formatMs(snapshot?.caddy?.swapLatencyMs?.p50)})
+                    {snapshot?.caddy?.swapsTotal ?? 0} {locale === 'es' ? 'cambios' : 'swaps'} ({formatMs(snapshot?.caddy?.swapLatencyMs?.p50)})
                   </dd>
                 </div>
               </dl>

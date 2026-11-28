@@ -131,6 +131,11 @@ function getOciSignatureVerifier() { return _lazyV2.ociverify || (_lazyV2.ociver
 function getStreamFloodGuardService() { return _lazyV2.streamguard || (_lazyV2.streamguard = require('../services/streamFloodGuardService')); }
 function getDnsCutoverService() { return _lazyV2.dnscutover || (_lazyV2.dnscutover = require('../services/dnsCutoverService')); }
 function getOrphanReaperService() { return _lazyV2.orphanreaper || (_lazyV2.orphanreaper = require('../services/orphanReaperService')); }
+function getReproducibleBuildService() { return _lazyV2.reprobuild || (_lazyV2.reprobuild = require('../services/reproducibleBuildService')); }
+function getPreviewGateService() { return _lazyV2.previewgate || (_lazyV2.previewgate = require('../services/previewGateService')); }
+function getEdgeCacheService() { return _lazyV2.edgecache || (_lazyV2.edgecache = require('../services/edgeCacheService')); }
+function getResourceRightsizerService() { return _lazyV2.rightsizer || (_lazyV2.rightsizer = require('../services/resourceRightsizerService')); }
+function getPostmortemCorrelatorService() { return _lazyV2.postmortem || (_lazyV2.postmortem = require('../services/postmortemCorrelatorService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -9739,6 +9744,278 @@ router.post('/cleanup/orphans/reap', certAndAdminLimiter, async (req, res) => {
     }
     const out = await svc.executeReap({ plan, dryRun });
     res.json(protectedItems ? { ...out, protected: protectedItems } : out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #17 MILESTONE LAZY ROUTES (170 MCP Tools -91.1% Core & 74 Suites — 0 boot RAM impact) ---
+
+// 1. Reproducible Build & Build-Cache Poisoning Verifier (`CVE-2026-93318`/`33747`/`93326`/`133630`)
+router.get('/builds/reproducibility/audits', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getReproducibleBuildService().listBuildAudits(projectId);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, projectId: projectId || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/builds/reproducibility/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getReproducibleBuildService().auditBuildReproducibility(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/builds/reproducibility/cache-plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar planes de caché aislada BuildKit', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getReproducibleBuildService().buildIsolatedCachePlan(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Preview Synthetic Smoke-Gate & Signed Commit-Status Reporter (`coolify#1671`, `dokploy#5856`/`#6010`)
+router.get('/projects/:id/preview-gates', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:read')) return;
+    const raw = await getPreviewGateService().listPreviewGates(req.params.id);
+    const gates = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.gates) ? raw.gates : []);
+    res.json({ ok: true, projectId: req.params.id, count: gates.length, gates });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/projects/:id/preview-gates/evaluate', async (req, res) => {
+  try {
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getPreviewGateService();
+    const evaluation = await svc.evaluatePreviewGate({
+      ...body,
+      projectId: req.params.id
+    });
+    let signedCommitStatus = null;
+    if (body.repo || body.signStatus || body.signingKey) {
+      const signingKey = typeof body.signingKey === 'string' && body.signingKey.trim()
+        ? body.signingKey.trim()
+        : crypto.randomBytes(32).toString('hex');
+      signedCommitStatus = await svc.buildSignedCommitStatus({
+        repo: String(body.repo || `${req.params.id}/repo`),
+        commitSha: String(body.commitSha || (evaluation && evaluation.commitSha) || ''),
+        context: typeof body.context === 'string' ? body.context : 'culkibo/preview-gate',
+        evaluation,
+        signingKey
+      });
+    }
+    res.json(signedCommitStatus ? { ...evaluation, signedCommitStatus } : evaluation);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/projects/:id/preview-gates/approve-fork', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden aprobar PRs de forks externos', code: 'FORBIDDEN' });
+    }
+    if (!assertTenantProjectAccess403(req, res, req.params.id, 'projects:write')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { actor } = getAuditActor(req);
+    const approver = (typeof body.approver === 'string' && body.approver.trim())
+      ? body.approver.trim()
+      : ((actor && (actor.email || actor.userId || actor.role)) || 'admin');
+    const out = await getPreviewGateService().approveForkPreview({
+      projectId: req.params.id,
+      prNumber: body.prNumber,
+      commitSha: body.commitSha,
+      approver: String(approver)
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Surrogate-Key Edge Cache & Stampede Coalescing Coordinator (`souin#884`/`#850`)
+router.get('/edge/cache/tags', async (_req, res) => {
+  try {
+    const raw = await getEdgeCacheService().listEdgeCacheTags();
+    const tags = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.tags) ? raw.tags : []);
+    res.json({ ok: true, count: tags.length, tags, globalSurrogateBucketUsed: false });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/cache/coalesce', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getEdgeCacheService();
+    let registered = null;
+    if (body.register === true || (Array.isArray(body.surrogateKeys) && body.cacheKey)) {
+      registered = await svc.registerCachedEntry({
+        cacheKey: body.cacheKey,
+        surrogateKeys: body.surrogateKeys,
+        ttlSec: body.ttlSec,
+        staleWhileRevalidateSec: body.staleWhileRevalidateSec
+      });
+    }
+    const out = await svc.evaluateCoalescing(body);
+    res.json(registered ? { ...out, registered } : out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/cache/purge', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden purgar caché edge por Surrogate-Key', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'purgar caché edge global por Surrogate-Key')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getEdgeCacheService().purgeBySurrogateKey({
+      ...body,
+      dryRun
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Container Resource Rightsizing & VPA-Lite Recommender (`dokploy#4050`/`#927`/`#903`, Goldilocks)
+router.get('/finops/rightsize/recommendations', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getResourceRightsizerService().listRecommendations(projectId);
+    const recommendations = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.recommendations) ? raw.recommendations : []);
+    res.json({ ok: true, projectId: projectId || null, count: recommendations.length, recommendations });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/finops/rightsize/analyze', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getResourceRightsizerService();
+    if (body.validateOnly === true || (body.memoryMb !== undefined && !Array.isArray(body.samples) && body.currentMemoryMb === undefined)) {
+      const check = await svc.validateDockerLimits({ memoryMb: body.memoryMb, cpuCores: body.cpuCores });
+      return res.json(check);
+    }
+    const rec = await svc.recommendContainerResources(body);
+    res.json(rec);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/finops/rightsize/patch', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar parches de límites de recursos', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const projectId = body.projectId || (body.recommendation && body.recommendation.projectId);
+    if (projectId && !assertTenantProjectAccess403(req, res, String(projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const svc = getResourceRightsizerService();
+    const rec = body.recommendation && typeof body.recommendation === 'object'
+      ? body.recommendation
+      : await svc.recommendContainerResources(body);
+    const patch = await svc.buildComposeResourcePatch(rec);
+    res.json({ ok: true, dryRun, recommendation: rec, patch });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Automated Blameless Incident Postmortem & Timeline Correlator (`incidentfox`/`akmatori`/`opensre`)
+router.get('/incidents/postmortems', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getPostmortemCorrelatorService().listPostmortems(projectId);
+    const postmortems = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.postmortems) ? raw.postmortems : []);
+    res.json({ ok: true, projectId: projectId || null, count: postmortems.length, postmortems });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/incidents/postmortems/correlate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getPostmortemCorrelatorService();
+    const correlation = await svc.correlateIncidentTimeline(body);
+    let markdown = null;
+    try {
+      const pm = await svc.generateBlamelessPostmortem(correlation, { persist: false });
+      const mdOut = await svc.exportPostmortemMarkdown(pm && pm.postmortem ? pm.postmortem : pm);
+      markdown = typeof mdOut === 'string' ? mdOut : (mdOut && mdOut.markdown ? mdOut.markdown : null);
+    } catch (e) {}
+    res.json(markdown ? { ...correlation, markdown } : correlation);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/incidents/postmortems', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden persistir postmortems de incidentes', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const projectId = body.projectId || (body.correlation && body.correlation.projectId);
+    if (projectId && !assertTenantProjectAccess403(req, res, String(projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const svc = getPostmortemCorrelatorService();
+    const correlation = body.correlation && typeof body.correlation === 'object'
+      ? body.correlation
+      : await svc.correlateIncidentTimeline(body);
+    const generated = await svc.generateBlamelessPostmortem(correlation, { persist: !dryRun });
+    const pmObj = generated && generated.postmortem ? generated.postmortem : generated;
+    const mdOut = await svc.exportPostmortemMarkdown(pmObj);
+    const markdown = typeof mdOut === 'string' ? mdOut : (mdOut && mdOut.markdown ? mdOut.markdown : '');
+    res.status(dryRun ? 200 : 201).json({
+      ok: true,
+      dryRun,
+      persisted: !dryRun,
+      postmortem: pmObj,
+      markdown
+    });
   } catch (err) {
     sendServiceError(err, res, 400);
   }

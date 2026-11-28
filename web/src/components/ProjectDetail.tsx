@@ -77,6 +77,9 @@ import {
   type RuntimeAnomalyInspectResult,
   type DigestPromotionActionResult,
   type ApiContractDiffResult,
+  type BuildReproAuditResult,
+  type BuildCachePlanResult,
+  type PreviewGateEvalResult,
 } from '../lib/api';
 import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
@@ -264,8 +267,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..16 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion & API Contract state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract'>('oom');
+  // Cycle-13..17 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro & Preview Gate state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -301,6 +304,14 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [contractResult, setContractResult] = useState<ApiContractDiffResult | null>(null);
   const [contractBusy, setContractBusy] = useState<'breaking' | 'major' | null>(null);
   const [contractError, setContractError] = useState<string | null>(null);
+  // Cycle-17 Build Reproducibility & Preview Smoke-Gate state
+  const [reproResult, setReproResult] = useState<BuildReproAuditResult | null>(null);
+  const [cachePlanResult, setCachePlanResult] = useState<BuildCachePlanResult | null>(null);
+  const [reproBusy, setReproBusy] = useState<'bad' | 'good' | null>(null);
+  const [reproError, setReproError] = useState<string | null>(null);
+  const [previewGateResult, setPreviewGateResult] = useState<PreviewGateEvalResult | null>(null);
+  const [previewGateBusy, setPreviewGateBusy] = useState<'fork' | 'sign' | null>(null);
+  const [previewGateError, setPreviewGateError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1493,6 +1504,86 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setContractBusy(null);
+    }
+  };
+
+  const handleRunBuildRepro = async (mode: 'bad' | 'good') => {
+    setReproBusy(mode);
+    setReproError(null);
+    try {
+      const sha64 = 'c7a9d3e1f5b20846c7a9d3e1f5b20846c7a9d3e1f5b20846c7a9d3e1f5b20846';
+      if (mode === 'bad') {
+        setCachePlanResult(null);
+        const res = await api.auditBuildReproducibility({
+          projectId: project.id,
+          dockerfile: [
+            '#syntax=docker/dockerfile:latest',
+            'FROM node:22',
+            'RUN curl -fsSL https://get.example.dev/install.sh | bash',
+            'COPY . .',
+          ].join('\n'),
+        });
+        setReproResult(res);
+        onNotify(`Reproducibility Gate BLOCKED (${Array.isArray(res.violations) ? res.violations.length : 3} CVE/repro violation(s))`, 'error');
+      } else {
+        const res = await api.auditBuildReproducibility({
+          projectId: project.id,
+          dockerfile: [
+            `#syntax=docker/dockerfile:1.9@sha256:${sha64}`,
+            `FROM node:22-alpine@sha256:${sha64}`,
+            'ARG SOURCE_DATE_EPOCH=1700000000',
+            'ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}',
+            'USER node',
+            'CMD ["node", "server.js"]',
+          ].join('\n'),
+          buildArgs: { SOURCE_DATE_EPOCH: '1700000000' },
+        });
+        const plan = await api.planIsolatedBuildCache({
+          projectId: project.id,
+          branch: 'main',
+          lockfileHash: sha64.slice(0, 16),
+          sourceDateEpoch: 1700000000,
+          dryRun: true,
+        });
+        setReproResult(res);
+        setCachePlanResult(plan);
+        onNotify('Pinned Build Reproducible + Scoped BuildKit Cache Plan Verified!', 'success');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Build reproducibility audit failed';
+      setReproError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setReproBusy(null);
+    }
+  };
+
+  const handleRunPreviewGate = async (mode: 'fork' | 'sign') => {
+    setPreviewGateBusy(mode);
+    setPreviewGateError(null);
+    try {
+      const sha = mode === 'fork' ? 'f91a2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b' : 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+      const res = await api.evaluatePreviewGate(project.id, {
+        prNumber: mode === 'fork' ? 419 : 420,
+        commitSha: sha,
+        isFork: mode === 'fork',
+        maintainerApproved: mode !== 'fork',
+        checks: { health: 'pass', migrations: 'pass', contractGate: 'pass', smoke: 'pass' },
+        signStatus: mode === 'sign',
+      });
+      setPreviewGateResult(res);
+      onNotify(
+        res.allowed
+          ? 'Preview Gate PASSED · culkibo/preview-gate HMAC-SHA256 Commit Status Signed!'
+          : `Fork PR Guard BLOCKED: ${res.code || 'FORK_APPROVAL_REQUIRED'} (SHA-bound)`,
+        res.allowed ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Preview gate evaluation failed';
+      setPreviewGateError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setPreviewGateBusy(null);
     }
   };
 
@@ -3175,6 +3266,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 { id: 'anomaly' as const, label: t('pd.forensicsTabAnomaly') },
                 { id: 'promotion' as const, label: t('pd.forensicsTabPromo') },
                 { id: 'contract' as const, label: t('pd.forensicsTabContract') },
+                { id: 'repro' as const, label: t('pd.forensicsTabRepro') },
+                { id: 'previewgate' as const, label: t('pd.forensicsTabPreviewGate') },
               ]).map((tabItem) => (
                 <button
                   key={tabItem.id}
@@ -3832,6 +3925,124 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   </div>
                 );
               })()}
+            </div>
+          )}
+
+          {forensicsTab === 'repro' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={reproBusy !== null}
+                  onClick={() => void handleRunBuildRepro('bad')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {reproBusy === 'bad' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.reproTestBad')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={reproBusy !== null}
+                  onClick={() => void handleRunBuildRepro('good')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {reproBusy === 'good' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                  <span>{t('pd.reproTestGood')}</span>
+                </button>
+              </div>
+              {reproError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{reproError}</div>}
+              {reproResult && (() => {
+                const viols = Array.isArray(reproResult.violations) ? reproResult.violations : [];
+                return (
+                  <div className="space-y-2 tabular-nums font-mono text-[11px]">
+                    <div className={`p-3.5 rounded-xl border space-y-2 ${
+                      reproResult.reproducible
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        : 'bg-red-50 border-red-200 text-red-700'
+                    }`}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          {reproResult.reproducible ? 'REPRODUCIBLE · SCOPED CACHE' : `BLOCKED · ${viols.length} VIOLATION(S)`}
+                        </span>
+                        {reproResult.score != null && (
+                          <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                            score: {reproResult.score}/100
+                          </span>
+                        )}
+                      </div>
+                      {viols.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {viols.map((v, idx) => (
+                            <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                              {typeof v === 'string' ? v : (v.code || v.rule || v.message || 'REPRO_VIOLATION')}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {cachePlanResult && (
+                      <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 font-mono text-[10px] leading-relaxed overflow-x-auto border border-slate-800">
+                        {`${cachePlanResult.cacheMountArg || '--mount=type=cache,id=culkibo-scoped,sharing=locked'}\nSOURCE_DATE_EPOCH=${cachePlanResult.sourceDateEpoch ?? 1700000000}\nDiffID verification: ${cachePlanResult.diffIdCheckEnabled !== false ? 'ENABLED' : 'OFF'}`}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'previewgate' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={previewGateBusy !== null}
+                  onClick={() => void handleRunPreviewGate('fork')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {previewGateBusy === 'fork' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.pgateTestFork')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={previewGateBusy !== null}
+                  onClick={() => void handleRunPreviewGate('sign')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {previewGateBusy === 'sign' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.pgateTestSign')}</span>
+                </button>
+              </div>
+              {previewGateError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{previewGateError}</div>}
+              {previewGateResult && (
+                <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums font-mono text-[11px] ${
+                  previewGateResult.allowed
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                    : 'bg-red-50 border-red-200 text-red-700'
+                }`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      {previewGateResult.allowed
+                        ? `${previewGateResult.signedCommitStatus?.context || 'culkibo/preview-gate'} · HMAC-SHA256 SIGNED`
+                        : (previewGateResult.code || 'FORK_APPROVAL_REQUIRED')}
+                    </span>
+                    {previewGateResult.commitSha && (
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                        sha: {previewGateResult.commitSha.slice(0, 10)}
+                      </span>
+                    )}
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] uppercase">
+                      state: {previewGateResult.state}
+                    </span>
+                  </div>
+                  {(previewGateResult.signedCommitStatus?.signature || previewGateResult.signature) && (
+                    <div className="text-[10px] truncate">
+                      sig: {String(previewGateResult.signedCommitStatus?.signature || previewGateResult.signature)}
+                    </div>
+                  )}
+                  {previewGateResult.message && <div>{previewGateResult.message}</div>}
+                </div>
+              )}
             </div>
           )}
         </section>

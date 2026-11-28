@@ -44,6 +44,8 @@ import type {
   StreamGuardEvalResult,
   DnsCutoverPreflightResult,
   DnsCutoverPlanResult,
+  EdgeCacheCoalesceResult,
+  EdgeCachePurgeResult,
 } from '../lib/api';
 import { api } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
@@ -118,6 +120,11 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
   const [dnsPlanResult, setDnsPlanResult] = useState<DnsCutoverPlanResult | null>(null);
   const [dnsCutBusy, setDnsCutBusy] = useState<'cf' | 'plan' | null>(null);
   const [dnsCutError, setDnsCutError] = useState<string | null>(null);
+  // Cycle-17 Surrogate-Key Edge Cache & Stampede Coalescer (souin#884 / #850)
+  const [cacheCoalesceResult, setCacheCoalesceResult] = useState<EdgeCacheCoalesceResult | null>(null);
+  const [cachePurgeResult, setCachePurgeResult] = useState<EdgeCachePurgeResult | null>(null);
+  const [cacheBusy, setCacheBusy] = useState(false);
+  const [cacheError, setCacheError] = useState<string | null>(null);
   const [tunnelName, setTunnelName] = useState('');
   const [tunnelHost, setTunnelHost] = useState('127.0.0.1');
   const [tunnelPort, setTunnelPort] = useState('3000');
@@ -491,6 +498,35 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
 
   const skippedReasonFor = (hostname: string) =>
     (Array.isArray(ingress?.skipped) ? ingress.skipped : []).find((s) => Array.isArray(s?.hostnames) && s.hostnames.includes(hostname))?.reason || null;
+
+  const handleTestEdgeCache = async () => {
+    setCacheBusy(true);
+    setCacheError(null);
+    try {
+      const [coalRes, purgeRes] = await Promise.all([
+        api.evaluateEdgeCacheCoalesce({
+          cacheKey: '/api/v1/account/billing',
+          inFlightCount: 12,
+          backendTimeoutMs: 5000,
+          cacheControl: 'private, no-store',
+        }),
+        api.purgeEdgeCacheByTags({
+          tags: ['product:42', 'pricing'],
+          providers: ['caddy', 'cloudflare', 'fastly'],
+          dryRun: true,
+        }),
+      ]);
+      setCacheCoalesceResult(coalRes);
+      setCachePurgeResult(purgeRes);
+      onNotify?.(`Edge Cache Guard: ${coalRes.reason} · Multi-edge dry-run purge planned across ${(purgeRes.providers || []).length || 3} providers`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Edge cache guard evaluation failed';
+      setCacheError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setCacheBusy(false);
+    }
+  };
 
   const handleStartCaddy = async () => {
     setStartingCaddy(true);
@@ -2082,6 +2118,83 @@ export const DomainManager: React.FC<DomainManagerProps> = ({
                     ))}
                   </ol>
                 )}
+              </div>
+            );
+          })()}
+        </section>
+      )}
+
+      {/* Cycle-17: Surrogate-Key Edge Cache & Stampede Coalescer (souin#884 / #850) */}
+      {!projectId && (
+        <section className="p-5 rounded-2xl bg-white border border-slate-200 space-y-4 text-xs">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                <Zap className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-sm font-semibold text-slate-900">{t('domains.cacheTitle')}</h2>
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                    0 Global SURROGATE_ OOM
+                  </span>
+                </div>
+                <p className="text-slate-500 mt-0.5">{t('domains.cacheDesc')}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={cacheBusy}
+              onClick={() => void handleTestEdgeCache()}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+            >
+              {cacheBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+              <span>{cacheBusy ? t('domains.cacheWorking') : t('domains.cacheTestBtn')}</span>
+            </button>
+          </div>
+
+          {cacheError && (
+            <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{cacheError}</div>
+          )}
+
+          {(cacheCoalesceResult || cachePurgeResult) && (() => {
+            const plans = Array.isArray(cachePurgeResult?.providerPlans) ? cachePurgeResult.providerPlans : [];
+            const tags = Array.isArray(cachePurgeResult?.tags) ? cachePurgeResult.tags : [];
+            return (
+              <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      {cacheCoalesceResult?.reason || 'PRIVATE_OR_NO_STORE_BYPASS'}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      coalesced: {String(Boolean(cacheCoalesceResult?.coalesced))} (0 cross-tenant leak)
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      globalSurrogateBucketUsed: {String(Boolean(cachePurgeResult?.globalSurrogateBucketUsed))}
+                    </span>
+                    {tags.length > 0 && (
+                      <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                        tags: {tags.join(', ')} (dryRun: {String(cachePurgeResult?.dryRun !== false)})
+                      </span>
+                    )}
+                  </div>
+                  {plans.length > 0 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+                      {plans.map((pl, idx) => {
+                        const obj = typeof pl === 'string' ? { provider: pl } : pl;
+                        return (
+                          <div key={idx} className="p-2 rounded-lg bg-white border border-slate-200 text-slate-900 text-[10px] space-y-0.5">
+                            <div className="font-semibold uppercase">{obj.provider || `edge-${idx + 1}`}</div>
+                            <div className="text-slate-600 truncate">
+                              {obj.method || 'PURGE'} · {obj.header || 'Surrogate-Key'}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
             );
           })()}

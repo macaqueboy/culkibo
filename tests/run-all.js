@@ -69,6 +69,9 @@ const testCycle15HttpE2E = require('./cycle15-http-e2e.test');
 const testStreamGuardAndDnsCutover = require('./stream-guard-and-dns-cutover.test');
 const testContractOciOrphan = require('./contract-oci-orphan.test');
 const testCycle16HttpE2E = require('./cycle16-http-e2e.test');
+const testCacheAndRightsizer = require('./cache-and-rightsizer.test');
+const testReproPreviewPostmortem = require('./repro-preview-postmortem.test');
+const testCycle17HttpE2E = require('./cycle17-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -163,6 +166,9 @@ async function runAll() {
     { name: 'Edge WS/SSE Flood & 101 Hop-by-Hop Guard (CVE-2026-55458) & Zero-Downtime DNS Cutover / Cloudflare Proxy Verifier', fn: testStreamGuardAndDnsCutover },
     { name: 'Post-Optic API Contract Gate, Pure-Node OCI/SLSA Rekor Verifier (CVE-2026-22703) & Orphan PR-Preview Auto-Reaper', fn: testContractOciOrphan },
     { name: 'Cycle #16 165-MCP Milestone Live Isolated HTTP E2E (All 5 API Families + Rekor/101/Proxy/Reaper Guards + RBAC)', fn: testCycle16HttpE2E },
+    { name: 'Surrogate-Key Edge Cache & Stampede Coalescer (souin#884/#850) & VPA-Lite Container Rightsizer (dokploy#4050/#903)', fn: testCacheAndRightsizer },
+    { name: 'Reproducible Build / Cache Verifier (CVE-2026-93318), Preview Smoke-Gate & Blameless Postmortem Correlator', fn: testReproPreviewPostmortem },
+    { name: 'Cycle #17 170-MCP Milestone Live Isolated HTTP E2E (All 5 API Families + Fork/OOM/Cache/Postmortem Guards + RBAC)', fn: testCycle17HttpE2E },
   ];
 
   for (const suite of suites) {
