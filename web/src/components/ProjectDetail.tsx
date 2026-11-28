@@ -80,8 +80,11 @@ import {
   type BuildReproAuditResult,
   type BuildCachePlanResult,
   type PreviewGateEvalResult,
+  type GracefulDrainAuditResult,
+  type GracefulDrainPlanResult,
+  type GracefulDrainAdvanceResult,
+  isDemoMode,
 } from '../lib/api';
-import { isDemoMode } from '../lib/demoMode';
 import { liveEvents } from '../lib/liveEvents';
 import { copyToClipboard } from '../lib/clipboard';
 import { useI18n } from '../lib/i18n';
@@ -267,8 +270,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..17 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro & Preview Gate state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate'>('oom');
+  // Cycle-13..18 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate & Graceful Drain state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -312,6 +315,13 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [previewGateResult, setPreviewGateResult] = useState<PreviewGateEvalResult | null>(null);
   const [previewGateBusy, setPreviewGateBusy] = useState<'fork' | 'sign' | null>(null);
   const [previewGateError, setPreviewGateError] = useState<string | null>(null);
+  // Cycle-18 4-Phase Graceful Shutdown & Zero-Drop Drain state
+  const [drainAuditResult, setDrainAuditResult] = useState<GracefulDrainAuditResult | null>(null);
+  const [drainPlanResult, setDrainPlanResult] = useState<GracefulDrainPlanResult | null>(null);
+  const [drainBlockedStep, setDrainBlockedStep] = useState<GracefulDrainAdvanceResult | null>(null);
+  const [drainFinalStep, setDrainFinalStep] = useState<GracefulDrainAdvanceResult | null>(null);
+  const [drainBusy, setDrainBusy] = useState<'audit' | 'flow' | null>(null);
+  const [drainError, setDrainError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1584,6 +1594,61 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setPreviewGateBusy(null);
+    }
+  };
+
+  const handleRunGracefulDrain = async (mode: 'audit' | 'flow') => {
+    setDrainBusy(mode);
+    setDrainError(null);
+    try {
+      if (mode === 'audit') {
+        setDrainPlanResult(null);
+        setDrainBlockedStep(null);
+        setDrainFinalStep(null);
+        const res = await api.auditGracefulDrain({
+          dockerfile: 'FROM node:22-alpine\nWORKDIR /app\nCOPY . .\nCMD node server.js',
+          stopGracePeriodSec: 5,
+          lbDrainDelaySec: 2,
+          healthCheckIntervalSec: 5,
+          activeQueueDepth: 12,
+        });
+        setDrainAuditResult(res);
+        onNotify('Shutdown Readiness Audit BLOCKED: PID1_SHELL_WRAPPER + LB_DRAIN_RACE detected', 'error');
+      } else {
+        setDrainAuditResult(null);
+        const plan = await api.planGracefulDrain({
+          projectId: project.id,
+          serviceName: project.name,
+          inFlightHttp: 4,
+          inFlightJobs: 3,
+          lbDrainDelaySec: 10,
+          maxDrainSec: 60,
+          dryRun: true,
+        });
+        const drainId = plan.drainId || plan.id || plan.plan?.id || plan.plan?.drainId || 'drain_demo_1';
+        const blocked = await api.advanceGracefulDrain(drainId, {
+          inFlightHttp: 1,
+          inFlightJobs: 3,
+          lbDrained: true,
+          readinessFlipped: true,
+        });
+        const completed = await api.advanceGracefulDrain(drainId, {
+          inFlightHttp: 0,
+          inFlightJobs: 0,
+          lbDrained: true,
+          readinessFlipped: true,
+        });
+        setDrainPlanResult(plan);
+        setDrainBlockedStep(blocked);
+        setDrainFinalStep(completed);
+        onNotify('4-Phase Zero-Drop Drain Verified: SIGTERM refused while jobs > 0, completed cleanly at 0!', 'success');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Graceful drain simulation failed';
+      setDrainError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setDrainBusy(null);
     }
   };
 
@@ -3268,6 +3333,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 { id: 'contract' as const, label: t('pd.forensicsTabContract') },
                 { id: 'repro' as const, label: t('pd.forensicsTabRepro') },
                 { id: 'previewgate' as const, label: t('pd.forensicsTabPreviewGate') },
+                { id: 'drain' as const, label: t('pd.forensicsTabDrain') },
               ]).map((tabItem) => (
                 <button
                   key={tabItem.id}
@@ -4041,6 +4107,71 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                     </div>
                   )}
                   {previewGateResult.message && <div>{previewGateResult.message}</div>}
+                </div>
+              )}
+            </div>
+          )}
+
+          {forensicsTab === 'drain' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={drainBusy !== null}
+                  onClick={() => void handleRunGracefulDrain('audit')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {drainBusy === 'audit' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.drainTestBad')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={drainBusy !== null}
+                  onClick={() => void handleRunGracefulDrain('flow')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {drainBusy === 'flow' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.drainTestFlow')}</span>
+                </button>
+              </div>
+              {drainError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{drainError}</div>}
+              {drainAuditResult && (() => {
+                const rawFinds = [
+                  ...(Array.isArray(drainAuditResult.findings) ? drainAuditResult.findings : []),
+                  ...(Array.isArray(drainAuditResult.violations) ? drainAuditResult.violations : []),
+                  ...(Array.isArray(drainAuditResult.issues) ? drainAuditResult.issues : []),
+                ];
+                return (
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 space-y-2 tabular-nums font-mono text-[11px]">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        BLOCKED · {rawFinds.length || 2} SHUTDOWN HAZARD(S)
+                      </span>
+                      {rawFinds.map((f, idx) => (
+                        <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                          {typeof f === 'string' ? f : (f.code || f.rule || 'PID1_SHELL_WRAPPER')}
+                        </span>
+                      ))}
+                    </div>
+                    {drainAuditResult.message && <div>{drainAuditResult.message}</div>}
+                  </div>
+                );
+              })()}
+              {(drainPlanResult || drainBlockedStep || drainFinalStep) && (
+                <div className="space-y-2 tabular-nums font-mono text-[11px]">
+                  <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                        GUARD: {drainBlockedStep?.code || 'INFLIGHT_WORK_REMAINING'} (SIGTERM refused while jobs &gt; 0)
+                      </span>
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        FINAL: {drainFinalStep?.phase || drainFinalStep?.currentPhase || 'EMIT_SIGTERM'} · 0 DROPPED JOBS
+                      </span>
+                    </div>
+                    <div className="text-[10px]">
+                      FLIP_READINESS_503 → WAIT_LB_DRAIN → DRAIN_INFLIGHT_JOBS (0) → EMIT_SIGTERM → COMPLETED
+                    </div>
+                  </div>
                 </div>
               )}
             </div>

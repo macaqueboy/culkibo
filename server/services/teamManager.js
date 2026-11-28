@@ -4270,6 +4270,50 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:write');
     }
 
+    // Cycle-18: DB Query-Plan/Pool Guard, Network Micro-Seg Compiler, Dep Upgrade Planner, Streaming Log PII Scrubber & 4-Phase Graceful Drain
+    if (p === '/api/db/query-guard/analyze' || p === '/api/db/query-guard/pool-audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/db/query-guard/history') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/security/netseg/compile') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/security/netseg/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/security/netseg/policies') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/supply-chain/upgrades/cooldown') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/supply-chain/upgrades/plan') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/supply-chain/upgrades/plans') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/observability/pii-scrub/policy') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/observability/pii-scrub/test') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/observability/pii-scrub/ledger') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/deploys/drain/plan' || /^\/api\/deploys\/drain\/[^/]+\/advance$/.test(p)) {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/deploys/drain/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/deploys/drain/plans') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

@@ -54,6 +54,8 @@ import {
   type PiiMaskResult,
   type ReplicaTopologyResult,
   type ReplicaPromoteResult,
+  type DbQueryPlanResult,
+  type DbPoolAuditResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
@@ -201,6 +203,12 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [replicaPromo, setReplicaPromo] = useState<ReplicaPromoteResult | null>(null);
   const [replicaBusy, setReplicaBusy] = useState<'blocked' | 'safe' | null>(null);
   const [replicaError, setReplicaError] = useState<string | null>(null);
+
+  // Cycle-18 DB Query-Plan & Pool Exhaustion Regression Guard
+  const [qgPlanResult, setQgPlanResult] = useState<DbQueryPlanResult | null>(null);
+  const [qgPoolResult, setQgPoolResult] = useState<DbPoolAuditResult | null>(null);
+  const [qgBusy, setQgBusy] = useState<'bad' | 'safe' | null>(null);
+  const [qgError, setQgError] = useState<string | null>(null);
 
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
@@ -483,6 +491,74 @@ export const DatabasesPanel: React.FC<Props> = ({
       setPresignError(err instanceof Error ? err.message : 'Could not generate SigV4 presigned URL');
     } finally {
       setPresignBusy(false);
+    }
+  };
+
+  const handleRunQueryGuard = async (mode: 'bad' | 'safe') => {
+    setQgBusy(mode);
+    setQgError(null);
+    const isBad = mode === 'bad';
+    try {
+      const planJson = isBad
+        ? [
+            {
+              Plan: {
+                'Node Type': 'Seq Scan',
+                'Relation Name': 'orders',
+                'Plan Rows': 100,
+                'Actual Rows': 48000,
+                'Total Cost': 82400,
+                Plans: [{ 'Node Type': 'Sort', 'Sort Space Type': 'Disk', 'Plan Rows': 48000, 'Actual Rows': 48000, 'Total Cost': 14000 }],
+              },
+            },
+          ]
+        : [
+            {
+              Plan: {
+                'Node Type': 'Index Scan',
+                'Index Name': 'idx_orders_tenant_created',
+                'Relation Name': 'orders',
+                'Plan Rows': 120,
+                'Actual Rows': 115,
+                'Total Cost': 42.5,
+              },
+            },
+          ];
+      const queryTrace = isBad
+        ? Array.from({ length: 24 }, (_, i) => `SELECT * FROM order_items WHERE order_id = ${i + 1}`)
+        : ['SELECT * FROM orders WHERE tenant_id = $1 LIMIT 50'];
+      const [planRes, poolRes] = await Promise.all([
+        api.analyzeDbQueryPlan({
+          projectId,
+          planJson,
+          sql: isBad ? 'SELECT * FROM orders ORDER BY created_at DESC' : 'SELECT * FROM orders WHERE tenant_id = $1 LIMIT 50',
+          queryTrace,
+          tableRowThreshold: 10000,
+          costThreshold: 50000,
+        }),
+        api.auditDbPoolBudget({
+          maxConnections: 100,
+          reservedSuperuser: 5,
+          replicas: isBad ? 12 : 4,
+          poolSizePerReplica: 15,
+          pgbouncerMode: 'transaction',
+          idleTimeoutSec: isBad ? 0 : 30,
+        }),
+      ]);
+      setQgPlanResult(planRes);
+      setQgPoolResult(poolRes);
+      onNotify(
+        isBad
+          ? 'DB Query-Plan & Pool Guard BLOCKED: SEQ_SCAN_REGRESSION, POOL_OVERCOMMIT & N_PLUS_ONE_DETECTED'
+          : 'DB Query-Plan & Pool Guard VERIFIED: SAFE indexed scan + PgBouncer pool within budget (60 / 95)',
+        isBad ? 'error' : 'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'DB Query-Plan guard evaluation failed';
+      setQgError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setQgBusy(null);
     }
   };
 
@@ -2084,6 +2160,102 @@ export const DatabasesPanel: React.FC<Props> = ({
                     </li>
                   ))}
                 </ol>
+              )}
+            </div>
+          );
+        })()}
+      </section>
+
+      {/* Cycle-18: DB Query-Plan & Pool Exhaustion Regression Guard (PgBouncer / Prisma 7) */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <Database className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.qgTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  EXPLAIN JSON · PgBouncer / Prisma 7
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.qgDesc')}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+            <button
+              type="button"
+              disabled={qgBusy !== null}
+              onClick={() => void handleRunQueryGuard('bad')}
+              className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+            >
+              {qgBusy === 'bad' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+              <span>{qgBusy === 'bad' ? t('db.qgWorking') : t('db.qgTestBad')}</span>
+            </button>
+            <button
+              type="button"
+              disabled={qgBusy !== null}
+              onClick={() => void handleRunQueryGuard('safe')}
+              className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+            >
+              {qgBusy === 'safe' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+              <span>{qgBusy === 'safe' ? t('db.qgWorking') : t('db.qgTestSafe')}</span>
+            </button>
+          </div>
+        </div>
+
+        {qgError && (
+          <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{qgError}</div>
+        )}
+
+        {(qgPlanResult || qgPoolResult) && (() => {
+          const planFindings = [
+            ...(Array.isArray(qgPlanResult?.findings) ? qgPlanResult.findings : []),
+            ...(Array.isArray(qgPlanResult?.violations) ? qgPlanResult.violations : []),
+            ...(Array.isArray(qgPlanResult?.issues) ? qgPlanResult.issues : []),
+          ];
+          const poolFindings = [
+            ...(Array.isArray(qgPoolResult?.findings) ? qgPoolResult.findings : []),
+            ...(Array.isArray(qgPoolResult?.violations) ? qgPoolResult.violations : []),
+            ...(Array.isArray(qgPoolResult?.issues) ? qgPoolResult.issues : []),
+          ];
+          const codes: string[] = [];
+          for (const f of [...planFindings, ...poolFindings]) {
+            const c = typeof f === 'string' ? f : (f.code || f.rule || f.message || 'REGRESSION');
+            if (c && !codes.includes(c)) codes.push(c);
+          }
+          if (qgPlanResult?.nPlusOne?.detected && !codes.includes('N_PLUS_ONE_DETECTED')) {
+            codes.push(qgPlanResult.nPlusOne.code || 'N_PLUS_ONE_DETECTED');
+          }
+          const isSafe = codes.length === 0 && qgPlanResult?.safe !== false && qgPoolResult?.safe !== false;
+          return (
+            <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums font-mono text-[11px] ${
+              isSafe
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                : 'bg-red-50 border-red-200 text-red-700'
+            }`}>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                  {isSafe ? 'SAFE · INDEXED & POOL BUDGET OK' : `BLOCKED · ${codes.length} REGRESSION(S)`}
+                </span>
+                {qgPoolResult?.totalRequested != null && qgPoolResult?.availableBudget != null && (
+                  <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                    pool: {qgPoolResult.totalRequested} / {qgPoolResult.availableBudget} conns
+                  </span>
+                )}
+              </div>
+              {codes.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {codes.map((code, idx) => (
+                    <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                      {code}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {(qgPlanResult?.message || qgPoolResult?.message) && (
+                <div>{qgPlanResult?.message || qgPoolResult?.message}</div>
               )}
             </div>
           );

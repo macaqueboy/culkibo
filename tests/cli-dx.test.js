@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 170);
+    assert.strictEqual(demoJson.datasets.mcpTools, 175);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1165,7 +1165,56 @@ async function testCliDx() {
     const vpaFloorCli = await runCli(['rightsize-check', '--memory', '2', '--cpu', '0.5', '--json'], { env: isolatedEnv });
     assert.strictEqual(vpaFloorCli.status, 1, 'culkibo rightsize-check <4MiB debe salir con código 1');
     assert.strictEqual(JSON.parse(vpaFloorCli.stdout).limitsValidation.code, 'BELOW_DOCKER_MEMORY_FLOOR');
-    console.log(`  ✓ Pioneer CLI Cycle-17 verificado (culkibo repro-audit fail=1/pass=0, culkibo rightsize-check SHRINK/OOM+50%/floor=1, culkibo demo 170 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-17 verificado (culkibo repro-audit fail=1/pass=0, culkibo rightsize-check SHRINK/OOM+50%/floor=1)`);
+
+    // 22. Pioneer Cycle-18 CLI: `culkibo pool-audit` (overcommit/no-idle exit 1 vs safe exit 0) & `culkibo scrub-pii` (deterministic OTLP/JSON redaction, 0 raw PII)
+    const poolFailCli = await runCli([
+      'pool-audit',
+      '--max-conn', '100',
+      '--replicas', '8',
+      '--pool-size', '20',
+      '--idle-timeout', '0',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(poolFailCli.status, 1, 'culkibo pool-audit debe salir con código 1 ante POOL_OVERCOMMIT / MISSING_IDLE_TIMEOUT');
+    const poolFailJson = JSON.parse(poolFailCli.stdout);
+    assert.strictEqual(poolFailJson.ok, false);
+    assert.strictEqual(poolFailJson.safe, false);
+    const poolBlockerCodes = new Set(poolFailJson.blockers.map((b) => b.code));
+    assert.ok(poolBlockerCodes.has('POOL_OVERCOMMIT') && poolBlockerCodes.has('MISSING_IDLE_TIMEOUT'));
+
+    const poolOkCli = await runCli([
+      'pool-audit',
+      '--max-conn', '100',
+      '--replicas', '4',
+      '--pool-size', '15',
+      '--idle-timeout', '30',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(poolOkCli.status, 0, `culkibo pool-audit seguro falló: ${poolOkCli.stderr} ${poolOkCli.stdout}`);
+    assert.strictEqual(JSON.parse(poolOkCli.stdout).safe, true);
+
+    const piiSpanFile = path.join(tmpRoot, 'otlp-span-c18.json');
+    fs.writeFileSync(piiSpanFile, JSON.stringify({
+      attributes: {
+        orderId: '1234567890123456',
+        userEmail: 'alice.smith@example.com'
+      },
+      span: {
+        events: [{ name: 'charge', attributes: { note: 'Card 4532-0151-1283-0366 charged' } }]
+      }
+    }, null, 2), 'utf8');
+    const scrubCli = await runCli(['scrub-pii', piiSpanFile, '--json'], { env: isolatedEnv });
+    assert.strictEqual(scrubCli.status, 0, `culkibo scrub-pii falló: ${scrubCli.stderr} ${scrubCli.stdout}`);
+    assert.ok(!scrubCli.stdout.includes('alice.smith@example.com'), 'scrub-pii jamás debe imprimir email raw');
+    assert.ok(!scrubCli.stdout.includes('4532-0151-1283-0366'), 'scrub-pii jamás debe imprimir PAN PCI raw');
+    const scrubJson = JSON.parse(scrubCli.stdout);
+    assert.strictEqual(scrubJson.ok, true);
+    assert.strictEqual(scrubJson.scrubbed.attributes.orderId, '1234567890123456');
+    assert.strictEqual(scrubJson.scrubbed.attributes.userEmail, '[REDACTED:EMAIL]');
+    assert.ok(scrubJson.scrubbed.span.events[0].attributes.note.includes('[REDACTED:PCI_PAN]'));
+    assert.ok(scrubJson.redactedBytes > 0);
+    console.log(`  ✓ Pioneer CLI Cycle-18 verificado (culkibo pool-audit fail=1/safe=0, culkibo scrub-pii Luhn+OTLP 0 raw PII, culkibo demo 175 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

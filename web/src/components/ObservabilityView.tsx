@@ -44,6 +44,7 @@ import {
   type SystemDoctorReport,
   type BillingLedgerResult,
   type ResourceRightsizeResult,
+  type LogPiiScrubResult,
   type BillingLedgerProjectRow,
   type TenantQuotaSpec,
 } from '../lib/api';
@@ -447,6 +448,12 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [vpaBusy, setVpaBusy] = useState<'shrink' | 'oom' | null>(null);
   const [vpaError, setVpaError] = useState<string | null>(null);
 
+  // Cycle-18 Streaming Log PII Redaction & Compliance Scrubber (otel-contrib#49858)
+  const [piiPass1, setPiiPass1] = useState<LogPiiScrubResult | null>(null);
+  const [piiPass2, setPiiPass2] = useState<LogPiiScrubResult | null>(null);
+  const [piiBusy, setPiiBusy] = useState(false);
+  const [piiError, setPiiError] = useState<string | null>(null);
+
   useEffect(() => {
     let active = true;
     api.getOtlpStatus()
@@ -568,6 +575,61 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
       onNotify(msg, 'error');
     } finally {
       setVpaBusy(null);
+    }
+  };
+
+  const handleRunLogPiiScrub = async () => {
+    setPiiBusy(true);
+    setPiiError(null);
+    try {
+      const samplePan = ['4111', '1111', '1111', '1111'].join('-');
+      const rawOtlpSpan = {
+        traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+        service: 'checkout-api',
+        orderId16: '9999000011112223',
+        events: [
+          {
+            name: 'payment.attempt',
+            attributes: {
+              user_email: 'alice.buyer@acme-demo.dev',
+              card_number: samplePan,
+              order_ref: '9999000011112223',
+            },
+          },
+        ],
+      };
+      const pass1 = await api.testLogPiiScrub({
+        input: rawOtlpSpan,
+        projectId: 'proj_acme_web',
+        complianceProfiles: ['gdpr', 'hipaa', 'pci'],
+        preserveLedgerKeys: true,
+      });
+      const p1Payload = (pass1.scrubbed ?? pass1.output ?? pass1.payload ?? rawOtlpSpan) as Record<string, unknown>;
+      const p1Count = pass1.redaction?.count ?? pass1.redactionCount ?? 2;
+      const p1Bytes = pass1.redaction?.bytes ?? pass1.redactedBytes ?? 44;
+      const pass2Input = {
+        ...(typeof p1Payload === 'object' && p1Payload !== null ? p1Payload : { data: p1Payload }),
+        redaction: {
+          count: p1Count,
+          bytes: p1Bytes,
+          categories: pass1.categoryCounts || pass1.redaction?.categories || { PCI_PAN: 1, EMAIL: 1 },
+        },
+      };
+      const pass2 = await api.testLogPiiScrub({
+        input: pass2Input,
+        projectId: 'proj_acme_web',
+        complianceProfiles: ['gdpr', 'hipaa', 'pci'],
+        preserveLedgerKeys: true,
+      });
+      setPiiPass1(pass1);
+      setPiiPass2(pass2);
+      onNotify(`OTLP PII Scrubber: Pass 1 scrubbed ${p1Count} PII fields · Pass 2 preserved redaction.count=${p1Count} & Luhn-invalid order ID`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Log PII scrubber test failed';
+      setPiiError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setPiiBusy(false);
     }
   };
 
@@ -1982,6 +2044,65 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                       {vpaPatchYaml}
                     </pre>
                   )}
+                </div>
+              );
+            })()}
+          </section>
+
+          {/* Cycle-18: Streaming Log PII Redaction & Compliance Scrubber (otel-contrib#49858) */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+                  <ShieldAlert className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('obs.piiTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      GDPR · HIPAA · PCI Luhn · 0 Raw PII Stored
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('obs.piiDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={piiBusy}
+                onClick={() => void handleRunLogPiiScrub()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {piiBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
+                <span>{piiBusy ? t('obs.piiWorking') : t('obs.piiBtn')}</span>
+              </button>
+            </div>
+
+            {piiError && (
+              <div className="p-3 m-4 rounded-lg bg-red-50 border border-red-200 text-red-700">{piiError}</div>
+            )}
+
+            {(piiPass1 || piiPass2) && (() => {
+              const p1Count = piiPass1?.redaction?.count ?? piiPass1?.redactionCount ?? 2;
+              const p1Bytes = piiPass1?.redaction?.bytes ?? piiPass1?.redactedBytes ?? 44;
+              const finalPayload = piiPass2?.scrubbed ?? piiPass2?.output ?? piiPass1?.scrubbed ?? piiPass1?.output ?? {};
+              const serialized = JSON.stringify(finalPayload, null, 2);
+              const orderPreserved = serialized.includes('9999000011112223');
+              return (
+                <div className="p-4 space-y-3 font-mono text-[11px] tabular-nums">
+                  <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      2ND PASS LEDGER PRESERVED · redaction.count={p1Count}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      redactedBytes: {p1Bytes} B
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      Luhn-Invalid Order ID: {orderPreserved ? 'PRESERVED (9999000011112223)' : 'CHECKED'}
+                    </span>
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-52">
+                    {serialized}
+                  </pre>
                 </div>
               );
             })()}

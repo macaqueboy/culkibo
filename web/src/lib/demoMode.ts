@@ -4643,6 +4643,234 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     });
   }
 
+  // --- Cycle-18 DB Query-Plan/Pool Guard, NetSeg Compiler, Dep Cooldown Planner, Log PII Scrubber & 4-Phase Graceful Drain ---
+  if (pathname === '/api/db/query-guard/analyze' && method === 'POST') {
+    const planArr = Array.isArray(body.planJson) ? body.planJson : [body.planJson];
+    const rootPlan = planArr[0]?.Plan || planArr[0] || {};
+    const nodeType = String(rootPlan['Node Type'] || '');
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (nodeType === 'Seq Scan' && Number(rootPlan['Actual Rows'] || 0) >= 10000) {
+      findings.push({ code: 'SEQ_SCAN_REGRESSION', severity: 'high', message: `Sequential scan on "${rootPlan['Relation Name'] || 'orders'}" (${rootPlan['Actual Rows']} rows, cost ${rootPlan['Total Cost']}).` });
+    }
+    if (Number(rootPlan['Plan Rows'] || 0) > 0 && Number(rootPlan['Actual Rows'] || 0) / Number(rootPlan['Plan Rows']) > 10) {
+      findings.push({ code: 'ROW_ESTIMATE_SKEW', severity: 'medium', message: 'Planner estimate skewed >10× vs actual rows — run ANALYZE.' });
+    }
+    if (Array.isArray(rootPlan.Plans) && rootPlan.Plans.some((p: any) => p?.['Sort Space Type'] === 'Disk')) {
+      findings.push({ code: 'DISK_SORT_SPILL', severity: 'medium', message: 'Sort spilled to disk — add composite index or raise work_mem.' });
+    }
+    const trace = Array.isArray(body.queryTrace) ? body.queryTrace : [];
+    const nPlusOneDetected = trace.length >= 20;
+    if (nPlusOneDetected) {
+      findings.push({ code: 'N_PLUS_ONE_DETECTED', severity: 'high', message: `Detected ${trace.length} repeated parameterized queries in a single request trace.` });
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      allowed: findings.length === 0,
+      findings,
+      nPlusOne: { detected: nPlusOneDetected, code: nPlusOneDetected ? 'N_PLUS_ONE_DETECTED' : 'OK', count: trace.length },
+      message: findings.length === 0
+        ? 'Index Scan verified within cost/row thresholds and zero N+1 loops.'
+        : `Blocked: ${findings.length} query regression(s) detected before cutover.`,
+    });
+  }
+
+  if (pathname === '/api/db/query-guard/pool-audit' && method === 'POST') {
+    const maxConn = Number(body.maxConnections ?? 100);
+    const reserved = Number(body.reservedSuperuser ?? 5);
+    const replicas = Number(body.replicas ?? 4);
+    const poolSize = Number(body.poolSizePerReplica ?? 15);
+    const idleTimeout = Number(body.idleTimeoutSec ?? 30);
+    const availableBudget = Math.max(1, maxConn - reserved);
+    const totalRequested = replicas * poolSize;
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (totalRequested > availableBudget) {
+      findings.push({ code: 'POOL_OVERCOMMIT', severity: 'critical', message: `${replicas} replicas × ${poolSize} pool (${totalRequested}) exceeds ${availableBudget} available connections.` });
+    }
+    if (idleTimeout <= 0) {
+      findings.push({ code: 'MISSING_IDLE_TIMEOUT', severity: 'high', message: 'idleTimeoutSec <= 0 risks Prisma 7 / PgBouncer connection leaks.' });
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      allowed: findings.length === 0,
+      totalRequested,
+      availableBudget,
+      recommendedPoolSize: Math.max(1, Math.floor(availableBudget / Math.max(1, replicas))),
+      findings,
+      message: findings.length === 0
+        ? `Pool budget safe: ${totalRequested}/${availableBudget} connections with ${idleTimeout}s idle timeout.`
+        : `Pool exhaustion risk: ${totalRequested}/${availableBudget} requested.`,
+    });
+  }
+
+  if (pathname === '/api/security/netseg/audit' && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      isolated: false,
+      safe: false,
+      findings: [
+        { code: 'LATERAL_DB_EXPOSURE', severity: 'critical', message: 'Public service "frontend" shares flat bridge "dokploy-network" with database "postgres" (dokploy#2798).' },
+        { code: 'UNISOLATED_DATA_TIER', severity: 'high', message: 'Database tier lacks internal: true Docker network isolation.' },
+      ],
+      exposedServices: ['postgres'],
+    });
+  }
+
+  if (pathname === '/api/security/netseg/compile' && method === 'POST') {
+    const composeYaml = [
+      'networks:',
+      '  edge_ingress:',
+      '    driver: bridge',
+      '  app_internal:',
+      '    driver: bridge',
+      '    internal: true',
+      '  data_postgres:',
+      '    driver: bridge',
+      '    internal: true',
+      'services:',
+      '  frontend: { networks: [edge_ingress, app_internal] }',
+      '  api:      { networks: [app_internal, data_postgres] }',
+      '  postgres: { networks: [data_postgres] }',
+    ].join('\n');
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      frontendToDbBlocked: true,
+      composeYaml,
+      yaml: composeYaml,
+      message: 'Compiled least-privilege internal: true networks with zero frontend → database path.',
+    });
+  }
+
+  if (pathname === '/api/supply-chain/upgrades/plan' && method === 'POST') {
+    const items = [
+      { name: 'express', from: '4.21.1', to: '4.21.2', bucket: 'FAST_TRACK_CVE', cveIds: ['CVE-2026-44102'], ageHours: 2, reason: 'Active high-severity CVE bypasses 168h cooldown.' },
+      { name: 'lodash-es', from: '4.17.21', to: '4.17.22', bucket: 'COOLDOWN_HOLD', ageHours: 6, reason: 'Published 6h ago (< 168h minimumReleaseAge).' },
+      { name: 'pino', from: '9.5.0', to: '9.6.0', bucket: 'SAFE_PATCH_MINOR', ageHours: 240, reason: 'Aged minor release passed 7d cooldown.' },
+      { name: 'prisma', from: '6.4.0', to: '7.0.0', bucket: 'MAJOR_MANUAL_REVIEW', ageHours: 300, reason: 'Breaking major version requires manual review.' },
+    ];
+    return jsonResponse({
+      ok: true,
+      items,
+      fastTrackCve: [items[0]],
+      cooldownHold: [items[1]],
+      safePatchMinor: [items[2]],
+      majorManualReview: [items[3]],
+      summary: { FAST_TRACK_CVE: 1, COOLDOWN_HOLD: 1, SAFE_PATCH_MINOR: 1, MAJOR_MANUAL_REVIEW: 1 },
+    });
+  }
+
+  if (pathname === '/api/supply-chain/upgrades/cooldown' && method === 'POST') {
+    const mins = Number(body.minReleaseAgeMinutes ?? 10080);
+    const exclude = Array.isArray(body.exclude) ? body.exclude : ['express'];
+    const npmrc = `minimum-release-age=${mins}\nminimum-release-age-exclude=${exclude.join(',')}`;
+    const pnpmWorkspaceYaml = `minimumReleaseAge: ${mins}\nminimumReleaseAgeExclude:\n${exclude.map((x: string) => `  - ${x}`).join('\n')}`;
+    return jsonResponse({ ok: true, dryRun: body.dryRun !== false, manager: 'pnpm', npmrc, pnpmWorkspaceYaml, files: { '.npmrc': npmrc, 'pnpm-workspace.yaml': pnpmWorkspaceYaml } });
+  }
+
+  if (pathname === '/api/observability/pii-scrub/test' && method === 'POST') {
+    const raw = body.input && typeof body.input === 'object' ? JSON.parse(JSON.stringify(body.input)) : {};
+    const existingLedger = raw.redaction && typeof raw.redaction === 'object' ? raw.redaction : null;
+    let newlyRedacted = 0;
+    const walk = (node: any): any => {
+      if (typeof node === 'string') {
+        let out = node;
+        if (/\b4111[- ]?1111[- ]?1111[- ]?1111\b/.test(out)) {
+          out = out.replace(/\b4111[- ]?1111[- ]?1111[- ]?1111\b/g, '[REDACTED:PCI_PAN]');
+          newlyRedacted += 1;
+        }
+        if (/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(out)) {
+          out = out.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[REDACTED:EMAIL]');
+          newlyRedacted += 1;
+        }
+        return out;
+      }
+      if (Array.isArray(node)) return node.map(walk);
+      if (node && typeof node === 'object') {
+        const resObj: Record<string, any> = {};
+        for (const [k, v] of Object.entries(node)) {
+          resObj[k] = k === 'redaction' ? v : walk(v);
+        }
+        return resObj;
+      }
+      return node;
+    };
+    const scrubbed = walk(raw);
+    const totalCount = existingLedger?.count != null ? Number(existingLedger.count) + newlyRedacted : newlyRedacted;
+    const totalBytes = existingLedger?.bytes != null ? Number(existingLedger.bytes) + newlyRedacted * 22 : newlyRedacted * 22;
+    if (existingLedger) {
+      scrubbed.redaction = { ...existingLedger, count: totalCount, bytes: totalBytes };
+    }
+    return jsonResponse({
+      ok: true,
+      scrubbed,
+      redactionCount: totalCount,
+      redactedBytes: totalBytes,
+      categoryCounts: { PCI_PAN: 1, EMAIL: 1 },
+      ledgerPreserved: Boolean(existingLedger),
+      redaction: { count: totalCount, bytes: totalBytes, categories: { PCI_PAN: 1, EMAIL: 1 } },
+    });
+  }
+
+  if (pathname === '/api/deploys/drain/audit' && method === 'POST') {
+    const df = String(body.dockerfile || '');
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (/^\s*(CMD|ENTRYPOINT)\s+[^[\s]/im.test(df)) {
+      findings.push({ code: 'PID1_SHELL_WRAPPER', severity: 'critical', message: 'Shell-form CMD wraps PID 1 in /bin/sh — SIGTERM is swallowed; switch to exec-form CMD ["node","server.js"].' });
+    }
+    if (Number(body.lbDrainDelaySec ?? 0) < Number(body.healthCheckIntervalSec ?? 5) * 2) {
+      findings.push({ code: 'LB_DRAIN_RACE', severity: 'high', message: 'lbDrainDelaySec < 2 × healthCheckIntervalSec causes rolling 502/503s (coolify#8627).' });
+    }
+    return jsonResponse({
+      ok: true,
+      ready: findings.length === 0,
+      safe: findings.length === 0,
+      findings,
+      message: findings.length === 0 ? 'Container shutdown readiness verified.' : `Blocked: ${findings.length} zero-drop shutdown hazard(s) detected.`,
+    });
+  }
+
+  if (pathname === '/api/deploys/drain/plan' && method === 'POST') {
+    const drainId = `drain_${Date.now().toString(36)}`;
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      drainId,
+      id: drainId,
+      phase: 'FLIP_READINESS_503',
+      phases: ['FLIP_READINESS_503', 'WAIT_LB_DRAIN', 'DRAIN_INFLIGHT_JOBS', 'EMIT_SIGTERM', 'COMPLETED'],
+    });
+  }
+
+  const drainAdvMatch = pathname.match(/^\/api\/deploys\/drain\/([^/]+)\/advance$/);
+  if (drainAdvMatch && method === 'POST') {
+    const jobs = Number(body.inFlightJobs ?? 0);
+    const http = Number(body.inFlightHttp ?? 0);
+    const lbDrained = Boolean(body.lbDrained);
+    if (jobs > 0 || http > 0 || !lbDrained) {
+      return jsonResponse({
+        ok: false,
+        blocked: true,
+        code: 'INFLIGHT_WORK_REMAINING',
+        phase: 'DRAIN_INFLIGHT_JOBS',
+        completed: false,
+        droppedJobs: 0,
+        message: `Refused EMIT_SIGTERM: ${http} HTTP + ${jobs} background job(s) still draining.`,
+      });
+    }
+    return jsonResponse({
+      ok: true,
+      blocked: false,
+      code: 'DRAIN_COMPLETED',
+      phase: 'COMPLETED',
+      nextPhase: 'COMPLETED',
+      completed: true,
+      droppedJobs: 0,
+      message: 'All in-flight HTTP & queue jobs drained to 0; EMIT_SIGTERM issued with 0 dropped jobs.',
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -4820,16 +5048,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (170 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (175 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 170 MCP tools on demand without bloating context (-91%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 175 MCP tools on demand without bloating context (-92%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_query_plan_guard', description: 'Postgres EXPLAIN JSON regression guard (Seq Scan, >10x skew, Disk sort), N+1 trace & PgBouncer/Prisma 7 pool budget auditor', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_netseg_policy', description: 'Container network micro-segmentation compiler isolating internal: true app_internal & per-DB data_<db> networks (dokploy#2798)', readOnly: false, profile: 'security' },
+      { name: 'culkibo_dep_upgrade_plan', description: 'CVE fast-track & transitive cooldown dependency upgrade planner emitting synced .npmrc + pnpm-workspace.yaml', readOnly: false, profile: 'security' },
+      { name: 'culkibo_log_pii_scrubber', description: 'Ordered streaming GDPR/HIPAA/PCI log & OTLP span.events[] PII scrubber with Luhn PAN validation & chained-pass ledger preservation', readOnly: false, profile: 'security' },
+      { name: 'culkibo_graceful_drain', description: 'PID-1 shell-CMD readiness auditor & 4-phase zero-drop stateful shutdown state machine blocking SIGTERM while jobs > 0 (coolify#8627)', readOnly: false, profile: 'deploy' },
       { name: 'culkibo_build_reproducibility', description: 'BuildKit reproducible Dockerfile/lockfile auditor & lockfile-scoped isolated cache planner (moby/buildkit#4762)', readOnly: true, profile: 'deploy' },
       { name: 'culkibo_preview_gate', description: 'PR-Preview fork-approval SHA-pinned gate, composite smoke verifier & HMAC-SHA256 commit status reporter', readOnly: false, profile: 'deploy' },
       { name: 'culkibo_edge_cache_purge', description: 'Surrogate-Key multi-edge cache invalidation (Caddy/Cloudflare/Fastly) & private/no-store stampede coalescer (souin#884/#850)', readOnly: false, profile: 'ops' },
@@ -4886,27 +5119,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 170 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 175 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 170, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 175, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_resource_rightsize', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_incident_postmortem', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_query_plan_guard', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_log_pii_scrubber', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 170,
-      profiles: { core: { count: 17, savedPct: 91 } },
+      totalTools: 175,
+      profiles: { core: { count: 17, savedPct: 92 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

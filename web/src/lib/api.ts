@@ -1,10 +1,56 @@
-import { isDemoMode, handleDemoFetch } from './demoMode';
-
 const API_BASE = '/api';
 const TOKEN_STORAGE_KEY = 'culkibo_control_token';
+const DEMO_STORAGE_KEY = 'culkibo_demo_mode';
 
 let _cachedToken: string | null | undefined;
 let _unauthorizedHandler: (() => void) | null = null;
+let _cachedDemo: boolean | null = null;
+
+type DemoFetchHandler = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+let _demoFetchHandler: DemoFetchHandler | null = null;
+let _demoLoadPromise: Promise<DemoFetchHandler> | null = null;
+
+export function isDemoMode(): boolean {
+  if (_cachedDemo !== null) return _cachedDemo;
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    _cachedDemo = true;
+    return true;
+  }
+  if (typeof window === 'undefined') return false;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get('demo')?.toLowerCase();
+    if (q === '0' || q === 'false') {
+      window.sessionStorage.removeItem(DEMO_STORAGE_KEY);
+      _cachedDemo = false;
+      return false;
+    }
+    if (q === '1' || q === 'true') {
+      window.sessionStorage.setItem(DEMO_STORAGE_KEY, '1');
+      _cachedDemo = true;
+      return true;
+    }
+    if (window.sessionStorage.getItem(DEMO_STORAGE_KEY) === '1') {
+      _cachedDemo = true;
+      return true;
+    }
+  } catch {
+    // ignore storage/URL restrictions
+  }
+  _cachedDemo = false;
+  return false;
+}
+
+export function loadDemoRuntime(): Promise<DemoFetchHandler> {
+  if (_demoFetchHandler) return Promise.resolve(_demoFetchHandler);
+  if (!_demoLoadPromise) {
+    _demoLoadPromise = import('./demoMode').then((mod) => {
+      _demoFetchHandler = mod.handleDemoFetch;
+      return mod.handleDemoFetch;
+    });
+  }
+  return _demoLoadPromise;
+}
 
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
   _unauthorizedHandler = handler;
@@ -41,7 +87,8 @@ export function clearAuthToken(): void {
 
 export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   if (isDemoMode()) {
-    return handleDemoFetch(input, init);
+    const handler = _demoFetchHandler || (await loadDemoRuntime());
+    return handler(input, init);
   }
   const token = getAuthToken();
   const headers = new Headers(init.headers || {});
@@ -6132,6 +6179,183 @@ export const api = {
     }
     throw new Error(data?.error || data?.message || 'Preview gate evaluation failed');
   },
+
+  // --- Cycle-18: DB Query-Plan/Pool Guard, NetSeg Compiler, Dep Cooldown Planner, Log PII Scrubber & 4-Phase Graceful Drain ---
+
+  async analyzeDbQueryPlan(payload: {
+    projectId?: string;
+    planJson: unknown;
+    sql?: string;
+    queryTrace?: string[];
+    tableRowThreshold?: number;
+    costThreshold?: number;
+  }): Promise<DbQueryPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/db/query-guard/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'DB query-plan analysis failed'
+    );
+  },
+
+  async auditDbPoolBudget(payload: {
+    maxConnections?: number;
+    reservedSuperuser?: number;
+    replicas?: number;
+    poolSizePerReplica?: number;
+    pgbouncerMode?: string;
+    idleTimeoutSec?: number;
+  }): Promise<DbPoolAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/db/query-guard/pool-audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'DB connection pool audit failed'
+    );
+  },
+
+  async auditNetSegLateral(payload: {
+    services: Array<Record<string, unknown>>;
+    networks?: Record<string, unknown>;
+    sharedNetworkName?: string;
+  }): Promise<NetSegAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/netseg/audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Container network lateral-movement audit failed'
+    );
+  },
+
+  async compileNetSegPolicy(payload: {
+    projectId?: string;
+    services: Array<Record<string, unknown>>;
+    allowedEdges?: Array<{ from: string; to: string }>;
+    ingressServices?: string[];
+    dryRun?: boolean;
+  }): Promise<NetSegCompileResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/netseg/compile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Network micro-segmentation compilation failed'
+    );
+  },
+
+  async planDepUpgrades(payload: {
+    projectId?: string;
+    dependencies: Array<Record<string, unknown>>;
+    advisories?: Array<Record<string, unknown>>;
+    minReleaseAgeHours?: number;
+    nowIso?: string;
+  }): Promise<DepUpgradePlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/supply-chain/upgrades/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Dependency upgrade planning failed'
+    );
+  },
+
+  async generateDepCooldownConfig(payload: {
+    manager?: 'pnpm' | 'npm' | 'yarn';
+    minReleaseAgeMinutes?: number;
+    exclude?: string[];
+    dryRun?: boolean;
+  }): Promise<DepCooldownConfigResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/supply-chain/upgrades/cooldown`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Package-manager cooldown config generation failed'
+    );
+  },
+
+  async testLogPiiScrub(payload: {
+    input: unknown;
+    projectId?: string;
+    complianceProfiles?: string[];
+    preserveLedgerKeys?: boolean;
+    maxDepth?: number;
+  }): Promise<LogPiiScrubResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/pii-scrub/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Log PII scrubber test failed'
+    );
+  },
+
+  async auditGracefulDrain(payload: {
+    dockerfile: string;
+    stopGracePeriodSec?: number;
+    lbDrainDelaySec?: number;
+    healthCheckIntervalSec?: number;
+    activeQueueDepth?: number;
+  }): Promise<GracefulDrainAuditResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/deploys/drain/audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      'Graceful shutdown readiness audit failed'
+    );
+  },
+
+  async planGracefulDrain(payload: {
+    projectId: string;
+    serviceName?: string;
+    inFlightHttp?: number;
+    inFlightJobs?: number;
+    lbDrainDelaySec?: number;
+    maxDrainSec?: number;
+    dryRun?: boolean;
+  }): Promise<GracefulDrainPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/deploys/drain/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Graceful drain plan failed'
+    );
+  },
+
+  async advanceGracefulDrain(
+    drainId: string,
+    payload: {
+      inFlightHttp?: number;
+      inFlightJobs?: number;
+      lbDrained?: boolean;
+      readinessFlipped?: boolean;
+    }
+  ): Promise<GracefulDrainAdvanceResult> {
+    const res = await apiFetch(`${API_BASE}/deploys/drain/${encodeURIComponent(drainId)}/advance`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.blocked === true || data?.code === 'INFLIGHT_WORK_REMAINING') {
+      return data as GracefulDrainAdvanceResult;
+    }
+    throw new Error(data?.error || data?.message || 'Graceful drain state advance failed');
+  },
 };
 
 // =====================================================================
@@ -8267,5 +8491,137 @@ export interface PreviewGateEvalResult {
     algorithm?: string;
   };
   signature?: string;
+  message?: string;
+}
+
+// --- Cycle-18 DB Query-Plan/Pool Guard, NetSeg Compiler, Dep Cooldown Planner, Log PII Scrubber & 4-Phase Graceful Drain Types ---
+
+export type GuardFindingItem = string | { code?: string; rule?: string; severity?: string; message?: string; detail?: string };
+
+export interface DbQueryPlanResult {
+  ok?: boolean;
+  safe?: boolean;
+  allowed?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  violations?: GuardFindingItem[];
+  issues?: GuardFindingItem[];
+  nPlusOne?: { detected?: boolean; code?: string; count?: number; pattern?: string; findings?: GuardFindingItem[] };
+  message?: string;
+}
+
+export interface DbPoolAuditResult {
+  ok?: boolean;
+  safe?: boolean;
+  allowed?: boolean;
+  code?: string;
+  totalRequested?: number;
+  availableBudget?: number;
+  findings?: GuardFindingItem[];
+  violations?: GuardFindingItem[];
+  issues?: GuardFindingItem[];
+  recommendedPoolSize?: number;
+  message?: string;
+}
+
+export interface NetSegAuditResult {
+  ok?: boolean;
+  isolated?: boolean;
+  safe?: boolean;
+  findings?: GuardFindingItem[];
+  violations?: GuardFindingItem[];
+  exposedServices?: string[];
+  message?: string;
+}
+
+export interface NetSegCompileResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  policy?: Record<string, unknown>;
+  networks?: Record<string, unknown>;
+  composeYaml?: string;
+  yaml?: string;
+  frontendToDbBlocked?: boolean;
+  message?: string;
+}
+
+export interface DepUpgradeItem {
+  name: string;
+  from?: string;
+  to?: string;
+  bucket?: string;
+  classification?: string;
+  decision?: string;
+  cveIds?: string[];
+  ageHours?: number | null;
+  reason?: string;
+}
+
+export interface DepUpgradePlanResult {
+  ok?: boolean;
+  items?: DepUpgradeItem[];
+  buckets?: Record<string, DepUpgradeItem[]>;
+  fastTrackCve?: DepUpgradeItem[];
+  cooldownHold?: DepUpgradeItem[];
+  safePatchMinor?: DepUpgradeItem[];
+  majorManualReview?: DepUpgradeItem[];
+  summary?: Record<string, number>;
+  message?: string;
+}
+
+export interface DepCooldownConfigResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  manager?: string;
+  npmrc?: string;
+  pnpmWorkspaceYaml?: string;
+  files?: Record<string, string>;
+}
+
+export interface LogPiiScrubResult {
+  ok?: boolean;
+  scrubbed?: unknown;
+  output?: unknown;
+  payload?: unknown;
+  redactionCount?: number;
+  redactedBytes?: number;
+  categoryCounts?: Record<string, number>;
+  sha256Pre?: string;
+  sha256Post?: string;
+  ledgerPreserved?: boolean;
+  redaction?: { count?: number; bytes?: number; categories?: Record<string, number> };
+}
+
+export interface GracefulDrainAuditResult {
+  ok?: boolean;
+  ready?: boolean;
+  safe?: boolean;
+  findings?: GuardFindingItem[];
+  violations?: GuardFindingItem[];
+  issues?: GuardFindingItem[];
+  message?: string;
+}
+
+export interface GracefulDrainPlanResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  drainId?: string;
+  id?: string;
+  phase?: string;
+  currentPhase?: string;
+  phases?: string[];
+  plan?: { id?: string; drainId?: string; phase?: string; currentPhase?: string; phases?: string[] };
+  message?: string;
+}
+
+export interface GracefulDrainAdvanceResult {
+  ok?: boolean;
+  blocked?: boolean;
+  code?: string;
+  phase?: string;
+  currentPhase?: string;
+  nextPhase?: string;
+  completed?: boolean;
+  droppedJobs?: number;
   message?: string;
 }

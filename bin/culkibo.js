@@ -68,7 +68,9 @@ const svc = {
   get apiContractGateService() { return require('../server/services/apiContractGateService'); },
   get dnsCutoverService() { return require('../server/services/dnsCutoverService'); },
   get reproducibleBuildService() { return require('../server/services/reproducibleBuildService'); },
-  get resourceRightsizerService() { return require('../server/services/resourceRightsizerService'); }
+  get resourceRightsizerService() { return require('../server/services/resourceRightsizerService'); },
+  get queryPlanGuardService() { return require('../server/services/queryPlanGuardService'); },
+  get logPiiScrubberService() { return require('../server/services/logPiiScrubberService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2891,15 +2893,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 170,
+            mcpTools: 175,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '170 MCP tools (-91.1% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'Build Repro Verifier, Preview Smoke-Gate, Surrogate Edge Cache, VPA-Lite Rightsizer & Blameless Postmortem'
+            '175 MCP tools (-91.6% core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'DB Query/Pool Guard, Network Micro-Seg, Dep Upgrade Cooldown, Stream PII Scrubber & 4-Phase Graceful Drain'
           ]
         };
       };
@@ -4454,6 +4456,133 @@ program
       }
       console.log('');
       if (!limitsValidation.valid) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    } finally {
+      try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (e) {}
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-18 CLI: pool-audit (PgBouncer/Prisma) & scrub-pii (GDPR/HIPAA/PCI)
+// ===========================================================================
+
+program
+  .command('pool-audit')
+  .description('DB Connection Pool Exhaustion Guard (PgBouncer / Prisma 7): sale con código 1 ante POOL_OVERCOMMIT o MISSING_IDLE_TIMEOUT')
+  .option('--max-conn <n>', 'max_connections del servidor Postgres', '100')
+  .option('--reserved <n>', 'Conexiones reservadas para superuser', '5')
+  .option('--replicas <n>', 'Número de réplicas de aplicación', '1')
+  .option('--pool-size <n>', 'Tamaño de pool de conexiones por réplica', '10')
+  .option('--idle-timeout <sec>', 'Timeout de conexiones inactivas en segundos (0 = fuga)', '30')
+  .option('--pgbouncer <mode>', 'Modo PgBouncer: transaction | session | statement | none', 'transaction')
+  .option('--json', 'Salida JSON estructurada')
+  .action((options) => {
+    try {
+      const qpSvc = svc.queryPlanGuardService;
+      const result = qpSvc.auditPoolBudget({
+        maxConnections: Number(options.maxConn ?? 100),
+        reservedSuperuser: Number(options.reserved ?? 5),
+        replicas: Number(options.replicas ?? 1),
+        poolSizePerReplica: Number(options.poolSize ?? 10),
+        idleTimeoutSec: Number(options.idleTimeout ?? 30),
+        pgbouncerMode: String(options.pgbouncer || 'transaction')
+      });
+      const blockers = Array.isArray(result?.blockers) ? result.blockers : [];
+      const hasBlocker = blockers.some((f) => f && (f.code === 'POOL_OVERCOMMIT' || f.code === 'MISSING_IDLE_TIMEOUT'));
+      const safe = Boolean(result && result.safe !== false && result.allowed !== false && !hasBlocker);
+      const payload = {
+        ...result,
+        ok: safe,
+        safe
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!safe) process.exitCode = 1;
+        return;
+      }
+
+      const badge = safe ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mOVERCOMMIT / UNSAFE ❌\x1b[0m';
+      console.log(`\n🗄️  Culkibo DB Connection Pool Budget Audit — [${badge}]`);
+      console.log(`   Blockers:  ${blockers.length}`);
+      console.log('');
+      if (!safe) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('scrub-pii [inputFile]')
+  .description('Streaming Log PII Redaction & GDPR/HIPAA/PCI Scrubber (orden determinista, verificación Luhn PCI y ledger sin eco de PII raw)')
+  .option('--text <str>', 'Texto, JSON o NDJSON directo a depurar')
+  .option('--profiles <csv>', 'Perfiles de cumplimiento CSV (gdpr,hipaa,pci)', 'gdpr,hipaa,pci')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    const osMod = require('os');
+    const scratchDir = fs.mkdtempSync(path.join(osMod.tmpdir(), 'culkibo-cli-scrub-'));
+    try {
+      const scrubMod = svc.logPiiScrubberService;
+      const scrubInst = typeof scrubMod.LogPiiScrubberService === 'function'
+        ? new scrubMod.LogPiiScrubberService({ dataDir: scratchDir })
+        : scrubMod;
+      const complianceProfiles = String(options.profiles || 'gdpr,hipaa,pci')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+
+      /** @type {any} */
+      let rawInput;
+      /** @type {string | null} */
+      let sourceFile = null;
+      if (typeof options.text === 'string' && options.text.length > 0) {
+        rawInput = options.text;
+      } else if (inputFile) {
+        sourceFile = path.resolve(String(inputFile));
+        if (!fs.existsSync(sourceFile)) {
+          throw new Error(`Archivo de entrada no encontrado: ${sourceFile}`);
+        }
+        rawInput = fs.readFileSync(sourceFile, 'utf8');
+      } else {
+        throw new Error('Proporciona un archivo <inputFile> o el flag --text "<texto>".');
+      }
+
+      /** @type {any} */
+      let parsedInput = rawInput;
+      const trimmed = String(rawInput).trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          parsedInput = JSON.parse(trimmed);
+        } catch (e) {
+          parsedInput = rawInput;
+        }
+      }
+
+      const opts = {
+        complianceProfiles,
+        preserveLedgerKeys: true,
+        persist: false
+      };
+      const isNdjson = typeof parsedInput === 'string' && parsedInput.includes('\n') && parsedInput.trim().startsWith('{');
+      const result = isNdjson
+        ? scrubInst.scrubStreamChunk(parsedInput, opts)
+        : scrubInst.scrubPayload(parsedInput, opts);
+
+      const payload = {
+        ...result,
+        ok: true,
+        ...(sourceFile ? { file: sourceFile } : {})
+      };
+
+      if (isJsonMode(options)) {
+        return printJson(payload);
+      }
+
+      console.log(`\n🛡️  Culkibo Streaming Log PII Scrubber (${complianceProfiles.join(', ')})`);
+      console.log(`   Redacted bytes: ${result.redactedBytes ?? 0}`);
+      console.log(typeof result.scrubbed === 'string' ? result.scrubbed : JSON.stringify(result.scrubbed, null, 2));
+      console.log('');
     } catch (err) {
       failCli(err, options);
     } finally {

@@ -136,6 +136,11 @@ function getPreviewGateService() { return _lazyV2.previewgate || (_lazyV2.previe
 function getEdgeCacheService() { return _lazyV2.edgecache || (_lazyV2.edgecache = require('../services/edgeCacheService')); }
 function getResourceRightsizerService() { return _lazyV2.rightsizer || (_lazyV2.rightsizer = require('../services/resourceRightsizerService')); }
 function getPostmortemCorrelatorService() { return _lazyV2.postmortem || (_lazyV2.postmortem = require('../services/postmortemCorrelatorService')); }
+function getQueryPlanGuardService() { return _lazyV2.queryguard || (_lazyV2.queryguard = require('../services/queryPlanGuardService')); }
+function getNetSegCompilerService() { return _lazyV2.netseg || (_lazyV2.netseg = require('../services/netSegCompilerService')); }
+function getDepUpgradePlannerService() { return _lazyV2.depupgrade || (_lazyV2.depupgrade = require('../services/depUpgradePlannerService')); }
+function getLogPiiScrubberService() { return _lazyV2.piiscrubber || (_lazyV2.piiscrubber = require('../services/logPiiScrubberService')); }
+function getGracefulDrainService() { return _lazyV2.gracefuldrain || (_lazyV2.gracefuldrain = require('../services/gracefulDrainService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -10016,6 +10021,282 @@ router.post('/incidents/postmortems', certAndAdminLimiter, async (req, res) => {
       postmortem: pmObj,
       markdown
     });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// --- CYCLE #18 MILESTONE LAZY ROUTES (175 MCP Tools -91.6% Core & 77 Suites — 0 boot RAM impact) ---
+
+// 1. DB Query-Plan & Pool Exhaustion Regression Guard (PgBouncer v1.25+, Prisma 7)
+router.get('/db/query-guard/history', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getQueryPlanGuardService().listQueryGuardHistory(projectId);
+    const history = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.history) ? raw.history : []);
+    res.json({ ok: true, projectId: projectId || null, count: history.length, history });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/db/query-guard/analyze', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getQueryPlanGuardService();
+    if (body.poolConfig || body.queryTrace) {
+      const out = await svc.evaluateDbCutoverGate(body);
+      return res.json(out);
+    }
+    const out = await svc.analyzeExplainPlan(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/db/query-guard/pool-audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getQueryPlanGuardService().auditPoolBudget(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Container Network Micro-Segmentation & Lateral-Movement Compiler (`dokploy#2798`/`#2987`)
+router.get('/security/netseg/policies', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getNetSegCompilerService().listSegmentationPolicies(projectId);
+    const policies = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.policies) ? raw.policies : []);
+    res.json({ ok: true, projectId: projectId || null, count: policies.length, policies });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/netseg/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getNetSegCompilerService().auditLateralMovement(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/netseg/compile', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden compilar políticas de micro-segmentación', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const svc = getNetSegCompilerService();
+    const compiled = await svc.compileSegmentationPolicy({
+      ...body,
+      persist: !dryRun
+    });
+    let compose = null;
+    try {
+      compose = await svc.renderComposeNetworks(compiled && compiled.policy ? compiled.policy : compiled);
+    } catch (e) {}
+    res.json({
+      ...(compiled && typeof compiled === 'object' ? compiled : { ok: true, policy: compiled }),
+      dryRun,
+      persisted: !dryRun,
+      ...(compose ? { compose } : {})
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Security Patch & Transitive Dependency Upgrade Planner (`pnpm`/`Renovate`/`Dependabot`)
+router.get('/supply-chain/upgrades/plans', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getDepUpgradePlannerService().listUpgradePlans(projectId);
+    const plans = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.plans) ? raw.plans : []);
+    res.json({ ok: true, projectId: projectId || null, count: plans.length, plans });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/supply-chain/upgrades/plan', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getDepUpgradePlannerService().planDependencyUpgrades(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/supply-chain/upgrades/cooldown', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar políticas de cooldown de dependencias', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getDepUpgradePlannerService().generatePackageManagerCooldown(body);
+    res.json({
+      ...(out && typeof out === 'object' ? out : { ok: true, config: out }),
+      dryRun
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Streaming Log PII Redaction & GDPR/HIPAA/PCI Scrubber (`otel-contrib#49858`/`#36633`/`#50770`)
+router.get('/observability/pii-scrub/ledger', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const out = await getLogPiiScrubberService().getRedactionLedger(projectId);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/observability/pii-scrub/test', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getLogPiiScrubberService();
+    if (typeof body.ndjsonChunk === 'string') {
+      const out = await svc.scrubStreamChunk(body.ndjsonChunk, body);
+      return res.json(out);
+    }
+    const payload = body.payload !== undefined ? body.payload : (body.input !== undefined ? body.input : body);
+    const out = await svc.scrubPayload(payload, {
+      projectId: body.projectId,
+      complianceProfiles: body.complianceProfiles,
+      preserveLedgerKeys: body.preserveLedgerKeys !== undefined ? Boolean(body.preserveLedgerKeys) : true,
+      maxDepth: body.maxDepth,
+      persist: Boolean(body.persist)
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/observability/pii-scrub/policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden modificar políticas de redacción PII', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'modificar la política global de redacción PII')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const svc = getLogPiiScrubberService();
+    if (dryRun) {
+      return res.json({
+        ok: true,
+        dryRun: true,
+        persisted: false,
+        proposedPolicy: body,
+        ruleCount: Array.isArray(svc.SCRUB_RULES_ORDERED) ? svc.SCRUB_RULES_ORDERED.length : 0
+      });
+    }
+    const saved = await svc.upsertScrubPolicy(body);
+    res.json({
+      ...(saved && typeof saved === 'object' ? saved : { ok: true, policy: saved }),
+      dryRun: false,
+      persisted: true
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Graceful Stateful Shutdown & Zero-Drop Queue/Webhook Drain (`coolify#8627`, `kamal-proxy`)
+router.get('/deploys/drain/plans', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getGracefulDrainService().listDrainPlans(projectId);
+    const plans = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.plans) ? raw.plans : []);
+    res.json({ ok: true, projectId: projectId || null, count: plans.length, plans });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/deploys/drain/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getGracefulDrainService().auditShutdownReadiness(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/deploys/drain/plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden planificar drains ordenados de despliegue', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getGracefulDrainService().planOrderedDrain({
+      ...body,
+      dryRun
+    });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/deploys/drain/:drainId/advance', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden avanzar fases de graceful drain', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const svc = getGracefulDrainService();
+    const allPlans = await svc.listDrainPlans();
+    const existing = Array.isArray(allPlans) ? allPlans.find((p) => p && p.drainId === req.params.drainId) : null;
+    const scopedProjectId = (existing && existing.projectId && existing.projectId !== 'default')
+      ? String(existing.projectId)
+      : (typeof body.projectId === 'string' && body.projectId.trim() ? body.projectId.trim() : null);
+    if (scopedProjectId && !assertTenantProjectAccess403(req, res, scopedProjectId, 'projects:write')) return;
+    const out = await svc.advanceDrainState(req.params.drainId, body);
+    res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

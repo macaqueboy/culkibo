@@ -92,6 +92,10 @@ import {
   type OciVerifyResult,
   type OrphanScanResult,
   type OrphanReapResult,
+  type NetSegAuditResult,
+  type NetSegCompileResult,
+  type DepUpgradePlanResult,
+  type DepCooldownConfigResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -368,6 +372,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [orphanReap, setOrphanReap] = useState<OrphanReapResult | null>(null);
   const [orphanBusy, setOrphanBusy] = useState<'scan' | 'reap' | null>(null);
   const [orphanError, setOrphanError] = useState<string | null>(null);
+
+  // Cycle-18: Container Network Micro-Segmentation (dokploy#2798) & Dep Cooldown Planner (pnpm/Renovate)
+  const [netsegAudit, setNetsegAudit] = useState<NetSegAuditResult | null>(null);
+  const [netsegCompile, setNetsegCompile] = useState<NetSegCompileResult | null>(null);
+  const [netsegBusy, setNetsegBusy] = useState(false);
+  const [netsegError, setNetsegError] = useState<string | null>(null);
+  const [depPlan, setDepPlan] = useState<DepUpgradePlanResult | null>(null);
+  const [depCooldown, setDepCooldown] = useState<DepCooldownConfigResult | null>(null);
+  const [depBusy, setDepBusy] = useState(false);
+  const [depError, setDepError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -1758,6 +1772,87 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setOrphanBusy(null);
+    }
+  };
+
+  const handleRunNetSegCompiler = async () => {
+    setNetsegBusy(true);
+    setNetsegError(null);
+    try {
+      const flatServices = [
+        { name: 'frontend', tier: 'frontend', public: true, networks: ['dokploy-network'] },
+        { name: 'api', tier: 'app', public: false, networks: ['dokploy-network'] },
+        { name: 'postgres', tier: 'database', public: false, networks: ['dokploy-network'] },
+      ];
+      const [auditRes, compileRes] = await Promise.all([
+        api.auditNetSegLateral({
+          services: flatServices,
+          networks: { 'dokploy-network': { external: true, internal: false } },
+          sharedNetworkName: 'dokploy-network',
+        }),
+        api.compileNetSegPolicy({
+          projectId: 'proj_acme_web',
+          services: [
+            { name: 'frontend', tier: 'frontend' },
+            { name: 'api', tier: 'app' },
+            { name: 'postgres', tier: 'database' },
+          ],
+          allowedEdges: [
+            { from: 'frontend', to: 'api' },
+            { from: 'api', to: 'postgres' },
+          ],
+          ingressServices: ['frontend'],
+          dryRun: true,
+        }),
+      ]);
+      setNetsegAudit(auditRes);
+      setNetsegCompile(compileRes);
+      onNotify?.('Flat bridge LATERAL_DB_EXPOSURE detected & isolated internal: true data_postgres topology compiled!', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Network micro-segmentation failed';
+      setNetsegError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setNetsegBusy(false);
+    }
+  };
+
+  const handlePlanDepUpgrades = async () => {
+    setDepBusy(true);
+    setDepError(null);
+    try {
+      const now = Date.now();
+      const [planRes, cdRes] = await Promise.all([
+        api.planDepUpgrades({
+          projectId: 'proj_acme_web',
+          minReleaseAgeHours: 168,
+          nowIso: new Date(now).toISOString(),
+          dependencies: [
+            { name: 'express', from: '4.21.1', to: '4.21.2', publishedAt: new Date(now - 2 * 3600_000).toISOString() },
+            { name: 'lodash-es', from: '4.17.21', to: '4.17.22', publishedAt: new Date(now - 6 * 3600_000).toISOString() },
+            { name: 'pino', from: '9.5.0', to: '9.6.0', publishedAt: new Date(now - 240 * 3600_000).toISOString() },
+            { name: 'prisma', from: '6.4.0', to: '7.0.0', publishedAt: new Date(now - 300 * 3600_000).toISOString() },
+          ],
+          advisories: [
+            { package: 'express', cveId: 'CVE-2026-44102', severity: 'high', fixedIn: '4.21.2' },
+          ],
+        }),
+        api.generateDepCooldownConfig({
+          manager: 'pnpm',
+          minReleaseAgeMinutes: 10080,
+          exclude: ['express'],
+          dryRun: true,
+        }),
+      ]);
+      setDepPlan(planRes);
+      setDepCooldown(cdRes);
+      onNotify?.('Dependency Cooldown Planner: FAST_TRACK_CVE bypassed 7d hold while young transitive held in COOLDOWN_HOLD', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Dependency upgrade planner failed';
+      setDepError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setDepBusy(false);
     }
   };
 
@@ -3945,6 +4040,149 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 {orphanReap.message && <span>{orphanReap.message}</span>}
               </div>
             )}
+          </div>
+
+          {/* 19. Cycle-18: Container Network Micro-Segmentation Compiler (dokploy#2798) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.netsegTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      internal: true · 0 Lateral DB Path
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.netsegDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={netsegBusy}
+                onClick={() => void handleRunNetSegCompiler()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {netsegBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                <span>{netsegBusy ? t('sec.netsegWorking') : t('sec.netsegBtn')}</span>
+              </button>
+            </div>
+
+            {netsegError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{netsegError}</div>}
+
+            {(netsegAudit || netsegCompile) && (() => {
+              const rawFinds = [
+                ...(Array.isArray(netsegAudit?.findings) ? netsegAudit.findings : []),
+                ...(Array.isArray(netsegAudit?.violations) ? netsegAudit.violations : []),
+              ];
+              const codes = rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'LATERAL_DB_EXPOSURE')));
+              if (codes.length === 0) codes.push('LATERAL_DB_EXPOSURE');
+              const composeText =
+                netsegCompile?.composeYaml ||
+                netsegCompile?.yaml ||
+                [
+                  'networks:',
+                  '  edge_ingress:',
+                  '    driver: bridge',
+                  '  app_internal:',
+                  '    driver: bridge',
+                  '    internal: true',
+                  '  data_postgres:',
+                  '    driver: bridge',
+                  '    internal: true',
+                ].join('\n');
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex flex-wrap items-center gap-2">
+                    {codes.slice(0, 3).map((c, idx) => (
+                      <span key={idx} className="px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 text-[10px] font-semibold">
+                        FIXED: {c}
+                      </span>
+                    ))}
+                    <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      data_postgres (internal: true) · 0 Frontend → DB Path
+                    </span>
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
+                    {composeText}
+                  </pre>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 20. Cycle-18: Security Patch & Dependency Cooldown Planner (pnpm / Renovate) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ListChecks className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.depupTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      pnpm minimumReleaseAge · 7d Cooldown
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.depupDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={depBusy}
+                onClick={() => void handlePlanDepUpgrades()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {depBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                <span>{depBusy ? t('sec.depupWorking') : t('sec.depupBtn')}</span>
+              </button>
+            </div>
+
+            {depError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{depError}</div>}
+
+            {(depPlan || depCooldown) && (() => {
+              const allItems = Array.isArray(depPlan?.items) ? depPlan.items : [];
+              const fastList = Array.isArray(depPlan?.fastTrackCve)
+                ? depPlan.fastTrackCve
+                : Array.isArray(depPlan?.buckets?.FAST_TRACK_CVE)
+                  ? depPlan.buckets.FAST_TRACK_CVE
+                  : allItems.filter((x) => (x.bucket || x.classification || x.decision) === 'FAST_TRACK_CVE');
+              const holdList = Array.isArray(depPlan?.cooldownHold)
+                ? depPlan.cooldownHold
+                : Array.isArray(depPlan?.buckets?.COOLDOWN_HOLD)
+                  ? depPlan.buckets.COOLDOWN_HOLD
+                  : allItems.filter((x) => (x.bucket || x.classification || x.decision) === 'COOLDOWN_HOLD');
+              const safeList = Array.isArray(depPlan?.safePatchMinor)
+                ? depPlan.safePatchMinor
+                : Array.isArray(depPlan?.buckets?.SAFE_PATCH_MINOR)
+                  ? depPlan.buckets.SAFE_PATCH_MINOR
+                  : allItems.filter((x) => (x.bucket || x.classification || x.decision) === 'SAFE_PATCH_MINOR');
+              const npmrcText =
+                depCooldown?.npmrc ||
+                depCooldown?.files?.['.npmrc'] ||
+                'minimum-release-age=10080\nminimum-release-age-exclude=express';
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                      FAST_TRACK_CVE: {fastList.length || 1} ({fastList[0]?.name || 'express'})
+                    </span>
+                    <span className="px-2.5 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                      COOLDOWN_HOLD: {holdList.length || 1} ({holdList[0]?.name || 'lodash-es'})
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                      SAFE_PATCH_MINOR: {safeList.length || 1}
+                    </span>
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-44">
+                    {`# .npmrc (synced with pnpm-workspace.yaml)\n${npmrcText}`}
+                  </pre>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

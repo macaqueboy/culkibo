@@ -3565,6 +3565,117 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #17 CVEs (19a-19e): CVE-2026-93318/33747 build repro, coolify#1671/dokploy#6010 preview gate, souin#884/#850 surrogate cache, dokploy#4050/#903 VPA rightsizer, IncidentFox blameless postmortem');
 
+  // -------------------------------------------------------------------------
+  // 20. Cycle #18 Query/Pool Guard, Network Micro-Seg, Dep Cooldown, Streaming PII Scrubber & Graceful Drain Regressions (docs/COMPETITOR_RADAR_CYCLE17.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const queryGuard = require('../server/services/queryPlanGuardService');
+    const netSeg = require('../server/services/netSegCompilerService');
+    const depUpgrade = require('../server/services/depUpgradePlannerService');
+    const { LogPiiScrubberService } = require('../server/services/logPiiScrubberService');
+    const { GracefulDrainService } = require('../server/services/gracefulDrainService');
+
+    const c18Tmp = makeTempDir('culkibo-c18-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c18Tmp;
+    try {
+      // 20a. Query-Plan & Pool Guard (PgBouncer/Prisma): Seq Scan + skew + pool overcommit + missing idleTimeout + 25 N+1
+      const exp20a = queryGuard.analyzeExplainPlan({
+        planJson: [{ Plan: { 'Node Type': 'Seq Scan', 'Relation Name': 'events', 'Plan Rows': 500, 'Actual Rows': 85000, 'Total Cost': 60000 } }]
+      });
+      assert.strictEqual(exp20a.safe, false);
+      const expCodes = new Set(exp20a.findings.map((f) => f.code));
+      assert.ok(expCodes.has('SEQ_SCAN_REGRESSION'));
+      assert.ok(expCodes.has('ROW_ESTIMATE_SKEW'));
+      const pool20a = queryGuard.auditPoolBudget({ maxConnections: 100, replicas: 8, poolSizePerReplica: 20, idleTimeoutSec: 0 });
+      assert.strictEqual(pool20a.safe, false);
+      const poolCodes = new Set(pool20a.blockers.map((b) => b.code));
+      assert.ok(poolCodes.has('POOL_OVERCOMMIT'));
+      assert.ok(poolCodes.has('MISSING_IDLE_TIMEOUT'));
+      const n1 = queryGuard.detectNPlusOne(Array.from({ length: 25 }, () => 'SELECT * FROM items WHERE id = $1'));
+      assert.strictEqual(n1.detected, true);
+      assert.strictEqual(n1.code, 'N_PLUS_ONE_DETECTED');
+
+      // 20b. Network Micro-Seg (Dokploy#2798/#2987): flat bridge LATERAL_DB_EXPOSURE -> internal: true data_postgres reachable ONLY by api
+      const lat20b = netSeg.auditLateralMovement({
+        sharedNetworkName: 'dokploy-network',
+        services: [
+          { name: 'web', tier: 'frontend', networks: ['dokploy-network'] },
+          { name: 'api', tier: 'api', networks: ['dokploy-network'] },
+          { name: 'postgres', tier: 'database', networks: ['dokploy-network'] }
+        ],
+        networks: { 'dokploy-network': { internal: false } }
+      });
+      assert.strictEqual(lat20b.safe, false);
+      assert.ok(lat20b.violations.some((v) => v.code === 'LATERAL_DB_EXPOSURE'));
+      const seg20b = netSeg.compileSegmentationPolicy({
+        projectId: 'proj_20b',
+        services: [{ name: 'web', tier: 'frontend' }, { name: 'api', tier: 'api' }, { name: 'postgres', tier: 'database' }],
+        allowedEdges: [{ from: 'api', to: 'postgres' }]
+      });
+      assert.strictEqual(seg20b.frontendToDbIsolated, true);
+      assert.strictEqual(seg20b.networks.data_postgres.internal, true);
+      assert.ok(seg20b.networks.data_postgres.members.includes('api') && !seg20b.networks.data_postgres.members.includes('web'));
+
+      // 20c. Dep Upgrade Planner (pnpm/Renovate): 6h routine -> COOLDOWN_HOLD, 2h CVE -> FAST_TRACK_CVE, major -> MAJOR_MANUAL_REVIEW
+      const up20c = depUpgrade.planDependencyUpgrades({
+        projectId: 'proj_20c',
+        minReleaseAgeHours: 168,
+        persist: false,
+        dependencies: [
+          { name: 'routine-pkg', currentVersion: '1.0.0', targetVersion: '1.1.0', ageHours: 6 },
+          { name: 'sec-pkg', currentVersion: '2.1.0', targetVersion: '2.1.1', ageHours: 2, cveIds: ['CVE-2026-11111'] },
+          { name: 'breaking-pkg', currentVersion: '3.0.0', targetVersion: '4.0.0', ageHours: 500 }
+        ]
+      });
+      assert.strictEqual(up20c.lanes.COOLDOWN_HOLD[0].name, 'routine-pkg');
+      assert.strictEqual(up20c.lanes.FAST_TRACK_CVE[0].name, 'sec-pkg');
+      assert.strictEqual(up20c.lanes.MAJOR_MANUAL_REVIEW[0].name, 'breaking-pkg');
+
+      // 20d. Stream PII Scrubber (OTel#49858/#36633/#37591/#50770): deterministic across 10 runs, preserves redaction.count on 2nd pass, ignores Luhn-invalid order ID
+      const piiSvc = new LogPiiScrubberService({ dataDir: c18Tmp });
+      const cardPan = ['4242', '4242', '4242', '4242'].join('-');
+      const nonLuhnOrder = '4242424242424243';
+      const sampleSpan = {
+        orderId: nonLuhnOrder,
+        ssn: 123456789,
+        'redaction.count': 4,
+        span: { events: [{ attributes: { email: 'user@example.test', card: cardPan } }] }
+      };
+      const baselineJson = JSON.stringify(piiSvc.scrubPayload(sampleSpan).scrubbed);
+      for (let i = 0; i < 9; i++) {
+        assert.strictEqual(JSON.stringify(piiSvc.scrubPayload(sampleSpan).scrubbed), baselineJson, 'Scrubbing MUST be 100% deterministic');
+      }
+      const firstPass = piiSvc.scrubPayload(sampleSpan);
+      assert.strictEqual(firstPass.scrubbed.orderId, nonLuhnOrder);
+      assert.strictEqual(firstPass.scrubbed.ssn, '[REDACTED:SSN]');
+      assert.strictEqual(firstPass.scrubbed.span.events[0].attributes.card, '[REDACTED:PCI_PAN]');
+      assert.strictEqual(firstPass.scrubbed.span.events[0].attributes.email, '[REDACTED:EMAIL]');
+      assert.strictEqual(firstPass.scrubbed['redaction.count'], 4);
+      const secondPass = piiSvc.scrubPayload(firstPass.scrubbed);
+      assert.strictEqual(secondPass.scrubbed['redaction.count'], 4, '2nd pass MUST preserve redaction.count');
+
+      // 20e. Graceful Drain (Coolify#8627 / kamal-proxy): shell CMD + lbDrainDelaySec 0 fails; advance refuses EMIT_SIGTERM until inFlightJobs === 0
+      const drainSvc = new GracefulDrainService({ dataDir: c18Tmp });
+      const audit20e = drainSvc.auditShutdownReadiness({ dockerfile: 'FROM node:22\nCMD npm start', lbDrainDelaySec: 0, healthCheckIntervalSec: 5 });
+      assert.strictEqual(audit20e.ready, false);
+      assert.ok(audit20e.codes.includes('PID1_SHELL_WRAPPER'));
+      assert.ok(audit20e.codes.includes('LB_DRAIN_RACE'));
+      const plan20e = drainSvc.planOrderedDrain({ projectId: 'proj_20e', serviceName: 'worker', inFlightJobs: 3 });
+      const blocked20e = drainSvc.advanceDrainState(plan20e.drainId, { readinessFlipped: true, lbDrained: true, inFlightHttp: 0, inFlightJobs: 2 });
+      assert.strictEqual(blocked20e.blocked, true);
+      assert.strictEqual(blocked20e.sigtermEmitted, false);
+      const done20e = drainSvc.advanceDrainState(plan20e.drainId, { readinessFlipped: true, lbDrained: true, inFlightHttp: 0, inFlightJobs: 0 });
+      assert.strictEqual(done20e.blocked, false);
+      assert.strictEqual(done20e.sigtermEmitted, true);
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c18Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #18 CVEs (20a-20e): PgBouncer/Prisma query+pool guard, dokploy#2798/#2987 network micro-seg, pnpm/Renovate CVE fast-track, otel-contrib#49858/#50770 PII scrubber, coolify#8627 4-phase graceful drain');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 
