@@ -88,6 +88,7 @@ import {
   type BaseHardenerAuditResult,
   type CopaThinPatchResult,
   type MonorepoPlanResult,
+  type GraphqlShieldInspectResult,
   isDemoMode,
 } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
@@ -275,8 +276,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..21 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain, Region Shift, Base Hardener & Monorepo DAG state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift' | 'basehardener' | 'monorepo'>('oom');
+  // Cycle-13..22 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain, Region Shift, Base Hardener, Monorepo DAG & GraphQL DoS Shield state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift' | 'basehardener' | 'monorepo' | 'graphql'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -341,6 +342,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [monoResult, setMonoResult] = useState<MonorepoPlanResult | null>(null);
   const [monoBusy, setMonoBusy] = useState<'wave' | 'cycle' | null>(null);
   const [monoError, setMonoError] = useState<string | null>(null);
+  // Cycle-22 GraphQL Depth, Fragment-Spread Alias & Introspection Shield state
+  const [gqlResult, setGqlResult] = useState<GraphqlShieldInspectResult | null>(null);
+  const [gqlBusy, setGqlBusy] = useState<'alias' | 'introspect' | null>(null);
+  const [gqlError, setGqlError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1780,6 +1785,41 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setMonoBusy(null);
+    }
+  };
+
+  const handleRunGraphqlShield = async (mode: 'alias' | 'introspect') => {
+    setGqlBusy(mode);
+    setGqlError(null);
+    try {
+      const query =
+        mode === 'introspect'
+          ? 'query ProdIntrospect { __schema { types { name fields { name } } } }'
+          : 'fragment F1 on User { a1: id a2: email a3: name a4: role a5: org a6: plan } fragment F2 on User { ...F1 ...F1 ...F1 ...F1 ...F1 ...F1 } query AliasFanOut { u1: user { ...F2 } u2: user { ...F2 } }';
+      const res = await api.inspectGraphqlShield({
+        projectId: project.id,
+        query,
+        batchSize: 1,
+        maxDepth: 6,
+        maxAliases: 25,
+        maxFragmentExpansions: 10,
+        maxBatchSize: 5,
+        allowIntrospection: false,
+        env: 'production',
+      });
+      setGqlResult(res);
+      onNotify(
+        mode === 'introspect'
+          ? 'GraphQL Shield BLOCKED: Production __schema introspection denied!'
+          : 'GraphQL Shield BLOCKED: Fragment-spread alias fan-out (CVE-2026-47707) stopped!',
+        'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'GraphQL DoS shield inspection failed';
+      setGqlError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setGqlBusy(null);
     }
   };
 
@@ -3468,6 +3508,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 { id: 'regionshift' as const, label: t('pd.forensicsTabRegionShift') },
                 { id: 'basehardener' as const, label: t('pd.forensicsTabBaseHardener') },
                 { id: 'monorepo' as const, label: t('pd.forensicsTabMonorepo') },
+                { id: 'graphql' as const, label: t('pd.forensicsTabGraphql') },
               ]).map((tabItem) => (
                 <button
                   key={tabItem.id}
@@ -4515,6 +4556,76 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                       </div>
                     )}
                     {monoResult.message && <div>{monoResult.message}</div>}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'graphql' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={gqlBusy !== null}
+                  onClick={() => void handleRunGraphqlShield('alias')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {gqlBusy === 'alias' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.gqlTestAlias')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={gqlBusy !== null}
+                  onClick={() => void handleRunGraphqlShield('introspect')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {gqlBusy === 'introspect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.gqlTestIntrospect')}</span>
+                </button>
+              </div>
+              {gqlError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{gqlError}</div>}
+              {gqlResult && (() => {
+                const rawFinds = Array.isArray(gqlResult.findings) ? gqlResult.findings : [];
+                const codes = Array.from(
+                  new Set([
+                    ...(Array.isArray(gqlResult.findingCodes) ? gqlResult.findingCodes : []),
+                    ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'GRAPHQL_DOS_BLOCKED'))),
+                  ])
+                );
+                const isBlocked = Boolean(gqlResult.blocked || gqlResult.safe === false || codes.length > 0);
+                const aliases = gqlResult.metrics?.expandedAliases ?? gqlResult.expandedAliases ?? gqlResult.aliasCount;
+                const depthVal = gqlResult.metrics?.maxObservedDepth ?? gqlResult.depth ?? gqlResult.maxDepthObserved;
+                const spreadsVal = gqlResult.metrics?.fragmentExpansions ?? gqlResult.fragmentExpansions;
+                return (
+                  <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums font-mono text-[11px] ${
+                    isBlocked
+                      ? 'bg-red-50 border-red-200 text-red-700'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {depthVal != null && (
+                        <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                          depth: {depthVal}
+                        </span>
+                      )}
+                      {aliases != null && (
+                        <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                          expanded aliases: {aliases}
+                        </span>
+                      )}
+                      {spreadsVal != null && spreadsVal > 0 && (
+                        <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                          fragment spreads: {spreadsVal}
+                        </span>
+                      )}
+                      {codes.map((c, idx) => (
+                        <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          {c}
+                        </span>
+                      ))}
+                    </div>
+                    {gqlResult.message && <div>{gqlResult.message}</div>}
                   </div>
                 );
               })()}

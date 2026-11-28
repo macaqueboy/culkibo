@@ -156,6 +156,11 @@ function getPgVacuumGuardService() { return _lazyV2.pgvacuum || (_lazyV2.pgvacuu
 function getMonorepoGraphService() { return _lazyV2.monorepo || (_lazyV2.monorepo = require('../services/monorepoGraphService')); }
 function getEmailAuthGuardService() { return _lazyV2.emailauth || (_lazyV2.emailauth = require('../services/emailAuthGuardService')); }
 function getPkgConfusionGuardService() { return _lazyV2.pkgguard || (_lazyV2.pkgguard = require('../services/pkgConfusionGuardService')); }
+function getJwtOidcFirewallService() { return _lazyV2.jwtfw || (_lazyV2.jwtfw = require('../services/jwtOidcFirewallService')); }
+function getRuntimeLeakGuardService() { return _lazyV2.leakguard || (_lazyV2.leakguard = require('../services/runtimeLeakGuardService')); }
+function getGraphqlDosShieldService() { return _lazyV2.gqlshield || (_lazyV2.gqlshield = require('../services/graphqlDosShieldService')); }
+function getAcmeTlsBudgetService() { return _lazyV2.acmebudget || (_lazyV2.acmebudget = require('../services/acmeTlsBudgetService')); }
+function getArchiveSlipGuardService() { return _lazyV2.archiveguard || (_lazyV2.archiveguard = require('../services/archiveSlipGuardService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -11048,6 +11053,218 @@ router.post('/supply-chain/pkg-guard/npmrc', certAndAdminLimiter, async (req, re
     if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
     const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
     const out = await getPkgConfusionGuardService().generateSafeNpmrc({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ============================================================================
+// CYCLE #22 PIONEER CAPABILITIES (195 MCP TOOLS & 89 SUITES)
+// ============================================================================
+
+// 1. JWT Algorithm-Confusion, `jku`/`kid` & OIDC Claim Firewall (`CVE-2026-29000`/`33322`/`22817`, `CVE-2025-61152`)
+router.get('/security/jwt-firewall/audits', async (req, res) => {
+  try {
+    const raw = await getJwtOidcFirewallService().listJwtFirewallAudits();
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/jwt-firewall/inspect', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getJwtOidcFirewallService().inspectJwtHeaderAndClaims(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/jwt-firewall/audit-config', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden auditar configuración OIDC/JWT global', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'auditar configuración OIDC/JWT global')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getJwtOidcFirewallService().auditOidcVerifierConfig({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Container Heap-Slope, FD-Leak (`EMFILE`) & Event-Loop Lag Guard
+router.get('/observability/leak-guard/history', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getRuntimeLeakGuardService().listLeakAnalyses(projectId);
+    const history = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.history) ? raw.history : []);
+    res.json({ ok: true, projectId: projectId || null, count: history.length, history });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/observability/leak-guard/analyze', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getRuntimeLeakGuardService().analyzeRuntimeLeakTelemetry(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/observability/leak-guard/drain-plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar planes de drenaje proactivo por fugas', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getRuntimeLeakGuardService().buildProactiveDrainPlan({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. GraphQL Depth, Fragment-Spread Alias & Introspection Shield (`CVE-2026-47707`/`35441`, `CVE-2025-32031`)
+router.get('/edge/graphql-shield/policies', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getGraphqlDosShieldService().listGraphqlShieldPolicies();
+    const allPolicies = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.policies) ? raw.policies : []);
+    const policies = projectId ? allPolicies.filter((p) => p && p.projectId === projectId) : allPolicies;
+    res.json({ ok: true, projectId: projectId || null, count: policies.length, policies });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/graphql-shield/inspect', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getGraphqlDosShieldService().inspectGraphqlQuery(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/graphql-shield/policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden configurar políticas del escudo GraphQL', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    if (!body.projectId && denyInstanceGlobalForTenant(req, res, 'configurar políticas globales del escudo GraphQL')) return;
+    const projectId = typeof body.projectId === 'string' && body.projectId.trim() ? body.projectId.trim() : 'default';
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const payload = body.policy && typeof body.policy === 'object' ? { ...body.policy, dryRun } : { ...body, dryRun };
+    const out = await getGraphqlDosShieldService().upsertGraphqlShieldPolicy(projectId, payload);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. ACME Rate-Limit Budget, RFC 9773 ARI & TLS Cipher Guard (`Coolify#6800`, `Dokploy#2238`)
+router.get('/domains/acme-budget/audits', async (req, res) => {
+  try {
+    const raw = await getAcmeTlsBudgetService().listAcmeBudgetAudits();
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/domains/acme-budget/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getAcmeTlsBudgetService();
+    const budget = await svc.auditAcmeRateBudget(body);
+    const runTls = body.minTlsVersion !== undefined || Array.isArray(body.ciphers) || (body.tls && typeof body.tls === 'object');
+    const tls = runTls
+      ? await svc.auditTlsCipherPolicy(body.tls && typeof body.tls === 'object' ? body.tls : body)
+      : null;
+    const budgetFindings = Array.isArray(budget && budget.findings) ? budget.findings : [];
+    const tlsFindings = Array.isArray(tls && tls.findings) ? tls.findings : [];
+    const findings = [...budgetFindings, ...tlsFindings];
+    const findingCodes = Array.from(new Set([
+      ...(Array.isArray(budget && budget.findingCodes) ? budget.findingCodes : budgetFindings.map((f) => f && f.code).filter(Boolean)),
+      ...(Array.isArray(tls && tls.findingCodes) ? tls.findingCodes : tlsFindings.map((f) => f && f.code).filter(Boolean))
+    ]));
+    const safe = Boolean((budget ? budget.safe !== false : true) && (tls ? tls.safe !== false : true) && findings.length === 0);
+    const blocked = Boolean((budget && budget.blocked) || (tls && tls.blocked) || !safe);
+    const caddyTlsBlock = (tls && typeof tls.caddyTlsBlock === 'string' && tls.caddyTlsBlock)
+      || (budget && typeof budget.caddyTlsBlock === 'string' && budget.caddyTlsBlock)
+      || '';
+    res.json({
+      ok: true,
+      safe,
+      blocked,
+      status: blocked ? 'CRITICAL' : 'HEALTHY',
+      findings,
+      findingCodes,
+      budget,
+      tls,
+      caddyTlsBlock
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/domains/acme-budget/ari-window', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getAcmeTlsBudgetService().evaluateAriRenewalWindow(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Archive ("Zip Slip") / Symlink Traversal & Zip-Bomb Firewall (`CVE-2026-23745`/`23950`, `CVE-2025-66626`/`62725`)
+router.get('/security/archive-guard/audits', async (req, res) => {
+  try {
+    const raw = await getArchiveSlipGuardService().listArchiveAudits();
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/archive-guard/inspect', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getArchiveSlipGuardService().inspectArchiveManifest(body);
     res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);

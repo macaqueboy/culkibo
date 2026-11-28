@@ -104,6 +104,8 @@ import {
   type McpPoisonScanResult,
   type EdgeCorsCspAuditResult,
   type PkgSupplyChainAuditResult,
+  type JwtFirewallInspectResult,
+  type ArchiveSlipInspectResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -422,6 +424,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [pkgGuardRes, setPkgGuardRes] = useState<PkgSupplyChainAuditResult | null>(null);
   const [pkgGuardBusy, setPkgGuardBusy] = useState(false);
   const [pkgGuardError, setPkgGuardError] = useState<string | null>(null);
+
+  // Cycle-22: JWT Algorithm-Confusion & OIDC Firewall (CVE-2026-29000) + Archive Zip-Slip / Zip-Bomb Firewall (CVE-2026-23745)
+  const [jwtRes, setJwtRes] = useState<JwtFirewallInspectResult | null>(null);
+  const [jwtBusy, setJwtBusy] = useState<'confusion' | 'none' | null>(null);
+  const [jwtError, setJwtError] = useState<string | null>(null);
+  const [archiveRes, setArchiveRes] = useState<ArchiveSlipInspectResult | null>(null);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -2087,6 +2097,73 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setPkgGuardBusy(false);
+    }
+  };
+
+  const handleInspectJwtFirewall = async (mode: 'confusion' | 'none') => {
+    setJwtBusy(mode);
+    setJwtError(null);
+    try {
+      const toB64Url = (obj: Record<string, unknown>) =>
+        btoa(JSON.stringify(obj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+      const hdr =
+        mode === 'none'
+          ? { alg: 'none', typ: 'JWT', jku: 'https://evil.example/jwks.json', kid: '../../etc/passwd' }
+          : { alg: 'HS256', typ: 'JWT', jku: 'https://evil.example/jwks.json', kid: '../../etc/passwd' };
+      const claims = {
+        iss: 'https://untrusted.example',
+        aud: 'wrong-audience',
+        sub: 'admin-demo',
+        exp: Math.floor(Date.now() / 1000) + 600,
+      };
+      const syntheticToken = `${toB64Url(hdr)}.${toB64Url(claims)}.${mode === 'none' ? '' : 'demoSigPlaceholder'}`;
+      const res = await api.inspectJwtFirewall({
+        token: syntheticToken,
+        expectedAlgorithms: ['RS256'],
+        expectedIssuer: 'https://auth.acme-demo.dev',
+        expectedAudience: 'culkibo-api',
+        jwkHasExplicitAlg: false,
+      });
+      setJwtRes(res);
+      onNotify?.(
+        mode === 'none'
+          ? 'JWT Firewall BLOCKED: alg:none (CVE-2026-29000), jku SSRF & kid traversal rejected!'
+          : 'JWT Firewall BLOCKED: HS256 algorithm confusion (CVE-2026-33322), jku SSRF & kid injection rejected!',
+        'error'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'JWT/OIDC firewall inspection failed';
+      setJwtError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setJwtBusy(null);
+    }
+  };
+
+  const handleInspectArchiveSlip = async () => {
+    setArchiveBusy(true);
+    setArchiveError(null);
+    try {
+      const res = await api.inspectArchiveSlip({
+        targetRoot: '/var/lib/culkibo/extract/acme-web',
+        maxRatio: 100,
+        allowSymlinks: false,
+        entries: [
+          { path: '../../etc/cron.d/pwn', type: 'file', compressedBytes: 120, uncompressedBytes: 240 },
+          { path: 'links/passwd', type: 'symlink', linkname: '/etc/passwd', compressedBytes: 0, uncompressedBytes: 0 },
+          { path: 'App/config.json', type: 'file', compressedBytes: 100, uncompressedBytes: 200 },
+          { path: 'app/config.json', type: 'file', compressedBytes: 100, uncompressedBytes: 200 },
+          { path: 'payload/bomb.bin', type: 'file', compressedBytes: 1024, uncompressedBytes: 512_000 },
+        ],
+      });
+      setArchiveRes(res);
+      onNotify?.('Archive Firewall BLOCKED: Zip-Slip ../, symlink /etc/passwd, Unicode collision & 500:1 Zip-Bomb!', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Archive Zip-Slip inspection failed';
+      setArchiveError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setArchiveBusy(false);
     }
   };
 
@@ -4791,6 +4868,131 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-40">
                     {`# Hardened .npmrc (blocks postinstall worms)\n${npmrcText}`}
                   </pre>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 27. Cycle-22: JWT Algorithm-Confusion, jku/kid & OIDC Claim Firewall (CVE-2026-29000 / 33322) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.jwtTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Pinned RS256/EdDSA · 0 Raw Token Storage
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.jwtDesc')}</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={jwtBusy !== null}
+                  onClick={() => void handleInspectJwtFirewall('confusion')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {jwtBusy === 'confusion' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{jwtBusy === 'confusion' ? t('sec.jwtWorking') : t('sec.jwtBtnConfusion')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={jwtBusy !== null}
+                  onClick={() => void handleInspectJwtFirewall('none')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {jwtBusy === 'none' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('sec.jwtBtnNone')}</span>
+                </button>
+              </div>
+            </div>
+
+            {jwtError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{jwtError}</div>}
+
+            {jwtRes && (() => {
+              const rawFinds = Array.isArray(jwtRes.findings) ? jwtRes.findings : [];
+              const codes = Array.from(
+                new Set([
+                  ...(Array.isArray(jwtRes.findingCodes) ? jwtRes.findingCodes : []),
+                  ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'JWT_BLOCKED'))),
+                ])
+              );
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                      RAW TOKEN REDACTED
+                    </span>
+                    {codes.map((c, idx) => (
+                      <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-36">
+                    {`# Hardened OIDC Verifier Policy (CVE-2026-29000 / CVE-2026-33322)\npinnedAlgorithms: ["RS256", "EdDSA"]\nallowAlgNone: false\nallowJkuHeader: false\nsanitizeKid: "^[a-zA-Z0-9._-]{1,64}$"\nvalidateIssAud: true`}
+                  </pre>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 28. Cycle-22: Archive Zip-Slip, Symlink Traversal & Zip-Bomb Firewall (CVE-2026-23745 / 23950) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.archiveTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Canonical Root · NFC Guard · ≤100:1 Ratio
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.archiveDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={archiveBusy}
+                onClick={() => void handleInspectArchiveSlip()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {archiveBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                <span>{archiveBusy ? t('sec.archiveWorking') : t('sec.archiveBtn')}</span>
+              </button>
+            </div>
+
+            {archiveError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{archiveError}</div>}
+
+            {archiveRes && (() => {
+              const rawFinds = Array.isArray(archiveRes.findings) ? archiveRes.findings : [];
+              const codes = Array.from(
+                new Set([
+                  ...(Array.isArray(archiveRes.findingCodes) ? archiveRes.findingCodes : []),
+                  ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'ZIP_SLIP_PATH_TRAVERSAL'))),
+                ])
+              );
+              const count = archiveRes.entriesInspected ?? archiveRes.checkedEntries ?? archiveRes.entryCount ?? 5;
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                      PRE-EXTRACT BLOCKED · {count} ENTRIES SCANNED
+                    </span>
+                    {codes.map((c, idx) => (
+                      <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
                 </div>
               );
             })()}

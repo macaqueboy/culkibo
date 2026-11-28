@@ -4061,6 +4061,128 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #21 CVEs (23a-23e): CVE-2025-34291 CORS/CSP/SRI, Postgres 32-bit XID/Autovacuum, Dokploy#5547 monorepo DAG, Coolify#4311 email auth/SMTP, Shai-Hulud/CHAINDROP worm guard');
 
+  // -------------------------------------------------------------------------
+  // 24. Cycle #22 JWT/OIDC Firewall, Runtime Leak Guard, GraphQL DoS Shield, ACME ARI/TLS & Archive Zip-Slip Regressions (docs/COMPETITOR_RADAR_CYCLE21.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const { JwtOidcFirewallService } = require('../server/services/jwtOidcFirewallService');
+    const leakGuard = require('../server/services/runtimeLeakGuardService');
+    const { GraphqlDosShieldService } = require('../server/services/graphqlDosShieldService');
+    const acmeTls = require('../server/services/acmeTlsBudgetService');
+    const archiveGuard = require('../server/services/archiveSlipGuardService');
+
+    const c22Tmp = makeTempDir('culkibo-c22-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c22Tmp;
+    try {
+      const b64u = (obj) => Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
+      const mkJwt = (h, p, sig = 'c2ln') => [b64u(h), b64u(p), sig].join('.');
+      const nowSec = 1764300000;
+
+      // 24a. JWT/OIDC Firewall (CVE-2026-29000/33322/22817, CVE-2025-61152)
+      const jwtFw = new JwtOidcFirewallService({ dataDir: c22Tmp });
+      const tokNone = mkJwt({ alg: 'none', typ: 'JWT' }, { sub: 'admin', exp: nowSec + 300 }, '');
+      assert.ok(jwtFw.inspectJwtHeaderAndClaims({ token: tokNone, expectedAlgorithms: ['RS256'], nowSec, persist: false }).findingCodes.includes('JWT_ALG_NONE_FORBIDDEN'));
+      const tokHs = mkJwt({ alg: 'HS256', jku: 'https://evil/jwks.json', kid: '../../etc/passwd' }, { iss: 'https://idp.test', aud: 'api', exp: nowSec + 300 });
+      const hsRes = jwtFw.inspectJwtHeaderAndClaims({ token: tokHs, expectedAlgorithms: ['RS256'], expectedIssuer: 'https://idp.test', expectedAudience: 'api', nowSec, persist: false });
+      assert.strictEqual(hsRes.blocked, true);
+      assert.ok(hsRes.findingCodes.includes('JWT_ALG_CONFUSION_BLOCKED'));
+      assert.ok(hsRes.findingCodes.includes('JWT_JKU_SSRF_BLOCKED'));
+      assert.ok(hsRes.findingCodes.includes('JWT_KID_INJECTION'));
+      const tokOk = mkJwt({ alg: 'RS256', kid: 'key-2026-01' }, { iss: 'https://idp.test', aud: 'api', exp: nowSec + 300 });
+      assert.strictEqual(jwtFw.inspectJwtHeaderAndClaims({ token: tokOk, expectedAlgorithms: ['RS256'], expectedIssuer: 'https://idp.test', expectedAudience: 'api', nowSec, persist: false }).safe, true);
+
+      // 24b. Runtime Leak Guard (V8 heap slope, EMFILE FDs, Event-Loop lag)
+      const lk24b = leakGuard.analyzeRuntimeLeakTelemetry({
+        projectId: 'proj_24b',
+        containerLimitMb: 1024,
+        heapSamplesMb: [200, 320, 440, 560, 680],
+        openFds: 950,
+        fdLimit: 1024,
+        eventLoopLagP99Ms: 180,
+        persist: false
+      });
+      assert.strictEqual(lk24b.safe, false);
+      assert.ok(lk24b.findingCodes.includes('HEAP_LEAK_SLOPE_HIGH'));
+      assert.ok(lk24b.findingCodes.includes('FD_EXHAUSTION_EMFILE_RISK'));
+      assert.ok(lk24b.findingCodes.includes('EVENT_LOOP_LAG_CRITICAL'));
+      assert.ok(typeof lk24b.hoursToOom === 'number' && Number.isFinite(lk24b.hoursToOom) && lk24b.hoursToOom > 0);
+      assert.strictEqual(lk24b.recommendedMaxOldSpaceMb, 798);
+      assert.ok(lk24b.nodeOptions.includes('--max-old-space-size=798'));
+      assert.strictEqual(leakGuard.buildProactiveDrainPlan(lk24b).dryRun, true);
+
+      // 24c. GraphQL DoS Shield (CVE-2026-47707/35441, CVE-2025-32031)
+      const gqlShield = new GraphqlDosShieldService({ dataDir: c22Tmp });
+      const ampQuery = [
+        'query Q { ...F1 ...F1 ...F1 ...F1 }',
+        'fragment F1 on Query { ...F2 ...F2 ...F2 ...F2 }',
+        'fragment F2 on Query { a1:u a2:u a3:u }'
+      ].join('\n');
+      const ampRes = gqlShield.inspectGraphqlQuery({ query: ampQuery, maxAliases: 15, maxFragmentExpansions: 8 });
+      assert.strictEqual(ampRes.blocked, true);
+      assert.ok(ampRes.findingCodes.includes('GRAPHQL_ALIAS_AMPLIFICATION'));
+      assert.ok(ampRes.findingCodes.includes('GRAPHQL_FRAGMENT_FANOUT_DOS'));
+      const introRes = gqlShield.inspectGraphqlQuery({ query: '{ __schema { types { name } } }', env: 'production' });
+      assert.ok(introRes.findingCodes.includes('GRAPHQL_INTROSPECTION_BLOCKED'));
+      assert.strictEqual(gqlShield.inspectGraphqlQuery({ query: '{ user(id: 1) { id name } }', env: 'production' }).safe, true);
+
+      // 24d. ACME Rate-Limit Budget, RFC 9773 ARI & TLS Cipher Guard (Coolify#6800, Dokploy#2238)
+      const acmeBad = acmeTls.auditAcmeRateBudget({
+        domain: 'app.example.test',
+        failedAuthz1h: 5,
+        staleDomainsInStore: ['old.example.com'],
+        hasPersistentCertVolume: false,
+        persist: false
+      });
+      assert.strictEqual(acmeBad.blocked, true);
+      assert.ok(acmeBad.findingCodes.includes('ACME_AUTHZ_LOCKOUT_RISK'));
+      assert.ok(acmeBad.findingCodes.includes('STALE_ACME_DOMAINS_DETECTED'));
+      assert.ok(acmeBad.findingCodes.includes('EPHEMERAL_CERT_STORAGE'));
+      const tlsBad = acmeTls.auditTlsCipherPolicy({ minTlsVersion: '1.1', ciphers: ['TLS_RSA_WITH_RC4_128_SHA'] });
+      assert.strictEqual(tlsBad.blocked, true);
+      assert.ok(tlsBad.findingCodes.includes('WEAK_TLS_VERSION'));
+      assert.ok(tlsBad.findingCodes.includes('WEAK_CIPHER_SUITE'));
+      const ariWin = acmeTls.evaluateAriRenewalWindow({
+        certId: 'cert_24d',
+        replacesCertId: 'cert_old_24d',
+        suggestedStartIso: '2026-12-01T00:00:00Z',
+        suggestedEndIso: '2026-12-03T00:00:00Z',
+        nowIso: '2026-11-28T00:00:00Z'
+      });
+      assert.strictEqual(ariWin.rateLimitWaiverEligible, true);
+      assert.ok(Date.parse(ariWin.chosenRenewalIso) >= Date.parse('2026-12-01T00:00:00Z') && Date.parse(ariWin.chosenRenewalIso) <= Date.parse('2026-12-03T00:00:00Z'));
+
+      // 24e. Archive Zip-Slip / Symlink Traversal & Zip-Bomb Firewall (CVE-2026-23745/23950, CVE-2025-66626)
+      const archBad = archiveGuard.inspectArchiveManifest({
+        targetRoot: '/srv/app',
+        entries: [
+          { path: '../../etc/cron.d/pwn', type: 'file', compressedBytes: 100, uncompressedBytes: 100 },
+          { path: 'link-etc', type: 'symlink', linkname: '/etc/passwd' },
+          { path: 'App/index.js', type: 'file', compressedBytes: 100, uncompressedBytes: 100 },
+          { path: 'app/index.js', type: 'file', compressedBytes: 100, uncompressedBytes: 100 },
+          { path: 'bomb.bin', type: 'file', compressedBytes: 1000, uncompressedBytes: 500000 }
+        ],
+        persist: false
+      });
+      assert.strictEqual(archBad.blocked, true);
+      assert.ok(archBad.findingCodes.includes('ZIP_SLIP_PATH_TRAVERSAL'));
+      assert.ok(archBad.findingCodes.includes('SYMLINK_ESCAPE_BLOCKED'));
+      assert.ok(archBad.findingCodes.includes('UNICODE_PATH_COLLISION'));
+      assert.ok(archBad.findingCodes.includes('ZIP_BOMB_DETECTED'));
+      const archOk = archiveGuard.inspectArchiveManifest({
+        targetRoot: '/srv/app',
+        entries: [{ path: 'dist/server.js', type: 'file', compressedBytes: 1000, uncompressedBytes: 3000 }],
+        persist: false
+      });
+      assert.strictEqual(archOk.safe, true);
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c22Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #22 CVEs (24a-24e): CVE-2026-29000/33322 JWT/OIDC firewall, V8 heap/FD/EL leak guard, CVE-2026-47707 GraphQL fragment DoS, Coolify#6800 ACME ARI/TLS, CVE-2026-23745 Zip-Slip');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

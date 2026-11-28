@@ -116,7 +116,12 @@ const ALLOWED_LAZY_SERVICES = new Set([
   'pgVacuumGuardService',
   'monorepoGraphService',
   'emailAuthGuardService',
-  'pkgConfusionGuardService'
+  'pkgConfusionGuardService',
+  'jwtOidcFirewallService',
+  'runtimeLeakGuardService',
+  'graphqlDosShieldService',
+  'acmeTlsBudgetService',
+  'archiveSlipGuardService'
 ]);
 /** @type {Map<string, any>} */
 const _lazyServices = new Map();
@@ -173,7 +178,8 @@ const REDACTED_RESULT_TOOLS = new Set([
   'culkibo_log_pii_scrubber',
   'culkibo_webhook_firewall',
   'culkibo_credential_watchdog',
-  'culkibo_worm_backup_crypto'
+  'culkibo_worm_backup_crypto',
+  'culkibo_jwt_oidc_firewall'
 ]);
 
 /** @type {Record<string, number>} */
@@ -184,7 +190,7 @@ const ROLE_RANK = Object.freeze({
   owner: 40
 });
 
-/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (44 destructivas + 44 = 88). */
+/** Herramientas no destructivas (y destructivas con plan propio) que soportan `dryRun: true` (44 destructivas + 49 = 93). */
 const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_deploy_production',
   'culkibo_rollback_deployment',
@@ -236,7 +242,12 @@ const EXTRA_DRY_RUN_TOOLS = new Set([
   'culkibo_pg_vacuum_guard',
   'culkibo_monorepo_graph',
   'culkibo_email_auth_guard',
-  'culkibo_pkg_confusion_guard'
+  'culkibo_pkg_confusion_guard',
+  'culkibo_jwt_oidc_firewall',
+  'culkibo_runtime_leak_guard',
+  'culkibo_graphql_dos_shield',
+  'culkibo_acme_tls_budget',
+  'culkibo_archive_slip_guard'
 ]);
 
 /** Perfiles de herramientas MCP para reducir el consumo de contexto en >=80% bajo demanda. */
@@ -334,7 +345,10 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_base_image_hardener',
     'culkibo_pg_vacuum_guard',
     'culkibo_monorepo_graph',
-    'culkibo_pkg_confusion_guard'
+    'culkibo_pkg_confusion_guard',
+    'culkibo_runtime_leak_guard',
+    'culkibo_graphql_dos_shield',
+    'culkibo_archive_slip_guard'
   ]),
   ops: new Set([
     'culkibo_search_tools',
@@ -424,6 +438,11 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_monorepo_graph',
     'culkibo_email_auth_guard',
     'culkibo_pkg_confusion_guard',
+    'culkibo_jwt_oidc_firewall',
+    'culkibo_runtime_leak_guard',
+    'culkibo_graphql_dos_shield',
+    'culkibo_acme_tls_budget',
+    'culkibo_archive_slip_guard',
     'culkibo_sleep_status',
     'culkibo_sleep_manage',
     'culkibo_fleet_list_servers',
@@ -492,7 +511,11 @@ const TOOL_PROFILES = Object.freeze({
     'culkibo_mcp_poison_guard',
     'culkibo_cors_csp_guard',
     'culkibo_email_auth_guard',
-    'culkibo_pkg_confusion_guard'
+    'culkibo_pkg_confusion_guard',
+    'culkibo_jwt_oidc_firewall',
+    'culkibo_graphql_dos_shield',
+    'culkibo_acme_tls_budget',
+    'culkibo_archive_slip_guard'
   ])
 });
 
@@ -685,7 +708,14 @@ const SEARCH_SYNONYMS = Object.freeze({
   monorepo: ['affected', 'dag', 'waves', 'workspaces', 'watchpaths', 'build', 'deploy'],
   spf: ['email', 'dkim', 'dmarc', 'smtp', 'mtasts', 'dns', 'deliverability'],
   dmarc: ['email', 'spf', 'dkim', 'smtp', 'mtasts', 'dns', 'deliverability'],
-  typosquat: ['npm', 'supply', 'worm', 'postinstall', 'chaindrop', 'confusion', 'security']
+  typosquat: ['npm', 'supply', 'worm', 'postinstall', 'chaindrop', 'confusion', 'security'],
+  jwt: ['oidc', 'jwe', 'jku', 'kid', 'alg', 'auth', 'token', 'security'],
+  oidc: ['jwt', 'jwks', 'iss', 'aud', 'alg', 'auth', 'security'],
+  leak: ['heap', 'rss', 'oom', 'emfile', 'fd', 'eventloop', 'gc', 'memory'],
+  emfile: ['fd', 'leak', 'ulimit', 'descriptors', 'runtime', 'memory'],
+  ari: ['acme', 'tls', 'letsencrypt', 'cert', 'cipher', 'renewal', 'caddy'],
+  acme: ['ari', 'tls', 'letsencrypt', 'cert', 'rate', 'budget', 'caddy'],
+  zipslip: ['archive', 'tar', 'zip', 'symlink', 'hardlink', 'traversal', 'bomb', 'security']
 });
 
 const AUTO_REMEDIATE_ACTIONS = Object.freeze([
@@ -924,7 +954,13 @@ const TOOL_POLICIES = Object.freeze({
   culkibo_pg_vacuum_guard: { minRole: 'developer', scope: 'databases:write', projectScoped: true },
   culkibo_monorepo_graph: { minRole: 'developer', scope: 'deployments:write', projectScoped: true },
   culkibo_email_auth_guard: { minRole: 'developer', scope: 'domains:write', projectScoped: true },
-  culkibo_pkg_confusion_guard: { minRole: 'developer', scope: 'security:write', projectScoped: true }
+  culkibo_pkg_confusion_guard: { minRole: 'developer', scope: 'security:write', projectScoped: true },
+  // MCP 2026 Cycle-22 (195 MCP Tools -93.2%+ Core!): JWT/OIDC Firewall, Container Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Firewall (+5 = 195)
+  culkibo_jwt_oidc_firewall: { minRole: 'developer', scope: 'security:write', projectScoped: true, secretSensitive: true },
+  culkibo_runtime_leak_guard: { minRole: 'developer', scope: 'observability:write', projectScoped: true },
+  culkibo_graphql_dos_shield: { minRole: 'developer', scope: 'domains:write', projectScoped: true },
+  culkibo_acme_tls_budget: { minRole: 'developer', scope: 'domains:write', projectScoped: true },
+  culkibo_archive_slip_guard: { minRole: 'developer', scope: 'security:write', projectScoped: true }
 });
 
 /**
@@ -6144,6 +6180,188 @@ class McpServer extends EventEmitter {
             dryRun: { type: 'boolean', description: 'En generate_npmrc es true por defecto.' }
           }
         }
+      },
+      // --- MCP 2026 Cycle-22 (195 MCP Tools -93.2%+ Core!): JWT/OIDC Firewall, Container Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Firewall (+5 = 195) ---
+      {
+        name: 'culkibo_jwt_oidc_firewall',
+        title: 'Inspeccionar JWT/JWE contra alg:none, confusion HS256/RS256, jku SSRF y kid injection',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            audits: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Firewall JWT/OIDC sin persistir jamás tokens raw (cura CVE-2026-29000 CVSS 10.0, CVE-2026-33322 CVSS 9.8, CVE-2026-22817 y CVE-2025-61152): bloquea JWT_ALG_NONE_FORBIDDEN, JWE_PLAIN_INNER_FORBIDDEN, JWT_ALG_CONFUSION_BLOCKED, JWK_MISSING_EXPLICIT_ALG, JWT_JKU_SSRF_BLOCKED, JWT_KID_INJECTION y JWT_CLAIMS_MISMATCH. audit_config exige admin y dryRun: true por defecto; resultados redactados en auditoría.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['inspect', 'audit_config', 'list'], description: 'Operación del firewall JWT/OIDC (default "inspect")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto opcional (validado por ACL si se proporciona)' },
+            token: { type: 'string', description: 'Token compacto JWS/JWE a inspeccionar (solo se guarda huella SHA-256)' },
+            innerToken: { type: 'string', description: 'Token interno opcional tras descifrar JWE' },
+            innerUnsigned: { type: 'boolean', description: 'Indicar que el inner token JWE carece de firma (PlainJWT)' },
+            header: { type: 'object', description: 'Cabecera JWT decodificada opcional' },
+            claims: { type: 'object', description: 'Claims JWT decodificados opcionales' },
+            expectedAlgorithms: { type: 'array', items: { type: 'string' }, description: 'Algoritmos fijados permitidos (default ["RS256","ES256","EdDSA"])' },
+            expectedIssuer: { type: 'string', maxLength: 256, description: 'Emisor OIDC esperado (iss)' },
+            expectedAudience: { type: 'string', maxLength: 256, description: 'Audiencia OIDC esperada (aud)' },
+            nowSec: { type: 'integer', description: 'Timestamp UNIX en segundos para validación determinista de exp' },
+            jwkHasExplicitAlg: { type: 'boolean', description: 'True si la clave JWK fija explícitamente el campo alg (CVE-2026-22817)' },
+            pinnedAlgorithms: { type: 'array', items: { type: 'string' }, description: 'Algoritmos fijados para audit_config' },
+            allowAlgNone: { type: 'boolean', description: 'Si el verificador OIDC permite alg=none' },
+            allowJkuHeader: { type: 'boolean', description: 'Si el verificador OIDC honra cabeceras jku/x5u' },
+            sanitizeKid: { type: 'boolean', description: 'Si el verificador OIDC sanea kid' },
+            validateIssAud: { type: 'boolean', description: 'Si el verificador OIDC valida iss y aud' },
+            jwksRefreshMinIntervalSec: { type: 'integer', minimum: 0, description: 'Intervalo mínimo de refresco JWKS en segundos' },
+            persist: { type: 'boolean', description: 'Persistir metadatos de auditoría (default true salvo dryRun: true)' },
+            dryRun: { type: 'boolean', description: 'En audit_config es true por defecto.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_runtime_leak_guard',
+        title: 'Predecir OOM por pendiente de heap/RSS, fugas FD EMFILE y lag de Event Loop',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            analyses: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Guardia predictivo de fugas runtime en contenedores Node.js/V8: ejecuta regresión lineal OLS sobre heap/RSS estimando hoursToOom, recomienda --max-old-space-size=floor(limit*0.78), detecta HEAP_LEAK_SLOPE_HIGH, NATIVE_RSS_DIVERGENCE, V8_HEAP_EXCEEDS_CGROUP, FD_EXHAUSTION_EMFILE_RISK (>=80%) y EVENT_LOOP_LAG_CRITICAL (>=100ms), y genera planes de rolling-drain + SIGUSR2. drain_plan exige admin y dryRun: true.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['analyze', 'drain_plan', 'history'], description: 'Operación del guardia de fugas runtime (default "analyze")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto opcional (validado por ACL si se proporciona)' },
+            containerLimitMb: { type: 'number', minimum: 64, description: 'Límite cgroup de RAM del contenedor en MB (default 1024)' },
+            configuredMaxOldSpaceMb: { type: 'number', minimum: 0, description: 'Valor actual de --max-old-space-size en MB' },
+            heapSamplesMb: { type: 'array', items: { type: 'number' }, description: 'Serie temporal de muestras V8 heapUsed en MB' },
+            rssSamplesMb: { type: 'array', items: { type: 'number' }, description: 'Serie temporal de muestras RSS en MB' },
+            sampleIntervalMinutes: { type: 'number', minimum: 1, description: 'Intervalo entre muestras en minutos (default 60)' },
+            openFds: { type: 'integer', minimum: 0, description: 'Descriptores de archivo abiertos actuales' },
+            fdLimit: { type: 'integer', minimum: 1, description: 'Límite ulimit -n de FDs (default 1024)' },
+            eventLoopLagP99Ms: { type: 'number', minimum: 0, description: 'Latencia p99 del Event Loop en ms' },
+            gcPausePct: { type: 'number', minimum: 0, maximum: 100, description: 'Porcentaje de tiempo bloqueado en pausas GC' },
+            analysis: { type: 'object', description: 'Análisis previo opcional para action="drain_plan"' },
+            persist: { type: 'boolean', description: 'Persistir análisis en runtime-leak-guard.json (default true salvo dryRun: true)' },
+            dryRun: { type: 'boolean', description: 'En drain_plan es true por defecto.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_graphql_dos_shield',
+        title: 'Bloquear amplificación GraphQL por FragmentSpread, profundidad, batching e introspección',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            policies: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Escudo DoS GraphQL zero-dep con expansión recursiva de fragmentos (cura CVE-2026-47707, CVE-2026-35441 y CVE-2025-32031): detecta GRAPHQL_DEPTH_EXCEEDED, GRAPHQL_ALIAS_AMPLIFICATION, GRAPHQL_FRAGMENT_FANOUT_DOS (incluyendo ciclos), GRAPHQL_BATCH_LIMIT_EXCEEDED y GRAPHQL_INTROSPECTION_BLOCKED (__schema/__type en prod). set_policy exige admin y dryRun: true por defecto.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['inspect', 'set_policy', 'list'], description: 'Operación del escudo GraphQL (default "inspect")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto opcional (validado por ACL si se proporciona)' },
+            query: { description: 'Consulta GraphQL (string o array de strings para batching)' },
+            batchSize: { type: 'integer', minimum: 1, description: 'Tamaño del lote HTTP GraphQL' },
+            maxDepth: { type: 'integer', minimum: 1, maximum: 64, description: 'Profundidad máxima expandida (default 7)' },
+            maxAliases: { type: 'integer', minimum: 1, maximum: 500, description: 'Número máximo de alias tras expandir fragmentos (default 15)' },
+            maxFragmentExpansions: { type: 'integer', minimum: 1, maximum: 500, description: 'Presupuesto máximo de expansiones de fragmentos (default 8)' },
+            maxBatchSize: { type: 'integer', minimum: 1, maximum: 200, description: 'Tamaño máximo de lote HTTP (default 10)' },
+            allowIntrospection: { type: 'boolean', description: 'Permitir __schema/__type (default false en production)' },
+            env: { type: 'string', maxLength: 32, description: 'Entorno de ejecución (default "production")' },
+            dryRun: { type: 'boolean', description: 'En set_policy es true por defecto; pasa dryRun: false para persistir.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_acme_tls_budget',
+        title: 'Auditar cuotas Let\'s Encrypt, ventanas RFC 9773 ARI y cifrados TLS 1.2/1.3',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            audits: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Guardia de presupuesto ACME, RFC 9773 ARI y cifrados TLS (cura Coolify#6800 y Dokploy#2238): detecta ACME_WEEKLY_QUOTA_NEAR, ACME_AUTHZ_LOCKOUT_RISK, STALE_ACME_DOMAINS_DETECTED, EPHEMERAL_CERT_STORAGE y ARI_REPLACES_MISSING; calcula ventanas jittered ARI y bloquea WEAK_TLS_VERSION (1.0/1.1) y WEAK_CIPHER_SUITE (RC4/3DES/CBC).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['audit_budget', 'ari_window', 'audit_tls', 'list'], description: 'Operación ACME/ARI/TLS (default "audit_budget")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto opcional (validado por ACL si se proporciona)' },
+            domain: { type: 'string', maxLength: 253, description: 'Dominio TLS a auditar' },
+            certsIssued7d: { type: 'integer', minimum: 0, description: 'Certificados emitidos en los últimos 7 días (límite 50)' },
+            failedAuthz1h: { type: 'integer', minimum: 0, description: 'Autorizaciones ACME fallidas en la última hora (límite 5)' },
+            staleDomainsInStore: { type: 'array', items: { type: 'string' }, description: 'Dominios obsoletos aún presentes en acme.json' },
+            ariSupported: { type: 'boolean', description: 'True si el cliente ACME soporta RFC 9773 ARI replaces' },
+            hasPersistentCertVolume: { type: 'boolean', description: 'True si los certificados se guardan en volumen persistente' },
+            certId: { type: 'string', maxLength: 128, description: 'ID del certificado para action="ari_window"' },
+            suggestedStartIso: { type: 'string', maxLength: 64, description: 'Inicio ISO de suggestedWindow ARI' },
+            suggestedEndIso: { type: 'string', maxLength: 64, description: 'Fin ISO de suggestedWindow ARI' },
+            nowIso: { type: 'string', maxLength: 64, description: 'Timestamp ISO de referencia para ari_window' },
+            replacesCertId: { type: 'string', maxLength: 128, description: 'ID RFC 9773 replaces para exención de rate-limit' },
+            minTlsVersion: { type: 'string', maxLength: 16, description: 'Versión mínima TLS para audit_tls (1.2, 1.3)' },
+            ciphers: { type: 'array', items: { type: 'string' }, description: 'Lista de suites de cifrado TLS para audit_tls' },
+            persist: { type: 'boolean', description: 'Persistir auditoría en acme-tls-budget.json (default true salvo dryRun: true)' },
+            dryRun: { type: 'boolean', description: 'Pasa dryRun: true para evaluar sin persistir.' }
+          }
+        }
+      },
+      {
+        name: 'culkibo_archive_slip_guard',
+        title: 'Inspeccionar archivos tar/zip/OCI contra Zip-Slip, escapes symlink, colisiones Unicode y Zip-Bomb',
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            dryRun: { type: 'boolean' },
+            projectId: { type: ['string', 'null'] },
+            audits: { type: 'array' },
+            result: { type: ['object', 'null'] }
+          }
+        },
+        description: 'Firewall pre-extracción para manifiestos .tar/.zip/OCI (cura CVE-2026-23745/23950 y CVE-2025-66626/62725): bloquea ZIP_SLIP_PATH_TRAVERSAL (../ y rutas absolutas), SYMLINK_ESCAPE_BLOCKED, HARDLINK_ESCAPE_BLOCKED, UNICODE_PATH_COLLISION (NFC/case-folding) y ZIP_BOMB_DETECTED (>maxRatio:1 o exceso de bytes descomprimidos).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['inspect', 'list'], description: 'Operación del firewall de archivos (default "inspect")' },
+            projectId: { type: 'string', maxLength: 128, description: 'ID de proyecto opcional (validado por ACL si se proporciona)' },
+            targetRoot: { type: 'string', maxLength: 256, description: 'Directorio raíz canónico de extracción (default "/srv/extract")' },
+            entries: { type: 'array', description: 'Entradas del archivo [{ path, type, linkname, compressedBytes, uncompressedBytes }]' },
+            maxRatio: { type: 'number', minimum: 1, description: 'Ratio máximo de descompresión permitido (default 100)' },
+            maxTotalUncompressedBytes: { type: 'integer', minimum: 1024, description: 'Límite total de bytes descomprimidos (default 512 MiB)' },
+            allowSymlinks: { type: 'boolean', description: 'Permitir symlinks relativos estrictamente internos (default false)' },
+            persist: { type: 'boolean', description: 'Persistir auditoría en archive-slip-guard.json (default true salvo dryRun: true)' },
+            dryRun: { type: 'boolean', description: 'Pasa dryRun: true para inspeccionar sin persistir.' }
+          }
+        }
       }
     ];
 
@@ -8601,6 +8819,33 @@ class McpServer extends EventEmitter {
       }
     }
 
+    if (toolName === 'culkibo_jwt_oidc_firewall' && args.action === 'audit_config') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Auditar/persistir la configuración global del verificador OIDC/JWT (audit_config) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "inspect" o "list", o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_runtime_leak_guard' && args.action === 'drain_plan') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Construir planes de rolling-drain proactivo + SIGUSR2 (drain_plan) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "analyze" o "history", o autentícate como admin/owner.'
+        });
+      }
+    }
+
+    if (toolName === 'culkibo_graphql_dos_shield' && args.action === 'set_policy') {
+      if (callerRank < ROLE_RANK.admin || Array.isArray(principal.projectIds)) {
+        throw new McpToolError('FORBIDDEN', 'Guardar políticas del escudo DoS GraphQL (set_policy) requiere rol admin/owner sin restricción de proyectos.', {
+          retryable: false,
+          remediation: 'Usa action: "inspect" o "list", o autentícate como admin/owner.'
+        });
+      }
+    }
+
     // Aislamiento de equipo en argumentos explícitos (teamId y serverId) antes de dryRun
     if (principal.teamId && args.teamId && String(args.teamId) !== principal.teamId) {
       throw new McpToolError('FORBIDDEN', 'No tienes acceso al equipo especificado.', {
@@ -10325,6 +10570,69 @@ class McpServer extends EventEmitter {
           riskLevel = 'low';
           reversible = true;
         }
+        break;
+      }
+
+      case 'culkibo_jwt_oidc_firewall': {
+        const action = String(args.action || 'inspect');
+        Object.assign(target, { action, projectId: args.projectId || null });
+        if (action === 'audit_config') {
+          effects.push('Auditará la configuración del verificador OIDC/JWT (pinnedAlgorithms, jku/kid, JWKS refresh) sin guardar tokens.');
+          riskLevel = 'low';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' del firewall JWT/OIDC en modo solo metadatos (huella SHA-256).`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_runtime_leak_guard': {
+        const action = String(args.action || 'analyze');
+        Object.assign(target, { action, projectId: args.projectId || null, containerLimitMb: args.containerLimitMb ?? 1024 });
+        if (action === 'drain_plan') {
+          effects.push('Generará plan proactivo de rolling-drain + captura SIGUSR2 heapsnapshot antes de OOMKilled (137).');
+          riskLevel = 'medium';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' de regresión OLS de heap/RSS, FDs y Event-Loop lag sin tocar contenedores.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_graphql_dos_shield': {
+        const action = String(args.action || 'inspect');
+        Object.assign(target, { action, projectId: args.projectId || null });
+        if (action === 'set_policy') {
+          effects.push('Actualizará límites GraphQL expandidos (maxDepth, maxAliases, maxFragmentExpansions, maxBatchSize) en graphql-dos-shield.json.');
+          riskLevel = 'medium';
+          reversible = true;
+        } else {
+          effects.push(`Ejecutará '${action}' del escudo AST GraphQL contra amplificación de fragmentos e introspección.`);
+          riskLevel = 'low';
+          reversible = true;
+        }
+        break;
+      }
+
+      case 'culkibo_acme_tls_budget': {
+        const action = String(args.action || 'audit_budget');
+        Object.assign(target, { action, projectId: args.projectId || null, domain: args.domain || null });
+        effects.push(`Ejecutará '${action}' del guardia de cuotas Let's Encrypt, RFC 9773 ARI y cifrados TLS.`);
+        riskLevel = 'low';
+        reversible = true;
+        break;
+      }
+
+      case 'culkibo_archive_slip_guard': {
+        const action = String(args.action || 'inspect');
+        Object.assign(target, { action, projectId: args.projectId || null, targetRoot: args.targetRoot || '/srv/extract' });
+        effects.push(`Ejecutará '${action}' del firewall pre-extracción Zip-Slip, symlink/hardlink, Unicode y Zip-Bomb.`);
+        riskLevel = 'low';
+        reversible = true;
         break;
       }
 
@@ -17426,6 +17734,233 @@ class McpServer extends EventEmitter {
           break;
         }
 
+        case 'culkibo_jwt_oidc_firewall': {
+          const jwtFwSvc = requireLazySvc('jwtOidcFirewallService', 'JWT Algorithm-Confusion, jku/kid & OIDC Claim Firewall');
+          const action = String(args.action || 'inspect');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso al firewall JWT/OIDC del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado de culkibo_list_projects.'
+            });
+          }
+          if (action === 'audit_config') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Auditar la configuración global OIDC/JWT requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const out = jwtFwSvc.auditOidcVerifierConfig({
+              ...(Array.isArray(args.pinnedAlgorithms) ? { pinnedAlgorithms: args.pinnedAlgorithms.map(String) } : {}),
+              allowAlgNone: Boolean(args.allowAlgNone),
+              allowJkuHeader: Boolean(args.allowJkuHeader),
+              ...(args.sanitizeKid !== undefined ? { sanitizeKid: Boolean(args.sanitizeKid) } : {}),
+              ...(args.validateIssAud !== undefined ? { validateIssAud: Boolean(args.validateIssAud) } : {}),
+              ...(args.jwksRefreshMinIntervalSec !== undefined ? { jwksRefreshMinIntervalSec: Number(args.jwksRefreshMinIntervalSec) } : {}),
+              dryRun
+            });
+            res = { ok: Boolean(out && out.safe === true), action: 'audit_config', dryRun, projectId: pid, audits: [], result: out };
+          } else if (action === 'list') {
+            const rawAudits = jwtFwSvc.listJwtFirewallAudits();
+            const audits = Array.isArray(rawAudits) ? rawAudits : [];
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, audits, result: { count: audits.length } };
+          } else {
+            // action === 'inspect'
+            const dryRun = Boolean(args.dryRun);
+            const out = jwtFwSvc.inspectJwtHeaderAndClaims({
+              ...(typeof args.token === 'string' ? { token: args.token } : {}),
+              ...(typeof args.innerToken === 'string' ? { innerToken: args.innerToken } : {}),
+              ...(args.innerUnsigned !== undefined ? { innerUnsigned: Boolean(args.innerUnsigned) } : {}),
+              ...(args.header && typeof args.header === 'object' ? { header: args.header } : {}),
+              ...(args.claims && typeof args.claims === 'object' ? { claims: args.claims } : {}),
+              ...(Array.isArray(args.expectedAlgorithms) ? { expectedAlgorithms: args.expectedAlgorithms.map(String) } : {}),
+              ...(args.expectedIssuer ? { expectedIssuer: String(args.expectedIssuer) } : {}),
+              ...(args.expectedAudience ? { expectedAudience: String(args.expectedAudience) } : {}),
+              ...(args.nowSec !== undefined ? { nowSec: Number(args.nowSec) } : {}),
+              ...(args.jwkHasExplicitAlg !== undefined ? { jwkHasExplicitAlg: Boolean(args.jwkHasExplicitAlg) } : {}),
+              persist: !dryRun && args.persist !== false
+            });
+            res = { ok: Boolean(out && out.safe === true), action: 'inspect', dryRun, projectId: pid, audits: [], result: out };
+          }
+          break;
+        }
+
+        case 'culkibo_runtime_leak_guard': {
+          const leakGuardSvc = requireLazySvc('runtimeLeakGuardService', 'Container Heap-Slope, FD-Leak (EMFILE) & Event-Loop Lag Guard');
+          const action = String(args.action || 'analyze');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso a las telemetrías de fugas del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'drain_plan') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Generar planes proactivos de rolling-drain requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const planInput = args.analysis && typeof args.analysis === 'object'
+              ? { ...args.analysis, dryRun }
+              : { ...args, projectId: pid || 'default', dryRun };
+            const out = leakGuardSvc.buildProactiveDrainPlan(planInput);
+            res = { ok: Boolean(out && out.ok !== false), action: 'drain_plan', dryRun, projectId: pid, analyses: [], result: out };
+          } else if (action === 'history') {
+            const rawHist = leakGuardSvc.listLeakAnalyses(pid || undefined);
+            const analyses = Array.isArray(rawHist) ? rawHist : [];
+            res = { ok: true, action: 'history', dryRun: false, projectId: pid, analyses, result: { count: analyses.length } };
+          } else {
+            // action === 'analyze'
+            const dryRun = Boolean(args.dryRun);
+            const out = leakGuardSvc.analyzeRuntimeLeakTelemetry({
+              projectId: pid || 'default',
+              ...(args.containerLimitMb !== undefined ? { containerLimitMb: Number(args.containerLimitMb) } : {}),
+              ...(args.configuredMaxOldSpaceMb !== undefined ? { configuredMaxOldSpaceMb: Number(args.configuredMaxOldSpaceMb) } : {}),
+              ...(Array.isArray(args.heapSamplesMb) ? { heapSamplesMb: args.heapSamplesMb.map(Number) } : {}),
+              ...(Array.isArray(args.rssSamplesMb) ? { rssSamplesMb: args.rssSamplesMb.map(Number) } : {}),
+              ...(args.sampleIntervalMinutes !== undefined ? { sampleIntervalMinutes: Number(args.sampleIntervalMinutes) } : {}),
+              ...(args.openFds !== undefined ? { openFds: Number(args.openFds) } : {}),
+              ...(args.fdLimit !== undefined ? { fdLimit: Number(args.fdLimit) } : {}),
+              ...(args.eventLoopLagP99Ms !== undefined ? { eventLoopLagP99Ms: Number(args.eventLoopLagP99Ms) } : {}),
+              ...(args.gcPausePct !== undefined ? { gcPausePct: Number(args.gcPausePct) } : {}),
+              persist: !dryRun && args.persist !== false
+            });
+            res = { ok: Boolean(out && out.safe !== false), action: 'analyze', dryRun, projectId: pid, analyses: [], result: out };
+          }
+          break;
+        }
+
+        case 'culkibo_graphql_dos_shield': {
+          const gqlShieldSvc = requireLazySvc('graphqlDosShieldService', 'GraphQL Depth, Fragment-Spread Alias & Introspection Shield');
+          const action = String(args.action || 'inspect');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso al escudo GraphQL del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'set_policy') {
+            if (!principal.isSuperAdmin && ((ROLE_RANK[principal.role] || 0) < ROLE_RANK.admin || Array.isArray(principal.projectIds))) {
+              throw new McpToolError('FORBIDDEN', 'Guardar políticas del escudo GraphQL requiere rol admin/owner.', {
+                retryable: false,
+                remediation: 'Autentícate como admin/owner.'
+              });
+            }
+            const dryRun = args.dryRun !== false;
+            const out = gqlShieldSvc.upsertGraphqlShieldPolicy(pid || 'default', {
+              ...(args.maxDepth !== undefined ? { maxDepth: Number(args.maxDepth) } : {}),
+              ...(args.maxAliases !== undefined ? { maxAliases: Number(args.maxAliases) } : {}),
+              ...(args.maxFragmentExpansions !== undefined ? { maxFragmentExpansions: Number(args.maxFragmentExpansions) } : {}),
+              ...(args.maxBatchSize !== undefined ? { maxBatchSize: Number(args.maxBatchSize) } : {}),
+              ...(args.allowIntrospection !== undefined ? { allowIntrospection: Boolean(args.allowIntrospection) } : {}),
+              dryRun
+            });
+            res = { ok: Boolean(out && out.ok !== false), action: 'set_policy', dryRun, projectId: pid, policies: [], result: out };
+          } else if (action === 'list') {
+            const rawPols = gqlShieldSvc.listGraphqlShieldPolicies();
+            const policies = Array.isArray(rawPols) ? rawPols : [];
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, policies, result: { count: policies.length } };
+          } else {
+            // action === 'inspect'
+            const out = gqlShieldSvc.inspectGraphqlQuery({
+              ...(pid ? { projectId: pid } : {}),
+              ...(args.query !== undefined ? { query: args.query } : {}),
+              ...(args.batchSize !== undefined ? { batchSize: Number(args.batchSize) } : {}),
+              ...(args.maxDepth !== undefined ? { maxDepth: Number(args.maxDepth) } : {}),
+              ...(args.maxAliases !== undefined ? { maxAliases: Number(args.maxAliases) } : {}),
+              ...(args.maxFragmentExpansions !== undefined ? { maxFragmentExpansions: Number(args.maxFragmentExpansions) } : {}),
+              ...(args.maxBatchSize !== undefined ? { maxBatchSize: Number(args.maxBatchSize) } : {}),
+              ...(args.allowIntrospection !== undefined ? { allowIntrospection: Boolean(args.allowIntrospection) } : {}),
+              ...(args.env ? { env: String(args.env) } : {})
+            });
+            res = { ok: Boolean(out && out.safe === true), action: 'inspect', dryRun: false, projectId: pid, policies: [], result: out };
+          }
+          break;
+        }
+
+        case 'culkibo_acme_tls_budget': {
+          const acmeBudgetSvc = requireLazySvc('acmeTlsBudgetService', 'ACME Rate-Limit Budget, RFC 9773 ARI & TLS Cipher Guard');
+          const action = String(args.action || 'audit_budget');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso al presupuesto ACME/TLS del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'ari_window') {
+            const out = acmeBudgetSvc.evaluateAriRenewalWindow({
+              ...(args.certId ? { certId: String(args.certId) } : {}),
+              suggestedStartIso: args.suggestedStartIso ? String(args.suggestedStartIso) : new Date().toISOString(),
+              suggestedEndIso: args.suggestedEndIso ? String(args.suggestedEndIso) : new Date(Date.now() + 86400000).toISOString(),
+              ...(args.nowIso ? { nowIso: String(args.nowIso) } : {}),
+              ...(args.replacesCertId ? { replacesCertId: String(args.replacesCertId) } : {})
+            });
+            res = { ok: Boolean(out && out.ok !== false), action: 'ari_window', dryRun: false, projectId: pid, audits: [], result: out };
+          } else if (action === 'audit_tls') {
+            const out = acmeBudgetSvc.auditTlsCipherPolicy({
+              ...(args.minTlsVersion ? { minTlsVersion: String(args.minTlsVersion) } : {}),
+              ...(Array.isArray(args.ciphers) ? { ciphers: args.ciphers.map(String) } : {}),
+              ...(args.domain ? { domain: String(args.domain) } : {})
+            });
+            res = { ok: Boolean(out && out.safe === true), action: 'audit_tls', dryRun: false, projectId: pid, audits: [], result: out };
+          } else if (action === 'list') {
+            const rawAudits = acmeBudgetSvc.listAcmeBudgetAudits();
+            const audits = Array.isArray(rawAudits) ? rawAudits : [];
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, audits, result: { count: audits.length } };
+          } else {
+            // action === 'audit_budget'
+            const dryRun = Boolean(args.dryRun);
+            const out = acmeBudgetSvc.auditAcmeRateBudget({
+              ...(args.domain ? { domain: String(args.domain) } : {}),
+              ...(args.certsIssued7d !== undefined ? { certsIssued7d: Number(args.certsIssued7d) } : {}),
+              ...(args.failedAuthz1h !== undefined ? { failedAuthz1h: Number(args.failedAuthz1h) } : {}),
+              ...(Array.isArray(args.staleDomainsInStore) ? { staleDomainsInStore: args.staleDomainsInStore.map(String) } : {}),
+              ...(args.ariSupported !== undefined ? { ariSupported: Boolean(args.ariSupported) } : {}),
+              ...(args.hasPersistentCertVolume !== undefined ? { hasPersistentCertVolume: Boolean(args.hasPersistentCertVolume) } : {}),
+              persist: !dryRun && args.persist !== false
+            });
+            res = { ok: Boolean(out && out.blocked === false), action: 'audit_budget', dryRun, projectId: pid, audits: [], result: out };
+          }
+          break;
+        }
+
+        case 'culkibo_archive_slip_guard': {
+          const archiveGuardSvc = requireLazySvc('archiveSlipGuardService', 'Archive (Zip Slip) / Symlink Traversal & Zip-Bomb Firewall');
+          const action = String(args.action || 'inspect');
+          const pid = args.projectId ? String(args.projectId).trim() : null;
+          if (pid && !principal.isSuperAdmin && !canAccessProject(principal, pid)) {
+            throw new McpToolError('FORBIDDEN', `No tienes acceso al firewall de archivos del proyecto '${pid}'.`, {
+              retryable: false,
+              remediation: 'Usa un projectId autorizado.'
+            });
+          }
+          if (action === 'list') {
+            const rawAudits = archiveGuardSvc.listArchiveAudits();
+            const audits = Array.isArray(rawAudits) ? rawAudits : [];
+            res = { ok: true, action: 'list', dryRun: false, projectId: pid, audits, result: { count: audits.length } };
+          } else {
+            // action === 'inspect'
+            const dryRun = Boolean(args.dryRun);
+            const out = archiveGuardSvc.inspectArchiveManifest({
+              ...(args.targetRoot ? { targetRoot: String(args.targetRoot) } : {}),
+              entries: Array.isArray(args.entries) ? args.entries : [],
+              ...(args.maxRatio !== undefined ? { maxRatio: Number(args.maxRatio) } : {}),
+              ...(args.maxTotalUncompressedBytes !== undefined ? { maxTotalUncompressedBytes: Number(args.maxTotalUncompressedBytes) } : {}),
+              allowSymlinks: Boolean(args.allowSymlinks),
+              persist: !dryRun && args.persist !== false
+            });
+            res = { ok: Boolean(out && out.safe === true), action: 'inspect', dryRun, projectId: pid, audits: [], result: out };
+          }
+          break;
+        }
+
         default:
           // Inalcanzable: `tool` ya se resolvió contra el catálogo más arriba.
           throw new McpToolError('UNKNOWN_TOOL', `La herramienta '${toolName}' está declarada pero no implementada.`, {
@@ -18409,7 +18944,7 @@ class McpServer extends EventEmitter {
           }
         },
         instructions: [
-          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 190 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), Policy-as-Code Admission de 10 reglas CIS/PSS (culkibo_admission_check), expedientes SOC2/ISO27001/GDPR firmados Ed25519 (culkibo_compliance_bundle), planificador de migración stateful cross-VPS en 4 fases (culkibo_volume_migrate), Geo-Routing y A/B sticky en Caddy v2.11 (culkibo_edge_experiment), scorecard ejecutivo de seguridad (culkibo_security_posture), flujos sintéticos multi-paso y sonda TLS/SNI (culkibo_synthetic_sentinel), linter SQL zero-downtime de 10 reglas DDL (culkibo_lint_sql_migration), autoscaler de workers OOM-safe y circuit breaker 503 (culkibo_worker_autoscaler), auditor de licencias SPDX CycloneDX 1.6 (culkibo_audit_licenses), perfiles OCI seccomp mínimos y guardia runc CVE (culkibo_seccomp_profile), auditor de bloat/secretos en capas OCI (culkibo_audit_image_bloat), leases distribuidos de Cron con fencing tokens (culkibo_cron_lease), enmascarador determinista PII para PR-Preview + pg_anonymizer (culkibo_mask_preview_pii), clasificador forense OOM/Exit-Code de 8 clases (culkibo_oom_forensics), enrutador On-Call con dedup y amortiguación de flapping (culkibo_oncall_router), auditor de egress y drift DOCKER-USER/nftables (culkibo_egress_firewall), failover Blue/Green de réplicas DB con fencing anti split-brain (culkibo_replica_failover), puerta pre-despliegue de secretos por entropía de Shannon (culkibo_secret_gate), planificador multi-arch amd64/arm64 OCI (culkibo_multiarch_planner), simulador Chaos Engineering GameDay con auto-abort (culkibo_chaos_gameday), CA Zero-Trust SPIFFE-Lite mTLS (culkibo_mtls_mesh), Feature Flags con kill-switch instantáneo (culkibo_feature_flags), escudo Edge API Rate-Limit RPM+TPM anti Denial-of-Wallet (culkibo_api_ratelimit), detector Falco-Lite de anomalías/cryptominers (culkibo_runtime_anomaly), promociones GitOps inmutables @sha256: con control dual (culkibo_digest_promotion), puerta de drift de contratos OpenAPI/JSON-Schema/GraphQL (culkibo_api_contract_gate), verificador pure-Node OCI/SLSA Rekor v1/v2 (culkibo_verify_oci_signature), guardia Edge WS/SSE anti-flood/Slowloris/101 (culkibo_stream_flood_guard), planificador zero-downtime DNS cutover y detector proxy Cloudflare ACME (culkibo_dns_cutover_plan), auto-reaper de previews PR huérfanos y volúmenes fugados (culkibo_orphan_reaper), verificador de builds reproducibles y caché BuildKit aislada (culkibo_build_reproducibility), puerta sintética de merge PR-Preview con Commit Status firmado (culkibo_preview_gate), purga multi-edge por Surrogate-Key y coalescing anti-stampede (culkibo_edge_cache_purge), recomendador VPA-Lite P95/P99 con guardia OOM +50% (culkibo_resource_rightsize), correlador autónomo de postmortems SRE sin culpas (culkibo_incident_postmortem), guardia de planes EXPLAIN JSON y pools DB (culkibo_query_plan_guard), compilador de micro-segmentación Compose internal: true (culkibo_netseg_policy), planificador de upgrades con carril CVE y cooldown (culkibo_dep_upgrade_plan), depurador PII determinista para logs/OTLP (culkibo_log_pii_scrubber), coordinador de drenaje ordenado en 4 fases sin pérdida de webhooks (culkibo_graceful_drain), firewall entrante HMAC/replay Base64URL de webhooks (culkibo_webhook_firewall), guardia dual de presión de bloques/inodos/pg_wal (culkibo_disk_pressure_guard), controlador Blue/Green multi-región con drenaje sticky Caddy (culkibo_region_traffic_shift), watchdog solo-metadatos de expiración e higiene NTP/SSH/STS (culkibo_credential_watchdog), puerta de evolución de esquemas de colas y disyuntor DLQ poison-pill (culkibo_queue_dlq_gate), guardia de frontera proxy forward_auth y anti-smuggling h2c/CONNECT (culkibo_proxy_trust_guard), auditor Valkey/Redis fork CoW, THP y desalojo (culkibo_valkey_guard), endurecedor de bases EOL/Wolfi/Distroless y parches CNCF copa (culkibo_base_image_hardener), verificador S3 WORM Object Lock y rotación KEK AES-256-GCM sin re-subida (culkibo_worm_backup_crypto), guardia Zero-Trust anti-MCPoison rug-pull SHA-256 y Unicode Tag (culkibo_mcp_poison_guard), firewall CORS exacto + CSP/SRI/HSTS (culkibo_cors_csp_guard), guardia Postgres Autovacuum y wraparound XID 32-bit (culkibo_pg_vacuum_guard), grafo selectivo monorepo y olas topológicas Kahn (culkibo_monorepo_graph), guardia SPF/DKIM/DMARC/MTA-STS y SMTP STARTTLS (culkibo_email_auth_guard), guardia anti-gusanos npm Shai-Hulud/CHAINDROP y typosquats (culkibo_pkg_confusion_guard), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
+          'Culkibo es un orquestador cloud AI-native autohospedado (MCP 2026-07-28: 195 herramientas anotadas, Async Tasks oficiales tasks/list|get|result|cancel, elicitation/create en rutas de remediación, 10 recursos incluyendo 3 MCP Apps interactivas ui://culkibo/* y 13 prompts con 8 playbooks de ingeniería). Gestiona proyectos, pods (The Forge y The Citadel), SmartPack build intelligence, túneles CGNAT soberanos EdgeTunnel, atestaciones SLSA v1.1 Ed25519 DSSE (culkibo_verify_attestation), exportación OTLP/HTTP nativa sin deps (culkibo_otlp_status), Shadow Traffic Replay con puerta de cutover (culkibo_shadow_replay), Time-Machine de stack completo (culkibo_time_machine), FinOps Cloud vs Self-Hosted (culkibo_finops_report), Auto-Healer determinista de 20 patrones (culkibo_heal_build_failure), malla WireGuard cero-configuración (culkibo_fleet_mesh), heatmap 24h de Crons y Dead-Man-Switch Heartbeats (culkibo_cron_timeline), Edge Bot-Shield + Hashcash PoW (culkibo_edge_shield), triaje autónomo unificado (culkibo_triage_playbook), escaneo SBOM CVE OSV.dev (culkibo_cve_scan), detector de drift y PgBouncer (culkibo_drift_check), exportador IaC OpenTofu/Compose sin lock-in (culkibo_export_iac), leases efímeros de secretos y Break-Glass (culkibo_secret_lease), bus Standard-Webhooks con DLQ y dual-secret (culkibo_webhook_dlq), DB Studio de solo lectura y Redis seguro (culkibo_db_studio), orquestador S3 Post-MinIO Garage/RustFS/SeaweedFS + SigV4 (culkibo_s3_storage), cuotas multi-tenant y ledger facturable CSV-safe (culkibo_agency_ledger), tema white-label open-core (culkibo_brand_theme), DR Fire-Drills de backups (culkibo_dr_drill), SLO Error-Budget Canary Auto-Rollback (culkibo_slo_canary), orquestador AI/GPU LLM local (culkibo_ai_workload), remote build-node offloader (culkibo_remote_builder), archivo comprimido .ndjson.gz de logs (culkibo_log_archive_search), Policy-as-Code Admission de 10 reglas CIS/PSS (culkibo_admission_check), expedientes SOC2/ISO27001/GDPR firmados Ed25519 (culkibo_compliance_bundle), planificador de migración stateful cross-VPS en 4 fases (culkibo_volume_migrate), Geo-Routing y A/B sticky en Caddy v2.11 (culkibo_edge_experiment), scorecard ejecutivo de seguridad (culkibo_security_posture), flujos sintéticos multi-paso y sonda TLS/SNI (culkibo_synthetic_sentinel), linter SQL zero-downtime de 10 reglas DDL (culkibo_lint_sql_migration), autoscaler de workers OOM-safe y circuit breaker 503 (culkibo_worker_autoscaler), auditor de licencias SPDX CycloneDX 1.6 (culkibo_audit_licenses), perfiles OCI seccomp mínimos y guardia runc CVE (culkibo_seccomp_profile), auditor de bloat/secretos en capas OCI (culkibo_audit_image_bloat), leases distribuidos de Cron con fencing tokens (culkibo_cron_lease), enmascarador determinista PII para PR-Preview + pg_anonymizer (culkibo_mask_preview_pii), clasificador forense OOM/Exit-Code de 8 clases (culkibo_oom_forensics), enrutador On-Call con dedup y amortiguación de flapping (culkibo_oncall_router), auditor de egress y drift DOCKER-USER/nftables (culkibo_egress_firewall), failover Blue/Green de réplicas DB con fencing anti split-brain (culkibo_replica_failover), puerta pre-despliegue de secretos por entropía de Shannon (culkibo_secret_gate), planificador multi-arch amd64/arm64 OCI (culkibo_multiarch_planner), simulador Chaos Engineering GameDay con auto-abort (culkibo_chaos_gameday), CA Zero-Trust SPIFFE-Lite mTLS (culkibo_mtls_mesh), Feature Flags con kill-switch instantáneo (culkibo_feature_flags), escudo Edge API Rate-Limit RPM+TPM anti Denial-of-Wallet (culkibo_api_ratelimit), detector Falco-Lite de anomalías/cryptominers (culkibo_runtime_anomaly), promociones GitOps inmutables @sha256: con control dual (culkibo_digest_promotion), puerta de drift de contratos OpenAPI/JSON-Schema/GraphQL (culkibo_api_contract_gate), verificador pure-Node OCI/SLSA Rekor v1/v2 (culkibo_verify_oci_signature), guardia Edge WS/SSE anti-flood/Slowloris/101 (culkibo_stream_flood_guard), planificador zero-downtime DNS cutover y detector proxy Cloudflare ACME (culkibo_dns_cutover_plan), auto-reaper de previews PR huérfanos y volúmenes fugados (culkibo_orphan_reaper), verificador de builds reproducibles y caché BuildKit aislada (culkibo_build_reproducibility), puerta sintética de merge PR-Preview con Commit Status firmado (culkibo_preview_gate), purga multi-edge por Surrogate-Key y coalescing anti-stampede (culkibo_edge_cache_purge), recomendador VPA-Lite P95/P99 con guardia OOM +50% (culkibo_resource_rightsize), correlador autónomo de postmortems SRE sin culpas (culkibo_incident_postmortem), guardia de planes EXPLAIN JSON y pools DB (culkibo_query_plan_guard), compilador de micro-segmentación Compose internal: true (culkibo_netseg_policy), planificador de upgrades con carril CVE y cooldown (culkibo_dep_upgrade_plan), depurador PII determinista para logs/OTLP (culkibo_log_pii_scrubber), coordinador de drenaje ordenado en 4 fases sin pérdida de webhooks (culkibo_graceful_drain), firewall entrante HMAC/replay Base64URL de webhooks (culkibo_webhook_firewall), guardia dual de presión de bloques/inodos/pg_wal (culkibo_disk_pressure_guard), controlador Blue/Green multi-región con drenaje sticky Caddy (culkibo_region_traffic_shift), watchdog solo-metadatos de expiración e higiene NTP/SSH/STS (culkibo_credential_watchdog), puerta de evolución de esquemas de colas y disyuntor DLQ poison-pill (culkibo_queue_dlq_gate), guardia de frontera proxy forward_auth y anti-smuggling h2c/CONNECT (culkibo_proxy_trust_guard), auditor Valkey/Redis fork CoW, THP y desalojo (culkibo_valkey_guard), endurecedor de bases EOL/Wolfi/Distroless y parches CNCF copa (culkibo_base_image_hardener), verificador S3 WORM Object Lock y rotación KEK AES-256-GCM sin re-subida (culkibo_worm_backup_crypto), guardia Zero-Trust anti-MCPoison rug-pull SHA-256 y Unicode Tag (culkibo_mcp_poison_guard), firewall CORS exacto + CSP/SRI/HSTS (culkibo_cors_csp_guard), guardia Postgres Autovacuum y wraparound XID 32-bit (culkibo_pg_vacuum_guard), grafo selectivo monorepo y olas topológicas Kahn (culkibo_monorepo_graph), guardia SPF/DKIM/DMARC/MTA-STS y SMTP STARTTLS (culkibo_email_auth_guard), guardia anti-gusanos npm Shai-Hulud/CHAINDROP y typosquats (culkibo_pkg_confusion_guard), firewall JWT/OIDC alg-confusion y jku/kid (culkibo_jwt_oidc_firewall), guardia predictivo de heap-slope/EMFILE/Event-Loop (culkibo_runtime_leak_guard), escudo DoS GraphQL con expansión de fragmentos (culkibo_graphql_dos_shield), presupuesto ACME + RFC 9773 ARI + cifrados TLS (culkibo_acme_tls_budget), firewall Zip-Slip/symlink/Unicode/Zip-Bomb (culkibo_archive_slip_guard), flota multi-servidor SSH, equipos/RBAC, entornos y promoción, uptime y páginas de estado, GitOps (culkibo.yaml), Smart Sleep y Cost Advisor, LiveSync 2.0 time-travel, smoke tests, canary auto-guard, deploy freeze, despliegue autónomo Ship & Verify, diagnóstico de incidentes, remediación segura y generación 1-clic de kits de agente.',
           'Para reducir el consumo de contexto en >80%, conecta con POST /api/mcp?profile=core|deploy|ops|security|all (o env CULKIBO_MCP_PROFILE=core sobre stdio), usa tools/list con params.query o descubre cualquier herramienta bajo demanda con culkibo_search_tools.',
           'Para operaciones largas usa Async Tasks enviando params.task ({ ttl: 60000 }) en tools/call y consulta tasks/list, tasks/get, tasks/result o tasks/cancel (aisladas estrictamente por principal RBAC).',
           'Para desplegar con escaneo pre-despliegue de secretos, smoke checks y rollback automático usa culkibo_ship_and_verify (dryRun: true -> confirmToken HMAC-SHA256 de un solo uso -> dryRun: false). Para incidentes usa culkibo_diagnose_incident + culkibo_auto_remediate.',

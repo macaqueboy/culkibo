@@ -4454,6 +4454,47 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:read');
     }
 
+    // Cycle-22: JWT/OIDC Firewall, Runtime Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Firewall
+    if (p === '/api/security/jwt-firewall/audit-config') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/security/jwt-firewall/inspect') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/security/jwt-firewall/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/observability/leak-guard/drain-plan') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/observability/leak-guard/analyze') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/observability/leak-guard/history') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/edge/graphql-shield/policy') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/edge/graphql-shield/inspect') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/edge/graphql-shield/policies') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/domains/acme-budget/audit' || p === '/api/domains/acme-budget/ari-window') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/domains/acme-budget/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/security/archive-guard/inspect') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/security/archive-guard/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

@@ -5486,7 +5486,7 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       if (String(p?.name || '') === 'expres' || String(p?.name || '') === 'lodahs') {
         findings.push({ code: 'TYPOSQUAT_SUSPECTED', severity: 'high', message: `Package "${p.name}" is Levenshtein distance 1 from popular npm package.` });
       }
-      if (p?.privateInternal && !String(p?.name || '').startsWith('@')) {
+      if ((p?.privateInternal || p?.isInternal || p?.private) && !String(p?.name || '').startsWith('@')) {
         findings.push({ code: 'DEPENDENCY_CONFUSION_RISK', severity: 'high', message: `Unscoped internal package "${p.name}" risks public registry hijacking.` });
       }
     }
@@ -5503,6 +5503,176 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       findingCodes: findings.map((f) => f.code),
       npmrcContent,
       message: findings.length > 0 ? `Blocked ${findings.length} supply-chain worm / typosquat hazard(s).` : 'Package supply-chain verified.',
+    });
+  }
+
+  // --- Cycle-22: JWT/OIDC Firewall, Runtime Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Firewall ---
+  if (pathname === '/api/security/jwt-firewall/inspect' && method === 'POST') {
+    const rawTok = String(body.token || '');
+    const parts = rawTok.split('.');
+    let hdr: Record<string, any> = {};
+    let claims: Record<string, any> = {};
+    try {
+      if (parts[0]) hdr = JSON.parse(atob(parts[0].replace(/-/g, '+').replace(/_/g, '/')));
+      if (parts[1]) claims = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+    } catch { /* ignore malformed demo token */ }
+    const alg = String(hdr.alg || 'none');
+    const expectedAlgs: string[] = Array.isArray(body.expectedAlgorithms) ? body.expectedAlgorithms : ['RS256'];
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (alg.toLowerCase() === 'none') {
+      findings.push({ code: 'JWT_ALG_NONE_FORBIDDEN', severity: 'critical', message: 'Unsigned JWT alg:none rejected (CVE-2026-29000).' });
+    } else if (!expectedAlgs.includes(alg)) {
+      findings.push({ code: 'JWT_ALG_CONFUSION_BLOCKED', severity: 'critical', message: `Algorithm "${alg}" blocked under pinned [${expectedAlgs.join(', ')}] (CVE-2026-33322).` });
+    }
+    if (body.jwkHasExplicitAlg === false) {
+      findings.push({ code: 'JWK_MISSING_EXPLICIT_ALG', severity: 'high', message: 'JWK lacks explicit alg field (CVE-2026-22817).' });
+    }
+    if (hdr.jku || hdr.x5u) {
+      findings.push({ code: 'JWT_JKU_SSRF_BLOCKED', severity: 'critical', message: 'Remote jku/x5u header blocked to prevent JWKS SSRF forgery.' });
+    }
+    if (typeof hdr.kid === 'string' && /(\.\.|\/|\\|'|;|--)/.test(hdr.kid)) {
+      findings.push({ code: 'JWT_KID_INJECTION', severity: 'critical', message: `Unsafe kid "${hdr.kid}" rejected (path traversal / SQLi pattern).` });
+    }
+    if ((body.expectedIssuer && claims.iss !== body.expectedIssuer) || (body.expectedAudience && claims.aud !== body.expectedAudience)) {
+      findings.push({ code: 'JWT_CLAIMS_MISMATCH', severity: 'high', message: 'JWT iss/aud claims do not match pinned OIDC tenant.' });
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'BLOCKED' : 'SAFE',
+      headerAlg: alg,
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      message: findings.length > 0 ? `Blocked ${findings.length} JWT/OIDC forgery vector(s) without storing raw token.` : 'JWT header & OIDC claims verified.',
+    });
+  }
+
+  if (pathname === '/api/observability/leak-guard/analyze' && method === 'POST') {
+    const limitMb = Number(body.containerLimitMb) || 1024;
+    const recMaxOld = Math.floor(limitMb * 0.78);
+    const heapSamples: number[] = Array.isArray(body.heapSamplesMb) ? body.heapSamplesMb : [200, 320, 440, 560, 680];
+    const slope = heapSamples.length >= 2 ? (heapSamples[heapSamples.length - 1] - heapSamples[0]) / (heapSamples.length - 1) : 120;
+    const lastHeap = heapSamples[heapSamples.length - 1] || 680;
+    const hoursToOom = slope > 0 ? Number(((limitMb - lastHeap) / slope).toFixed(2)) : null;
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (slope >= 20) findings.push({ code: 'HEAP_LEAK_SLOPE_HIGH', severity: 'critical', message: `Monotonic V8 heap leak (+${slope.toFixed(1)} MB/hr); OOM in ~${hoursToOom}h.` });
+    if ((Number(body.configuredMaxOldSpaceMb) || 0) > recMaxOld) findings.push({ code: 'V8_HEAP_EXCEEDS_CGROUP', severity: 'high', message: `Configured V8 heap exceeds 78% cgroup cap (${recMaxOld} MB).` });
+    if ((Number(body.openFds) || 0) / Math.max(1, Number(body.fdLimit) || 1024) >= 0.8) findings.push({ code: 'FD_EXHAUSTION_EMFILE_RISK', severity: 'critical', message: `Open FDs ${body.openFds}/${body.fdLimit} (>=80% EMFILE threshold).` });
+    if ((Number(body.eventLoopLagP99Ms) || 0) >= 100) findings.push({ code: 'EVENT_LOOP_LAG_CRITICAL', severity: 'high', message: `Event-loop p99 lag ${body.eventLoopLagP99Ms}ms (>=100ms GC stall).` });
+    const nodeOptions = `--max-old-space-size=${recMaxOld} --heapsnapshot-signal=SIGUSR2`;
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'CRITICAL' : 'HEALTHY',
+      heapSlopeMbPerSample: Number(slope.toFixed(1)),
+      hoursToOom,
+      recommendedMaxOldSpaceMb: recMaxOld,
+      nodeOptions,
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      message: `Projected OOM in ${hoursToOom}h; pin NODE_OPTIONS="${nodeOptions}".`,
+    });
+  }
+
+  if (pathname === '/api/observability/leak-guard/drain-plan' && method === 'POST') {
+    const limitMb = Number(body.containerLimitMb) || 1024;
+    const recMaxOld = Math.floor(limitMb * 0.78);
+    const nodeOptions = `--max-old-space-size=${recMaxOld} --heapsnapshot-signal=SIGUSR2`;
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      recommendedMaxOldSpaceMb: recMaxOld,
+      nodeOptions,
+      steps: [
+        { order: 1, phase: 'snapshot', action: 'Send SIGUSR2 to capture V8 heap snapshot before rolling drain' },
+        { order: 2, phase: 'drain', action: 'Shift Caddy traffic to warm standby replica & drain in-flight connections' },
+        { order: 3, phase: 'remediate', action: `Restart with NODE_OPTIONS="${nodeOptions}" and verify FD usage < 50%` },
+      ],
+    });
+  }
+
+  if (pathname === '/api/edge/graphql-shield/inspect' && method === 'POST') {
+    const q = String(body.query || '');
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    const isIntrospect = /__schema|__type\b/i.test(q);
+    const isFragmentAbuse = /fragment\s+\w+/i.test(q) && /\.\.\.\w+/.test(q);
+    if (isIntrospect && body.allowIntrospection === false) {
+      findings.push({ code: 'GRAPHQL_INTROSPECTION_BLOCKED', severity: 'high', message: 'Production __schema/__type introspection blocked.' });
+    }
+    if (isFragmentAbuse) {
+      findings.push({ code: 'GRAPHQL_ALIAS_AMPLIFICATION', severity: 'critical', message: 'Expanded fragment spreads resolved 72 aliases (> maxAliases 25 — CVE-2026-47707).' });
+      findings.push({ code: 'GRAPHQL_FRAGMENT_FANOUT_DOS', severity: 'critical', message: 'Recursive fragment spread fan-out exceeded budget (14 > 10 — CVE-2025-32031).' });
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'BLOCKED' : 'SAFE',
+      metrics: {
+        maxObservedDepth: isFragmentAbuse ? 5 : 3,
+        expandedAliases: isFragmentAbuse ? 72 : 1,
+        fragmentExpansions: isFragmentAbuse ? 14 : 0,
+        fragmentCycleDetected: false,
+        batchSize: 1,
+        introspectionUsed: isIntrospect,
+      },
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      message: findings.length > 0 ? `Blocked GraphQL DoS/introspection query (${findings.map((f) => f.code).join(', ')}).` : 'GraphQL query within complexity bounds.',
+    });
+  }
+
+  if (pathname === '/api/domains/acme-budget/audit' && method === 'POST') {
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if ((Number(body.certsIssued7d) || 0) >= 40) findings.push({ code: 'ACME_WEEKLY_QUOTA_NEAR', severity: 'high', message: `Issued ${body.certsIssued7d}/50 weekly Let's Encrypt certificates.` });
+    if ((Number(body.failedAuthz1h) || 0) >= 4) findings.push({ code: 'ACME_AUTHZ_LOCKOUT_RISK', severity: 'critical', message: `${body.failedAuthz1h}/5 failed authorizations/hr risks 429 lockout (Coolify#6800).` });
+    if (Array.isArray(body.staleDomainsInStore) && body.staleDomainsInStore.length > 0) findings.push({ code: 'STALE_ACME_DOMAINS_DETECTED', severity: 'high', message: `${body.staleDomainsInStore.length} stale domain(s) still polling ACME.` });
+    if (body.hasPersistentCertVolume === false) findings.push({ code: 'EPHEMERAL_CERT_STORAGE', severity: 'critical', message: 'Certificate storage volume is ephemeral (Dokploy#2238 overwrite risk).' });
+    if (String(body.minTlsVersion || '1.2') < '1.2') findings.push({ code: 'WEAK_TLS_VERSION', severity: 'critical', message: `TLS ${body.minTlsVersion} is deprecated; require TLS 1.2/1.3.` });
+    if (Array.isArray(body.ciphers) && body.ciphers.some((c: string) => /RC4|3DES|CBC/i.test(c))) findings.push({ code: 'WEAK_CIPHER_SUITE', severity: 'high', message: 'Deprecated RC4/CBC cipher suite detected.' });
+    const domain = String(body.domain || 'acme-demo.dev');
+    const caddyTlsBlock = `tls {\n  protocols tls1.2 tls1.3\n  ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n}\n# Persistent cert volume: /data/caddy/certificates (${domain} · RFC 9773 ARI enabled)`;
+    return jsonResponse({
+      ok: true,
+      domain,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'CRITICAL' : 'HEALTHY',
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      caddyTlsBlock,
+      message: `Flagged ${findings.length} ACME quota / TLS cipher defect(s).`,
+    });
+  }
+
+  if (pathname === '/api/security/archive-guard/inspect' && method === 'POST') {
+    const entries: any[] = Array.isArray(body.entries) ? body.entries : [];
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    const seenLower = new Set<string>();
+    for (const e of entries) {
+      const p = String(e?.path || '');
+      if (p.includes('..') || p.startsWith('/')) findings.push({ code: 'ZIP_SLIP_PATH_TRAVERSAL', severity: 'critical', message: `Archive entry "${p}" escapes canonical targetRoot (CVE-2026-23745).` });
+      if (e?.type === 'symlink' && String(e?.linkname || '').startsWith('/')) findings.push({ code: 'SYMLINK_ESCAPE_BLOCKED', severity: 'critical', message: `Symlink "${p}" -> "${e.linkname}" escapes targetRoot.` });
+      const norm = p.normalize('NFC').toLowerCase();
+      if (seenLower.has(norm)) findings.push({ code: 'UNICODE_PATH_COLLISION', severity: 'high', message: `Case/Unicode collision on "${p}" (CVE-2026-23950).` });
+      seenLower.add(norm);
+      if (Number(e?.compressedBytes) > 0 && Number(e?.uncompressedBytes) / Number(e.compressedBytes) > (Number(body.maxRatio) || 100)) {
+        findings.push({ code: 'ZIP_BOMB_DETECTED', severity: 'critical', message: `Decompression ratio ${Math.round(Number(e.uncompressedBytes) / Number(e.compressedBytes))}:1 exceeds 100:1 cap.` });
+      }
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'BLOCKED' : 'SAFE',
+      entriesInspected: entries.length,
+      checkedEntries: entries.length,
+      targetRoot: String(body.targetRoot || '/var/lib/culkibo/extract/acme-web'),
+      findings,
+      findingCodes: Array.from(new Set(findings.map((f) => f.code))),
+      message: findings.length > 0 ? `Blocked ${findings.length} archive extraction threat(s) before write.` : 'Archive manifest verified safe.',
     });
   }
 
@@ -5683,16 +5853,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (190 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (195 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 190 MCP tools on demand without bloating context (-93%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 195 MCP tools on demand without bloating context (-93%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_jwt_oidc_firewall', description: 'Zero-dep JWT algorithm-confusion, alg:none/JWE PlainJWT, jku SSRF, kid traversal & OIDC claim firewall (CVE-2026-29000/33322)', readOnly: false, profile: 'security' },
+      { name: 'culkibo_runtime_leak_guard', description: 'OLS container heap/RSS leak slope predictor (hoursToOom), V8 cgroup max-old-space-size, FD EMFILE & GC event-loop drain planner', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_graphql_dos_shield', description: 'Zero-dep fragment-expanding GraphQL depth, alias amplification, batching & production __schema introspection shield (CVE-2026-47707)', readOnly: false, profile: 'security' },
+      { name: 'culkibo_acme_tls_budget', description: 'ACME 50-cert/wk & 5-fail/hr lockout auditor, stale domain detector, RFC 9773 ARI renewal scheduler & TLS 1.2/1.3 cipher guard (Coolify#6800)', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_archive_slip_guard', description: 'Canonical Zip-Slip ../ traversal, symlink/hardlink escape, Unicode NFC collision & >100:1 Zip-Bomb archive inspector (CVE-2026-23745)', readOnly: true, profile: 'security' },
       { name: 'culkibo_cors_csp_guard', description: 'Browser CORS wildcard/reflected credentials, strict CSP/SRI & HSTS firewall emitting hardened Caddy headers (CVE-2025-34291)', readOnly: false, profile: 'security' },
       { name: 'culkibo_pg_vacuum_guard', description: 'PostgreSQL 32-bit datfrozenxid wraparound, idle-in-tx xmin pin & autovacuum guard emitting online VACUUM VERBOSE SQL', readOnly: false, profile: 'ops' },
       { name: 'culkibo_monorepo_graph', description: 'Pure-JS monorepo workspace DAG selective affected-path builder, Kahn deployWaves[] & cycle blocker (Dokploy#5547)', readOnly: false, profile: 'deploy' },
@@ -5769,26 +5944,26 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 190 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 195 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 190, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 195, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_cors_csp_guard', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_pkg_confusion_guard', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_jwt_oidc_firewall', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_archive_slip_guard', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 190,
+      totalTools: 195,
       profiles: { core: { count: 17, savedPct: 93 } },
     });
   }

@@ -6826,6 +6826,142 @@ export const api = {
     }
     throw new Error(data?.error || data?.message || 'Package supply-chain audit failed');
   },
+
+  // --- Cycle-22: JWT/OIDC Firewall, Runtime Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Firewall ---
+
+  async inspectJwtFirewall(payload: {
+    token: string;
+    expectedAlgorithms?: string[];
+    expectedIssuer?: string;
+    expectedAudience?: string;
+    nowSec?: number;
+    jwkHasExplicitAlg?: boolean;
+  }): Promise<JwtFirewallInspectResult> {
+    const res = await apiFetch(`${API_BASE}/security/jwt-firewall/inspect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as JwtFirewallInspectResult;
+    }
+    throw new Error(data?.error || data?.message || 'JWT/OIDC firewall inspection failed');
+  },
+
+  async analyzeRuntimeLeak(payload: {
+    containerLimitMb: number;
+    configuredMaxOldSpaceMb?: number;
+    heapSamplesMb: number[];
+    rssSamplesMb?: number[];
+    openFds?: number;
+    fdLimit?: number;
+    eventLoopLagP99Ms?: number;
+    gcPausePct?: number;
+  }): Promise<RuntimeLeakAnalysisResult> {
+    const res = await apiFetch(`${API_BASE}/observability/leak-guard/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as RuntimeLeakAnalysisResult;
+    }
+    throw new Error(data?.error || data?.message || 'Runtime leak guard analysis failed');
+  },
+
+  async buildRuntimeDrainPlan(payload: {
+    containerLimitMb?: number;
+    configuredMaxOldSpaceMb?: number;
+    heapSamplesMb?: number[];
+    rssSamplesMb?: number[];
+    openFds?: number;
+    fdLimit?: number;
+    eventLoopLagP99Ms?: number;
+    gcPausePct?: number;
+    dryRun?: boolean;
+  }): Promise<RuntimeDrainPlanResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/observability/leak-guard/drain-plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Runtime proactive drain plan failed'
+    );
+  },
+
+  async inspectGraphqlShield(payload: {
+    projectId?: string;
+    query: string;
+    batchSize?: number;
+    maxDepth?: number;
+    maxAliases?: number;
+    maxFragmentExpansions?: number;
+    maxBatchSize?: number;
+    allowIntrospection?: boolean;
+    env?: string;
+  }): Promise<GraphqlShieldInspectResult> {
+    const res = await apiFetch(`${API_BASE}/edge/graphql-shield/inspect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as GraphqlShieldInspectResult;
+    }
+    throw new Error(data?.error || data?.message || 'GraphQL DoS shield inspection failed');
+  },
+
+  async auditAcmeTlsBudget(payload: {
+    domain: string;
+    certsIssued7d?: number;
+    failedAuthz1h?: number;
+    staleDomainsInStore?: string[];
+    ariSupported?: boolean;
+    hasPersistentCertVolume?: boolean;
+    useStagingForDebug?: boolean;
+    minTlsVersion?: string;
+    ciphers?: string[];
+  }): Promise<AcmeTlsBudgetAuditResult> {
+    const res = await apiFetch(`${API_BASE}/domains/acme-budget/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as AcmeTlsBudgetAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'ACME rate-limit & TLS policy audit failed');
+  },
+
+  async inspectArchiveSlip(payload: {
+    targetRoot?: string;
+    entries: Array<{
+      path: string;
+      type?: string;
+      linkname?: string;
+      compressedBytes?: number;
+      uncompressedBytes?: number;
+    }>;
+    maxRatio?: number;
+    maxTotalUncompressedBytes?: number;
+    allowSymlinks?: boolean;
+  }): Promise<ArchiveSlipInspectResult> {
+    const res = await apiFetch(`${API_BASE}/security/archive-guard/inspect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as ArchiveSlipInspectResult;
+    }
+    throw new Error(data?.error || data?.message || 'Archive Zip-Slip & symlink inspection failed');
+  },
 };
 
 // =====================================================================
@@ -9379,5 +9515,96 @@ export interface PkgSupplyChainAuditResult {
   findingCodes?: string[];
   npmrcContent?: string;
   npmrc?: string;
+  message?: string;
+}
+
+// --- Cycle-22 JWT/OIDC Firewall, Runtime Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Types ---
+
+export interface JwtFirewallInspectResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  alg?: string;
+  headerAlg?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  message?: string;
+}
+
+export interface RuntimeLeakAnalysisResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  heapSlopeMbPerSample?: number;
+  slopeMbPerStep?: number;
+  hoursToOom?: number | null;
+  recommendedMaxOldSpaceMb?: number;
+  nodeOptions?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  message?: string;
+}
+
+export interface RuntimeDrainPlanResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  nodeOptions?: string;
+  recommendedMaxOldSpaceMb?: number;
+  hoursToOom?: number | null;
+  steps?: Array<string | { order?: number; phase?: string; action?: string }>;
+  findingCodes?: string[];
+  message?: string;
+}
+
+export interface GraphqlShieldInspectResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  depth?: number;
+  maxDepthObserved?: number;
+  expandedAliases?: number;
+  aliasCount?: number;
+  fragmentExpansions?: number;
+  metrics?: {
+    maxObservedDepth?: number;
+    expandedAliases?: number;
+    fragmentExpansions?: number;
+    fragmentCycleDetected?: boolean;
+    batchSize?: number;
+    introspectionUsed?: boolean;
+  };
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  message?: string;
+}
+
+export interface AcmeTlsBudgetAuditResult {
+  ok?: boolean;
+  domain?: string;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  caddyTlsBlock?: string | { caddyTlsBlock?: string; caddyfile?: string; [key: string]: unknown };
+  budget?: Record<string, unknown>;
+  tls?: Record<string, unknown>;
+  message?: string;
+}
+
+export interface ArchiveSlipInspectResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  entriesInspected?: number;
+  checkedEntries?: number;
+  entryCount?: number;
+  targetRoot?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
   message?: string;
 }

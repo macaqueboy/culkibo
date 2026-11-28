@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 190);
+    assert.strictEqual(demoJson.datasets.mcpTools, 195);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1394,7 +1394,64 @@ async function testCliDx() {
     ], { env: isolatedEnv });
     assert.strictEqual(pkgOkCli.status, 0, `culkibo pkg-guard sano falló: ${pkgOkCli.stderr} ${pkgOkCli.stdout}`);
     assert.strictEqual(JSON.parse(pkgOkCli.stdout).ok, true);
-    console.log(`  ✓ Pioneer CLI Cycle-21 Milestone verificado (culkibo email-audit fail=1/ok=0, culkibo pkg-guard worm+typo=1/safe=0, culkibo demo 190 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-21 Milestone verificado (culkibo email-audit fail=1/ok=0, culkibo pkg-guard worm+typo=1/safe=0)`);
+
+    // 26. Pioneer Cycle-22 CLI: `culkibo jwt-audit` (alg:none/jku/kid exit 1, 0 raw token echo vs valid RS256 exit 0) & `culkibo archive-guard` (Zip-Slip/symlink/bomb exit 1 vs clean exit 0)
+    const b64uCli = (obj) => Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
+    const badCliJwt = `${b64uCli({ alg: 'none', jku: 'https://evil.example/jwks.json', kid: '../../etc/passwd' })}.${b64uCli({ sub: 'root', exp: 1999999999 })}.`;
+    const jwtFailCli = await runCli([
+      'jwt-audit',
+      '--token', badCliJwt,
+      '--alg', 'RS256',
+      '--now', '1790000000',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(jwtFailCli.status, 1, 'culkibo jwt-audit debe salir con código 1 ante alg:none / jku / kid');
+    assert.ok(!jwtFailCli.stdout.includes(badCliJwt), 'culkibo jwt-audit jamás debe imprimir el token JWT raw');
+    const jwtFailJson = JSON.parse(jwtFailCli.stdout);
+    assert.strictEqual(jwtFailJson.ok, false);
+    assert.ok(jwtFailJson.findingCodes.includes('JWT_ALG_NONE_FORBIDDEN'));
+    assert.ok(jwtFailJson.findingCodes.includes('JWT_JKU_SSRF_BLOCKED'));
+    assert.ok(jwtFailJson.findingCodes.includes('JWT_KID_INJECTION'));
+
+    const goodCliJwt = `${b64uCli({ alg: 'RS256', kid: 'key-2026' })}.${b64uCli({ sub: 'u1', iss: 'https://auth.culkibo.dev', aud: 'api', exp: 1999999999 })}.valid_sig_placeholder`;
+    const jwtOkCli = await runCli([
+      'jwt-audit',
+      '--token', goodCliJwt,
+      '--alg', 'RS256',
+      '--issuer', 'https://auth.culkibo.dev',
+      '--audience', 'api',
+      '--now', '1790000000',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(jwtOkCli.status, 0, `culkibo jwt-audit válido falló: ${jwtOkCli.stderr} ${jwtOkCli.stdout}`);
+    assert.ok(!jwtOkCli.stdout.includes(goodCliJwt), 'culkibo jwt-audit jamás debe imprimir el token JWT raw en éxito');
+    assert.strictEqual(JSON.parse(jwtOkCli.stdout).ok, true);
+
+    const archFailFile = path.join(tmpRoot, 'archive-bad-c22.json');
+    fs.writeFileSync(archFailFile, JSON.stringify({
+      targetRoot: '/srv/extract',
+      entries: [
+        { path: '../../etc/cron.d/pwn', type: 'file', compressedBytes: 100, uncompressedBytes: 100 },
+        { path: 'link.txt', type: 'symlink', linkname: '/etc/passwd' },
+        { path: 'App/a.js', type: 'file', compressedBytes: 10, uncompressedBytes: 10 },
+        { path: 'app/a.js', type: 'file', compressedBytes: 10, uncompressedBytes: 10 },
+        { path: 'bomb.bin', type: 'file', compressedBytes: 1000, uncompressedBytes: 500000 }
+      ]
+    }, null, 2), 'utf8');
+    const archFailCli = await runCli(['archive-guard', archFailFile, '--json'], { env: isolatedEnv });
+    assert.strictEqual(archFailCli.status, 1, 'culkibo archive-guard debe salir con código 1 ante Zip-Slip/symlink/Unicode/Zip-Bomb');
+    const archFailJson = JSON.parse(archFailCli.stdout);
+    assert.strictEqual(archFailJson.ok, false);
+    assert.ok(archFailJson.findingCodes.includes('ZIP_SLIP_PATH_TRAVERSAL'));
+    assert.ok(archFailJson.findingCodes.includes('SYMLINK_ESCAPE_BLOCKED'));
+    assert.ok(archFailJson.findingCodes.includes('UNICODE_PATH_COLLISION'));
+    assert.ok(archFailJson.findingCodes.includes('ZIP_BOMB_DETECTED'));
+
+    const archOkCli = await runCli(['archive-guard', '--entry', 'dist/server.js', '--json'], { env: isolatedEnv });
+    assert.strictEqual(archOkCli.status, 0, `culkibo archive-guard limpio falló: ${archOkCli.stderr} ${archOkCli.stdout}`);
+    assert.strictEqual(JSON.parse(archOkCli.stdout).ok, true);
+    console.log(`  ✓ Pioneer CLI Cycle-22 verificado (culkibo jwt-audit fail=1/ok=0 0-raw, culkibo archive-guard slip+bomb=1/ok=0, culkibo demo 195 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

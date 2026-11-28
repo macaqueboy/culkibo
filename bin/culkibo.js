@@ -76,7 +76,9 @@ const svc = {
   get baseImageHardenerService() { return require('../server/services/baseImageHardenerService'); },
   get mcpPoisonGuardService() { return require('../server/services/mcpPoisonGuardService'); },
   get emailAuthGuardService() { return require('../server/services/emailAuthGuardService'); },
-  get pkgConfusionGuardService() { return require('../server/services/pkgConfusionGuardService'); }
+  get pkgConfusionGuardService() { return require('../server/services/pkgConfusionGuardService'); },
+  get jwtOidcFirewallService() { return require('../server/services/jwtOidcFirewallService'); },
+  get archiveSlipGuardService() { return require('../server/services/archiveSlipGuardService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2899,15 +2901,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 190,
+            mcpTools: 195,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '190 MCP tools (-92.8%+ core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'CORS/CSP/SRI Firewall, Postgres Vacuum/XID Guard, Monorepo DAG, Email Auth/SMTP & Shai-Hulud/CHAINDROP Guard'
+            '195 MCP tools (-93.2%+ core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'JWT/OIDC Firewall, Runtime Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Firewall'
           ]
         };
       };
@@ -5118,6 +5120,166 @@ program
 
       const badge = ok ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
       console.log(`\n🧬 Culkibo Supply-Chain Worm & Typosquat Guard (${report.packageCount} pkg) — [${badge}]`);
+      console.log(`   Findings: ${report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
+      console.log('');
+      if (!ok) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-22 CLI: jwt-audit (CVE-2026-29000/33322) & archive-guard
+// ===========================================================================
+
+program
+  .command('jwt-audit [inputFile]')
+  .description('JWT Algorithm-Confusion, jku/kid & OIDC Claim Firewall (CVE-2026-29000/33322): sale con código 1 si está bloqueado y jamás hace eco del token raw')
+  .option('--jwt <jwt>', 'Token compacto JWS/JWE a inspeccionar (solo se imprime huella SHA-256)')
+  .option('--token <jwt>', 'Alias de --jwt para inspeccionar un token compacto JWS/JWE')
+  .option('--alg <csv>', 'Algoritmos fijados esperados CSV', 'RS256,ES256,EdDSA')
+  .option('--issuer <iss>', 'Emisor OIDC esperado (iss)')
+  .option('--audience <aud>', 'Audiencia OIDC esperada (aud)')
+  .option('--now <sec>', 'Timestamp UNIX en segundos para evaluación determinista de exp')
+  .option('--missing-jwk-alg', 'Simular clave JWK sin parámetro explícito alg (CVE-2026-22817)')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    try {
+      const jwtSvc = svc.jwtOidcFirewallService;
+      /** @type {Record<string, any>} */
+      let fileData = {};
+      if (inputFile) {
+        const resolved = path.resolve(String(inputFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Archivo de entrada JWT no encontrado: ${resolved}`);
+        }
+        fileData = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+      }
+
+      const expectedAlgorithms = Array.isArray(fileData.expectedAlgorithms) && options.alg === 'RS256,ES256,EdDSA'
+        ? fileData.expectedAlgorithms.map(String)
+        : String(options.alg || 'RS256,ES256,EdDSA').split(',').map((s) => s.trim()).filter(Boolean);
+
+      const rawToken = (typeof options.jwt === 'string' && options.jwt.trim())
+        ? options.jwt.trim()
+        : (typeof options.token === 'string' && options.token.trim()
+            ? options.token.trim()
+            : (typeof fileData.token === 'string' && fileData.token.trim()
+                ? fileData.token.trim()
+                : (typeof program.opts().token === 'string' && program.opts().token.trim() ? program.opts().token.trim() : '')));
+
+      const report = jwtSvc.inspectJwtHeaderAndClaims({
+        ...(rawToken ? { token: rawToken } : {}),
+        ...(typeof fileData.innerToken === 'string' ? { innerToken: fileData.innerToken } : {}),
+        ...(fileData.innerUnsigned !== undefined ? { innerUnsigned: Boolean(fileData.innerUnsigned) } : {}),
+        ...(fileData.header && typeof fileData.header === 'object' ? { header: fileData.header } : {}),
+        ...(fileData.claims && typeof fileData.claims === 'object' ? { claims: fileData.claims } : {}),
+        expectedAlgorithms,
+        ...(options.issuer || fileData.expectedIssuer ? { expectedIssuer: String(options.issuer || fileData.expectedIssuer) } : {}),
+        ...(options.audience || fileData.expectedAudience ? { expectedAudience: String(options.audience || fileData.expectedAudience) } : {}),
+        ...(options.now !== undefined
+          ? { nowSec: Number(options.now) }
+          : (fileData.nowSec !== undefined ? { nowSec: Number(fileData.nowSec) } : {})),
+        jwkHasExplicitAlg: options.missingJwkAlg ? false : (fileData.jwkHasExplicitAlg !== undefined ? Boolean(fileData.jwkHasExplicitAlg) : true),
+        persist: false
+      });
+
+      const ok = Boolean(report && report.blocked === false);
+      const payload = {
+        ...report,
+        ok
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n🔑 Culkibo JWT/OIDC Algorithm-Confusion Firewall — [${badge}]`);
+      console.log(`   Format:      ${report.format} · alg=${report.headerAlg || 'none'} · sha256=${report.tokenFingerprintSha256 ? report.tokenFingerprintSha256.slice(0, 16) : 'n/a'}`);
+      console.log(`   Findings:    ${report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
+      console.log('');
+      if (!ok) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('archive-guard [manifestFile]')
+  .description('Archive Zip-Slip, Symlink/Hardlink Traversal, Unicode Collision & Zip-Bomb Firewall (CVE-2026-23745/23950): sale con código 1 si está bloqueado')
+  .option('--root <dir>', 'Directorio raíz canónico de extracción', '/srv/extract')
+  .option('--entry <path>', 'Ruta individual de archivo a evaluar rápidamente')
+  .option('--type <type>', 'Tipo de entrada para --entry (file|symlink|hardlink)', 'file')
+  .option('--linkname <target>', 'Destino symlink/hardlink para --entry')
+  .option('--max-ratio <n>', 'Ratio máximo de descompresión permitido', '100')
+  .option('--allow-symlinks', 'Permitir symlinks relativos estrictamente internos')
+  .option('--json', 'Salida JSON estructurada')
+  .action((manifestFile, options) => {
+    try {
+      const archiveSvc = svc.archiveSlipGuardService;
+      let targetRoot = String(options.root || '/srv/extract');
+      /** @type {any[]} */
+      let entries = [];
+      let maxRatio = Number(options.maxRatio ?? 100);
+      /** @type {number | undefined} */
+      let maxTotalUncompressedBytes;
+      let allowSymlinks = Boolean(options.allowSymlinks);
+
+      if (manifestFile) {
+        const resolved = path.resolve(String(manifestFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Manifiesto de archivo no encontrado: ${resolved}`);
+        }
+        const parsed = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+        if (Array.isArray(parsed)) {
+          entries = parsed;
+        } else if (parsed && typeof parsed === 'object') {
+          if (Array.isArray(parsed.entries)) entries = parsed.entries;
+          if (typeof parsed.targetRoot === 'string' && options.root === '/srv/extract') targetRoot = parsed.targetRoot;
+          if (parsed.maxRatio !== undefined && options.maxRatio === '100') maxRatio = Number(parsed.maxRatio);
+          if (parsed.maxTotalUncompressedBytes !== undefined) maxTotalUncompressedBytes = Number(parsed.maxTotalUncompressedBytes);
+          if (parsed.allowSymlinks !== undefined && !options.allowSymlinks) allowSymlinks = Boolean(parsed.allowSymlinks);
+        }
+      }
+
+      if (typeof options.entry === 'string' && options.entry.trim()) {
+        entries = [
+          ...entries,
+          {
+            path: options.entry.trim(),
+            type: String(options.type || 'file'),
+            ...(options.linkname ? { linkname: String(options.linkname) } : {})
+          }
+        ];
+      }
+
+      const report = archiveSvc.inspectArchiveManifest({
+        targetRoot,
+        entries,
+        maxRatio,
+        ...(maxTotalUncompressedBytes !== undefined ? { maxTotalUncompressedBytes } : {}),
+        allowSymlinks,
+        persist: false
+      });
+
+      const ok = Boolean(report && report.blocked === false);
+      const payload = {
+        ...report,
+        ok
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n📦 Culkibo Archive Zip-Slip & Zip-Bomb Firewall (${report.entriesInspected} entries) — [${badge}]`);
+      console.log(`   Ratio:    ${report.compressionRatio}:1 · Root: ${report.targetRoot}`);
       console.log(`   Findings: ${report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
       console.log('');
       if (!ok) process.exitCode = 1;

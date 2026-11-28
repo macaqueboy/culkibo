@@ -84,6 +84,9 @@ const testCycle20HttpE2E = require('./cycle20-http-e2e.test');
 const testCorsCspAndPkgGuard = require('./cors-csp-and-pkg-guard.test');
 const testVacuumMonorepoEmail = require('./vacuum-monorepo-email.test');
 const testCycle21HttpE2E = require('./cycle21-http-e2e.test');
+const testJwtAndGraphqlShield = require('./jwt-and-graphql-shield.test');
+const testLeakAcmeArchive = require('./leak-acme-archive.test');
+const testCycle22HttpE2E = require('./cycle22-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -193,6 +196,9 @@ async function runAll() {
     { name: 'CORS/Strict CSP/SRI Firewall (CVE-2025-34291) & Supply-Chain Worm (Shai-Hulud/CHAINDROP) / Typosquat Guard', fn: testCorsCspAndPkgGuard },
     { name: 'PostgreSQL Autovacuum / 32-Bit XID Wraparound Guard, Monorepo Affected-Graph DAG (Dokploy#5547) & Email Auth/SMTP Guard (Coolify#4311)', fn: testVacuumMonorepoEmail },
     { name: 'Cycle #21 190-MCP & 86-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + CORS/XID/Monorepo/Email/Worm + RBAC)', fn: testCycle21HttpE2E },
+    { name: 'JWT Algorithm-Confusion / OIDC Firewall (CVE-2026-29000) & GraphQL Fragment-Spread DoS Shield (CVE-2026-47707)', fn: testJwtAndGraphqlShield },
+    { name: 'Container Heap-Slope / FD-Leak Guard, ACME RFC 9773 ARI / TLS Budget (Coolify#6800) & Archive Zip-Slip Firewall (CVE-2026-23745)', fn: testLeakAcmeArchive },
+    { name: 'Cycle #22 195-MCP & 89-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + JWT/Leak/GraphQL/ACME/ZipSlip + RBAC)', fn: testCycle22HttpE2E },
   ];
 
   for (const suite of suites) {
