@@ -102,6 +102,8 @@ import {
   type McpPoisonPinResult,
   type McpPoisonVerifyResult,
   type McpPoisonScanResult,
+  type EdgeCorsCspAuditResult,
+  type PkgSupplyChainAuditResult,
 } from '../lib/api';
 import { RemoteAccessPanel } from './RemoteAccessPanel';
 import { TeamAccessPanel } from './TeamAccessPanel';
@@ -412,6 +414,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   } | null>(null);
   const [mcpPoisonBusy, setMcpPoisonBusy] = useState(false);
   const [mcpPoisonError, setMcpPoisonError] = useState<string | null>(null);
+
+  // Cycle-21: CORS/CSP/SRI Firewall (CVE-2025-34291) & Supply-Chain Worm (Shai-Hulud/CHAINDROP) Guard
+  const [corsRes, setCorsRes] = useState<EdgeCorsCspAuditResult | null>(null);
+  const [corsBusy, setCorsBusy] = useState(false);
+  const [corsError, setCorsError] = useState<string | null>(null);
+  const [pkgGuardRes, setPkgGuardRes] = useState<PkgSupplyChainAuditResult | null>(null);
+  const [pkgGuardBusy, setPkgGuardBusy] = useState(false);
+  const [pkgGuardError, setPkgGuardError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab !== 'security') return;
@@ -2029,6 +2039,54 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onNotify?.(msg, 'error');
     } finally {
       setMcpPoisonBusy(false);
+    }
+  };
+
+  const handleAuditCorsCsp = async () => {
+    setCorsBusy(true);
+    setCorsError(null);
+    try {
+      const res = await api.auditEdgeCorsCsp({
+        allowedOrigins: ['*'],
+        allowCredentials: true,
+        reflectOrigin: true,
+        sameSiteCookie: 'None',
+        probeOrigin: 'https://evil.example',
+        headers: { 'Content-Security-Policy': "default-src 'self' 'unsafe-inline'" },
+        externalScripts: [{ src: 'https://cdn.example.net/widget.js' }],
+      });
+      setCorsRes(res);
+      onNotify?.('CORS/CSP/SRI Firewall BLOCKED: Wildcard + credentials (CVE-2025-34291), unsafe-inline CSP & missing SRI!', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'CORS/CSP/SRI audit failed';
+      setCorsError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setCorsBusy(false);
+    }
+  };
+
+  const handleAuditPkgWorm = async () => {
+    setPkgGuardBusy(true);
+    setPkgGuardError(null);
+    try {
+      const res = await api.auditPkgSupplyChain({
+        npmrcIgnoreScripts: false,
+        internalScopes: ['@acme'],
+        packages: [
+          { name: 'keyv-helper', version: '6.0.0', scripts: { postinstall: 'node setup.mjs && rm -rf ~/' } },
+          { name: 'expres', version: '4.21.0' },
+          { name: 'acme-internal-auth', version: '1.0.0', isInternal: true },
+        ],
+      });
+      setPkgGuardRes(res);
+      onNotify?.('Supply-Chain Worm Guard BLOCKED: CHAINDROP IoC, typosquat "expres" & missing ignore-scripts=true!', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Package supply-chain audit failed';
+      setPkgGuardError(msg);
+      onNotify?.(msg, 'error');
+    } finally {
+      setPkgGuardBusy(false);
     }
   };
 
@@ -4613,6 +4671,129 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 {mcpPoisonRes.scan?.message && <div>{mcpPoisonRes.scan.message}</div>}
               </div>
             )}
+          </div>
+
+          {/* 25. Cycle-21: Browser Security Headers, Strict CSP/SRI & CORS Firewall (CVE-2025-34291) */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.corsTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      Exact Origin · Strict CSP · sha384 SRI
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.corsDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={corsBusy}
+                onClick={() => void handleAuditCorsCsp()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {corsBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                <span>{corsBusy ? t('sec.corsWorking') : t('sec.corsBtn')}</span>
+              </button>
+            </div>
+
+            {corsError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{corsError}</div>}
+
+            {corsRes && (() => {
+              const rawFinds = Array.isArray(corsRes.findings) ? corsRes.findings : [];
+              const codes = Array.from(
+                new Set([
+                  ...(Array.isArray(corsRes.findingCodes) ? corsRes.findingCodes : []),
+                  ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'CORS_CSP_BLOCKED'))),
+                ])
+              );
+              const caddyText =
+                typeof corsRes.caddyfile === 'string'
+                  ? corsRes.caddyfile
+                  : typeof corsRes.caddyBlock === 'string'
+                    ? corsRes.caddyBlock
+                    : (corsRes.caddyBlock?.caddyfile ||
+                        'header {\n  Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"\n  Content-Security-Policy "default-src \'self\'"\n}');
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                    {codes.map((c, idx) => (
+                      <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-44">
+                    {caddyText}
+                  </pre>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 26. Cycle-21: Supply-Chain Worm (Shai-Hulud / CHAINDROP) & Typosquat Guard */}
+          <div className="culkibo-surface rounded-2xl p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0">
+                  <ShieldAlert className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('sec.wormPkgTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      ignore-scripts=true · Levenshtein 1–2
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('sec.wormPkgDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={pkgGuardBusy}
+                onClick={() => void handleAuditPkgWorm()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {pkgGuardBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                <span>{pkgGuardBusy ? t('sec.wormPkgWorking') : t('sec.wormPkgBtn')}</span>
+              </button>
+            </div>
+
+            {pkgGuardError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{pkgGuardError}</div>}
+
+            {pkgGuardRes && (() => {
+              const rawFinds = Array.isArray(pkgGuardRes.findings) ? pkgGuardRes.findings : [];
+              const codes = Array.from(
+                new Set([
+                  ...(Array.isArray(pkgGuardRes.findingCodes) ? pkgGuardRes.findingCodes : []),
+                  ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'WORM_IOC_DETECTED'))),
+                ])
+              );
+              const npmrcText =
+                typeof pkgGuardRes.npmrcContent === 'string'
+                  ? pkgGuardRes.npmrcContent
+                  : typeof pkgGuardRes.npmrc === 'string'
+                    ? pkgGuardRes.npmrc
+                    : 'ignore-scripts=true\naudit=true\nfund=false';
+              return (
+                <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                    {codes.map((c, idx) => (
+                      <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-40">
+                    {`# Hardened .npmrc (blocks postinstall worms)\n${npmrcText}`}
+                  </pre>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

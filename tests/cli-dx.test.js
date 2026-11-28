@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 185);
+    assert.strictEqual(demoJson.datasets.mcpTools, 190);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1334,7 +1334,67 @@ async function testCliDx() {
     const poisonOkCli = await runCli(['mcp-poison-check', liveCleanFile, '--pin-file', pinFile, '--json'], { env: isolatedEnv });
     assert.strictEqual(poisonOkCli.status, 0, `culkibo mcp-poison-check limpio falló: ${poisonOkCli.stderr} ${poisonOkCli.stdout}`);
     assert.strictEqual(JSON.parse(poisonOkCli.stdout).ok, true);
-    console.log(`  ✓ Pioneer CLI Cycle-20 verificado (culkibo base-harden fail=1/ok=0, culkibo mcp-poison-check rug-pull+Unicode=1/clean=0, culkibo demo 185 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-20 verificado (culkibo base-harden fail=1/ok=0, culkibo mcp-poison-check rug-pull+Unicode=1/clean=0)`);
+
+    // 25. Pioneer Cycle-21 Milestone CLI: `culkibo email-audit` (SPF>10/DKIM1024/SMTP exit 1 vs pass exit 0) & `culkibo pkg-guard` (CHAINDROP/typosquat exit 1 vs safe exit 0)
+    const spf12Cli = 'v=spf1 ' + Array.from({ length: 12 }, (_, i) => `include:m${i}.mail.example`).join(' ') + ' ~all';
+    const emailFailCli = await runCli([
+      'email-audit',
+      '--domain', 'acme.dev',
+      '--from', 'alerts@other.org',
+      '--spf', spf12Cli,
+      '--dkim-bits', '1024',
+      '--dmarc', 'v=DMARC1; p=quarantine;',
+      '--smtp-port', '587',
+      '--smtp-tls', 'none',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(emailFailCli.status, 1, 'culkibo email-audit debe salir con código 1 ante fallos SPF/DKIM/DMARC/SMTP');
+    const emailFailJson = JSON.parse(emailFailCli.stdout);
+    assert.strictEqual(emailFailJson.ok, false);
+    assert.ok(emailFailJson.findingCodes.includes('SPF_LOOKUP_LIMIT_EXCEEDED'));
+    assert.ok(emailFailJson.findingCodes.includes('DKIM_KEY_TOO_WEAK'));
+    assert.ok(emailFailJson.findingCodes.includes('SMTP_TLS_MISMATCH'));
+
+    const emailOkCli = await runCli([
+      'email-audit',
+      '--domain', 'acme.dev',
+      '--from', 'noreply@acme.dev',
+      '--spf', 'v=spf1 include:_spf.resend.com ~all',
+      '--dkim-bits', '2048',
+      '--dmarc', 'v=DMARC1; p=quarantine; adkim=s; aspf=s;',
+      '--mta-sts', 'enforce',
+      '--smtp-port', '587',
+      '--smtp-tls', 'starttls',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(emailOkCli.status, 0, `culkibo email-audit válido falló: ${emailOkCli.stderr} ${emailOkCli.stdout}`);
+    assert.strictEqual(JSON.parse(emailOkCli.stdout).ok, true);
+
+    const pkgFailFile = path.join(tmpRoot, 'pkg-guard-fail-c21.json');
+    fs.writeFileSync(pkgFailFile, JSON.stringify({
+      npmrcIgnoreScripts: false,
+      packages: [
+        { name: 'keyv-compromised', postinstall: 'node setup.mjs && rm -rf ~/' },
+        { name: 'expres' }
+      ]
+    }, null, 2), 'utf8');
+    const pkgFailCli = await runCli(['pkg-guard', pkgFailFile, '--json'], { env: isolatedEnv });
+    assert.strictEqual(pkgFailCli.status, 1, 'culkibo pkg-guard debe salir con código 1 ante WORM_IOC_DETECTED / TYPOSQUAT_SUSPECTED');
+    const pkgFailJson = JSON.parse(pkgFailCli.stdout);
+    assert.strictEqual(pkgFailJson.ok, false);
+    assert.ok(pkgFailJson.findingCodes.includes('WORM_IOC_DETECTED'));
+    assert.ok(pkgFailJson.findingCodes.includes('TYPOSQUAT_SUSPECTED'));
+
+    const pkgOkCli = await runCli([
+      'pkg-guard',
+      '--pkg', 'express,zod',
+      '--ignore-scripts',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(pkgOkCli.status, 0, `culkibo pkg-guard sano falló: ${pkgOkCli.stderr} ${pkgOkCli.stdout}`);
+    assert.strictEqual(JSON.parse(pkgOkCli.stdout).ok, true);
+    console.log(`  ✓ Pioneer CLI Cycle-21 Milestone verificado (culkibo email-audit fail=1/ok=0, culkibo pkg-guard worm+typo=1/safe=0, culkibo demo 190 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

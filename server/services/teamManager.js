@@ -4407,6 +4407,53 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:read');
     }
 
+    // Cycle-21: CORS/CSP/SRI Firewall, Postgres Vacuum/XID Guard, Monorepo DAG Builder, Email Auth/SMTP Guard & Supply-Chain Worm/Pkg Guard
+    if (p === '/api/edge/cors-csp/policy') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/edge/cors-csp/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/edge/cors-csp/policies') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/db/vacuum-guard/recover-plan') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/db/vacuum-guard/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/db/vacuum-guard/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/builds/monorepo/plan') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/builds/monorepo/affected') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/builds/monorepo/plans') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/domains/email-auth/render') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/domains/email-auth/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/domains/email-auth/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/supply-chain/pkg-guard/npmrc') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/supply-chain/pkg-guard/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/supply-chain/pkg-guard/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

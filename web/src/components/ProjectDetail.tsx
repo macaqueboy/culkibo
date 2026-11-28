@@ -87,6 +87,7 @@ import {
   type RegionTrafficShiftPlanResult,
   type BaseHardenerAuditResult,
   type CopaThinPatchResult,
+  type MonorepoPlanResult,
   isDemoMode,
 } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
@@ -274,8 +275,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..20 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain, Region Shift & Base Hardener state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift' | 'basehardener'>('oom');
+  // Cycle-13..21 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain, Region Shift, Base Hardener & Monorepo DAG state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift' | 'basehardener' | 'monorepo'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -336,6 +337,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [copaPlan, setCopaPlan] = useState<CopaThinPatchResult | null>(null);
   const [baseBusy, setBaseBusy] = useState<'bad' | 'good' | null>(null);
   const [baseError, setBaseError] = useState<string | null>(null);
+  // Cycle-21 Monorepo Affected-Graph Selective Builder & Rollout Planner state
+  const [monoResult, setMonoResult] = useState<MonorepoPlanResult | null>(null);
+  const [monoBusy, setMonoBusy] = useState<'wave' | 'cycle' | null>(null);
+  const [monoError, setMonoError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1742,6 +1747,39 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setBaseBusy(null);
+    }
+  };
+
+  const handleRunMonorepoGraph = async (mode: 'wave' | 'cycle') => {
+    setMonoBusy(mode);
+    setMonoError(null);
+    try {
+      const workspaces =
+        mode === 'cycle'
+          ? [
+              { name: 'svc-a', dir: 'apps/svc-a', deps: ['svc-b'], watchPaths: ['apps/svc-a/**'] },
+              { name: 'svc-b', dir: 'apps/svc-b', deps: ['svc-a'], watchPaths: ['apps/svc-b/**'] },
+            ]
+          : [
+              { name: 'packages/ui', dir: 'packages/ui', deps: [], watchPaths: ['packages/ui/**'] },
+              { name: 'apps/web', dir: 'apps/web', deps: ['packages/ui'], watchPaths: ['apps/web/**'] },
+              { name: 'apps/billing', dir: 'apps/billing', deps: [], watchPaths: ['apps/billing/**'] },
+            ];
+      const changedFiles = mode === 'cycle' ? ['apps/svc-a/index.ts'] : ['packages/ui/btn.tsx'];
+      const res = await api.planMonorepoRollout({ projectId: project.id, workspaces, changedFiles, dryRun: true });
+      setMonoResult(res);
+      onNotify(
+        mode === 'cycle'
+          ? 'Monorepo DAG Guard BLOCKED: WORKSPACE_CYCLE_DETECTED (svc-a ↔ svc-b)!'
+          : 'Monorepo Selective PR Waves Planned: packages/ui → apps/web (apps/billing skipped!)',
+        mode === 'cycle' ? 'error' : 'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Monorepo DAG rollout plan failed';
+      setMonoError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setMonoBusy(null);
     }
   };
 
@@ -3429,6 +3467,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 { id: 'drain' as const, label: t('pd.forensicsTabDrain') },
                 { id: 'regionshift' as const, label: t('pd.forensicsTabRegionShift') },
                 { id: 'basehardener' as const, label: t('pd.forensicsTabBaseHardener') },
+                { id: 'monorepo' as const, label: t('pd.forensicsTabMonorepo') },
               ]).map((tabItem) => (
                 <button
                   key={tabItem.id}
@@ -4409,6 +4448,73 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                         {copaCmd ? `# CNCF copa thin BuildKit patch (dryRun: true)\n${copaCmd}` : recDf}
                       </pre>
                     )}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'monorepo' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={monoBusy !== null}
+                  onClick={() => void handleRunMonorepoGraph('wave')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {monoBusy === 'wave' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.monoPlanWave')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={monoBusy !== null}
+                  onClick={() => void handleRunMonorepoGraph('cycle')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-slate-100 text-red-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {monoBusy === 'cycle' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.monoTestCycle')}</span>
+                </button>
+              </div>
+              {monoError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{monoError}</div>}
+              {monoResult && (() => {
+                const isBlocked = Boolean(monoResult.blocked || monoResult.hasCycle || monoResult.code === 'WORKSPACE_CYCLE_DETECTED');
+                const waves = Array.isArray(monoResult.deployWaves) ? monoResult.deployWaves : [];
+                const skipped = Array.isArray(monoResult.skippedServices) ? monoResult.skippedServices : [];
+                const cycleList = Array.isArray(monoResult.cycleNodes) && monoResult.cycleNodes.length > 0
+                  ? monoResult.cycleNodes
+                  : (Array.isArray(monoResult.cycle) ? monoResult.cycle : []);
+                return (
+                  <div className={`p-3.5 rounded-xl border space-y-2 tabular-nums font-mono text-[11px] ${
+                    isBlocked
+                      ? 'bg-red-50 border-red-200 text-red-700'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {isBlocked ? (monoResult.code || 'WORKSPACE_CYCLE_DETECTED') : `SELECTIVE DAG · ${waves.length} WAVE(S)`}
+                      </span>
+                      {isBlocked && cycleList.length > 0 && (
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          CYCLE: {cycleList.join(' ↔ ')}
+                        </span>
+                      )}
+                      {!isBlocked && skipped.length > 0 && (
+                        <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          SKIPPED: {skipped.join(', ')} (0 rebuilds)
+                        </span>
+                      )}
+                    </div>
+                    {!isBlocked && waves.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5">
+                        {waves.map((w, idx) => (
+                          <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px]">
+                            Wave {idx + 1}: {Array.isArray(w) ? w.join(', ') : String(w)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {monoResult.message && <div>{monoResult.message}</div>}
                   </div>
                 );
               })()}

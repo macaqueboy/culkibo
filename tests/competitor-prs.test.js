@@ -3938,6 +3938,129 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #20 CVEs (22a-22e): CVE-2026-30851 proxy trust/smuggling, valkey-io/valkey guard, copa/Wolfi base hardener, Coolify#12211/Restic#5411 WORM AES-GCM KEK rotation, CVE-2025-54136 MCPoison');
 
+  // -------------------------------------------------------------------------
+  // 23. Cycle #21 CORS/CSP/SRI, Postgres Vacuum/XID, Monorepo Graph, Email Auth & Supply-Chain Worm Regressions (docs/COMPETITOR_RADAR_CYCLE20.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const { auditCorsPolicy, auditSecurityHeaders } = require('../server/services/edgeCorsCspService');
+    const pgVacuum = require('../server/services/pgVacuumGuardService');
+    const monorepoGraph = require('../server/services/monorepoGraphService');
+    const emailAuth = require('../server/services/emailAuthGuardService');
+    const { PkgConfusionGuardService } = require('../server/services/pkgConfusionGuardService');
+
+    const c21Tmp = makeTempDir('culkibo-c21-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c21Tmp;
+    try {
+      // 23a. CORS/CSP/SRI (CVE-2025-34291/63388, CVE-2026-27579)
+      const corsBad23a = auditCorsPolicy({
+        allowedOrigins: ['*'],
+        allowCredentials: true,
+        reflectOrigin: true,
+        probeOrigin: 'https://evil.example'
+      });
+      assert.strictEqual(corsBad23a.safe, false);
+      assert.strictEqual(corsBad23a.blocked, true);
+      assert.ok(corsBad23a.findingCodes.includes('CORS_WILDCARD_CREDENTIALS'));
+      assert.ok(corsBad23a.findingCodes.includes('CORS_REFLECTED_ORIGIN_CREDENTIALS'));
+      const hdrBad23a = auditSecurityHeaders({
+        headers: { 'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'" },
+        externalScripts: [{ src: 'https://cdn.example.net/sdk.js' }]
+      });
+      assert.strictEqual(hdrBad23a.safe, false);
+      assert.ok(hdrBad23a.findingCodes.includes('CSP_UNSAFE_DIRECTIVE'));
+      assert.ok(hdrBad23a.findingCodes.includes('MISSING_SRI_HASH'));
+
+      // 23b. Postgres Autovacuum & 32-Bit XID Wraparound
+      const vacBad23b = pgVacuum.auditPgVacuumHealth({
+        databaseName: 'orders_prod',
+        xidAge: 1650000000,
+        idleInTxSec: 900,
+        autovacuumDisabledTables: ['events'],
+        persist: false
+      });
+      assert.strictEqual(vacBad23b.safe, false);
+      assert.ok(vacBad23b.findingCodes.includes('XID_WRAPAROUND_IMMINENT'));
+      assert.ok(vacBad23b.findingCodes.includes('IDLE_IN_TX_XMIN_PIN'));
+      assert.ok(vacBad23b.findingCodes.includes('AUTOVACUUM_DISABLED_TABLE'));
+      const rec23b = pgVacuum.planWraparoundRecovery(vacBad23b);
+      assert.strictEqual(rec23b.dryRun, true);
+      assert.strictEqual(rec23b.usesVacuumFull, false);
+      assert.ok(rec23b.recoverySql.includes('VACUUM (VERBOSE, FREEZE, ANALYZE)'));
+      assert.ok(!/VACUUM\s+FULL/i.test(rec23b.recoverySql), 'Recovery SQL MUST NEVER emit VACUUM FULL');
+
+      // 23c. Monorepo Affected-Graph Selective Builder (Dokploy#5547)
+      const ws23c = [
+        { name: 'packages/ui', dir: 'packages/ui', deps: [] },
+        { name: 'apps/web', dir: 'apps/web', deps: ['packages/ui'] },
+        { name: 'apps/billing', dir: 'apps/billing', deps: [] }
+      ];
+      const aff23c = monorepoGraph.resolveAffectedServices({ workspaces: ws23c, changedFiles: ['packages/ui/btn.tsx'] });
+      assert.deepStrictEqual(aff23c.affectedNames, ['apps/web', 'packages/ui']);
+      assert.deepStrictEqual(aff23c.skippedServices, ['apps/billing']);
+      const wav23c = monorepoGraph.computeTopologicalDeployWaves({ workspaces: ws23c, affectedNames: aff23c.affectedNames });
+      assert.strictEqual(wav23c.hasCycle, false);
+      assert.deepStrictEqual(wav23c.deployWaves, [['packages/ui'], ['apps/web']]);
+      const cyc23c = monorepoGraph.detectWorkspaceCycles([
+        { name: 'a', dir: 'a', deps: ['b'] },
+        { name: 'b', dir: 'b', deps: ['a'] }
+      ]);
+      assert.strictEqual(cyc23c.hasCycle, true);
+      assert.strictEqual(cyc23c.code, 'WORKSPACE_CYCLE_DETECTED');
+
+      // 23d. Transactional Email Auth & SMTP Parity (Coolify#4311)
+      const spf12 = 'v=spf1 ' + Array.from({ length: 12 }, (_, i) => `include:s${i + 1}.mail.test`).join(' ') + ' ~all';
+      const mailBad23d = emailAuth.auditEmailDeliverability({
+        domain: 'app.example.test',
+        fromAddress: 'noreply@other-domain.test',
+        spfTxt: spf12,
+        dkimBits: 1024,
+        dmarcTxt: 'v=DMARC1; p=quarantine',
+        smtpPort: 587,
+        smtpTlsMode: 'none',
+        persist: false
+      });
+      assert.strictEqual(mailBad23d.blocked, true);
+      assert.ok(mailBad23d.findingCodes.includes('SPF_LOOKUP_LIMIT_EXCEEDED'));
+      assert.ok(mailBad23d.findingCodes.includes('DKIM_KEY_TOO_WEAK'));
+      assert.ok(mailBad23d.findingCodes.includes('DMARC_MISSING_OR_UNALIGNED'));
+      assert.ok(mailBad23d.findingCodes.includes('SMTP_TLS_MISMATCH'));
+
+      // 23e. Supply-Chain Worm (Shai-Hulud/CHAINDROP) & Typosquat Guard
+      const pkgGuard23e = new PkgConfusionGuardService({ dataDir: c21Tmp });
+      const pkgBad23e = pkgGuard23e.auditPackageSupplyChain({
+        projectId: 'proj_23e',
+        npmrcIgnoreScripts: false,
+        packages: [
+          { name: 'keyv', scripts: { postinstall: 'node setup.mjs && rm -rf ~/' } },
+          { name: 'expres' }
+        ],
+        persist: false
+      });
+      assert.strictEqual(pkgBad23e.blocked, true);
+      assert.ok(pkgBad23e.findingCodes.includes('WORM_IOC_DETECTED'));
+      assert.ok(pkgBad23e.findingCodes.includes('UNAPPROVED_LIFECYCLE_SCRIPT'));
+      assert.ok(pkgBad23e.findingCodes.includes('TYPOSQUAT_SUSPECTED'));
+      assert.ok(pkgBad23e.findingCodes.includes('NPM_SCRIPTS_ENABLED'));
+      const pkgOk23e = pkgGuard23e.auditPackageSupplyChain({
+        projectId: 'proj_23e',
+        npmrcIgnoreScripts: true,
+        allowLifecycleScripts: ['esbuild'],
+        packages: [
+          { name: 'express' },
+          { name: 'esbuild', scripts: { postinstall: 'node install.js' } }
+        ],
+        persist: false
+      });
+      assert.strictEqual(pkgOk23e.safe, true);
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c21Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #21 CVEs (23a-23e): CVE-2025-34291 CORS/CSP/SRI, Postgres 32-bit XID/Autovacuum, Dokploy#5547 monorepo DAG, Coolify#4311 email auth/SMTP, Shai-Hulud/CHAINDROP worm guard');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

@@ -151,6 +151,11 @@ function getValkeyGuardService() { return _lazyV2.valkeyguard || (_lazyV2.valkey
 function getBaseImageHardenerService() { return _lazyV2.basehardener || (_lazyV2.basehardener = require('../services/baseImageHardenerService')); }
 function getWormBackupCryptoService() { return _lazyV2.wormcrypto || (_lazyV2.wormcrypto = require('../services/wormBackupCryptoService')); }
 function getMcpPoisonGuardService() { return _lazyV2.mcppoison || (_lazyV2.mcppoison = require('../services/mcpPoisonGuardService')); }
+function getEdgeCorsCspService() { return _lazyV2.corscsp || (_lazyV2.corscsp = require('../services/edgeCorsCspService')); }
+function getPgVacuumGuardService() { return _lazyV2.pgvacuum || (_lazyV2.pgvacuum = require('../services/pgVacuumGuardService')); }
+function getMonorepoGraphService() { return _lazyV2.monorepo || (_lazyV2.monorepo = require('../services/monorepoGraphService')); }
+function getEmailAuthGuardService() { return _lazyV2.emailauth || (_lazyV2.emailauth = require('../services/emailAuthGuardService')); }
+function getPkgConfusionGuardService() { return _lazyV2.pkgguard || (_lazyV2.pkgguard = require('../services/pkgConfusionGuardService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -10774,6 +10779,276 @@ router.post('/mcp/poison-guard/scan', async (req, res) => {
       ...(scanOut && typeof scanOut === 'object' ? scanOut : { ok: true, scan: scanOut }),
       ...(scopeOut ? { scopeAudit: scopeOut } : {})
     });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ============================================================================
+// CYCLE #21 PIONEER CAPABILITIES (190 MCP TOOLS & 86 SUITES)
+// ============================================================================
+
+// 1. Browser Security Headers, Strict CSP/SRI & CORS Firewall (`CVE-2025-34291`/`63388`, `CVE-2026-27579`)
+router.get('/edge/cors-csp/policies', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getEdgeCorsCspService().listCorsCspPolicies();
+    const allPolicies = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.policies) ? raw.policies : []);
+    const policies = projectId ? allPolicies.filter((p) => p && p.projectId === projectId) : allPolicies;
+    res.json({ ok: true, projectId: projectId || null, count: policies.length, policies });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/cors-csp/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getEdgeCorsCspService();
+    const corsInput = body.cors && typeof body.cors === 'object' ? { ...body, ...body.cors } : body;
+    const headersInput = body.securityHeaders && typeof body.securityHeaders === 'object' ? { ...body, ...body.securityHeaders } : body;
+    const cors = await svc.auditCorsPolicy(corsInput);
+    const securityHeaders = await svc.auditSecurityHeaders(headersInput);
+    const corsFindings = Array.isArray(cors && cors.findings) ? cors.findings : [];
+    const headerFindings = Array.isArray(securityHeaders && securityHeaders.findings) ? securityHeaders.findings : [];
+    const findings = [...corsFindings, ...headerFindings];
+    const findingCodes = Array.from(new Set([
+      ...(Array.isArray(cors && cors.findingCodes) ? cors.findingCodes : corsFindings.map((f) => f && f.code).filter(Boolean)),
+      ...(Array.isArray(securityHeaders && securityHeaders.findingCodes) ? securityHeaders.findingCodes : headerFindings.map((f) => f && f.code).filter(Boolean))
+    ]));
+    const safe = Boolean((cors ? cors.safe !== false : true) && (securityHeaders ? securityHeaders.safe !== false : true) && findings.length === 0);
+    const blocked = !safe;
+    let caddyfile = (cors && typeof cors.caddyfile === 'string' && cors.caddyfile)
+      || (securityHeaders && typeof securityHeaders.caddyfile === 'string' && securityHeaders.caddyfile)
+      || '';
+    if (!caddyfile) {
+      try {
+        const rendered = await svc.renderHardenedCaddyHeadersBlock(body);
+        caddyfile = typeof rendered === 'string' ? rendered : String((rendered && rendered.caddyfile) || '');
+      } catch (e) {}
+    }
+    res.json({
+      ok: true,
+      safe,
+      blocked,
+      status: blocked ? 'BLOCKED' : 'HARDENED',
+      cors,
+      securityHeaders,
+      findings,
+      findingCodes,
+      caddyfile
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/cors-csp/policy', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden configurar políticas CORS/CSP/SRI', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    if (!body.projectId && denyInstanceGlobalForTenant(req, res, 'configurar políticas globales CORS/CSP/SRI')) return;
+    const projectId = typeof body.projectId === 'string' && body.projectId.trim() ? body.projectId.trim() : 'default';
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const payload = body.policy && typeof body.policy === 'object' ? { ...body.policy, dryRun } : { ...body, dryRun };
+    const out = await getEdgeCorsCspService().upsertCorsCspPolicy(projectId, payload);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. PostgreSQL Autovacuum, 32-Bit XID Wraparound & Bloat Guard
+router.get('/db/vacuum-guard/audits', async (req, res) => {
+  try {
+    const databaseName = typeof req.query.databaseName === 'string' && req.query.databaseName.trim()
+      ? req.query.databaseName.trim()
+      : undefined;
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getPgVacuumGuardService().listVacuumAudits(databaseName);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, databaseName: databaseName || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/db/vacuum-guard/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getPgVacuumGuardService().auditPgVacuumHealth(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/db/vacuum-guard/recover-plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden planificar recuperación de wraparound/autovacuum', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getPgVacuumGuardService().planWraparoundRecovery({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Monorepo Affected-Graph Selective Builder & Rollout Planner (`Dokploy#5547`)
+router.get('/builds/monorepo/plans', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getMonorepoGraphService().listMonorepoPlans(projectId);
+    const plans = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.plans) ? raw.plans : []);
+    res.json({ ok: true, projectId: projectId || null, count: plans.length, plans });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/builds/monorepo/affected', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getMonorepoGraphService();
+    const workspaces = Array.isArray(body.workspaces) ? body.workspaces : [];
+    const cycleCheck = await svc.detectWorkspaceCycles(workspaces);
+    const affected = await svc.resolveAffectedServices(body);
+    const affectedNames = affected && Array.isArray(affected.affectedNames) ? affected.affectedNames : [];
+    const waves = cycleCheck && cycleCheck.hasCycle
+      ? { hasCycle: true, code: 'WORKSPACE_CYCLE_DETECTED', cycleNodes: cycleCheck.cycleNodes || [], deployWaves: [], rollbackWaves: [], totalWaves: 0 }
+      : await svc.computeTopologicalDeployWaves({ workspaces, affectedNames });
+    const hasCycle = Boolean((cycleCheck && cycleCheck.hasCycle) || (waves && waves.hasCycle));
+    res.json({
+      ...(affected && typeof affected === 'object' ? affected : { ok: true, affected }),
+      safe: !hasCycle,
+      blocked: hasCycle,
+      hasCycle,
+      cycleNodes: hasCycle ? ((cycleCheck && cycleCheck.cycleNodes && cycleCheck.cycleNodes.length > 0) ? cycleCheck.cycleNodes : (waves && waves.cycleNodes) || []) : [],
+      code: hasCycle ? 'WORKSPACE_CYCLE_DETECTED' : ((waves && waves.code) || 'VALID_DAG'),
+      deployWaves: (waves && waves.deployWaves) || [],
+      rollbackWaves: (waves && waves.rollbackWaves) || [],
+      totalWaves: (waves && waves.totalWaves) || 0
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/builds/monorepo/plan', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden planificar rollouts topológicos de monorepo', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getMonorepoGraphService().planMonorepoRollout({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. Transactional Email Auth (`SPF`/`DKIM`/`DMARC`/`MTA-STS`) & SMTP Guard (`Coolify#4311`)
+router.get('/domains/email-auth/audits', async (req, res) => {
+  try {
+    const domain = typeof req.query.domain === 'string' && req.query.domain.trim()
+      ? req.query.domain.trim()
+      : undefined;
+    const raw = await getEmailAuthGuardService().listEmailAuthAudits(domain);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, domain: domain || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/domains/email-auth/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getEmailAuthGuardService().auditEmailDeliverability(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/domains/email-auth/render', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar registros DNS SPF/DKIM/DMARC/MTA-STS', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getEmailAuthGuardService().renderHardenedDnsAuthRecords({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Supply-Chain Worm (`Shai-Hulud`/`CHAINDROP`), Typosquatting & `postinstall` Guard
+router.get('/supply-chain/pkg-guard/audits', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getPkgConfusionGuardService().listPkgGuardAudits(projectId);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, projectId: projectId || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/supply-chain/pkg-guard/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getPkgConfusionGuardService().auditPackageSupplyChain(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/supply-chain/pkg-guard/npmrc', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar configuraciones endurecidas .npmrc', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getPkgConfusionGuardService().generateSafeNpmrc({ ...body, dryRun });
+    res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);
   }

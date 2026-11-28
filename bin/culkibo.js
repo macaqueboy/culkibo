@@ -74,7 +74,9 @@ const svc = {
   get diskPressureGuardService() { return require('../server/services/diskPressureGuardService'); },
   get credentialExpiryWatchdogService() { return require('../server/services/credentialExpiryWatchdogService'); },
   get baseImageHardenerService() { return require('../server/services/baseImageHardenerService'); },
-  get mcpPoisonGuardService() { return require('../server/services/mcpPoisonGuardService'); }
+  get mcpPoisonGuardService() { return require('../server/services/mcpPoisonGuardService'); },
+  get emailAuthGuardService() { return require('../server/services/emailAuthGuardService'); },
+  get pkgConfusionGuardService() { return require('../server/services/pkgConfusionGuardService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2897,15 +2899,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 185,
+            mcpTools: 190,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '185 MCP tools (-92.5%+ core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'Proxy Trust Smuggling Guard, Valkey Fork Guard, EOL/Copa Hardener, WORM KEK Rotation & MCPoison Rug-Pull Guard'
+            '190 MCP tools (-92.8%+ core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'CORS/CSP/SRI Firewall, Postgres Vacuum/XID Guard, Monorepo DAG, Email Auth/SMTP & Shai-Hulud/CHAINDROP Guard'
           ]
         };
       };
@@ -4951,6 +4953,176 @@ program
       failCli(err, options);
     } finally {
       try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (e) {}
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-21 CLI: email-audit (SPF/DKIM/DMARC/SMTP) & pkg-guard (CHAINDROP)
+// ===========================================================================
+
+program
+  .command('email-audit [inputFile]')
+  .description('Transactional Email Auth (SPF/DKIM/DMARC/MTA-STS) & SMTP STARTTLS Guard (Coolify#4311): sale con código 1 si está bloqueado')
+  .option('--domain <domain>', 'Dominio remitente a auditar')
+  .option('--from <email>', 'Dirección MAIL_FROM para verificar alineación DMARC')
+  .option('--spf <txt>', 'Registro TXT SPF (v=spf1 ...)')
+  .option('--dkim-bits <n>', 'Tamaño de clave DKIM en bits (mínimo 2048)')
+  .option('--dmarc <txt>', 'Registro TXT DMARC (v=DMARC1 ...)')
+  .option('--mta-sts <mode>', 'Modo MTA-STS (enforce|testing|none)')
+  .option('--smtp-port <n>', 'Puerto SMTP saliente (587|465|25)')
+  .option('--smtp-tls <mode>', 'Modo TLS SMTP (starttls|implicit_tls|none)')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    try {
+      const emailSvc = svc.emailAuthGuardService;
+      /** @type {Record<string, any>} */
+      let fileData = {};
+      if (inputFile) {
+        const resolved = path.resolve(String(inputFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Archivo de configuración de email no encontrado: ${resolved}`);
+        }
+        fileData = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+      }
+
+      const report = emailSvc.auditEmailDeliverability({
+        domain: String(options.domain || fileData.domain || 'example.com'),
+        ...(options.from || fileData.fromAddress ? { fromAddress: String(options.from || fileData.fromAddress) } : {}),
+        spfTxt: options.spf !== undefined ? String(options.spf) : String(fileData.spfTxt || ''),
+        dkimBits: options.dkimBits !== undefined ? Number(options.dkimBits) : Number(fileData.dkimBits ?? 2048),
+        dmarcTxt: options.dmarc !== undefined ? String(options.dmarc) : String(fileData.dmarcTxt || ''),
+        mtaStsMode: options.mtaSts !== undefined ? String(options.mtaSts) : String(fileData.mtaStsMode || 'enforce'),
+        smtpPort: options.smtpPort !== undefined ? Number(options.smtpPort) : Number(fileData.smtpPort ?? 587),
+        ...(options.smtpTls !== undefined || fileData.smtpTlsMode !== undefined
+          ? { smtpTlsMode: String(options.smtpTls ?? fileData.smtpTlsMode) }
+          : {}),
+        persist: false
+      });
+
+      const ok = Boolean(report && report.blocked === false);
+      const payload = {
+        ...report,
+        ok
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mPASS ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n📧 Culkibo Email Auth & SMTP Guard (${report.domain}) — [${badge}]`);
+      console.log(`   SPF lookups: ${report.spfLookups}/10 · DKIM: ${report.dkimBits}b · SMTP: ${report.smtpPort}/${report.smtpTlsMode}`);
+      console.log(`   Findings:    ${report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
+      console.log('');
+      if (!ok) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('pkg-guard [inputFile]')
+  .description('Supply-Chain Worm (Shai-Hulud/CHAINDROP), Typosquatting & postinstall Guard: sale con código 1 si detecta IoCs, typosquats o scripts sin ignore-scripts=true')
+  .option('--pkg <csv>', 'Lista CSV de nombres de paquete a auditar')
+  .option('--postinstall <script>', 'Script postinstall inline a escanear en el paquete')
+  .option('--internal-scopes <csv>', 'Scopes/prefijos internos CSV para detectar dependency confusion')
+  .option('--allow-scripts <csv>', 'Paquetes CSV autorizados a ejecutar lifecycle scripts')
+  .option('--ignore-scripts', 'Indicar que .npmrc tiene ignore-scripts=true activo')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    try {
+      const pkgSvc = svc.pkgConfusionGuardService;
+      /** @type {any[]} */
+      let packages = [];
+      /** @type {string[]} */
+      let internalScopes = [];
+      /** @type {string[]} */
+      let allowLifecycleScripts = [];
+      let npmrcIgnoreScripts = Boolean(options.ignoreScripts);
+
+      if (inputFile) {
+        const resolved = path.resolve(String(inputFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Archivo de paquetes no encontrado: ${resolved}`);
+        }
+        const parsed = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+        if (Array.isArray(parsed)) {
+          packages = parsed;
+        } else if (parsed && typeof parsed === 'object') {
+          if (Array.isArray(parsed.packages)) {
+            packages = parsed.packages;
+          } else {
+            // Also support standard package.json files directly!
+            const depNames = [
+              ...Object.keys(parsed.dependencies && typeof parsed.dependencies === 'object' ? parsed.dependencies : {}),
+              ...Object.keys(parsed.devDependencies && typeof parsed.devDependencies === 'object' ? parsed.devDependencies : {})
+            ];
+            packages = depNames.map((n) => ({ name: n }));
+            if (parsed.name) {
+              packages.unshift({
+                name: String(parsed.name),
+                private: Boolean(parsed.private),
+                scripts: parsed.scripts && typeof parsed.scripts === 'object' ? parsed.scripts : {}
+              });
+            }
+          }
+          if (Array.isArray(parsed.internalScopes)) internalScopes = parsed.internalScopes.map(String);
+          if (Array.isArray(parsed.allowLifecycleScripts)) allowLifecycleScripts = parsed.allowLifecycleScripts.map(String);
+          if (parsed.npmrcIgnoreScripts !== undefined && !options.ignoreScripts) {
+            npmrcIgnoreScripts = Boolean(parsed.npmrcIgnoreScripts);
+          }
+        }
+      }
+
+      if (typeof options.pkg === 'string' && options.pkg.trim()) {
+        const extra = options.pkg.split(',').map((s) => s.trim()).filter(Boolean).map((name, idx) => ({
+          name,
+          ...(idx === 0 && typeof options.postinstall === 'string' && options.postinstall.trim()
+            ? { postinstall: options.postinstall.trim() }
+            : {})
+        }));
+        packages = [...packages, ...extra];
+      } else if (typeof options.postinstall === 'string' && options.postinstall.trim()) {
+        packages = [...packages, { name: 'inline-pkg', postinstall: options.postinstall.trim() }];
+      }
+
+      if (typeof options.internalScopes === 'string' && options.internalScopes.trim()) {
+        internalScopes = options.internalScopes.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+      if (typeof options.allowScripts === 'string' && options.allowScripts.trim()) {
+        allowLifecycleScripts = options.allowScripts.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+
+      const report = pkgSvc.auditPackageSupplyChain({
+        projectId: 'cli',
+        packages,
+        internalScopes,
+        allowLifecycleScripts,
+        npmrcIgnoreScripts,
+        persist: false
+      });
+
+      const ok = Boolean(report && report.blocked === false);
+      const payload = {
+        ...report,
+        ok
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n🧬 Culkibo Supply-Chain Worm & Typosquat Guard (${report.packageCount} pkg) — [${badge}]`);
+      console.log(`   Findings: ${report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
+      console.log('');
+      if (!ok) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
     }
   });
 

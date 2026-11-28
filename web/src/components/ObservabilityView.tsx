@@ -47,6 +47,7 @@ import {
   type LogPiiScrubResult,
   type DiskPressureEvalResult,
   type DiskPressureRemediateResult,
+  type EmailAuthAuditResult,
   type BillingLedgerProjectRow,
   type TenantQuotaSpec,
 } from '../lib/api';
@@ -462,6 +463,11 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [diskBusy, setDiskBusy] = useState(false);
   const [diskError, setDiskError] = useState<string | null>(null);
 
+  // Cycle-21 Transactional Email Auth (SPF/DKIM/DMARC/MTA-STS) & SMTP Guard (Coolify#4311)
+  const [emailAudit, setEmailAudit] = useState<EmailAuthAuditResult | null>(null);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailError, setEmailError] = useState<string | null>(null);
+
   useEffect(() => {
     let active = true;
     api.getOtlpStatus()
@@ -665,6 +671,32 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
       onNotify(msg, 'error');
     } finally {
       setDiskBusy(false);
+    }
+  };
+
+  const handleAuditEmailAuth = async () => {
+    setEmailBusy(true);
+    setEmailError(null);
+    try {
+      const res = await api.auditEmailAuth({
+        domain: 'acme-demo.dev',
+        fromAddress: 'alerts@mail.other-domain.net',
+        spfTxt: 'v=spf1 include:a.com include:b.com include:c.com include:d.com include:e.com include:f.com include:g.com include:h.com include:i.com include:j.com include:k.com include:l.com ~all',
+        dkimBits: 1024,
+        dkimSelector: 's1',
+        dmarcTxt: '',
+        mtaStsMode: 'none',
+        smtpPort: 587,
+        smtpTlsMode: 'none',
+      });
+      setEmailAudit(res);
+      onNotify('Email Auth Guard: 12-lookup SPF PermError, 1024b DKIM & Port 587 STARTTLS mismatch flagged!', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Email auth & SMTP audit failed';
+      setEmailError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setEmailBusy(false);
     }
   };
 
@@ -2228,6 +2260,76 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                   )}
                   <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-44">
                     {`# /etc/docker/daemon.json (dryRun: true)\n${daemonText}`}
+                  </pre>
+                </div>
+              );
+            })()}
+          </section>
+
+          {/* Cycle-21: Transactional Email Auth (SPF/DKIM/DMARC/MTA-STS) & SMTP Guard (coolify#4311) */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+                  <Send className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('obs.emailTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                      RFC 7208 ≤10 SPF · 2048b DKIM · STARTTLS
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('obs.emailDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={emailBusy}
+                onClick={() => void handleAuditEmailAuth()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {emailBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                <span>{emailBusy ? t('obs.emailWorking') : t('obs.emailBtn')}</span>
+              </button>
+            </div>
+
+            {emailError && (
+              <div className="p-3 m-4 rounded-lg bg-red-50 border border-red-200 text-red-700">{emailError}</div>
+            )}
+
+            {emailAudit && (() => {
+              const rawFinds = Array.isArray(emailAudit.findings) ? emailAudit.findings : [];
+              const codes = Array.from(
+                new Set([
+                  ...(Array.isArray(emailAudit.findingCodes) ? emailAudit.findingCodes : []),
+                  ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'EMAIL_AUTH_FAIL'))),
+                ])
+              );
+              const dnsText =
+                typeof emailAudit.dnsRecordsBlock === 'string'
+                  ? emailAudit.dnsRecordsBlock
+                  : typeof emailAudit.dnsRecords === 'string'
+                    ? emailAudit.dnsRecords
+                    : emailAudit.dnsRecords
+                      ? JSON.stringify(emailAudit.dnsRecords, null, 2)
+                      : 'acme-demo.dev. IN TXT "v=spf1 include:_spf.mail-provider.net -all"';
+              return (
+                <div className="p-4 space-y-3 font-mono text-[11px] tabular-nums">
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                    {emailAudit.spfLookups != null && (
+                      <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                        SPF lookups: {emailAudit.spfLookups}/10
+                      </span>
+                    )}
+                    {codes.map((c, idx) => (
+                      <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
+                    {dnsText}
                   </pre>
                 </div>
               );

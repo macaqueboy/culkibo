@@ -6700,6 +6700,132 @@ export const api = {
     }
     throw new Error(data?.error || data?.message || 'MCP poisoning scan failed');
   },
+
+  // --- Cycle-21: CORS/CSP/SRI Firewall, Postgres Vacuum/XID Guard, Monorepo DAG, Email Auth/SMTP & Supply-Chain Worm Guard ---
+
+  async auditEdgeCorsCsp(payload: {
+    allowedOrigins?: string[];
+    allowCredentials?: boolean;
+    reflectOrigin?: boolean;
+    sameSiteCookie?: string;
+    probeOrigin?: string;
+    headers?: Record<string, string>;
+    externalScripts?: Array<{ src: string; integrity?: string }>;
+  }): Promise<EdgeCorsCspAuditResult> {
+    const res = await apiFetch(`${API_BASE}/edge/cors-csp/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as EdgeCorsCspAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'CORS/CSP/SRI audit failed');
+  },
+
+  async auditPgVacuum(payload: {
+    databaseName?: string;
+    xidAge: number;
+    maxTableXidAge?: number;
+    idleInTxSec?: number;
+    deadTuplePct?: number;
+    autovacuumDisabledTables?: string[];
+    inactiveSlots?: number;
+    idleInTxTimeoutMs?: number;
+  }): Promise<PgVacuumAuditResult> {
+    const res = await apiFetch(`${API_BASE}/db/vacuum-guard/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as PgVacuumAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'Postgres vacuum & XID audit failed');
+  },
+
+  async planPgVacuumRecovery(payload: {
+    audit?: PgVacuumAuditResult;
+    databaseName?: string;
+    xidAge?: number;
+    idleInTxSec?: number;
+    deadTuplePct?: number;
+    autovacuumDisabledTables?: string[];
+    inactiveSlots?: number;
+    idleInTxTimeoutMs?: number;
+    dryRun?: boolean;
+  }): Promise<PgVacuumRecoverResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/db/vacuum-guard/recover-plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Postgres wraparound recovery plan failed'
+    );
+  },
+
+  async planMonorepoRollout(payload: {
+    projectId: string;
+    workspaces: Array<{ name: string; dir: string; deps?: string[]; watchPaths?: string[] }>;
+    changedFiles: string[];
+    dryRun?: boolean;
+  }): Promise<MonorepoPlanResult> {
+    const res = await apiFetch(`${API_BASE}/builds/monorepo/plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun: true, ...payload }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.blocked === true || data?.code === 'WORKSPACE_CYCLE_DETECTED' || data?.hasCycle === true) {
+      return data as MonorepoPlanResult;
+    }
+    throw new Error(data?.error || data?.message || 'Monorepo affected rollout plan failed');
+  },
+
+  async auditEmailAuth(payload: {
+    domain: string;
+    fromAddress?: string;
+    spfTxt?: string;
+    dkimBits?: number;
+    dkimSelector?: string;
+    dmarcTxt?: string;
+    mtaStsMode?: string;
+    smtpPort?: number;
+    smtpTlsMode?: string;
+  }): Promise<EmailAuthAuditResult> {
+    const res = await apiFetch(`${API_BASE}/domains/email-auth/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as EmailAuthAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'Email auth & SMTP audit failed');
+  },
+
+  async auditPkgSupplyChain(payload: {
+    projectId?: string;
+    packages: Array<Record<string, unknown>>;
+    internalScopes?: string[];
+    allowLifecycleScripts?: string[];
+    npmrcIgnoreScripts?: boolean;
+  }): Promise<PkgSupplyChainAuditResult> {
+    const res = await apiFetch(`${API_BASE}/supply-chain/pkg-guard/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as PkgSupplyChainAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'Package supply-chain audit failed');
+  },
 };
 
 // =====================================================================
@@ -9171,5 +9297,87 @@ export interface McpPoisonScanResult {
   code?: string;
   findings?: GuardFindingItem[];
   unicodeTagCount?: number;
+  message?: string;
+}
+
+// --- Cycle-21 CORS/CSP/SRI, Postgres Vacuum/XID, Monorepo DAG, Email Auth & Supply-Chain Worm Types ---
+
+export interface EdgeCorsCspAuditResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  caddyfile?: string;
+  caddyBlock?: string | { caddyfile?: string; [key: string]: unknown };
+  message?: string;
+}
+
+export interface PgVacuumAuditResult {
+  ok?: boolean;
+  databaseName?: string;
+  safe?: boolean;
+  blocked?: boolean;
+  severity?: string;
+  xidAge?: number;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  recoverySql?: string;
+  sql?: string;
+  usesVacuumFull?: boolean;
+  message?: string;
+}
+
+export interface PgVacuumRecoverResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  usesVacuumFull?: boolean;
+  sql?: string;
+  recoverySql?: string;
+  statements?: string[];
+  steps?: Array<string | { sql?: string; action?: string }>;
+  message?: string;
+}
+
+export interface MonorepoPlanResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  blocked?: boolean;
+  hasCycle?: boolean;
+  code?: string;
+  affectedServices?: string[];
+  affectedNames?: string[];
+  skippedServices?: string[];
+  savedBuildsCount?: number;
+  deployWaves?: string[][];
+  rollbackWaves?: string[][];
+  cycle?: string[];
+  cycleNodes?: string[];
+  findings?: GuardFindingItem[];
+  message?: string;
+}
+
+export interface EmailAuthAuditResult {
+  ok?: boolean;
+  domain?: string;
+  safe?: boolean;
+  blocked?: boolean;
+  spfLookups?: number;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  dnsRecordsBlock?: string;
+  dnsRecords?: string | Record<string, unknown>;
+  message?: string;
+}
+
+export interface PkgSupplyChainAuditResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  npmrcContent?: string;
+  npmrc?: string;
   message?: string;
 }

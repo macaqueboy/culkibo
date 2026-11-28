@@ -81,6 +81,9 @@ const testCycle19HttpE2E = require('./cycle19-http-e2e.test');
 const testProxyTrustAndMcpPoison = require('./proxy-trust-and-mcp-poison.test');
 const testValkeyHardenerWorm = require('./valkey-hardener-worm.test');
 const testCycle20HttpE2E = require('./cycle20-http-e2e.test');
+const testCorsCspAndPkgGuard = require('./cors-csp-and-pkg-guard.test');
+const testVacuumMonorepoEmail = require('./vacuum-monorepo-email.test');
+const testCycle21HttpE2E = require('./cycle21-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -187,6 +190,9 @@ async function runAll() {
     { name: 'Reverse-Proxy Trust Boundary / Smuggling Guard (CVE-2026-30851) & MCP Rug-Pull / Tool-Poisoning Guard (CVE-2025-54136)', fn: testProxyTrustAndMcpPoison },
     { name: 'Valkey/Redis Kernel & Eviction Guard, EOL Base-Image / Copa Distroless Hardener & WORM Backup AES-256-GCM KEK Rotation', fn: testValkeyHardenerWorm },
     { name: 'Cycle #20 185-MCP & 83-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + Trust/Valkey/Copa/WORM/MCPoison + RBAC)', fn: testCycle20HttpE2E },
+    { name: 'CORS/Strict CSP/SRI Firewall (CVE-2025-34291) & Supply-Chain Worm (Shai-Hulud/CHAINDROP) / Typosquat Guard', fn: testCorsCspAndPkgGuard },
+    { name: 'PostgreSQL Autovacuum / 32-Bit XID Wraparound Guard, Monorepo Affected-Graph DAG (Dokploy#5547) & Email Auth/SMTP Guard (Coolify#4311)', fn: testVacuumMonorepoEmail },
+    { name: 'Cycle #21 190-MCP & 86-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + CORS/XID/Monorepo/Email/Worm + RBAC)', fn: testCycle21HttpE2E },
   ];
 
   for (const suite of suites) {

@@ -62,6 +62,8 @@ import {
   type ValkeyGuardAuditResult,
   type WormBackupAuditResult,
   type WormKekRotateResult,
+  type PgVacuumAuditResult,
+  type PgVacuumRecoverResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
@@ -231,6 +233,12 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [wormRotate, setWormRotate] = useState<WormKekRotateResult | null>(null);
   const [wormBusy, setWormBusy] = useState(false);
   const [wormError, setWormError] = useState<string | null>(null);
+
+  // Cycle-21 PostgreSQL Autovacuum & 32-Bit XID Wraparound Guard
+  const [vacAudit, setVacAudit] = useState<PgVacuumAuditResult | null>(null);
+  const [vacRecover, setVacRecover] = useState<PgVacuumRecoverResult | null>(null);
+  const [vacBusy, setVacBusy] = useState(false);
+  const [vacError, setVacError] = useState<string | null>(null);
 
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
@@ -750,6 +758,44 @@ export const DatabasesPanel: React.FC<Props> = ({
       onNotify(msg, 'error');
     } finally {
       setWormBusy(false);
+    }
+  };
+
+  const handleAuditPgVacuum = async () => {
+    setVacBusy(true);
+    setVacError(null);
+    try {
+      const audit = await api.auditPgVacuum({
+        databaseName: 'acme_prod',
+        xidAge: 1_650_000_000,
+        maxTableXidAge: 1_650_000_000,
+        idleInTxSec: 900,
+        deadTuplePct: 44,
+        autovacuumDisabledTables: ['events'],
+        inactiveSlots: 1,
+        idleInTxTimeoutMs: 0,
+      });
+      const rec = await api
+        .planPgVacuumRecovery({
+          databaseName: 'acme_prod',
+          xidAge: 1_650_000_000,
+          idleInTxSec: 900,
+          deadTuplePct: 44,
+          autovacuumDisabledTables: ['events'],
+          inactiveSlots: 1,
+          idleInTxTimeoutMs: 0,
+          dryRun: true,
+        })
+        .catch(() => null);
+      setVacAudit(audit);
+      setVacRecover(rec);
+      onNotify('Postgres Vacuum Guard: XID_WRAPAROUND_IMMINENT (1.65B) caught; online VACUUM VERBOSE SQL ready (NO VACUUM FULL)!', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Postgres vacuum guard audit failed';
+      setVacError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setVacBusy(false);
     }
   };
 
@@ -2669,6 +2715,77 @@ export const DatabasesPanel: React.FC<Props> = ({
                 </span>
               </div>
               {wormRotate?.message && <div>{wormRotate.message}</div>}
+            </div>
+          );
+        })()}
+      </section>
+
+      {/* Cycle-21: PostgreSQL Autovacuum & 32-Bit XID Wraparound Guard */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <Database className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.vacTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  Online VACUUM VERBOSE · NO VACUUM FULL
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.vacDesc')}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={vacBusy}
+            onClick={() => void handleAuditPgVacuum()}
+            className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+          >
+            {vacBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+            <span>{vacBusy ? t('db.vacWorking') : t('db.vacBtn')}</span>
+          </button>
+        </div>
+
+        {vacError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{vacError}</div>}
+
+        {vacAudit && (() => {
+          const rawFinds = Array.isArray(vacAudit.findings) ? vacAudit.findings : [];
+          const codes = Array.from(
+            new Set([
+              ...(Array.isArray(vacAudit.findingCodes) ? vacAudit.findingCodes : []),
+              ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'XID_WRAPAROUND_IMMINENT'))),
+            ])
+          );
+          const sqlText =
+            typeof vacRecover?.sql === 'string'
+              ? vacRecover.sql
+              : typeof vacRecover?.recoverySql === 'string'
+                ? vacRecover.recoverySql
+                : Array.isArray(vacRecover?.statements)
+                  ? vacRecover.statements.join('\n')
+                  : typeof vacAudit.recoverySql === 'string'
+                    ? vacAudit.recoverySql
+                    : typeof vacAudit.sql === 'string'
+                      ? vacAudit.sql
+                      : 'VACUUM (VERBOSE, FREEZE) "events";';
+          const noVacFull = vacRecover?.usesVacuumFull !== true && vacAudit.usesVacuumFull !== true;
+          return (
+            <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+              <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-semibold">
+                  {noVacFull ? 'NO VACUUM FULL (Online Safe)' : 'ONLINE RECOVERY'}
+                </span>
+                {codes.map((c, idx) => (
+                  <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    {c}
+                  </span>
+                ))}
+              </div>
+              <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
+                {sqlText}
+              </pre>
             </div>
           );
         })()}
