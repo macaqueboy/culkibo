@@ -161,6 +161,11 @@ function getRuntimeLeakGuardService() { return _lazyV2.leakguard || (_lazyV2.lea
 function getGraphqlDosShieldService() { return _lazyV2.gqlshield || (_lazyV2.gqlshield = require('../services/graphqlDosShieldService')); }
 function getAcmeTlsBudgetService() { return _lazyV2.acmebudget || (_lazyV2.acmebudget = require('../services/acmeTlsBudgetService')); }
 function getArchiveSlipGuardService() { return _lazyV2.archiveguard || (_lazyV2.archiveguard = require('../services/archiveSlipGuardService')); }
+function getSsrEdgeGuardService() { return _lazyV2.ssredge || (_lazyV2.ssredge = require('../services/ssrEdgeGuardService')); }
+function getRegistryMirrorGuardService() { return _lazyV2.regmirror || (_lazyV2.regmirror = require('../services/registryMirrorGuardService')); }
+function getSessionCsrfGuardService() { return _lazyV2.sessioncsrf || (_lazyV2.sessioncsrf = require('../services/sessionCsrfGuardService')); }
+function getSqliteWalGuardService() { return _lazyV2.sqlitewal || (_lazyV2.sqlitewal = require('../services/sqliteWalGuardService')); }
+function getEnvSecretSurfaceService() { return _lazyV2.envsurface || (_lazyV2.envsurface = require('../services/envSecretSurfaceService')); }
 
 /**
  * Circuito anti-autobaneo SPA en 401 repetidos (Cosmos#616):
@@ -11265,6 +11270,228 @@ router.post('/security/archive-guard/inspect', async (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
     const out = await getArchiveSlipGuardService().inspectArchiveManifest(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// ============================================================================
+// HISTORIC CYCLE #23 MILESTONE CAPABILITIES (200 MCP TOOLS & 92 SUITES)
+// ============================================================================
+
+// 1. Next.js / RSC Middleware & SSR Cache-Poisoning Firewall (`CVE-2025-29927`, `CVE-2025-55182` React2Shell, `CVE-2025-49005`)
+router.get('/edge/ssr-guard/audits', async (req, res) => {
+  try {
+    const raw = await getSsrEdgeGuardService().listSsrEdgeAudits();
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/edge/ssr-guard/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getSsrEdgeGuardService().evaluateSsrEdgeSecurity(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/edge/ssr-guard/render', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden renderizar bloques Caddy SSR endurecidos', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getSsrEdgeGuardService().renderHardenedSsrCaddyBlock({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 2. Container Registry Pull-Limit (`429`) & Pull-Through Mirror (`registry:3`) Guard
+router.get('/builds/registry-mirror/audits', async (req, res) => {
+  try {
+    const nodeId = typeof req.query.nodeId === 'string' && req.query.nodeId.trim()
+      ? req.query.nodeId.trim()
+      : undefined;
+    const raw = await getRegistryMirrorGuardService().listRegistryMirrorAudits(nodeId);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, nodeId: nodeId || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/builds/registry-mirror/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getRegistryMirrorGuardService().auditRegistryPullBudget(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/builds/registry-mirror/config', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar /etc/docker/daemon.json de espejos de registro', code: 'FORBIDDEN' });
+    }
+    if (denyInstanceGlobalForTenant(req, res, 'generar configuración global daemon.json de espejos de registro')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getRegistryMirrorGuardService().renderDaemonMirrorConfig({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 3. Session Cookie, Fetch-Metadata (`Sec-Fetch-Site` Go 1.25) & OAuth 2.1 PKCE Guard (`CVE-2026-26247`)
+router.get('/security/session-csrf/audits', async (req, res) => {
+  try {
+    const raw = await getSessionCsrfGuardService().listSessionCsrfAudits();
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/session-csrf/evaluate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const svc = getSessionCsrfGuardService();
+    const csrf = await svc.evaluateCrossOriginRequest(body);
+    const cookieHeader = typeof body.setCookieHeader === 'string'
+      ? body.setCookieHeader
+      : (typeof body.cookieHeader === 'string' ? body.cookieHeader : (typeof body.cookie === 'string' ? body.cookie : ''));
+    const cookie = cookieHeader ? await svc.auditSessionCookie(cookieHeader) : null;
+    const csrfFindings = Array.isArray(csrf && csrf.findings) ? csrf.findings : [];
+    const cookieFindings = Array.isArray(cookie && cookie.findings) ? cookie.findings : [];
+    const findings = [...csrfFindings, ...cookieFindings];
+    const findingCodes = Array.from(new Set([
+      ...(Array.isArray(csrf && csrf.findingCodes) ? csrf.findingCodes : csrfFindings.map((f) => f && f.code).filter(Boolean)),
+      ...(Array.isArray(cookie && cookie.findingCodes) ? cookie.findingCodes : cookieFindings.map((f) => f && f.code).filter(Boolean))
+    ]));
+    const safe = Boolean((csrf ? csrf.safe !== false && csrf.allowed !== false : true) && (cookie ? cookie.safe !== false : true) && findings.length === 0);
+    const blocked = !safe;
+    res.json({
+      ok: true,
+      safe,
+      blocked,
+      status: blocked ? 'BLOCKED' : 'SAFE',
+      findings,
+      findingCodes,
+      csrf,
+      cookie
+    });
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/session-csrf/pkce', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getSessionCsrfGuardService().verifyOAuthPkceFlow(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 4. SQLite WAL Checkpoint Starvation & Network-FS Corruption Guard (Rails 8 Solid / PocketBase / Uptime Kuma / Litestream)
+router.get('/db/sqlite-wal/audits', async (req, res) => {
+  try {
+    const databaseName = typeof req.query.databaseName === 'string' && req.query.databaseName.trim()
+      ? req.query.databaseName.trim()
+      : undefined;
+    const raw = await getSqliteWalGuardService().listSqliteWalAudits(databaseName);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, databaseName: databaseName || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/db/sqlite-wal/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getSqliteWalGuardService().auditSqliteWalHealth(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/db/sqlite-wal/pragmas', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar PRAGMAs SQLite WAL endurecidos', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getSqliteWalGuardService().renderHardenedSqlitePragmas({ ...body, dryRun });
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+// 5. Build-`ARG` / `ENV` Secret Surface & `/run/secrets/` Migrator (`Dokploy#3347`, `Coolify#10822` — key names ONLY!)
+router.get('/security/env-surface/audits', async (req, res) => {
+  try {
+    const projectId = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+      ? req.query.projectId.trim()
+      : undefined;
+    if (projectId && !assertTenantProjectAccess403(req, res, projectId, 'projects:read')) return;
+    const raw = await getEnvSecretSurfaceService().listEnvSurfaceAudits(projectId);
+    const audits = Array.isArray(raw) ? raw : (Array.isArray(raw && raw.audits) ? raw.audits : []);
+    res.json({ ok: true, projectId: projectId || null, count: audits.length, audits });
+  } catch (err) {
+    sendServiceError(err, res, 500);
+  }
+});
+
+router.post('/security/env-surface/audit', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const out = await getEnvSecretSurfaceService().auditEnvSecretSurface(body);
+    res.json(out);
+  } catch (err) {
+    sendServiceError(err, res, 400);
+  }
+});
+
+router.post('/security/env-surface/migrate', certAndAdminLimiter, async (req, res) => {
+  try {
+    const principal = getPrincipal(req);
+    if (!principal.isSuperAdmin && !getTeamManager().canAccess(principal, 'team:write')) {
+      return res.status(403).json({ error: 'Solo administradores pueden generar migraciones BuildKit /run/secrets/', code: 'FORBIDDEN' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.projectId && !assertTenantProjectAccess403(req, res, String(body.projectId).trim(), 'projects:write')) return;
+    const dryRun = body.dryRun !== undefined ? Boolean(body.dryRun) : true;
+    const out = await getEnvSecretSurfaceService().renderSecretMountMigration({ ...body, dryRun });
     res.json(out);
   } catch (err) {
     sendServiceError(err, res, 400);

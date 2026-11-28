@@ -51,6 +51,7 @@ import {
   type RuntimeLeakAnalysisResult,
   type RuntimeDrainPlanResult,
   type AcmeTlsBudgetAuditResult,
+  type RegistryMirrorAuditResult,
   type BillingLedgerProjectRow,
   type TenantQuotaSpec,
 } from '../lib/api';
@@ -480,6 +481,11 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
   const [acmeBusy, setAcmeBusy] = useState(false);
   const [acmeError, setAcmeError] = useState<string | null>(null);
 
+  // Cycle-23 Container Registry Pull-Limit (429) & registry:3 Mirror Guard
+  const [mirrorRes, setMirrorRes] = useState<RegistryMirrorAuditResult | null>(null);
+  const [mirrorBusy, setMirrorBusy] = useState(false);
+  const [mirrorError, setMirrorError] = useState<string | null>(null);
+
   useEffect(() => {
     let active = true;
     api.getOtlpStatus()
@@ -763,6 +769,31 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
       onNotify(msg, 'error');
     } finally {
       setAcmeBusy(false);
+    }
+  };
+
+  const handleAuditRegistryMirror = async () => {
+    setMirrorBusy(true);
+    setMirrorError(null);
+    try {
+      const res = await api.auditRegistryMirror({
+        nodeId: 'vps-eu-1',
+        registry: 'docker.io',
+        authenticated: false,
+        pullsPerHour: 12,
+        archCount: 2,
+        sharedNatIp: true,
+        mirrors: [],
+        plaintextConfigAuth: true,
+      });
+      setMirrorRes(res);
+      onNotify('Registry Mirror Guard: Anonymous Docker Hub 429 pull limit & missing registry:3 mirror flagged!', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Registry pull-limit & mirror audit failed';
+      setMirrorError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setMirrorBusy(false);
     }
   };
 
@@ -2543,6 +2574,74 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({ onNotify }
                   </div>
                   <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
                     {caddyTlsText}
+                  </pre>
+                </div>
+              );
+            })()}
+          </section>
+
+          {/* Cycle-23: Container Registry Pull-Limit (429) & registry:3 Mirror Guard */}
+          <section className="culkibo-surface rounded-2xl overflow-hidden text-xs">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+                  <Server className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-sm font-semibold text-slate-900">{t('obs.mirrorTitle')}</h2>
+                    <span className="px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 font-mono text-[10px] font-semibold">
+                      429 TOOMANYREQUESTS · registry:3 · daemon.json
+                    </span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5">{t('obs.mirrorDesc')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={mirrorBusy}
+                onClick={() => void handleAuditRegistryMirror()}
+                className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                {mirrorBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                <span>{mirrorBusy ? t('obs.mirrorWorking') : t('obs.mirrorBtn')}</span>
+              </button>
+            </div>
+
+            {mirrorError && (
+              <div className="p-3 m-4 rounded-lg bg-red-50 border border-red-200 text-red-700">{mirrorError}</div>
+            )}
+
+            {mirrorRes && (() => {
+              const rawFinds = Array.isArray(mirrorRes.findings) ? mirrorRes.findings : [];
+              const codes = Array.from(
+                new Set([
+                  ...(Array.isArray(mirrorRes.findingCodes) ? mirrorRes.findingCodes : []),
+                  ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'ANONYMOUS_HUB_RATE_LIMIT_RISK'))),
+                ])
+              );
+              const daemonText =
+                typeof mirrorRes.daemonJsonText === 'string' && mirrorRes.daemonJsonText.trim()
+                  ? mirrorRes.daemonJsonText
+                  : mirrorRes.daemonConfig
+                    ? JSON.stringify(mirrorRes.daemonConfig, null, 2)
+                    : '{\n  "registry-mirrors": ["http://127.0.0.1:5000"],\n  "max-concurrent-downloads": 3\n}';
+              return (
+                <div className="p-4 space-y-3 font-mono text-[11px] tabular-nums">
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                    {mirrorRes.effectivePullsPerHour != null && (
+                      <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-semibold">
+                        effective pulls: {mirrorRes.effectivePullsPerHour}/hr
+                      </span>
+                    )}
+                    {codes.map((c, idx) => (
+                      <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                  <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-44">
+                    {`# /etc/docker/daemon.json (pull-through registry:3 mirror)\n${daemonText}`}
                   </pre>
                 </div>
               );

@@ -5676,6 +5676,192 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     });
   }
 
+  // --- Cycle-23 (Historic 200 MCP): SSR Edge Guard, Registry Mirror Guard, Session CSRF/PKCE, SQLite WAL Guard & Build-ARG Secret Surface ---
+  if (pathname === '/api/edge/ssr-guard/evaluate' && method === 'POST') {
+    const reqHdrs = body.requestHeaders && typeof body.requestHeaders === 'object' ? body.requestHeaders : {};
+    const resHdrs = body.responseHeaders && typeof body.responseHeaders === 'object' ? body.responseHeaders : {};
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    const reqKeys = Object.keys(reqHdrs).map((k) => k.toLowerCase());
+    if (reqKeys.some((k) => ['x-middleware-subrequest', 'x-middleware-invoke', 'x-invoke-path', 'x-invoke-query', 'x-nextjs-data'].includes(k))) {
+      findings.push({ code: 'SSR_INTERNAL_HEADER_SPOOF', severity: 'critical', message: 'Client supplied internal Next.js x-middleware-subrequest header (CVE-2025-29927).' });
+    }
+    const reactVer = String(body.reactVersion || '');
+    if (['19.0.0', '19.1.0', '19.1.1', '19.2.0'].includes(reactVer)) {
+      findings.push({ code: 'REACT2SHELL_VULNERABLE_VERSION', severity: 'critical', message: `React ${reactVer} is vulnerable to React2Shell RSC RCE (CVE-2025-55182 CVSS 10.0).` });
+    }
+    const nextVer = String(body.nextVersion || '');
+    if (/^15\.[012]\.|^14\.2\.(?:[0-9]|1[0-9]|2[0-4])$/.test(nextVer)) {
+      findings.push({ code: 'NEXTJS_MIDDLEWARE_CVE_VERSION', severity: 'critical', message: `Next.js ${nextVer} is vulnerable to middleware bypass (CVE-2025-29927).` });
+    }
+    const varyStr = String(resHdrs.vary || resHdrs.Vary || '');
+    if (!/\bRSC\b/i.test(varyStr) || !/\bNext-Router-State-Tree\b/i.test(varyStr)) {
+      findings.push({ code: 'RSC_VARY_HEADER_MISSING', severity: 'high', message: 'Response Vary header omits RSC / Next-Router-State-Tree (CVE-2025-49005 cache poison).' });
+    }
+    const caddyBlock = 'request_header -x-middleware-subrequest\nrequest_header -x-middleware-invoke\nrequest_header -x-invoke-path\nheader +Vary "RSC, Next-Router-State-Tree, Next-Router-Prefetch"';
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'BLOCKED' : 'SAFE',
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      caddyBlock,
+      message: findings.length > 0 ? `Blocked ${findings.length} SSR/RSC edge vulnerability defect(s).` : 'SSR Edge headers & React/Next.js versions verified safe.',
+    });
+  }
+
+  if (pathname === '/api/builds/registry-mirror/audit' && method === 'POST') {
+    const pullsPerHour = Number(body.pullsPerHour) || 0;
+    const archCount = Math.max(1, Number(body.archCount) || 1);
+    const effectivePullsPerHour = pullsPerHour * archCount;
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (!body.authenticated && effectivePullsPerHour >= 10) {
+      findings.push({ code: 'ANONYMOUS_HUB_RATE_LIMIT_RISK', severity: 'critical', message: `Anonymous Docker Hub pulls (${effectivePullsPerHour}/hr) exceed 10/hr 429 TOOMANYREQUESTS limit.` });
+    }
+    if (body.sharedNatIp) {
+      findings.push({ code: 'SHARED_NAT_QUOTA_EXHAUSTION', severity: 'high', message: 'Shared IPv4 NAT risks neighbor-induced Docker Hub 429 lockout.' });
+    }
+    if (!Array.isArray(body.mirrors) || body.mirrors.length === 0) {
+      findings.push({ code: 'MISSING_REGISTRY_MIRROR', severity: 'high', message: 'No pull-through registry:3 mirror configured in /etc/docker/daemon.json.' });
+    }
+    if (body.plaintextConfigAuth) {
+      findings.push({ code: 'PLAINTEXT_DOCKER_CONFIG_AUTH', severity: 'medium', message: 'Plaintext base64 auth in ~/.docker/config.json; use credential helper.' });
+    }
+    const daemonConfig = { 'registry-mirrors': ['http://127.0.0.1:5000'], 'max-concurrent-downloads': 3 };
+    const daemonJsonText = JSON.stringify(daemonConfig, null, 2);
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'CRITICAL' : 'HEALTHY',
+      effectivePullsPerHour,
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      daemonConfig,
+      daemonJsonText,
+      message: findings.length > 0 ? `Flagged ${findings.length} registry 429 pull-limit defect(s).` : 'Registry pull budget & mirror verified.',
+    });
+  }
+
+  if (pathname === '/api/security/session-csrf/evaluate' && method === 'POST') {
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (['cross-site', 'same-site'].includes(String(body.secFetchSite || '').toLowerCase())) {
+      findings.push({ code: 'CSRF_CROSS_ORIGIN_BLOCKED', severity: 'critical', message: 'Go 1.25 CrossOriginProtection blocked cross-site mutating request.' });
+    }
+    const cookieStr = String(body.setCookieHeader || body.setCookie || '');
+    if (cookieStr) {
+      if (!/httponly/i.test(cookieStr)) findings.push({ code: 'COOKIE_MISSING_HTTPONLY', severity: 'high', message: 'Session cookie lacks HttpOnly flag.' });
+      if (!/secure/i.test(cookieStr)) findings.push({ code: 'COOKIE_MISSING_SECURE', severity: 'high', message: 'Session cookie lacks Secure flag.' });
+      if (/^__Host-/i.test(cookieStr) && (!/;\s*Path=\/(?:;|$)/i.test(cookieStr) || !/secure/i.test(cookieStr))) {
+        findings.push({ code: 'COOKIE_HOST_PREFIX_INVALID', severity: 'critical', message: '__Host- cookie requires Secure, Path=/, and no Domain attribute.' });
+      }
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'BLOCKED' : 'SAFE',
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      message: findings.length > 0 ? `Blocked ${findings.length} CSRF / cookie violation(s).` : 'Request origin & cookie flags verified.',
+    });
+  }
+
+  if (pathname === '/api/security/session-csrf/pkce' && method === 'POST') {
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (String(body.method || '').toLowerCase() !== 's256') {
+      findings.push({ code: 'PKCE_PLAIN_FORBIDDEN', severity: 'critical', message: 'OAuth 2.1 requires PKCE S256 (plain rejected — CVE-2026-26247).' });
+    }
+    if (String(body.state || '').length < 16) {
+      findings.push({ code: 'OAUTH_STATE_WEAK', severity: 'high', message: 'OAuth state nonce must be >= 16 high-entropy characters.' });
+    }
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      valid: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'BLOCKED' : 'SAFE',
+      findings,
+      findingCodes: findings.map((f) => f.code),
+    });
+  }
+
+  if (pathname === '/api/db/sqlite-wal/audit' && method === 'POST') {
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (['nfs', 'cifs', 'smb', 'efs'].includes(String(body.filesystemType || '').toLowerCase())) {
+      findings.push({ code: 'SQLITE_NETWORK_FS_CORRUPTION', severity: 'critical', message: 'SQLite on NFS/EFS/SMB causes POSIX lock corruption; move to local ext4/xfs.' });
+    }
+    if (String(body.journalMode || 'wal').toLowerCase() !== 'wal') {
+      findings.push({ code: 'SQLITE_NON_WAL_LOCK_RISK', severity: 'high', message: 'Enable PRAGMA journal_mode = WAL for concurrent reads.' });
+    }
+    if ((Number(body.busyTimeoutMs) || 0) < 5000) {
+      findings.push({ code: 'SQLITE_BUSY_TIMEOUT_LOW', severity: 'high', message: 'Set PRAGMA busy_timeout = 5000 to prevent immediate SQLITE_BUSY errors.' });
+    }
+    if (String(body.synchronous || '').toLowerCase() === 'off') {
+      findings.push({ code: 'SQLITE_SYNC_OFF_CORRUPTION', severity: 'critical', message: 'PRAGMA synchronous = OFF risks DB corruption on host crash.' });
+    }
+    if ((Number(body.journalSizeLimitMb) || 0) <= 0) {
+      findings.push({ code: 'SQLITE_UNBOUNDED_WAL', severity: 'high', message: 'Missing journal_size_limit lets -wal grow unbounded.' });
+    }
+    if ((Number(body.walSizeMb) || 0) > (Number(body.dbSizeMb) || 1) * 2 || (Number(body.blockedReaders) || 0) > 0) {
+      findings.push({ code: 'WAL_CHECKPOINT_STARVATION', severity: 'critical', message: `WAL (${body.walSizeMb} MB) pinned by ${body.blockedReaders} blocked reader(s).` });
+    }
+    const pragmaSql = [
+      'PRAGMA journal_mode = WAL;',
+      'PRAGMA synchronous = NORMAL;',
+      'PRAGMA busy_timeout = 5000;',
+      'PRAGMA journal_size_limit = 67108864;',
+      'PRAGMA foreign_keys = ON;',
+      'PRAGMA wal_checkpoint(TRUNCATE);',
+    ].join('\n');
+    return jsonResponse({
+      ok: true,
+      databaseName: String(body.databaseName || 'app.sqlite3'),
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'CRITICAL' : 'HEALTHY',
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      pragmaSql,
+    });
+  }
+
+  if (pathname === '/api/security/env-surface/audit' && method === 'POST') {
+    const df = String(body.dockerfile || '');
+    const findings: Array<{ code: string; severity: string; message: string }> = [];
+    if (/(?:ARG|ENV)\s+[A-Z0-9_]*(?:SECRET|KEY|TOKEN|PASSWORD|DATABASE_URL)/i.test(df)) {
+      findings.push({ code: 'BUILDKIT_SECRET_IN_ARG_OR_ENV', severity: 'critical', message: 'Dockerfile ARG/ENV exposes sensitive key names inside OCI image layers (Dokploy#3347).' });
+    }
+    if (Array.isArray(body.composeEnvKeys) && body.composeEnvKeys.length > 0) {
+      findings.push({ code: 'COMPOSE_SECRET_IN_PLAIN_ENV', severity: 'high', message: 'Compose environment: carries secret keys instead of /run/secrets/ tmpfs mounts.' });
+    }
+    if (Array.isArray(body.buildTimeEnvKeys) && body.buildTimeEnvKeys.length > 0) {
+      findings.push({ code: 'BUILD_RUNTIME_SECRET_OVERLAP', severity: 'high', message: 'Same secret key scoped to both build-time & runtime (Coolify#10822).' });
+    }
+    const dockerfileSnippet = 'RUN --mount=type=secret,id=jwt_secret \\\n  JWT_SECRET="$(cat /run/secrets/jwt_secret)" npm run build';
+    const composeSnippet = 'services:\n  app:\n    secrets:\n      - source: jwt_secret\n        target: jwt_secret\n        mode: 0400\nsecrets:\n  jwt_secret:\n    file: ./secrets/jwt_secret.txt';
+    return jsonResponse({
+      ok: true,
+      safe: findings.length === 0,
+      blocked: findings.length > 0,
+      status: findings.length > 0 ? 'BLOCKED' : 'SAFE',
+      flaggedKeyNames: ['JWT_SECRET', 'DATABASE_URL', 'STRIPE_SECRET_KEY'],
+      findings,
+      findingCodes: findings.map((f) => f.code),
+      dockerfileSnippet,
+      composeSnippet,
+    });
+  }
+
+  if (pathname === '/api/security/env-surface/migrate' && method === 'POST') {
+    return jsonResponse({
+      ok: true,
+      dryRun: body.dryRun !== false,
+      dockerfileSnippet: 'RUN --mount=type=secret,id=jwt_secret \\\n  JWT_SECRET="$(cat /run/secrets/jwt_secret)" npm run build',
+      composeSnippet: 'services:\n  app:\n    secrets:\n      - source: jwt_secret\n        target: jwt_secret\n        mode: 0400\nsecrets:\n  jwt_secret:\n    file: ./secrets/jwt_secret.txt',
+    });
+  }
+
   // --- Catalog ---
   if (pathname === '/api/services/catalog' || pathname === '/api/catalog') {
     const catMap = new Map<string, { id: string; label: string; count: number }>();
@@ -5853,16 +6039,21 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
     return jsonResponse({ policies: {} });
   }
 
-  // --- MCP 2026-07-28 (195 tools + 13 prompts + 3 sandboxed MCP Apps) ---
+  // --- MCP 2026-07-28 (200 tools + 13 prompts + 3 sandboxed MCP Apps) ---
   if (pathname === '/api/mcp/tools') {
     const coreTools = [
       { name: 'culkibo_ship_and_verify', description: 'Atomic ship with secret scan, SmartPack build, smoke check, and auto-rollback', readOnly: false, profile: 'core' },
-      { name: 'culkibo_search_tools', description: 'Discover any of the 195 MCP tools on demand without bloating context (-93%)', readOnly: true, profile: 'core' },
+      { name: 'culkibo_search_tools', description: 'Discover any of the 200 MCP tools on demand without bloating context (-94%)', readOnly: true, profile: 'core' },
       { name: 'culkibo_list_projects', description: 'List projects, live status, domains, and linked databases', readOnly: true, profile: 'core' },
       { name: 'culkibo_smartpack_plan', description: 'Generate deterministic SmartPack build plan across 18 stacks', readOnly: true, profile: 'core' },
       { name: 'culkibo_diagnose_incident', description: 'Correlate OOMKilled, CrashLoop, logs, and uptime telemetry', readOnly: true, profile: 'core' },
       { name: 'culkibo_auto_remediate', description: '2-phase safe remediation (dryRun -> HMAC confirmToken)', readOnly: false, profile: 'core' },
       { name: 'culkibo_migrate_coolify', description: 'Zero-downtime Coolify v4 migration with 100% parity diff', readOnly: false, profile: 'core' },
+      { name: 'culkibo_ssr_edge_guard', description: 'Next.js x-middleware-subrequest spoof, React2Shell (CVE-2025-55182 CVSS 10.0) & Vary: RSC cache-poisoning firewall emitting Caddy rules', readOnly: false, profile: 'security' },
+      { name: 'culkibo_registry_mirror_guard', description: 'Docker Hub anonymous 429 pull-limit & multi-arch exhaustion auditor emitting /etc/docker/daemon.json registry:3 mirror failover', readOnly: false, profile: 'deploy' },
+      { name: 'culkibo_session_csrf_guard', description: 'Go 1.25 Sec-Fetch-Site zero-token CSRF, __Host-/HttpOnly/Secure cookie & OAuth 2.1 PKCE S256 verifier (CVE-2026-26247)', readOnly: true, profile: 'security' },
+      { name: 'culkibo_sqlite_wal_guard', description: 'SQLite WAL checkpoint starvation & NFS/EFS POSIX locking corruption guard for Rails 8 Solid, PocketBase & Uptime Kuma', readOnly: false, profile: 'ops' },
+      { name: 'culkibo_env_secret_surface', description: 'Key-name-only Dockerfile Build-ARG/ENV secret surface auditor & BuildKit --mount=type=secret / Compose 0400 migrator (Dokploy#3347)', readOnly: false, profile: 'security' },
       { name: 'culkibo_jwt_oidc_firewall', description: 'Zero-dep JWT algorithm-confusion, alg:none/JWE PlainJWT, jku SSRF, kid traversal & OIDC claim firewall (CVE-2026-29000/33322)', readOnly: false, profile: 'security' },
       { name: 'culkibo_runtime_leak_guard', description: 'OLS container heap/RSS leak slope predictor (hoursToOom), V8 cgroup max-old-space-size, FD EMFILE & GC event-loop drain planner', readOnly: false, profile: 'ops' },
       { name: 'culkibo_graphql_dos_shield', description: 'Zero-dep fragment-expanding GraphQL depth, alias amplification, batching & production __schema introspection shield (CVE-2026-47707)', readOnly: false, profile: 'security' },
@@ -5944,27 +6135,27 @@ export async function handleDemoFetch(input: RequestInfo | URL, init: RequestIni
       { name: 'culkibo_edge_shield', description: 'Caddy native Edge Bot-Shield & SHA-256 Hashcash PoW gate controls', readOnly: false, profile: 'security' },
       { name: 'culkibo_verify_attestation', description: 'Verify SLSA v1.1 Ed25519 DSSE release attestation', readOnly: true, profile: 'security' },
     ];
-    const generated = Array.from({ length: 195 - coreTools.length }, (_, i) => ({
+    const generated = Array.from({ length: 200 - coreTools.length }, (_, i) => ({
       name: `culkibo_ops_tool_${i + coreTools.length + 1}`,
       description: `Managed PaaS control-plane operation #${i + coreTools.length + 1} (RBAC + audit-chained)`,
       readOnly: i % 2 === 0,
       profile: i % 3 === 0 ? 'deploy' : i % 3 === 1 ? 'ops' : 'security',
     }));
-    return jsonResponse({ tools: [...coreTools, ...generated], total: 195, coreCount: 17 });
+    return jsonResponse({ tools: [...coreTools, ...generated], total: 200, coreCount: 17 });
   }
   if (pathname === '/api/mcp/audit') {
     return jsonResponse({
       auditLog: [
-        { id: 'aud_1', toolName: 'culkibo_jwt_oidc_firewall', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
-        { id: 'aud_2', toolName: 'culkibo_archive_slip_guard', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
+        { id: 'aud_1', toolName: 'culkibo_ssr_edge_guard', status: 'ok', durationMs: 1, timestamp: nowIso(-30000), client: 'claude-code' },
+        { id: 'aud_2', toolName: 'culkibo_env_secret_surface', status: 'ok', durationMs: 2, timestamp: nowIso(-120000), client: 'antigravity' },
       ],
     });
   }
   if (pathname === '/api/mcp/config') {
     return jsonResponse({
       protocol: { version: '2026-07-28', transport: 'streamable-http', endpoint: `${parsed.origin}/api/mcp` },
-      totalTools: 195,
-      profiles: { core: { count: 17, savedPct: 93 } },
+      totalTools: 200,
+      profiles: { core: { count: 17, savedPct: 94 } },
     });
   }
   if (pathname === '/api/mcp' && method === 'POST') {

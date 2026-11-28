@@ -287,10 +287,10 @@ async function testScaleAndWildcard() {
     maintenanceMode: false
   });
   try {
-    // Verify 195 MCP 2026-07-28 tools registered including meta-discovery, self-healing, Coolify/Bundle, SmartPack, EdgeTunnel, OTLP, SLSA, Shadow Replay, Time-Machine, FinOps, Build Healer, Fleet Mesh, Cron Timeline, Edge Shield, Cycle-8..21 & Cycle-22 JwtFirewall/LeakGuard/GraphqlShield/AcmeBudget/ArchiveSlipGuard tools
+    // Verify 200 MCP 2026-07-28 tools registered including meta-discovery, self-healing, Coolify/Bundle, SmartPack, EdgeTunnel, OTLP, SLSA, Shadow Replay, Time-Machine, FinOps, Build Healer, Fleet Mesh, Cron Timeline, Edge Shield, Cycle-8..22 & Historic Cycle-23 SsrEdge/RegistryMirror/SessionCsrf/SqliteWal/EnvSecretSurface tools
     const listedTools = await mcpServer.handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     const toolNames = (listedTools.result?.tools || []).map((t) => t.name);
-    assert.strictEqual(toolNames.length, 195, `Expected 195 MCP tools, got ${toolNames.length}`);
+    assert.strictEqual(toolNames.length, 200, `Expected 200 MCP tools, got ${toolNames.length}`);
     assert.ok(toolNames.includes('culkibo_link_database'));
     assert.ok(toolNames.includes('culkibo_toggle_maintenance'));
     assert.ok(toolNames.includes('culkibo_get_deploy_queue'));

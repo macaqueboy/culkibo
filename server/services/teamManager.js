@@ -4495,6 +4495,50 @@ class TeamManager extends EventEmitter {
       return this.authorizeAction(principal, 'projects:read');
     }
 
+    // Cycle-23 (Historic 200-MCP Milestone): SSR/React2Shell Edge Guard, Registry Pull Mirror, Session CSRF/PKCE, SQLite WAL Guard & Build-ARG Env Secret Surface
+    if (p === '/api/edge/ssr-guard/render') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/edge/ssr-guard/evaluate') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/edge/ssr-guard/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/builds/registry-mirror/config') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/builds/registry-mirror/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/builds/registry-mirror/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/security/session-csrf/evaluate' || p === '/api/security/session-csrf/pkce') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/security/session-csrf/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/db/sqlite-wal/pragmas') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/db/sqlite-wal/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/db/sqlite-wal/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+    if (p === '/api/security/env-surface/migrate') {
+      return this.authorizeAction(principal, 'team:write');
+    }
+    if (p === '/api/security/env-surface/audit') {
+      return this.authorizeAction(principal, 'projects:write');
+    }
+    if (p === '/api/security/env-surface/audits') {
+      return this.authorizeAction(principal, 'projects:read');
+    }
+
     // Multi-Server Fleet (SSH nodes) -> lectura `fleet:read`, escritura `fleet:write` (admin/owner)
     // Excepción Cycle-10: agendar slots de build remoto en un proyecto permite `projects:write` (developer+)
     if (p === '/api/fleet/builders/schedule') {

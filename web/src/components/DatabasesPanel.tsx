@@ -64,6 +64,7 @@ import {
   type WormKekRotateResult,
   type PgVacuumAuditResult,
   type PgVacuumRecoverResult,
+  type SqliteWalAuditResult,
 } from '../lib/api';
 import { copyToClipboard } from '../lib/clipboard';
 import { Modal } from './Modal';
@@ -239,6 +240,11 @@ export const DatabasesPanel: React.FC<Props> = ({
   const [vacRecover, setVacRecover] = useState<PgVacuumRecoverResult | null>(null);
   const [vacBusy, setVacBusy] = useState(false);
   const [vacError, setVacError] = useState<string | null>(null);
+
+  // Cycle-23 SQLite WAL Checkpoint Starvation & Network-FS Corruption Guard
+  const [sqliteRes, setSqliteRes] = useState<SqliteWalAuditResult | null>(null);
+  const [sqliteBusy, setSqliteBusy] = useState(false);
+  const [sqliteError, setSqliteError] = useState<string | null>(null);
 
   const databasesRef = React.useRef<ManagedDatabase[]>([]);
   useEffect(() => {
@@ -796,6 +802,33 @@ export const DatabasesPanel: React.FC<Props> = ({
       onNotify(msg, 'error');
     } finally {
       setVacBusy(false);
+    }
+  };
+
+  const handleAuditSqliteWal = async () => {
+    setSqliteBusy(true);
+    setSqliteError(null);
+    try {
+      const res = await api.auditSqliteWal({
+        databaseName: 'solid_queue.sqlite3',
+        filesystemType: 'nfs',
+        journalMode: 'delete',
+        synchronous: 'off',
+        busyTimeoutMs: 0,
+        journalSizeLimitMb: 0,
+        dbSizeMb: 80,
+        walSizeMb: 512,
+        blockedReaders: 2,
+        foreignKeys: false,
+      });
+      setSqliteRes(res);
+      onNotify('SQLite WAL Guard BLOCKED: NFS POSIX lock corruption & 512 MB WAL starvation flagged; PRAGMA SQL ready!', 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'SQLite WAL & NFS guard audit failed';
+      setSqliteError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setSqliteBusy(false);
     }
   };
 
@@ -2785,6 +2818,67 @@ export const DatabasesPanel: React.FC<Props> = ({
               </div>
               <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-48">
                 {sqlText}
+              </pre>
+            </div>
+          );
+        })()}
+      </section>
+
+      {/* Cycle-23: SQLite WAL Checkpoint Starvation & Network-FS Corruption Guard */}
+      <section className="culkibo-surface rounded-2xl p-5 space-y-4 text-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
+              <Database className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-sm font-semibold text-slate-900">{t('db.sqliteTitle')}</h3>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-mono text-[10px] font-semibold">
+                  Rails 8 Solid · PocketBase · Local ext4/xfs Only
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">{t('db.sqliteDesc')}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={sqliteBusy}
+            onClick={() => void handleAuditSqliteWal()}
+            className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer shrink-0 disabled:opacity-50"
+          >
+            {sqliteBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+            <span>{sqliteBusy ? t('db.sqliteWorking') : t('db.sqliteBtn')}</span>
+          </button>
+        </div>
+
+        {sqliteError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{sqliteError}</div>}
+
+        {sqliteRes && (() => {
+          const rawFinds = Array.isArray(sqliteRes.findings) ? sqliteRes.findings : [];
+          const codes = Array.from(
+            new Set([
+              ...(Array.isArray(sqliteRes.findingCodes) ? sqliteRes.findingCodes : []),
+              ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'SQLITE_NETWORK_FS_CORRUPTION'))),
+            ])
+          );
+          const pragmaText =
+            typeof sqliteRes.pragmaSql === 'string' && sqliteRes.pragmaSql.trim()
+              ? sqliteRes.pragmaSql
+              : typeof sqliteRes.sql === 'string' && sqliteRes.sql.trim()
+                ? sqliteRes.sql
+                : 'PRAGMA journal_mode = WAL;\nPRAGMA busy_timeout = 5000;\nPRAGMA wal_checkpoint(TRUNCATE);';
+          return (
+            <div className="space-y-2.5 tabular-nums font-mono text-[11px]">
+              <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 flex flex-wrap items-center gap-1.5">
+                {codes.map((c, idx) => (
+                  <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                    {c}
+                  </span>
+                ))}
+              </div>
+              <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-44">
+                {pragmaText}
               </pre>
             </div>
           );

@@ -78,7 +78,9 @@ const svc = {
   get emailAuthGuardService() { return require('../server/services/emailAuthGuardService'); },
   get pkgConfusionGuardService() { return require('../server/services/pkgConfusionGuardService'); },
   get jwtOidcFirewallService() { return require('../server/services/jwtOidcFirewallService'); },
-  get archiveSlipGuardService() { return require('../server/services/archiveSlipGuardService'); }
+  get archiveSlipGuardService() { return require('../server/services/archiveSlipGuardService'); },
+  get ssrEdgeGuardService() { return require('../server/services/ssrEdgeGuardService'); },
+  get envSecretSurfaceService() { return require('../server/services/envSecretSurfaceService'); }
 };
 
 function runSpawnStep(bin, args, cwd) {
@@ -2901,15 +2903,15 @@ program
             databases: 2,
             domains: 4,
             edgeTunnels: 1,
-            mcpTools: 195,
+            mcpTools: 200,
             mcpApps: 3,
             topologyNodes: 7
           },
           highlights: [
             'Zero-install interactive sandbox (?demo=1&lang=en&theme=dark)',
             '3 sample projects, 2 managed DBs, 4 HTTPS domains + 1 Sovereign EdgeTunnel',
-            '195 MCP tools (-93.2%+ core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
-            'JWT/OIDC Firewall, Runtime Leak Guard, GraphQL DoS Shield, ACME ARI/TLS Budget & Archive Zip-Slip Firewall'
+            '200 MCP tools (-93.5%+ core profile) + 3 sandboxed MCP Apps (ui://culkibo/*) + Async Tasks',
+            'React2Shell SSR Edge Guard, Registry Mirror 429 Guard, Go 1.25 CSRF/PKCE, SQLite WAL Guard & Build-ARG Secret Surface'
           ]
         };
       };
@@ -5281,6 +5283,156 @@ program
       console.log(`\n📦 Culkibo Archive Zip-Slip & Zip-Bomb Firewall (${report.entriesInspected} entries) — [${badge}]`);
       console.log(`   Ratio:    ${report.compressionRatio}:1 · Root: ${report.targetRoot}`);
       console.log(`   Findings: ${report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
+      console.log('');
+      if (!ok) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+// ===========================================================================
+// PIONEER CYCLE-23 MILESTONE CLI: ssr-guard (React2Shell/CVE-2025-29927) & env-surface
+// ===========================================================================
+
+program
+  .command('ssr-guard [inputFile]')
+  .description('Next.js / React2Shell (CVE-2025-55182) & SSR Cache-Poisoning Firewall: sale con código 1 si está bloqueado')
+  .option('--framework <name>', 'Framework SSR (nextjs, remix, sveltekit, astro)', 'nextjs')
+  .option('--next-version <ver>', 'Versión de Next.js a auditar (ej. 15.3.3)')
+  .option('--react-version <ver>', 'Versión de React a auditar (ej. 19.2.1)')
+  .option('--header <pair>', 'Cabecera entrante "Nombre: Valor" (repetible)', (val, /** @type {string[]} */ acc) => { acc.push(val); return acc; }, /** @type {string[]} */ ([]))
+  .option('--vary <csv>', 'Cabecera de respuesta Vary (ej. "RSC, Next-Router-State-Tree, Next-Router-Prefetch")')
+  .option('--json', 'Salida JSON estructurada')
+  .action((inputFile, options) => {
+    try {
+      const ssrSvc = svc.ssrEdgeGuardService;
+      /** @type {Record<string, any>} */
+      let fileData = {};
+      if (inputFile) {
+        const resolved = path.resolve(String(inputFile));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Archivo de entrada SSR no encontrado: ${resolved}`);
+        }
+        fileData = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+      }
+
+      /** @type {Record<string, string>} */
+      const requestHeaders = { ...(fileData.requestHeaders && typeof fileData.requestHeaders === 'object' ? fileData.requestHeaders : {}) };
+      if (Array.isArray(options.header)) {
+        for (const pair of options.header) {
+          const idx = String(pair).indexOf(':');
+          if (idx > 0) {
+            const k = String(pair).slice(0, idx).trim();
+            const v = String(pair).slice(idx + 1).trim();
+            if (k) requestHeaders[k] = v;
+          }
+        }
+      }
+
+      const hasRespHeaders = (fileData.responseHeaders && typeof fileData.responseHeaders === 'object') || options.vary !== undefined;
+      /** @type {Record<string, string> | undefined} */
+      const responseHeaders = hasRespHeaders
+        ? {
+            ...(fileData.responseHeaders && typeof fileData.responseHeaders === 'object' ? fileData.responseHeaders : {}),
+            ...(options.vary !== undefined ? { vary: String(options.vary) } : {})
+          }
+        : undefined;
+
+      const report = ssrSvc.evaluateSsrEdgeSecurity({
+        framework: String(options.framework !== 'nextjs' ? options.framework : (fileData.framework || options.framework || 'nextjs')),
+        ...(options.nextVersion || fileData.nextVersion ? { nextVersion: String(options.nextVersion || fileData.nextVersion) } : {}),
+        ...(options.reactVersion || fileData.reactVersion ? { reactVersion: String(options.reactVersion || fileData.reactVersion) } : {}),
+        requestHeaders,
+        ...(responseHeaders !== undefined ? { responseHeaders } : {}),
+        persist: false
+      });
+
+      const ok = Boolean(report && report.blocked === false && report.safe !== false);
+      const payload = {
+        ...report,
+        ok
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n🛡️  Culkibo SSR / React2Shell Edge Firewall (${report.framework || 'nextjs'}) — [${badge}]`);
+      console.log(`   Findings: ${Array.isArray(report.findingCodes) && report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
+      console.log('');
+      if (!ok) process.exitCode = 1;
+    } catch (err) {
+      failCli(err, options);
+    }
+  });
+
+program
+  .command('env-surface [dockerfile]')
+  .description('Build-ARG / ENV Secret Surface & /run/secrets/ Migrator (Dokploy#3347): solo nombres de claves, cero secretos en salida, sale con código 1 si está bloqueado')
+  .option('--compose-env <csv>', 'Nombres de claves declaradas en Compose environment: (CSV)')
+  .option('--compose-secret <csv>', 'Nombres de claves ya montadas en /run/secrets/ (CSV)')
+  .option('--build-env <csv>', 'Nombres de claves inyectadas en tiempo de build (CSV)')
+  .option('--project-id <id>', 'ID lógico de proyecto opcional', 'cli-local')
+  .option('--json', 'Salida JSON estructurada')
+  .action((dockerfilePath, options) => {
+    try {
+      const envSvc = svc.envSecretSurfaceService;
+      let dockerfileContent = '';
+      /** @type {Record<string, any>} */
+      let jsonSpec = {};
+
+      if (dockerfilePath) {
+        const resolved = path.resolve(String(dockerfilePath));
+        if (!fs.existsSync(resolved)) {
+          throw new Error(`Archivo Dockerfile/manifiesto no encontrado: ${resolved}`);
+        }
+        const raw = fs.readFileSync(resolved, 'utf8');
+        if (resolved.toLowerCase().endsWith('.json')) {
+          jsonSpec = JSON.parse(raw);
+          if (typeof jsonSpec.dockerfile === 'string') dockerfileContent = jsonSpec.dockerfile;
+        } else {
+          dockerfileContent = raw;
+        }
+      }
+
+      const splitCsv = (val) => String(val || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const composeEnvKeys = options.composeEnv
+        ? splitCsv(options.composeEnv)
+        : (Array.isArray(jsonSpec.composeEnvKeys) ? jsonSpec.composeEnvKeys.map(String) : []);
+      const composeSecretKeys = options.composeSecret
+        ? splitCsv(options.composeSecret)
+        : (Array.isArray(jsonSpec.composeSecretKeys) ? jsonSpec.composeSecretKeys.map(String) : []);
+      const buildTimeEnvKeys = options.buildEnv
+        ? splitCsv(options.buildEnv)
+        : (Array.isArray(jsonSpec.buildTimeEnvKeys) ? jsonSpec.buildTimeEnvKeys.map(String) : []);
+
+      const report = envSvc.auditEnvSecretSurface({
+        projectId: String(options.projectId || jsonSpec.projectId || 'cli-local'),
+        dockerfile: dockerfileContent,
+        composeEnvKeys,
+        composeSecretKeys,
+        buildTimeEnvKeys,
+        persist: false
+      });
+
+      const ok = Boolean(report && report.blocked === false && report.safe !== false);
+      const payload = {
+        ...report,
+        ok
+      };
+
+      if (isJsonMode(options)) {
+        printJson(payload);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+
+      const badge = ok ? '\x1b[32mSAFE ✅\x1b[0m' : '\x1b[31mBLOCKED ❌\x1b[0m';
+      console.log(`\n🔐 Culkibo Build-ARG / ENV Secret Surface Auditor — [${badge}]`);
+      console.log(`   Findings: ${Array.isArray(report.findingCodes) && report.findingCodes.length > 0 ? report.findingCodes.join(', ') : 'none'}`);
       console.log('');
       if (!ok) process.exitCode = 1;
     } catch (err) {

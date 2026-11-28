@@ -89,6 +89,7 @@ import {
   type CopaThinPatchResult,
   type MonorepoPlanResult,
   type GraphqlShieldInspectResult,
+  type SsrEdgeGuardResult,
   isDemoMode,
 } from '../lib/api';
 import { liveEvents } from '../lib/liveEvents';
@@ -276,8 +277,8 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [autoBusy, setAutoBusy] = useState<'load' | 'save' | 'eval' | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
 
-  // Cycle-13..22 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain, Region Shift, Base Hardener, Monorepo DAG & GraphQL DoS Shield state
-  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift' | 'basehardener' | 'monorepo' | 'graphql'>('oom');
+  // Cycle-13..23 OOM Forensics, Image Bloat, Egress Firewall, Multi-Arch, Chaos GameDay, Feature Flags, Runtime Anomaly, Digest Promotion, API Contract, Build Repro, Preview Gate, Graceful Drain, Region Shift, Base Hardener, Monorepo DAG, GraphQL DoS Shield & SSR Edge/React2Shell state
+  const [forensicsTab, setForensicsTab] = useState<'oom' | 'image' | 'egress' | 'multiarch' | 'chaos' | 'flags' | 'anomaly' | 'promotion' | 'contract' | 'repro' | 'previewgate' | 'drain' | 'regionshift' | 'basehardener' | 'monorepo' | 'graphql' | 'ssredge'>('oom');
   const [oomResult, setOomResult] = useState<OomForensicsResult | null>(null);
   const [oomBusy, setOomBusy] = useState(false);
   const [oomError, setOomError] = useState<string | null>(null);
@@ -346,6 +347,10 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [gqlResult, setGqlResult] = useState<GraphqlShieldInspectResult | null>(null);
   const [gqlBusy, setGqlBusy] = useState<'alias' | 'introspect' | null>(null);
   const [gqlError, setGqlError] = useState<string | null>(null);
+  // Cycle-23 Next.js / React2Shell (CVE-2025-55182) & SSR Cache-Poisoning Firewall state
+  const [ssrResult, setSsrResult] = useState<SsrEdgeGuardResult | null>(null);
+  const [ssrBusy, setSsrBusy] = useState<'attack' | 'safe' | null>(null);
+  const [ssrError, setSsrError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -1820,6 +1825,42 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
       onNotify(msg, 'error');
     } finally {
       setGqlBusy(null);
+    }
+  };
+
+  const handleRunSsrEdgeGuard = async (mode: 'attack' | 'safe') => {
+    setSsrBusy(mode);
+    setSsrError(null);
+    try {
+      const requestHeaders: Record<string, string> =
+        mode === 'attack'
+          ? { 'x-middleware-subrequest': 'middleware:middleware' }
+          : { host: 'app.acme-demo.dev' };
+      const responseHeaders: Record<string, string> =
+        mode === 'attack'
+          ? { 'cache-control': 'public, max-age=300', vary: 'Accept-Encoding' }
+          : { vary: 'RSC, Next-Router-State-Tree, Next-Router-Prefetch, Accept-Encoding' };
+      const res = await api.evaluateSsrEdgeGuard({
+        projectId: project.id,
+        framework: 'nextjs',
+        nextVersion: mode === 'attack' ? '15.2.0' : '15.3.3',
+        reactVersion: mode === 'attack' ? '19.1.0' : '19.2.1',
+        requestHeaders,
+        responseHeaders,
+      });
+      setSsrResult(res);
+      onNotify(
+        mode === 'attack'
+          ? 'SSR Edge Firewall BLOCKED: React2Shell (CVE-2025-55182), x-middleware-subrequest spoof & missing Vary: RSC!'
+          : 'SSR Edge Verified SAFE: Next.js 15.3.3 + React 19.2.1 with RSC Vary protection!',
+        mode === 'attack' ? 'error' : 'success'
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'SSR Edge evaluation failed';
+      setSsrError(msg);
+      onNotify(msg, 'error');
+    } finally {
+      setSsrBusy(null);
     }
   };
 
@@ -3509,6 +3550,7 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                 { id: 'basehardener' as const, label: t('pd.forensicsTabBaseHardener') },
                 { id: 'monorepo' as const, label: t('pd.forensicsTabMonorepo') },
                 { id: 'graphql' as const, label: t('pd.forensicsTabGraphql') },
+                { id: 'ssredge' as const, label: t('pd.forensicsTabSsrEdge') },
               ]).map((tabItem) => (
                 <button
                   key={tabItem.id}
@@ -4626,6 +4668,73 @@ export const ProjectDetail: React.FC<ProjectDetailProps> = ({
                       ))}
                     </div>
                     {gqlResult.message && <div>{gqlResult.message}</div>}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {forensicsTab === 'ssredge' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={ssrBusy !== null}
+                  onClick={() => void handleRunSsrEdgeGuard('attack')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {ssrBusy === 'attack' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />}
+                  <span>{t('pd.ssrTestAttack')}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={ssrBusy !== null}
+                  onClick={() => void handleRunSsrEdgeGuard('safe')}
+                  className="culkibo-press inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 hover:bg-slate-100 text-emerald-700 font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {ssrBusy === 'safe' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>{t('pd.ssrTestSafe')}</span>
+                </button>
+              </div>
+              {ssrError && <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700">{ssrError}</div>}
+              {ssrResult && (() => {
+                const rawFinds = Array.isArray(ssrResult.findings) ? ssrResult.findings : [];
+                const codes = Array.from(
+                  new Set([
+                    ...(Array.isArray(ssrResult.findingCodes) ? ssrResult.findingCodes : []),
+                    ...rawFinds.map((f) => (typeof f === 'string' ? f : (f.code || f.rule || 'SSR_INTERNAL_HEADER_SPOOF'))),
+                  ])
+                );
+                const isBlocked = Boolean(ssrResult.blocked || ssrResult.safe === false || codes.length > 0);
+                const caddyText =
+                  typeof ssrResult.caddyBlock === 'string' && ssrResult.caddyBlock.trim()
+                    ? ssrResult.caddyBlock
+                    : ssrResult.caddyBlock && typeof ssrResult.caddyBlock === 'object'
+                      ? String(ssrResult.caddyBlock.caddyBlock || ssrResult.caddyBlock.caddyfile || '')
+                      : typeof ssrResult.caddyfile === 'string' && ssrResult.caddyfile.trim()
+                        ? ssrResult.caddyfile
+                        : 'request_header -x-middleware-subrequest\nheader +Vary "RSC, Next-Router-State-Tree, Next-Router-Prefetch"';
+                return (
+                  <div className="space-y-2.5 font-mono text-[11px] tabular-nums">
+                    <div className={`p-3.5 rounded-xl border flex flex-wrap items-center gap-1.5 ${
+                      isBlocked
+                        ? 'bg-red-50 border-red-200 text-red-700'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                    }`}>
+                      <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                        {isBlocked ? 'SSR EDGE BLOCKED' : 'SSR EDGE SAFE · NEXT 15.3.3 + REACT 19.2.1'}
+                      </span>
+                      {codes.map((c, idx) => (
+                        <span key={idx} className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-900 text-[10px] font-semibold">
+                          {c}
+                        </span>
+                      ))}
+                    </div>
+                    {caddyText && (
+                      <pre className="p-3 rounded-xl bg-slate-950 text-sky-300 border border-slate-800 text-[10px] leading-relaxed overflow-x-auto max-h-40">
+                        {caddyText}
+                      </pre>
+                    )}
                   </div>
                 );
               })()}

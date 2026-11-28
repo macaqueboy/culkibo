@@ -562,7 +562,7 @@ async function testCliDx() {
     assert.strictEqual(demoJson.env.CULKIBO_DEMO, '1');
     assert.strictEqual(demoJson.url, 'http://127.0.0.1:3030/?demo=1&lang=en&theme=dark');
     assert.ok(typeof demoJson.bootMs === 'number' && demoJson.bootMs < 200, `bootMs debe ser <200ms (actual: ${demoJson.bootMs}ms)`);
-    assert.strictEqual(demoJson.datasets.mcpTools, 195);
+    assert.strictEqual(demoJson.datasets.mcpTools, 200);
 
     const demoCustomPort = await runCli(['demo', '--port', '4044', '--no-open', '--json'], { env: isolatedEnv });
     assert.strictEqual(demoCustomPort.status, 0, demoCustomPort.stderr);
@@ -1451,7 +1451,69 @@ async function testCliDx() {
     const archOkCli = await runCli(['archive-guard', '--entry', 'dist/server.js', '--json'], { env: isolatedEnv });
     assert.strictEqual(archOkCli.status, 0, `culkibo archive-guard limpio falló: ${archOkCli.stderr} ${archOkCli.stdout}`);
     assert.strictEqual(JSON.parse(archOkCli.stdout).ok, true);
-    console.log(`  ✓ Pioneer CLI Cycle-22 verificado (culkibo jwt-audit fail=1/ok=0 0-raw, culkibo archive-guard slip+bomb=1/ok=0, culkibo demo 195 tools)`);
+    console.log(`  ✓ Pioneer CLI Cycle-22 verificado (culkibo jwt-audit fail=1/ok=0 0-raw, culkibo archive-guard slip+bomb=1/ok=0, culkibo demo 200 tools)`);
+
+    // 27. Pioneer Cycle-23 Historic Milestone CLI: `culkibo ssr-guard` (React2Shell/x-middleware-subrequest/Vary exit 1 vs patched exit 0) & `culkibo env-surface` (Dockerfile ARG/ENV secret exit 1, 0 raw echoes vs clean exit 0)
+    const ssrFailCli = await runCli([
+      'ssr-guard',
+      '--framework', 'nextjs',
+      '--next-version', '15.2.0',
+      '--react-version', '19.1.0',
+      '--header', 'x-middleware-subrequest: middleware',
+      '--vary', 'Accept-Encoding',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(ssrFailCli.status, 1, 'culkibo ssr-guard debe salir con código 1 ante React2Shell / x-middleware-subrequest / Vary ausente');
+    const ssrFailJson = JSON.parse(ssrFailCli.stdout);
+    assert.strictEqual(ssrFailJson.ok, false);
+    assert.ok(ssrFailJson.findingCodes.includes('SSR_INTERNAL_HEADER_SPOOF'));
+    assert.ok(ssrFailJson.findingCodes.includes('REACT2SHELL_VULNERABLE_VERSION'));
+    assert.ok(ssrFailJson.findingCodes.includes('NEXTJS_MIDDLEWARE_CVE_VERSION'));
+    assert.ok(ssrFailJson.findingCodes.includes('RSC_VARY_HEADER_MISSING'));
+
+    const ssrOkCli = await runCli([
+      'ssr-guard',
+      '--framework', 'nextjs',
+      '--next-version', '15.3.3',
+      '--react-version', '19.2.1',
+      '--vary', 'RSC, Next-Router-State-Tree, Next-Router-Prefetch',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(ssrOkCli.status, 0, `culkibo ssr-guard parcheado falló: ${ssrOkCli.stderr} ${ssrOkCli.stdout}`);
+    assert.strictEqual(JSON.parse(ssrOkCli.stdout).ok, true);
+
+    const cliRawSecret = 'cli_secret_' + 'never_echo_446688';
+    const leakyDfPathC23 = path.join(tmpRoot, 'Dockerfile.leaky-c23');
+    fs.writeFileSync(
+      leakyDfPathC23,
+      `FROM node:22-alpine\nARG JWT_SECRET=${cliRawSecret}\nENV DATABASE_URL=postgres://u:${cliRawSecret}@db/app\n`,
+      'utf8'
+    );
+    const envFailCli = await runCli([
+      'env-surface',
+      leakyDfPathC23,
+      '--compose-env', 'JWT_SECRET,AUTH_SECRET',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(envFailCli.status, 1, 'culkibo env-surface debe salir con código 1 ante secretos en ARG/ENV y Compose plain env');
+    assert.ok(!envFailCli.stdout.includes(cliRawSecret), 'culkibo env-surface jamás debe imprimir valores crudos de secretos');
+    const envFailJson = JSON.parse(envFailCli.stdout);
+    assert.strictEqual(envFailJson.ok, false);
+    assert.ok(envFailJson.findingCodes.includes('BUILDKIT_SECRET_IN_ARG_OR_ENV'));
+    assert.ok(envFailJson.findingCodes.includes('COMPOSE_SECRET_IN_PLAIN_ENV'));
+    assert.ok(envFailJson.findingCodes.includes('BUILD_RUNTIME_SECRET_OVERLAP'));
+
+    const cleanDfPathC23 = path.join(tmpRoot, 'Dockerfile.clean-c23');
+    fs.writeFileSync(cleanDfPathC23, 'FROM node:22-alpine\nENV NODE_ENV=production\n', 'utf8');
+    const envOkCli = await runCli([
+      'env-surface',
+      cleanDfPathC23,
+      '--compose-secret', 'JWT_SECRET',
+      '--json'
+    ], { env: isolatedEnv });
+    assert.strictEqual(envOkCli.status, 0, `culkibo env-surface limpio falló: ${envOkCli.stderr} ${envOkCli.stdout}`);
+    assert.strictEqual(JSON.parse(envOkCli.stdout).ok, true);
+    console.log(`  ✓ Pioneer CLI Cycle-23 Historic Milestone verificado (culkibo ssr-guard fail=1/ok=0, culkibo env-surface leak=1 0-raw/clean=0, culkibo demo 200 tools)`);
 
     console.log('✅ All CLI DX tests passed!\n');
   } finally {

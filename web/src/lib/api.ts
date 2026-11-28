@@ -6962,6 +6962,147 @@ export const api = {
     }
     throw new Error(data?.error || data?.message || 'Archive Zip-Slip & symlink inspection failed');
   },
+
+  // --- Cycle-23 (Historic 200 MCP Tools): SSR Edge Guard, Registry Mirror Guard, Session CSRF/PKCE, SQLite WAL Guard & Build-ARG Secret Surface ---
+
+  async evaluateSsrEdgeGuard(payload: {
+    projectId?: string;
+    framework?: string;
+    nextVersion?: string;
+    reactVersion?: string;
+    requestHeaders?: Record<string, string>;
+    responseHeaders?: Record<string, string>;
+  }): Promise<SsrEdgeGuardResult> {
+    const res = await apiFetch(`${API_BASE}/edge/ssr-guard/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as SsrEdgeGuardResult;
+    }
+    throw new Error(data?.error || data?.message || 'SSR Edge & React2Shell evaluation failed');
+  },
+
+  async auditRegistryMirror(payload: {
+    nodeId?: string;
+    registry?: string;
+    authenticated?: boolean;
+    pullsPerHour?: number;
+    archCount?: number;
+    sharedNatIp?: boolean;
+    mirrors?: string[];
+    plaintextConfigAuth?: boolean;
+  }): Promise<RegistryMirrorAuditResult> {
+    const res = await apiFetch(`${API_BASE}/builds/registry-mirror/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as RegistryMirrorAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'Registry pull-limit & mirror audit failed');
+  },
+
+  async evaluateSessionCsrf(payload: {
+    method?: string;
+    secFetchSite?: string;
+    origin?: string;
+    host?: string;
+    trustedOrigins?: string[];
+    setCookieHeader?: string;
+    setCookie?: string;
+  }): Promise<SessionCsrfEvalResult> {
+    const res = await apiFetch(`${API_BASE}/security/session-csrf/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || res.status === 403 || data?.safe === false || data?.blocked === true || data?.allowed === false) {
+      return data as SessionCsrfEvalResult;
+    }
+    throw new Error(data?.error || data?.message || 'Session CSRF & cookie evaluation failed');
+  },
+
+  async verifyOAuthPkce(payload: {
+    method?: string;
+    codeChallenge?: string;
+    codeVerifier?: string;
+    persistedMethod?: string;
+    state?: string;
+  }): Promise<OAuthPkceVerifyResult> {
+    const res = await apiFetch(`${API_BASE}/security/session-csrf/pkce`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true || data?.valid === false) {
+      return data as OAuthPkceVerifyResult;
+    }
+    throw new Error(data?.error || data?.message || 'OAuth 2.1 PKCE verification failed');
+  },
+
+  async auditSqliteWal(payload: {
+    databaseName?: string;
+    filesystemType?: string;
+    journalMode?: string;
+    synchronous?: string;
+    busyTimeoutMs?: number;
+    journalSizeLimitMb?: number;
+    dbSizeMb?: number;
+    walSizeMb?: number;
+    blockedReaders?: number;
+    foreignKeys?: boolean;
+  }): Promise<SqliteWalAuditResult> {
+    const res = await apiFetch(`${API_BASE}/db/sqlite-wal/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as SqliteWalAuditResult;
+    }
+    throw new Error(data?.error || data?.message || 'SQLite WAL & NFS guard audit failed');
+  },
+
+  async auditEnvSecretSurface(payload: {
+    projectId?: string;
+    dockerfile?: string;
+    composeEnvKeys?: string[];
+    composeSecretKeys?: string[];
+    buildTimeEnvKeys?: string[];
+  }): Promise<EnvSecretSurfaceResult> {
+    const res = await apiFetch(`${API_BASE}/security/env-surface/audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok || data?.safe === false || data?.blocked === true) {
+      return data as EnvSecretSurfaceResult;
+    }
+    throw new Error(data?.error || data?.message || 'Build-ARG/ENV secret surface audit failed');
+  },
+
+  async renderEnvSecretMigration(payload: {
+    secretNames: string[];
+    dryRun?: boolean;
+  }): Promise<EnvSecretMigrateResult> {
+    return jsonOrThrow(
+      await apiFetch(`${API_BASE}/security/env-surface/migrate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, ...payload }),
+      }),
+      'Secret mount migration snippet failed'
+    );
+  },
 };
 
 // =====================================================================
@@ -9606,5 +9747,95 @@ export interface ArchiveSlipInspectResult {
   targetRoot?: string;
   findings?: GuardFindingItem[];
   findingCodes?: string[];
+  message?: string;
+}
+
+// --- Cycle-23 (Historic 200 MCP) SSR Edge, Registry Mirror, Session CSRF/PKCE, SQLite WAL & Build-ARG Secret Surface Types ---
+
+export interface SsrEdgeGuardResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  caddyBlock?: string | { caddyBlock?: string; caddyfile?: string; [key: string]: unknown };
+  caddyfile?: string;
+  message?: string;
+}
+
+export interface RegistryMirrorAuditResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  effectivePullsPerHour?: number;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  daemonJsonText?: string;
+  daemonConfig?: Record<string, unknown>;
+  message?: string;
+}
+
+export interface SessionCsrfEvalResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  allowed?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  csrf?: { findings?: GuardFindingItem[]; findingCodes?: string[]; blocked?: boolean };
+  cookie?: { findings?: GuardFindingItem[]; findingCodes?: string[]; blocked?: boolean };
+  message?: string;
+}
+
+export interface OAuthPkceVerifyResult {
+  ok?: boolean;
+  safe?: boolean;
+  valid?: boolean;
+  blocked?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  message?: string;
+}
+
+export interface SqliteWalAuditResult {
+  ok?: boolean;
+  databaseName?: string;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  pragmaSql?: string;
+  sql?: string;
+  message?: string;
+}
+
+export interface EnvSecretSurfaceResult {
+  ok?: boolean;
+  safe?: boolean;
+  blocked?: boolean;
+  status?: string;
+  dockerfileSecretKeys?: string[];
+  composePlainSecretKeys?: string[];
+  buildRuntimeOverlapKeys?: string[];
+  flaggedKeyNames?: string[];
+  secretNames?: string[];
+  findings?: GuardFindingItem[];
+  findingCodes?: string[];
+  dockerfileSnippet?: string;
+  composeSnippet?: string;
+  message?: string;
+}
+
+export interface EnvSecretMigrateResult {
+  ok?: boolean;
+  dryRun?: boolean;
+  dockerfileSnippet?: string;
+  composeSnippet?: string;
+  secretNames?: string[];
   message?: string;
 }

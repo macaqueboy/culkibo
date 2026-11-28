@@ -4183,6 +4183,143 @@ function reqJson(port, method, pth, { token, body } = {}) {
   }
   console.log('  ✓ Cycle #22 CVEs (24a-24e): CVE-2026-29000/33322 JWT/OIDC firewall, V8 heap/FD/EL leak guard, CVE-2026-47707 GraphQL fragment DoS, Coolify#6800 ACME ARI/TLS, CVE-2026-23745 Zip-Slip');
 
+  // -------------------------------------------------------------------------
+  // 25. Historic Cycle #23 (200-MCP Milestone) Next.js/React2Shell, Registry Mirror, CSRF/PKCE, SQLite WAL & Build-ARG Secret Surface Regressions (docs/COMPETITOR_RADAR_CYCLE22.md §3)
+  // -------------------------------------------------------------------------
+  {
+    const { SsrEdgeGuardService } = require('../server/services/ssrEdgeGuardService');
+    const regMirror = require('../server/services/registryMirrorGuardService');
+    const { SessionCsrfGuardService } = require('../server/services/sessionCsrfGuardService');
+    const sqliteWal = require('../server/services/sqliteWalGuardService');
+    const envSurface = require('../server/services/envSecretSurfaceService');
+
+    const c23Tmp = makeTempDir('culkibo-c23-cve-');
+    const prevDataDir = process.env.CULKIBO_DATA_DIR;
+    process.env.CULKIBO_DATA_DIR = c23Tmp;
+    try {
+      // 25a. Next.js / React2Shell SSR Edge Guard (CVE-2025-29927/55182/49005)
+      const ssrSvc = new SsrEdgeGuardService({ dataDir: c23Tmp });
+      const ssrBad = ssrSvc.evaluateSsrEdgeSecurity({
+        framework: 'nextjs',
+        nextVersion: '15.2.1',
+        reactVersion: '19.1.0',
+        requestHeaders: { 'x-middleware-subrequest': 'middleware' },
+        responseHeaders: { Vary: 'Accept-Encoding' },
+        persist: false
+      });
+      assert.strictEqual(ssrBad.blocked, true);
+      assert.ok(ssrBad.findingCodes.includes('SSR_INTERNAL_HEADER_SPOOF'));
+      assert.ok(ssrBad.findingCodes.includes('REACT2SHELL_VULNERABLE_VERSION'));
+      assert.ok(ssrBad.findingCodes.includes('NEXTJS_MIDDLEWARE_CVE_VERSION'));
+      assert.ok(ssrBad.findingCodes.includes('RSC_VARY_HEADER_MISSING'));
+      const ssrOk = ssrSvc.evaluateSsrEdgeSecurity({
+        framework: 'nextjs',
+        nextVersion: '15.3.3',
+        reactVersion: '19.2.1',
+        requestHeaders: { accept: 'text/html' },
+        responseHeaders: { Vary: 'RSC, Next-Router-State-Tree, Next-Router-Prefetch' },
+        persist: false
+      });
+      assert.strictEqual(ssrOk.safe, true);
+
+      // 25b. Container Registry Pull-Limit & Mirror Guard (Docker Hub 429 / registry:3)
+      const regBad = regMirror.auditRegistryPullBudget({
+        nodeId: 'vps_25b',
+        registry: 'docker.io',
+        authenticated: false,
+        pullsPerHour: 12,
+        archCount: 2,
+        mirrors: [],
+        persist: false
+      });
+      assert.strictEqual(regBad.blocked, true);
+      assert.ok(regBad.findingCodes.includes('ANONYMOUS_HUB_RATE_LIMIT_RISK'));
+      assert.ok(regBad.findingCodes.includes('MISSING_REGISTRY_MIRROR'));
+      const regOk = regMirror.auditRegistryPullBudget({
+        nodeId: 'vps_25b',
+        registry: 'docker.io',
+        authenticated: true,
+        pullsPerHour: 6,
+        archCount: 2,
+        mirrors: ['http://127.0.0.1:5000'],
+        persist: false
+      });
+      assert.strictEqual(regOk.safe, true);
+      assert.ok(regOk.daemonJsonText.includes('registry-mirrors'));
+
+      // 25c. Session Cookie, Go 1.25 Fetch-Metadata CSRF & OAuth 2.1 PKCE Guard (CVE-2026-26247)
+      const csrfSvc = new SessionCsrfGuardService({ dataDir: c23Tmp });
+      const csrfBad = csrfSvc.evaluateCrossOriginRequest({ method: 'POST', secFetchSite: 'cross-site', persist: false });
+      assert.strictEqual(csrfBad.blocked, true);
+      assert.strictEqual(csrfBad.httpStatus, 403);
+      assert.ok(csrfBad.findingCodes.includes('CSRF_CROSS_ORIGIN_BLOCKED'));
+      const pkcePlain = csrfSvc.verifyOAuthPkceFlow({ method: 'plain', codeChallenge: 'abc', codeVerifier: 'abc', persist: false });
+      assert.strictEqual(pkcePlain.blocked, true);
+      assert.ok(pkcePlain.findingCodes.includes('PKCE_PLAIN_FORBIDDEN'));
+      const verifier25c = crypto.randomBytes(36).toString('base64url');
+      const challenge25c = crypto.createHash('sha256').update(verifier25c, 'utf8').digest('base64url');
+      const pkceOk = csrfSvc.verifyOAuthPkceFlow({
+        method: 'S256',
+        persistedMethod: 'S256',
+        codeChallenge: challenge25c,
+        codeVerifier: verifier25c,
+        state: crypto.randomBytes(16).toString('hex'),
+        persist: false
+      });
+      assert.strictEqual(pkceOk.verified, true);
+      const ckBad = csrfSvc.auditSessionCookie('__Host-sid=ephemeral_val; Path=/app');
+      assert.ok(ckBad.findingCodes.includes('COOKIE_HOST_PREFIX_INVALID'));
+
+      // 25d. SQLite WAL Checkpoint Starvation & Network-FS Corruption Guard
+      const walBad = sqliteWal.auditSqliteWalHealth({
+        databaseName: 'solid_queue.sqlite3',
+        filesystemType: 'nfs',
+        busyTimeoutMs: 0,
+        walSizeMb: 512,
+        dbSizeMb: 80,
+        blockedReaders: 2,
+        persist: false
+      });
+      assert.strictEqual(walBad.blocked, true);
+      assert.ok(walBad.findingCodes.includes('SQLITE_NETWORK_FS_CORRUPTION'));
+      assert.ok(walBad.findingCodes.includes('SQLITE_BUSY_TIMEOUT_LOW'));
+      assert.ok(walBad.findingCodes.includes('WAL_CHECKPOINT_STARVATION'));
+      const walOk = sqliteWal.auditSqliteWalHealth({
+        databaseName: 'solid_queue.sqlite3',
+        filesystemType: 'ext4',
+        journalMode: 'wal',
+        synchronous: 'normal',
+        busyTimeoutMs: 5000,
+        journalSizeLimitMb: 64,
+        dbSizeMb: 80,
+        walSizeMb: 12,
+        blockedReaders: 0,
+        persist: false
+      });
+      assert.strictEqual(walOk.safe, true);
+
+      // 25e. Build-ARG / ENV Secret Surface & /run/secrets/ Migrator (Dokploy#3347 / Coolify#10822)
+      const dynVal25e = ['never', 'persisted', 'raw', 'dsn', '25e'].join('_');
+      const surfBad = envSurface.auditEnvSecretSurface({
+        projectId: 'proj_25e',
+        dockerfile: `FROM node:22-alpine\nARG JWT_SECRET\nENV DATABASE_URL=${dynVal25e}\nRUN npm run build`,
+        persist: false
+      });
+      assert.strictEqual(surfBad.blocked, true);
+      assert.ok(surfBad.findingCodes.includes('BUILDKIT_SECRET_IN_ARG_OR_ENV'));
+      assert.ok(!JSON.stringify(surfBad).includes(dynVal25e), 'Raw secret value MUST NEVER appear in audit output');
+      const mig25e = envSurface.renderSecretMountMigration({ secretNames: ['JWT_SECRET', 'DATABASE_URL'] });
+      assert.strictEqual(mig25e.dryRun, true);
+      assert.ok(mig25e.dockerfileSnippet.includes('RUN --mount=type=secret,id=jwt_secret'));
+      assert.ok(mig25e.composeSnippet.includes('mode: 0400'));
+    } finally {
+      if (prevDataDir === undefined) delete process.env.CULKIBO_DATA_DIR;
+      else process.env.CULKIBO_DATA_DIR = prevDataDir;
+      fs.rmSync(c23Tmp, { recursive: true, force: true });
+    }
+  }
+  console.log('  ✓ Cycle #23 CVEs (25a-25e): CVE-2025-55182 React2Shell/Next.js SSR, Docker Hub 429 mirror, Go 1.25 CSRF + CVE-2026-26247 PKCE, SQLite WAL/NFS, Dokploy#3347 Build-ARG secret migrator');
+
   console.log('✅ Suite #23 completada correctamente.\n');
 }
 

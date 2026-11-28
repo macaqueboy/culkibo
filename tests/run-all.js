@@ -87,6 +87,9 @@ const testCycle21HttpE2E = require('./cycle21-http-e2e.test');
 const testJwtAndGraphqlShield = require('./jwt-and-graphql-shield.test');
 const testLeakAcmeArchive = require('./leak-acme-archive.test');
 const testCycle22HttpE2E = require('./cycle22-http-e2e.test');
+const testSsrAndSessionCsrf = require('./ssr-and-session-csrf.test');
+const testMirrorSqliteEnvSurface = require('./mirror-sqlite-env-surface.test');
+const testCycle23HttpE2E = require('./cycle23-http-e2e.test');
 
 const { ensureDaemon } = require('./helpers/daemon');
 
@@ -199,6 +202,9 @@ async function runAll() {
     { name: 'JWT Algorithm-Confusion / OIDC Firewall (CVE-2026-29000) & GraphQL Fragment-Spread DoS Shield (CVE-2026-47707)', fn: testJwtAndGraphqlShield },
     { name: 'Container Heap-Slope / FD-Leak Guard, ACME RFC 9773 ARI / TLS Budget (Coolify#6800) & Archive Zip-Slip Firewall (CVE-2026-23745)', fn: testLeakAcmeArchive },
     { name: 'Cycle #22 195-MCP & 89-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + JWT/Leak/GraphQL/ACME/ZipSlip + RBAC)', fn: testCycle22HttpE2E },
+    { name: 'Next.js / React2Shell SSR Edge Guard (CVE-2025-55182) & Go 1.25 Fetch-Metadata CSRF / OAuth 2.1 PKCE Guard (CVE-2026-26247)', fn: testSsrAndSessionCsrf },
+    { name: 'Container Registry Pull-Limit Mirror (registry:3), SQLite WAL/NFS Corruption Guard & Build-ARG /run/secrets/ Migrator (Dokploy#3347)', fn: testMirrorSqliteEnvSurface },
+    { name: 'Historic Cycle #23 200-MCP & 92-Suites Milestone Live Isolated HTTP E2E (All 5 API Families + React2Shell/Mirror/CSRF/WAL/Secrets + RBAC)', fn: testCycle23HttpE2E },
   ];
 
   for (const suite of suites) {
